@@ -1,11 +1,15 @@
-import { validateAdapterSecretFields } from "../protocol/adapter-validation";
+import {
+	type AdapterValidationError,
+	validateAdapterControl,
+	validateAdapterSecretFields,
+} from "../protocol/adapter-validation";
 import { type Adapter, OPERATIONS, type Operation, type OperationKind } from "../protocol/operation-registry";
 
 export type ChatTransport = Extract<Adapter, "telegram" | "discord" | "slack">;
 export type ChatOperationDisposition = "allowed" | "unsupported_on_chat";
 
 export interface ChatCommandError {
-	code: "unsupported_on_chat" | "secret_input_forbidden";
+	code: "unsupported_on_chat" | "secret_input_forbidden" | "ultrafast_tier_forbidden" | AdapterValidationError["code"];
 	message: string;
 }
 
@@ -57,11 +61,20 @@ export function authorizeChatOperation(transport: ChatTransport, request: ChatOp
 		candidate => candidate.kind === request.kind && candidate.sdkId === request.operation,
 	);
 	if (!operation) return unsupported();
-	if (validateAdapterSecretFields(operation.sdkId, (request.input ?? {}) as Record<string, unknown>)) {
+	const secretValidation = validateAdapterSecretFields(
+		operation.sdkId,
+		(request.input ?? {}) as Record<string, unknown>,
+	);
+	if (secretValidation?.code === "secret_field_forbidden") {
 		return {
 			ok: false,
 			error: { code: "secret_input_forbidden", message: "Secret configuration input is forbidden on chat." },
 		};
+	}
+	if (secretValidation) return { ok: false, error: secretValidation };
+	if (operation.kind === "control") {
+		const invalid = validateAdapterControl(operation.sdkId, (request.input ?? {}) as Record<string, unknown>);
+		if (invalid) return { ok: false, error: invalid };
 	}
 	return CHAT_OPERATION_POLICY[transport][operation.id] === "allowed" ? { ok: true } : unsupported();
 }

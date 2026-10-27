@@ -1,0 +1,12 @@
+{
+  "oracle": "diff@9.0.0",
+  "archive": "packages/typescript-edit-benchmark/fixtures.tar.gz",
+  "archiveSha256": "4cc8a7a291da6f9579be9453c15f6b7af49880ab47a10c9fe253f3b0cffcc5ee",
+  "seededMutations": [
+    1,
+    17,
+    12648432
+  ],
+  "fixtureFiles": 320,
+  "cases": 960
+}

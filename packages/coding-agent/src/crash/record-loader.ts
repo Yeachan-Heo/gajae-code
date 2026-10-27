@@ -5,8 +5,8 @@
  * is explicitly **not** a parseable database. The field corpus contains at least
  * one interleaved record (two headers merged onto one line), and throwable text
  * is arbitrary multiline content. Recovery therefore trusts only a complete
- * v1 record whose terminal identity line matches a fingerprint recomputed from
- * that record's own header and stack.
+ * record whose terminal identity line matches a fingerprint recomputed from
+ * that record's own header and stack using the marker's supported version.
  *
  * Records written before that line existed are `unmatchable` and are never
  * offered for reporting — no retroactive mining is attempted or claimed.
@@ -17,6 +17,9 @@ import {
 	type CrashFingerprint,
 	type CrashProvenance,
 	computeCrashFingerprint,
+	computeCrashFingerprintV1,
+	computeHandledErrorFingerprint,
+	computeHandledErrorFingerprintV1,
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
 
@@ -47,6 +50,7 @@ function findBoundFingerprint(
 	headline: string,
 	bodyLines: string[],
 	markerFingerprint: string,
+	markerVersion: number,
 ): CrashFingerprint | undefined {
 	for (let separator = headline.indexOf(":"); separator > 0; separator = headline.indexOf(":", separator + 1)) {
 		const name = headline.slice(0, separator).trim();
@@ -60,11 +64,25 @@ function findBoundFingerprint(
 			// suffix omission against the marker rather than trusting its syntax.
 			if (remaining.length > 0) stackCandidates.push(remaining.slice(0, -1).join("\n").trimEnd());
 			for (const stack of stackCandidates) {
-				const fingerprint = computeCrashFingerprint({ name, message, stack });
-				if (fingerprint.fingerprint === markerFingerprint) return fingerprint;
+				const input = { name, message, stack };
+				const fatalFingerprint = computeCrashFingerprintForVersion(input, markerVersion, false);
+				if (fatalFingerprint?.fingerprint === markerFingerprint) return fatalFingerprint;
+				const handledFingerprint = computeCrashFingerprintForVersion(input, markerVersion, true);
+				if (handledFingerprint?.fingerprint === markerFingerprint) return handledFingerprint;
 			}
 		}
 	}
+	return undefined;
+}
+
+function computeCrashFingerprintForVersion(
+	input: { name: string; message: string; stack: string },
+	version: number,
+	handled: boolean,
+): CrashFingerprint | undefined {
+	if (version === 1) return handled ? computeHandledErrorFingerprintV1(input) : computeCrashFingerprintV1(input);
+	if (version === CRASH_FINGERPRINT_VERSION)
+		return handled ? computeHandledErrorFingerprint(input) : computeCrashFingerprint(input);
 	return undefined;
 }
 
@@ -111,7 +129,7 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 			if (marker && started) {
 				const rawBody = buffer.join("\n").trimEnd();
 				const bodyLines = rawBody.split("\n");
-				const fingerprint = findBoundFingerprint(headline, bodyLines, marker.fingerprint);
+				const fingerprint = findBoundFingerprint(headline, bodyLines, marker.fingerprint, marker.version);
 				// A stack's first line repeats `Name: message`, which the header already
 				// carries; dropping it keeps the rendered report free of a duplicate.
 				const lines = buffer[0]?.trim() === headline.trim() ? buffer.slice(1) : buffer;
@@ -128,7 +146,7 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 						...(provenance === undefined ? {} : { provenance }),
 					},
 					complete: false,
-					bound: marker.version === CRASH_FINGERPRINT_VERSION && fingerprint !== undefined,
+					bound: fingerprint !== undefined,
 				};
 				records.push(pending);
 			}
@@ -145,7 +163,7 @@ export function parseCrashRecords(contents: string): LoadedCrashRecord[] {
 	return parseCandidates(contents).map(candidate => candidate.record);
 }
 
-/** Complete v1 records whose marker fingerprint is recomputed from their diagnostic text. */
+/** Complete records with supported marker versions and fingerprints recomputed from their diagnostic text. */
 export function parseRecoverableCrashRecords(contents: string): LoadedCrashRecord[] {
 	return parseCandidates(contents)
 		.filter(candidate => candidate.complete && candidate.bound)

@@ -15,6 +15,7 @@ import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
+import type { QueuedRunStartFailure } from "../../session/agent-session";
 import type { CustomMessage } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
@@ -394,6 +395,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 		},
@@ -791,7 +793,14 @@ export async function discoverAndLoadExtensions(
 		...(options.profileAuthority === undefined ? {} : { profileAuthority: options.profileAuthority }),
 		...(options.settings === undefined ? {} : { settings: options.settings }),
 	});
-	for (const ext of discovered.items) {
+	// Filter project modules before first-wins name deduplication. `items` has
+	// already deduplicated, so a project module could otherwise shadow the
+	// same-named user module before being rejected here.
+	const seenDiscoveredNames = new Set<string>();
+	for (const ext of discovered.all) {
+		if (ext._source.provider === "native" && ext.level === "project") continue;
+		if (seenDiscoveredNames.has(ext.name)) continue;
+		seenDiscoveredNames.add(ext.name);
 		if (ext._source.provider !== "native") continue;
 		addPath(ext.path);
 	}

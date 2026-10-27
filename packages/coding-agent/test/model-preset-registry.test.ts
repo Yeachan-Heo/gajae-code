@@ -3,6 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getBundledModels, writeModelCache } from "@gajae-code/ai";
 import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
 import { withModelPresetRegistryTestTrust } from "../src/config/internal/model-preset-registry-test-support";
 import {
@@ -261,6 +262,26 @@ describe("signed model preset registry", () => {
 			'{"negativeZero":0,"𐀀":2,"":1}',
 		);
 		expect(() => canonicalModelPresetRegistryJson("\ud800")).toThrow(/lone high surrogate/i);
+		expect(() => canonicalModelPresetRegistryJson({ key: "a\udc00" })).toThrow(/lone low surrogate/i);
+	});
+
+	test("quotes strings and keys exactly as JSON.stringify", () => {
+		const strings = [
+			"plain-id",
+			'quote"in',
+			"back\\slash",
+			"tab\tnew\nline",
+			"nul\u0000ctl\u001f",
+			"del\u007f",
+			"é🙂",
+			"\u2028sep",
+		];
+		for (const value of strings) {
+			expect(canonicalModelPresetRegistryJson(value)).toBe(JSON.stringify(value));
+			expect(canonicalModelPresetRegistryJson({ [value]: value })).toBe(
+				`{${JSON.stringify(value)}:${JSON.stringify(value)}}`,
+			);
+		}
 	});
 
 	test("accepts the exact producer revision-1 manifest signature and snapshot binding", async () => {
@@ -339,6 +360,12 @@ describe("signed model preset registry", () => {
 		await Bun.write(
 			path.join(data.agentDir, "models.yml"),
 			`providers:
+  alibaba-token-plan:
+    auth: none
+    streamIdleTimeoutMs: 360000
+    modelOverrides:
+      cached-alibaba-model:
+        streamIdleTimeoutMs: 450000
   configured-provider:
     baseUrl: https://configured.example/v1
     api: openai-completions
@@ -356,7 +383,40 @@ describe("signed model preset registry", () => {
 `,
 		);
 		const authStorage = await AuthStorage.create(path.join(data.agentDir, "auth.db"));
+		const previousAlibabaBaseUrl = Bun.env.ALIBABA_TOKEN_PLAN_BASE_URL;
 		try {
+			Bun.env.ALIBABA_TOKEN_PLAN_BASE_URL = "https://alibaba-cache.example/v1";
+			const seedRegistry = data.run(
+				() =>
+					new ModelRegistry(authStorage, path.join(data.agentDir, "models.yml"), undefined, {
+						automaticRefresh: false,
+					}),
+			);
+			const alibabaTemplate = getBundledModels("alibaba-token-plan").find(
+				model => model.api === "openai-completions",
+			);
+			if (!alibabaTemplate?.baseUrl) throw new Error("Expected a bundled Alibaba Completions model");
+			const cachedModel = { ...alibabaTemplate, id: "cached-alibaba-model", name: "Cached Alibaba model" };
+			const providerBaseUrl = seedRegistry.getProviderBaseUrl("alibaba-token-plan");
+			if (!providerBaseUrl) throw new Error("Expected an Alibaba provider endpoint");
+			const parsedEndpoint = new URL(providerBaseUrl);
+			const endpoint = `${parsedEndpoint.protocol}//${parsedEndpoint.host}${parsedEndpoint.pathname.replace(/\/+$/g, "")}${parsedEndpoint.search}`;
+			const cachedModelProvenance = sha256(
+				`gajae:model-discovery-provenance\0${JSON.stringify({
+					authEvidence: "credentialless:alibaba-token-plan",
+					endpoint,
+				})}`,
+			);
+			writeModelCache(
+				"alibaba-token-plan",
+				Date.now(),
+				[cachedModel],
+				true,
+				"",
+				path.join(data.agentDir, "models.db"),
+				[cachedModel.id],
+				cachedModelProvenance,
+			);
 			const modelRegistry = data.run(
 				() =>
 					new ModelRegistry(authStorage, path.join(data.agentDir, "models.yml"), undefined, {
@@ -390,6 +450,10 @@ describe("signed model preset registry", () => {
 				contextWindow: 24_680,
 				baseUrl: expect.stringContaining("https://"),
 				compat: expect.objectContaining({ supportsDeveloperRole: false }),
+				streamIdleTimeoutMs: 360_000,
+			});
+			expect(modelRegistry.find("alibaba-token-plan", "cached-alibaba-model")).toMatchObject({
+				streamIdleTimeoutMs: 450_000,
 			});
 			expect(
 				modelRegistry
@@ -409,6 +473,8 @@ describe("signed model preset registry", () => {
 			);
 		} finally {
 			authStorage.close();
+			if (previousAlibabaBaseUrl === undefined) delete Bun.env.ALIBABA_TOKEN_PLAN_BASE_URL;
+			else Bun.env.ALIBABA_TOKEN_PLAN_BASE_URL = previousAlibabaBaseUrl;
 		}
 		const merged = mergeModelProfiles(
 			{ remote: { required_providers: ["user"], model_mapping: { default: "user/model" } } },
@@ -573,6 +639,87 @@ describe("signed model preset registry", () => {
 				baseUrl: "http://127.0.0.1:1234/v1",
 				compat: expect.objectContaining({ supportsStore: false }),
 			});
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	test("does not inherit provider timeouts for registry-only Anthropic models", async () => {
+		const data = await fixture();
+		const registry = signedRegistry(
+			data.privateKey,
+			1,
+			[],
+			[
+				{
+					...registryPreset("registry-anthropic-model"),
+					provider: "github-copilot",
+					api: "anthropic-messages",
+				},
+				{ ...registryPreset("registry-openai-model"), provider: "github-copilot" },
+			],
+		);
+		await expect(accept(data, registry)).resolves.toMatchObject({ status: "updated", revision: 1 });
+		await Bun.write(
+			path.join(data.agentDir, "models.yml"),
+			`providers:
+  github-copilot:
+    streamIdleTimeoutMs: 360000
+`,
+		);
+		const authStorage = await AuthStorage.create(path.join(data.agentDir, "github-copilot-timeout-auth.db"));
+		try {
+			const modelRegistry = data.run(
+				() =>
+					new ModelRegistry(authStorage, path.join(data.agentDir, "models.yml"), undefined, {
+						automaticRefresh: false,
+					}),
+			);
+			expect(modelRegistry.getError()).toBeUndefined();
+			expect(modelRegistry.find("github-copilot", "registry-anthropic-model")).toMatchObject({
+				api: "anthropic-messages",
+			});
+			expect(modelRegistry.find("github-copilot", "registry-anthropic-model")).not.toHaveProperty(
+				"streamIdleTimeoutMs",
+			);
+			expect(modelRegistry.find("github-copilot", "registry-openai-model")).toMatchObject({
+				api: "openai-completions",
+				streamIdleTimeoutMs: 360_000,
+			});
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	test("drops provider timeouts when preset metadata is rebound to Anthropic transport", async () => {
+		const data = await fixture();
+		await expect(
+			accept(
+				data,
+				signedRegistry(data.privateKey, 1, [], [{ ...registryPreset("gpt-4o-mini"), provider: "openai" }]),
+			),
+		).resolves.toMatchObject({ status: "updated", revision: 1 });
+		await Bun.write(
+			path.join(data.agentDir, "models.yml"),
+			`providers:
+  openai:
+    baseUrl: https://openai-proxy.example/v1
+    api: anthropic-messages
+    auth: none
+    streamIdleTimeoutMs: 360000
+`,
+		);
+		const authStorage = await AuthStorage.create(path.join(data.agentDir, "openai-anthropic-timeout-auth.db"));
+		try {
+			const modelRegistry = data.run(
+				() =>
+					new ModelRegistry(authStorage, path.join(data.agentDir, "models.yml"), undefined, {
+						automaticRefresh: false,
+					}),
+			);
+			expect(modelRegistry.getError()).toBeUndefined();
+			expect(modelRegistry.find("openai", "gpt-4o-mini")).toMatchObject({ api: "anthropic-messages" });
+			expect(modelRegistry.find("openai", "gpt-4o-mini")).not.toHaveProperty("streamIdleTimeoutMs");
 		} finally {
 			authStorage.close();
 		}
@@ -1565,6 +1712,62 @@ describe("signed model preset registry", () => {
 		expect(secondCalls).toBe(4);
 		expect(firstHeaders[0]?.get("if-none-match")).toBeNull();
 		expect(secondHeaders[0]?.get("if-none-match")).toBeNull();
+	});
+
+	test("refreshes the accepted profile snapshot through the live ModelRegistry API", async () => {
+		const data = await fixture();
+		const remote = signedRegistry(data.privateKey, 1, [registryProfile("refreshed-profile")], undefined, undefined, [
+			"provider",
+		]);
+		await Bun.write(
+			path.join(data.agentDir, "models.yml"),
+			`providers:
+  provider:
+    baseUrl: https://provider.example/v1
+    api: openai-completions
+    auth: none
+`,
+		);
+		let calls = 0;
+		const fetchImpl = registryFetch(remote);
+		const countingFetch = (async (input, init) => {
+			calls++;
+			return fetchImpl(input, init);
+		}) as typeof fetch;
+		const authStorage = await AuthStorage.create(path.join(data.agentDir, "registry-refresh-auth.db"));
+		let modelRegistry: ModelRegistry | undefined;
+		let unsubscribe: (() => void) | undefined;
+		let catalogChanged = false;
+		try {
+			modelRegistry = data.run(
+				() =>
+					new ModelRegistry(authStorage, path.join(data.agentDir, "models.yml"), undefined, {
+						agentDir: data.agentDir,
+						manifestUrl,
+						fetch: countingFetch,
+						automaticRefresh: false,
+					}),
+			);
+			expect(modelRegistry.getModelProfile("refreshed-profile")).toBeUndefined();
+			expect(modelRegistry.getModelProfiles().has("refreshed-profile")).toBe(false);
+			unsubscribe = modelRegistry.onCatalogChanged(() => {
+				catalogChanged = true;
+			});
+
+			await expect(data.run(() => modelRegistry!.refreshModelPresetProfilesFromRegistry())).resolves.toMatchObject({
+				status: "updated",
+				revision: 1,
+			});
+
+			expect(calls).toBe(4);
+			expect(catalogChanged).toBe(true);
+			expect(modelRegistry.getModelProfile("refreshed-profile")).toMatchObject({ source: "registry" });
+			expect(modelRegistry.getModelProfiles().get("refreshed-profile")).toMatchObject({ source: "registry" });
+		} finally {
+			unsubscribe?.();
+			if (modelRegistry) await modelRegistry.dispose();
+			authStorage.close();
+		}
 	});
 
 	test("never awaits startup network and publishes a later accepted catalog to the live registry", async () => {

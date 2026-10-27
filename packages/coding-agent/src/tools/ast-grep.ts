@@ -11,6 +11,7 @@ import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
+import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import { formatMatchLine } from "./match-line-format";
@@ -221,7 +222,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				const parseMessage = cappedParseErrors.length
 					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`${noMatchMessage}${parseMessage}`).done();
+				return toolResult(baseDetails)
+					.text(wrapUntrustedContent(`${noMatchMessage}${parseMessage}`))
+					.done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -291,7 +294,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
 
-			return toolResult(details).text(outputLines.join("\n")).done();
+			return toolResult(details)
+				.text(wrapUntrustedContent(outputLines.join("\n")))
+				.done();
 		});
 	}
 }

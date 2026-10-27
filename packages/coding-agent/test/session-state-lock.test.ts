@@ -63,6 +63,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.afterLocalTransitionQueued = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
+	SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = undefined;
 	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
 	SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
 	SessionStateLockTestHooks.afterAcquireContention = undefined;
@@ -727,6 +728,94 @@ describe("coordinator session state lock", () => {
 		await expectReleasedOwner(lockFile);
 		expectReleasedTransition(lockFile);
 	});
+	it("rewrites an owner record without ever shortening it past its own preamble", async () => {
+		// The in-place rewrite used to `truncate(0)` before writing, so EVERY rewrite passed
+		// through a zero-length record. An empty record carries no `owner_host_id`, so a
+		// process killed inside that window left a transition claim that
+		// `malformedOwnerProvenance` refuses as `unprovenanced` forever:
+		// `transition_claim_timeout` with `claim_or_owner_unreadable`, and coordinator state
+		// persistence for the session was lost for good (#5159, #5216).
+		//
+		// The released tombstone is the shortening half of the cycle — the released form is
+		// shorter than the held form it replaces — so it is where the record used to shrink.
+		// It must now keep the previous length and stay parseable with its host id intact.
+		const { root, stateFile } = await seededRunningSession("lock-rewrite-attributable");
+		const lockFile = `${stateFile}.lock`;
+		let heldBytes = "";
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			// Runs with the held record still on disk, immediately before the rewrite.
+			if (file === lockFile) heldBytes = await Bun.file(file).text();
+		};
+		try {
+			await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+		} finally {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+		}
+
+		expect(heldBytes).not.toBe("");
+		expect((JSON.parse(heldBytes) as { released?: boolean }).released).toBeUndefined();
+
+		const releasedBytes = await Bun.file(lockFile).text();
+		expect(releasedBytes.length).toBeGreaterThanOrEqual(heldBytes.length);
+		// Padding is trailing whitespace and nothing else, so every reader — `JSON.parse`,
+		// `validLockOwner`, `malformedOwnerProvenance` — still sees exactly the released
+		// record, which is what keeps the tombstone reclaimable.
+		const releasedRecord = releasedBytes.trimEnd();
+		expect(releasedRecord).toBe(JSON.stringify(JSON.parse(releasedRecord)));
+		expect(releasedBytes.slice(releasedRecord.length)).toMatch(/^ *$/u);
+		expect(JSON.parse(releasedRecord)).toMatchObject({
+			pid: 1,
+			owner_host_id: expect.any(String),
+			released: true,
+		});
+
+		// The claim's own sidecar is written by the same primitive and is what a contender
+		// reads first when the claim survives a crash.
+		const sidecar = await Bun.file(`${lockFile}.transition.owner`).text();
+		expect(sidecar.length).toBeGreaterThan(0);
+		expect(JSON.parse(sidecar)).toMatchObject({ owner_host_id: expect.any(String), released: true });
+	}, 15_000);
+
+	it("propagates pre-rewrite fstat failure and leaves the held record untouched", async () => {
+		// The pre-rewrite stat must fail before any write attempt, so a descriptor
+		// fault does not silently become a zero-length record assumption (#6621).
+		// If the fstat fails, the rewrite should throw and leave the original held
+		// record on disk unchanged.
+		const { root, stateFile } = await seededRunningSession("lock-prewrite-stat-failure");
+		const lockFile = `${stateFile}.lock`;
+		let heldBytes = "";
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			// Capture the held record before rewrite attempt
+			if (file === lockFile) heldBytes = await Bun.file(file).text();
+		};
+		let faulted = false;
+		SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = async file => {
+			if (!faulted && file === lockFile) {
+				faulted = true;
+				throw Object.assign(new Error("pre-rewrite fstat failure"), { code: "EIO" });
+			}
+		};
+		try {
+			// writeToolActivity triggers a rewrite by calling withSessionStateFileLock,
+			// which acquires the lock, transitions it, and tries to release it (rewrite).
+			await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toBeInstanceOf(
+				SessionStateLockUnavailableError,
+			);
+		} finally {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+			SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = undefined;
+		}
+		expect(faulted).toBe(true);
+		// The held record must still be on disk unchanged
+		const finalBytes = await Bun.file(lockFile).text();
+		expect(finalBytes).toBe(heldBytes);
+		// And it must still be valid JSON
+		const parsed = JSON.parse(finalBytes);
+		expect(parsed).toMatchObject({
+			pid: expect.any(Number),
+			owner_host_id: expect.any(String),
+		});
+	}, 15_000);
 
 	it("leaves a successor owner that claimed the path after the stale verdict", async () => {
 		const { stateFile } = await seededRunningSession("lock-successor");
@@ -1997,6 +2086,44 @@ describe("coordinator session state lock", () => {
 		expect(await fs.readFile(lockFile, "utf8")).toContain("foreign-malformed-owner");
 	});
 
+	it("admits a released tombstone whose tail reads back as NUL padding", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-nul-padded-tombstone");
+		const lockFile = `${stateFile}.lock`;
+		// The exact on-disk shape a Windows session left behind: a complete released
+		// tombstone followed by a zero-filled tail the file system never wrote.
+		const record = JSON.stringify({
+			pid: 1,
+			start_time: "unknown",
+			token: "nul-padded-tombstone",
+			owner_host_id: "local-host",
+			released: true,
+		});
+		await fs.writeFile(lockFile, Buffer.concat([Buffer.from(record, "utf8"), Buffer.alloc(38, 0)]));
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		await expectReleasedOwner(lockFile);
+	});
+
+	it("still fails closed when a NUL sits inside the owner document", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-interior-nul");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(
+			lockFile,
+			'{"pid":1,"start_time":"unknown",\0"token":"interior-nul","owner_host_id":"local-host","released":true}',
+		);
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		const failure = await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z").catch(error => error);
+
+		expect((failure as Error).message).toContain("lock_owner_record_unprovenanced");
+		expect(await fs.readFile(lockFile, "utf8")).toContain("interior-nul");
+	});
+
 	it("fails closed for an unqualified transition claim on a shared volume", async () => {
 		const { stateFile } = await seededRunningSession("lock-unqualified-transition");
 		const transitionFile = `${stateFile}.lock.transition`;
@@ -3020,6 +3147,54 @@ describe("session state lock failure diagnostics", () => {
 			});
 		});
 
+		it("holds a fresh released tombstone during the handoff grace window", async () => {
+			const dir = await claimWith("reclaim-fresh-release", {
+				pid: 1,
+				start_time: "unknown",
+				token: "fresh-release-token",
+				owner_host_id: "local-host",
+				released: true,
+			});
+			setSystemTime();
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_within_grace",
+			});
+		});
+
+		it("labels a released handoff after its grace window", async () => {
+			const dir = await claimWith("reclaim-released-handoff", {
+				pid: 1,
+				start_time: "unknown",
+				token: "released-handoff-token",
+				owner_host_id: "local-host",
+				released: true,
+			});
+			setSystemTime();
+			const old = new Date(Date.now() - 2_000);
+			await fs.utimes(`${dir}.owner`, old, old);
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: true,
+				reclaimReason: "released_handoff",
+			});
+		});
+
+		it("labels a proven-dead owner reclaim separately from a released handoff", async () => {
+			const dir = await claimWith("reclaim-dead-owner", {
+				pid: 999_999,
+				start_time: "unknown",
+				token: "dead-owner-token",
+				owner_host_id: "local-host",
+			});
+			SessionStateLockTestHooks.probeProcessSignal = () => {
+				throw Object.assign(new Error("owner exited"), { code: "ESRCH" });
+			};
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: true,
+				reclaimReason: "dead_owner",
+			});
+		});
+
 		it("names a live owner rather than reporting a bare timeout", async () => {
 			// This process is unambiguously alive, so liveness cannot be disproven.
 			const dir = await claimWith("reclaim-live", {
@@ -3104,5 +3279,102 @@ describe("session state lock failure diagnostics", () => {
 			expect(error.message).not.toContain("reclaim refused");
 			expect(error.reason).toBe("transition_claim_timeout");
 		});
+	});
+
+	it("lets a waiter reclaim an aged released claim without a timeout", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "released-waiter.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await Bun.write(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 1,
+				start_time: "unknown",
+				token: "released-waiter",
+				owner_host_id: "local-host",
+				released: true,
+			}),
+		);
+		setSystemTime();
+		const old = new Date(Date.now() - 2_000);
+		await fs.utimes(`${transitionDir}.owner`, old, old);
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 5_001;
+		};
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it("keeps the absolute transition deadline for a released handoff", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "released-waiter-deadline.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await Bun.write(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 1,
+				start_time: "unknown",
+				token: "released-waiter-deadline",
+				owner_host_id: "local-host",
+				released: true,
+			}),
+		);
+		setSystemTime();
+		const old = new Date(Date.now() - 2_000);
+		await fs.utimes(`${transitionDir}.owner`, old, old);
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 60_001;
+		};
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "unreachable")).rejects.toMatchObject({
+				reason: "transition_claim_timeout",
+			});
+		} finally {
+			now.mockRestore();
+			await fs.rm(`${transitionDir}.owner`, { force: true });
+			await fs.rmdir(transitionDir).catch(() => undefined);
+		}
+	});
+
+	it("keeps a dead-owner reclaim bounded by the transition deadline", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "dead-owner-waiter.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await Bun.write(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 999_999,
+				start_time: "unknown",
+				token: "dead-owner-waiter",
+				owner_host_id: "local-host",
+			}),
+		);
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("owner exited"), { code: "ESRCH" });
+		};
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 5_001;
+		};
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "unreachable")).rejects.toMatchObject({
+				reason: "transition_claim_timeout",
+			});
+		} finally {
+			now.mockRestore();
+			await fs.rm(`${transitionDir}.owner`, { force: true });
+			await fs.rmdir(transitionDir).catch(() => undefined);
+		}
 	});
 });

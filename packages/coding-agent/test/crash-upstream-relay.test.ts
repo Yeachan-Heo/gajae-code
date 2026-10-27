@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { appendCrashEvent, computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
+import {
+	appendCrashEvent,
+	computeCrashFingerprint,
+	computeHandledErrorFingerprint,
+	formatCrashRecordMarker,
+} from "@gajae-code/utils";
 import { crashRelayExitCode } from "../src/cli/crash-cli";
 import type { CrashSignatureView, CrashStatePaths } from "../src/crash/index-store";
 import { compactCrashIndex, listCrashSignatures, readCrashIndex } from "../src/crash/index-store";
@@ -893,7 +898,7 @@ describe("relayCrashSignatures", () => {
 		try {
 			await seed();
 			// Same shape in the handled store, under a different fingerprint.
-			const handledFingerprint = computeCrashFingerprint({
+			const handledFingerprint = computeHandledErrorFingerprint({
 				name: "ToolError",
 				message: "tool failed",
 				stack: STACK,
@@ -947,7 +952,7 @@ describe("relayCrashSignatures", () => {
 			}
 			for (let i = 0; i < 3; i++) {
 				const messageClass = `tool failed (${String.fromCharCode(100 + i)})`;
-				const fingerprint = computeCrashFingerprint({
+				const fingerprint = computeHandledErrorFingerprint({
 					name: "ToolError",
 					message: messageClass,
 					stack: STACK,

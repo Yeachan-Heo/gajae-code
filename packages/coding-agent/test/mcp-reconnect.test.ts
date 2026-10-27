@@ -3,6 +3,7 @@ import { legacyEraObservation } from "../src/runtime-mcp/protocol";
 import type { MCPReconnect } from "../src/runtime-mcp/tool-bridge";
 import { DeferredMCPTool, isRetriableConnectionError, MCPTool } from "../src/runtime-mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolCallResult, MCPTransport } from "../src/runtime-mcp/types";
+import { wrapUntrustedContent } from "../src/tools/fetch";
 import { ToolAbortError } from "../src/tools/tool-errors";
 
 // ---------------------------------------------------------------------------
@@ -145,7 +146,7 @@ describe("MCPTool.execute retry on connection error", () => {
 
 		expect(callCount).toBe(2); // 1 fail + 1 retry
 		expect(result.details?.isError).toBeFalsy();
-		expect(result.content[0]).toEqual({ type: "text", text: "ok" });
+		expect(result.content[0]).toEqual({ type: "text", text: wrapUntrustedContent("ok") });
 	});
 
 	it("retries on transport closed and rebinding succeeds", async () => {
@@ -175,7 +176,7 @@ describe("MCPTool.execute retry on connection error", () => {
 		expect(oldCalls).toBe(1);
 		expect(newCalls).toBe(1);
 		expect(result.details?.isError).toBeFalsy();
-		expect(result.content[0]).toEqual({ type: "text", text: "ok" });
+		expect(result.content[0]).toEqual({ type: "text", text: wrapUntrustedContent("ok") });
 	});
 
 	it("reuses refreshed connection on later call", async () => {
@@ -207,8 +208,8 @@ describe("MCPTool.execute retry on connection error", () => {
 		expect(reconnects).toBe(1);
 		expect(first.details?.isError).toBeFalsy();
 		expect(second.details?.isError).toBeFalsy();
-		expect(first.content[0]).toEqual({ type: "text", text: "ok" });
-		expect(second.content[0]).toEqual({ type: "text", text: "ok" });
+		expect(first.content[0]).toEqual({ type: "text", text: wrapUntrustedContent("ok") });
+		expect(second.content[0]).toEqual({ type: "text", text: wrapUntrustedContent("ok") });
 	});
 
 	it("returns error result when reconnect returns null", async () => {

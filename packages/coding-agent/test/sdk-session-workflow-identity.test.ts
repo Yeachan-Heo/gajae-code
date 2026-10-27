@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AsyncJobManager, asyncJobEndpointId } from "@gajae-code/coding-agent/async";
+import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { deepInterviewStatePath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -13,6 +13,7 @@ import { JobTool } from "@gajae-code/coding-agent/tools/job";
 import { MonitorTool } from "@gajae-code/coding-agent/tools/monitor";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
+import { asyncJobEndpointId } from "../src/async/endpoint-id";
 
 const tempDirs: string[] = [];
 
@@ -52,10 +53,10 @@ test("SDK tool session separates workflow identity from async endpoint identity"
 
 	try {
 		const job = session.getToolByName("job") as unknown as
-			| { materializeForTests?: () => Promise<{ session?: ToolSession }> }
+			| { materialize?: () => Promise<{ session?: ToolSession }> }
 			| undefined;
 		if (!job) throw new Error(`Job tool unavailable: ${session.getAllToolNames().join(", ")}`);
-		const toolSession = (await job.materializeForTests?.())?.session;
+		const toolSession = (await job.materialize?.())?.session;
 		expect(toolSession).toBeDefined();
 
 		const sessionId = toolSession?.getSessionId?.();

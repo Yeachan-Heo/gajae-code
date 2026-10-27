@@ -7,11 +7,14 @@ import {
 	Broker,
 	type BrokerLockArtifactRetention,
 	reapStaleBrokerLockArtifacts,
+	setBrokerLockReclaimHooksForTest,
 	setLockArtifactGraceForTest,
 } from "../src/sdk/broker/broker";
-import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import * as brokerDiscovery from "../src/sdk/broker/discovery";
+import { brokerProcessIncarnation, readBrokerDiscovery, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { ensureBroker } from "../src/sdk/broker/ensure";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 
 const HOUR_MS = 60 * 60 * 1_000;
 
@@ -36,18 +39,30 @@ async function ageTo(target: string, ageMs: number, now: number): Promise<void> 
 async function writeArtifact(
 	agentDir: string,
 	name: string,
-	owner: { pid: number } | "no-record" | "unparseable",
+	owner: { pid: number; incarnation?: string; ownerHostId?: string | null } | "no-record" | "unparseable",
 	ageMs: number,
 	now: number,
 ): Promise<string> {
 	const target = path.join(agentDir, "sdk", name);
 	await fs.mkdir(target, { recursive: true, mode: 0o700 });
 	if (owner === "unparseable") await Bun.write(path.join(target, "owner.json"), "{not json");
-	else if (owner !== "no-record")
+	else if (owner !== "no-record") {
+		const ownerHostId =
+			owner.ownerHostId === undefined
+				? (await brokerLockHostIdentity(agentDir)).ownerHostId
+				: (owner.ownerHostId ?? undefined);
 		await Bun.write(
 			path.join(target, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "owner-a", pid: owner.pid, acquiredAt: now - ageMs }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "owner-a",
+				pid: owner.pid,
+				...(owner.incarnation === undefined ? {} : { incarnation: owner.incarnation }),
+				...(ownerHostId === undefined ? {} : { ownerHostId }),
+				acquiredAt: now - ageMs,
+			}),
 		);
+	}
 	await ageTo(target, ageMs, now);
 	return target;
 }
@@ -108,6 +123,64 @@ describe("broker lock artifact reaper", () => {
 		expect(warn.mock.calls.map(call => String(call[0]))).toEqual([
 			"sdk broker: retained 1 stale lock artifact(s) (owner-alive: 1)",
 		]);
+	});
+
+	it("reaps an aged tombstone when its live PID now has a different incarnation", async () => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const currentIncarnation = brokerProcessIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Test process incarnation is unavailable.");
+		const previousIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
+		const { ownerHostId } = await brokerLockHostIdentity(agentDir);
+		const tombstone = await writeArtifact(
+			agentDir,
+			".broker.lock.stale-pid-reused",
+			{ pid: process.pid, incarnation: previousIncarnation, ownerHostId },
+			30 * HOUR_MS,
+			now,
+		);
+
+		const result = await reapStaleBrokerLockArtifacts({
+			agentDir,
+			now,
+			graceMs: HOUR_MS,
+			pidAlive: () => true,
+			processIncarnation: () => currentIncarnation,
+		});
+
+		expect(result).toEqual({ removed: [tombstone], retained: [] });
+		expect(await exists(tombstone)).toBe(false);
+	});
+
+	it.each([
+		["a foreign host", "some-foreign-host", (): boolean => false],
+		["a host-unqualified legacy owner with a live PID", undefined, (): boolean => true],
+		["a host-unqualified legacy owner with a locally absent PID", undefined, (): boolean => false],
+	] as const)("retains an aged tombstone owned by %s despite PID evidence", async (_label, ownerHostId, alive) => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const currentIncarnation = brokerProcessIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Test process incarnation is unavailable.");
+		const previousIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
+		const tombstone = await writeArtifact(
+			agentDir,
+			".broker.lock.stale-host-qualified",
+			{ pid: process.pid, incarnation: previousIncarnation, ownerHostId: ownerHostId ?? null },
+			30 * HOUR_MS,
+			now,
+		);
+
+		const result = await reapStaleBrokerLockArtifacts({
+			agentDir,
+			now,
+			graceMs: HOUR_MS,
+			pidAlive: alive,
+			processIncarnation: () => currentIncarnation,
+		});
+
+		expect(result.removed).toEqual([]);
+		expect(result.retained).toEqual([{ path: tombstone, reason: "owner-alive" }]);
+		expect(await exists(tombstone)).toBe(true);
 	});
 
 	it("keeps a tombstone whose owner record cannot be parsed", async () => {
@@ -317,6 +390,322 @@ describe("broker lock artifact reaper", () => {
 	});
 });
 
+describe("broker lock owner incarnation", () => {
+	/** Writes an owner record; the host defaults to this host, `null` writes a legacy host-unqualified record. */
+	async function writeOwner(
+		agentDir: string,
+		incarnation: unknown,
+		options: { ownerHostId?: string | null; pid?: number } = {},
+	): Promise<string> {
+		const lock = path.join(agentDir, "sdk", "broker.lock");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		const record = path.join(lock, "owner.json");
+		const ownerHostId =
+			options.ownerHostId === undefined
+				? (await brokerLockHostIdentity(agentDir)).ownerHostId
+				: (options.ownerHostId ?? undefined);
+		await Bun.write(
+			record,
+			JSON.stringify({
+				version: 1,
+				ownerId: "previous-owner",
+				pid: options.pid ?? process.pid,
+				incarnation,
+				...(ownerHostId === undefined ? {} : { ownerHostId }),
+			}),
+		);
+		return record;
+	}
+
+	function currentIncarnation(): string {
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("Test process incarnation is unavailable.");
+		return incarnation;
+	}
+
+	function differentIncarnation(incarnation: string): string {
+		const separator = incarnation.lastIndexOf(":");
+		return `${incarnation.slice(0, separator + 1)}${incarnation.slice(separator + 1) === "0" ? "1" : "0"}`;
+	}
+
+	it("reclaims a lock whose live PID belongs to a different incarnation", async () => {
+		const agentDir = await makeAgentDir();
+		const incarnation = currentIncarnation();
+		const record = await writeOwner(agentDir, differentIncarnation(incarnation));
+		const broker = new Broker({ agentDir });
+		try {
+			const discovery = await broker.start();
+			expect(broker.ownsDiscovery).toBe(true);
+			expect(discovery.ownerId).not.toBe("previous-owner");
+			expect(discovery.incarnation).toBe(incarnation);
+			expect(await Bun.file(record).json()).toMatchObject({ ownerId: discovery.ownerId, incarnation });
+			expect(process.kill(process.pid, 0)).toBe(true);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("serializes concurrent reclaimers of a live reused PID", async () => {
+		const agentDir = await makeAgentDir();
+		const incarnation = currentIncarnation();
+		await writeOwner(agentDir, differentIncarnation(incarnation));
+		const first = new Broker({ agentDir });
+		const second = new Broker({ agentDir });
+		const quarantineReached = Promise.withResolvers<void>();
+		const allowQuarantine = Promise.withResolvers<void>();
+		const secondContended = Promise.withResolvers<void>();
+		let quarantineChecks = 0;
+		setBrokerLockReclaimHooksForTest(first, {
+			beforeQuarantine: async () => {
+				quarantineChecks++;
+				quarantineReached.resolve();
+				await allowQuarantine.promise;
+			},
+		});
+		setBrokerLockReclaimHooksForTest(second, { onContended: () => secondContended.resolve() });
+		try {
+			const firstStart = first.start();
+			await quarantineReached.promise;
+			const secondStart = second.start();
+			await secondContended.promise;
+			allowQuarantine.resolve();
+			const [firstDiscovery, secondDiscovery] = await Promise.all([firstStart, secondStart]);
+
+			expect(firstDiscovery.ownerId).toBe(secondDiscovery.ownerId);
+			expect([first, second].filter(broker => broker.ownsDiscovery)).toHaveLength(1);
+			expect(quarantineChecks).toBe(1);
+			expect(await Bun.file(path.join(agentDir, "sdk", "broker.lock", "owner.json")).json()).toMatchObject({
+				ownerId: firstDiscovery.ownerId,
+				pid: process.pid,
+				incarnation,
+			});
+		} finally {
+			allowQuarantine.resolve();
+			setBrokerLockReclaimHooksForTest(first, undefined);
+			setBrokerLockReclaimHooksForTest(second, undefined);
+			await first.stop();
+			await second.stop();
+		}
+	}, 10_000);
+
+	it.each(["matching", "missing", "malformed"])("preserves a live owner's lock with %s incarnation", async kind => {
+		const agentDir = await makeAgentDir();
+		const incarnation = kind === "matching" ? currentIncarnation() : kind === "missing" ? undefined : "invalid";
+		const record = await writeOwner(agentDir, incarnation);
+		const original = await Bun.file(record).text();
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("fails closed when the current process incarnation cannot be read", async () => {
+		const agentDir = await makeAgentDir();
+		const record = await writeOwner(agentDir, differentIncarnation(currentIncarnation()));
+		const original = await Bun.file(record).text();
+		const probe = vi.spyOn(brokerDiscovery, "brokerProcessIncarnation").mockReturnValue(undefined);
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			probe.mockRestore();
+			await broker.stop();
+		}
+	});
+
+	it("rechecks incarnation after waiting for discovery", async () => {
+		const agentDir = await makeAgentDir();
+		const incarnation = currentIncarnation();
+		const previous = differentIncarnation(incarnation);
+		await writeOwner(agentDir, previous);
+		const probe = vi
+			.spyOn(brokerDiscovery, "brokerProcessIncarnation")
+			.mockReturnValue(incarnation)
+			.mockReturnValueOnce(previous);
+		const broker = new Broker({ agentDir });
+		try {
+			const discovery = await broker.start();
+			expect(broker.ownsDiscovery).toBe(true);
+			expect(discovery.ownerId).not.toBe("previous-owner");
+			expect(discovery.incarnation).toBe(incarnation);
+		} finally {
+			probe.mockRestore();
+			await broker.stop();
+		}
+	});
+
+	it("keeps a legacy host-unqualified lock whose live PID has a different incarnation", async () => {
+		const agentDir = await makeAgentDir();
+		const record = await writeOwner(agentDir, differentIncarnation(currentIncarnation()), { ownerHostId: null });
+		const original = await Bun.file(record).text();
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("does not reclaim a host-unqualified lock from a locally absent PID", async () => {
+		const agentDir = await makeAgentDir();
+		const pid = 2_147_483_646;
+		const record = await writeOwner(agentDir, differentIncarnation(currentIncarnation()), {
+			ownerHostId: null,
+			pid,
+		});
+		const original = await Bun.file(record).text();
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow(
+				`Broker lock owner is host-unqualified (pid ${pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`,
+			);
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("never reclaims a foreign host's lock, even when its PID is dead on this host", async () => {
+		const agentDir = await makeAgentDir();
+		const record = await writeOwner(agentDir, differentIncarnation(currentIncarnation()), {
+			ownerHostId: "some-foreign-host",
+			pid: 2_147_483_646,
+		});
+		const original = await Bun.file(record).text();
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is attributed to a different host");
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("does not reclaim when incarnation evidence becomes unavailable before quarantine", async () => {
+		const agentDir = await makeAgentDir();
+		const incarnation = currentIncarnation();
+		const record = await writeOwner(agentDir, differentIncarnation(incarnation));
+		const original = await Bun.file(record).text();
+		const probe = vi
+			.spyOn(brokerDiscovery, "brokerProcessIncarnation")
+			.mockReturnValue(undefined)
+			.mockReturnValueOnce(incarnation);
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			probe.mockRestore();
+			await broker.stop();
+		}
+	});
+
+	it("removes its exact lock when owner read-back fails so startup can retry", async () => {
+		const agentDir = await makeAgentDir();
+		const lock = path.join(agentDir, "sdk", "broker.lock");
+		const lockRecord = path.join(lock, "owner.json");
+		const broker = new Broker({ agentDir });
+		const injectedError = Object.assign(new Error("EIO: injected broker owner read-back failure"), { code: "EIO" });
+		const realReadFile = fs.readFile;
+		let injected = false;
+		vi.spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+			if (!injected && String(args[0]) === lockRecord) {
+				injected = true;
+				throw injectedError;
+			}
+			return realReadFile(...args);
+		}) as typeof fs.readFile);
+
+		try {
+			await expect(broker.start()).rejects.toBe(injectedError);
+			expect(injected).toBe(true);
+			expect(await exists(lock)).toBe(false);
+
+			const discovery = await broker.start();
+			expect(discovery.pid).toBe(process.pid);
+			expect(broker.ownsDiscovery).toBe(true);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("preserves a successor lock when owner read-back fails", async () => {
+		const agentDir = await makeAgentDir();
+		const lockRecord = path.join(agentDir, "sdk", "broker.lock", "owner.json");
+		const replacementPath = `${lockRecord}.replacement`;
+		const broker = new Broker({ agentDir });
+		const injectedError = Object.assign(new Error("EIO: injected broker owner read-back failure"), { code: "EIO" });
+		const realReadFile = fs.readFile;
+		let injected = false;
+		vi.spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+			if (!injected && String(args[0]) === lockRecord) {
+				injected = true;
+				await fs.writeFile(replacementPath, JSON.stringify({ ownerId: "successor-owner", pid: 123 }));
+				await fs.rename(replacementPath, lockRecord);
+				throw injectedError;
+			}
+			return realReadFile(...args);
+		}) as typeof fs.readFile);
+
+		try {
+			await expect(broker.start()).rejects.toBe(injectedError);
+			expect(injected).toBe(true);
+			expect(await Bun.file(lockRecord).json()).toMatchObject({ ownerId: "successor-owner", pid: 123 });
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("does not publish when canonical lock ownership changes during startup", async () => {
+		const agentDir = await makeAgentDir();
+		const lockRecord = path.join(agentDir, "sdk", "broker.lock", "owner.json");
+		const broker = new Broker({
+			agentDir,
+			startupPrePublicationTestHook: async () => {
+				const owner = JSON.parse(await fs.readFile(lockRecord, "utf8")) as { ownerId: string };
+				await fs.writeFile(lockRecord, JSON.stringify({ ...owner, ownerId: "replaced-owner" }));
+			},
+		});
+
+		try {
+			await expect(broker.start()).rejects.toThrow("SDK broker lock ownership changed before discovery publication");
+			expect(await readBrokerDiscovery(agentDir)).toBeNull();
+			expect(await Bun.file(lockRecord).json()).toMatchObject({ ownerId: "replaced-owner" });
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("refuses service requests after canonical broker lock ownership changes", async () => {
+		const agentDir = await makeAgentDir();
+		const broker = new Broker({ agentDir });
+		const lockRecord = path.join(agentDir, "sdk", "broker.lock", "owner.json");
+		try {
+			await broker.start();
+			const owner = JSON.parse(await fs.readFile(lockRecord, "utf8")) as { ownerId: string };
+			await fs.writeFile(lockRecord, JSON.stringify({ ...owner, ownerId: "replaced-owner" }));
+
+			expect(await broker.handleRequest("broker.diagnostics", {})).toMatchObject({
+				ok: false,
+				error: { code: "unavailable" },
+			});
+		} finally {
+			await broker.stop();
+		}
+	});
+});
+
 describe("broker clean-exit lock contention diagnostics", () => {
 	it("names lock contention when yielding to a live broker owner", async () => {
 		const agentDir = await makeAgentDir();
@@ -354,9 +743,15 @@ describe("broker clean-exit lock contention diagnostics", () => {
 		expect(contention[0]).toContain("yielding to the live broker owner");
 		expect(contention[0]).toContain("ownerId=foreign-owner");
 		expect(contention[0]).toContain("exits without owning discovery");
+		expect(info.mock.calls.find(call => String(call[0]).includes("lock contention"))?.[1]).toMatchObject({
+			reason: "startup-race-lost",
+			ownerId: "foreign-owner",
+			pid: process.pid,
+			exitCode: 0,
+		});
 	});
 
-	it("warns with the holding pid before refusing a lock held by a live owner", async () => {
+	it("warns with the recovery procedure before refusing a host-unqualified lock", async () => {
 		const agentDir = await makeAgentDir();
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const lock = path.join(agentDir, "sdk", "broker.lock");
@@ -368,14 +763,15 @@ describe("broker clean-exit lock contention diagnostics", () => {
 
 		const broker = new Broker({ agentDir });
 
-		await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+		await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
 
 		const refusals = warn.mock.calls
 			.map(call => String(call[0]))
 			.filter(message => message.includes("lock contention"));
 		expect(refusals).toHaveLength(1);
 		expect(refusals[0]).toContain("refusing to start");
-		expect(refusals[0]).toContain(`live pid ${process.pid}`);
+		expect(refusals[0]).toContain(`owner pid ${process.pid} has no host identity`);
+		expect(refusals[0]).toContain("#recovering-legacy-broker-locks");
 	});
 });
 

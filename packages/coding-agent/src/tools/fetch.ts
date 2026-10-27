@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
@@ -10,16 +12,23 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
 import type { AgentStorage } from "../session/agent-storage";
+import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
 import { DEFAULT_MAX_BYTES, type TruncationDirection, truncateContent } from "../session/streaming-output";
-import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
+import { renderStatusLine } from "../tui/status-line";
+import { rasterizeSvgInputBytes } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
 import { INSANE_NOTES } from "../web/insane/bridge";
 import { validatePublicHttpUrl } from "../web/insane/url-guard";
-import { specialHandlers } from "../web/scrapers";
-import type { RenderResult } from "../web/scrapers/types";
-import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
+import {
+	finalizeOutput,
+	loadPage,
+	looksLikeHtml,
+	MAX_OUTPUT_CHARS,
+	type RenderResult,
+	type SpecialHandler,
+} from "../web/scrapers/types";
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
@@ -30,6 +39,12 @@ import { clampTimeout } from "./tool-timeouts";
 
 type NativeHtmlBindings = { htmlToMarkdown: typeof htmlToMarkdownFn };
 let nativeHtmlBindings: NativeHtmlBindings | undefined;
+let specialHandlersCache: SpecialHandler[] | undefined;
+
+function getSpecialHandlers(): SpecialHandler[] {
+	specialHandlersCache ??= (require("../web/scrapers") as { specialHandlers: SpecialHandler[] }).specialHandlers;
+	return specialHandlersCache;
+}
 
 /**
  * Lazy native access for HTML conversion. The module is cached, never the
@@ -49,6 +64,7 @@ const FETCH_DEFAULT_MAX_LINES = 300;
 // Convertible document types handled by markit.
 const CONVERTIBLE_MIMES = new Set([
 	"application/pdf",
+	"application/x-pdf",
 	"application/msword",
 	"application/vnd.ms-powerpoint",
 	"application/vnd.ms-excel",
@@ -95,8 +111,15 @@ const IMAGE_MIME_BY_EXTENSION = new Map<string, string>([
 	[".jpeg", "image/jpeg"],
 	[".gif", "image/gif"],
 	[".webp", "image/webp"],
+	[".svg", "image/svg+xml"],
 ]);
-const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set([
+	"image/png",
+	"image/jpeg",
+	"image/gif",
+	"image/webp",
+	"image/svg+xml",
+]);
 const MAX_INLINE_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024;
 const MAX_INLINE_IMAGE_OUTPUT_BYTES = 300 * 1024;
 
@@ -228,17 +251,52 @@ function normalizeMime(contentType: string): string {
 	return contentType.split(";")[0].trim().toLowerCase();
 }
 
+// Bound both parsing work and decoded filename size to a single modest header.
+function getDispositionFilename(header: string): string | undefined {
+	if (header.length > 8192 || /[\x00-\x1f\x7f]/.test(header.replaceAll("\t", ""))) return undefined;
+	const separator = header.indexOf(";");
+	if (separator < 0) return undefined;
+	const parameter = /;[ \t]*([!#$%&'*+.^_`|~\w-]+)[ \t]*=[ \t]*(?:"((?:[^"\\]|\\.)*)"|([!#$%&'*+.^_`|~\w-]+))[ \t]*/y;
+	let offset = separator;
+	let plain: string | undefined;
+	let extended: string | undefined;
+	const seen = new Set<string>();
+	while (offset < header.length) {
+		parameter.lastIndex = offset;
+		const match = parameter.exec(header);
+		if (!match) return undefined;
+		offset = parameter.lastIndex;
+		const name = match[1].toLowerCase();
+		if (name !== "filename" && name !== "filename*") continue;
+		// Duplicate filename parameters are ambiguous, not an ordering override.
+		if (seen.has(name)) return undefined;
+		seen.add(name);
+		const value = match[2] === undefined ? match[3] : match[2].replace(/\\(.)/g, "$1");
+		if (name === "filename") {
+			if (value) plain = value;
+			continue;
+		}
+		// RFC 8187 ext-value: only UTF-8 is supported; quoted ext-values are invalid.
+		const encoded =
+			match[2] === undefined ? /^UTF-8'[A-Za-z0-9-]*'((?:[!#$&+.^_`|~\w-]|%[\da-fA-F]{2})*)$/i.exec(value) : null;
+		if (!encoded) continue;
+		try {
+			const decoded = decodeURIComponent(encoded[1]);
+			if (decoded && !/[\x00-\x1f\x7f]/.test(decoded)) extended = decoded;
+		} catch {
+			// Invalid UTF-8 or percent encoding must not escape classification.
+		}
+	}
+	return extended ?? plain;
+}
+
 /**
  * Get extension from URL or Content-Disposition
  */
 function getExtensionHint(url: string, contentDisposition?: string): string {
-	// Try Content-Disposition filename first
 	if (contentDisposition) {
-		const match = contentDisposition.match(/filename[*]?=["']?([^"';\n]+)/i);
-		if (match) {
-			const ext = path.extname(match[1]).toLowerCase();
-			if (ext) return ext;
-		}
+		const filename = getDispositionFilename(contentDisposition);
+		if (filename !== undefined) return path.extname(filename).toLowerCase();
 	}
 
 	// Fall back to URL path
@@ -251,21 +309,25 @@ function getExtensionHint(url: string, contentDisposition?: string): string {
 	return "";
 }
 
+function isGenericMimeType(mime: string): boolean {
+	return (
+		mime.length === 0 || mime === "application/octet-stream" || mime === "binary/octet-stream" || mime === "unknown"
+	);
+}
+
 /**
  * Check if content type is convertible via markit.
  */
 function isConvertible(mime: string, extensionHint: string): boolean {
-	if (CONVERTIBLE_MIMES.has(mime)) return true;
-	if (mime === "application/octet-stream" && CONVERTIBLE_EXTENSIONS.has(extensionHint)) return true;
-	if (CONVERTIBLE_EXTENSIONS.has(extensionHint)) return true;
-	return false;
+	return (
+		CONVERTIBLE_MIMES.has(mime) ||
+		(CONVERTIBLE_EXTENSIONS.has(extensionHint) && (extensionHint !== ".pdf" || isGenericMimeType(mime)))
+	);
 }
 
 function resolveImageMimeType(mime: string, extensionHint: string): string | null {
 	if (mime.startsWith("image/")) return mime;
-	const shouldUseExtensionHint =
-		mime.length === 0 || mime === "application/octet-stream" || mime === "binary/octet-stream" || mime === "unknown";
-	if (!shouldUseExtensionHint) return null;
+	if (!isGenericMimeType(mime)) return null;
 	return IMAGE_MIME_BY_EXTENSION.get(extensionHint) ?? null;
 }
 
@@ -618,16 +680,22 @@ async function handleSpecialUrls(
 	timeout: number,
 	signal: AbortSignal | undefined,
 	storage: AgentStorage | null,
+	settings: Settings,
 ): Promise<FetchRenderResult | null> {
-	for (const handler of specialHandlers) {
+	for (const handler of getSpecialHandlers()) {
 		if (signal?.aborted) {
 			throw new ToolAbortError();
 		}
-		const result = await handler(url, timeout, signal, storage);
+		const result = await handler(url, timeout, signal, storage, settings);
 		if (result) return result;
 	}
 	return null;
 }
+
+/** Test-only seam for verifying lazy special-handler loading and dispatch. */
+export const fetchSpecialHandlerTestHooks = {
+	dispatch: handleSpecialUrls,
+};
 
 // =============================================================================
 // Main Render Function
@@ -702,7 +770,7 @@ async function renderUrl(
 
 	// Step 1: Try special handlers for known sites (unless raw mode)
 	if (!raw) {
-		const specialResult = await handleSpecialUrls(url, timeout, signal, storage);
+		const specialResult = await handleSpecialUrls(url, timeout, signal, storage, settings);
 		if (specialResult) return specialResult;
 	}
 
@@ -741,15 +809,60 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
+	let isPdf =
+		mime === "application/pdf" || mime === "application/x-pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
 
-	const imageMimeType = resolveImageMimeType(mime, extHint);
+	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
+	if (raw && isPdf) {
+		const output = finalizeOutput(rawContent);
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "raw",
+			content: output.content,
+			fetchedAt,
+			truncated: output.truncated,
+			notes,
+		};
+	}
+
+	// Classify generic downloads from the bounded binary response before dispatch.
+	// Both image rendering and document conversion reuse these bytes.
+	const dispositionBinary =
+		!raw && isGenericMimeType(mime)
+			? response.buffer
+				? { ok: true as const, buffer: response.buffer, contentDisposition: response.contentDisposition }
+				: await fetchBinary(finalUrl, timeout, signal)
+			: undefined;
+	if (dispositionBinary && !dispositionBinary.ok) {
+		notes.push(dispositionBinary.error ? `Binary fetch failed: ${dispositionBinary.error}` : "Binary fetch failed");
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "failed",
+			content: "",
+			fetchedAt,
+			truncated: false,
+			notes,
+		};
+	}
+	const effectiveExt = dispositionBinary?.ok
+		? getExtensionHint(finalUrl, dispositionBinary.contentDisposition)
+		: extHint;
+	isPdf =
+		mime === "application/pdf" ||
+		mime === "application/x-pdf" ||
+		(effectiveExt === ".pdf" && isGenericMimeType(mime));
+	const imageMimeType = isPdf ? undefined : resolveImageMimeType(mime, effectiveExt);
 	let skipConvertibleBinaryRetry = false;
 	if (imageMimeType) {
 		if (!isInlineImageMimeTypeSupported(imageMimeType)) {
 			notes.push(
 				`Image MIME type ${imageMimeType} is unsupported for inline model serialization; returning text metadata only`,
 			);
-			const shouldTryConvertibleFallback = isConvertible(mime, extHint);
+			const shouldTryConvertibleFallback = isConvertible(mime, effectiveExt);
 			if (shouldTryConvertibleFallback) {
 				notes.push("Attempting binary conversion fallback for unsupported image MIME type");
 			} else {
@@ -757,25 +870,27 @@ async function renderUrl(
 			}
 			skipConvertibleBinaryRetry = !shouldTryConvertibleFallback;
 		} else {
-			const binary = await fetchBinary(finalUrl, timeout, signal);
+			const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 			if (binary.ok) {
 				notes.push("Fetched image binary");
-				const conversionExtension = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 				let convertedText: string | null = null;
-				const converted = await convertWithMarkit(binary.buffer, conversionExtension, timeout, signal);
-				if (converted.ok) {
-					// See the non-empty conversion note near the document path
-					// below (#5433): short conversions still beat raw fallback.
-					if (converted.content.trim().length > 0) {
-						notes.push("Converted with markit");
-						convertedText = converted.content;
+				if (imageMimeType !== "image/svg+xml") {
+					const conversionExtension = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
+					const converted = await convertWithMarkit(binary.buffer, conversionExtension, timeout, signal);
+					if (converted.ok) {
+						// See the non-empty conversion note near the document path
+						// below (#5433): short conversions still beat raw fallback.
+						if (converted.content.trim().length > 0) {
+							notes.push("Converted with markit");
+							convertedText = converted.content;
+						} else {
+							notes.push("markit conversion produced no usable output");
+						}
+					} else if (converted.error) {
+						notes.push(`markit conversion failed: ${converted.error}`);
 					} else {
-						notes.push("markit conversion produced no usable output");
+						notes.push("markit conversion failed");
 					}
-				} else if (converted.error) {
-					notes.push(`markit conversion failed: ${converted.error}`);
-				} else {
-					notes.push("markit conversion failed");
 				}
 
 				if (binary.buffer.byteLength > MAX_INLINE_IMAGE_SOURCE_BYTES) {
@@ -796,14 +911,33 @@ async function renderUrl(
 						notes,
 					};
 				}
+				let imageBytes: Uint8Array | undefined = binary.buffer;
+				if (imageMimeType === "image/svg+xml") {
+					try {
+						imageBytes = await rasterizeSvgInputBytes(binary.buffer);
+					} catch (error) {
+						notes.push(`SVG rasterization failed: ${error instanceof Error ? error.message : String(error)}`);
+						imageBytes = undefined;
+					}
+				}
 
-				const resized = await resizeImage(
-					{ type: "image", data: Buffer.from(binary.buffer).toBase64(), mimeType: imageMimeType },
-					{ maxBytes: MAX_INLINE_IMAGE_OUTPUT_BYTES },
-				);
+				const resized = imageBytes
+					? await resizeImage(
+							{
+								type: "image",
+								data: Buffer.from(imageBytes).toBase64(),
+								mimeType: imageMimeType === "image/svg+xml" ? "image/png" : imageMimeType,
+							},
+							{ maxBytes: MAX_INLINE_IMAGE_OUTPUT_BYTES },
+						)
+					: undefined;
 				const isDecodedImage =
-					resized.originalWidth > 0 && resized.originalHeight > 0 && resized.width > 0 && resized.height > 0;
-				if (!isDecodedImage) {
+					resized !== undefined &&
+					resized.originalWidth > 0 &&
+					resized.originalHeight > 0 &&
+					resized.width > 0 &&
+					resized.height > 0;
+				if (!isDecodedImage || resized === undefined) {
 					notes.push(`Fetched payload could not be decoded as ${imageMimeType}; returning text metadata only`);
 					const output = finalizeOutput(
 						convertedText ??
@@ -868,39 +1002,51 @@ async function renderUrl(
 	}
 
 	// Step 3: Handle convertible binary files (PDF, DOCX, etc.)
-	if (!skipConvertibleBinaryRetry && isConvertible(mime, extHint)) {
-		const binary = await fetchBinary(finalUrl, timeout, signal);
+	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, effectiveExt))) {
+		const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 		if (binary.ok) {
-			const ext = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
+			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
 			if (converted.ok) {
-				// Any non-empty markit conversion is preferable to a raw-bytes
-				// fallback (#5433): short documents like the W3C dummy.pdf
-				// ("Dummy PDF file", 14 chars) are legitimately converted text.
+				// A non-empty conversion is preferable to raw bytes: short PDFs are still readable text.
 				if (converted.content.trim().length > 0) {
-					notes.push("Converted with markit");
+					notes.push(isPdf ? "Extracted PDF with native inspector" : "Converted with markit");
 					const output = finalizeOutput(converted.content);
 					return {
 						url,
 						finalUrl,
 						contentType: mime,
-						method: "markit",
+						method: isPdf ? "pdf" : "markit",
 						content: output.content,
 						fetchedAt,
 						truncated: output.truncated,
 						notes,
 					};
 				}
-				notes.push("markit conversion produced no usable output");
+				notes.push(
+					isPdf ? "PDF conversion produced no usable output" : "markit conversion produced no usable output",
+				);
 			} else if (converted.error) {
-				notes.push(`markit conversion failed: ${converted.error}`);
+				notes.push(`${isPdf ? "PDF conversion" : "markit conversion"} failed: ${converted.error}`);
 			} else {
-				notes.push("markit conversion failed");
+				notes.push(isPdf ? "PDF conversion failed" : "markit conversion failed");
 			}
 		} else if (binary.error) {
 			notes.push(`Binary fetch failed: ${binary.error}`);
 		} else {
 			notes.push("Binary fetch failed");
+		}
+		if (isPdf) {
+			return {
+				url,
+				finalUrl,
+				contentType: mime,
+				method: "failed",
+				content: "",
+				fetchedAt,
+				truncated: false,
+				notes,
+			};
 		}
 	}
 
@@ -1066,7 +1212,7 @@ async function renderUrl(
 				if (binary.ok) {
 					const ext = getExtensionHint(docUrl, binary.contentDisposition);
 					const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
-					if (converted.ok && converted.content.trim().length > htmlResult.content.length) {
+					if (converted.ok && converted.content.trim().length > (ext === ".pdf" ? 0 : htmlResult.content.length)) {
 						notes.push(`Extracted and converted document: ${docUrl}`);
 						const output = finalizeOutput(converted.content);
 						return {
@@ -1081,7 +1227,13 @@ async function renderUrl(
 						};
 					}
 					if (!converted.ok && converted.error) {
-						notes.push(`markit conversion failed: ${converted.error}`);
+						notes.push(`${ext === ".pdf" ? "PDF conversion" : "markit conversion"} failed: ${converted.error}`);
+					} else if (converted.ok && !converted.content.trim()) {
+						notes.push(
+							ext === ".pdf"
+								? "PDF conversion produced no usable output"
+								: "markit conversion produced no usable output",
+						);
 					}
 				} else if (binary.error) {
 					notes.push(`Binary fetch failed: ${binary.error}`);
@@ -1236,10 +1388,93 @@ async function materializeReadUrlCacheEntry(
 	return null;
 }
 
+const ARTIFACT_NOFOLLOW = process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0);
+
+async function unlinkOwnedStaging(staging: string, dev: bigint, ino: bigint): Promise<void> {
+	try {
+		const stat = await fs.lstat(staging, { bigint: true });
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.dev !== dev || stat.ino !== ino) return;
+		await fs.unlink(staging);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+/**
+ * Publish text at an explicit artifact path the way `ArtifactManager.save` does:
+ * a temp file opened with `O_NOFOLLOW` and mode 0600, then rename. A symlink is
+ * not followed. A pre-existing regular file is replaced, so mode 0644 is not kept.
+ */
+export async function publishExplicitArtifactText(destination: string, text: string): Promise<void> {
+	const bytes = Buffer.from(text, "utf8");
+	const parent = path.dirname(destination);
+	// Bun.write created a missing parent. Match that when the allocated path's
+	// directory does not exist yet.
+	try {
+		await fs.lstat(parent);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+	}
+	// Keep the staging component a fixed length. A destination basename near NAME_MAX
+	// plus a UUID would make the temp name longer than the filesystem allows.
+	const staging = path.join(parent, `.artifact-${randomUUID()}.staging`);
+	let handle: fs.FileHandle | undefined;
+	let stagedDev: bigint | undefined;
+	let stagedIno: bigint | undefined;
+	let published = false;
+	try {
+		handle = await fs.open(
+			staging,
+			nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | ARTIFACT_NOFOLLOW,
+			0o600,
+		);
+		const opened = await handle.stat({ bigint: true });
+		stagedDev = opened.dev;
+		stagedIno = opened.ino;
+		if (process.platform !== "win32") await handle.chmod(0o600);
+		await handle.writeFile(bytes);
+		await handle.sync();
+		const staged = await handle.stat({ bigint: true });
+		if (process.platform !== "win32" && (Number(staged.mode) & 0o777) !== 0o600) {
+			throw new Error("artifact_publish_mode");
+		}
+		await handle.close();
+		handle = undefined;
+
+		let existing: nodeFs.Stats | undefined;
+		try {
+			existing = await fs.lstat(destination);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (existing?.isSymbolicLink()) throw new Error("artifact_destination_symlink");
+		if (existing && !existing.isFile()) throw new Error("artifact_destination_not_file");
+
+		await fs.rename(staging, destination);
+		const named = await fs.lstat(destination, { bigint: true });
+		if (
+			!named.isFile() ||
+			named.isSymbolicLink() ||
+			named.dev !== stagedDev ||
+			named.ino !== stagedIno ||
+			(process.platform !== "win32" && (Number(named.mode) & 0o777) !== 0o600)
+		) {
+			throw new Error("artifact_destination_identity_changed");
+		}
+		published = true;
+	} finally {
+		if (handle) await handle.close().catch(() => undefined);
+		if (!published && stagedDev !== undefined && stagedIno !== undefined) {
+			await unlinkOwnedStaging(staging, stagedDev, stagedIno);
+		}
+	}
+}
+
 async function persistReadUrlArtifact(session: ToolSession, output: string): Promise<string | undefined> {
 	const { path: artifactPath, id } = (await session.allocateOutputArtifact?.("read")) ?? {};
 	if (!artifactPath) return undefined;
-	await Bun.write(artifactPath, wrapUntrustedContent(output));
+	await publishExplicitArtifactText(artifactPath, wrapUntrustedContent(output));
 	return id;
 }
 
@@ -1325,13 +1560,7 @@ const UNTRUSTED_CONTENT_CLOSE = "</untrusted-content>";
 export const WRAP_PREFIX_CHARS = `${UNTRUSTED_CONTENT_OPEN}\n`.length;
 const WRAP_SUFFIX = `\n${UNTRUSTED_CONTENT_CLOSE}`;
 
-export function escapeUntrustedContent(content: string): string {
-	return content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
-}
-
-export function wrapUntrustedContent(content: string): string {
-	return `${UNTRUSTED_CONTENT_OPEN}\n${escapeUntrustedContent(content)}${WRAP_SUFFIX}`;
-}
+export { escapeUntrustedContent, wrapUntrustedContent };
 
 function isWrappedReadUrlOutput(output: string): boolean {
 	return output.startsWith(`${UNTRUSTED_CONTENT_OPEN}\n`) && output.endsWith(WRAP_SUFFIX);

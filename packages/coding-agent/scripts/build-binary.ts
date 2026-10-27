@@ -13,7 +13,8 @@ function shouldAdhocSignDarwinBinary(): boolean {
 }
 
 async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): Promise<void> {
-	const proc = Bun.spawn(command, {
+	const argv = command[0] === "bun" ? [process.execPath, ...command.slice(1)] : command;
+	const proc = Bun.spawn(argv, {
 		cwd: packageDir,
 		env,
 		stdout: "inherit",
@@ -31,10 +32,10 @@ async function stageWorkspaceNativeAddons(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 	try {
-		await runCommand(["bun", "--cwd=../natives", "run", "embed:native"]);
+		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 		try {
+			await runCommand(["bun", "--cwd=../natives", "run", "embed:native"]);
 			const buildEnv = shouldAdhocSignDarwinBinary() ? { ...Bun.env, BUN_NO_CODESIGN_MACHO_BINARY: "1" } : Bun.env;
 			await runCommand(buildDevCompileArgs(), buildEnv);
 

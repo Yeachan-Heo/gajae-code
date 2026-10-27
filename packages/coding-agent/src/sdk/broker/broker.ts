@@ -3,11 +3,22 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import {
+	exactRemoveDirectoryTree,
+	type NativeBrokerRestartIntent,
+	type NativeDirectoryTreeSnapshot,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
+import { FileLockAcquireError, withFileLock } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
+import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerRetirementContinuation,
+} from "../../session/task-artifact-owner-codec";
 import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
@@ -20,6 +31,19 @@ import {
 	listManagedSessionCandidates,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import {
+	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
+	type SessionListSavedSessionOmission,
+	type SessionListSavedSessionOmissionDetailCode,
+} from "../session-list";
+import {
+	type BrokerExitMode,
+	type BrokerExitReason,
+	type BrokerExitRecord,
+	type BrokerFenceReason,
+	type BrokerStopRequest,
+	writeBrokerExitRecord,
+} from "./broker-exit";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -35,9 +59,16 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 	redactBrokerDiscovery,
+	rollbackBrokerDiscoveryIfCurrent,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
-import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	deriveScopedIdempotencyIdentity,
+	getBrokerIdentityKey,
+} from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
@@ -54,9 +85,55 @@ import {
 	type LifecycleState,
 	type TerminalReadBack,
 } from "./lifecycle-ledger";
+import { brokerLockHostIdentity } from "./lock-host-identity";
+import {
+	cancelManagedTasks,
+	createManagedDomainBinding,
+	currentManagedRevision,
+	defineManagedTaskGraph,
+	inspectManagedAttemptByNativeIdentity,
+	loadManagedDomainBinding,
+	loadManagedEnrollmentRecord,
+	lookupManagedAttemptByNativeIdentity,
+	type ManagedAttemptRef,
+	type ManagedDomainBinding,
+	type ManagedEnrollmentRecord,
+	type ManagedTaskAttempt,
+	managedAttemptRefMatches,
+	managedIdentity,
+	managedNativeVector,
+	managedTaskDomainPath,
+	markManagedEnrollmentEstablished,
+	markManagedEnrollmentPending,
+	markManagedEnrollmentPublishing,
+	observeOrAdmitManagedTask,
+	recordManagedEnrollment,
+	recordManagedNativeObservation,
+	restoreManagedAttemptRefs,
+	reviseManagedTaskGraph,
+	transactManagedTaskDomain,
+	validateManagedTaskDomain,
+	withManagedNativeEffectAuthorized,
+} from "./managed-task-dag";
+import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
+import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
+import {
+	armPublicationLivenessWatchdog,
+	disarmPublicationLivenessWatchdog,
+	notePublicationLivenessLoop,
+	notePublicationLivenessProven,
+	publicationLivenessWatchdogLost,
+	syncPublicationLivenessGrace,
+} from "./publication-liveness-watchdog";
 import { sdkInternalRuntimeImage } from "./runtime";
-import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	SessionIndex,
+	type SessionList,
+	sessionIndexStartupLockOptions,
+} from "./session-index";
 import {
 	type ResolvedScopeV1,
 	resolveScopeRequest,
@@ -76,6 +153,7 @@ import {
 	type SpawnSubstrateProvider,
 } from "./spawn-authority";
 import { createSpawnSubstrateProvider } from "./spawn-substrate";
+import type { BrokerTaskArtifactOwnerRetirementDisposition } from "./task-artifact-owner-validation";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -95,6 +173,21 @@ export interface BrokerSettings {
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
+	/**
+	 * Grace before a broker nobody is left to use exits on its own. The clock only
+	 * runs while the index proves no live session host and no open spawn authority,
+	 * so a broker whose client died without closing exits instead of holding its
+	 * port, its publication, and its lock for the life of the machine.
+	 */
+	abandonedGraceMs?: number;
+	/**
+	 * Whether this broker may end itself once nobody is left to use it. Only the
+	 * detached autostart entry point enables this: an operator-supervised
+	 * `gjc sdk broker run` service owns its own lifetime, and its supervisor reads an
+	 * owned-root completion as a clean exit, so self-reaping would quietly retire a
+	 * service that was meant to keep serving.
+	 */
+	reapWhenAbandoned?: boolean;
 	/** Host model resolver override for lifecycle tests and embedders. */
 	resolveModelPin?: SdkHostModelResolver;
 	/**
@@ -105,6 +198,20 @@ export interface BrokerSettings {
 	 * value its launcher decided, with no cast/assumed tag in between.
 	 */
 	restartRequestId?: string;
+	/** Cancel bootstrap before retained publication when the owning CLI receives a signal. */
+	startupAbortSignal?: AbortSignal;
+	/** Monotonic checkpoint deadline, leaving time for retained publication. */
+	startupCheckpointDeadline?: number;
+	/** Called synchronously when retained publication establishes broker readiness. */
+	onStartupReady?: () => void;
+	/** Test-only delay after session checkpoint to verify unpublished discovery ownership. */
+	startupPrePublicationDelayMs?: number;
+	/** Test-only notification at the cached-discovery, pre-publication boundary. */
+	startupPrePublicationTestHook?: () => Promise<void>;
+	/** Test-only delay hook after discovery rename and before retained publication authority. */
+	startupAfterDiscoveryWriteTestHook?: () => Promise<void>;
+	/** Test-only delay after publication to exercise signal handoff ordering. */
+	startupPostPublicationDelayMs?: number;
 }
 
 type ResolvedBrokerSettings = {
@@ -118,6 +225,8 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	abandonedGraceMs: number;
+	reapWhenAbandoned: boolean;
 	restartRequestId?: string;
 };
 export function resolveBrokerPackageGeneration(): string {
@@ -143,6 +252,7 @@ function modelResolutionCwd(input: Record<string, unknown>): string | undefined 
 
 export type BrokerErrorCode =
 	| "idempotency_conflict"
+	| "legacy_lifecycle_ambiguous"
 	| "terminal_uncertain"
 	| "broker_restarting"
 	| "unavailable"
@@ -210,7 +320,7 @@ export type BrokerCleanupEvidence = {
 	artifactsIdentity?: BrokerCleanupIdentity;
 	transcriptIdentity?: BrokerCleanupIdentity;
 	transcriptParentIdentity?: { dev: string; ino: string };
-	/** Identity-bound lifecycle metadata marker retained when exact cleanup is deferred. */
+	/** Identity-bound lifecycle metadataker retained when exact cleanup is deferred. */
 	metadataIdentity?: BrokerCleanupIdentity;
 	metadataPath?: string;
 	/** Monotonic append-only cleanup attempt. */
@@ -230,6 +340,19 @@ export type BrokerCleanupEvidence = {
 	retainedTranscriptSuccessorPath?: string;
 	retainedTranscriptPlaceholderPath?: string;
 	retainedTranscriptUnknownPath?: string;
+	/** Immutable task-artifact owner authority captured before the first deletion effect. */
+	taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+	/** Latest exact native remnant; it never replaces the original deletion evidence. */
+	taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+	/** Strict owner-only wire disposition, decoded only with its separately stored evidence. */
+	taskArtifactOwnerRetirementOutcome?: BrokerTaskArtifactOwnerRetirementDisposition;
+	taskArtifactOwnerPayloadRetired?: true;
+	taskArtifactOwnerNamespaceRetained?: true;
+	taskArtifactOwnerRetired?: true;
+	/** Durable fact that transcript retirement completed while the owner namespace remains. */
+	taskArtifactOwnerTranscriptDeleted?: true;
+	/** Stable artifacts-phase owner refusal diagnostic. */
+	taskArtifactOwnerCleanupError?: string;
 	/** Durable proof that artifact cleanup completed before transcript mutation. */
 	artifactsRemoved?: boolean;
 	artifactsAbsentAtAuthorization?: true;
@@ -242,7 +365,7 @@ export type BrokerCleanupEvidence = {
 	/** Fully identity-bound startup-failure cleanup plan, persisted before any detach. */
 	lifecycleFiles?: BrokerLifecycleCleanupFile[];
 	lifecycleParentIdentity?: { dev: string; ino: string };
-	/** Delete metadata receipts authorize only the canonical marker/ready sibling pair. */
+	/** Delete metadata receipts authorize only the canonicalker/ready sibling pair. */
 	lifecycleDeleteMetadata?: true;
 };
 export type BrokerResponse =
@@ -260,6 +383,17 @@ export type BrokerResponse =
 			durableEffects?: LifecycleDurableEffectsReceipt;
 			startupFailure?: LifecycleStartupFailureReceipt;
 	  };
+type VerifiedManagedOwner =
+	| {
+			kind: "verified";
+			ownerSessionId: string;
+			attestationEpoch: string;
+			controlRoot: string;
+			enrollmentId: string;
+			worktrees: string[];
+			aliases?: string[];
+	  }
+	| { kind: "denied"; response: BrokerResponse };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
 const spawnFailureError = (failure: SpawnSubstrateFailure): BrokerResponse => ({
 	ok: false,
@@ -344,6 +478,7 @@ type SessionListCursor = {
 	limit: number;
 	offset: number;
 	expiresAt: number;
+	cwd?: string;
 	scope?: ResolvedScopeV1;
 	observedAt?: string;
 };
@@ -357,6 +492,7 @@ type SpawnInFlight = {
 	resolve: (response: BrokerResponse) => void;
 	claimId?: string;
 	phase?: SpawnClaimV2["state"];
+	managedRequestHash?: string;
 };
 
 /** Complete five-leg child endpoint pin captured at registration. */
@@ -412,6 +548,9 @@ type SpawnAdmissionInput = {
 	cwd: string;
 	modelId?: string;
 	modelPreset?: string;
+	managedAttempt?: ManagedAttemptRef;
+	managedBinding?: ManagedDomainBinding;
+	managedNativeVector?: string;
 };
 
 function parseSpawnInput(
@@ -498,6 +637,10 @@ function sessionListLimit(input: Record<string, unknown>): number | BrokerRespon
 	return limit;
 }
 
+function savedSessionOmissionDetailCode(code: string): SessionListSavedSessionOmissionDetailCode | undefined {
+	return SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES.find(candidate => candidate === code);
+}
+
 function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
@@ -506,6 +649,24 @@ const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
+const BROKER_ABANDONED_GRACE_DEFAULT_MS = 120_000;
+const MANAGED_CLOSE_WAIT_MS = 10_000;
+
+function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	const settled = Promise.withResolvers<boolean>();
+	const timer = setTimeout(() => settled.resolve(false), timeoutMs);
+	void promise.then(
+		() => {
+			clearTimeout(timer);
+			settled.resolve(true);
+		},
+		() => {
+			clearTimeout(timer);
+			settled.resolve(true);
+		},
+	);
+	return settled.promise;
+}
 
 /** The five legs every usable pin must carry; a partial pin is missing authority. */
 type CompleteSpawnPinAuthority = SpawnAuthorityV1 & {
@@ -656,6 +817,17 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
+const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
+	"taskArtifactOwnerDeletionEvidence",
+	"taskArtifactOwnerRetirementContinuation",
+	"taskArtifactOwnerRetirementOutcome",
+	"taskArtifactOwnerPayloadRetired",
+	"taskArtifactOwnerNamespaceRetained",
+	"taskArtifactOwnerRetired",
+	"taskArtifactOwnerTranscriptDeleted",
+	"taskArtifactOwnerCleanupError",
+] as const;
+
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
@@ -681,8 +853,15 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 		const resolved = input.resolveSessionId;
 		if (resolved !== undefined && (typeof resolved !== "string" || !isCanonicalSessionId(resolved)))
 			return error("invalid_input", "resolveSessionId must be a canonical safe identifier");
+		const cwd = input.cwd;
+		if (cwd !== undefined && (typeof cwd !== "string" || cwd.length === 0))
+			return error("invalid_input", "cwd must be a non-empty string");
 		if (input.cursor !== undefined && (typeof input.cursor !== "string" || input.cursor.length === 0))
 			return error("invalid_input", "cursor must be a non-empty opaque string");
+		if (input.cursor !== undefined && resolved !== undefined)
+			return error("invalid_input", "cursor cannot be combined with resolveSessionId");
+		if (input.scope !== undefined && (cwd !== undefined || resolved !== undefined))
+			return error("invalid_input", "scope cannot be combined with cwd or resolveSessionId");
 		const limit = sessionListLimit(input);
 		if (isBrokerResponse(limit)) return limit;
 		if (input.scope !== undefined && !scopeRequestV1(input.scope) && input.cursor === undefined)
@@ -727,6 +906,18 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	if (cwd.value !== undefined) normalized.stateRoot = path.join(cwd.value, ".gjc", "state");
 	else if (stateRoot.value !== undefined) return error("invalid_input", "stateRoot requires cwd.");
 
+	if (operation === "session.delete") {
+		const hasOwnerField = (value: unknown): boolean =>
+			typeof value === "object" &&
+			value !== null &&
+			!Array.isArray(value) &&
+			BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS.some(key => Object.hasOwn(value, key));
+		if (hasOwnerField(input) || hasOwnerField(target) || hasOwnerField(input.cleanup))
+			return error(
+				"invalid_input",
+				"Task-artifact owner cleanup state is broker-managed and cannot be supplied by clients.",
+			);
+	}
 	if (target) {
 		const normalizedTarget = { ...target };
 		delete normalizedTarget.path;
@@ -864,6 +1055,8 @@ type BrokerSessionControlRequest = {
 
 type BrokerSessionControlAuthority = {
 	record: IndexedSession;
+	/** Value the session runtime's operator-abort gate expects; see `sessionAbortCapability`. */
+	abortCapability: string;
 	endpoint: Record<string, unknown>;
 	endpointIdentity: {
 		dev: bigint;
@@ -914,6 +1107,24 @@ function brokerControlResponse(value: unknown): BrokerResponse {
 	return { ok: false, error: { code, message } };
 }
 
+/**
+ * The operator-abort marker the session's runtime expects from the Broker.
+ *
+ * A Broker-launched host expects its lifecycle request id. A TUI or direct CLI host
+ * has none and expects the marker it published in its own endpoint registration.
+ * Either way the value is read only from broker-owned index state; a session that
+ * published neither cannot be reached by the operator route.
+ */
+function sessionAbortCapability(record: IndexedSession): string | undefined {
+	const capability = record.lifecycleRequestId ?? record.abortCapability;
+	return typeof capability === "string" &&
+		capability.length > 0 &&
+		capability.length <= 128 &&
+		/^[A-Za-z0-9._-]+$/u.test(capability)
+		? capability
+		: undefined;
+}
+
 function sameSessionControlAuthority(
 	left: BrokerSessionControlAuthority,
 	right: BrokerSessionControlAuthority,
@@ -923,6 +1134,7 @@ function sameSessionControlAuthority(
 		left.record.processIncarnation === right.record.processIncarnation &&
 		left.record.hostIncarnation === right.record.hostIncarnation &&
 		left.record.lifecycleRequestId === right.record.lifecycleRequestId &&
+		left.abortCapability === right.abortCapability &&
 		endpointIncarnation(left.record, left.record.sessionId) ===
 			endpointIncarnation(right.record, right.record.sessionId) &&
 		left.endpoint.sessionId === right.endpoint.sessionId &&
@@ -936,6 +1148,13 @@ function sameSessionControlAuthority(
 		left.endpointIdentity.ctimeNs === right.endpointIdentity.ctimeNs
 	);
 }
+
+const SESSION_TARGETED_LIFECYCLE_OPERATIONS: ReadonlySet<string> = new Set([
+	"session.close",
+	"session.resume",
+	"session.delete",
+	"session.reconcile_uncertain",
+]);
 
 function lifecycleTarget(operation: string, input: Record<string, unknown>): unknown {
 	const target = input.target as Record<string, unknown> | undefined;
@@ -960,13 +1179,29 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
 		case "session.resume":
-		case "session.close":
 		case "session.delete":
 		case "session.reconcile_uncertain":
 			return { sessionId: id };
+		case "session.close":
+			return { sessionId: id, ...closeTargetAuthority(input) };
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+function closeTargetAuthority(input: Record<string, unknown>): {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+} {
+	if (
+		typeof input.endpointGeneration !== "number" ||
+		!Number.isSafeInteger(input.endpointGeneration) ||
+		input.endpointGeneration <= 0 ||
+		typeof input.endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(input.endpointIncarnation)
+	)
+		return {};
+	return { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation };
 }
 
 /**
@@ -996,9 +1231,28 @@ const BROKER_LOCK_RETRY_MS = 10;
 type BrokerLockSnapshot = {
 	ownerId?: string;
 	pid: number;
+	incarnation?: string;
+	ownerHostId?: string;
 	identity: string;
 	lockIdentity: string;
 };
+
+function isBrokerLockOwnerAlive(
+	snapshot: Pick<BrokerLockSnapshot, "pid" | "incarnation" | "ownerHostId">,
+	currentHostId: string | undefined,
+	pidAlive: (pid: number) => boolean = isPidAlive,
+	readProcessIncarnation: (pid: number) => string | undefined = brokerProcessIncarnation,
+): boolean {
+	if (snapshot.pid <= 0) return false;
+	// Local PID evidence is meaningful only when the owner record identifies this host.
+	// Foreign and legacy host-unqualified owners are never reclaimed from this process table.
+	if (snapshot.ownerHostId === undefined || snapshot.ownerHostId !== currentHostId) return true;
+	if (!pidAlive(snapshot.pid)) return false;
+	// A live PID is retained unless its recorded incarnation proves reuse.
+	if (!snapshot.incarnation) return true;
+	const incarnation = readProcessIncarnation(snapshot.pid);
+	return !incarnation || incarnation === snapshot.incarnation;
+}
 
 /** Tombstone prefix used by {@link Broker.reclaimStaleLock} when a dead owner's lock is renamed aside. */
 export const BROKER_LOCK_TOMBSTONE_PREFIX = ".broker.lock.stale-";
@@ -1047,11 +1301,12 @@ function isBrokerLockArtifactName(name: string): boolean {
  * Decide whether one candidate directory is provably abandoned.
  *
  * Fail-closed by construction: every branch that cannot prove abandonment
- * returns a retention reason. A tombstone with an owner record is only
- * abandoned when that record names a dead PID. A missing record is abandoned
- * only when the aged tombstone is empty; non-empty tombstones remain retained
- * as ambiguous evidence. Backup directories carry no owner contract, so an
- * absent record there is not ambiguity and age alone governs.
+ * returns a retention reason. A tombstone with an owner record is abandoned
+ * only when its PID is dead or validated incarnation evidence proves PID reuse;
+ * missing or unavailable evidence remains retained. A missing record is
+ * abandoned only when the aged tombstone is empty; non-empty tombstones remain
+ * retained as ambiguous evidence. Backup directories carry no owner contract,
+ * so an absent record there is not ambiguity and age alone governs.
  */
 async function classifyBrokerLockArtifact(
 	directory: string,
@@ -1059,6 +1314,8 @@ async function classifyBrokerLockArtifact(
 	now: number,
 	graceMs: number,
 	pidAlive: (pid: number) => boolean,
+	readProcessIncarnation: (pid: number) => string | undefined,
+	currentHostId: string | undefined,
 ): Promise<BrokerLockArtifactRetentionReason | "abandoned"> {
 	const target = path.join(directory, name);
 	// lstat, never stat: a symlink pointing at live state must never be followed
@@ -1081,14 +1338,26 @@ async function classifyBrokerLockArtifact(
 			return "owner-record-unreadable";
 		}
 	}
-	let pid: unknown;
+	let owner: { pid?: unknown; incarnation?: unknown; ownerHostId?: unknown };
 	try {
-		pid = (JSON.parse(raw) as { pid?: unknown }).pid;
+		owner = JSON.parse(raw) as { pid?: unknown; incarnation?: unknown; ownerHostId?: unknown };
 	} catch {
 		return "owner-record-unreadable";
 	}
-	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return "owner-record-unreadable";
-	return pidAlive(pid) ? "owner-alive" : "abandoned";
+	if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0)
+		return "owner-record-unreadable";
+	return isBrokerLockOwnerAlive(
+		{
+			pid: owner.pid,
+			incarnation: isProcessIncarnation(owner.incarnation) ? owner.incarnation : undefined,
+			ownerHostId: typeof owner.ownerHostId === "string" ? owner.ownerHostId : undefined,
+		},
+		currentHostId,
+		pidAlive,
+		readProcessIncarnation,
+	)
+		? "owner-alive"
+		: "abandoned";
 }
 
 /**
@@ -1107,11 +1376,18 @@ export async function reapStaleBrokerLockArtifacts(input: {
 	now?: number;
 	graceMs?: number;
 	pidAlive?: (pid: number) => boolean;
+	processIncarnation?: (pid: number) => string | undefined;
 }): Promise<BrokerLockArtifactReapResult> {
 	const directory = path.join(input.agentDir, "sdk");
 	const now = input.now ?? Date.now();
 	const graceMs = input.graceMs ?? BROKER_LOCK_ARTIFACT_GRACE_MS;
 	const pidAlive = input.pidAlive ?? isPidAlive;
+	const readProcessIncarnation = input.processIncarnation ?? brokerProcessIncarnation;
+	// Without this host's identity no host-qualified owner can be matched, so all of them are retained.
+	const currentHostId = await brokerLockHostIdentity(input.agentDir).then(
+		identity => identity.ownerHostId,
+		() => undefined,
+	);
 	const removed: string[] = [];
 	const retained: BrokerLockArtifactRetention[] = [];
 	const retainedByReason = new Map<BrokerLockArtifactRetentionReason, number>();
@@ -1128,7 +1404,15 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		const target = path.join(directory, name);
 		let verdict: BrokerLockArtifactRetentionReason | "abandoned";
 		try {
-			verdict = await classifyBrokerLockArtifact(directory, name, now, graceMs, pidAlive);
+			verdict = await classifyBrokerLockArtifact(
+				directory,
+				name,
+				now,
+				graceMs,
+				pidAlive,
+				readProcessIncarnation,
+				currentHostId,
+			);
 		} catch (error) {
 			// A vanished candidate needs no decision; anything else is ambiguous.
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -1183,13 +1467,19 @@ const BROKER_AMBIGUITY_GRACE_MS = 120_000;
 // to reclaim a lock whose owner pid is alive, so the deadlock is permanent (#4704).
 // Liveness is proven by publishing, not by being scheduled, so this deadline runs
 // from the last *successful* publication and is the only bound that survives a
-// stalled tick.
+// stalled tick. The interval that evaluates it shares the JS thread with the
+// tick's fsync/rename, so a syscall that never returns also suppresses the
+// check. An off-thread watchdog enforces the same deadline in that case. Startup
+// rejects when that watchdog cannot be armed, so the broker is not left published
+// without it. The test runner and `GJC_BROKER_LIVENESS_HARD_EXIT=0` opt out.
 const BROKER_LIVENESS_GRACE_MS = 60_000;
 // The floor must still be a multiple of the peer-visible TTL: with a longer TTL
 // configured, a fixed floor would terminate a broker whose published heartbeat is
 // still fresh to every reader.
 const BROKER_LIVENESS_TTL_MULTIPLIER = 4;
 const BROKER_SETTLEMENT_MS = 2_000;
+const BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS = 1_000;
+const BROKER_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
 
 export interface StartupAdmissionTiming {
 	now(): number;
@@ -1354,14 +1644,20 @@ type BrokerPublicationState =
 	| "observation-ambiguous"
 	| "heartbeat-ambiguous"
 	| "stopping";
-type BrokerStopMode = "owned-root" | "lost-root";
 
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
+const brokerLockReclaimHooksForTest = new WeakMap<
+	Broker,
+	{ beforeQuarantine?: () => Promise<void>; onContended?: () => void }
+>();
 const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
+const abandonedGraceOverridesForTest = new WeakMap<Broker, number>();
 const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
+const heartbeatMainThreadBlockMsForTest = new WeakMap<Broker, number>();
+const managedCloseWaitOverridesForTest = new WeakMap<Broker, number>();
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
@@ -1370,10 +1666,25 @@ export class Broker {
 	discovery: BrokerDiscovery | null = null;
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
+	#ownedLockIdentity: string | undefined;
+	#ownedLockIncarnation: string | undefined;
+	/** Public publication-incarnation id, fixed at startup; never the endpoint generation. */
+	#diagnosticGeneration = randomBytes(16).toString("hex");
+	/** Trusted build snapshot captured at startup; unknown buildId stays null. */
+	#startupBuild: { packageVersion: string; buildId: string | null } = {
+		packageVersion: packageJson.version,
+		buildId:
+			typeof process.env.GJC_BUILD_ID === "string" && process.env.GJC_BUILD_ID.length > 0
+				? process.env.GJC_BUILD_ID
+				: null,
+	};
 	#sessionListCursors = new Map<string, SessionListCursor>();
 	#chains = new Map<string, Promise<void>>();
 	#spawnInFlight = new Map<string, SpawnInFlight>();
 	#spawnTasks = new WeakMap<SpawnInFlight, string>();
+	#managedAttempts = new Map<string, ManagedAttemptRef>();
+	#managedFailedRoots = new Set<string>();
+	#managedEnrollmentFailed = false;
 	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#spawnPromptLayer: SpawnPromptLayer;
 	#spawnReapInFlight = false;
@@ -1381,14 +1692,29 @@ export class Broker {
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
 	#publicationState: BrokerPublicationState = "healthy-owned";
+	#fenceReason: BrokerFenceReason | null = null;
 	#lossAt: bigint | null = null;
 	#ambiguousAt: bigint | null = null;
 	#publishedAt: bigint | null = null;
+	#startedAt: bigint | null = null;
 	#watchInFlight = false;
+	#abandonedAt: number | null = null;
+	#abandonedReapInFlight = false;
+	#checkpointInFlight = false;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	/** This generation armed the watchdog. A later worker loss must end the broker. */
+	#publicationWatchdogArmed = false;
+	#startupAbortSignal: AbortSignal | undefined;
+	#startupCheckpointDeadline: number | undefined;
+	#onStartupReady: (() => void) | undefined;
+	#startupPrePublicationDelayMs: number;
+	#startupPrePublicationTestHook: (() => Promise<void>) | undefined;
+	#startupAfterDiscoveryWriteTestHook: (() => Promise<void>) | undefined;
+	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
+	#terminalExit: { mode: BrokerExitMode; reason: BrokerExitReason } | null = null;
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
@@ -1415,12 +1741,31 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
+			reapWhenAbandoned: settings.reapWhenAbandoned === true,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#startupAbortSignal = settings.startupAbortSignal;
+		this.#startupCheckpointDeadline = settings.startupCheckpointDeadline;
+		this.#onStartupReady = settings.onStartupReady;
+		this.#startupPrePublicationDelayMs =
+			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
+			(settings.startupPrePublicationDelayMs ?? 0) > 0 &&
+			(settings.startupPrePublicationDelayMs ?? 0) <= 10_000
+				? (settings.startupPrePublicationDelayMs as number)
+				: 0;
+		this.#startupPrePublicationTestHook = settings.startupPrePublicationTestHook;
+		this.#startupAfterDiscoveryWriteTestHook = settings.startupAfterDiscoveryWriteTestHook;
+		this.#startupPostPublicationDelayMs =
+			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
+			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
+			(settings.startupPostPublicationDelayMs ?? 0) <= 10_000
+				? (settings.startupPostPublicationDelayMs as number)
+				: 0;
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
@@ -1448,11 +1793,17 @@ export class Broker {
 	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
 		const admission = parseSpawnInput(input, idempotencyKey);
 		if (isBrokerResponse(admission)) return admission;
-		const lifecycleIdentity = await deriveIdempotencyIdentity(
+		// session.spawn predates target-bound lifecycle identities and its durable
+		// authority store already binds the raw request. Keep the v3 identity for
+		// new claims, while recognizing the v4 identity written by the short-lived
+		// target-bound implementation so an upgrade cannot admit a second child.
+		const targetBoundIdentity = await deriveIdempotencyIdentity(
 			this.settings.agentDir,
 			"session.spawn",
 			idempotencyKey!,
 		);
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey!);
+		const lifecycleIdentity = this.#spawnAuthority?.claim(targetBoundIdentity) ? targetBoundIdentity : legacyIdentity;
 		const active = this.#spawnInFlight.get(lifecycleIdentity);
 		if (active) {
 			if (this.#spawnTasks.get(active) !== admission.task)
@@ -1483,122 +1834,12 @@ export class Broker {
 				admission.masterCapability = "";
 			}
 			if (!verified.allowed) return finish(error("spawn_failed", "master capability verification was denied"));
-			const key = await getBrokerIdentityKey(this.settings.agentDir);
-			const authority = this.#spawnAuthority;
-			if (!authority) return finish(error("unavailable", "spawn authority is unavailable"));
-			const requestBindingMac = spawnBindingMac(
-				key,
-				admission,
-				admission.modelId ?? null,
-				admission.modelPreset ?? null,
-			);
-			const existing = authority.claim(lifecycleIdentity);
-			const resolveModels = async (): Promise<BrokerResponse | undefined> => {
-				// Validate the optional profile BEFORE any new durable claim or substrate
-				// effect. Generic lifecycle create validates it; spawn must do the same.
-				if (admission.modelPreset !== undefined) {
-					const validated = validateBrokerModelPresetSync(this.settings.agentDir, admission.modelPreset);
-					if (isBrokerResponse(validated)) return validated;
-					admission.modelPreset = validated;
-				}
-				// Resolve the explicit model pin before a new durable claim. Raw
-				// selectors must never reach a newly launched child.
-				if (admission.modelId !== undefined) {
-					const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
-					if (!resolved.ok) return error("unknown_model", resolved.error);
-					if (resolved.model === null)
-						return error("unknown_model", "session.spawn modelId could not be resolved.");
-					admission.modelId = resolved.model;
-				}
-				return undefined;
-			};
-			let decision: SpawnClaimDecision;
-			if (existing !== undefined) {
-				// An existing claim carries the raw-selector binding, so terminal and
-				// replay responses do not depend on today's model/profile catalog.
-				let existingBindingMac: string | undefined;
-				if (existing.requestBindingMac === undefined) {
-					// Claims written before raw-selector evidence was introduced only have
-					// the canonical binding. Re-resolve that historical selector before
-					// comparison; if the catalog no longer proves it, fail closed rather
-					// than guessing or weakening idempotency conflict protection.
-					const modelError = await resolveModels();
-					if (modelError) return finish(modelError);
-					existingBindingMac = spawnBindingMac(
-						key,
-						admission,
-						admission.modelId ?? null,
-						admission.modelPreset ?? null,
-					);
-				}
-				decision = await authority.claimOrJoin(
-					lifecycleIdentity,
-					existingBindingMac,
-					existingBindingMac ?? requestBindingMac,
-				);
-				if (decision.kind === "owner") {
-					becameOwner = true;
-					// A recovered pre-send claim may still need to launch. Preserve the
-					// fail-closed model validation for that effectful path and reject a
-					// catalog remap rather than launching a different model.
-					const modelError = await resolveModels();
-					if (modelError) return finish(modelError);
-					const recoveredBindingMac = spawnBindingMac(
-						key,
-						admission,
-						admission.modelId ?? null,
-						admission.modelPreset ?? null,
-					);
-					if (recoveredBindingMac !== decision.claim.bindingMac)
-						return finish(
-							error("idempotency_conflict", "session.spawn model selection differs from its durable claim"),
-						);
-				}
-			} else {
-				const modelError = await resolveModels();
-				if (modelError) {
-					// A concurrent claimant may have durably established this exact raw
-					// request while catalog loading was in flight. Re-check its opaque
-					// binding before returning the validation failure.
-					const raced = authority.claim(lifecycleIdentity);
-					if (raced === undefined) return finish(modelError);
-					decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
-					if (decision.kind === "owner") {
-						becameOwner = true;
-						return finish(modelError);
-					}
-				} else {
-					const bindingMac = spawnBindingMac(
-						key,
-						admission,
-						admission.modelId ?? null,
-						admission.modelPreset ?? null,
-					);
-					decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac, requestBindingMac);
-				}
-			}
-			if (decision.kind === "idempotency_conflict")
-				return finish(
-					error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"),
-				);
-			if (decision.kind === "in_progress")
-				return finish(error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
-			if (decision.kind === "terminal_uncertain") {
-				if (decision.claim.substrateProof !== undefined && decision.claim.authorityRef === undefined)
-					return finish(await this.#reconcileUncertainRegistration(lifecycleIdentity, decision.claim));
-				return finish(error("terminal_uncertain", "session.spawn outcome is uncertain"));
-			}
-			if (decision.kind === "terminal") return finish(this.#spawnTerminalResponse(decision.claim));
-			if (decision.kind === "replay")
-				return finish(await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim));
-			becameOwner = true;
-			inFlight.claimId = decision.claim.claimId;
-			inFlight.phase = decision.claim.state;
-			// Claim fsync precedes this audit mirror. Substrate work may start
-			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
-			await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+			const managedDenied = await this.#denyOrdinaryManagedSpawn(lifecycleIdentity, idempotencyKey!);
+			if (managedDenied) return finish(managedDenied);
 			return finish(
-				await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery),
+				await this.#driveVerifiedSpawn(lifecycleIdentity, admission, inFlight, owner => {
+					becameOwner = owner;
+				}),
 			);
 		} catch {
 			return finish(error("spawn_failed", "session.spawn admission could not be durably established"));
@@ -1607,6 +1848,641 @@ export class Broker {
 			this.#spawnTasks.delete(inFlight);
 			this.#spawnInFlight.delete(lifecycleIdentity);
 			if (becameOwner) await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+		}
+	}
+	async #denyOrdinaryManagedSpawn(lifecycleIdentity: string, callerKey: string): Promise<BrokerResponse | undefined> {
+		if (this.#managedAttempts.has(lifecycleIdentity))
+			return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+		if (this.#managedEnrollmentFailed) return error("spawn_failed", "managed enrollment membership is unprovable");
+		let enrolled: ManagedEnrollmentRecord;
+		try {
+			enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
+		} catch {
+			return error("spawn_failed", "managed enrollment membership is unprovable");
+		}
+		if (enrolled.nativeIdentities.includes(lifecycleIdentity))
+			return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+		for (const root of enrolled.controlRoots) {
+			if (this.#managedFailedRoots.has(root)) continue;
+			try {
+				const scopedIdentity = await deriveScopedIdempotencyIdentity(
+					this.settings.agentDir,
+					"session.spawn",
+					callerKey,
+					root,
+				);
+				if (this.#managedAttempts.has(scopedIdentity) || enrolled.nativeIdentities.includes(scopedIdentity))
+					return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+				const read = await readExistingStateForMutation(managedTaskDomainPath(root));
+				if (read.kind !== "valid") continue;
+				const state = validateManagedTaskDomain(read.value);
+				const attempt =
+					lookupManagedAttemptByNativeIdentity(state, lifecycleIdentity) ??
+					lookupManagedAttemptByNativeIdentity(state, scopedIdentity) ??
+					state.graphs.flatMap(graph => graph.attempts).find(item => item.native.key === callerKey);
+				if (attempt) return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
+			} catch {}
+		}
+		return undefined;
+	}
+
+	async #driveVerifiedSpawn(
+		lifecycleIdentity: string,
+		admission: SpawnAdmissionInput,
+		inFlight: SpawnInFlight,
+		setOwner: (owned: boolean) => void,
+	): Promise<BrokerResponse> {
+		const key = await getBrokerIdentityKey(this.settings.agentDir);
+		const authority = this.#spawnAuthority;
+		if (!authority) return error("unavailable", "spawn authority is unavailable");
+		const requestBindingMac = spawnBindingMac(
+			key,
+			admission,
+			admission.modelId ?? null,
+			admission.modelPreset ?? null,
+		);
+		const existing = authority.claim(lifecycleIdentity);
+		const resolveModels = async (): Promise<BrokerResponse | undefined> => {
+			if (admission.modelPreset !== undefined) {
+				const validated = validateBrokerModelPresetSync(this.settings.agentDir, admission.modelPreset);
+				if (isBrokerResponse(validated)) return validated;
+				admission.modelPreset = validated;
+			}
+			if (admission.modelId !== undefined) {
+				const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
+				if (!resolved.ok) return error("unknown_model", resolved.error);
+				if (resolved.model === null) return error("unknown_model", "session.spawn modelId could not be resolved.");
+				admission.modelId = resolved.model;
+			}
+			return undefined;
+		};
+		let decision: SpawnClaimDecision | undefined;
+		if (existing !== undefined) {
+			let existingBindingMac: string | undefined;
+			if (existing.requestBindingMac === undefined) {
+				const modelError = await resolveModels();
+				if (modelError) return modelError;
+				existingBindingMac = spawnBindingMac(
+					key,
+					admission,
+					admission.modelId ?? null,
+					admission.modelPreset ?? null,
+				);
+			}
+			decision = await authority.claimOrJoin(
+				lifecycleIdentity,
+				existingBindingMac,
+				existingBindingMac ?? requestBindingMac,
+			);
+			if (decision.kind === "owner") {
+				setOwner(true);
+				const modelError = await resolveModels();
+				if (modelError) return modelError;
+				const recoveredBindingMac = spawnBindingMac(
+					key,
+					admission,
+					admission.modelId ?? null,
+					admission.modelPreset ?? null,
+				);
+				if (recoveredBindingMac !== decision.claim.bindingMac)
+					return error("idempotency_conflict", "session.spawn model selection differs from its durable claim");
+			}
+		} else {
+			const modelError = await resolveModels();
+			if (modelError) {
+				const raced = authority.claim(lifecycleIdentity);
+				if (raced === undefined) return modelError;
+				decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
+				if (decision.kind === "owner") {
+					setOwner(true);
+					return modelError;
+				}
+			} else {
+				const bindingMac = spawnBindingMac(
+					key,
+					admission,
+					admission.modelId ?? null,
+					admission.modelPreset ?? null,
+				);
+				decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac, requestBindingMac);
+			}
+		}
+		if (!decision) return error("spawn_failed", "session.spawn admission could not be durably established");
+		if (decision.kind === "managed_key_conflict")
+			return error("idempotency_conflict", "idempotency key is reserved by a managed task.dag attempt");
+		if (decision.kind === "idempotency_conflict")
+			return error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim");
+		if (decision.kind === "in_progress")
+			return error("spawn_in_progress", `session.spawn is ${decision.claim.state}`);
+		if (decision.kind === "terminal_uncertain") {
+			if (decision.claim.substrateProof !== undefined && decision.claim.authorityRef === undefined)
+				return await this.#reconcileUncertainRegistration(lifecycleIdentity, decision.claim);
+			return error("terminal_uncertain", "session.spawn outcome is uncertain");
+		}
+		if (decision.kind === "terminal") return this.#spawnTerminalResponse(decision.claim);
+		if (decision.kind === "replay") return await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim);
+		setOwner(true);
+		inFlight.claimId = decision.claim.claimId;
+		inFlight.phase = decision.claim.state;
+		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac, { spawnAnchor: true });
+		return await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery);
+	}
+
+	async #handleManagedTaskDag(
+		input: Record<string, unknown>,
+		idempotencyKey: string | undefined,
+	): Promise<BrokerResponse> {
+		if (input.action === "define") return this.#managedDefine(input);
+		if (input.action === "advance") return this.#managedAdvance(input, idempotencyKey);
+		if (input.action === "status") return this.#managedStatus(input);
+		if (input.action === "revise") return this.#managedRevise(input);
+		if (input.action === "cancel") return this.#managedCancel(input);
+		if (input.action === "verify") return this.#managedVerify(input);
+		return error("invalid_input", "unknown task.dag action");
+	}
+
+	async #verifiedManagedOwner(input: Record<string, unknown>): Promise<VerifiedManagedOwner> {
+		const ownerSessionId = input.ownerSessionId;
+		const attestationEpoch = input.attestationEpoch;
+		const masterCapability = input.masterCapability;
+		const controlRoot = input.controlRoot;
+		const enrollmentId = input.enrollmentId;
+		if (
+			typeof ownerSessionId !== "string" ||
+			!isCanonicalSessionId(ownerSessionId) ||
+			typeof attestationEpoch !== "string" ||
+			attestationEpoch.length === 0 ||
+			attestationEpoch.length > 512 ||
+			typeof masterCapability !== "string" ||
+			masterCapability.length === 0 ||
+			masterCapability.length > 16_384 ||
+			typeof controlRoot !== "string" ||
+			!path.isAbsolute(controlRoot) ||
+			path.normalize(controlRoot) !== controlRoot ||
+			typeof enrollmentId !== "string" ||
+			enrollmentId.trim().length === 0 ||
+			enrollmentId.length > 256
+		)
+			return { kind: "denied", response: error("invalid_input", "task.dag authorization is invalid") };
+		if ("accepted" in input || "pass" in input || "receipt" in input)
+			return { kind: "denied", response: error("invalid_input", "public verification material is not authority") };
+		if (input.worktrees !== undefined) {
+			if (!Array.isArray(input.worktrees) || input.worktrees.length === 0)
+				return { kind: "denied", response: error("invalid_input", "worktrees are invalid") };
+			if (
+				input.worktrees.some(
+					value => typeof value !== "string" || !path.isAbsolute(value) || path.normalize(value) !== value,
+				)
+			)
+				return { kind: "denied", response: error("invalid_input", "worktrees are invalid") };
+		}
+		if (input.aliases !== undefined) {
+			if (!Array.isArray(input.aliases))
+				return { kind: "denied", response: error("invalid_input", "aliases are invalid") };
+			if (
+				input.aliases.some(
+					value =>
+						typeof value !== "string" || value.length === 0 || path.normalize(value) !== path.resolve(value),
+				)
+			)
+				return { kind: "denied", response: error("invalid_input", "aliases are invalid") };
+		}
+		let allowed = false;
+		try {
+			allowed = (await this.verifyMasterCapability(ownerSessionId, masterCapability, attestationEpoch)).allowed;
+		} finally {
+			if (typeof input.masterCapability === "string") input.masterCapability = "";
+		}
+		if (!allowed)
+			return { kind: "denied", response: error("spawn_failed", "master capability verification was denied") };
+		const worktrees = Array.isArray(input.worktrees)
+			? input.worktrees.filter((value): value is string => typeof value === "string" && value.length > 0)
+			: [controlRoot];
+		const aliases = Array.isArray(input.aliases)
+			? input.aliases.filter((value): value is string => typeof value === "string" && value.length > 0)
+			: undefined;
+		return {
+			kind: "verified",
+			ownerSessionId,
+			attestationEpoch,
+			controlRoot,
+			enrollmentId,
+			worktrees: worktrees.length > 0 ? worktrees : [controlRoot],
+			...(aliases && aliases.length > 0 ? { aliases } : {}),
+		};
+	}
+
+	#managedPublic(
+		stateRevision: number,
+		graphs: Array<{ id: string; revision: number; attempts: ManagedTaskAttempt[] }>,
+	): Record<string, unknown> {
+		return {
+			stateRevision,
+			graphs: graphs.map(graph => ({
+				id: graph.id,
+				revision: graph.revision,
+				attempts: graph.attempts.length,
+				nativeRefs: graph.attempts.map(attempt => attempt.native.identity),
+				fences: graph.attempts.map(attempt => attempt.fence),
+				validations: graph.attempts.map(attempt => attempt.validation),
+				accepted: graph.attempts.map(attempt => attempt.accepted !== null),
+			})),
+		};
+	}
+
+	async #managedDefine(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (
+			typeof input.expectedRevision !== "number" ||
+			!Number.isSafeInteger(input.expectedRevision) ||
+			input.expectedRevision < 0
+		)
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string" || input.graphId.trim().length === 0)
+			return error("invalid_input", "graphId is required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			let rootWasEstablished = false;
+			try {
+				rootWasEstablished = (await loadManagedEnrollmentRecord(this.settings.agentDir)).establishedRoots.includes(
+					binding.controlRoot,
+				);
+			} catch {
+				throw new Error("native managed evidence exists");
+			}
+			// Publish the enrollment before the first domain snapshot.  The index is
+			// the recovery root list, so this ordering leaves only a recoverable
+			// stale index entry if the process dies before the state publication.
+			await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
+			const result = await transactManagedTaskDomain(
+				{
+					binding,
+					expectedRevision: input.expectedRevision,
+					...(input.expectedRevision === 0
+						? {
+								assertNoManagedEvidence: async () => {
+									let enrolled: ManagedEnrollmentRecord;
+									try {
+										enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
+									} catch {
+										throw new Error("native managed evidence exists");
+									}
+									if (
+										rootWasEstablished ||
+										enrolled.establishedRoots.includes(binding.controlRoot) ||
+										enrolled.publishingRoots.includes(binding.controlRoot) ||
+										(enrolled.byRoot[binding.controlRoot] ?? []).length > 0
+									)
+										throw new Error("native managed evidence exists");
+									await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
+								},
+								beforeFirstPublication: async () => {
+									await markManagedEnrollmentPublishing(this.settings.agentDir, binding.controlRoot);
+								},
+								onFirstPublication: async () => {
+									await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
+								},
+								onFirstPublicationAborted: async () => {
+									await markManagedEnrollmentPending(this.settings.agentDir, binding.controlRoot);
+								},
+							}
+						: {}),
+				},
+				async state =>
+					defineManagedTaskGraph(state, {
+						id: input.graphId as string,
+						owner: auth.ownerSessionId,
+						nodes: input.nodes,
+					}),
+			);
+			await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
+			return {
+				ok: true,
+				result: {
+					...this.#managedPublic(result.state.state_revision, result.state.graphs),
+					graphId: result.result.id,
+				},
+			};
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed define failed");
+		}
+	}
+
+	async #managedAdvance(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
+		if (!idempotencyKey || idempotencyKey.length > 512)
+			return error("invalid_input", "idempotencyKey is required for task.dag advance");
+		if (
+			typeof input.expectedRevision !== "number" ||
+			!Number.isSafeInteger(input.expectedRevision) ||
+			input.expectedRevision < 0
+		)
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string" || typeof input.nodeId !== "string")
+			return error("invalid_input", "graphId and nodeId are required");
+		const maxAdmissions = input.maxAdmissions === undefined ? 1 : input.maxAdmissions;
+		if (typeof maxAdmissions !== "number" || !Number.isSafeInteger(maxAdmissions) || maxAdmissions < 1)
+			return error("invalid_input", "maxAdmissions is invalid");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const scopedIdentity = await deriveScopedIdempotencyIdentity(
+				this.settings.agentDir,
+				"session.spawn",
+				idempotencyKey,
+				binding.controlRoot,
+			);
+			const ordinaryAliases = await Promise.all([
+				deriveIdempotencyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey),
+				deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey),
+			]);
+			const authority = this.#spawnAuthority;
+			if (!authority) return error("unavailable", "spawn authority is unavailable");
+			const requestHash = managedIdentity({
+				graphId: input.graphId,
+				nodeId: input.nodeId,
+				ownerSessionId: auth.ownerSessionId,
+				controlRoot: binding.controlRoot,
+			});
+			const active = this.#spawnInFlight.get(scopedIdentity);
+			if (active) {
+				if (active.managedRequestHash !== requestHash)
+					return error("idempotency_conflict", "idempotency key conflicts with a live managed task.dag advance");
+				return await active.completion;
+			}
+			const reserved = await transactManagedTaskDomain(
+				{ binding, expectedRevision: input.expectedRevision },
+				async state => {
+					const graph = state.graphs.find(item => item.id === input.graphId);
+					if (!graph) throw new Error("graph owner mismatch");
+					const node = graph.nodes.find(item => item.definition.id === input.nodeId);
+					if (!node) throw new Error("node not ready");
+					const workspace = path.resolve(node.definition.workspace);
+					if (typeof input.cwd === "string" && input.cwd.length > 0 && path.resolve(input.cwd) !== workspace)
+						throw new Error("cwd must match admitted workspace");
+					const prior = state.graphs
+						.flatMap(item => item.attempts)
+						.find(
+							attempt =>
+								!attempt.retired &&
+								attempt.native.key === idempotencyKey &&
+								attempt.native.requestHash === requestHash &&
+								attempt.nodeId === input.nodeId &&
+								attempt.id === `attempt-${idempotencyKey}`,
+						);
+					const admitted = await observeOrAdmitManagedTask(state, {
+						graphId: graph.id,
+						owner: auth.ownerSessionId,
+						nodeId: input.nodeId as string,
+						attemptId: `attempt-${idempotencyKey}`,
+						native: {
+							key: idempotencyKey,
+							identity: prior?.native.identity ?? scopedIdentity,
+							requestHash,
+						},
+					});
+					if (
+						!(await authority.reserveManagedKeyAliases(
+							ordinaryAliases,
+							admitted.nativeIdentity,
+							binding.controlRoot,
+						))
+					)
+						throw new Error("idempotency key conflicts with an existing ordinary session.spawn claim");
+					return admitted;
+				},
+			);
+			const attemptRef = reserved.result;
+			if (
+				!managedAttemptRefMatches(
+					attemptRef,
+					reserved.state.graphs.flatMap(g => g.attempts).find(a => a.id === attemptRef.attemptId)!,
+					binding,
+				)
+			)
+				return error("spawn_failed", "managed attempt ref mismatch");
+			const activeAfterAdmission = this.#spawnInFlight.get(attemptRef.nativeIdentity);
+			if (activeAfterAdmission) {
+				if (activeAfterAdmission.managedRequestHash !== requestHash)
+					return error("idempotency_conflict", "idempotency key conflicts with a live managed task.dag advance");
+				return await activeAfterAdmission.completion;
+			}
+			const node = reserved.state.graphs
+				.find(graph => graph.id === attemptRef.graphId)
+				?.nodes.find(item => item.definition.id === attemptRef.nodeId);
+			const persisted = reserved.state.graphs
+				.flatMap(graph => graph.attempts)
+				?.find(item => item.id === attemptRef.attemptId);
+			if (!node || !persisted) return error("spawn_failed", "admitted node missing");
+			this.#managedAttempts.set(attemptRef.nativeIdentity, attemptRef);
+			const spawnAdmission: SpawnAdmissionInput = {
+				task: node.definition.task,
+				masterCapability: "",
+				ownerSessionId: auth.ownerSessionId,
+				attestationEpoch: auth.attestationEpoch,
+				cwd: path.resolve(node.definition.workspace),
+				managedAttempt: attemptRef,
+				managedBinding: binding,
+				managedNativeVector: managedNativeVector(persisted),
+			};
+			const completion = Promise.withResolvers<BrokerResponse>();
+			const inFlight: SpawnInFlight = {
+				completion: completion.promise,
+				resolve: completion.resolve,
+				managedRequestHash: requestHash,
+			};
+			this.#spawnInFlight.set(attemptRef.nativeIdentity, inFlight);
+			this.#spawnTasks.set(inFlight, spawnAdmission.task);
+			let becameOwner = false;
+			let completionResult: BrokerResponse = error("spawn_failed", "managed advance did not complete");
+			try {
+				await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot, attemptRef.nativeIdentity);
+				const driven = await this.#driveVerifiedSpawn(
+					attemptRef.nativeIdentity,
+					spawnAdmission,
+					inFlight,
+					owner => {
+						becameOwner = owner;
+					},
+				);
+				completionResult = driven;
+				if (!driven.ok) return driven;
+				const liveRevision = await currentManagedRevision(binding);
+				completionResult = {
+					ok: true,
+					result: {
+						...this.#managedPublic(liveRevision, reserved.state.graphs),
+						attemptId: attemptRef.attemptId,
+						nativeIdentity: attemptRef.nativeIdentity,
+						spawn: driven.result,
+					},
+				};
+				return completionResult;
+			} catch (caught) {
+				completionResult = error(
+					"spawn_failed",
+					caught instanceof Error ? caught.message : "managed advance failed",
+				);
+				throw caught;
+			} finally {
+				completion.resolve(completionResult);
+				this.#spawnTasks.delete(inFlight);
+				if (this.#spawnInFlight.get(attemptRef.nativeIdentity) === inFlight)
+					this.#spawnInFlight.delete(attemptRef.nativeIdentity);
+				if (becameOwner) await this.#spawnAuthority?.releaseOwner(attemptRef.nativeIdentity);
+			}
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed advance failed");
+		}
+	}
+
+	async #managedStatus(input: Record<string, unknown>): Promise<BrokerResponse> {
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const target = managedTaskDomainPath(binding.controlRoot);
+			const state = await withWorkflowStateLock(
+				target,
+				async () => {
+					const read = await readExistingStateForMutation(target);
+					if (read.kind !== "valid") throw new Error("established authority missing");
+					const parsed = validateManagedTaskDomain(read.value);
+					if (managedIdentity(parsed.binding) !== managedIdentity(binding))
+						throw new Error("domain binding mismatch");
+					return parsed;
+				},
+				{ cwd: binding.controlRoot, privateDurable: { directory: path.dirname(target) } },
+			);
+			return { ok: true, result: this.#managedPublic(state.state_revision, state.graphs) };
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed status failed");
+		}
+	}
+
+	async #managedRevise(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (typeof input.expectedRevision !== "number" || !Number.isSafeInteger(input.expectedRevision))
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string") return error("invalid_input", "graphId is required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		if (this.#managedEnrollmentFailed || this.#managedFailedRoots.has(auth.controlRoot))
+			return error("terminal_uncertain", "managed enrollment membership is unprovable; revision was not applied");
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const result = await transactManagedTaskDomain(
+				{ binding, expectedRevision: input.expectedRevision },
+				async state => {
+					const graph = state.graphs.find(item => item.id === input.graphId);
+					if (!graph || graph.owner !== auth.ownerSessionId) throw new Error("graph owner mismatch");
+					return reviseManagedTaskGraph(state, graph, input.nodes);
+				},
+			);
+			if (!(await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result)))
+				return error("terminal_uncertain", "managed child close remains unresolved after graph revision");
+			return {
+				ok: true,
+				result: {
+					...this.#managedPublic(result.state.state_revision, result.state.graphs),
+					affected: result.result,
+				},
+			};
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed revise failed");
+		}
+	}
+
+	async #managedCancel(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (typeof input.expectedRevision !== "number" || !Number.isSafeInteger(input.expectedRevision))
+			return error("invalid_input", "expectedRevision is required");
+		if (typeof input.graphId !== "string") return error("invalid_input", "graphId is required");
+		const ids = Array.isArray(input.nodeIds)
+			? input.nodeIds.filter((value): value is string => typeof value === "string")
+			: [];
+		if (ids.length === 0) return error("invalid_input", "nodeIds are required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		if (this.#managedEnrollmentFailed || this.#managedFailedRoots.has(auth.controlRoot))
+			return error(
+				"terminal_uncertain",
+				"managed enrollment membership is unprovable; cancellation was not applied",
+			);
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const result = await transactManagedTaskDomain(
+				{ binding, expectedRevision: input.expectedRevision },
+				async state => {
+					const graph = state.graphs.find(item => item.id === input.graphId);
+					if (!graph || graph.owner !== auth.ownerSessionId) throw new Error("graph owner mismatch");
+					return cancelManagedTasks(graph, ids);
+				},
+			);
+			if (!(await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result)))
+				return error("terminal_uncertain", "managed child close remains unresolved after cancellation");
+			return {
+				ok: true,
+				result: {
+					...this.#managedPublic(result.state.state_revision, result.state.graphs),
+					affected: result.result,
+				},
+			};
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed cancel failed");
+		}
+	}
+	async #managedVerify(input: Record<string, unknown>): Promise<BrokerResponse> {
+		if (typeof input.graphId !== "string" || typeof input.nodeId !== "string")
+			return error("invalid_input", "graphId and nodeId are required");
+		const auth = await this.#verifiedManagedOwner(input);
+		if (auth.kind === "denied") return auth.response;
+		try {
+			const binding = await createManagedDomainBinding({
+				controlRoot: auth.controlRoot,
+				agentDir: this.settings.agentDir,
+				enrollmentId: auth.enrollmentId,
+				worktrees: auth.worktrees,
+				...(auth.aliases ? { aliases: auth.aliases } : {}),
+			});
+			const verified = await verifyManagedTaskAttempt({
+				binding,
+				graphId: input.graphId,
+				nodeId: input.nodeId,
+				owner: auth.ownerSessionId,
+			});
+			return { ok: true, result: { ...verified, commandsStarted: verified.started } };
+		} catch (caught) {
+			return error("spawn_failed", caught instanceof Error ? caught.message : "managed verify failed");
 		}
 	}
 
@@ -1724,14 +2600,39 @@ export class Broker {
 					...(admission.modelId === undefined ? {} : { modelId: admission.modelId }),
 					...(admission.modelPreset === undefined ? {} : { modelPreset: admission.modelPreset }),
 				});
-				current = (
-					await store.persistTransition(lifecycleIdentity, {
-						claimId: current.claimId,
-						from: "prepared",
-						to: "substrate_starting",
-						childId: prep.childId,
-					})
-				).claim;
+				if (admission.managedAttempt && admission.managedBinding && admission.managedNativeVector) {
+					try {
+						current = await withManagedNativeEffectAuthorized(
+							admission.managedBinding,
+							admission.managedAttempt.nativeIdentity,
+							admission.managedNativeVector,
+							"launch",
+							async () =>
+								(
+									await store.persistTransition(lifecycleIdentity, {
+										claimId: current.claimId,
+										from: "prepared",
+										to: "substrate_starting",
+										childId: prep.childId,
+									})
+								).claim,
+						);
+					} catch (caught) {
+						return error(
+							"spawn_failed",
+							caught instanceof Error ? caught.message : "managed native fence denied",
+						);
+					}
+				} else {
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "prepared",
+							to: "substrate_starting",
+							childId: prep.childId,
+						})
+					).claim;
+				}
 				inFlight.phase = current.state;
 				const launched = await provider.launch({
 					childSessionId: prep.childId,
@@ -1804,6 +2705,56 @@ export class Broker {
 						substrateProof: launched.proof,
 					})
 				).claim;
+				inFlight.phase = current.state;
+				if (admission.managedAttempt && admission.managedBinding) {
+					let attempt: ManagedTaskAttempt | undefined;
+					try {
+						attempt = await inspectManagedAttemptByNativeIdentity(
+							admission.managedBinding,
+							admission.managedAttempt.nativeIdentity,
+						);
+					} catch {
+						// A failed fence read cannot prove the launch is still authorized.
+					}
+					if (attempt?.fence !== "current" || attempt?.retired) {
+						const release = await this.#releaseUnownedSubstrate(provider, launched.proof);
+						let gone = release === "gone";
+						if (release === "closed") {
+							try {
+								gone = (await provider.verify(launched.proof)) === "gone";
+							} catch {
+								gone = false;
+							}
+						}
+						if (gone) {
+							current = (
+								await store.persistTransition(lifecycleIdentity, {
+									claimId: current.claimId,
+									from: "substrate_starting",
+									to: "closed",
+								})
+							).claim;
+							inFlight.phase = current.state;
+							launchedProof = undefined;
+							return error("spawn_failed", "managed attempt was fenced while its child was launching");
+						}
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launched.proof.substrateKind,
+									code: "managed_child_close_unresolved",
+									message: "managed child close could not be proven after its attempt was fenced",
+								},
+							})
+						).claim;
+						inFlight.phase = current.state;
+						launchedProof = undefined;
+						return error("terminal_uncertain", "managed child close is unresolved after its attempt was fenced");
+					}
+				}
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
@@ -1949,26 +2900,59 @@ export class Broker {
 			}
 			const childId = current.childId;
 			const preparedSeed = current.seed;
+			const preSendLeaseEpoch = current.preSendLease.epoch;
+			const exactPinnedRegistration = pinnedRegistration;
 			// Dispatch without a complete pin must never consume the pre-send lease.
-			if (pinnedRegistration === undefined)
+			if (exactPinnedRegistration === undefined)
 				return error("terminal_uncertain", "session.spawn endpoint pin is unavailable before dispatch");
-			current = (
-				await store.persistTransition(lifecycleIdentity, {
-					claimId: current.claimId,
-					from: "seed_prepared",
-					to: "dispatching",
-					leaseEpoch: current.preSendLease.epoch,
-					seed: { ...preparedSeed, phase: "dispatching" },
-				})
-			).claim;
-			inFlight.phase = current.state;
-			handedOff = true;
-			const dispatched = await this.#spawnPromptLayer.dispatch({
-				sessionId: childId,
-				task: admission.task,
-				clientRef: preparedSeed.clientRef,
-				pinned: pinnedRegistration,
-			});
+			const dispatchSeed = async (): Promise<SpawnPromptDispatch> =>
+				await this.#spawnPromptLayer.dispatch({
+					sessionId: childId,
+					task: admission.task,
+					clientRef: preparedSeed.clientRef,
+					pinned: exactPinnedRegistration,
+				});
+			let dispatched: SpawnPromptDispatch;
+			if (admission.managedAttempt && admission.managedBinding && admission.managedNativeVector) {
+				try {
+					dispatched = await withManagedNativeEffectAuthorized(
+						admission.managedBinding,
+						admission.managedAttempt.nativeIdentity,
+						admission.managedNativeVector,
+						"seed",
+						async () => {
+							current = (
+								await store.persistTransition(lifecycleIdentity, {
+									claimId: current.claimId,
+									from: "seed_prepared",
+									to: "dispatching",
+									leaseEpoch: preSendLeaseEpoch,
+									seed: { ...preparedSeed, phase: "dispatching" },
+								})
+							).claim;
+							inFlight.phase = current.state;
+							handedOff = true;
+							return await dispatchSeed();
+						},
+					);
+				} catch (caught) {
+					if (handedOff) throw caught;
+					return error("spawn_failed", caught instanceof Error ? caught.message : "managed native fence denied");
+				}
+			} else {
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "seed_prepared",
+						to: "dispatching",
+						leaseEpoch: current.preSendLease.epoch,
+						seed: { ...preparedSeed, phase: "dispatching" },
+					})
+				).claim;
+				inFlight.phase = current.state;
+				handedOff = true;
+				dispatched = await dispatchSeed();
+			}
 			if (dispatched.kind === "accepted") {
 				current = (
 					await store.persistTransition(lifecycleIdentity, {
@@ -2077,6 +3061,10 @@ export class Broker {
 					}
 				}
 			}
+			if (ambiguous && admission.managedBinding)
+				await recordManagedNativeObservation(admission.managedBinding, lifecycleIdentity, "unknown").catch(
+					() => undefined,
+				);
 			return ambiguous
 				? error(
 						"terminal_uncertain",
@@ -2276,6 +3264,148 @@ export class Broker {
 		}
 	}
 
+	async #restoreManagedAttempts(): Promise<void> {
+		this.#managedAttempts.clear();
+		this.#managedFailedRoots.clear();
+		this.#managedEnrollmentFailed = false;
+		try {
+			const restored = await restoreManagedAttemptRefs(this.settings.agentDir);
+			for (const ref of restored.refs) this.#managedAttempts.set(ref.nativeIdentity, ref);
+			for (const root of restored.failedRoots) this.#managedFailedRoots.add(root);
+		} catch {
+			this.#managedEnrollmentFailed = true;
+		}
+	}
+
+	async #observeManagedNative(
+		lifecycleIdentity: string,
+		worker: "no-effect" | "authorized" | "unknown" | "closed",
+	): Promise<void> {
+		const ref = this.#managedAttempts.get(lifecycleIdentity);
+		if (!ref) return;
+		const binding = await loadManagedDomainBinding(ref.controlRoot);
+		if (!binding) return;
+		await recordManagedNativeObservation(binding, lifecycleIdentity, worker);
+	}
+
+	async #reconcileManagedNativeLifetimes(): Promise<void> {
+		const store = this.#spawnAuthority;
+		if (!store || this.#managedEnrollmentFailed) return;
+		for (const ref of this.#managedAttempts.values()) {
+			if (this.#managedFailedRoots.has(ref.controlRoot)) continue;
+			const binding = await loadManagedDomainBinding(ref.controlRoot);
+			if (!binding) throw new Error("managed attempt domain is unavailable during startup reconciliation");
+			const attempt = await inspectManagedAttemptByNativeIdentity(binding, ref.nativeIdentity);
+			if (!attempt) throw new Error("managed attempt authority is missing during startup reconciliation");
+			const claim = store.claim(ref.nativeIdentity);
+			if (attempt.fence !== "current" || attempt.retired) {
+				if (!claim) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "prepared") {
+					await store.persistTransition(ref.nativeIdentity, {
+						claimId: claim.claimId,
+						from: "prepared",
+						to: "closed",
+					});
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "closed" && !store.authority(ref.nativeIdentity) && !claim.substrateProof) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "pre_send_rejected" && !store.authority(ref.nativeIdentity) && !claim.substrateProof) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+				if (outcome !== "closed") {
+					await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+					throw new Error("fenced managed child could not be exactly closed during startup reconciliation");
+				}
+				await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				continue;
+			}
+			if (!claim) {
+				await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				continue;
+			}
+			if (claim.state === "uncertain" || claim.state === "dispatching" || claim.state === "substrate_starting") {
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+				continue;
+			}
+			if (claim.state === "closed") {
+				const authority = store.authority(ref.nativeIdentity);
+				if (authority?.closeState === "closed" || (!authority && claim.substrateProof))
+					await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				else if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+				continue;
+			}
+			if (claim.state === "pre_send_rejected") {
+				const authority = store.authority(ref.nativeIdentity);
+				if (!authority && claim.substrateProof) {
+					const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+					await this.#observeManagedNative(ref.nativeIdentity, outcome === "closed" ? "closed" : "unknown");
+				} else if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+				continue;
+			}
+			if (claim.state === "prepared") continue;
+			await this.#observeManagedNative(ref.nativeIdentity, "authorized");
+		}
+	}
+
+	async #closeManagedAttempts(controlRoot: string, graphId: string, nodeIds: string[]): Promise<boolean> {
+		const affected = [...this.#managedAttempts.values()].filter(
+			ref => ref.controlRoot === controlRoot && ref.graphId === graphId && nodeIds.includes(ref.nodeId),
+		);
+		let allClosed = true;
+		for (const ref of affected) {
+			const inFlight = this.#spawnInFlight.get(ref.nativeIdentity);
+			const waitMs = managedCloseWaitOverridesForTest.get(this) ?? MANAGED_CLOSE_WAIT_MS;
+			if (inFlight && !(await settlesWithin(inFlight.completion, waitMs))) {
+				this.#scheduleManagedCloseAfterFlight(ref, inFlight);
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+				allClosed = false;
+				continue;
+			}
+			const claim = this.#spawnAuthority?.claim(ref.nativeIdentity);
+			const authority = this.#spawnAuthority?.authority(ref.nativeIdentity);
+			if (!claim || (claim.state === "pre_send_rejected" && !authority && !claim.substrateProof)) {
+				try {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				} catch {
+					await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+					allClosed = false;
+				}
+				continue;
+			}
+			const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+			if (outcome === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
+			else {
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+				allClosed = false;
+			}
+		}
+		return allClosed;
+	}
+
+	#scheduleManagedCloseAfterFlight(ref: ManagedAttemptRef, inFlight: SpawnInFlight): void {
+		void inFlight.completion
+			.then(async () => {
+				const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+				if (outcome === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+			})
+			.catch(async caught => {
+				logger.warn(`sdk broker: deferred managed child close failed for ${ref.nativeIdentity}: ${String(caught)}`);
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+			});
+	}
+
 	async #awaitSpawnHostRegistration(input: {
 		childId: string;
 		cwd: string;
@@ -2467,7 +3597,10 @@ export class Broker {
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
 		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
-		if (outcome === "closed") return { ok: true, result: { code: "spawn_child_closed", sessionId } };
+		if (outcome === "closed") {
+			await this.#observeManagedNative(claim.lifecycleIdentity, "closed").catch(() => undefined);
+			return { ok: true, result: { code: "spawn_child_closed", sessionId } };
+		}
 		if (outcome === "uncertain")
 			return error("terminal_uncertain", "session.close substrate identity could not be re-proven");
 		return error("close_refused", "session.close could not complete for the spawned child");
@@ -2484,8 +3617,47 @@ export class Broker {
 		try {
 			const claim = store.claim(lifecycleIdentity);
 			let authority = store.authority(lifecycleIdentity);
-			if (!claim || !authority) return "retained";
-			if (claim.state === "closed" && authority.closeState === "closed") return "closed";
+			if (!claim) return "retained";
+			if (claim.state === "closed" && (!authority || authority.closeState === "closed")) return "closed";
+			if (!authority) {
+				if (!claim.substrateProof || !claim.childId) return "retained";
+				const provider = this.#spawnSubstrateProvider();
+				const proof = claim.substrateProof;
+				let verdict: "verified" | "mismatch" | "gone";
+				try {
+					verdict = await provider.verify(proof);
+				} catch {
+					verdict = "mismatch";
+				}
+				let gone = verdict === "gone";
+				if (verdict === "verified") {
+					try {
+						gone = (await provider.close(proof)).ok && (await provider.verify(proof)) === "gone";
+					} catch {
+						gone = false;
+					}
+				}
+				if (!gone) {
+					if (claim.state !== "uncertain")
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: claim.claimId,
+							from: claim.state,
+							to: "uncertain",
+							failure: {
+								substrateKind: proof.substrateKind,
+								code: "child_close_unresolved",
+								message: "session.spawn child close could not be proven",
+							},
+						});
+					return verdict === "mismatch" ? "uncertain" : "retained";
+				}
+				await store.persistTransition(lifecycleIdentity, {
+					claimId: claim.claimId,
+					from: claim.state,
+					to: "closed",
+				});
+				return "closed";
+			}
 			if (authority.closeState === "closed") return "closed";
 			const provider = this.#spawnSubstrateProvider();
 			const proof = spawnProofFromAuthority(authority);
@@ -2512,13 +3684,11 @@ export class Broker {
 					})
 				).authority!;
 			}
-			if (verdict === "verified") {
+			if (verdict === "verified" || verdict === "gone") {
 				const closedSubstrate = await provider.close(proof);
 				if (!closedSubstrate.ok) return "retained";
-				// Signal delivery is not terminal evidence: only a second exact proof
-				// that observes this substrate gone permits the durable close.
 				if ((await provider.verify(proof)) !== "gone") return "retained";
-			}
+			} else return "retained";
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
 			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };
 			const currentClaim = store.claim(lifecycleIdentity);
@@ -2544,6 +3714,96 @@ export class Broker {
 	/** Deterministic single reap pass; used by maintenance paths and tests. */
 	async reapSpawnOrphansOnce(): Promise<void> {
 		await this.#reapSpawnOrphans();
+	}
+
+	/**
+	 * Grace before an idle broker exits. The clock starts only after the index has
+	 * already stopped proving any host live, so this grace is time on top of that
+	 * freshness window, never a substitute for it.
+	 */
+	#abandonedGraceMs(): number {
+		return abandonedGraceOverridesForTest.get(this) ?? this.settings.abandonedGraceMs;
+	}
+
+	/**
+	 * What the index proves about the hosts using this agent directory. Liveness is
+	 * judged on read -- fresh checkpoint, live pid, matching incarnation -- so a host
+	 * that died without closing stops proving it without help. A row that is not live
+	 * is absence only once the OS confirms the process is gone: an inconclusive
+	 * reading is never death proof on any platform, and a pid that still exists but
+	 * cannot be matched to the recorded incarnation leaves the host undecided.
+	 */
+	async #sessionHostLiveness(): Promise<"live" | "absent" | "unknown"> {
+		try {
+			await this.index.refreshIfChanged();
+		} catch (error) {
+			logger.warn(`sdk broker: abandonment probe could not read the session index: ${String(error)}`);
+			return "unknown";
+		}
+		for (const row of this.index.listSessionIdentities()) {
+			if (row.endpointGeneration <= 0) continue;
+			if (row.live) return "live";
+			// The tri-state observer keeps positive absence separate from every
+			// inconclusive outcome, which is the difference between reaping a broker and
+			// killing one out from under a host this platform simply cannot confirm.
+			const observed = observeProcessIncarnation(row.pid);
+			if (observed.status === "unknown") return "unknown";
+			if (observed.status === "absent") continue;
+			const recorded = row.hostIncarnation ?? row.processIncarnation;
+			if (recorded === undefined) return "unknown";
+			if (observed.incarnation === recorded) return "live";
+			// The pid names another process now: the host that registered it is gone.
+		}
+		return "absent";
+	}
+
+	/** Whether any client currently holds a transport connection to this broker. */
+	#hasAttachedClient(): boolean {
+		return (this.#transport?.clientCount ?? 0) > 0;
+	}
+
+	/** Whether this broker still owns a spawn authority it must keep serving. */
+	#hasOpenSpawnAuthority(): boolean {
+		const store = this.#spawnAuthority;
+		if (!store) return false;
+		for (const claim of store.claims()) {
+			const authority = store.authority(claim.lifecycleIdentity);
+			if (authority && (authority.closeState === "active" || authority.closeState === "close_requested"))
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Ends a broker nobody is left to use. A client that dies without closing leaves
+	 * no live session host behind, and nothing else reaps this process: without this
+	 * pass it would hold its port, its publication, and its lock until the machine
+	 * reboots. The clock only runs while absence is confirmed and no client holds a
+	 * connection, and any live host, attached client, open authority, or undecided
+	 * reading disarms it, so a slow reattach never races the grace. Brokers an
+	 * operator supervises never reap themselves at all.
+	 */
+	async #reapSelfIfAbandoned(): Promise<void> {
+		if (!this.settings.reapWhenAbandoned) return;
+		if (this.#stopping || this.#completionTask !== null || this.#fenceReason !== null) return;
+		if (this.#abandonedReapInFlight) return;
+		this.#abandonedReapInFlight = true;
+		try {
+			const liveness = await this.#sessionHostLiveness();
+			const now = Date.now();
+			if (liveness !== "absent" || this.#hasAttachedClient() || this.#hasOpenSpawnAuthority()) {
+				this.#abandonedAt = null;
+				return;
+			}
+			if (this.#abandonedAt === null) {
+				this.#abandonedAt = now;
+				return;
+			}
+			if (now - this.#abandonedAt < this.#abandonedGraceMs()) return;
+			await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root", "abandoned");
+		} finally {
+			this.#abandonedReapInFlight = false;
+		}
 	}
 
 	async #reapSpawnOrphans(): Promise<void> {
@@ -2628,7 +3888,12 @@ export class Broker {
 	}
 	async #lockSnapshot(raw: string, lockIdentity: string): Promise<BrokerLockSnapshot> {
 		try {
-			const lock = JSON.parse(raw) as { ownerId?: unknown; pid?: unknown };
+			const lock = JSON.parse(raw) as {
+				ownerId?: unknown;
+				pid?: unknown;
+				incarnation?: unknown;
+				ownerHostId?: unknown;
+			};
 			if (
 				typeof lock.ownerId === "string" &&
 				lock.ownerId.length > 0 &&
@@ -2636,7 +3901,14 @@ export class Broker {
 				Number.isInteger(lock.pid) &&
 				lock.pid > 0
 			)
-				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}`, lockIdentity };
+				return {
+					ownerId: lock.ownerId,
+					pid: lock.pid,
+					incarnation: isProcessIncarnation(lock.incarnation) ? lock.incarnation : undefined,
+					ownerHostId: typeof lock.ownerHostId === "string" ? lock.ownerHostId : undefined,
+					identity: `owner:${lock.ownerId}`,
+					lockIdentity,
+				};
 		} catch {}
 		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}`, lockIdentity };
 	}
@@ -2668,34 +3940,102 @@ export class Broker {
 		}
 		return this.#lockSnapshot(raw, lockIdentity);
 	}
-	async #createLock(): Promise<void> {
-		await fs.mkdir(this.#lock, { mode: 0o700 });
+	async #withLockReclaimGuard<T>(operation: () => Promise<T>): Promise<T> {
+		const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+		return withFileLock(`${this.#lock}.reclaim`, operation, {
+			...hostIdentity,
+			onContended: () => brokerLockReclaimHooksForTest.get(this)?.onContended?.(),
+		});
+	}
+	async #hasCanonicalLockOwnership(): Promise<boolean> {
+		if (!this.#ownedLockIdentity || !this.#ownedLockIncarnation) return false;
 		try {
-			const incarnation = brokerProcessIncarnation(process.pid);
-			// A minimal, non-secret receipt delta for D9 stale-artifact detach
-			// (sequenced follow-up): the OS incarnation and a digest of the exact
-			// resolved root this lock authorizes, so a later positive-death check can
-			// cross-bind this owner record against the discovery record it authored
-			// without re-deriving anything from file content or adding new identity.
-			const rootDigest = await canonicalServiceRootDigest(this.settings.agentDir);
-			await fs.writeFile(
-				this.#lockRecordPath(),
-				JSON.stringify({
-					version: 1,
-					ownerId: this.#owner,
-					pid: process.pid,
-					acquiredAt: Date.now(),
-					...(incarnation ? { incarnation } : {}),
-					rootDigest,
-				}),
-				{ flag: "wx", mode: 0o600 },
+			const current = await this.#readLock();
+			return (
+				current?.identity === `owner:${this.#owner}` &&
+				current.lockIdentity === this.#ownedLockIdentity &&
+				current.pid === process.pid &&
+				current.incarnation === this.#ownedLockIncarnation
 			);
-		} catch (e) {
-			try {
-				await fs.rmdir(this.#lock);
-			} catch {}
-			throw e;
+		} catch {
+			return false;
 		}
+	}
+	#removeCreatedLockGeneration(
+		lockIdentity: { dev: string; ino: string },
+		parentIdentity: { dev: bigint; ino: bigint },
+		ownerHash?: string,
+	): void {
+		const captured = snapshotDirectoryTree(this.#lock);
+		const snapshot = captured.snapshot;
+		const root = snapshot?.entries.find(entry => entry.relativePath === "");
+		if (
+			!captured.ok ||
+			!snapshot ||
+			root?.kind !== "directory" ||
+			snapshot.rootDev !== lockIdentity.dev ||
+			snapshot.rootIno !== lockIdentity.ino
+		)
+			return;
+
+		const owner = snapshot.entries.find(entry => entry.relativePath === BROKER_LOCK_RECORD);
+		const exactOwner =
+			ownerHash !== undefined &&
+			snapshot.entries.length === 2 &&
+			owner?.kind === "file" &&
+			owner.sha256 === ownerHash;
+		if (!exactOwner && snapshot.entries.length !== 1) return;
+
+		exactRemoveDirectoryTree(this.#lock, snapshot, parentIdentity);
+	}
+	async #createLockInsideGuard(): Promise<void> {
+		const rootDigest = await canonicalServiceRootDigest(this.settings.agentDir);
+		const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+		const parent = await fs.lstat(path.dirname(this.#lock), { bigint: true });
+		await fs.mkdir(this.#lock, { mode: 0o700 });
+		let createdLockIdentity: { dev: string; ino: string } | undefined;
+		let createdOwnerHash: string | undefined;
+		try {
+			const lockStat = await fs.lstat(this.#lock, { bigint: true });
+			if (!lockStat.isDirectory()) throw new Error("SDK broker lock is not a directory.");
+			createdLockIdentity = { dev: String(lockStat.dev), ino: String(lockStat.ino) };
+			const incarnation = brokerProcessIncarnation(process.pid);
+			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
+			const ownerRecord = JSON.stringify({
+				version: 1,
+				ownerId: this.#owner,
+				pid: process.pid,
+				acquiredAt: Date.now(),
+				incarnation,
+				ownerHostId: hostIdentity.ownerHostId,
+				rootDigest,
+			});
+			createdOwnerHash = createHash("sha256").update(ownerRecord).digest("hex");
+			await fs.writeFile(this.#lockRecordPath(), ownerRecord, { flag: "wx", mode: 0o600 });
+			const current = await this.#readLock();
+			if (
+				!current ||
+				current.ownerId !== this.#owner ||
+				current.pid !== process.pid ||
+				current.incarnation !== incarnation
+			)
+				throw new Error("SDK broker lock ownership changed during startup.");
+			this.#ownedLockIdentity = current.lockIdentity;
+			this.#ownedLockIncarnation = incarnation;
+		} catch (error) {
+			try {
+				if (createdLockIdentity)
+					this.#removeCreatedLockGeneration(
+						createdLockIdentity,
+						{ dev: parent.dev, ino: parent.ino },
+						createdOwnerHash,
+					);
+			} catch {}
+			throw error;
+		}
+	}
+	async #createLock(): Promise<void> {
+		await this.#withLockReclaimGuard(() => this.#createLockInsideGuard());
 	}
 	async #waitForBrokerDiscovery(): Promise<BrokerDiscovery | null> {
 		const deadline = Date.now() + BROKER_LOCK_STARTUP_WAIT_MS;
@@ -2706,50 +4046,63 @@ export class Broker {
 		}
 		return readBrokerDiscovery(this.settings.agentDir, this.settings.heartbeatTtlMs);
 	}
-	async #reclaimStaleLock(snapshot: BrokerLockSnapshot): Promise<void> {
-		const current = await this.#readLock();
-		if (
-			!current ||
-			current.identity !== snapshot.identity ||
-			current.lockIdentity !== snapshot.lockIdentity ||
-			(current.pid > 0 && isPidAlive(current.pid))
-		)
-			return;
+	async #reclaimStaleLock(snapshot: BrokerLockSnapshot): Promise<boolean> {
+		return await this.#withLockReclaimGuard(async () => {
+			const current = await this.#readLock();
+			const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+			if (
+				!current ||
+				current.identity !== snapshot.identity ||
+				current.lockIdentity !== snapshot.lockIdentity ||
+				isBrokerLockOwnerAlive(current, hostIdentity.ownerHostId)
+			)
+				return false;
+			await brokerLockReclaimHooksForTest.get(this)?.beforeQuarantine?.();
 
-		// Give every reclaimed generation a fresh quarantine name. Older brokers
-		// used only the lock inode hash; if that tombstone survived a crash, the
-		// deterministic name collided forever and left the dead canonical lock in
-		// place. The random suffix preserves no-replace rename semantics without
-		// letting retained cleanup debris block takeover.
-		for (let attempt = 0; attempt < 8; attempt++) {
-			const tombstone = path.join(
-				path.dirname(this.#lock),
-				`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
-			);
-			try {
-				await fs.rename(this.#lock, tombstone);
-				return;
-			} catch (e) {
-				const code = (e as NodeJS.ErrnoException).code;
-				if (code === "EEXIST" || code === "ENOTEMPTY") continue;
-				if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
-				if (code === "EPERM") {
-					try {
-						await fs.lstat(tombstone);
-						continue;
-					} catch (statError) {
-						if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+			// Keep validation, quarantine, and successor lock publication under one
+			// cross-process fence so a stale snapshot can never move a newer lock.
+			for (let attempt = 0; attempt < 8; attempt++) {
+				const tombstone = path.join(
+					path.dirname(this.#lock),
+					`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
+				);
+				try {
+					await fs.rename(this.#lock, tombstone);
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException).code;
+					if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+					if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return false;
+					if (code === "EPERM") {
+						try {
+							await fs.lstat(tombstone);
+							continue;
+						} catch (statError) {
+							if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+						}
 					}
+					throw error;
 				}
-				throw e;
+				try {
+					await this.#createLockInsideGuard();
+					return true;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+					throw error;
+				}
 			}
-		}
-		throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
+			throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
+		});
 	}
 	async #releaseOwnedLock(): Promise<void> {
 		try {
 			const lock = await this.#readLock();
-			if (lock?.ownerId !== this.#owner) return;
+			if (
+				!lock ||
+				lock.ownerId !== this.#owner ||
+				lock.lockIdentity !== this.#ownedLockIdentity ||
+				lock.incarnation !== this.#ownedLockIncarnation
+			)
+				return;
 			await fs.unlink(this.#lockRecordPath());
 			await fs.rmdir(this.#lock);
 		} catch (error) {
@@ -2772,6 +4125,10 @@ export class Broker {
 			logger.warn(`sdk broker: stale lock artifact reap failed: ${String(error)}`);
 		}
 	}
+	#throwIfStartupAborted(): void {
+		if (this.#startupAbortSignal?.aborted)
+			throw new Error("SDK broker startup was interrupted before retained publication.");
+	}
 
 	async start(): Promise<BrokerDiscovery> {
 		if (this.#completionTask) {
@@ -2788,13 +4145,27 @@ export class Broker {
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 		}
 		this.#stopping = false;
+		this.#publicationWatchdogArmed = false;
 		this.#publicationState = "healthy-owned";
+		this.#fenceReason = null;
 		this.#lossAt = null;
 		this.#ambiguousAt = null;
 		this.#publishedAt = null;
+		this.#startedAt = process.hrtime.bigint();
+		this.#ownedLockIdentity = undefined;
+		this.#ownedLockIncarnation = undefined;
 		this.#watchInFlight = false;
+		this.#checkpointInFlight = false;
+		// A restarted instance is a new generation: it holds none of the state the
+		// previous one stopped with, so the abandonment clock it armed (and any reap
+		// still unwinding) must not survive into the generation clients reconnect to.
+		this.#abandonedAt = null;
+		this.#abandonedReapInFlight = false;
+		this.#throwIfStartupAborted();
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
+		this.#throwIfStartupAborted();
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
+		this.#throwIfStartupAborted();
 		for (;;) {
 			try {
 				await this.#createLock();
@@ -2809,53 +4180,109 @@ export class Broker {
 				// clean exit, so name the reason here (#3963).
 				logger.info(
 					`sdk broker: lock contention, yielding to the live broker owner (ownerId=${live.ownerId}, pid=${live.pid}); this process exits without owning discovery`,
+					{ reason: "startup-race-lost", ownerId: live.ownerId, pid: live.pid, exitCode: 0 },
 				);
 				this.discovery = live;
 				return live;
 			}
 			const snapshot = await this.#readLock();
 			if (!snapshot) continue;
-			if (snapshot.pid > 0 && isPidAlive(snapshot.pid)) {
+			const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+			if (isBrokerLockOwnerAlive(snapshot, hostIdentity.ownerHostId)) {
 				const starting = await this.#waitForBrokerDiscovery();
 				if (starting) {
 					logger.info(
 						`sdk broker: lock contention, yielding to the broker that just started (ownerId=${starting.ownerId}, pid=${starting.pid}); this process exits without owning discovery`,
+						{ reason: "startup-race-lost", ownerId: starting.ownerId, pid: starting.pid, exitCode: 0 },
 					);
 					this.discovery = starting;
 					return starting;
 				}
 				const current = await this.#readLock();
-				if (current && current.identity === snapshot.identity && current.pid > 0 && isPidAlive(current.pid)) {
+				if (
+					current &&
+					current.identity === snapshot.identity &&
+					isBrokerLockOwnerAlive(current, hostIdentity.ownerHostId)
+				) {
+					const hostUnqualified = current.ownerHostId === undefined;
+					const foreignHostOwner = !hostUnqualified && current.ownerHostId !== hostIdentity.ownerHostId;
+					let refusal: string;
+					let errorMessage: string;
+					if (hostUnqualified) {
+						refusal = `owner pid ${current.pid} has no host identity; automatic recovery is unsafe for shared agent directories. Stop every broker using this agent directory on all hosts, then follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
+						errorMessage = `Broker lock owner is host-unqualified (pid ${current.pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
+					} else if (foreignHostOwner) {
+						refusal = `owner pid ${current.pid} is attributed to another host; its liveness cannot be verified here`;
+						errorMessage = `Broker lock owner is attributed to a different host (pid ${current.pid}); refusing automatic recovery because its liveness cannot be verified from this host.`;
+					} else {
+						refusal = `live pid ${current.pid} has published no discovery record`;
+						errorMessage = `Broker lock is held by a live owner (pid ${current.pid})`;
+					}
 					logger.warn(
-						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by live pid ${current.pid} that published no discovery record`,
+						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by ${refusal}`,
 					);
-					throw new Error(`Broker lock is held by a live owner (pid ${current.pid})`);
+					throw new Error(errorMessage);
 				}
 				continue;
 			}
-			await this.#reclaimStaleLock(snapshot);
+			if (await this.#reclaimStaleLock(snapshot)) break;
 		}
+		this.#throwIfStartupAborted();
 		// Only the lock holder reaps, so concurrent brokers cannot race the removal.
 		await this.#reapLockArtifacts();
 		try {
-			await this.index.open();
+			this.#throwIfStartupAborted();
+			// Recheck under the broker ownership lock: a restart can be committed while
+			// an ordinary startup is waiting to acquire this lock.
+			const restartIntent = await readBrokerRestartIntent(this.settings.agentDir);
+			const activeCommittedIntent =
+				restartIntent?.phase === "committed" && restartIntent.expiresAt > Date.now() ? restartIntent : undefined;
+			if (
+				this.settings.restartRequestId === undefined
+					? activeCommittedIntent !== undefined
+					: activeCommittedIntent?.requestId !== this.settings.restartRequestId
+			)
+				throw new Error("A committed SDK broker restart is active; startup requires its exact request ID.");
+			await this.index.open(
+				this.#startupCheckpointDeadline === undefined
+					? undefined
+					: sessionIndexStartupLockOptions(
+							this.#startupCheckpointDeadline,
+							this.#startupAbortSignal,
+							this.settings.restartRequestId === undefined ? "ordinary" : "authorized-successor",
+						),
+			);
 			await this.ledger.open();
 			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
 			this.#spawnAuthority = new SpawnAuthorityStore(this.settings.agentDir, brokerIdentityKey);
 			await this.#spawnAuthority.open();
 			for (const claim of this.#spawnAuthority.claims()) {
 				const mirror = this.ledger.get(claim.lifecycleIdentity);
-				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac);
+				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac, { spawnAnchor: true });
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
+			await this.#restoreManagedAttempts();
+			if (this.#managedEnrollmentFailed || this.#managedFailedRoots.size > 0)
+				throw new Error("Broker cannot establish complete managed enrollment membership.");
 			await this.#recoverSpawnClaims();
+			await this.#reconcileManagedNativeLifetimes();
+			const reconciledRoots = new Set<string>();
+			for (const ref of this.#managedAttempts.values()) {
+				if (this.#managedFailedRoots.has(ref.controlRoot) || reconciledRoots.has(ref.controlRoot)) continue;
+				reconciledRoots.add(ref.controlRoot);
+				try {
+					const binding = await loadManagedDomainBinding(ref.controlRoot);
+					if (binding) await reconcileRunningManagedVerification(binding);
+				} catch {}
+			}
 			const now = Date.now();
 			const incarnation = brokerProcessIncarnation(process.pid);
 			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
 			const token = newBrokerToken();
 			this.#transport = new BrokerTransport(this, token, this.settings.port);
 			const port = await this.#transport.start();
+			this.#throwIfStartupAborted();
 			this.discovery = {
 				version: 1,
 				protocolVersion: 3,
@@ -2864,6 +4291,10 @@ export class Broker {
 				ownerId: this.#owner,
 				pid: process.pid,
 				incarnation,
+				// Observation capability: the startup-fixed generation and the protocol the
+				// broker answers. An old broker simply omits both.
+				diagnosticGeneration: this.#diagnosticGeneration,
+				diagnosticProtocol: 1,
 				host: "127.0.0.1",
 				port,
 				url: `ws://127.0.0.1:${port}`,
@@ -2878,18 +4309,46 @@ export class Broker {
 			// checkpoint settles. The bootstrap watchdog owns this pre-publication
 			// interval; publishing first allowed it to kill an endpoint already handed
 			// to callers when a legitimate index-lock wait outlived the fence.
-			await this.#checkpointSessionHeartbeats();
-			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
+			await this.#checkpointSessionHeartbeats(this.#startupAbortSignal, this.#startupCheckpointDeadline);
+			this.#throwIfStartupAborted();
+			await this.#startupPrePublicationTestHook?.();
+			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
+			this.#throwIfStartupAborted();
+			if (!(await this.#hasCanonicalLockOwnership()))
+				throw new Error("SDK broker lock ownership changed before discovery publication.");
+			this.#publication = await publishBrokerDiscovery(
+				this.settings.agentDir,
+				this.discovery,
+				process.platform,
+				this.#startupAbortSignal,
+				this.#startupAfterDiscoveryWriteTestHook,
+			);
+			this.#throwIfStartupAborted();
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
+			this.#onStartupReady?.();
 			const cadenceMs = Math.max(
 				10,
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => {
+				if (this.#publicationWatchdogArmed && publicationLivenessWatchdogLost()) {
+					void this.#complete("lost-root", "publication-liveness-timeout");
+					return;
+				}
+				notePublicationLivenessLoop(this, this.#livenessGraceMs());
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
+				void this.#reapSelfIfAbandoned();
 			}, cadenceMs);
+			// The timer above cannot run while a discovery write blocks this thread.
+			// Hard-exit startup must not return until the off-thread watchdog is armed.
+			this.#publicationWatchdogArmed = await armPublicationLivenessWatchdog(
+				this,
+				this.#livenessGraceMs(),
+				cadenceMs,
+			);
+			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
 			// discovery just published under its own retained authority. Release the
 			// predecessor's reservation only now, keyed to the exact request this
@@ -2909,6 +4368,32 @@ export class Broker {
 			}
 			return this.discovery;
 		} catch (error) {
+			disarmPublicationLivenessWatchdog(this);
+			this.#publicationWatchdogArmed = false;
+			if (this.#heartbeatTimer) {
+				clearInterval(this.#heartbeatTimer);
+				this.#heartbeatTimer = null;
+				// A tick already queued must not publish or complete over this cleanup.
+				this.#stopping = true;
+				this.#publicationState = "stopping";
+			}
+			// `close()` drops the retained handle and leaves the file. After publication,
+			// a rejected start has to remove that file too: the lock release below would
+			// otherwise leave a live pid in discovery with no watchdog. Cancellation
+			// before the publication is retained uses the same rollback.
+			const published = this.#publishedAt !== null;
+			this.#publishedAt = null;
+			if (this.discovery && (this.#startupAbortSignal?.aborted || published)) {
+				try {
+					await rollbackBrokerDiscoveryIfCurrent(this.settings.agentDir, this.discovery);
+				} catch (rollbackError) {
+					logger.error("sdk broker: startup publication rollback failed", {
+						reason: "startup-publication-rollback-failed",
+						pid: process.pid,
+						error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+					});
+				}
+			}
 			await this.#transport?.stop();
 			this.#transport = null;
 			this.#publication?.close();
@@ -2919,10 +4404,23 @@ export class Broker {
 		}
 	}
 	get ownsDiscovery(): boolean {
-		return this.discovery?.ownerId === this.#owner;
+		// A cached discovery record is not ownership proof until its retained publication is healthy.
+		return (
+			this.#publication !== null &&
+			this.#publicationState === "healthy-owned" &&
+			this.discovery?.ownerId === this.#owner
+		);
+	}
+	/** Whether this broker completed its initial retained discovery publication. */
+	get hasPublishedDiscovery(): boolean {
+		return this.#publishedAt !== null;
 	}
 	get completion(): Promise<void> {
 		return this.#completion;
+	}
+	/** Why this broker completed, or null while it is still running. */
+	get terminalExit(): { readonly mode: BrokerExitMode; readonly reason: BrokerExitReason } | null {
+		return this.#terminalExit;
 	}
 	#restartIdentity(): BrokerRestartOwnerIdentity | undefined {
 		const d = this.discovery;
@@ -3026,7 +4524,7 @@ export class Broker {
 		// this process has actually exited -- would let a racing ordinary
 		// `ensureBroker` treat the still-live old owner as idle and spawn early.
 		setTimeout(() => {
-			void this.#complete("owned-root").finally(() => {
+			void this.#complete("owned-root", "restart-committed").finally(() => {
 				if (this.#restart === current) this.#restart = undefined;
 			});
 		}, 0);
@@ -3051,9 +4549,10 @@ export class Broker {
 	status(): RedactedBrokerDiscovery | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
 	}
-	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
+	#fence(kind: BrokerFenceReason): void {
 		if (this.#publicationState === "stopping") return;
 		this.#publicationState = kind;
+		this.#fenceReason = kind;
 		this.#startupAdmissions.close();
 		if (kind === "suspect-unpublished") {
 			this.#lossAt ??= process.hrtime.bigint();
@@ -3103,10 +4602,7 @@ export class Broker {
 		// The lock is deliberately left behind: this process is about to exit, and the
 		// dead-owner reclaim (#3963) is what hands it to the successor.
 		if (this.#unprovenBeyondLivenessDeadline()) {
-			logger.error(
-				`sdk broker: no publication has succeeded in ${this.#livenessGraceMs()}ms; terminating so peers can reclaim the lock (#4704)`,
-			);
-			void this.#complete("lost-root");
+			void this.#complete("lost-root", "publication-liveness-timeout");
 			return;
 		}
 		// Ticks must not stack behind a stalled one: each would add another pending
@@ -3128,7 +4624,7 @@ export class Broker {
 		} catch {
 			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("observation-ambiguous");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return;
 		}
 		if (this.#stopping || this.#publication !== publication) return;
@@ -3138,6 +4634,7 @@ export class Broker {
 			// authority. A replacement can win between this observation and that write;
 			// reopening here would admit lifecycle work under stale authority.
 			this.#publicationState = "healthy-owned";
+			this.#fenceReason = null;
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) {
@@ -3146,14 +4643,20 @@ export class Broker {
 					return;
 			}
 			this.#startupAdmissions.reopen();
-			if (this.#publicationState === "healthy-owned") await this.#checkpointSessionHeartbeats();
+			if (this.#publicationState === "healthy-owned") void this.#checkpointSessionHeartbeats();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 	}
 	async #writeHeartbeat(publication: RetainedBrokerDiscovery): Promise<void> {
 		if (!this.discovery || this.#publication !== publication || this.#publicationState === "stopping") return;
+		// Refresh the grace before a test blocks the thread, so the watchdog
+		// observes the overridden deadline rather than the one stored on the
+		// previous interval tick.
+		syncPublicationLivenessGrace(this, this.#livenessGraceMs());
+		const blockMs = heartbeatMainThreadBlockMsForTest.get(this);
+		if (blockMs !== undefined && blockMs > 0) blockHeartbeatMainThreadForTest(blockMs);
 		const stall = heartbeatStallOverridesForTest.get(this);
 		if (stall) await stall.promise;
 		const heartbeatAt = Date.now();
@@ -3172,6 +4675,7 @@ export class Broker {
 		// The durable write landed, so liveness is proven for this cycle whatever the
 		// authority re-check below decides about this broker's cached state.
 		this.#publishedAt = process.hrtime.bigint();
+		notePublicationLivenessProven(this);
 		const recovery = this.runSynchronousEffectWithFreshPublicationAuthority(() => {
 			this.discovery = { ...this.discovery!, heartbeatAt };
 		});
@@ -3183,19 +4687,70 @@ export class Broker {
 		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
-	async heartbeatSessions(now = Date.now()): Promise<number> {
-		return await this.index.checkpointLiveHeartbeats(now);
+	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal, deadlineAt?: number): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now, abortSignal, deadlineAt);
 	}
-	async #checkpointSessionHeartbeats(): Promise<void> {
+	async #checkpointSessionHeartbeats(abortSignal?: AbortSignal, startupCheckpointDeadline?: number): Promise<void> {
+		if (this.#checkpointInFlight || this.#stopping) return;
+		this.#checkpointInFlight = true;
 		try {
-			await this.heartbeatSessions();
+			// The CLI reserves publication headroom in this startup deadline.
+			// Periodic passes use their own budget, not a retired startup signal.
+			await this.heartbeatSessions(Date.now(), abortSignal, startupCheckpointDeadline);
 		} catch (error) {
+			if (
+				error instanceof FileLockAcquireError &&
+				error.orphanPath &&
+				this.#publication !== null &&
+				this.#publicationState === "healthy-owned" &&
+				this.#fenceReason === null &&
+				this.#completionTask === null &&
+				this.#provenOwnedRoot()
+			) {
+				await this.#complete("owned-root", "heartbeat-renewal-blocked", null, error.orphanPath);
+				return;
+			}
 			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
+		} finally {
+			this.#checkpointInFlight = false;
 		}
 	}
-	async #complete(mode: BrokerStopMode): Promise<void> {
+	async #complete(
+		mode: BrokerExitMode,
+		reason: BrokerExitReason,
+		signal: BrokerExitRecord["signal"] = null,
+		blockingLockPath?: string,
+	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
+		// Disarm before any later syscall. A graceful exit that then blocks must
+		// not be SIGKILLed by the watchdog it has already superseded.
+		disarmPublicationLivenessWatchdog(this);
+		this.#publicationWatchdogArmed = false;
+		this.#terminalExit = { mode, reason };
+		const now = process.hrtime.bigint();
+		const fenceStartedAt = this.#lossAt ?? this.#ambiguousAt;
+		const exitRecord: BrokerExitRecord & Record<string, unknown> = {
+			version: 1,
+			mode,
+			reason,
+			fenceReason: this.#fenceReason,
+			fencedForMs: fenceStartedAt === null ? 0 : Math.max(0, Number((now - fenceStartedAt) / 1_000_000n)),
+			uptimeMs: this.#startedAt === null ? 0 : Math.max(0, Number((now - this.#startedAt) / 1_000_000n)),
+			...(blockingLockPath === undefined ? {} : { blockingLockPath }),
+			pid: process.pid,
+			signal,
+			writtenAt: Date.now(),
+		};
+		const message =
+			reason === "heartbeat-renewal-blocked" && blockingLockPath
+				? `blocked by retained removal transition ${blockingLockPath}`
+				: undefined;
+		(mode === "lost-root" || message !== undefined ? logger.warn : logger.info)("sdk broker: exiting", {
+			...exitRecord,
+			...(message === undefined ? {} : { message }),
+		});
 		this.#stopping = true;
+		this.#checkpointInFlight = false;
 		this.#publicationState = "stopping";
 		// A lost-root broker has been fenced: it no longer owns the published root, and
 		// its settlement is bounded, so any startup still queued behind it would be
@@ -3207,6 +4762,27 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
+			const recordWrite = Promise.withResolvers<boolean>();
+			const recordWriteController = new AbortController();
+			const recordWriteTimeoutMs =
+				reason === "signal" ? BROKER_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS : BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS;
+			const recordWriteTimer = setTimeout(() => {
+				recordWriteController.abort();
+				recordWrite.resolve(false);
+			}, recordWriteTimeoutMs);
+			void writeBrokerExitRecord(this.settings.agentDir, exitRecord, recordWriteController.signal).then(
+				() => recordWrite.resolve(true),
+				() => recordWrite.resolve(false),
+			);
+			const recordPersisted = await recordWrite.promise;
+			clearTimeout(recordWriteTimer);
+			if (!recordPersisted) {
+				logger.error("sdk broker: failed to persist exit reason", {
+					reason: "exit-record-write-failed-or-timed-out",
+					mode,
+					pid: process.pid,
+				});
+			}
 			try {
 				await this.#transport?.stop();
 				this.#transport = null;
@@ -3269,12 +4845,12 @@ export class Broker {
 			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
 		} catch {
 			this.#fence("observation-ambiguous");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return { authorized: false };
 		}
 		if (observation !== "owned") {
 			this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return { authorized: false };
 		}
 		return { authorized: true, value: effect() };
@@ -3285,8 +4861,12 @@ export class Broker {
 	 * queued behind this broker is granted a slot that frees after completion and
 	 * spawns a child the broker has no authority over.
 	 */
-	async stop(): Promise<void> {
-		await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root");
+	async stop(request: BrokerStopRequest = { kind: "shutdown-request" }): Promise<void> {
+		await this.#complete(
+			this.#provenOwnedRoot() ? "owned-root" : "lost-root",
+			request.kind,
+			request.kind === "signal" ? request.signal : null,
+		);
 	}
 	async #endpoint(input: Record<string, unknown>): Promise<BrokerResponse> {
 		const sessionId = input.sessionId;
@@ -3400,13 +4980,15 @@ export class Broker {
 			indexed.endpointMtimeMs === undefined ||
 			!Number.isFinite(indexed.endpointMtimeMs) ||
 			indexed.endpointMtimeMs <= 0 ||
-			typeof indexed.lifecycleRequestId !== "string" ||
-			indexed.lifecycleRequestId.length === 0 ||
-			indexed.lifecycleRequestId.length > 128 ||
-			!/^[A-Za-z0-9._-]+$/u.test(indexed.lifecycleRequestId) ||
 			endpointIncarnation(indexed, indexed.sessionId) === undefined
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const abortCapability = sessionAbortCapability(indexed);
+		// The endpoint itself is current; only its host never published operator
+		// authority (a gjc that predates the operator route). Retrying cannot help, so
+		// this must not read as a stale endpoint.
+		if (abortCapability === undefined)
+			return error("operator_control_unsupported", "session host does not publish operator control authority");
 		let endpointResponse: BrokerResponse;
 		try {
 			endpointResponse = await this.#readEndpoint(indexed, {});
@@ -3433,6 +5015,7 @@ export class Broker {
 			if (!endpointIdentity.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
 			return {
 				record: indexed,
+				abortCapability,
 				endpoint,
 				endpointIdentity: {
 					dev: endpointIdentity.dev,
@@ -3488,7 +5071,7 @@ export class Broker {
 					"turn.abort",
 					{
 						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.record.lifecycleRequestId,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.abortCapability,
 					},
 					{
 						confirm: true,
@@ -3542,6 +5125,8 @@ export class Broker {
 			if (typeof cursor === "string") this.#sessionListCursors.delete(cursor);
 			return error("invalid_input", "cursor is expired or invalid");
 		}
+		if (stored && input.cwd !== undefined && input.cwd !== stored.cwd)
+			return error("cwd_cursor_mismatch", "cwd must match the cursor snapshot");
 		if (stored && requestedLimit !== undefined && stored.limit !== requestedLimit)
 			return error("invalid_input", "limit must match the cursor page shape");
 		let scope: ResolvedScopeV1 | undefined;
@@ -3584,10 +5169,15 @@ export class Broker {
 			limit,
 			offset: 0,
 			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
+			...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
-			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			const {
+				lifecycleRequestId: _lifecycleRequestId,
+				abortCapability: _abortCapability,
+				...publicSession
+			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
 			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
 		});
@@ -3616,15 +5206,31 @@ export class Broker {
 		requestedOperation: string,
 		idempotencyKey: string | undefined,
 		requestedFingerprint: string,
+		legacyFingerprint?: string,
 	): Promise<BrokerResponse> {
 		if (!idempotencyKey) return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
 		if (requestedOperation === "session.spawn")
 			return error("invalid_input", "session.spawn does not support lifecycle lookup");
 		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-		const entry = this.ledger.get(identity);
+		let entry =
+			this.ledger.get(identity) ??
+			this.ledger.findByOperationKey(`${requestedOperation}\0${idempotencyKey}`, requestedFingerprint);
+		let acceptedFingerprint = requestedFingerprint;
+		if (!entry && legacyFingerprint !== undefined) {
+			// Rows written before target-bound identities (v3) fingerprinted the raw,
+			// un-normalized request and are never expired, so they are matched only
+			// under their exact v3 identity and only against that raw fingerprint.
+			const legacy = this.ledger.get(
+				await deriveLegacyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey),
+			);
+			if (legacy) {
+				entry = legacy;
+				if (legacy.fingerprint === legacyFingerprint) acceptedFingerprint = legacyFingerprint;
+			}
+		}
 		if (!entry) return error("not_found", "lifecycle operation was not found");
-		if (entry.fingerprint !== requestedFingerprint)
+		if (entry.fingerprint !== acceptedFingerprint)
 			return error("idempotency_conflict", "lifecycle request fingerprint differs");
 		if (entry.state === "terminal_uncertain")
 			return error("terminal_uncertain", "lifecycle outcome is still uncertain");
@@ -3634,7 +5240,46 @@ export class Broker {
 			? entry.response
 			: error("terminal_uncertain", "lifecycle outcome has no recorded response");
 	}
-	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+	/**
+	 * Published diagnostics for observation clients (SPEC "Result contract").
+	 *
+	 * Everything here is captured once at startup and never recomputed, so a later source
+	 * or package change cannot alter what a running broker reports. No token, socket
+	 * coordinate, argv or environment value is included; the identity fields are the
+	 * internal owner/process/root binding the observer already knows from discovery.
+	 */
+	#publishedDiagnostics(): Promise<BrokerResponse> {
+		// Observation is answered ONLY from an already-owned healthy retained publication.
+		// A broker that owns no publication refuses here and recovers nothing: it does not
+		// publish, ensure, restart or touch the authority to answer.
+		if (this.#publication === null || this.#publicationState !== "healthy-owned") {
+			return Promise.resolve(error("unavailable", "broker publication authority is not owned"));
+		}
+		return Promise.resolve({
+			ok: true,
+			result: {
+				diagnosticProtocol: 1,
+				generation: this.#diagnosticGeneration,
+				build: this.#startupBuild,
+				identity: { ownerId: this.#owner, pid: process.pid, agentRoot: this.settings.agentDir },
+			},
+		});
+	}
+
+	// Wire requests are readiness-gated by BrokerTransport before reaching this dispatcher.
+	async handleRequest(
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey?: string,
+	): Promise<BrokerResponse> {
+		if (
+			this.#publication !== null &&
+			this.#publicationState === "healthy-owned" &&
+			!(await this.#hasCanonicalLockOwnership())
+		) {
+			this.#fence("suspect-unpublished");
+			return error("unavailable", "broker lock ownership is not held");
+		}
 		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
@@ -3659,6 +5304,32 @@ export class Broker {
 			this.#admitted.delete(admission);
 		});
 	}
+	/**
+	 * Session-targeted lifecycle requests may pass terminal legacy rows recorded
+	 * for other sessions. A row equal to this key's legacy target identity for its
+	 * recorded session proves cross-target key reuse and keeps the fence; close
+	 * targets are reconstructed sessionId-only because legacy close rows may lack
+	 * endpoint authority.
+	 */
+	async #legacySessionTarget(
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<{ sessionId: string; keyReuseIdentities: ReadonlySet<string> } | undefined> {
+		if (!SESSION_TARGETED_LIFECYCLE_OPERATIONS.has(operation)) return undefined;
+		const { sessionId } = lifecycleTarget(operation, input) as { sessionId?: string };
+		if (sessionId === undefined) return undefined;
+		const keyReuseIdentities = new Set<string>();
+		for (const recordedSessionId of this.ledger.terminalLegacySessionIds()) {
+			const recordedTarget = createHash("sha256")
+				.update(canonicalJson(lifecycleTarget(operation, { sessionId: recordedSessionId })))
+				.digest("hex");
+			keyReuseIdentities.add(
+				await deriveLegacyTargetIdentity(this.settings.agentDir, operation, idempotencyKey, recordedTarget),
+			);
+		}
+		return { sessionId, keyReuseIdentities };
+	}
 	async #handleRequest(
 		operation: string,
 		input: Record<string, unknown>,
@@ -3668,24 +5339,31 @@ export class Broker {
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
+		if (operation === "task.dag") return this.#handleManagedTaskDag(input, idempotencyKey);
 		if (operation === "session.close") {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
+		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
 			if (isBrokerResponse(lookup)) return lookup;
+			// The ledger fingerprint covers the normalized mutation input, so the
+			// lookup target must pass through the same normalization to match it.
+			const lookupTarget = normalizeBrokerInput(lookup.operation, lookup.target);
+			if (isBrokerResponse(lookupTarget)) return lookupTarget;
 			return await this.#lookupLifecycle(
 				lookup.operation,
 				idempotencyKey,
+				lifecycleFingerprint(lookup.operation, lookupTarget.input),
 				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
-		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
+		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
 			const page = await this.#sessionListPage(input, this.index.listSessions());
@@ -3695,38 +5373,96 @@ export class Broker {
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
 			if (resolveSessionId && cwd) {
 				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
-				const listed =
+				let listed =
 					scope.kind === "resolved" ? await listManagedSessionCandidates({ scope: scope.scope }) : undefined;
+				if (
+					scope.kind === "resolved" &&
+					listed?.kind === "complete" &&
+					listed.invalid.some(
+						candidate => candidate.sessionId === resolveSessionId && candidate.code === "source_changed",
+					)
+				)
+					// A writer can finish after the preflight read but before the independent
+					// identity-bound inspection. Retry one complete scan, rerunning every
+					// scope, no-follow, uniqueness, and identity check against fresh state.
+					listed = await listManagedSessionCandidates({ scope: scope.scope });
+				const invalidCandidate =
+					listed?.kind === "complete"
+						? listed.invalid.find(candidate => candidate.sessionId === resolveSessionId)
+						: undefined;
 				const matches =
 					listed?.kind === "complete"
 						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
 						: [];
 				const match = matches.length === 1 ? matches[0] : undefined;
-				const savedSession =
-					match &&
-					match.sessionId === resolveSessionId &&
-					match.identity.nlink !== undefined &&
-					match.identity.ctimeNs !== undefined
-						? {
-								id: match.sessionId,
-								path: match.path,
-								identity: {
-									dev: match.identity.dev.toString(),
-									ino: match.identity.ino.toString(),
-									nlink: match.identity.nlink.toString(),
-									size: match.identity.size,
-									mtimeMs: match.identity.mtimeMs,
-									mtimeNs: match.identity.mtimeNs.toString(),
-									ctimeNs: match.identity.ctimeNs.toString(),
-									sha256: match.identity.sha256,
-								},
-							}
-						: undefined;
+				let savedSession: Record<string, unknown> | undefined;
+				let savedSessionOmission: SessionListSavedSessionOmission | undefined;
+				if (scope.kind !== "resolved") {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "scope_unavailable",
+						detailCode: scope.code,
+					};
+				} else if (listed?.kind !== "complete") {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_scan_failed",
+						...(listed === undefined ? {} : { detailCode: listed.code }),
+					};
+				} else if (invalidCandidate !== undefined) {
+					const detailCode = savedSessionOmissionDetailCode(invalidCandidate.code);
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_invalid",
+						...(detailCode === undefined ? {} : { detailCode }),
+					};
+				} else if (matches.length === 0) {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_not_found",
+					};
+				} else if (matches.length > 1) {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_ambiguous",
+						candidateCount: matches.length,
+					};
+				} else if (match) {
+					const missingIdentityFields: ("nlink" | "ctimeNs")[] = [];
+					const { nlink, ctimeNs } = match.identity;
+					if (nlink === undefined) missingIdentityFields.push("nlink");
+					if (ctimeNs === undefined) missingIdentityFields.push("ctimeNs");
+					if (missingIdentityFields.length > 0) {
+						savedSessionOmission = {
+							sessionId: resolveSessionId,
+							reason: "identity_incomplete",
+							missingIdentityFields,
+						};
+					} else if (match.sessionId === resolveSessionId && nlink !== undefined && ctimeNs !== undefined) {
+						savedSession = {
+							id: match.sessionId,
+							path: match.path,
+							identity: {
+								dev: match.identity.dev.toString(),
+								ino: match.identity.ino.toString(),
+								nlink: nlink.toString(),
+								size: match.identity.size,
+								mtimeMs: match.identity.mtimeMs,
+								mtimeNs: match.identity.mtimeNs.toString(),
+								ctimeNs: ctimeNs.toString(),
+								sha256: match.identity.sha256,
+							},
+						};
+					}
+				} else {
+					savedSessionOmission = { sessionId: resolveSessionId, reason: "candidate_not_found" };
+				}
 				return {
 					...page,
 					result: {
 						...pageResult,
 						...(savedSession === undefined ? {} : { savedSession }),
+						...(savedSessionOmission === undefined ? {} : { savedSessionOmission }),
 					},
 				};
 			}
@@ -3755,8 +5491,73 @@ export class Broker {
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
-		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const identity = await deriveIdempotencyIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			operation === "session.create" ? undefined : target,
+		);
 		const operationKey = `${operation}\0${idempotencyKey}`;
+		const requestedRequestHash = createHash("sha256")
+			.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+			.digest("hex");
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, operation, idempotencyKey);
+		const legacyTargetIdentity = await deriveLegacyTargetIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			target,
+		);
+		const metadata = {
+			operationKey,
+			fingerprint,
+			...(operation === "session.close" && typeof input.sessionId === "string"
+				? { intendedSessionId: input.sessionId }
+				: {}),
+			...(operation === "session.close" &&
+			typeof input.endpointGeneration === "number" &&
+			typeof input.endpointIncarnation === "string"
+				? { closeAuthorityBound: true }
+				: {}),
+		};
+		if (!this.ledger.get(identity)) {
+			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
+			const sameCloseSession =
+				operation === "session.close" &&
+				(matchingOperation?.intendedSessionId === input.sessionId ||
+					matchingOperation?.resultSessionId === input.sessionId);
+			if (
+				matchingOperation &&
+				!sameCloseSession &&
+				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
+			)
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			const matchingLegacy = matchingOperation;
+			if (matchingLegacy) {
+				if (matchingLegacy.identity === legacyIdentity || matchingLegacy.identity === legacyTargetIdentity)
+					await this.ledger.migrateIdentity(matchingLegacy.identity, identity, metadata);
+			} else if (this.ledger.get(legacyIdentity)) {
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			} else {
+				const legacyTargetEntry = this.ledger.get(legacyTargetIdentity);
+				if (legacyTargetEntry) {
+					if (legacyTargetEntry.requestHash !== requestedRequestHash)
+						return error("idempotency_conflict", "idempotency key was used with a different request");
+					await this.ledger.migrateIdentity(legacyTargetIdentity, identity, metadata);
+					// Exact target-derived legacy identity migrated without granting new authority.
+				} else if (
+					this.ledger.hasLegacyIdentity(
+						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
+						{
+							ignoreFinalRows: operation === "session.create",
+							sessionTarget: await this.#legacySessionTarget(operation, input, idempotencyKey),
+						},
+					)
+				) {
+					return error("legacy_lifecycle_ambiguous", "legacy lifecycle request has an ambiguous target");
+				}
+			}
+		}
 
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
@@ -3826,9 +5627,12 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
+			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
+				// Proven errors are immutable even when their response carries cleanup
+				// metadata. Only unproven cleanup outcomes may execute again.
+				if (begun.entry.state === "terminal_error") return replay;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
 				if (!cleanup) {
 					if (
@@ -3873,7 +5677,7 @@ export class Broker {
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
-				await this.ledger.transition(identity, lifecycleResponseState(response), {
+				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(operation === "session.delete" &&
 					typeof input.sessionId === "string" &&
 					lifecycleResponseState(response) === "terminal_uncertain" &&
@@ -3885,6 +5689,10 @@ export class Broker {
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
+				// A late transition may have proven a terminal result already. The ledger
+				// preserves that row; return it instead of the freshly computed response.
+				if (recorded.state === "terminal_error" && recorded.response !== undefined)
+					return recorded.response as BrokerResponse;
 				return response;
 			}
 			if (begun.kind === "idempotency_conflict")
@@ -3897,7 +5705,7 @@ export class Broker {
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
-				await this.ledger.transition(identity, lifecycleResponseState(response), {
+				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 					...(operation === "session.delete" &&
 					typeof input.sessionId === "string" &&
@@ -3910,6 +5718,8 @@ export class Broker {
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
+				if (recorded.state === "terminal_error" && recorded.response !== undefined)
+					return recorded.response as BrokerResponse;
 				return response;
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
@@ -3997,10 +5807,50 @@ export function setLockArtifactGraceForTest(broker: Broker, graceMs: number | un
 	else lockArtifactGraceOverridesForTest.set(broker, graceMs);
 }
 
+/** Test-only barriers for exercising the cross-process broker-lock reclaim fence. */
+export function setBrokerLockReclaimHooksForTest(
+	broker: Broker,
+	hooks: { beforeQuarantine?: () => Promise<void>; onContended?: () => void } | undefined,
+): void {
+	if (hooks === undefined) brokerLockReclaimHooksForTest.delete(broker);
+	else brokerLockReclaimHooksForTest.set(broker, hooks);
+}
+
+/** Test-only hook for shortening the bounded abandonment grace. */
+export function setAbandonedGraceForTest(broker: Broker, graceMs: number | undefined): void {
+	if (graceMs === undefined) abandonedGraceOverridesForTest.delete(broker);
+	else abandonedGraceOverridesForTest.set(broker, graceMs);
+}
+
 /** Test-only hook for shortening the bounded liveness deadline. */
 export function setLivenessGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) livenessGraceOverridesForTest.delete(broker);
 	else livenessGraceOverridesForTest.set(broker, graceMs);
+	syncPublicationLivenessGrace(
+		broker,
+		graceMs ?? Math.max(BROKER_LIVENESS_GRACE_MS, broker.settings.heartbeatTtlMs * BROKER_LIVENESS_TTL_MULTIPLIER),
+	);
+}
+
+/**
+ * Test-only hook that blocks the JS thread inside the heartbeat write.
+ * `Atomics.wait` stands in for an fsync/rename that does not return to the
+ * event loop, which a never-settling promise does not reproduce.
+ */
+export function setHeartbeatMainThreadBlockForTest(broker: Broker, blockMs: number | undefined): void {
+	if (blockMs === undefined || blockMs <= 0) heartbeatMainThreadBlockMsForTest.delete(broker);
+	else heartbeatMainThreadBlockMsForTest.set(broker, blockMs);
+}
+
+function blockHeartbeatMainThreadForTest(blockMs: number): void {
+	const scratch = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+	Atomics.wait(scratch, 0, 0, blockMs);
+}
+
+/** Test-only hook for shortening the bounded wait before a deferred managed close is queued. */
+export function setManagedCloseWaitForTest(broker: Broker, waitMs: number | undefined): void {
+	if (waitMs === undefined) managedCloseWaitOverridesForTest.delete(broker);
+	else managedCloseWaitOverridesForTest.set(broker, Math.max(0, waitMs));
 }
 
 /**

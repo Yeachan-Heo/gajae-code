@@ -46,11 +46,11 @@ afterEach(() => {
 });
 
 describe("getProviderStreamIdleTimeoutFallbackMs(provider)", () => {
-	it("gives Anthropic a 300-second idle window for long reasoning gaps", () => {
-		expect(getProviderStreamIdleTimeoutFallbackMs("anthropic")).toBe(300_000);
+	it("gives Anthropic a 600-second idle window for long reasoning gaps", () => {
+		expect(getProviderStreamIdleTimeoutFallbackMs("anthropic")).toBe(600_000);
 	});
 
-	it("gives xAI Grok and Grok Build the same 300-second idle window as Anthropic", () => {
+	it("gives xAI Grok and Grok Build a 300-second idle window for long reasoning gaps", () => {
 		expect(getProviderStreamIdleTimeoutFallbackMs("xai")).toBe(300_000);
 		expect(getProviderStreamIdleTimeoutFallbackMs("grok-build")).toBe(300_000);
 	});
@@ -125,6 +125,17 @@ describe("getOpenAIStreamIdleTimeoutMs()", () => {
 		expect(getOpenAIStreamIdleTimeoutMs("openai")).toBe(120_000);
 		expect(getOpenAIStreamIdleTimeoutMs()).toBe(120_000);
 	});
+	it("uses configured model timeout before built-in floors while preserving env precedence", () => {
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "anthropic/claude-opus-5-5", 300_000)).toBe(300_000);
+		expect(getOpenAIStreamIdleTimeoutMs("xai", "grok-4.6", 180_000)).toBe(180_000);
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "moonshotai/kimi-k3", 0)).toBeUndefined();
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "invalid";
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "claude-opus-5-5", 300_000)).toBe(300_000);
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "77";
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "claude-opus-5-5", 300_000)).toBe(77);
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "0";
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "claude-opus-5-5", 300_000)).toBeUndefined();
+	});
 
 	it("falls back to the legacy PI_OPENAI_STREAM_IDLE_TIMEOUT_MS alias", () => {
 		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
@@ -177,6 +188,26 @@ describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
 		expect(resolveOpenAISdkRequestTimeoutMs("openai", 5_000)).toBe(120_000);
 	});
 
+	it("uses configured model idle timeouts to bound OpenAI SDK setup", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, "claude-opus-5-5", 300_000)).toBe(300_000);
+	});
+
+	it("uses a longer request idle timeout for SDK setup instead of the model fallback", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, "claude-opus-5-5", 120_000, 300_000)).toBe(
+			300_000,
+		);
+	});
+
+	it("caps SDK request deadlines at the maximum platform timer delay", () => {
+		const maxTimerDelayMs = 2 ** 31 - 1;
+		expect(resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, undefined, maxTimerDelayMs + 1)).toBe(
+			maxTimerDelayMs,
+		);
+		expect(
+			resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, undefined, 120_000, Number.MAX_SAFE_INTEGER),
+		).toBe(maxTimerDelayMs);
+	});
+
 	it("disables the SDK request timeout when the first-event watchdog is explicitly off", () => {
 		expect(resolveOpenAISdkRequestTimeoutMs("openai", 0)).toBeUndefined();
 		expect(resolveOpenAISdkRequestTimeoutMs("alibaba-token-plan", 0)).toBeUndefined();
@@ -189,16 +220,16 @@ describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
 });
 
 describe("resolveAnthropicSdkRequestTimeoutMs(provider, override, idleOverride)", () => {
-	it("bounds the Anthropic connect/headers phase at the 300s idle-floored first-event window", () => {
+	it("bounds the Anthropic connect/headers phase at the 600s idle-floored first-event window", () => {
 		// The Anthropic first-event watchdog arms only after headers arrive, so
 		// without an SDK timeout a connection that dies before headers hangs for
 		// the SDK's 10-minute default per attempt times its internal retries —
 		// the "stuck after a completed tool call" spinner.
-		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic")).toBe(300_000);
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic")).toBe(600_000);
 	});
 
 	it("floors an explicit short first-event override at the env/default window", () => {
-		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 5_000)).toBe(300_000);
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 5_000)).toBe(600_000);
 	});
 
 	it("lets a longer explicit first-event override widen the setup bound", () => {

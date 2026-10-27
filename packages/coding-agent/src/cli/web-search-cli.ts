@@ -95,7 +95,10 @@ export function parseSearchArgs(args: string[]): SearchCommandArgs | undefined {
 			result.recency = value() as SearchCommandArgs["recency"];
 			consumeSeparateValue();
 		} else if (arg === "--limit" || arg === "-l") {
-			result.limit = Number.parseInt(value(), 10);
+			const raw = value();
+			// `Number.parseInt` accepts trailing garbage ("5x" -> 5); leave
+			// anything that is not plain digits as NaN so it is rejected below.
+			result.limit = /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
 			consumeSeparateValue();
 		} else if (arg === "--xai-mode") {
 			result.xaiSearchMode = value() as SearchCommandArgs["xaiSearchMode"];
@@ -164,8 +167,11 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		process.exit(1);
 	}
 
-	if (cmd.limit !== undefined && Number.isNaN(cmd.limit)) {
-		process.stderr.write(`${chalk.red("Error: --limit must be a number")}\n`);
+	// `Flags.integer` accepts `0` and negative values; providers forward them
+	// as `num_results` and several slice sources with them (`slice(0, -3)`
+	// silently drops the last three results).
+	if (cmd.limit !== undefined && (!Number.isSafeInteger(cmd.limit) || cmd.limit < 1)) {
+		process.stderr.write(`${chalk.red("Error: --limit must be a positive integer")}\n`);
 		process.exit(1);
 	}
 

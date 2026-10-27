@@ -12,6 +12,7 @@ import type {
 	ShellRunResult,
 } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
+import { projectDeclaredSpawnHookNames, stripProjectSpawnHooks } from "@gajae-code/utils/shell-config";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import {
@@ -91,6 +92,20 @@ let shellFactoryForTests: ShellFactory | undefined;
 
 export function setShellFactoryForTests(factory: ShellFactory | undefined): void {
 	shellFactoryForTests = factory;
+}
+
+function projectHookUnsetEnv(
+	unsetEnv: string[] | undefined,
+	env: Record<string, string> | undefined,
+	sessionEnv: Record<string, string>,
+): string[] | undefined {
+	// Keys present in `sessionEnv` (e.g. the trusted HOME replacement) already
+	// override the ambient import, so only shadow the ones it does not carry.
+	const hooks = projectDeclaredSpawnHookNames().filter(
+		name => !Object.hasOwn(env ?? {}, name) && !Object.hasOwn(sessionEnv, name),
+	);
+	if (hooks.length === 0) return unsetEnv;
+	return [...(unsetEnv ?? []), ...hooks.filter(name => !unsetEnv?.includes(name))];
 }
 
 async function createShell(
@@ -319,6 +334,8 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/** Environment names to hide from this command's inherited environment. */
+	unsetEnv?: string[];
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -412,13 +429,67 @@ async function resolveShellCwd(cwd: string | undefined): Promise<string | undefi
 	}
 }
 
+function presentMinimizerString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+type ShellMinimizerSource = {
+	getGroup(prefix: "shellMinimizer"): ShellMinimizerSettings;
+	getGlobal?(path: "shellMinimizer.settingsPath" | "shellMinimizer.settingsHash"): unknown;
+	getOverride?(path: "shellMinimizer.settingsPath"): unknown;
+};
+
+/**
+ * A repo `.gjc/settings.json` must not point the minimizer at a TOML file.
+ * The native gate loads that file only when `settingsHash` matches, and the
+ * pin is the user/global value. A user path or a runtime override is still
+ * passed through. A project path is passed only together with that pin.
+ */
+export function resolveTrustedShellMinimizer(settings: ShellMinimizerSource): ShellMinimizerSettings {
+	const group = settings.getGroup("shellMinimizer");
+	const globalPath =
+		typeof settings.getGlobal === "function"
+			? presentMinimizerString(settings.getGlobal("shellMinimizer.settingsPath"))
+			: undefined;
+	const globalHash =
+		typeof settings.getGlobal === "function"
+			? presentMinimizerString(settings.getGlobal("shellMinimizer.settingsHash"))
+			: undefined;
+	const overridePath =
+		typeof settings.getOverride === "function"
+			? presentMinimizerString(settings.getOverride("shellMinimizer.settingsPath"))
+			: undefined;
+	const effectivePath = presentMinimizerString(group.settingsPath);
+
+	let settingsPath: string | undefined;
+	if (overridePath && effectivePath === overridePath) {
+		settingsPath = overridePath;
+	} else if (globalPath) {
+		settingsPath = globalPath;
+	} else if (effectivePath && globalHash) {
+		settingsPath = effectivePath;
+	}
+
+	// A runtime override of a different path is operator input, not the file the
+	// user hash pins. Every other admitted path is checked with that pin.
+	const unpinnedOverride = overridePath !== undefined && settingsPath === overridePath && settingsPath !== globalPath;
+	return {
+		...group,
+		settingsPath,
+		settingsHash: globalHash && settingsPath && !unpinnedOverride ? globalHash : undefined,
+	};
+}
+
 /** Translate `ShellMinimizerSettings` into native `MinimizerOptions`, or `undefined` when disabled. */
 export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerOptions | undefined {
 	if (!group.enabled) return undefined;
 	const maxCaptureBytes = Math.min(4 * 1024 * 1024, Math.max(1024, Math.trunc(group.maxCaptureBytes)));
+	const settingsPath = group.settingsPath || undefined;
+	const settingsHash = settingsPath && group.settingsHash ? group.settingsHash : undefined;
 	return {
 		enabled: true,
-		settingsPath: group.settingsPath || undefined,
+		settingsPath,
+		...(settingsHash ? { settingsHash } : {}),
 		only: group.only.length > 0 ? group.only : undefined,
 		except: group.except.length > 0 ? group.except : undefined,
 		maxCaptureBytes,
@@ -427,12 +498,16 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = options?.settings ?? (await Settings.init());
-	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
+	const { shell, env: configEnv, prefix } = settings.getShellConfig();
+	// The shell config env is shared with other consumers (Python kernels keep
+	// their own documented allowlist). Only the bash tool's shell must not see
+	// project hook variables such as BASH_ENV or GIT_CONFIG_*.
+	const shellEnv = stripProjectSpawnHooks({ ...configEnv });
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =
 		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
 
-	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
+	const minimizer = buildMinimizerOptions(resolveTrustedShellMinimizer(settings));
 
 	const commandCwd = await resolveShellCwd(options?.cwd);
 	const commandEnv = options?.env ? { ...NON_INTERACTIVE_ENV, ...options.env } : NON_INTERACTIVE_ENV;
@@ -578,6 +653,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			command: finalCommand,
 			cwd: commandCwd,
 			env: commandEnv,
+			// The native shell imports the host process environment before
+			// `sessionEnv`, and where it runs in-process (Windows) that environment
+			// holds the autoloaded project `.env`. Shadow project hook variables per
+			// run unless this call sets them explicitly.
+			unsetEnv: projectHookUnsetEnv(options?.unsetEnv, options?.env, shellEnv),
 			timeoutMs: executionTimeoutMs,
 			signal: runAbortController.signal,
 		};

@@ -892,7 +892,14 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 
 				if (operation === "abort") await loop.session.abort();
 				else if (operation === "dispose") await loop.session.dispose();
-				else await loop.session.newSession();
+				else {
+					// A history transition cannot displace the automatic compaction owner.
+					expect(() => loop.session.newSession()).toThrow(
+						"Cannot start new-session while a auto-compaction transition is in progress.",
+					);
+					await loop.session.abort({ cause: "new_session" });
+					expect(await loop.session.newSession()).toBe(true);
+				}
 
 				expect(loop.session.activeMidRunBarrierCountForTests).toBe(0);
 				expect(getLatestCompactionEntry(loop.session.sessionManager.getBranch())).toBeNull();

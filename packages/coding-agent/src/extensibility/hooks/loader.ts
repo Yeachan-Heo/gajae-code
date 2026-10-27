@@ -346,9 +346,17 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 	};
 
 	// 1. Discover hooks via capability API and validate the provider descriptor
-	// against the canonical model before importing project-controlled code.
+	// against the canonical model before importing. A repository
+	// `<cwd>/.gjc/hooks` module is not imported. Skip those entries before
+	// dedup so a same-named user-agent hook still loads. An explicit path
+	// below remains a consent path.
 	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd, providers: ["native"] });
-	for (const hook of discovered.items) {
+	const seenHookKeys = new Set<string>();
+	for (const hook of discovered.all) {
+		if (hook.level === "project") continue;
+		const hookKey = `${hook.type}:${hook.tool}:${hook.name}`;
+		if (seenHookKeys.has(hookKey)) continue;
+		seenHookKeys.add(hookKey);
 		const convention =
 			hook._source.provider === "native"
 				? HookSourceConvention.NativeGjc

@@ -290,8 +290,36 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * first refusal, so an owner still running the generation-178 router keeps
  * killing a session's mirroring after one transient rejection and must be
  * replaced across this upgrade.
+ * Generation 190 acknowledges the protected prompt-deadline boundary change,
+ * so generation-189 owners are replaced instead of retaining the old path.
+ * Generation 192 makes session-host liveness a reference-counted work lease,
+ * so generation-191 owners cannot reap hosts with queued or promoted work.
+ * Generation 193 gates streamed content on negotiated observer capabilities,
+ * so existing owners are replaced before exposing the new observer path.
+ * Generation 201 binds queued cancellation and terminal deadlines to the exact
+ * consuming run, so pre-fix owners cannot serve the new generic lifecycle path.
+ * Generation 202 joins queued-removal terminal publication before ordinary
+ * abort acknowledgement, replacing owners that still acknowledge cancellation
+ * before its terminal record is durable.
+ * Generation 203 replaces owners that still treat a project `.gjc` file as an
+ * explicit deadline-autosave opt-in for a primary checkout.
+ * Generation 205 replaces owners whose process descendant walk can adopt
+ * children of a recycled PID. Generation 206 verifies macOS descendant
+ * identities and parentage before retaining PTY termination authority, and
+ * reaps adopted Linux PTY descendants when GJC is a child reaper.
+ * Generation 209 installs connection-owned private SDK image staging with
+ * execution-owned reservations, replacing hosts without that lifecycle contract.
+ * Generation 210 keeps tool results in their turn's settlement provenance and
+ * never anchors a lean composition on tool-loop narration, so a same-run
+ * autonomous follow-up cannot displace the final answer from the idle receipt.
+ * Generation 211 fences only the exact attachment that sent session_closed, so
+ * owners that refuse every later attachment of a resumed session are replaced.
+ * Generation 212 allocates each SDK host start's event generation from the
+ * agent dir's per-session authority and resumes a stored replay cursor only
+ * within its own generation, replacing owners that reuse the previous host's
+ * replay position or publication receipts for a resumed session.
  */
-export const DAEMON_GENERATION = 189;
+export const DAEMON_GENERATION = 212;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

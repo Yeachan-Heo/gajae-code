@@ -29,6 +29,7 @@ import asyncio
 import ast
 import base64
 import builtins
+import codecs
 import inspect
 import io
 import json
@@ -49,9 +50,14 @@ from typing import Any, Callable
 # Frame writer
 # ---------------------------------------------------------------------------
 
-_RAW_STDOUT = sys.__stdout__
 _RAW_STDERR = sys.__stderr__
 _OUT_LOCK = threading.Lock()
+_PROTO_FD: int | None = None
+_CAP_LOCK = threading.Lock()
+_FLUSH_EVENT = threading.Event()
+_FLUSH_TOKEN: bytes | None = None
+_CAPTURED = b""
+_CAPTURE_DECODER = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
 
 def _json_default(o: Any) -> Any:
@@ -61,13 +67,141 @@ def _json_default(o: Any) -> Any:
         return f"<unrepr {type(o).__name__}>"
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while len(view):
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(0, "protocol write returned no bytes")
+        view = view[written:]
+
+
 def _emit(frame: dict) -> None:
     """Serialize a frame and write it to the host as a single NDJSON line."""
-    line = json.dumps(frame, ensure_ascii=False, default=_json_default)
+    payload = (json.dumps(frame, ensure_ascii=False, default=_json_default) + "\n").encode("utf-8")
+    fd = _PROTO_FD if _PROTO_FD is not None else 1
     with _OUT_LOCK:
-        _RAW_STDOUT.write(line)
-        _RAW_STDOUT.write("\n")
-        _RAW_STDOUT.flush()
+        _write_all(fd, payload)
+
+
+def _token_suffix_len(buf: bytes, token: bytes) -> int:
+    max_n = min(len(buf), len(token) - 1)
+    for size in range(max_n, 0, -1):
+        if buf.endswith(token[:size]):
+            return size
+    return 0
+
+
+def _take_captured_locked() -> tuple[list[bytes], bool]:
+    """Split captured fd-1 bytes. A flush token is a delimiter, not output."""
+    global _CAPTURED, _FLUSH_TOKEN
+    pieces: list[bytes] = []
+    flushed = False
+    while True:
+        token = _FLUSH_TOKEN
+        if token is None:
+            if _CAPTURED:
+                pieces.append(_CAPTURED)
+                _CAPTURED = b""
+            return pieces, flushed
+        idx = _CAPTURED.find(token)
+        if idx < 0:
+            keep = _token_suffix_len(_CAPTURED, token)
+            if len(_CAPTURED) > keep:
+                pieces.append(_CAPTURED[: len(_CAPTURED) - keep])
+                _CAPTURED = _CAPTURED[-keep:] if keep else b""
+            return pieces, flushed
+        if idx:
+            pieces.append(_CAPTURED[:idx])
+        _CAPTURED = _CAPTURED[idx + len(token) :]
+        _FLUSH_TOKEN = None
+        flushed = True
+
+
+def _publish_captured(pieces: list[bytes], flushed: bool) -> None:
+    global _CAPTURE_DECODER
+    for piece in pieces:
+        text = _CAPTURE_DECODER.decode(piece)
+        if text:
+            _forward_captured_stdout(text)
+    if not flushed:
+        return
+    tail = _CAPTURE_DECODER.decode(b"", final=True)
+    if tail:
+        _forward_captured_stdout(tail)
+    _CAPTURE_DECODER = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+
+def _forward_captured_stdout(text: str) -> None:
+    rid = _STATE.current_id
+    if not text:
+        return
+    if rid is None:
+        _RAW_STDERR.write(text)
+        _RAW_STDERR.flush()
+        return
+    _emit({"type": "stdout", "id": rid, "data": text})
+
+
+def _pump_captured_stdout(read_fd: int) -> None:
+    global _CAPTURED
+    while True:
+        try:
+            chunk = os.read(read_fd, 65536)
+        except OSError:
+            return
+        if not chunk:
+            return
+        with _CAP_LOCK:
+            _CAPTURED += chunk
+            pieces, flushed = _take_captured_locked()
+        _publish_captured(pieces, flushed)
+        if flushed:
+            _FLUSH_EVENT.set()
+
+
+def _capture_user_stdout() -> None:
+    """Move the host pipe off fd 1 so raw user writes are cell output."""
+    global _PROTO_FD
+    if _PROTO_FD is not None:
+        return
+    try:
+        sys.__stdout__.flush()
+    except Exception:
+        pass
+    proto = os.dup(1)
+    os.set_inheritable(proto, False)
+    _PROTO_FD = proto
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(read_fd, False)
+    os.dup2(write_fd, 1, inheritable=True)
+    os.close(write_fd)
+    threading.Thread(
+        target=_pump_captured_stdout,
+        args=(read_fd,),
+        name="gjc-stdout-capture",
+        daemon=True,
+    ).start()
+
+
+def _flush_captured_stdout() -> None:
+    if _PROTO_FD is None:
+        return
+    token = b"\0gjcfd1:" + os.urandom(8).hex().encode("ascii") + b"\0"
+    with _CAP_LOCK:
+        global _FLUSH_TOKEN
+        _FLUSH_EVENT.clear()
+        _FLUSH_TOKEN = token
+    _write_all(1, token)
+    if _FLUSH_EVENT.wait(5):
+        return
+    with _CAP_LOCK:
+        if _FLUSH_TOKEN == token:
+            _FLUSH_TOKEN = None
+            pieces, flushed = _take_captured_locked()
+        else:
+            pieces, flushed = [], False
+    _publish_captured(pieces, flushed)
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +1036,10 @@ def _handle_request(req: dict) -> None:
             _flush_matplotlib_figures()
         except Exception:
             pass
+        try:
+            _flush_captured_stdout()
+        except Exception:
+            pass
 
     _emit({
         "type": "done",
@@ -930,6 +1068,7 @@ def _emit_error(rid: str, exc: BaseException) -> None:
 
 
 def main() -> None:
+    _capture_user_stdout()
     sys.stdout = _StreamProxy("stdout")
     sys.stderr = _StreamProxy("stderr")
     _install_idle_sigint()

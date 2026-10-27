@@ -6,6 +6,16 @@ export type OAuthCredentials = {
 	projectId?: string;
 	email?: string;
 	accountId?: string;
+	profileArn?: string;
+	/**
+	 * Organization the token is scoped to. One Anthropic account can belong to
+	 * several organizations (e.g. a Team workspace and a personal Max plan); each
+	 * login is bound to exactly one of them, so the organization is part of the
+	 * credential's identity.
+	 */
+	organizationId?: string;
+	/** Display name of {@link organizationId}. */
+	organizationName?: string;
 };
 
 export type OAuthProvider =

@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import type { SdkSessionRowV1 } from "../src/sdk/cli/rows";
 import {
 	filterSessionRowsByScope,
@@ -66,19 +67,18 @@ describe("sdk session list scope parsing", () => {
 
 	test("runSdkSessionCli exits 2 on an invalid scope before broker contact", async () => {
 		const outputs: unknown[] = [];
-		let exitCode: number | undefined;
+		let failure: unknown;
 		const args: SdkSessionCliArgs = { action: "list", scope: "bogus", agentDir: path.join(tempRoot, "unused") };
-		await runSdkSessionCli(
-			args,
-			value => outputs.push(value),
-			code => {
-				exitCode = code;
-			},
-		);
-		expect(exitCode).toBe(2);
-		const record = outputs[0] as { ok: boolean; error: { code: string } };
-		expect(record.ok).toBe(false);
-		expect(record.error.code).toBe("usage");
+		try {
+			await runSdkSessionCli(args, value => outputs.push(value));
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect(outputs).toEqual([]);
+		const rendered = await renderPublicCommandFailure(failure, { command: ["sdk", "session", "list"], json: true });
+		expect(rendered.exitCode).toBe(2);
+		expect(rendered.envelope).toMatchObject({ ok: false, error: { code: "usage", outcomeCertainty: "not-applied" } });
 	});
 });
 

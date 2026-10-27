@@ -21,9 +21,11 @@ export class CustomToolAdapter<TParams extends TSchema = TSchema, TDetails = any
 		private tool: CustomTool<TParams, TDetails>,
 		private getContext: () => CustomToolContext,
 	) {
-		applyToolProxy(tool, this);
+		// Own these before proxying: with useDefineForClassFields off, the uninitialized fields do not
+		// exist yet, so applyToolProxy would install getter-only accessors that reject assignment.
 		this.strict = tool.strict;
 		this.concurrency = tool.concurrency;
+		applyToolProxy(tool, this);
 	}
 
 	execute(

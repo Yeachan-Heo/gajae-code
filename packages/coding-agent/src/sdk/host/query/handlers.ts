@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
-
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
 
@@ -51,6 +51,8 @@ export interface SessionSurface {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown | Promise<unknown>;
+	/** Q32 read-only project progress snapshot (`gjc.project_progress.v1`). */
+	getProjectProgress?(): ProjectProgressSnapshot | Promise<ProjectProgressSnapshot>;
 	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
 	getPromptStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
 	getSkillInvokeStatus?(selector: {
@@ -152,6 +154,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q25: { resource: "jobs", method: "getJobs", mvcc: false },
 	Q29: { resource: "activeProviders", method: "getActiveProviders", mvcc: false },
 	Q27: { resource: "modelProfiles", method: "getModelProfiles", mvcc: true },
+	Q32: { resource: "progress", method: "getProjectProgress", mvcc: false },
 };
 const names = [
 	"transcript.list",
@@ -186,6 +189,7 @@ const names = [
 	"providers.list/active",
 	"session.checkpoint",
 	"turn.steer_status",
+	"session.progress",
 ];
 
 export class QueryHandlers {
@@ -275,6 +279,10 @@ export class QueryHandlers {
 				);
 			if (query === "Q29" && typeof this.surface.getActiveProviders !== "function")
 				return this.#error(request, "unavailable", false, "providers.list/active is unavailable for this session.");
+			if (query === "Q32" && request.input && Object.keys(request.input).length > 0)
+				return this.#error(request, "invalid_request", false, "session.progress does not accept input fields.");
+			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
+				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);

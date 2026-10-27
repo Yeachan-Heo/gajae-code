@@ -57,7 +57,9 @@ describe("AgentSession skill reload", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(cwd),
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			skills: [oldSkill],
 			skillWarnings: [{ skillPath: oldSkill.filePath, message: "old warning" }],
 			reloadSkills: async () => ({

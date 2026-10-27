@@ -6,13 +6,16 @@ import {
 	getBehaviorByModel,
 	getBehaviorOverall,
 	getBehaviorTimeSeries,
+	getCacheMissAttribution,
 	getCostTimeSeries,
+	getFailureReport,
 	getFileOffset,
 	getMessageById,
 	getMessageCount,
 	getModelPerformanceSeries,
 	getModelTimeSeries,
 	getOverallStats,
+	getStatsByAgent,
 	getStatsByFolder,
 	getStatsByModel,
 	getTimeSeries,
@@ -365,12 +368,15 @@ export async function getDashboardStats(range?: string | null): Promise<Dashboar
 
 	return {
 		overall: getOverallStats(cutoff ?? undefined),
+		failures: getFailureReport(cutoff ?? undefined),
 		byModel: getStatsByModel(cutoff ?? undefined),
 		byFolder: getStatsByFolder(cutoff ?? undefined),
+		byAgent: getStatsByAgent(cutoff ?? undefined),
 		timeSeries: getTimeSeries(timeSeriesHours, cutoff, timeSeriesBucketMs),
 		modelSeries: getModelTimeSeries(modelSeriesDays, cutoff, modelSeriesBucketMs),
 		modelPerformanceSeries: getModelPerformanceSeries(modelPerformanceDays, cutoff, modelPerformanceBucketMs),
 		costSeries: getCostTimeSeries(costSeriesDays, cutoff),
+		cacheMissAttribution: getCacheMissAttribution(cutoff ?? undefined),
 	};
 }
 

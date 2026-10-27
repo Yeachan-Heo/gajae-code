@@ -219,6 +219,17 @@ const TRUNCATION_MARKER = "\n\n…[mental-model snapshot truncated at render bud
  */
 const MIN_CONTENT_ROOM_CHARS = 64;
 
+const MEMORY_FRAME_NAMES = ["memories", "hindsight_memories", "relevant_memories", "mental_models"] as const;
+
+/** Escape the same frame tokens as recalled memory text so a stored closer cannot end this block early. */
+function escapeMemoryFrameTokens(text: string): string {
+	let out = text;
+	for (const name of MEMORY_FRAME_NAMES) {
+		out = out.replace(new RegExp(`<\\s*\\/?\\s*${name}\\s*>`, "gi"), tag => tag.replace("<", "&lt;"));
+	}
+	return out;
+}
+
 /** Smallest budget that can yield a usable block (wrapper + preamble + marker + a few chars of content). */
 function minRenderBudgetChars(): number {
 	const cleanOverhead = `<mental_models>\n${PREAMBLE}\n\n\n</mental_models>`.length;
@@ -235,7 +246,6 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 	if (budgetChars < minRenderBudgetChars()) return "";
 
 	const truncatedOverhead = `<mental_models>\n${PREAMBLE}\n\n${TRUNCATION_MARKER}\n</mental_models>`.length;
-	const cleanOverhead = `<mental_models>\n${PREAMBLE}\n\n\n</mental_models>`.length;
 	const innerBudget = Math.max(0, budgetChars - truncatedOverhead);
 	const perModelBudget = Math.max(120, Math.floor(innerBudget / Math.max(1, models.length)));
 
@@ -260,18 +270,20 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 		consumed += sectionCost;
 	}
 
+	// Escape after the heading/body join. A closer split across that newline
+	// (`</mental_models` + `>`) is not visible in either field alone.
+	// The wrapper is added after this step and is not escaped.
+	let inner = escapeMemoryFrameTokens(sections.join("\n\n"));
 	const tail = truncated ? TRUNCATION_MARKER : "";
-	let assembled = `<mental_models>\n${PREAMBLE}\n\n${sections.join("\n\n")}${tail}\n</mental_models>`;
+	let assembled = `<mental_models>\n${PREAMBLE}\n\n${inner}${tail}\n</mental_models>`;
 
-	// Final hard-cap: if the careful per-model budgeting still slips past the
-	// requested ceiling (small budgets, fat preambles, etc.), brutally truncate
-	// the body region while keeping the wrapper intact so `stripMemoryTags` can
-	// still find the closing tag.
+	// Final hard-cap: slice the already escaped body so a cut cannot restore a raw closer.
+	// The marker is always appended on this path, so reserve its overhead.
+	// Escaped tags are longer than the raw text the per-model budget measured.
 	if (assembled.length > budgetChars) {
-		const overhead = truncated ? truncatedOverhead : cleanOverhead;
-		const room = Math.max(0, budgetChars - overhead);
-		const body = sections.join("\n\n").slice(0, room).trimEnd();
-		assembled = `<mental_models>\n${PREAMBLE}\n\n${body}${TRUNCATION_MARKER}\n</mental_models>`;
+		const room = Math.max(0, budgetChars - truncatedOverhead);
+		inner = inner.slice(0, room).trimEnd();
+		assembled = `<mental_models>\n${PREAMBLE}\n\n${inner}${TRUNCATION_MARKER}\n</mental_models>`;
 	}
 	return assembled;
 }

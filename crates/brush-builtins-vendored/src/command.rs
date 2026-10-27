@@ -1,3 +1,4 @@
+// Vendored from can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-builtins/src/command.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, retains the synchronous local executable lookup API.
 use std::{fmt::Display, io::Write, path::Path};
 
 use brush_core::{
@@ -40,12 +41,17 @@ impl builtins::Command for CommandCommand {
 		&self,
 		context: brush_core::ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
-		// Silently exit if no command was provided.
-		if let Some(command_name) = self.command() {
-			if self.print_description || self.print_verbose_description {
+		if self.print_description || self.print_verbose_description {
+			if self.command_and_args.is_empty() {
+				return Ok(ExecutionResult::success());
+			}
+
+			let mut any_found = false;
+			for command_name in &self.command_and_args {
 				if let Some(found_cmd) =
 					Self::try_find_command(context.shell, command_name.as_str(), self.use_default_path)
 				{
+					any_found = true;
 					if self.print_description {
 						writeln!(context.stdout(), "{found_cmd}")?;
 					} else {
@@ -58,18 +64,20 @@ impl builtins::Command for CommandCommand {
 							},
 						}
 					}
-					Ok(ExecutionResult::success())
-				} else {
-					if self.print_verbose_description {
-						writeln!(context.stderr(), "command: {command_name}: not found")?;
-					}
-					Ok(ExecutionResult::general_error())
+				} else if self.print_verbose_description {
+					writeln!(context.stderr(), "command: {command_name}: not found")?;
 				}
-			} else {
-				self
-					.execute_command(context, command_name, self.use_default_path)
-					.await
 			}
+
+			if any_found {
+				Ok(ExecutionResult::success())
+			} else {
+				Ok(ExecutionResult::general_error())
+			}
+		} else if let Some(command_name) = self.command() {
+			self
+				.execute_command(context, command_name, self.use_default_path)
+				.await
 		} else {
 			Ok(ExecutionResult::success())
 		}

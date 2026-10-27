@@ -9,9 +9,10 @@ import {
 	publishSessionHostRuntimeEvidence,
 	reapDeadSessionRegistrations,
 	sessionHostAttachedClients,
-	sessionHostWorkInFlight,
+	sessionHostWorkLeaseActive,
 } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { createSessionWorkLease } from "../src/session/session-work-lease";
 
 const HALT = "halt-attachment-watch";
 
@@ -150,7 +151,7 @@ test("a host with clients attached but never observed attached is not reaped whi
 	const outcome = await runUntilStable(
 		{
 			readAttachedClients: () => undefined,
-			readWorkInFlight: () => true,
+			readWorkLease: () => true,
 			idleGraceMs: 20,
 			firstAttachGraceMs: 40,
 			pollMs: 10,
@@ -162,7 +163,7 @@ test("a host with clients attached but never observed attached is not reaped whi
 	expect(clock.nowMs).toBe(2_000);
 });
 
-test("a host whose evidence vanishes mid-prompt is held open by work in flight past the idle bound", async () => {
+test("a host whose evidence vanishes mid-prompt is held open by the work lease past the idle bound", async () => {
 	const clock = { nowMs: 0 };
 	let reads = 0;
 	// Attached once, then the count stops being readable while the turn that
@@ -173,7 +174,7 @@ test("a host whose evidence vanishes mid-prompt is held open by work in flight p
 				reads += 1;
 				return reads === 1 ? 1 : undefined;
 			},
-			readWorkInFlight: () => true,
+			readWorkLease: () => true,
 			idleGraceMs: 20,
 			firstAttachGraceMs: 40,
 			pollMs: 10,
@@ -185,11 +186,11 @@ test("a host whose evidence vanishes mid-prompt is held open by work in flight p
 	expect(clock.nowMs).toBe(2_000);
 });
 
-test("work in flight defers the first-attach bound to the end of the work, it does not remove it", async () => {
+test("the work lease defers the first-attach bound until release, it does not remove it", async () => {
 	let nowMs = 0;
 	await watchSessionHostClientAttachment({
 		readAttachedClients: () => undefined,
-		readWorkInFlight: () => nowMs < 20,
+		readWorkLease: () => nowMs < 20,
 		now: () => nowMs,
 		sleep: async ms => {
 			nowMs += ms;
@@ -206,7 +207,7 @@ test("a host whose SDK runtime never came up reports no work and still exits at 
 	let nowMs = 0;
 	await watchSessionHostClientAttachment({
 		readAttachedClients: () => undefined,
-		readWorkInFlight: () => false,
+		readWorkLease: () => false,
 		now: () => nowMs,
 		sleep: async ms => {
 			nowMs += ms;
@@ -218,30 +219,31 @@ test("a host whose SDK runtime never came up reports no work and still exits at 
 	expect(nowMs).toBe(40);
 });
 
-test("published runtime evidence is the host's own client count and work, and retracts to no-evidence", () => {
+test("published runtime evidence is the host's own client count and lease, and retracts to no-evidence", () => {
 	// Shard peers may legitimately hold their own publications; every assertion is
 	// relative to that baseline, since a foreign publication is exactly what the
 	// identity-scoped registry must leave untouched.
 	const baseClients = sessionHostAttachedClients();
-	const baseWork = sessionHostWorkInFlight();
+	const baseWork = sessionHostWorkLeaseActive();
 	let clients = 3;
-	let busy = false;
+	const lease = createSessionWorkLease();
 	const publication = publishSessionHostRuntimeEvidence({
 		attachedClients: () => clients,
-		workInFlight: () => busy,
+		workLease: lease,
 	});
 	try {
 		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 3);
-		expect(sessionHostWorkInFlight()).toBe(baseWork || false);
+		expect(sessionHostWorkLeaseActive()).toBe(baseWork || false);
 		clients = 0;
-		busy = true;
+		const held = lease.acquire();
 		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 0);
-		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		held.release();
 	} finally {
 		publication.retract();
 	}
 	expect(sessionHostAttachedClients()).toEqual(baseClients);
-	expect(sessionHostWorkInFlight()).toBe(baseWork);
+	expect(sessionHostWorkLeaseActive()).toBe(baseWork);
 	// Retraction is idempotent and still owns nothing else.
 	publication.retract();
 	expect(sessionHostAttachedClients()).toEqual(baseClients);
@@ -249,18 +251,18 @@ test("published runtime evidence is the host's own client count and work, and re
 
 test("an attached observer daemon does not count as demand, while in-flight work still does", async () => {
 	const baseClients = sessionHostAttachedClients() ?? 0;
-	let work = false;
+	const workLease = createSessionWorkLease();
 	const publication = publishSessionHostRuntimeEvidence({
 		attachedClients: () => 1,
 		observerClients: () => 1,
-		workInFlight: () => work,
+		workLease,
 	});
 	try {
 		const readDemand = () => Math.max(0, (sessionHostAttachedClients() ?? baseClients) - baseClients);
 		const idleOutcome = await runUntilStable(
 			{
 				readAttachedClients: readDemand,
-				readWorkInFlight: sessionHostWorkInFlight,
+				readWorkLease: sessionHostWorkLeaseActive,
 				idleGraceMs: 20,
 				firstAttachGraceMs: 40,
 				pollMs: 10,
@@ -269,11 +271,11 @@ test("an attached observer daemon does not count as demand, while in-flight work
 			{ nowMs: 0 },
 		);
 		expect(idleOutcome).toBe("reaped");
-		work = true;
+		const held = workLease.acquire();
 		const inFlightOutcome = await runUntilStable(
 			{
 				readAttachedClients: readDemand,
-				readWorkInFlight: sessionHostWorkInFlight,
+				readWorkLease: sessionHostWorkLeaseActive,
 				idleGraceMs: 20,
 				firstAttachGraceMs: 40,
 				pollMs: 10,
@@ -282,6 +284,7 @@ test("an attached observer daemon does not count as demand, while in-flight work
 			{ nowMs: 0 },
 		);
 		expect(inFlightOutcome).toBe("still-running");
+		held.release();
 	} finally {
 		publication.retract();
 	}
@@ -289,23 +292,27 @@ test("an attached observer daemon does not count as demand, while in-flight work
 
 test("a retracting runtime cannot clear the evidence of the runtime that succeeded it", () => {
 	const baseClients = sessionHostAttachedClients();
+	const predecessorLease = createSessionWorkLease();
+	const successorLease = createSessionWorkLease();
+	const successorHeld = successorLease.acquire();
 	const predecessor = publishSessionHostRuntimeEvidence({
 		attachedClients: () => 2,
-		workInFlight: () => false,
+		workLease: predecessorLease,
 	});
 	const successor = publishSessionHostRuntimeEvidence({
 		attachedClients: () => 1,
-		workInFlight: () => true,
+		workLease: successorLease,
 	});
 	try {
 		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 3);
 		// The predecessor's deferred teardown runs late, while the successor serves.
 		predecessor.retract();
 		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 1);
-		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
 		predecessor.retract();
 		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 1);
 	} finally {
+		successorHeld.release();
 		successor.retract();
 	}
 	expect(sessionHostAttachedClients()).toEqual(baseClients);
@@ -313,32 +320,86 @@ test("a retracting runtime cannot clear the evidence of the runtime that succeed
 
 test("a reader that fails is no evidence, and never fakes attachment or work for a sibling", () => {
 	const baseClients = sessionHostAttachedClients();
-	const baseWork = sessionHostWorkInFlight();
+	const baseWork = sessionHostWorkLeaseActive();
 	const broken = publishSessionHostRuntimeEvidence({
 		attachedClients: () => {
 			throw new Error("native server is gone");
 		},
-		workInFlight: () => {
-			throw new Error("native server is gone");
+		workLease: {
+			acquire: () => ({ release: () => {} }),
+			isHeld: () => {
+				throw new Error("native server is gone");
+			},
 		},
 	});
 	try {
 		expect(sessionHostAttachedClients()).toEqual(baseClients);
-		expect(sessionHostWorkInFlight()).toBe(baseWork);
+		expect(sessionHostWorkLeaseActive()).toBe(baseWork);
+		const healthyLease = createSessionWorkLease();
+		const healthyHeld = healthyLease.acquire();
 		const healthy = publishSessionHostRuntimeEvidence({
 			attachedClients: () => 4,
-			workInFlight: () => true,
+			workLease: healthyLease,
 		});
 		try {
 			expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 4);
-			expect(sessionHostWorkInFlight()).toBe(true);
+			expect(sessionHostWorkLeaseActive()).toBe(true);
 		} finally {
+			healthyHeld.release();
 			healthy.retract();
 		}
 	} finally {
 		broken.retract();
 	}
 	expect(sessionHostAttachedClients()).toEqual(baseClients);
+});
+
+async function expectWorkLeaseKeepsHostAliveUntilReleased(): Promise<void> {
+	let nowMs = 0;
+	let polls = 0;
+	const lease = createSessionWorkLease();
+	const held = lease.acquire();
+	const firstPoll = Promise.withResolvers<void>();
+	const publication = publishSessionHostRuntimeEvidence({
+		attachedClients: () => 0,
+		workLease: lease,
+	});
+	try {
+		const watching = watchSessionHostClientAttachment({
+			readAttachedClients: () => undefined,
+			readWorkLease: sessionHostWorkLeaseActive,
+			now: () => nowMs,
+			sleep: async ms => {
+				nowMs += ms;
+				polls += 1;
+				if (polls === 1) firstPoll.resolve();
+				await Promise.resolve();
+			},
+			idleGraceMs: 20,
+			firstAttachGraceMs: 40,
+			pollMs: 10,
+		});
+		await firstPoll.promise;
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		held.release();
+		await watching;
+		expect(nowMs).toBe(40);
+	} finally {
+		held.release();
+		publication.retract();
+	}
+}
+
+test("queued admitted input holds the host lease until released", async () => {
+	await expectWorkLeaseKeepsHostAliveUntilReleased();
+});
+
+test("post-agent_end continuation holds the host lease until released", async () => {
+	await expectWorkLeaseKeepsHostAliveUntilReleased();
+});
+
+test("a paused loop holds the host lease until released", async () => {
+	await expectWorkLeaseKeepsHostAliveUntilReleased();
 });
 
 test("the broker drops registrations whose host process is gone, keeps live ones, and logs each reap", async () => {

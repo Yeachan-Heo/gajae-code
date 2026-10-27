@@ -122,6 +122,10 @@ function lockRetryExhausted(budget: LockRetryBudget): boolean {
 	return lockRetryRemainingMs(budget) <= 0;
 }
 
+function lockRetryTotalWaitExhausted(budget: LockRetryBudget): boolean {
+	return Math.max(0, performance.now() - budget.firstAttemptAt) >= LOCK_ACQUIRE_MAX_WAIT_MS;
+}
+
 async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 	budget.attempts++;
 	const remainingMs = lockRetryRemainingMs(budget);
@@ -296,9 +300,12 @@ async function repairPendingOwnerRecord(pending: PendingOwnerRepair): Promise<bo
 	const handle = pending.repairHandle;
 	if (!handle || pending.repairBytes === undefined) return true;
 	try {
-		await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"));
+		const written = await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"), undefined);
 		const stat = await handle.stat({ bigint: true });
-		pending.repairSnapshot = ownerSnapshotFrom(stat, Buffer.from(pending.repairBytes, "utf8"));
+		// The rewritten record may have been padded back to its previous length, so the
+		// identity that authorizes later cleanup is the bytes that landed, not the bytes
+		// requested.
+		pending.repairSnapshot = ownerSnapshotFrom(stat, written);
 		await handle.close();
 		pending.repairHandle = undefined;
 		return true;
@@ -529,6 +536,8 @@ export const SessionStateLockTestHooks: {
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before a held owner record rewrite mutates bytes. */
 	beforeOwnerRecordRewrite?: (file: string) => void | Promise<void>;
+	/** @internal Fault seam immediately before the pre-rewrite fstat on the owner record handle. */
+	beforeOwnerRecordPrewriteStat?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before final transition-generation validation. */
 	beforeTransitionReleaseLstat?: (transitionDir: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before setup generation capture. */
@@ -570,7 +579,7 @@ export type SessionStateLockUnavailableReason =
 /**
  * Why a stale-transition reclaim refused, as a bounded classifier.
  *
- * `transition_claim_timeout` collapsed six structurally different refusals into
+ * `transition_claim_timeout` collapsed several structurally different refusals into
  * one message, so an operator could not tell a foreign-host tombstone from a
  * live owner from a directory an external process was stamping — the gap #5606
  * asked for. Every member is a fixed enum: never a path, token, host id, pid or
@@ -787,7 +796,7 @@ function lockUnavailable(
 /**
  * `transition_claim_timeout` with the reclaim refusal that kept repeating.
  *
- * The bare classifier could not distinguish six structurally different
+ * The bare classifier could not distinguish several structurally different
  * refusals, so an operator had no way to tell which action would help (#5606).
  * The suffix is a fixed enum member and nothing else — this string reaches user
  * reports, so it must never carry a path, token, host id, pid or errno.
@@ -887,6 +896,24 @@ function ownerStartIdentity(pid: number): { start_time: string; start_time_forma
 	if (portableStartTime !== null)
 		return { start_time: portableStartTime, start_time_format: PORTABLE_START_TIME_FORMAT };
 	return { start_time: "unknown" };
+}
+
+/**
+ * Parse owner-record bytes, treating a trailing run of NUL bytes like the space padding
+ * `writeOwnerBytes` emits.
+ *
+ * NTFS and file-system filters (cloud sync placeholders, crash recovery) can publish a
+ * file length whose tail data never landed, and that tail reads back as zero-filled.
+ * The complete record before it is still a fully attributable owner, so it is judged by
+ * the same validation as any other record. Rejecting it as unparseable instead wedges
+ * the lock forever with `lock_owner_record_unprovenanced`, even when it is a released
+ * tombstone. Only TRAILING NULs are stripped: a NUL anywhere inside the document still
+ * fails `JSON.parse`.
+ */
+function parseOwnerRecordBytes(bytes: string): unknown {
+	let end = bytes.length;
+	while (end > 0 && bytes.charCodeAt(end - 1) === 0) end--;
+	return JSON.parse(end === bytes.length ? bytes : bytes.slice(0, end));
 }
 
 function validLockOwner(value: unknown): value is SessionStateLockOwner {
@@ -1487,13 +1514,21 @@ async function createOwnerLock(
 	// pair names the record this call brought into existence and nothing else.
 	let created: OpenOwnerIdentity | null = null;
 	try {
-		await handle.chmod(0o600);
 		created = await openOwnerIdentity(handle);
 		await SessionStateLockTestHooks.ownerRecordWriteFault?.(file);
+		// The record's bytes land before anything else is asked of this descriptor. A
+		// freshly created record is empty until they do, and an empty record carries no
+		// `owner_host_id`, so every syscall placed in front of this write is a window in
+		// which a kill leaves debris no later contender may reclaim. `chmod` is the one
+		// that can actually stall — it is a metadata round-trip that a File Provider,
+		// NFS, or CIFS mount may hold for seconds — so it moves behind the write. The
+		// unrestricted mode it corrected for is already excluded by the create's own
+		// mode argument, so the descriptor is never more permissive than 0o600 here.
 		await handle.writeFile(bytes);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile() || stat.size !== BigInt(bytes.byteLength))
 			throw new SessionStateLockUnavailableError(new Error("Owner record did not land as a regular file."));
+		await handle.chmod(0o600);
 		return ownerSnapshotFrom(stat, bytes);
 	} catch (error) {
 		// Deliberately BEFORE any close: releasing the descriptor first would free the
@@ -1516,16 +1551,48 @@ const POSIX_OWNER_REWRITE_FLAGS = POSIX_NOFOLLOW_AVAILABLE
 	? fsSync.constants.O_RDWR | fsSync.constants.O_NONBLOCK | fsSync.constants.O_NOFOLLOW
 	: undefined;
 
-async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer): Promise<void> {
-	await handle.truncate(0);
+/**
+ * The one writer of an owner record's bytes: overwrite in place, never shorter.
+ *
+ * `truncate(0)` followed by a write looks atomic and is not. The bytes a truncate
+ * publishes are EMPTY, and an empty record carries no `owner_host_id` at all, so a
+ * process that dies inside that window (a repeated Ctrl-C reaches `postmortem.quit`,
+ * which deliberately performs no lock release) leaves a record with no attributable
+ * owner. `malformedOwnerProvenance` classifies it `unprovenanced`, the reclaim refuses
+ * it, and every later contender fails closed forever: `transition_claim_timeout` with
+ * `claim_or_owner_unreadable`, and coordinator state persistence for that session is
+ * lost for good — the failure class #5159 and #5216 both land on.
+ *
+ * So the replacement is written over the HEAD of the record and the previous byte
+ * length is kept instead of discarded. A JSON document ignores trailing whitespace, so
+ * a padded record is the same record to every reader — `JSON.parse`, `validLockOwner`,
+ * `malformedOwnerProvenance`, and the identity-bound unlink all see exactly the
+ * replacement — while the bytes on disk always carry the full ownership preamble. That
+ * leaves a torn single write (which needs the kernel to short-write a ~200 byte payload)
+ * as the only state the record cannot be attributed from, instead of the guaranteed
+ * empty window between two syscalls.
+ *
+ * @returns the exact bytes now on disk. A padded record's size and SHA-256 are the
+ * padded bytes', so this — not the requested payload — is what identifies the record
+ * for every later capture, comparison, and replay.
+ */
+async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer, file?: string): Promise<Buffer> {
+	if (file) await SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat?.(file);
+	const previous = await handle.stat({ bigint: true });
+	const previousSize = previous.isFile() === true ? Number(previous.size) : 0;
+	const padding = Math.max(0, previousSize - bytes.byteLength);
+	const payload = padding === 0 ? bytes : Buffer.concat([bytes, Buffer.alloc(padding, 0x20)]);
 	let offset = 0;
-	while (offset < bytes.byteLength) {
-		const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+	while (offset < payload.byteLength) {
+		const { bytesWritten } = await handle.write(payload, offset, payload.byteLength - offset, offset);
 		if (bytesWritten <= 0) throw new Error("Owner record rewrite made no progress.");
 		offset += bytesWritten;
 	}
-	await handle.truncate(bytes.byteLength);
+	// `payload` is never shorter than the record already was, so this can only remove a
+	// tail that outgrew the bytes just written; it can never cut the record itself.
+	await handle.truncate(payload.byteLength);
 	await handle.sync();
+	return payload;
 }
 
 async function rewriteHeldOwnerRecord(
@@ -1577,18 +1644,18 @@ async function rewriteHeldOwnerRecord(
 		mutationStarted = true;
 		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
 		rewriteHookPassed = true;
-		await writeOwnerBytes(handle, replacementBytes);
+		const writtenBytes = await writeOwnerBytes(handle, replacementBytes, file);
 		const canonical = await captureRegularLockOwner(file);
-		// On Windows, an in-place truncate/write can expose refreshed descriptor
+		// On Windows, an in-place rewrite can expose refreshed descriptor
 		// metadata even though the file object is unchanged. The descriptor opened
 		// before mutation is the stable identity bracket; the path capture still
 		// proves that the pathname resolves to that same object after the rewrite.
 		if (!canonical || canonical.dev !== opened.dev || canonical.ino !== opened.ino)
 			throw new SessionStateLockUnavailableError(new Error("Owner pathname changed after rewrite."));
-		if (canonical.bytes !== replacementBytes.toString("utf8")) {
+		if (canonical.bytes !== writtenBytes.toString("utf8")) {
 			let successor: unknown;
 			try {
-				successor = JSON.parse(canonical.bytes);
+				successor = parseOwnerRecordBytes(canonical.bytes);
 			} catch {
 				successor = null;
 			}
@@ -1598,7 +1665,7 @@ async function rewriteHeldOwnerRecord(
 		return canonical;
 	} catch (error) {
 		// Keep the descriptor as the repair authority until the held bytes have
-		// been restored. A truncate/write/fsync fault may leave a malformed or
+		// been restored. A write/fsync fault may leave a malformed or
 		// partially committed record; closing first would force recovery to trust
 		// an unproven pathname and can wedge a successor behind the transition.
 		let repairNeeded = mutationStarted;
@@ -1612,9 +1679,9 @@ async function rewriteHeldOwnerRecord(
 		if (repairNeeded) {
 			let repaired: LockOwnerSnapshot;
 			try {
-				await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"));
+				const restored = await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"), file);
 				const repairedStat = await handle.stat({ bigint: true });
-				repaired = ownerSnapshotFrom(repairedStat, Buffer.from(held.bytes, "utf8"));
+				repaired = ownerSnapshotFrom(repairedStat, restored);
 			} catch (repairError) {
 				const aggregate = new AggregateError(
 					[error, repairError],
@@ -1657,7 +1724,7 @@ async function acquireOwnerLock(
 		if (!current) throw error;
 		let observed: unknown;
 		try {
-			observed = JSON.parse(current.bytes);
+			observed = parseOwnerRecordBytes(current.bytes);
 		} catch {
 			throw error;
 		}
@@ -1697,7 +1764,7 @@ async function acquireOwnerLock(
 async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
 	let owner: unknown;
 	try {
-		owner = JSON.parse(held.bytes);
+		owner = parseOwnerRecordBytes(held.bytes);
 	} catch {
 		owner = null;
 	}
@@ -1758,7 +1825,7 @@ async function reclaimStaleOwnerRecord(
 	if (!snapshot) return "absent_or_changed";
 	let owner: unknown;
 	try {
-		owner = JSON.parse(snapshot.bytes);
+		owner = parseOwnerRecordBytes(snapshot.bytes);
 	} catch {
 		owner = null;
 	}
@@ -1863,7 +1930,7 @@ async function releaseTransitionClaim(
 ): Promise<void> {
 	let heldOwner: SessionStateLockOwner;
 	try {
-		heldOwner = JSON.parse(held.bytes) as SessionStateLockOwner;
+		heldOwner = parseOwnerRecordBytes(held.bytes) as SessionStateLockOwner;
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
 	}
@@ -1920,6 +1987,7 @@ async function releaseTransitionClaim(
  */
 interface TransitionReclaimOutcome {
 	reclaimed: boolean;
+	reclaimReason?: "released_handoff" | "dead_owner";
 	refusal?: TransitionReclaimRefusal;
 }
 
@@ -1945,14 +2013,17 @@ async function reclaimStaleTransitionClaim(
 			},
 			quarantineName,
 		);
-		return { reclaimed: reclaimed === "owner_removed" };
+		return {
+			reclaimed: reclaimed === "owner_removed",
+			...(reclaimed === "owner_removed" ? { reclaimReason: "dead_owner" as const } : {}),
+		};
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
 	if (!ownerSnapshot) return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	let owner: unknown;
 	try {
-		owner = JSON.parse(ownerSnapshot.bytes);
+		owner = parseOwnerRecordBytes(ownerSnapshot.bytes);
 	} catch {
 		return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	}
@@ -1996,7 +2067,10 @@ async function reclaimStaleTransitionClaim(
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return { reclaimed: removed.ok };
+		return {
+			reclaimed: removed.ok,
+			...(removed.ok ? { reclaimReason: owner.released === true ? "released_handoff" : "dead_owner" } : {}),
+		};
 	}
 	if (
 		removed.code === "cleanup_pending" &&
@@ -2013,7 +2087,7 @@ async function reclaimStaleTransitionClaim(
 		// successor populated the detached path.
 		await removeTransitionDir(removed.detachedPath);
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return { reclaimed: true };
+		return { reclaimed: true, reclaimReason: owner.released === true ? "released_handoff" : "dead_owner" };
 	}
 	throw new SessionStateLockUnavailableError(
 		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
@@ -2147,7 +2221,7 @@ async function recoverPendingTransitionRelease(
 			if (!pendingOwner) return false;
 			let parsed: Partial<SessionStateLockOwner>;
 			try {
-				parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+				parsed = parseOwnerRecordBytes(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 			} catch {
 				// A rewrite can truncate the held inode and fail before replacement
 				// bytes land. The malformed payload is still ours only when its object
@@ -2181,7 +2255,7 @@ async function recoverPendingTransitionRelease(
 				pendingOwner = await captureRegularLockOwner(ownerFile);
 				if (!pendingOwner) return false;
 				try {
-					parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+					parsed = parseOwnerRecordBytes(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 				} catch {
 					return false;
 				}
@@ -2427,8 +2501,21 @@ async function runLockPathTransition<T>(
 			// succession of contenders. A later maintenance pass can take the freed claim.
 			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
 			if (outcome.reclaimed) {
-				if (lockRetryExhausted(budget))
-					throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
+				if (lockRetryExhausted(budget)) {
+					// Only a released tombstone is the previous holder's explicit handoff.
+					// Ordinary dead-owner reclaims remain bounded by the original deadline,
+					// even though both reclaim paths unlink their owner sidecar.
+					const ownerStillPresent = await fs.lstat(`${transitionDir}.owner`).then(
+						() => true,
+						error => (error as NodeJS.ErrnoException).code !== "ENOENT",
+					);
+					if (
+						outcome.reclaimReason !== "released_handoff" ||
+						ownerStillPresent ||
+						lockRetryTotalWaitExhausted(budget)
+					)
+						throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
+				}
 				continue;
 			}
 			if (!(await waitForLockRetry(budget)))

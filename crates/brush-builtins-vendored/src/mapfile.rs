@@ -1,7 +1,10 @@
-use std::io::{Read, Write};
+// Vendored from can1357/oh-my-pi@68fb9863b377af566d3b56aa882a964654b5760a:crates/pi-builtins/src/mapfile.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, retained local array validation and synchronous file descriptor reads, one byte at a time with no read-ahead.
+use std::io::Write;
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, env, error, variables};
+use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, env, escape, variables};
 use clap::Parser;
+
+use crate::line_input::{CTRL_C, CTRL_D, LineInput};
 
 /// Read lines from standard input into an indexed array variable.
 #[derive(Parser)]
@@ -48,12 +51,8 @@ impl builtins::Command for MapFileCommand {
 
 	async fn execute<SE: brush_core::ShellExtensions>(
 		&self,
-		context: brush_core::ExecutionContext<'_, SE>,
+		mut context: brush_core::ExecutionContext<'_, SE>,
 	) -> Result<brush_core::ExecutionResult, Self::Error> {
-		if self.callback_group_size != 5000 || self.callback.is_some() {
-			return error::unimp("mapfile -C/-c is not yet implemented");
-		}
-
 		if let Some(origin) = self.origin {
 			if origin < 0 {
 				writeln!(context.stderr(), "{}: {origin}: invalid array origin", context.command_name)?;
@@ -62,6 +61,12 @@ impl builtins::Command for MapFileCommand {
 		}
 
 		if let Some((_, var)) = context.shell.env().get(&self.array_var_name) {
+			// Refused before any input is read, as in bash. Assigning an element
+			// does not check this itself (so -O wrote into a readonly array), and
+			// failing at the first element would still consume its line.
+			if var.is_readonly() {
+				return Err(ErrorKind::ReadonlyVariable.into());
+			}
 			if matches!(
 				var.value(),
 				variables::ShellValue::AssociativeArray(_)
@@ -81,33 +86,19 @@ impl builtins::Command for MapFileCommand {
 			.try_fd(self.fd)
 			.ok_or_else(|| ErrorKind::BadFileDescriptor(self.fd))?;
 
-		// Read!
-		let results = self.read_entries(input_file)?;
-
-		if let Some(origin) = self.origin {
-			// -O: preserve existing array, assign at offset.
-			for (elem_idx, (_key, value)) in results.0.into_iter().enumerate() {
-				// If the user is getting to wraparounds in *bash*, they got bigger problems.
-				#[allow(clippy::cast_possible_wrap)]
-				let elem_idx = elem_idx as i64;
-				context.shell.env_mut().update_or_add_array_element(
-					&self.array_var_name,
-					(elem_idx + origin).to_string(),
-					value,
-					|_| Ok(()),
-					env::EnvironmentLookup::Anywhere,
-					env::EnvironmentScope::Global,
-				)?;
-			}
-		} else {
-			// No -O: replace the entire variable (clears existing).
+		// Bash clears the array before reading unless an explicit origin is used.
+		if self.origin.is_none() {
 			context.shell.env_mut().update_or_add(
 				&self.array_var_name,
-				variables::ShellValueLiteral::Array(results),
+				variables::ShellValueLiteral::Array(variables::ArrayLiteral(vec![])),
 				|_| Ok(()),
 				env::EnvironmentLookup::Anywhere,
 				env::EnvironmentScope::Global,
 			)?;
+		}
+
+		if let Some(result) = self.read_entries(input_file, &mut context).await? {
+			return Ok(result);
 		}
 
 		Ok(ExecutionResult::success())
@@ -115,70 +106,125 @@ impl builtins::Command for MapFileCommand {
 }
 
 impl MapFileCommand {
-	fn read_entries(
+	async fn read_entries<SE: brush_core::ShellExtensions>(
 		&self,
-		mut input_file: brush_core::openfiles::OpenFile,
-	) -> Result<variables::ArrayLiteral, brush_core::Error> {
+		input_file: brush_core::openfiles::OpenFile,
+		context: &mut brush_core::ExecutionContext<'_, SE>,
+	) -> Result<Option<ExecutionResult>, brush_core::Error> {
 		let _term_mode = setup_terminal_settings(&input_file)?;
 
-		let mut entries = vec![];
+		let mut entry_count = 0usize;
 		let mut read_count = 0;
 		let max_count = self.max_count.try_into()?;
+		let callback_group_size: usize = self.callback_group_size.try_into()?;
 		let delimiter = match &self.delimiter {
 			Some(d) if d.is_empty() => b'\0',
 			Some(d) => d.as_bytes().first().copied().unwrap_or(b'\n'),
 			None => b'\n',
 		};
 
-		let mut buf = [0u8; 1];
+		let terminal = input_file.is_terminal();
+		let held_input = input_file.held_input().cloned();
+		// Bytes are read one at a time, so a -C callback, a failed assignment
+		// or a later command finds the input right after the last line
+		// stored (bash's mapfile reads a pipe unbuffered too).
+		let mut input = LineInput::new(input_file);
 
-		while max_count == 0 || entries.len() < max_count {
-			let mut line = vec![];
-			let mut saw_delimiter = false;
+		while max_count == 0 || entry_count < max_count {
+			let line_str = {
+				// Release before running a callback so it can read the same
+				// descriptor without deadlocking on this mapfile operation.
+				let _read_guard = held_input.as_ref().map(|held| held.lock_reader());
+				let mut line = vec![];
+				let mut saw_delimiter = false;
 
-			loop {
-				match input_file.read(&mut buf) {
-					Ok(0) => break,                                         // End of input
-					Ok(1) if buf[0] == b'\x03' => break,                    // Ctrl+C
-					Ok(1) if buf[0] == b'\x04' && line.is_empty() => break, // Ctrl+D
-					Ok(1) => {
-						let byte = buf[0];
-						line.push(byte);
-						if byte == delimiter {
-							saw_delimiter = true;
-							break;
-						}
-					},
-					Ok(_) => unreachable!("input can only be 0, 1, or error"),
-					Err(e) => return Err(e.into()),
+				while let Some(byte) = input.next_byte()? {
+					// Interactive keys end input only on a terminal; in a file or
+					// pipe they are data.
+					if terminal && (byte == CTRL_C || byte == CTRL_D && line.is_empty()) {
+						break;
+					}
+					line.push(byte);
+					if byte == delimiter {
+						saw_delimiter = true;
+						break;
+					}
 				}
-			}
 
-			if line.is_empty() && !saw_delimiter {
+				if line.is_empty() && !saw_delimiter {
+					None
+				} else {
+					if self.remove_delimiter && line.ends_with(&[delimiter]) {
+						line.pop();
+					}
+					Some(input.decode_line(line))
+				}
+			};
+			let Some(line_str) = line_str else {
 				break;
-			}
+			};
 
 			if read_count < self.skip_count {
 				read_count += 1;
 				continue;
 			}
 
-			if self.remove_delimiter && line.ends_with(&[delimiter]) {
-				line.pop();
+			let array_index = self.origin.unwrap_or(0) + i64::try_from(entry_count)?;
+
+			if let Some(callback) = &self.callback
+				&& (entry_count + 1).is_multiple_of(callback_group_size)
+			{
+				let result = run_callback(callback, array_index, &line_str, context).await?;
+				if !result.is_normal_flow() {
+					return Ok(Some(result));
+				}
 			}
 
-			let line_str = String::from_utf8_lossy(&line).to_string();
+			context.shell.env_mut().update_or_add_array_element(
+				&self.array_var_name,
+				array_index.to_string(),
+				line_str,
+				|_| Ok(()),
+				env::EnvironmentLookup::Anywhere,
+				env::EnvironmentScope::Global,
+			)?;
 
-			entries.push((None, line_str));
+			entry_count += 1;
 		}
 
-		Ok(variables::ArrayLiteral(entries))
+		Ok(None)
 	}
+}
+
+async fn run_callback<SE: brush_core::ShellExtensions>(
+	callback: &str,
+	array_index: i64,
+	line: &str,
+	context: &mut brush_core::ExecutionContext<'_, SE>,
+) -> Result<ExecutionResult, brush_core::Error> {
+	let index_arg = array_index.to_string();
+	let index_arg = escape::quote_if_needed(&index_arg, escape::QuoteMode::SingleQuote);
+	let line_arg = escape::quote_if_needed(line, escape::QuoteMode::SingleQuote);
+
+	let mut command = String::with_capacity(callback.len() + index_arg.len() + line_arg.len() + 2);
+	command.push_str(callback);
+	command.push(' ');
+	command.push_str(index_arg.as_ref());
+	command.push(' ');
+	command.push_str(line_arg.as_ref());
+
+	let source_info = context.shell.call_stack().current_pos_as_source_info();
+	context.shell.run_string(command, &source_info, &context.params).await
 }
 
 fn setup_terminal_settings(
 	file: &brush_core::openfiles::OpenFile,
 ) -> Result<Option<brush_core::terminal::AutoModeGuard>, brush_core::Error> {
+	// The guard dups the descriptor and reads its terminal attributes; a
+	// pipe or file has none.
+	if !file.is_terminal() {
+		return Ok(None);
+	}
 	let mode = brush_core::terminal::AutoModeGuard::new(file.to_owned()).ok();
 	if let Some(mode) = &mode {
 		let config = brush_core::terminal::Settings::builder()

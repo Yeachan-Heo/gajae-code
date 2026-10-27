@@ -466,8 +466,8 @@ function buildOutcomeText(outcome: DapContinueOutcome, timeoutSec: number, verb:
 	return lines.join("\n");
 }
 
-function getConfiguredAdapters(cwd: string): string {
-	const adapters = getAvailableAdapters(cwd).map(adapter => adapter.name);
+function getConfiguredAdapters(cwd: string, trustCwds?: readonly string[]): string {
+	const adapters = getAvailableAdapters(cwd, trustCwds).map(adapter => adapter.name);
 	return adapters.length > 0 ? adapters.join(", ") : "none";
 }
 async function validateLaunchProgram(program: string, cwd: string): Promise<void> {
@@ -637,6 +637,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		const details: DebugToolDetails = { action: params.action, success: true };
 		const result = toolResult(details);
+		const trustCwds = [this.session.cwd];
 		switch (params.action) {
 			case "launch": {
 				if (!params.program) {
@@ -645,14 +646,14 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 				const commandCwd = params.cwd ? resolveToCwd(params.cwd, this.session.cwd) : this.session.cwd;
 				const program = resolveToCwd(params.program, commandCwd);
 				await validateLaunchProgram(program, commandCwd);
-				const adapter = selectLaunchAdapter(program, commandCwd, params.adapter);
+				const adapter = selectLaunchAdapter(program, commandCwd, params.adapter, trustCwds);
 				if (!adapter) {
 					throw new ToolError(
-						`No debugger adapter available. Installed adapters: ${getConfiguredAdapters(commandCwd)}`,
+						`No debugger adapter available. Installed adapters: ${getConfiguredAdapters(commandCwd, trustCwds)}`,
 					);
 				}
 				const snapshot = await dapSessionManager.launch(
-					{ adapter, program, args: params.args, cwd: commandCwd },
+					{ adapter, program, args: params.args, cwd: commandCwd, workspace: this.session.cwd },
 					combinedSignal,
 					timeoutSec * 1000,
 				);
@@ -665,14 +666,21 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					throw new ToolError("attach requires pid or port");
 				}
 				const commandCwd = params.cwd ? resolveToCwd(params.cwd, this.session.cwd) : this.session.cwd;
-				const adapter = selectAttachAdapter(commandCwd, params.adapter, params.port);
+				const adapter = selectAttachAdapter(commandCwd, params.adapter, params.port, trustCwds);
 				if (!adapter) {
 					throw new ToolError(
-						`No debugger adapter available. Installed adapters: ${getConfiguredAdapters(commandCwd)}`,
+						`No debugger adapter available. Installed adapters: ${getConfiguredAdapters(commandCwd, trustCwds)}`,
 					);
 				}
 				const snapshot = await dapSessionManager.attach(
-					{ adapter, cwd: commandCwd, pid: params.pid, port: params.port, host: params.host },
+					{
+						adapter,
+						cwd: commandCwd,
+						workspace: this.session.cwd,
+						pid: params.pid,
+						port: params.port,
+						host: params.host,
+					},
 					combinedSignal,
 					timeoutSec * 1000,
 				);

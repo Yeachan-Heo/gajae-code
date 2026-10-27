@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,6 +21,10 @@ import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-s
 import { getConfigRootDir, getSessionsDir, getTerminalSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRmSync } from "../../../../scripts/safe-cleanup";
 import { listManagedCandidates, resolveManagedScope } from "../../src/session/internal/managed-session-scope";
+import {
+	reapScrubbedProtocolRemnants,
+	reapScrubbedProtocolRemnantsSync,
+} from "../../src/session/internal/managed-session-storage";
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -687,6 +692,138 @@ describe("SessionManager temp cwd session dirs", () => {
 
 		expect(sessions.map(session => session.path)).toContain(validPath);
 	});
+
+	/**
+	 * A negative age gate puts the cutoff in the future so every fixture file is
+	 * unconditionally old enough. Without it a just-created file can survive on
+	 * timing alone, which would let a retention assertion pass for the wrong
+	 * reason and stop biting on the guard it is meant to pin.
+	 */
+	const REAP_IGNORING_AGE_MS = -60_000;
+
+	/**
+	 * A crash between the publication exchange and the staging unlink strands
+	 * `.<transcript>.<uuid>.replacement` as a second name for the LIVE transcript
+	 * inode. Every managed capture opens no-follow and rejects `nlink > 1`, so the
+	 * surplus name silently removes the session from resume listing while its
+	 * bytes are intact — `--resume <id>` reported `Session "<id>" not found.` and
+	 * `--continue` reported `Could not inspect managed session: read-failed`.
+	 * Scope preparation reaps the surplus NAME, never the inode.
+	 */
+	it.skipIf(process.platform === "win32")(
+		"reaps stranded replacement staging that aliases its live transcript",
+		async () => {
+			const cwd = path.join(testAgentDir, `staging-alias-cwd-${Snowflake.next()}`);
+			fs.mkdirSync(cwd, { recursive: true });
+			const sessionDir = SessionManager.getDefaultSessionDir(cwd);
+			const transcript = path.join(sessionDir, "aliased.jsonl");
+			fs.writeFileSync(
+				transcript,
+				`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "aliased-session", timestamp: "2025-01-01T00:00:00Z", cwd })}\n`,
+				{ mode: 0o600 },
+			);
+			const staging = path.join(sessionDir, `.aliased.jsonl.${randomUUID()}.replacement`);
+			fs.linkSync(transcript, staging);
+			expect(fs.lstatSync(transcript).nlink).toBe(2);
+
+			// Pre-reap: the surplus name removes the session from managed inventory.
+			expect((await SessionManager.listForResumePickerReadOnly(cwd)).map(session => session.path)).not.toContain(
+				transcript,
+			);
+			// The managed picker is the local-scope inventory; losing the session there
+			// demotes resolution to the global fallback scan, which is the degraded
+			// path this reap exists to prevent.
+			expect((await resolveResumableSession("aliased-session", cwd))?.scope).toBe("global");
+
+			expect(reapScrubbedProtocolRemnantsSync(sessionDir, REAP_IGNORING_AGE_MS)).toEqual({
+				reaped: 1,
+				failures: 0,
+			});
+
+			expect(fs.existsSync(staging)).toBe(false);
+			expect(fs.existsSync(transcript)).toBe(true);
+			expect(fs.lstatSync(transcript).nlink).toBe(1);
+			expect((await SessionManager.listForResumePickerReadOnly(cwd)).map(session => session.path)).toContain(
+				transcript,
+			);
+			const resolved = await resolveResumableSession("aliased-session", cwd);
+			expect(resolved?.session.path).toBe(transcript);
+			expect(resolved?.scope).toBe("local");
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"retains replacement staging that does not alias a published destination",
+		() => {
+			const cwd = path.join(testAgentDir, `staging-evidence-cwd-${Snowflake.next()}`);
+			fs.mkdirSync(cwd, { recursive: true });
+			const sessionDir = SessionManager.getDefaultSessionDir(cwd);
+			// Retired predecessor: a sole-name staging entry whose destination is gone.
+			const orphan = path.join(sessionDir, `.orphan.jsonl.${randomUUID()}.replacement`);
+			fs.writeFileSync(orphan, "retired predecessor payload\n", { mode: 0o600 });
+			// Unpublished attempt: destination exists but is a DIFFERENT inode.
+			const distinct = path.join(sessionDir, "distinct.jsonl");
+			fs.writeFileSync(distinct, "successor\n", { mode: 0o600 });
+			const unrelated = path.join(sessionDir, `.distinct.jsonl.${randomUUID()}.replacement`);
+			fs.writeFileSync(unrelated, "unpublished attempt\n", { mode: 0o600 });
+			// A hard link to a destination that is NOT this staging's own name must
+			// not be reaped either: only self-aliasing staging is surplus.
+			const foreign = path.join(sessionDir, `.distinct.jsonl.${randomUUID()}.replacement`);
+			fs.linkSync(orphan, foreign);
+			// A symlink pointing at its own destination resolves to the same inode
+			// through stat but is not a surplus hard link; unlinking it would delete
+			// a user-visible alias the write protocol never created.
+			const symlinked = path.join(sessionDir, "symlinked.jsonl");
+			fs.writeFileSync(symlinked, "symlink destination\n", { mode: 0o600 });
+			const symlinkStaging = path.join(sessionDir, `.symlinked.jsonl.${randomUUID()}.replacement`);
+			fs.symlinkSync(symlinked, symlinkStaging);
+
+			expect(reapScrubbedProtocolRemnantsSync(sessionDir, REAP_IGNORING_AGE_MS)).toEqual({
+				reaped: 0,
+				failures: 0,
+			});
+
+			expect(fs.existsSync(orphan)).toBe(true);
+			expect(fs.existsSync(unrelated)).toBe(true);
+			expect(fs.existsSync(foreign)).toBe(true);
+			expect(fs.existsSync(distinct)).toBe(true);
+			expect(fs.lstatSync(symlinkStaging).isSymbolicLink()).toBe(true);
+			expect(fs.existsSync(symlinked)).toBe(true);
+		},
+	);
+
+	/**
+	 * Long-lived processes reap descendant scope directories through the async
+	 * twin, so it must apply the identical alias rule. A sync-only fix would
+	 * leave every in-process reap blind to the surplus name.
+	 */
+	it.skipIf(process.platform === "win32")(
+		"reaps aliased staging through the async remnant reaper as well",
+		async () => {
+			const cwd = path.join(testAgentDir, `staging-async-cwd-${Snowflake.next()}`);
+			fs.mkdirSync(cwd, { recursive: true });
+			const sessionDir = SessionManager.getDefaultSessionDir(cwd);
+			const transcript = path.join(sessionDir, "async-aliased.jsonl");
+			fs.writeFileSync(
+				transcript,
+				`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "async-aliased", timestamp: "2025-01-01T00:00:00Z", cwd })}\n`,
+				{ mode: 0o600 },
+			);
+			const staging = path.join(sessionDir, `.async-aliased.jsonl.${randomUUID()}.replacement`);
+			fs.linkSync(transcript, staging);
+			const retained = path.join(sessionDir, `.gone.jsonl.${randomUUID()}.replacement`);
+			fs.writeFileSync(retained, "retired predecessor payload\n", { mode: 0o600 });
+
+			expect(await reapScrubbedProtocolRemnants(sessionDir, REAP_IGNORING_AGE_MS)).toEqual({
+				reaped: 1,
+				failures: 0,
+			});
+
+			expect(fs.existsSync(staging)).toBe(false);
+			expect(fs.existsSync(retained)).toBe(true);
+			expect(fs.lstatSync(transcript).nlink).toBe(1);
+		},
+	);
 
 	it("follows a stale legacy breadcrumb by session identity instead of the newest candidate", async () => {
 		const cwd = path.join(testAgentDir, `breadcrumb-cwd-${Snowflake.next()}`);

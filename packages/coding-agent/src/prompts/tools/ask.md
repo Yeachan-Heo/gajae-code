@@ -8,6 +8,8 @@ Asks user when you need clarification or input during task execution.
 - Use `recommended: <index>` to mark default (0-indexed); " (Recommended)" added automatically
 - Use `questions` for multiple related questions instead of asking one at a time
 - Set `multi: true` on question to allow multiple selections
+- Every question body must contain meaningful, non-whitespace text. Never add empty `metadata`/`ignore` questions.
+- While deep-interview is in the `interviewing` phase, submit exactly one question with the required `deepInterview` metadata on that question. Round 0 needs `round: 0`, `component: "review-topology"`, `dimension: "topology"`, `ambiguity`, and `intent_contract` containing the displayed items and affirmative labels. Later questions need a positive round, component, dimension, and ambiguity. Question prose and `workflowGate` alone cannot record an interview answer. After final-spec persistence transitions to `handoff`, next-workflow/approval choices are ordinary asks without interview round metadata.
 </instruction>
 
 <caution>

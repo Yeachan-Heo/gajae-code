@@ -18,7 +18,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		let mut history_file = self.open_file(&options, history_path, &self.default_exec_params())?;
 
 		// Check on the file's size.
-		if let openfiles::OpenFile::File(file) = &mut history_file {
+		if let openfiles::OpenFile::File(file, _) = &mut history_file {
 			let file_metadata = file.metadata()?;
 			let file_size = file_metadata.len();
 

@@ -1,8 +1,10 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
-import { installRuntimeDeletionGuard } from "./safe-cleanup";
+import { getAgentProfileAuthority, getTrustedHomeDir, resetAgentDirFromEnvironment } from "../packages/utils/src/dirs";
+import { installRuntimeDeletionGuard, registerOwnedDeletionRoot, safeRmSync } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
-import { decideLogDirIsolation } from "./test-log-dir-isolation";
+import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -38,6 +40,80 @@ try {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
 
+const testTempRoot = path.resolve(os.tmpdir());
+// Keep isolated fixture state only when explicitly requested for debugging.
+const keepIsolatedTempDirs = process.env.GJC_TEST_KEEP_TMP === "1";
+const isolatedTempDirs: Array<{ dir: string; prefix: string }> = [];
+
+function createIsolatedTempDir(prefix: string): string {
+	if (testTempRoot === path.parse(testTempRoot).root) {
+		throw new Error(
+			`Cannot create isolated test temp directories directly under the filesystem root: ${testTempRoot}`,
+		);
+	}
+	const dir = path.join(testTempRoot, `${prefix}${crypto.randomUUID()}`);
+	const forgetOwnedRoot = registerOwnedDeletionRoot(dir);
+	try {
+		fs.mkdirSync(dir, { mode: 0o700 });
+	} catch (error) {
+		forgetOwnedRoot();
+		throw error;
+	}
+	// Retain the exact-path grant for this process so safeRmSync can remove
+	// os.tmpdir() descendants even when the OS temp root is beneath HOME, and
+	// later lifecycle callbacks remain authorized after an earlier removal.
+	isolatedTempDirs.push({ dir, prefix });
+	return dir;
+}
+
+export function cleanupIsolatedTempDirs(): void {
+	// Debugging deliberately preserves temp state even when preload setup later fails.
+	if (keepIsolatedTempDirs) return;
+
+	let cleanupError: unknown;
+	for (const isolatedTempDir of isolatedTempDirs) {
+		const { dir, prefix } = isolatedTempDir;
+		const resolvedDir = path.resolve(dir);
+		if (path.dirname(resolvedDir) !== testTempRoot || !path.basename(resolvedDir).startsWith(prefix)) {
+			cleanupError ??= new Error(`Refusing to remove test temp directory outside os.tmpdir(): ${dir}`);
+			continue;
+		}
+		try {
+			fs.lstatSync(resolvedDir);
+		} catch (error) {
+			if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+				continue;
+			}
+			cleanupError ??= error;
+			continue;
+		}
+		try {
+			// safeRmSync confines recursive deletion to the safe-cleanup world;
+			// the registered exact-path root also covers os.tmpdir() under HOME.
+			safeRmSync(resolvedDir, { recursive: true, force: true });
+		} catch (error) {
+			cleanupError ??= error;
+		}
+	}
+	if (cleanupError !== undefined) throw cleanupError;
+}
+
+function cleanupAfterInitializationFailure(error: unknown): never {
+	// Roll back roots created before a later preload error; the explicit debug opt-out still wins.
+	try {
+		cleanupIsolatedTempDirs();
+	} catch (cleanupError) {
+		throw new AggregateError([error, cleanupError], "Test preload initialization and temp cleanup both failed");
+	}
+	throw error;
+}
+
+// Bun test file isolates can be disposed without emitting process exit events; the
+// test-only preload bridge also calls this from afterAll. Keep these hooks for
+// ordinary process shutdown. Forceful safe removal makes every call idempotent.
+process.on("beforeExit", cleanupIsolatedTempDirs);
+process.on("exit", cleanupIsolatedTempDirs);
+
 // Hermetic unit shards must not discover the operator's provider credentials or
 // proxy endpoints. Explicitly opted-in E2E runs are different: their tests use
 // E2E=1 as the credential gate, so scrubbing the same variables here would make
@@ -59,6 +135,35 @@ if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 // behaviour changes.
 const projectEnv = projectEnvSnapshot(process.cwd());
 
+// Capture the operator's canonical user-state decision before replacing the
+// agent directory with a per-process temp profile. The static import above
+// initializes the resolver before this preload mutates isolation variables; the
+// pre-isolation snapshot is needed to identify an inherited XDG sink that
+// belongs to the operator's default profile.
+const preIsolationHome = getTrustedHomeDir();
+const profileMarkerKey = "GJC_TEST_PRELOAD_PROFILE_AUTHORITY";
+const profileMarker = process.env[profileMarkerKey];
+// Environment variables provide no authenticated provenance: the initial
+// operator or CI environment can forge this marker just as easily as an
+// ancestor preload can set it. Treat any marker as the default-profile lane,
+// which may isolate a custom profile unnecessarily but cannot mistake its
+// inherited XDG sink for an unrelated path and append to the operator sink.
+// Only an absent marker lets the resolver classify the current profile.
+const preIsolationXdgEligible = profileMarker !== undefined ? true : getAgentProfileAuthority() === "default";
+process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = preIsolationXdgEligible ? "default" : "custom";
+const logDirProvenanceKey = "GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE";
+const logDirProvenance = process.env[logDirProvenanceKey];
+// `undefined` means this is the first preload in the process tree. Once a
+// parent has marked its selected value, equality means the child inherited the
+// pin while inequality means the child explicitly replaced it.
+const inheritedLogDir = logDirProvenance === undefined ? undefined : logDirProvenance === process.env.GJC_LOG_DIR;
+const preIsolationLogEnv = {
+	GJC_LOG_DIR: process.env.GJC_LOG_DIR,
+	GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+	PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+	XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+};
+
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the
 // REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
@@ -76,7 +181,7 @@ const projectEnv = projectEnvSnapshot(process.cwd());
 // would silently run the suite against the operator's live agent dir, which is
 // the exact destructive regression this preload exists to prevent.
 const isolation = decideAgentDirIsolation({
-	home: os.homedir(),
+	home: preIsolationHome,
 	env: {
 		GJC_CODING_AGENT_DIR: process.env.GJC_CODING_AGENT_DIR,
 		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
@@ -86,16 +191,24 @@ const isolation = decideAgentDirIsolation({
 	projectEnv: projectEnv.values,
 });
 if (isolation.action === "isolate") {
-	let agentDir: string;
 	try {
-		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-agent-"));
+		const agentDir = createIsolatedTempDir("gjc-test-agent-");
+		process.env.GJC_CODING_AGENT_DIR = agentDir;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
 	} catch (error) {
 		throw new Error(
 			`Test agent-directory isolation failed (${isolation.reason}); refusing to run tests against the live agent dir: ${String(error)}`,
 		);
 	}
-	process.env.GJC_CODING_AGENT_DIR = agentDir;
-	process.env.PI_CODING_AGENT_DIR = agentDir;
+}
+
+// `dirs.ts` was loaded above to capture the operator profile. Rebuild its
+// resolver after the agent isolation variables change so production consumers
+// in this test process resolve the isolated profile, not the pre-isolation one.
+try {
+	resetAgentDirFromEnvironment();
+} catch (error) {
+	cleanupAfterInitializationFailure(error);
 }
 
 // Isolate the log sink for every test process (issue #5618). The agent-dir
@@ -110,11 +223,13 @@ if (isolation.action === "isolate") {
 // intended: they inherit the same isolated sink.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
-// on log content), so that is honored untouched — but only when the pin is
-// trusted. A nonblank value is not evidence of intent on its own: Bun overlays
-// `cwd/.env` into `process.env` before any module runs, so a checkout that
-// declares GJC_LOG_DIR would otherwise be honored here and isolation would never
-// happen. The decision (including that distrust rule) lives in
+// on log content), so that is honored untouched when the child replaced its
+// parent's marked value. An unknown or inherited value that resolves to the
+// canonical shared user sink is isolated instead. A nonblank value is not
+// evidence of intent on its own: Bun overlays `cwd/.env` into `process.env`
+// before any module runs, so a checkout that declares GJC_LOG_DIR would
+// otherwise be honored here and isolation would never happen. The decision
+// (including that distrust rule and the shared-sink guard) lives in
 // ./test-log-dir-isolation.ts so it is unit-testable without importing this
 // preload's side effects.
 //
@@ -123,27 +238,48 @@ if (isolation.action === "isolate") {
 // can survive production's provenance check — throw. Continuing would silently
 // run the suite against the operator's live log sink, which is the regression
 // this exists to prevent.
-const logIsolation = decideLogDirIsolation({
-	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
-	projectEnv,
-});
+const logIsolation = (() => {
+	try {
+		return decideLogDirIsolation({
+			env: preIsolationLogEnv,
+			projectEnv,
+			inheritedLogDir,
+			sharedLogDir: defaultLogDirFor({
+				home: preIsolationHome,
+				env: preIsolationLogEnv,
+				projectEnv,
+				xdgEligible: preIsolationXdgEligible,
+			}),
+		});
+	} catch (error) {
+		cleanupAfterInitializationFailure(error);
+	}
+})();
 if (logIsolation.action === "fail") {
-	throw new Error(
-		"Test log-directory isolation failed (dynamic): this checkout's .env declares GJC_LOG_DIR with a `$` or " +
-			"backtick in its value. Bun expands it at load time, so the trust check in packages/utils/src/dirs.ts " +
-			"rejects the key entirely and log writes would fall back to the operator's live log sink no matter what " +
-			"this preload pins. Remove GJC_LOG_DIR from the project .env before running tests.",
+	cleanupAfterInitializationFailure(
+		new Error(
+			"Test log-directory isolation failed (dynamic): this checkout's .env declares GJC_LOG_DIR with a `$` or " +
+				"backtick in its value. Bun expands it at load time, so the trust check in packages/utils/src/dirs.ts " +
+				"rejects the key entirely and log writes would fall back to the operator's live log sink no matter what " +
+				"this preload pins. Remove GJC_LOG_DIR from the project .env before running tests.",
+		),
 	);
 }
 if (logIsolation.action === "isolate") {
 	try {
-		process.env.GJC_LOG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-logs-"));
+		const logDir = createIsolatedTempDir("gjc-test-logs-");
+		process.env.GJC_LOG_DIR = logDir;
 	} catch (error) {
-		throw new Error(
-			`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,
+		cleanupAfterInitializationFailure(
+			new Error(
+				`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,
+			),
 		);
 	}
 }
+// Propagate the selected value so a nested preload can distinguish a pin it
+// inherited from its parent from a value the child explicitly supplied.
+process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
 //
 // Recursive-deletion boundary (issue #4794). An operator's real home was
 // destroyed by test cleanup activity; this preload now installs a
@@ -157,4 +293,8 @@ if (logIsolation.action === "isolate") {
 // module-load time — before any test mutates process.env.HOME — so a cleanup
 // bug that resolves back to the operator home aborts this process instead of
 // deleting it. A refusal exits 70 by default.
-installRuntimeDeletionGuard({ label: "test-preload" });
+try {
+	installRuntimeDeletionGuard({ label: "test-preload" });
+} catch (error) {
+	cleanupAfterInitializationFailure(error);
+}

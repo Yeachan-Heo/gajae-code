@@ -114,7 +114,7 @@ describe("AgentSession abort timeout", () => {
 		expect(notices.some(message => message.includes("Abort cleanup timed out"))).toBe(true);
 	});
 
-	it("aborts and quarantines only the captured prompt domain while a successor remains live", async () => {
+	it("keeps a sealed resource run recoverable until its pending work settles", async () => {
 		tempDir = TempDir.createSync("@gjc-exact-prompt-abort-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -180,12 +180,50 @@ describe("AgentSession abort timeout", () => {
 		expect(successor.signal.aborted).toBe(false);
 		expect(await session.abortPromptAndWait("captured-hanging", { graceMs: 0 })).toMatchObject({
 			status: "unfenced",
-			reason: "quarantined",
+			reason: "resources_pending",
 			pending: [{ kind: "post_prompt", label: "hanging-child" }],
 		});
 
 		agent.resourceLedger.seal("successor-b");
-		hanging.resolve();
+		hanging.reject(new Error("tracked resource cleanup failed after abort"));
+		expect(await agent.resourceLedger.waitForSettlement("captured-hanging", { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+		expect(agent.resourceLedger.pending("captured-hanging")).toEqual([]);
+		expect(agent.resourceLedger.lookupDomain("captured-hanging")).toBeUndefined();
+		expect(successor.signal.aborted).toBe(false);
+		expect(await session.abortPromptAndWait("captured-hanging", { graceMs: 0 })).toEqual({ status: "settled" });
+		expect(await session.abortPromptAndWait("unknown-resource-run", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "unknown_run",
+		});
+
+		// A run that never sealed is not the recoverable late-settlement case.
+		// Preserve the hard quarantine while keeping its uncertainty visible.
+		const unsealedDomain = agent.resourceLedger.open("captured-unsealed");
+		if (!unsealedDomain) throw new Error("Expected an unsealed prompt cancellation domain");
+		const unsealedWork = Promise.withResolvers<void>();
+		const unsealedProducer = agent.resourceLedger.reserveProducer(
+			"captured-unsealed",
+			unsealedDomain,
+			"tool",
+			"unsealed-tool",
+		);
+		if (!unsealedProducer.ok) throw new Error("Expected an unsealed tool producer");
+		unsealedProducer.lease.track("tool", "unsealed-tool", unsealedWork.promise);
+		const unsealedProof = await session.abortPromptAndWait("captured-unsealed", { graceMs: 5 });
+		expect(unsealedProof).toMatchObject({ status: "unfenced", reason: "run_not_sealed" });
+		expect(unsealedDomain.signal.aborted).toBe(true);
+		expect(await session.abortPromptAndWait("captured-unsealed", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "quarantined",
+		});
+		unsealedProducer.lease.closeDiscovery();
+		unsealedWork.resolve();
+		expect(await agent.resourceLedger.waitForSettlement("captured-unsealed", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "quarantined",
+		});
 	});
 
 	it("settles a never-resolving worker integration request after aborting it", async () => {

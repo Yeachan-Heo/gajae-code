@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
-import { startAuthGateway } from "../src/auth-gateway/server";
+import { redactGatewayStream, startAuthGateway } from "../src/auth-gateway/server";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { Effort } from "../src/model-thinking";
 import { encodeStream, formatError, parseRequest } from "../src/providers/pi-native-server";
@@ -312,6 +312,31 @@ describe("pi-native encodeStream", () => {
 		const parsed = (await collectSse(encodeStream(makeEventStream(events, errored)))).map(parseSseLine);
 		expect(parsed[0]).toEqual({ type: "error", reason: "error", error: JSON.parse(JSON.stringify(errored)) });
 		expect(parsed[1]).toBe("[DONE]");
+	});
+
+	it("drops credential-bearing error partials before direct and gateway SSE", async () => {
+		const credential = "ksk_upstream-secret-value";
+		const errored = baseAssistant({ stopReason: "error", errorMessage: "Upstream request failed" });
+		const partial = baseAssistant({ errorMessage: `authorization=Bearer ${credential}` });
+		const events: AssistantMessageEvent[] = [{ type: "error", reason: "error", error: errored, partial }];
+
+		const directFrames = (await collectSse(encodeStream(makeEventStream(events, errored)))).map(parseSseLine);
+		expect(JSON.stringify(directFrames)).not.toContain(credential);
+		expect(directFrames[0]).not.toHaveProperty("partial");
+
+		const redactedEvents: AssistantMessageEvent[] = [];
+		for await (const event of redactGatewayStream(makeEventStream(events, errored))) {
+			redactedEvents.push(event);
+		}
+		const redactedError = redactedEvents[0];
+		expect(redactedError?.type).toBe("error");
+		if (redactedError?.type === "error") expect(redactedError.partial).toBeUndefined();
+
+		const gatewayFrames = (await collectSse(encodeStream(redactGatewayStream(makeEventStream(events, errored))))).map(
+			parseSseLine,
+		);
+		expect(JSON.stringify(gatewayFrames)).not.toContain(credential);
+		expect(gatewayFrames[0]).not.toHaveProperty("partial");
 	});
 
 	it("replays mixed Responses reasoning safely across start, partial, done, and error envelopes", async () => {

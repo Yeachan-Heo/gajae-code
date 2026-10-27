@@ -14,6 +14,7 @@ import {
 	OAuthCredentialSelectorError,
 	type OAuthPinTarget,
 	resolveOAuthStorageProvider,
+	selectOrganizationMatches,
 } from "@gajae-code/ai/core";
 import { getAgentDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../config/model-registry";
@@ -25,15 +26,21 @@ import {
 	clearPersistentPinForRemovedRows,
 } from "../session/account-inventory";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../session/credential-store-errors";
-import { resolveStartupAuthConfig, type StartupAuthConfigSnapshot } from "../session/startup-auth-config";
+import {
+	type CredentialPreferenceEntryValue,
+	isValidCredentialPreferenceCap,
+	parsePreferenceAccount,
+	resolveStartupAuthConfig,
+	type StartupAuthConfigSnapshot,
+} from "../session/startup-auth-config";
 
-export const ACCOUNTS_ACTIONS = ["list", "check", "pin", "logout"] as const;
+export const ACCOUNTS_ACTIONS = ["list", "check", "pin", "prefer", "logout"] as const;
 export type AccountsAction = (typeof ACCOUNTS_ACTIONS)[number];
 
 export interface AccountsCommandArgs {
 	action: AccountsAction;
 	provider?: string;
-	selector?: string;
+	selectors?: readonly string[];
 	flags: {
 		json?: boolean;
 		persistent?: boolean;
@@ -92,9 +99,10 @@ function selectorFromInput(raw: string | undefined): AuthCredentialSelector {
 	if (/^id:[1-9]\d*$/.test(value)) return { kind: "id", value: value.slice(3) };
 	if (/^email:[^@\s]+@[^@\s]+$/.test(value)) return { kind: "email", value: value.slice(6) };
 	if (/^account:\S+$/.test(value)) return { kind: "account", value: value.slice(8) };
+	if (/^org:\S/.test(value)) return { kind: "org", value: value.slice(4).trim() };
 	if (/^[^@\s]+@[^@\s]+$/.test(value)) return { kind: "email", value };
 	throw new AccountsCommandError(
-		"Pin target must be a bare email or an id:<row-id>, email:<email>, or account:<account-id> selector.",
+		"Pin target must be a bare email or an id:<row-id>, email:<email>, account:<account-id>, or org:<organization id or name> selector.",
 	);
 }
 
@@ -286,13 +294,169 @@ async function runPin(
 	});
 }
 
+/**
+ * Split `<account>=<percent>` into the account and its usage cap. The cap follows the whole account, so an `=` before
+ * the last `@` belongs to an email local part (`user=2@example.com`), and a suffix that does not start with a digit is
+ * part of the account (account ids may end in `=`); a digit-led suffix must be a valid cap.
+ */
+function parsePreferArgument(raw: string): { account: string; cap: number | undefined } {
+	const separator = raw.lastIndexOf("=");
+	const rawCap = separator < 0 || separator < raw.lastIndexOf("@") ? "" : raw.slice(separator + 1).trim();
+	if (!/^\d/.test(rawCap)) return { account: raw.trim(), cap: undefined };
+	const cap = /^\d+(\.\d+)?$/.test(rawCap) ? Number(rawCap) : Number.NaN;
+	if (!isValidCredentialPreferenceCap(cap)) {
+		throw new AccountsCommandError(
+			`Usage cap in ${JSON.stringify(raw)} must be a percent above 0 and at most 100, e.g. me@example.com=75; no preference was written.`,
+		);
+	}
+	return { account: raw.slice(0, separator).trim(), cap };
+}
+
+/**
+ * Portable config text for a resolved OAuth row: its email, else its account id, whichever no other OAuth row of the
+ * provider shares. Numeric row ids are never persisted as preferences; a row with neither unique value is refused.
+ * Each candidate text is written only when {@link parsePreferenceAccount} reads it back as the same selector, so a
+ * successful write neither fails the next startup nor retargets the row: the email is written bare when that
+ * round-trips, else as `email:<address>` (an address such as `account:team@example.com` would otherwise parse as an
+ * account id, and `email:team@example.com` would lose its prefix).
+ */
+function portablePreferenceAccount(
+	row: CredentialInventoryRecord,
+	providerRows: readonly CredentialInventoryRecord[],
+): string | undefined {
+	const oauthRows = providerRows.filter(other => other.credentialKind === "oauth");
+	const email = row.email?.trim().toLowerCase();
+	if (email && oauthRows.filter(other => other.email?.trim().toLowerCase() === email).length === 1) {
+		const selector: AuthCredentialSelector = { kind: "email", value: row.email!.trim() };
+		const written = [selector.value, `email:${selector.value}`].find(text => readsBackAs(text, selector));
+		if (written) return written;
+	}
+	const accountId = row.accountId?.trim();
+	if (accountId && oauthRows.filter(other => other.accountId?.trim() === accountId).length === 1) {
+		const written = `account:${accountId}`;
+		if (readsBackAs(written, { kind: "account", value: accountId })) return written;
+	}
+	return undefined;
+}
+
+/** Whether startup parses `text` as exactly `selector`, kind and value. */
+function readsBackAs(text: string, selector: AuthCredentialSelector): boolean {
+	const parsed = parsePreferenceAccount(text);
+	return parsed?.kind === selector.kind && parsed.value === selector.value;
+}
+
+async function writePersistentPreferences(
+	provider: string,
+	entries: readonly CredentialPreferenceEntryValue[] | undefined,
+): Promise<void> {
+	const settings = await Settings.init();
+	await settings.commitAtomicBatchWithCurrent(current => {
+		const currentAuth = current.auth === undefined ? {} : asRecord(current.auth);
+		const rawPreferences = currentAuth?.credentialPreferences;
+		const preferences = rawPreferences === undefined ? {} : asRecord(rawPreferences);
+		if (!currentAuth || !preferences) {
+			throw new AccountsCommandError("Global auth.credentialPreferences is malformed; no preference was written.");
+		}
+		const next: Record<string, unknown> = { ...preferences };
+		if (entries) next[provider] = entries;
+		else delete next[provider];
+		return [{ path: "auth.credentialPreferences", op: "set", value: next }];
+	});
+}
+
+async function runPrefer(
+	providerArg: string | undefined,
+	accountArgs: readonly string[] | undefined,
+	flags: AccountsCommandArgs["flags"],
+): Promise<void> {
+	const provider = canonicalProvider(providerArg);
+	const accounts = accountArgs ?? [];
+	if (flags.clear && accounts.length > 0) {
+		throw new AccountsCommandError("Use either preferred accounts or --clear, not both.");
+	}
+	if (!flags.clear && accounts.length === 0) {
+		throw new AccountsCommandError(
+			"Prefer requires one or more accounts in order (e.g. me@example.com shared@example.com=75), or --clear.",
+		);
+	}
+	if (flags.clear) {
+		await writePersistentPreferences(provider, undefined);
+		if (flags.json) writeJson({ ok: true, provider, cleared: true });
+		else writeText([`Cleared preferred accounts for ${provider}; selection uses normal ranking.`]);
+		return;
+	}
+
+	const requested = accounts.map(parsePreferArgument);
+	await withAuthStorageAndModels(async (storage, modelRegistry, startupAuth) => {
+		if (
+			!modelRegistry.getConfiguredProviderIds().includes(provider) &&
+			modelRegistry.getAll().every(model => model.provider !== provider)
+		) {
+			throw new AccountsCommandError(`Provider ${provider} is not configured; no preference was written.`);
+		}
+		const providerRows = storage.listCredentialInventory(provider);
+		const seenIds = new Set<number>();
+		const resolved = requested.map(({ account, cap }) => {
+			let target: OAuthPinTarget;
+			try {
+				target = storage.resolveOAuthPinTarget(provider, selectorFromInput(account));
+			} catch (error) {
+				throw toAccountsCommandError(error) ?? error;
+			}
+			if (seenIds.has(target.credentialId)) {
+				throw new AccountsCommandError(`${account} is listed more than once; no preference was written.`);
+			}
+			seenIds.add(target.credentialId);
+			const row = providerRows.find(candidate => candidate.id === target.credentialId);
+			const portable = row ? portablePreferenceAccount(row, providerRows) : undefined;
+			if (!portable) {
+				throw new AccountsCommandError(
+					`${account} has no unique email or account id to store as a preference; no preference was written.`,
+				);
+			}
+			return { account: portable, cap: cap === 100 ? undefined : cap };
+		});
+		const entries: CredentialPreferenceEntryValue[] = resolved.map(({ account, cap }) =>
+			cap === undefined ? account : { [account]: cap },
+		);
+		await writePersistentPreferences(provider, entries);
+		if (flags.json) {
+			writeJson({ ok: true, provider, preferences: entries });
+			return;
+		}
+		writeText([
+			`Preferred accounts for ${provider}, tried in order:`,
+			...resolved.map(
+				({ account, cap }, index) =>
+					`  ${index + 1}. ${account}${cap === undefined ? " (until rate-limited)" : ` (until ${cap}% used)`}`,
+			),
+			`Then: remaining accounts by ${startupAuth.credentialRankingMode} ranking. Takes effect for new sessions.`,
+		]);
+	});
+}
+
 function accountMatches(row: CredentialInventoryRecord, rawAccount: string): boolean {
 	const value = rawAccount.trim();
 	if (value.length === 0) return false;
 	if (/^[1-9]\d*$/.test(value) && row.id === Number(value)) return true;
 	if (/^id:[1-9]\d*$/i.test(value) && row.id === Number(value.slice(3))) return true;
+	// Labels carry the organization name, so a bare email matches every organization of that account.
+	if (row.email?.toLowerCase() === value.toLowerCase()) return true;
 	const identity = inventoryIdentity(row);
 	return identity?.toLowerCase() === value.toLowerCase();
+}
+
+/**
+ * Rows a `--account` value designates. `org:` prefers an exact organization-id match over display-name
+ * matches; more than one result is reported as ambiguous by the caller, never resolved by guessing.
+ */
+function selectLogoutTargets<T extends { row: CredentialInventoryRecord }>(
+	targets: readonly T[],
+	rawAccount: string,
+): T[] {
+	const value = rawAccount.trim();
+	if (/^org:/i.test(value)) return selectOrganizationMatches(targets, value.slice(4), target => target.row);
+	return targets.filter(target => accountMatches(target.row, value));
 }
 
 function removalCandidates(
@@ -335,9 +499,7 @@ async function runLogout(providerArg: string | undefined, flags: AccountsCommand
 	try {
 		const inventory = storage.listCredentialInventory(provider);
 		const targets = removalCandidates(inventory, storage.listCredentialRemovalTargets(provider));
-		const selected = flags.all
-			? targets
-			: targets.filter(candidate => accountMatches(candidate.row, flags.account ?? ""));
+		const selected = flags.all ? targets : selectLogoutTargets(targets, flags.account ?? "");
 		if (selected.length !== 1 && !flags.all) throwLogoutResolutionError(provider, flags.account, targets);
 		if (selected.length === 0) throwLogoutResolutionError(provider, flags.account, targets);
 		const result = storage.removeAuthCredentialsHard(
@@ -383,7 +545,13 @@ export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void
 				await runCheck(cmd.provider, cmd.flags);
 				return;
 			case "pin":
-				await runPin(cmd.provider, cmd.selector, cmd.flags);
+				if ((cmd.selectors?.length ?? 0) > 1) {
+					throw new AccountsCommandError("Pin takes one selector; use `gjc accounts prefer` for an ordered list.");
+				}
+				await runPin(cmd.provider, cmd.selectors?.[0], cmd.flags);
+				return;
+			case "prefer":
+				await runPrefer(cmd.provider, cmd.selectors, cmd.flags);
 				return;
 			case "logout":
 				await runLogout(cmd.provider, cmd.flags);

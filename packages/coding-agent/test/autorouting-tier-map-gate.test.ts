@@ -8,6 +8,26 @@ async function committedCatalog(): Promise<Catalog> {
 }
 
 describe("autorouting tier-map CI gate", () => {
+	it("accounts for the Gemini 4 Argon and India Bedrock catalog additions", async () => {
+		const result = checkAutoroutingTierMap(await committedCatalog());
+		const issueKeys = [
+			"amazon-bedrock/in.anthropic.claude-haiku-4-5-20251001-v1:0",
+			"amazon-bedrock/in.anthropic.claude-opus-5",
+			"amazon-bedrock/in.anthropic.claude-sonnet-5",
+			"github-copilot/gemini-4-argon",
+			"google/gemini-4-argon",
+			"kilo/google/gemini-4-argon",
+			"opencode-zen/gemini-4-argon",
+			"openrouter/google/gemini-4-argon",
+			"openrouter/google/gemini-4-argon:batch",
+			"vercel-ai-gateway/google/gemini-4-argon",
+		];
+
+		expect(result.ok).toBe(true);
+		expect(result.report.unlabeledKeys).toEqual([]);
+		expect(issueKeys.filter(key => !result.report.skippedKeys.includes(key))).toEqual([]);
+	});
+
 	it("passes against the committed catalog and landed baseline", async () => {
 		const result = checkAutoroutingTierMap(await committedCatalog());
 		expect(result.ok).toBe(true);

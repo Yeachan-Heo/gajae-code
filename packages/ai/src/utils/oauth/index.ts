@@ -9,6 +9,16 @@ import type {
 	OAuthProviderInterface,
 } from "./types";
 
+export class UnknownOAuthProviderError extends Error {
+	readonly provider: string;
+
+	constructor(provider: string) {
+		super(`Unknown OAuth provider: ${provider}`);
+		this.name = "UnknownOAuthProviderError";
+		this.provider = provider;
+	}
+}
+
 const builtInOAuthProviders: OAuthProviderInfo[] = [
 	{
 		id: "anthropic",
@@ -442,7 +452,7 @@ export async function refreshOAuthToken(
 			newCredentials = credentials;
 			break;
 		default:
-			throw new Error(`Unknown OAuth provider: ${provider}`);
+			throw new UnknownOAuthProviderError(provider);
 	}
 	return newCredentials;
 }
@@ -528,6 +538,7 @@ export async function getOAuthApiKey(
 				expiresAt: creds.expires,
 				email: creds.email,
 				accountId: creds.accountId,
+				profileArn: creds.profileArn,
 			})
 		: creds.access;
 	return { newCredentials: creds, apiKey };

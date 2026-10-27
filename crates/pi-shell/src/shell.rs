@@ -1,3 +1,9 @@
+// Vendored from
+// can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-shell/
+// src/shell.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil
+// Labs, Inc. Modified for gajae-code: yes, 3-way reconciled cwd handling and
+// output decoding; retained local process, cancellation, HMAC, minimizer, and
+// output-budget hardening.
 //! Runtime-agnostic brush shell execution.
 
 use std::{
@@ -5,7 +11,6 @@ use std::{
 	fmt::Write as _,
 	fs,
 	io::{self, Write},
-	str,
 	sync::{
 		Arc, Mutex as StdMutex,
 		atomic::{AtomicI32, AtomicUsize, Ordering},
@@ -14,13 +19,14 @@ use std::{
 };
 
 use anyhow::{Error, Result};
-use brush_builtins::{BuiltinSet, default_builtins};
+use brush_builtins::{BuiltinSet, ShellBuilderExt};
 use brush_core::{
 	ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
 	ExternalProcessObserver, ProcessGroupPolicy, ProfileLoadBehavior, RcLoadBehavior,
 	Shell as BrushShell, ShellValue, ShellVariable, SourceInfo, builtins,
 	env::EnvironmentScope,
 	openfiles::{self, OpenFile, OpenFiles},
+	variables::ShellValueUnsetType,
 };
 use bytes::Bytes;
 use clap::Parser;
@@ -38,7 +44,9 @@ use tokio_util::sync::CancellationToken;
 use crate::windows::configure_windows_path;
 use crate::{
 	cancel::{AbortReason, AbortToken, CancelToken},
-	minimizer, process,
+	minimizer,
+	output_decode::{OutputDecoder, decode_bytes},
+	process,
 };
 
 struct ShellSessionCore {
@@ -60,6 +68,30 @@ struct OwnershipLedger {
 	token: String,
 }
 
+/// Optional Darwin evidence may be unavailable, but an incarnation must never
+/// be invented. A changed incarnation means the original child has exited.
+/// A later `Present` is only accepted when it matches the incarnation pinned at
+/// spawn: without a pin, the PID may already belong to an unrelated process
+/// that reused it, and signing or targeting that occupant is unsafe.
+#[cfg(any(target_os = "macos", test))]
+fn observed_spawn_incarnation(
+	incarnation: Option<String>,
+	observation: process::ProcessObservation,
+) -> Result<Option<String>, ()> {
+	match (incarnation, observation) {
+		(_, process::ProcessObservation::Absent) => Ok(None),
+		(Some(pinned), process::ProcessObservation::Present { incarnation: observed }) => {
+			if pinned == observed {
+				Ok(Some(pinned))
+			} else {
+				Ok(None)
+			}
+		},
+		(None, process::ProcessObservation::Present { .. }) => Err(()),
+		(pinned, process::ProcessObservation::Unknown { .. }) => pinned.map(Some).ok_or(()),
+	}
+}
+
 impl ExternalProcessObserver for CommandProcessObserver {
 	fn spawned(&self, pid: i32, process_group_id: Option<i32>) {
 		if let Some(upstream) = &self.upstream {
@@ -67,18 +99,41 @@ impl ExternalProcessObserver for CommandProcessObserver {
 		}
 		if let Some(ledger) = &self.ownership_ledger {
 			let process = process::Process::from_pid(pid);
+			let incarnation = process.as_ref().map(process::Process::incarnation);
+			let darwin_unique_id = process
+				.as_ref()
+				.and_then(process::Process::darwin_unique_id)
+				.map(|value| value.to_string());
+			// `pid_released` means the observation proved the spawned child is gone
+			// (absent, or the pid now holds a different incarnation). Re-resolving
+			// the numeric pid would then target an unrelated occupant, so only the
+			// process group is recorded.
 			#[cfg(target_os = "macos")]
-			let Some(process) = process else {
-				std::process::exit(70);
+			let (incarnation, pid_released) = if darwin_unique_id.is_none() {
+				match observed_spawn_incarnation(incarnation, process::Process::observe(pid)) {
+					Ok(Some(incarnation)) => (Some(incarnation), false),
+					Ok(None) => (None, true),
+					Err(()) => std::process::exit(70),
+				}
+			} else {
+				(incarnation, false)
 			};
 			#[cfg(not(target_os = "macos"))]
-			let Some(process) = process else {
-				self
-					.targets
-					.lock()
-					.expect("process target lock poisoned")
-					.add_pid(pid);
-				if let Some(pgid) = process_group_id {
+			let pid_released = false;
+			let Some(incarnation) = incarnation else {
+				let mut targets = self.targets.lock().expect("process target lock poisoned");
+				if !pid_released {
+					targets.add_pid(pid);
+				}
+				drop(targets);
+				// A released leader (Absent or reused) leaves only a numeric PGID. Any
+				// later lookup by that number can race a reuse (the group may empty
+				// and be reassigned between observation and lookup), so the group is
+				// neither rescanned nor published as signal authority: adopting a
+				// stranger's group is worse than missing an escaped member. Members
+				// still reachable from owned processes are covered by the guardian's
+				// ancestry tracking and the session/descendant scans at cleanup.
+				if !pid_released && let Some(pgid) = process_group_id {
 					self
 						.process_group_id
 						.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
@@ -86,16 +141,11 @@ impl ExternalProcessObserver for CommandProcessObserver {
 				}
 				return;
 			};
-			let incarnation = process.incarnation();
-			let darwin_unique_id = process.darwin_unique_id().map(|value| value.to_string());
-			#[cfg(target_os = "macos")]
-			if darwin_unique_id.is_none() {
-				process.kill_tree(Some(process::KILL_SIGNAL));
-				std::process::exit(70);
-			}
 			let payload = format!("{pid}:{incarnation}:{}", darwin_unique_id.as_deref().unwrap_or(""));
 			let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(ledger.token.as_bytes()) else {
-				process.kill_tree(Some(process::KILL_SIGNAL));
+				if let Some(process) = &process {
+					process.kill_tree(Some(process::KILL_SIGNAL));
+				}
 				std::process::exit(70);
 			};
 			mac.update(payload.as_bytes());
@@ -113,20 +163,23 @@ impl ExternalProcessObserver for CommandProcessObserver {
 				"darwinUniqueId": darwin_unique_id,
 				"signature": signature,
 			});
-			let published = ledger.file.lock().ok().is_some_and(|mut file| {
+			let published = ledger.file.lock().is_ok_and(|mut file| {
 				writeln!(file, "{record}")
 					.and_then(|()| file.flush())
 					.is_ok()
 			});
 			if !published {
-				process.kill_tree(Some(process::KILL_SIGNAL));
+				if let Some(process) = &process {
+					process.kill_tree(Some(process::KILL_SIGNAL));
+				}
 				std::process::exit(70);
 			}
-			self
-				.targets
-				.lock()
-				.expect("process target lock poisoned")
-				.add_process(process);
+			let mut targets = self.targets.lock().expect("process target lock poisoned");
+			if let Some(process) = process {
+				targets.add_process(process);
+			} else {
+				targets.add_pid(pid);
+			}
 		} else {
 			self
 				.targets
@@ -220,6 +273,7 @@ struct ShellRunConfig {
 	command:   String,
 	cwd:       Option<String>,
 	env:       Option<HashMap<String, String>>,
+	unset_env: Option<Vec<String>>,
 	minimizer: Option<minimizer::MinimizerConfig>,
 }
 
@@ -228,6 +282,7 @@ pub struct ShellRunOptions {
 	pub command:    String,
 	pub cwd:        Option<String>,
 	pub env:        Option<HashMap<String, String>>,
+	pub unset_env:  Option<Vec<String>>,
 	pub timeout_ms: Option<u32>,
 }
 
@@ -342,6 +397,7 @@ impl Shell {
 			command:   options.command,
 			cwd:       options.cwd,
 			env:       options.env,
+			unset_env: options.unset_env,
 			minimizer: self.config.minimizer.clone(),
 		};
 		run_shell_session(
@@ -387,8 +443,13 @@ pub async fn execute_shell(
 		contained_process_group: options.contained_process_group,
 		ownership_ledger:        None,
 	};
-	let run_config =
-		ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env, minimizer };
+	let run_config = ShellRunConfig {
+		command: options.command,
+		cwd: options.cwd,
+		env: options.env,
+		unset_env: None,
+		minimizer,
+	};
 	run_shell_oneshot(config, run_config, on_chunk, cancel_token).await
 }
 
@@ -425,6 +486,7 @@ pub async fn execute_shell_streams(
 		command:   options.command,
 		cwd:       options.cwd,
 		env:       options.env,
+		unset_env: None,
 		minimizer: None,
 	};
 	run_shell_oneshot_streams(config, run_config, streams, cancel_token).await
@@ -727,7 +789,7 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 		.contained_process_group(config.contained_process_group)
 		.profile(ProfileLoadBehavior::Skip)
 		.rc(RcLoadBehavior::Skip)
-		.builtins(default_builtins(BuiltinSet::BashMode))
+		.default_builtins(BuiltinSet::BashMode)
 		.build()
 		.await
 		.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
@@ -831,6 +893,27 @@ async fn source_snapshot(
 	Ok(())
 }
 
+fn shell_working_dir_matches(shell: &BrushShell, cwd: &str) -> bool {
+	let requested = std::path::Path::new(cwd);
+	let current = shell.working_dir();
+	if pi_vfs::is_virtual_path(requested) {
+		return current == requested;
+	}
+	if !requested.is_absolute() {
+		return false;
+	}
+	current == requested
+}
+
+fn set_shell_working_dir_if_changed(shell: &mut BrushShell, cwd: &str) -> Result<()> {
+	if shell_working_dir_matches(shell, cwd) {
+		return Ok(());
+	}
+	shell
+		.set_working_dir(cwd)
+		.map_err(|err| Error::msg(format!("Failed to set cwd: {err}")))
+}
+
 async fn run_shell_command(
 	session: &mut ShellSessionCore,
 	options: &ShellRunConfig,
@@ -838,13 +921,8 @@ async fn run_shell_command(
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
-		session
-			.shell
-			.set_working_dir(cwd)
-			.map_err(|err| Error::msg(format!("Failed to set cwd: {err}")))?;
+		set_shell_working_dir_if_changed(&mut session.shell, cwd)?;
 	}
-
-	let env_scope_pushed = apply_command_env(&mut session.shell, options.env.as_ref())?;
 
 	let minimizer_mode = if let Some(config) = options.minimizer.as_ref() {
 		minimizer::engine::mode_for(&options.command, config)
@@ -886,6 +964,8 @@ async fn run_shell_command(
 		ownership_ledger: session.ownership_ledger.clone(),
 		upstream:         params.process_observer(),
 	}));
+	let env_scope_pushed =
+		apply_command_env(&mut session.shell, options.unset_env.as_deref(), options.env.as_ref())?;
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
 	// Stream every raw chunk to the caller live, regardless of whether
@@ -1074,13 +1154,8 @@ async fn run_shell_command_streams(
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
-		session
-			.shell
-			.set_working_dir(cwd)
-			.map_err(|err| Error::msg(format!("Failed to set cwd: {err}")))?;
+		set_shell_working_dir_if_changed(&mut session.shell, cwd)?;
 	}
-
-	let env_scope_pushed = apply_command_env(&mut session.shell, options.env.as_ref())?;
 
 	let (stdout_reader, stdout_writer) = pipe_to_files("stdout")?;
 	let (stderr_reader, stderr_writer) = pipe_to_files("stderr")?;
@@ -1107,6 +1182,8 @@ async fn run_shell_command_streams(
 		ownership_ledger: session.ownership_ledger.clone(),
 		upstream:         params.process_observer(),
 	}));
+	let env_scope_pushed =
+		apply_command_env(&mut session.shell, options.unset_env.as_deref(), options.env.as_ref())?;
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
 
@@ -1305,7 +1382,7 @@ async fn read_output_bytes(
 		if let Some(sink) = sink.as_ref() {
 			let allowed = budget
 				.remaining
-				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+				.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
 					Some(remaining.saturating_sub(buf.len()))
 				})
 				.unwrap_or(0)
@@ -1533,32 +1610,55 @@ async fn terminate_background_jobs(shell: &BrushShell) {
 	targets.signal_processes(process::KILL_SIGNAL);
 }
 
-/// Apply per-command environment variables onto a freshly pushed
-/// `Command` scope. Returns `true` when a scope was pushed (so the caller
-/// can pop it after the command runs), `false` when there were no vars and
-/// the existing scopes remain untouched.
+/// Apply per-command environment removals and variables onto a freshly pushed
+/// `Command` scope. Exported unset variables shadow inherited values without
+/// mutating parent scopes. Explicit values are applied afterward and therefore
+/// take precedence. Returns `true` when a scope was pushed.
 fn apply_command_env(
 	shell: &mut BrushShell,
+	unset_env: Option<&[String]>,
 	env: Option<&HashMap<String, String>>,
 ) -> Result<bool> {
-	let Some(env) = env else {
+	let has_unset_env = unset_env.is_some_and(|names| !names.is_empty());
+	let has_env = env.is_some_and(|values| !values.is_empty());
+	if !has_unset_env && !has_env {
 		return Ok(false);
-	};
+	}
 	shell.env_mut().push_scope(EnvironmentScope::Command);
-	for (key, value) in env {
-		let normalized_key = normalize_env_key(key);
-		if should_skip_env_var(normalized_key) {
-			continue;
+	let result = (|| {
+		if let Some(unset_env) = unset_env {
+			for key in unset_env {
+				let normalized_key = normalize_env_key(key);
+				if should_skip_env_var(normalized_key) {
+					continue;
+				}
+				let mut var = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
+				var.export();
+				shell
+					.env_mut()
+					.add(normalized_key, var, EnvironmentScope::Command)
+					.map_err(|err| Error::msg(format!("Failed to remove env: {err}")))?;
+			}
 		}
-		let mut var = ShellVariable::new(ShellValue::String(value.clone()));
-		var.export();
-		if let Err(err) = shell
-			.env_mut()
-			.add(normalized_key, var, EnvironmentScope::Command)
-		{
-			let _ = shell.env_mut().pop_scope(EnvironmentScope::Command);
-			return Err(Error::msg(format!("Failed to set env: {err}")));
+		if let Some(env) = env {
+			for (key, value) in env {
+				let normalized_key = normalize_env_key(key);
+				if should_skip_env_var(normalized_key) {
+					continue;
+				}
+				let mut var = ShellVariable::new(ShellValue::String(value.clone()));
+				var.export();
+				shell
+					.env_mut()
+					.add(normalized_key, var, EnvironmentScope::Command)
+					.map_err(|err| Error::msg(format!("Failed to set env: {err}")))?;
+			}
 		}
+		Ok(())
+	})();
+	if let Err(err) = result {
+		let _ = shell.env_mut().pop_scope(EnvironmentScope::Command);
+		return Err(err);
 	}
 	Ok(true)
 }
@@ -1744,10 +1844,9 @@ async fn read_output(
 	activity: mpsc::Sender<()>,
 	budget: OutputBudget,
 ) {
-	const REPLACEMENT: &str = "\u{FFFD}";
 	const BUF: usize = 65536;
-	let mut buf = vec![0u8; BUF + 4]; // +4 for max UTF-8 char
-	let mut it = 0;
+	let mut buf = vec![0u8; BUF];
+	let mut decoder = OutputDecoder::new();
 
 	#[cfg(unix)]
 	let Ok(reader) = register_nonblocking_pipe(reader) else {
@@ -1767,7 +1866,7 @@ async fn read_output(
 			}) else {
 				break;
 			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf[it..BUF])) {
+			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
 				Ok(Ok(0)) => break,
 				Ok(Ok(n)) => n,
 				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1777,72 +1876,28 @@ async fn read_output(
 		};
 		#[cfg(not(unix))]
 		let n = {
-			let read_future = reader.read(&mut buf[it..BUF]);
+			let read_future = reader.read(&mut buf);
 			tokio::pin!(read_future);
 			match tokio::select! {
 				res = &mut read_future => res,
 				() = cancel_token.cancelled() => break,
 			} {
-				Ok(0) => break, // EOF
+				Ok(0) => break,
 				Ok(n) => n,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 				Err(_) => break,
 			}
 		};
-		if n > 0 {
-			let _ = activity.try_send(());
-		}
-		it += n;
-
-		// Consume as much of `pending` as is decodable *right now*.
-		while it > 0 {
-			let pending = &buf[..it];
-			match str::from_utf8(pending) {
-				Ok(text) => {
-					emit_chunk(text, on_chunk.as_ref(), &budget);
-					it = 0;
-					break;
-				},
-				Err(err) => {
-					let p = err.valid_up_to();
-					if p > 0 {
-						// SAFETY: [..p] is guaranteed valid UTF-8 by valid_up_to().
-						let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-						emit_chunk(text, on_chunk.as_ref(), &budget);
-						// copy p..it to the beginning of the buffer
-						buf.copy_within(p..it, 0);
-						it -= p;
-					}
-
-					match err.error_len() {
-						Some(p) => {
-							// Invalid byte sequence: emit replacement and drop those bytes.
-							emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
-							// copy p..it to the beginning of the buffer
-							buf.copy_within(p..it, 0);
-							it -= p;
-							// continue loop in case more bytes remain after the
-							// invalid sequence
-						},
-						None => {
-							// Incomplete UTF-8 sequence at end: keep bytes for next read.
-							break;
-						},
-					}
-				},
-			}
+		let _ = activity.try_send(());
+		let text = decoder.push(&buf[..n]);
+		if !text.is_empty() {
+			emit_chunk(&text, on_chunk.as_ref(), &budget);
 		}
 	}
 
-	// Flush whatever is left at EOF (including an incomplete final sequence).
-	for chunk in buf[..it].utf8_chunks() {
-		let valid = chunk.valid();
-		if !valid.is_empty() {
-			emit_chunk(valid, on_chunk.as_ref(), &budget);
-		}
-		if !chunk.invalid().is_empty() {
-			emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
-		}
+	let text = decoder.finish();
+	if !text.is_empty() {
+		emit_chunk(&text, on_chunk.as_ref(), &budget);
 	}
 }
 
@@ -1854,15 +1909,11 @@ async fn read_output_buffered(
 	max_capture_bytes: usize,
 	budget: OutputBudget,
 ) -> BufferedOutput {
-	const REPLACEMENT: &str = "\u{FFFD}";
 	const BUF: usize = 65536;
 	let mut buf = vec![0u8; BUF];
 	let mut captured = Vec::new();
 	let mut exceeded = false;
-	// Pending bytes from a prior read that ended mid-UTF-8 sequence. We hold
-	// them back so we emit only valid UTF-8 to the streaming callback while
-	// still capturing every byte into `captured` for post-processing.
-	let mut pending = Vec::<u8>::new();
+	let mut decoder = OutputDecoder::new();
 
 	#[cfg(unix)]
 	let Ok(reader) = register_nonblocking_pipe(reader) else {
@@ -1904,13 +1955,9 @@ async fn read_output_buffered(
 				Err(_) => break,
 			}
 		};
-		if n > 0 {
-			let _ = activity.try_send(());
-		}
-		// Once `exceeded`, the post-process minimizer is bypassed (see the
-		// `!output.exceeded` gate at the call site), so further appends just
-		// grow `captured` without serving any purpose. Stop accumulating to
-		// bound peak memory on commands that produce very large output.
+		let _ = activity.try_send(());
+
+		// Once exceeded, further capture would only increase peak memory.
 		if !exceeded {
 			if captured.len().saturating_add(n) > max_capture_bytes {
 				exceeded = true;
@@ -1919,52 +1966,22 @@ async fn read_output_buffered(
 			}
 		}
 
-		// Stream whatever is validly decodable *right now* to the callback,
-		// carrying incomplete trailing UTF-8 bytes over to the next iteration.
-		if let Some(cb) = on_chunk.as_ref() {
-			pending.extend_from_slice(&buf[..n]);
-			while !pending.is_empty() {
-				match str::from_utf8(&pending) {
-					Ok(text) => {
-						emit_chunk(text, Some(cb), &budget);
-						pending.clear();
-						break;
-					},
-					Err(err) => {
-						let p = err.valid_up_to();
-						if p > 0 {
-							// SAFETY: [..p] is valid UTF-8 per valid_up_to().
-							let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-							emit_chunk(text, Some(cb), &budget);
-							pending.drain(..p);
-						}
-						match err.error_len() {
-							Some(skip) => {
-								emit_chunk(REPLACEMENT, Some(cb), &budget);
-								pending.drain(..skip);
-							},
-							None => break,
-						}
-					},
-				}
-			}
+		let text = decoder.push(&buf[..n]);
+		if !text.is_empty()
+			&& let Some(cb) = on_chunk.as_ref()
+		{
+			emit_chunk(&text, Some(cb), &budget);
 		}
 	}
 
-	// Flush any trailing bytes the streaming decoder held back at EOF.
-	if let Some(cb) = on_chunk.as_ref() {
-		for chunk in pending.utf8_chunks() {
-			let valid = chunk.valid();
-			if !valid.is_empty() {
-				emit_chunk(valid, Some(cb), &budget);
-			}
-			if !chunk.invalid().is_empty() {
-				emit_chunk(REPLACEMENT, Some(cb), &budget);
-			}
-		}
+	let text = decoder.finish();
+	if !text.is_empty()
+		&& let Some(cb) = on_chunk.as_ref()
+	{
+		emit_chunk(&text, Some(cb), &budget);
 	}
 
-	BufferedOutput { text: String::from_utf8_lossy(&captured).into_owned(), exceeded }
+	BufferedOutput { text: decode_bytes(&captured), exceeded }
 }
 
 #[cfg(unix)]
@@ -2014,7 +2031,7 @@ fn emit_chunk(text: &str, callback: Option<&mpsc::UnboundedSender<String>>, budg
 	if let Some(callback) = callback {
 		let allowed = budget
 			.remaining
-			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+			.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
 				Some(remaining.saturating_sub(text.len()))
 			})
 			.unwrap_or(0)
@@ -2276,8 +2293,103 @@ fn quote_arg(arg: &str) -> String {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn spawn_identity_decisions() {
+		use process::ProcessObservation::{Absent, Present, Unknown};
+		let pinned = || Some("darwin:123:456".to_owned());
+		let present = || Present { incarnation: "darwin:123:456".to_owned() };
+		let unknown = || Unknown { reason_code: "identity_unavailable".to_owned() };
+		assert_eq!(observed_spawn_incarnation(None, Absent), Ok(None));
+		assert_eq!(observed_spawn_incarnation(pinned(), Absent), Ok(None));
+		// No incarnation pinned at spawn: a later occupant of the PID must not be
+		// adopted as the spawned child.
+		assert_eq!(observed_spawn_incarnation(None, present()), Err(()));
+		assert_eq!(observed_spawn_incarnation(pinned(), present()), Ok(pinned()));
+		assert_eq!(observed_spawn_incarnation(pinned(), unknown()), Ok(pinned()));
+		assert_eq!(observed_spawn_incarnation(None, unknown()), Err(()));
+		assert_eq!(
+			observed_spawn_incarnation(pinned(), Present { incarnation: "darwin:789:0".to_owned() }),
+			Ok(None),
+		);
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn spawned_reaped_child_does_not_require_ledger_identity() {
+		let path = std::env::temp_dir().join(format!("pi-shell-reaped-{}.jsonl", std::process::id()));
+		let file = fs::File::create(&path).expect("create ledger");
+		let observer = CommandProcessObserver {
+			process_group_id: Arc::new(AtomicI32::new(0)),
+			targets:          Arc::new(StdMutex::new(process::TerminationTargets::new())),
+			ownership_ledger: Some(OwnershipLedger {
+				file:  Arc::new(StdMutex::new(file)),
+				token: "test-token".to_owned(),
+			}),
+			upstream:         None,
+		};
+		let mut child = std::process::Command::new("/usr/bin/true")
+			.spawn()
+			.expect("spawn child");
+		let pid = i32::try_from(child.id()).expect("pid fits");
+		child.wait().expect("reap child");
+		observer.spawned(pid, Some(pid));
+		// On macOS the reaped child is confirmed Absent, so its numeric pgid is not
+		// published as signal authority. Elsewhere the pid path still records it.
+		let expected_pgid = if cfg!(target_os = "macos") { 0 } else { pid };
+		assert_eq!(observer.process_group_id.load(Ordering::SeqCst), expected_pgid);
+		assert_eq!(fs::read_to_string(&path).expect("read ledger"), "");
+		fs::remove_file(path).expect("remove ledger");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn spawn_ledger_write_failure_exits_70() {
+		const CHILD_FLAG: &str = "PI_SHELL_TEST_LEDGER_FAILURE";
+		if std::env::var_os(CHILD_FLAG).is_some() {
+			// A read-only descriptor deterministically rejects publication on
+			// every Unix platform, without depending on /dev/full availability.
+			let file = fs::File::open("/dev/null").expect("open read-only ledger");
+			let observer = CommandProcessObserver {
+				process_group_id: Arc::new(AtomicI32::new(0)),
+				targets:          Arc::new(StdMutex::new(process::TerminationTargets::new())),
+				ownership_ledger: Some(OwnershipLedger {
+					file:  Arc::new(StdMutex::new(file)),
+					token: "test-token".to_owned(),
+				}),
+				upstream:         None,
+			};
+			let mut child = std::process::Command::new("/bin/sleep")
+				.arg("30")
+				.spawn()
+				.expect("spawn identifiable child");
+			observer.spawned(i32::try_from(child.id()).expect("pid fits"), None);
+			child.kill().expect("clean up unexpected survivor");
+			child.wait().expect("reap unexpected survivor");
+			panic!("ledger failure must exit before returning");
+		}
+		let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+			.args(["--exact", "shell::tests::spawn_ledger_write_failure_exits_70", "--nocapture"])
+			.env(CHILD_FLAG, "1")
+			.status()
+			.expect("run isolated observer");
+		assert_eq!(status.code(), Some(70));
+	}
+
 	#[cfg(unix)]
 	static PROCESS_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
+	#[cfg(unix)]
+	async fn run_and_capture(shell: &Shell, options: ShellRunOptions) -> (ShellRunResult, String) {
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = shell
+			.run(options, Some(tx), CancelToken::default())
+			.await
+			.expect("shell command should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+		(result, output)
+	}
 	#[cfg(unix)]
 	async fn wait_until_descendant_visible(pid: i32) {
 		for _ in 0..100 {
@@ -2985,7 +3097,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3022,6 +3134,7 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.wait();
 		assert!(sibling_alive, "timeout killed unrelated sibling {sibling_pid}; output={output:?}");
 
 		// SIGKILL delivery to the reparented grandchild can lag under CI load, so
@@ -3049,7 +3162,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn contained_timeout_freezes_group_before_term_handler_can_escape() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3104,6 +3217,7 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.wait();
 		assert!(
 			sibling_alive,
 			"contained timeout killed unrelated sibling {sibling_pid}; output={output:?}"
@@ -3114,7 +3228,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3141,10 +3255,10 @@ mod tests {
 				// Wait for BOTH markers: the grandchild and parent lines race on the
 				// pipe, so returning as soon as `grandchild=` appears can leave the
 				// not-yet-read `parent=` chunk pending and flake the parent assertion.
-				if let Some(pid) = parse_marker_pid(&output, "grandchild=") {
-					if parse_marker_pid(&output, "parent=").is_some() {
-						return pid;
-					}
+				if let Some(pid) = parse_marker_pid(&output, "grandchild=")
+					&& parse_marker_pid(&output, "parent=").is_some()
+				{
+					return pid;
 				}
 			}
 		})
@@ -3197,6 +3311,7 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.wait();
 		assert!(
 			sibling_alive,
 			"cancellation killed unrelated sibling {sibling_pid}; output={output:?}"
@@ -3253,6 +3368,57 @@ mod tests {
 
 	#[cfg(unix)]
 	#[tokio::test]
+	async fn command_env_removals_mask_ambient_values_temporarily_and_explicit_values_win() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		const NAME: &str = "PI_SHELL_COMMAND_SCOPE_TEST";
+		const READ_VALUE: &str = "sh -c 'printf \"%s\" \"${PI_SHELL_COMMAND_SCOPE_TEST-unset}\"'";
+		let shell = Shell::new(Some(ShellOptions {
+			session_env: Some(HashMap::from([(NAME.to_string(), "ambient".to_string())])),
+			..Default::default()
+		}));
+		let removal = Some(vec![NAME.to_string()]);
+
+		// A removal-only call still gets a temporary command scope. The exported
+		// unset sentinel masks the session value and is omitted from child env.
+		let (removed, output) = run_and_capture(&shell, ShellRunOptions {
+			command: READ_VALUE.to_string(),
+			unset_env: removal.clone(),
+			..Default::default()
+		})
+		.await;
+		assert_eq!(removed.exit_code, Some(0));
+		assert_eq!(output, "unset");
+
+		// Adding an explicit value after the removal shadows the sentinel.
+		let (overridden, output) = run_and_capture(&shell, ShellRunOptions {
+			command: READ_VALUE.to_string(),
+			env: Some(HashMap::from([(NAME.to_string(), "explicit".to_string())])),
+			unset_env: removal.clone(),
+			..Default::default()
+		})
+		.await;
+		assert_eq!(overridden.exit_code, Some(0));
+		assert_eq!(output, "explicit");
+
+		// A nonzero command still pops its command scope before the next run.
+		let (failed, _) = run_and_capture(&shell, ShellRunOptions {
+			command: "sh -c 'exit 1'".to_string(),
+			unset_env: removal,
+			..Default::default()
+		})
+		.await;
+		assert_eq!(failed.exit_code, Some(1));
+		let (restored, output) = run_and_capture(&shell, ShellRunOptions {
+			command: READ_VALUE.to_string(),
+			..Default::default()
+		})
+		.await;
+		assert_eq!(restored.exit_code, Some(0));
+		assert_eq!(output, "ambient");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
 	async fn env_scope_pop_error_cleanup_cancels_reader_and_bridges() {
 		let (reader, writer) = pipe_to_files("env-pop-error").expect("pipe should be created");
 		let stdout_file = OpenFile::from(writer.try_clone().expect("clone writer"));
@@ -3292,7 +3458,7 @@ mod tests {
 		let mut session = create_session(&config).await.expect("create_session");
 		let mut env = HashMap::new();
 		env.insert("U3_POP_ERROR".to_string(), "1".to_string());
-		assert!(apply_command_env(&mut session.shell, Some(&env)).expect("push command env"));
+		assert!(apply_command_env(&mut session.shell, None, Some(&env)).expect("push command env"));
 
 		let mut params = session.shell.default_exec_params();
 		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
@@ -3354,6 +3520,82 @@ mod tests {
 		}
 		assert_eq!(stdout, b"out\n");
 		assert_eq!(stderr, b"err\n");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_length_and_substring_count_characters() {
+		// The repro from #6544; expected values are GNU bash 5.3 in a UTF-8 locale.
+		let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Bytes>();
+		let options = ShellExecuteOptions {
+			command: "v='caf\u{e9}'; k='\u{c6d0}\u{b798}'; a=('\u{c6d0}\u{b798}' x); echo \"${#v} \
+			          ${#k} [${v: -1}] [${v: -2}] [${k: -1}] [${k:0:-1}] ${#a[0]}\""
+				.to_string(),
+			..Default::default()
+		};
+		let streams = StreamSinks { stdout: Some(stdout_tx), stderr: None };
+		let result = execute_shell_streams(options, streams, CancelToken::default())
+			.await
+			.expect("execute should succeed");
+		assert_eq!(result.exit_code, Some(0));
+
+		let mut stdout = Vec::new();
+		while let Some(chunk) = stdout_rx.recv().await {
+			stdout.extend_from_slice(&chunk);
+		}
+		assert_eq!(
+			String::from_utf8(stdout).unwrap(),
+			"4 2 [\u{e9}] [f\u{e9}] [\u{b798}] [\u{c6d0}] 2\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_negative_substring_length_ends_before_the_end() {
+		// A negative length marks where the slice ends, as in bash (#6544 review).
+		let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Bytes>();
+		let options = ShellExecuteOptions {
+			command: "v=abcdefgh; w='caf\u{e9}'; echo \"${v:2:-2} ${w:1:-1} ${w:0:-1}\"".to_string(),
+			..Default::default()
+		};
+		let streams = StreamSinks { stdout: Some(stdout_tx), stderr: None };
+		let result = execute_shell_streams(options, streams, CancelToken::default())
+			.await
+			.expect("execute should succeed");
+		assert_eq!(result.exit_code, Some(0));
+
+		let mut stdout = Vec::new();
+		while let Some(chunk) = stdout_rx.recv().await {
+			stdout.extend_from_slice(&chunk);
+		}
+		assert_eq!(String::from_utf8(stdout).unwrap(), "cdef af caf\n");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_rejects_substring_ending_before_its_offset() {
+		let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Bytes>();
+		let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<Bytes>();
+		let options = ShellExecuteOptions {
+			command: "v='\u{e9}x'; echo \"[${v:1:-3}]\"".to_string(),
+			..Default::default()
+		};
+		let streams = StreamSinks { stdout: Some(stdout_tx), stderr: Some(stderr_tx) };
+		let result = execute_shell_streams(options, streams, CancelToken::default())
+			.await
+			.expect("execute should succeed");
+		assert_ne!(result.exit_code, Some(0));
+
+		let mut stdout = Vec::new();
+		while let Some(chunk) = stdout_rx.recv().await {
+			stdout.extend_from_slice(&chunk);
+		}
+		let mut stderr = Vec::new();
+		while let Some(chunk) = stderr_rx.recv().await {
+			stderr.extend_from_slice(&chunk);
+		}
+		assert!(stdout.is_empty(), "nothing should be echoed, got {stdout:?}");
+		assert!(String::from_utf8_lossy(&stderr).contains("substring expression < 0"));
 	}
 
 	#[cfg(unix)]
@@ -3464,5 +3706,508 @@ mod tests {
 			observed_pids.contains(&child_pid),
 			"a live child must appear in the observed descendant set",
 		);
+	}
+
+	async fn execute_captured(command: String) -> (ShellExecuteResult, String) {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command, ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("shell execution");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+		(result, output)
+	}
+
+	#[test]
+	fn duplicated_open_files_share_the_builtin_reader_lock_and_pushback() {
+		let input = OpenFile::from(tempfile::tempfile().expect("temporary file"));
+		let first = input
+			.held_input()
+			.expect("readable file holds input")
+			.clone();
+		let duplicate = input.try_clone().expect("duplicate file");
+		let second = duplicate
+			.held_input()
+			.expect("duplicate holds input")
+			.clone();
+
+		let guard = first.lock_reader();
+		assert!(second.try_lock_reader().is_none());
+		first.put_back(b"next");
+		drop(guard);
+
+		let _guard = second.try_lock_reader().expect("reader lock was released");
+		assert_eq!(second.pop(), Some(b'n'));
+	}
+
+	/// Contract: `read` from a file consumes exactly one line of the shared
+	/// offset — the next `read`, and any later reader of the same descriptor,
+	/// resumes right after it.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_from_a_file_leaves_the_rest_for_the_next_reader() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let path = dir.path().join("lines.txt");
+		std::fs::write(&path, "one\ntwo\nthree\nfour\n").expect("write fixture");
+		let path = path.to_string_lossy().replace('\\', "/");
+		let (result, output) = execute_captured(format!(
+			"{{ read -r a; read -r b; echo \"[$a][$b]\"; cat; }} < '{path}'"
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[one][two]\nthree\nfour\n");
+	}
+
+	/// Contract: `read` assigns UTF-8 input as text, not one Latin-1
+	/// character per byte.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_decodes_utf8_input() {
+		let (result, output) = execute_captured(
+			"printf 'é ü\\n' | { read -r first rest; echo \"$first|$rest\"; }".to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "é|ü\n");
+	}
+
+	/// Contract: a timed-out incomplete UTF-8 character is assigned to the
+	/// partial result instead of being hidden from the caller.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_timeout_assigns_an_incomplete_utf8_character() {
+		let (result, output) = execute_captured(
+			"{ printf '\\303'; sleep 0.2; printf '\\251\\n'; } | { read -r -t 0.05 first; rc=$?; \
+			 read -r second; printf '[%s][%s][%s]\\n' \"$rc\" \"$first\" \"$second\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[142][�][�]\n");
+	}
+
+	/// Contract: `read` preserves Windows ACP bytes from an external producer.
+	#[cfg(windows)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_decodes_windows_acp_bytes_from_native_pipeline() {
+		// This fixture is CP1252-specific; other Windows ACPs are covered by the
+		// shared decoder's explicit code-page tests.
+		// SAFETY: GetACP has no preconditions.
+		if unsafe { windows_sys::Win32::Globalization::GetACP() } != 1252 {
+			return;
+		}
+
+		let script = "$stream = [Console]::OpenStandardOutput(); $stream.WriteByte(0xE9); \
+		              $stream.WriteByte(0x0A)";
+		let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+		let encoded = test_base64(&utf16);
+		let command = format!(
+			"powershell -NoProfile -NonInteractive -EncodedCommand {encoded} | {{ read -r x; printf \
+			 '[%s]\\n' \"$x\"; }}"
+		);
+		let (result, output) = execute_captured(command).await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[é]\n");
+	}
+
+	/// Contract: `read -n` counts characters, not bytes, as bash does in a
+	/// UTF-8 locale; a multibyte character is never split.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_takes_whole_utf8_characters() {
+		let (result, output) = execute_captured(
+			"printf 'éa\\n' | { read -r -n 1 first; read -r rest; echo \"$first|$rest\"; }".to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "é|a\n");
+	}
+
+	/// Contract: `read -N` counts characters too, and only the count ends
+	/// it: a newline inside the limit is data, and three- and four-byte
+	/// characters are taken whole.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_exact_count_takes_whole_utf8_characters_across_newlines() {
+		let (result, output) = execute_captured(
+			"printf '한\\n😀x' | { read -r -N 3 first; read -r rest; echo \"[$first][$rest]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[한\n😀][x]\n");
+	}
+
+	/// Contract: `read -n` counts characters as the line decodes them, so
+	/// each invalid sequence, replaced by one U+FFFD, is one character. A lead
+	/// byte is known to be invalid only once the next byte arrives; when that
+	/// byte lies past the limit it is held for the next read of the input.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_counts_invalid_bytes_as_they_decode() {
+		let (result, output) = execute_captured(
+			"printf '\\300A\\n' | { read -r -n 1 a; read -r b; echo \"[$a][$b]\"; }; printf \
+			 '\\303AB\\n' | { read -r -n 2 a; read -r b; echo \"[$a][$b]\"; }; printf \
+			 '\\340\\200A\\n' | { read -r -n 1 a; read -r b; echo \"[$a][$b]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][A]\n[\u{FFFD}A][B]\n[\u{FFFD}][\u{FFFD}A]\n");
+	}
+
+	/// Contract: from a regular file too, the byte that showed a lead byte
+	/// to be invalid is held for the next read when it lies past the `-n`
+	/// limit; nothing seeks.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_holds_a_file_byte_past_the_limit_for_the_next_read() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let path = dir.path().join("invalid.txt");
+		std::fs::write(&path, b"\xC3A\n\xE0\x80A\n").expect("write fixture");
+		let path = path.to_string_lossy().replace('\\', "/");
+		let (result, output) = execute_captured(format!(
+			"{{ read -r -n 1 a; read -r b; read -r -n 1 c; read -r d; echo \"[$a][$b][$c][$d]\"; }} \
+			 < '{path}'"
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][A][\u{FFFD}][\u{FFFD}A]\n");
+	}
+
+	/// Contract: a `-n`/`-N` value never holds more characters than its
+	/// limit, also from a pipe: the byte read past the limit is held, and
+	/// the next `read` of the pipe gets it first.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_holds_the_byte_past_the_limit_for_the_next_read() {
+		let (result, output) = execute_captured(
+			"printf '\\303AB\\n' | { read -r -n 1 x; read -r y; echo \"[$x][$y]\"; }; printf \
+			 '\\303AB\\n' | { read -r -N 1 x; read -r y; echo \"[$x][$y]\"; }; printf \
+			 '\\342\\202A\\n' | { read -r -n 1 x; read -r y; echo \"[$x][$y]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][AB]\n[\u{FFFD}][AB]\n[\u{FFFD}][A]\n");
+	}
+
+	/// Contract: when the byte past the limit was escaped, the backslash
+	/// before it is held too, so the next read sees both input bytes.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_holds_both_bytes_of_an_escape_past_the_limit() {
+		let (result, output) = execute_captured(
+			"printf '\\303\\134\\134B\\n' | { read -n 1 x; read -r y; printf '[%s][%s]\\n' \"$x\" \
+			 \"$y\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][\\\\B]\n");
+	}
+
+	/// Contract: held input belongs to the input it was read from, not to a
+	/// descriptor number: a here-string read in between does not see it,
+	/// and the next read of the pipe does.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_held_input_stays_with_its_input_not_the_descriptor_number() {
+		let (result, output) = execute_captured(
+			"printf '\\303A' | { read -r -n 1 x; read -r y <<< Z; read -r w; echo \"[$x][$y][$w]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][Z][A]\n");
+	}
+
+	/// Contract: `mapfile` reads held input first and decodes each line as
+	/// UTF-8, replacing invalid sequences.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn mapfile_reads_held_input_first_and_decodes_utf8() {
+		let (result, output) = execute_captured(
+			"printf '\\303AB\\n\\303\\251\\n\\303A\\n' | { read -r -n 1 x; mapfile -t rest; echo \
+			 \"[$x][${rest[*]}]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][AB é \u{FFFD}A]\n");
+	}
+
+	/// Contract: a subshell shares the held input of the pipe it reads, so
+	/// a held byte is consumed once.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_held_input_is_consumed_once_across_a_subshell() {
+		let (result, output) = execute_captured(
+			"printf '\\303AB\\n' | { read -r -n 1 x; ( read -r y; echo \"sub[$y]\" ); read -r z; \
+			 echo \"[$x][$z]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "sub[AB]\n[\u{FFFD}][]\n");
+	}
+
+	/// Regression: `mapfile` reads a pipe only up to each delimiter, so when
+	/// assigning a line fails the rest of the pipe stays for the next reader.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn mapfile_assignment_failure_leaves_the_rest_of_a_pipe() {
+		let (_, output) = execute_captured(
+			"printf 'a\\nb\\nc\\n' | { mapfile -O 1 EPOCHSECONDS; echo \"rc=$?\"; cat; }".to_owned(),
+		)
+		.await;
+		assert!(output.contains("not yet implemented"), "{output:?}");
+		assert!(output.ends_with("rc=99\nb\nc\n"), "{output:?}");
+	}
+
+	/// Contract: at end of input, a character left incomplete decodes to one
+	/// U+FFFD and counts toward `-n`/`-N`, so reaching the limit with it is
+	/// success, as in bash; a short value is still end of input.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_counts_an_incomplete_character_at_eof() {
+		let (result, output) = execute_captured(
+			"printf 'a\\342' | { read -r -N 2 x; echo \"rc=$? [$x]\"; }; printf 'a\\342' | { read -r \
+			 -n 2 x; echo \"rc=$? [$x]\"; }; printf 'a\\342' | { read -r -n 3 x; echo \"rc=$? \
+			 [$x]\"; }; printf '\\342' | { read -r -n 1 x; echo \"rc=$? [$x]\"; }; printf 'ab' | { \
+			 read -r -N 3 x; echo \"rc=$? [$x]\"; }; printf 'a\\342' | { read -r -N 3 x; echo \
+			 \"rc=$? [$x]\"; }; printf 'a\\342' | { read -r x; echo \"rc=$? [$x]\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(
+			output,
+			"rc=0 [a\u{FFFD}]\nrc=0 [a\u{FFFD}]\nrc=1 [a\u{FFFD}]\nrc=0 [\u{FFFD}]\nrc=1 [ab]\nrc=1 \
+			 [a\u{FFFD}]\nrc=1 [a\u{FFFD}]\n"
+		);
+	}
+
+	/// Contract: `read -t 0` reports input that is ready without reading it.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_t_0_reports_ready_input() {
+		let (result, output) = execute_captured("read -t 0 <<< x; echo \"rc=$?\"".to_owned()).await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "rc=0\n");
+	}
+
+	/// Contract: a byte held from a regular file is not given back to the
+	/// file, so an external command reading next does not see it (as with
+	/// bash's pushback); the next builtin read does.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_count_holds_a_file_byte_that_external_readers_do_not_see() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let path = dir.path().join("invalid.txt");
+		std::fs::write(&path, b"\xC3AB\n").expect("write fixture");
+		let path = path.to_string_lossy().replace('\\', "/");
+		let (result, output) = execute_captured(format!(
+			"{{ read -r -n 1 x; cat; read -r y; printf '[%s][%s]\\n' \"$x\" \"$y\"; }} < '{path}'"
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "B\n[\u{FFFD}][A]\n");
+	}
+
+	/// Contract: held input belongs to one open of a file; opening the same
+	/// file again starts from its beginning and does not take it.
+	#[cfg(not(windows))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn read_from_a_reopened_file_does_not_see_held_input() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let path = dir.path().join("invalid.txt");
+		std::fs::write(&path, b"\xC3AB\n").expect("write fixture");
+		let path = path.to_string_lossy().replace('\\', "/");
+		let (result, output) = execute_captured(format!(
+			"{{ read -r -n 1 x; read -r y < '{path}'; read -r z; printf '[%s][%s][%s]\\n' \"$x\" \
+			 \"$y\" \"$z\"; }} < '{path}'"
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "[\u{FFFD}][\u{FFFD}AB][AB]\n");
+	}
+
+	/// Contract: `mapfile -n` from a file consumes exactly the lines it
+	/// stores; a later reader of the descriptor gets the rest.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn mapfile_count_from_a_file_leaves_the_rest_for_the_next_reader() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let path = dir.path().join("lines.txt");
+		std::fs::write(&path, "one\ntwo\nthree\nfour\n").expect("write fixture");
+		let path = path.to_string_lossy().replace('\\', "/");
+		let (result, output) = execute_captured(format!(
+			"{{ mapfile -t -n 2 lines; echo \"${{lines[*]}}\"; cat; }} < '{path}'"
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "one two\nthree\nfour\n");
+	}
+
+	/// Contract: a `mapfile -C` callback that reads the same piped stdin gets
+	/// the lines after the one mapfile stored, as in bash; mapfile must not
+	/// have read them ahead.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn mapfile_callback_reads_the_next_line_of_a_pipe() {
+		let (result, output) = execute_captured(
+			"cb() { read -r x; echo \"cb:$1:$2:$x\"; }; seq 1 4 | { mapfile -t -C cb -c 1 arr; echo \
+			 \"arr=${arr[*]}\"; }"
+				.to_owned(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "cb:0:1:2\ncb:1:3:4\narr=1 3\n");
+	}
+
+	/// Contract: the same holds for a regular file: mapfile reads only up to
+	/// each delimiter.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn mapfile_callback_reads_the_next_line_of_a_file() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let path = dir.path().join("lines.txt");
+		std::fs::write(&path, "1\n2\n3\n4\n").expect("write fixture");
+		let path = path.to_string_lossy().replace('\\', "/");
+		let (result, output) = execute_captured(format!(
+			"cb() {{ read -r x; echo \"cb:$1:$2:$x\"; }}; {{ mapfile -t -C cb -c 1 arr; echo \
+			 \"arr=${{arr[*]}}\"; }} < '{path}'"
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "cb:0:1:2\ncb:1:3:4\narr=1 3\n");
+	}
+
+	/// Contract: `mapfile` into a readonly array fails before reading, as in
+	/// bash: the array is unchanged and the piped input stays for the next
+	/// reader.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn mapfile_into_a_readonly_array_leaves_the_input_unread() {
+		let (_, output) = execute_captured(
+			"printf 'a\\nb\\n' | { arr=(x); readonly arr; mapfile -t -O 1 arr; echo \"rc=$? \
+			 ${arr[*]}\"; cat; }"
+				.to_owned(),
+		)
+		.await;
+		assert!(output.ends_with("rc=1 x\na\nb\n"), "{output:?}");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cd_physical_mode_supports_exit_on_failed_resolution() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+		let command = format!("cd -P -e {} && printf cd-e-ok", quote_arg(&cwd));
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command, ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("cd -Pe should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "cd-e-ok");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn unset_name_reference_removes_the_reference_not_its_target() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let command = r#"declare target=kept; declare -n reference=target; unset -n reference; printf '%s|%s' "$target" "${reference-unset}""#;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("unset -n should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "kept|unset");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn declare_local_inherit_copies_outer_value() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let command = r#"x=outer; f() { local -I x; printf '%s' "$x"; }; f"#;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("local -I should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "outer");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn jobs_list_changed_reports_completed_jobs() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		// Poll `jobs -n` until the background job's completion is reported rather
+		// than betting a fixed sleep on python3 startup (flaky on loaded macOS,
+		// #6098). The redirect keeps `jobs` in the current shell, so the first
+		// non-empty report is the one notification for this job; the loop is
+		// bounded at ~10s.
+		let report = std::env::temp_dir().join(format!("pi-shell-jobs-n-{}.txt", std::process::id()));
+		let report = report.display();
+		let (result, output) = run_and_capture(&shell, ShellRunOptions {
+			command: format!(
+				"python3 -c 'pass' & for _ in $(seq 1 200); do jobs -n > '{report}'; [ -s '{report}' \
+				 ] && break; sleep 0.05; done; cat '{report}'; rm -f '{report}'"
+			),
+			..Default::default()
+		})
+		.await;
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("Done"), "changed-job output: {output:?}");
+		assert!(output.contains("python3"), "changed-job command: {output:?}");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn jobs_list_long_includes_running_pid_and_command() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		let (result, output) = run_and_capture(&shell, ShellRunOptions {
+			command: "python3 -c 'import time; time.sleep(30)' & jobs -l".to_string(),
+			..Default::default()
+		})
+		.await;
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("Running"), "job state output: {output:?}");
+		assert!(output.contains("python3"), "job command output: {output:?}");
 	}
 }

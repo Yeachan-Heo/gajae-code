@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { buildCoordinatorMcpConfig } from "../../src/coordinator-mcp/policy";
 import {
 	type CoordinatorSessionTransactionV1,
+	claimPublicDelivery,
 	coordinatorStatePaths,
 	readSessionTransaction,
 	withSessionTransaction,
@@ -669,8 +670,11 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		const sessionId = "stale-evicted";
 		// Endpoint is permanently stale (no broker row) so every reap fails
 		// endpoint_stale and the session is force-evicted after MAX_REAP_FAILURES.
-		const { server, registryFile } = await createServer(root, {
+		const { server, controls, registryFile } = await createServer(root, {
 			brokerSessionsOverride: async () => [],
+			// The real stale-retirement endpoint returns not_found for an absent
+			// index row; an ordinary close acknowledgement is not retirement proof.
+			closeHandler: async () => ({ ok: false, error: { code: "not_found", message: "session is not indexed" } }),
 		});
 		const fixture = await writeDurableCoordinatorSession({
 			sessionId,
@@ -687,24 +691,85 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 
 		// The canonical WAL exists before eviction.
 		expect(await readSessionTransaction(fixture.paths, sessionId)).not.toBeNull();
+		expect(Object.keys((await readSessionTransaction(fixture.paths, sessionId))!.outbox).length).toBeGreaterThan(0);
 
 		for (let i = 0; i < MAX_REAP_FAILURES; i++) await server.sessionReaper.sweepOnce();
 
 		// Projection removed AND the canonical WAL drained/removed — not orphaned.
 		expect(await Bun.file(fixture.sessionFile).exists()).toBe(false);
 		expect(await readSessionTransaction(fixture.paths, sessionId)).toBeNull();
+		await expect(claimPublicDelivery(fixture.paths, sessionId, { limit: 8 })).rejects.toThrow(/resource_gone/);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({
+				input: {
+					cwd: root,
+					sessionId,
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation(sessionId),
+					forceRetireStale: true,
+				},
+				idempotencyKey: `coordinator-reaper-fence:${sessionId}:${endpointIncarnation(sessionId)}`,
+			}),
+		]);
 
 		// A durable retirement record was written and completed, guaranteeing full
 		// cleanup (WAL, deliveries, projections, events) is recorded.
 		const registry = JSON.parse(await fs.readFile(registryFile, "utf8")) as {
 			deletions: Record<string, { session_id: string; phase: string; cleanup: Record<string, unknown> }>;
+			roster?: Record<string, unknown>;
+			retained_sessions?: Record<string, unknown>;
 		};
 		const retirement = Object.values(registry.deletions).find(entry => entry.session_id === sessionId);
 		expect(retirement?.phase).toBe("completed");
 		expect(retirement?.cleanup).toMatchObject({ wal: true, session: true, events: true });
+		expect(registry.roster?.[sessionId]).toBeUndefined();
+		expect(registry.retained_sessions?.[sessionId]).toBeUndefined();
 
 		// The evicted session no longer appears to the reaper.
 		expect(await server.sessionReaper.sweepOnce()).toBe(0);
+	});
+
+	it.each([
+		"ordinary-close",
+		"foreign-session",
+		"authority-changed",
+	])("retains durable state when the eviction fence returns %s instead of retirement proof", async response => {
+		const root = await tempRoot();
+		const sessionId = "unproven-retirement";
+		const { server, controls, registryFile, sessionFile } = await createServer(root, {
+			brokerSessionsOverride: async () => [],
+			closeHandler: async () => {
+				if (response === "authority-changed")
+					return { ok: false, error: { code: "endpoint_stale", message: "authority changed" } };
+				if (response === "foreign-session")
+					return { ok: true, result: { sessionId: "foreign-session", retired: true } };
+				return { ok: true, result: { sessionId } };
+			},
+		});
+		await writeSession(sessionFile(sessionId), root, sessionId, { ephemeral: true });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const before = await readSessionTransaction(paths, sessionId);
+		const deliveryIds = Object.keys(before!.outbox);
+		expect(deliveryIds.length).toBeGreaterThan(0);
+
+		// Cross the eviction boundary twice: an unproven close must never
+		// authorize deletion, even after repeated stale observations.
+		for (let i = 0; i < MAX_REAP_FAILURES * 2; i++) await server.sessionReaper.sweepOnce();
+
+		expect(controls.filter(control => control.input.forceRetireStale === true)).toHaveLength(2);
+		expect(await Bun.file(sessionFile(sessionId)).exists()).toBe(true);
+		const after = await readSessionTransaction(paths, sessionId);
+		if (!before?.endpoint || !after?.endpoint)
+			throw new Error("Expected endpoint authority before and after refused retirement");
+		expect(after.endpoint.incarnation).toBe(before.endpoint.incarnation);
+		for (const id of deliveryIds) {
+			expect(after?.outbox[id]?.public_event_id).toBe(before!.outbox[id]!.public_event_id);
+			expect(after?.outbox[id]?.public_delivery).toBeDefined();
+		}
+		const registry = JSON.parse(await fs.readFile(registryFile, "utf8")) as {
+			deletions: Record<string, { session_id: string }>;
+		};
+		expect(Object.values(registry.deletions).filter(entry => entry.session_id === sessionId)).toEqual([]);
 	});
 
 	it("reuses the close idempotency key when the idle reaper retries", async () => {

@@ -92,9 +92,7 @@ describe("#697 auto-compaction respects the active custom provider", () => {
 		if (!currentModel) throw new Error("expected myproxy model to load");
 
 		// Only the custom provider has a usable credential — OpenAI must never be needed.
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model =>
-			model.provider === "myproxy" ? "myproxy-secret" : undefined,
-		);
+		authStorage.upsertCredential("myproxy", { type: "api_key", key: "myproxy-secret" });
 
 		const agent = new Agent({
 			initialState: { model: currentModel, systemPrompt: ["Test"], tools: [], messages: [] },
@@ -142,11 +140,8 @@ describe("#697 auto-compaction respects the active custom provider", () => {
 
 		// Both providers carry a credential — only an OpenAI *route* (not a missing
 		// key) is the failure mode under test, so order/provider-scope must decide.
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
-			if (model.provider === "myproxy") return "myproxy-secret";
-			if (model.provider === "openai") return "stray-openai-key";
-			return undefined;
-		});
+		authStorage.upsertCredential("myproxy", { type: "api_key", key: "myproxy-secret" });
+		authStorage.upsertCredential("openai", { type: "api_key", key: "stray-openai-key" });
 		// Make the stray OpenAI model "available" so the fallback could reach it.
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([currentModel, strayOpenAi]);
 
@@ -201,11 +196,8 @@ describe("#697 auto-compaction respects the active custom provider", () => {
 		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1 });
 		settings.setModelRole("default", `${roleFallback.provider}/${roleFallback.id}`);
 
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
-			if (model.provider === "myproxy") return "myproxy-secret";
-			if (model.provider === "anthropic") return "anthropic-token";
-			return undefined;
-		});
+		authStorage.upsertCredential("myproxy", { type: "api_key", key: "myproxy-secret" });
+		authStorage.upsertCredential("anthropic", { type: "api_key", key: "anthropic-token" });
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([currentModel, roleFallback]);
 
 		const agent = new Agent({

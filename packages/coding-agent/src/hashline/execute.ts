@@ -5,16 +5,19 @@ import { getFileReadCache } from "../edit/file-read-cache";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../edit/normalize";
 import { readEditFileText, serializeEditFileText } from "../edit/read-file";
 import type { EditToolDetails } from "../edit/renderer";
+import { wrapUntrustedContent } from "../session/messages";
+import { truncateLine } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { assertEditableFileContent } from "../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
-import { HashlineMismatchError } from "./anchors";
+import { formatFullAnchorRequirement, HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
 import { buildCompactHashlineDiffPreview } from "./diff-preview";
+import { computeLineHash, HL_BODY_SEP } from "./hash";
 import { type HashlineInputSection, splitHashlineInputs } from "./input";
-import { parseHashlineWithWarnings } from "./parser";
+import { HashlineMissingHashError, HashlineMissingLineError, parseHashlineWithWarnings } from "./parser";
 import { tryRecoverHashlineWithCache } from "./recovery";
 import type {
 	ExecuteHashlineSingleOptions,
@@ -60,8 +63,120 @@ function getTextContent(result: AgentToolResult<EditToolDetails>): string {
 	return result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
 }
 
+/** Frame a finished preview once, after warning text is appended and before any later tail window. */
+function frameHashlineModelResult(
+	result: AgentToolResult<EditToolDetails, typeof hashlineEditParamsSchema>,
+): AgentToolResult<EditToolDetails, typeof hashlineEditParamsSchema> {
+	return {
+		...result,
+		content: result.content.map(part =>
+			part.type === "text" ? { ...part, text: wrapUntrustedContent(part.text) } : part,
+		),
+	};
+}
+
 function getEditDetails(result: AgentToolResult<EditToolDetails>): EditToolDetails {
 	return result.details ?? { diff: "" };
+}
+
+/** Most current anchors echoed back for a hash-less line reference. */
+const MISSING_HASH_ANCHOR_LIMIT = 20;
+
+/**
+ * Format the anchors echoed for a hash-less reference. Both requested
+ * endpoints are always kept (a replacement range needs both hashes); a longer
+ * span is elided in the middle. Hashes are computed from the full line, but
+ * the displayed text is column-bounded like `read` output.
+ */
+function formatMissingHashAnchors(fileLines: string[], start: number, end: number): string[] {
+	const format = (line: number): string => {
+		const text = fileLines[line - 1] ?? "";
+		return `${line}${computeLineHash(line, text)}${HL_BODY_SEP}${truncateLine(text).text}`;
+	};
+	const count = end - start + 1;
+	if (count <= MISSING_HASH_ANCHOR_LIMIT) {
+		return Array.from({ length: count }, (_, offset) => format(start + offset));
+	}
+	const head = Array.from({ length: MISSING_HASH_ANCHOR_LIMIT - 1 }, (_, offset) => format(start + offset));
+	return [...head, "...", format(end)];
+}
+
+function formatMissingHashRetryHeader(
+	fileLines: string[],
+	start: number,
+	end: number,
+	opSigil: HashlineMissingHashError["opSigil"],
+): string {
+	const format = (line: number): string => `${line}${computeLineHash(line, fileLines[line - 1] ?? "")}`;
+	const anchorRange = start === end ? format(start) : `${format(start)}..${format(end)}`;
+	return `${opSigil}${anchorRange}`;
+}
+
+/**
+ * Parse an edit section. When an op names lines by number only, answer with
+ * the current full anchors for those lines so the model can retry without
+ * another read. The edit itself is never applied on a line number alone.
+ */
+async function parseHashlineSection(
+	diff: string,
+	absolutePath: string,
+	pathText: string,
+): Promise<{ edits: HashlineEdit[]; warnings: string[] }> {
+	try {
+		return parseHashlineWithWarnings(diff);
+	} catch (err) {
+		if (err instanceof HashlineMissingLineError) {
+			// When part of a range has a missing hash, suppress the "Did you mean" suggestion
+			// and require the full range to be re-supplied.
+			if (err.rangeRaw) {
+				throw new Error(
+					`Anchor "${err.hash}" lacks its line number. The range ${err.rangeRaw.start}..${err.rangeRaw.end} is incomplete. ` +
+						`Expected ${formatFullAnchorRequirement(err.hash)} Re-read the target to get the full range. ` +
+						`The edit was NOT applied.`,
+				);
+			}
+			const source = await readHashlineFile(absolutePath, pathText);
+			const fileLines = source.exists ? normalizeToLF(stripBom(source.rawContent).text).split("\n") : [];
+			let matchCount = 0;
+			let matchLine: number | undefined;
+			for (let index = 0; index < fileLines.length; index++) {
+				if (computeLineHash(index + 1, fileLines[index] ?? "") !== err.hash) continue;
+				matchCount++;
+				matchLine = index + 1;
+			}
+			if (matchCount === 1 && matchLine !== undefined) {
+				const suggestion = new HashlineMissingLineError(err.hash, matchLine, err.opSigil);
+				throw new Error(`${suggestion.message} The edit was NOT applied.`);
+			}
+			throw new Error(
+				`${err.message} Expected ${formatFullAnchorRequirement(err.hash)} ` +
+					`The hash matches ${matchCount} lines; re-read the target. The edit was NOT applied.`,
+			);
+		}
+		if (!(err instanceof HashlineMissingHashError)) throw err;
+		// When part of a range has a missing hash, suppress the copy-ready suggestion
+		// and require re-reading to get the full range.
+		if (err.rangeRaw) {
+			throw new Error(
+				`${err.message} The anchors are missing from the range ${err.rangeRaw.start}..${err.rangeRaw.end}. ` +
+					`Re-read the target to get the full range with hashes. The edit was NOT applied.`,
+			);
+		}
+		const source = await readHashlineFile(absolutePath, pathText);
+		if (!source.exists) throw err;
+		const fileLines = normalizeToLF(stripBom(source.rawContent).text).split("\n");
+		const { start, end } = err.lines;
+		if (end > fileLines.length) {
+			throw new Error(
+				`${err.message}\nThe edit was NOT applied. Line ${end} does not exist (${pathText} has ${fileLines.length} lines).`,
+			);
+		}
+		const anchors = formatMissingHashAnchors(fileLines, start, end);
+		const retryHeader = formatMissingHashRetryHeader(fileLines, start, end, err.opSigil);
+		throw new Error(
+			`${err.message}\nUse ${retryHeader}\nThe edit was NOT applied. Current anchors for ${pathText}:\n${anchors.join("\n")}`,
+		);
+	}
 }
 
 /**
@@ -106,7 +221,7 @@ async function preflightHashlineSection(options: ExecuteHashlineSingleOptions & 
 	const { session, path: sectionPath, diff } = options;
 
 	const absolutePath = resolvePlanPath(session, sectionPath);
-	const { edits } = parseHashlineWithWarnings(diff);
+	const { edits } = await parseHashlineSection(diff, absolutePath, sectionPath);
 	enforcePlanModeWrite(session, sectionPath, { op: "update" });
 
 	const source = await readHashlineFile(absolutePath, sectionPath);
@@ -139,7 +254,7 @@ async function executeHashlineSection(
 	} = options;
 
 	const absolutePath = resolvePlanPath(session, sourcePath);
-	const { edits, warnings: parseWarnings } = parseHashlineWithWarnings(diff);
+	const { edits, warnings: parseWarnings } = await parseHashlineSection(diff, absolutePath, sourcePath);
 	enforcePlanModeWrite(session, sourcePath, { op: "update" });
 
 	const source = await readHashlineFile(absolutePath, sourcePath);
@@ -182,7 +297,7 @@ async function executeHashlineSection(
 	// of the file: the model just received it back as the diff/preview. Cache
 	// it so a follow-up edit anchored against this state can still recover
 	// if the file is touched out-of-band before the next edit lands.
-	getFileReadCache(session).recordContiguous(absolutePath, 1, result.lines.split("\n"));
+	getFileReadCache(session).recordFull(absolutePath, result.lines.split("\n"));
 
 	const diffResult = generateDiffString(originalNormalized, result.lines);
 	const meta = outputMeta()
@@ -219,7 +334,9 @@ export async function executeHashlineSingle(
 	);
 
 	// Fast path: a single section needs no preflight pass.
-	if (sections.length === 1) return executeHashlineSection({ ...options, ...sections[0] });
+	if (sections.length === 1) {
+		return frameHashlineModelResult(await executeHashlineSection({ ...options, ...sections[0] }));
+	}
 
 	// Multi-section: validate everything up front so we don't apply a partial batch.
 	for (const section of sections) await preflightHashlineSection({ ...options, ...section });
@@ -230,7 +347,12 @@ export async function executeHashlineSingle(
 	}
 
 	return {
-		content: [{ type: "text", text: results.map(({ result }) => getTextContent(result)).join("\n\n") }],
+		content: [
+			{
+				type: "text",
+				text: wrapUntrustedContent(results.map(({ result }) => getTextContent(result)).join("\n\n")),
+			},
+		],
 		details: {
 			diff: results.map(({ result }) => getEditDetails(result).diff).join("\n"),
 			perFileResults: results.map(({ path: resultPath, result }) => {

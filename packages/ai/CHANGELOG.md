@@ -2,6 +2,464 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- Added the Amazon Bedrock Claude Haiku 5.5 selectors (`anthropic.claude-haiku-5-5` and the `au.`, `eu.`, `global.`, `jp.` and `us.` inference profiles) to the bundled catalog, taken from a fresh `generate-models` run.
+- Bedrock Haiku 5.5 resolves to adaptive thinking with the documented `low`..`max` effort range and `medium` default, sends an explicit `thinking: { type: "disabled" }` when thinking is Off (with a forced tool choice the selected effort is kept, capped at `high` while thinking is disabled), and bills prompts above 100K tokens at a long-context tier, with 1-hour cache writes (long retention) at twice the tier input rate.
+
+- Added Claude Haiku 5.5 (`anthropic/claude-haiku-5-5`) to the bundled catalog, taken from a fresh `generate-models` run. Bedrock selectors are not part of this change.
+- Claude Haiku 5.5 resolves to adaptive thinking with the documented `low`..`max` effort range and `medium` default on the Anthropic Messages API. Direct requests omit unsupported sampling controls, send an explicit `thinking: { type: "disabled" }` when thinking is Off, and with a forced tool choice keep the selected effort (capped at `high` while thinking is disabled), request summarized thinking output, and use the documented >100K-token pricing tier, billing 1-hour cache writes at their own rate from the response TTL split. Haiku 4.5 and older keep their existing behavior.
+
+### Changed
+
+- First-party Anthropic requests (`api.anthropic.com` over HTTPS) now send gzip-compressed bodies with `Content-Encoding: gzip`, which shrinks large, repetitive prompts substantially. Third-party endpoints, non-standard ports, and stream bodies are sent unchanged, and a stale `Content-Length` is dropped so the transport recomputes it.
+
+### Fixed
+
+- Antigravity model discovery now identifies with the Gemini CLI user agent so Gemini 4 Argon can be returned without relying on project metadata. Both `google-antigravity` and `google-gemini-cli` still forward project IDs from stored OAuth credentials or structured Google keys when available, and the generated-model refresh path forwards the stored project ID too. Discovery diagnostics redact endpoint credentials, and custom loggers keep their method receiver.
+- Google discovery cache identity now includes the session-selected project and the effective user agent for both Google providers, so catalogs are not reused across projects, CLI identities, or custom Antigravity user-agent overrides. Project-specific dynamic rows are also removed or withheld when the selected project changes.
+
+- Automatic Anthropic prompt caching now also marks the last system block, so a new session reads the shared tools + system prefix instead of re-writing it.
+
+- Anthropic automatic prompt caching no longer adds a root cache marker when caller markers already occupy all four breakpoints, which made the request fail validation.
+
+- `disableReasoning` is now honored on the Bedrock path, so budget-mode Bedrock models keep the caller's requested output cap when reasoning is disabled.
+
+- GLM ZCode OAuth endpoints and the client id (`ZCODE_OAUTH_*`) now resolve from the launching shell and user-owned env files, so a project `.env` cannot redirect the authorize, broker, or login calls. A dynamic project declaration also blocks a different shell value for that name.
+
+- A usage limit that is scoped to one model (an explicit `scope.modelId`, or a model-family tier such as Claude's `opus`/`sonnet`) no longer takes the whole credential out of rotation. The block is recorded for that model only, ranking ignores limits scoped to other models, and callers that do not know the requested model keep the previous conservative behaviour. Plan and quota tiers (`Codex`/`Copilot` plans, Gemini quota tiers) still apply to every model.
+
+- OpenAI Codex token refresh error messages now display readable error details instead of `[object Object]` when the OpenAI token endpoint returns structured error objects with `code`, `type`, and `message` fields. Both string errors (with optional `error_description`) and object errors are now handled correctly.
+
+- `getProxyForUrl` ignores `PI_PROXY`, `PI_PROXY_<PROVIDER>`, `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (and their lowercase aliases) when the project dotenv declares that value. The startup snapshot remains in force when `--worktree` changes cwd before the proxy module's first use. A different shell value is still used only when that declaration is a comparable static value. A dynamic or incomparable declaration (expansion, quoted inner whitespace, or an escape the snapshot will not compare) drops the shell value as well.
+
+- Orphan tool results restored as a user stale-tool-result note escape `&`, `<`, and `>` in the tool text, and attribute metacharacters in the tool name and id, so a closing tag in the tool output cannot end the note early.
+
+## [0.18.12] - 2026-10-16
+
+### Added
+
+- Added the `org:<organization id or name>` credential selector, matching an OAuth credential by its organization id or display name (case-insensitive).
+
+- `AuthStorageOptions.credentialPreferences` accepts an ordered, persisted soft OAuth account preference list per provider (`ConfiguredCredentialPreference[]`: selector plus optional `maxUsedFraction` cap per entry). Selection uses the first listed account that is usable and under its cap; when every listed account is blocked or capped, the unlisted accounts are ranked by balanced/earliest-reset ranking, and capped listed accounts are used only after those. Caps read the windows each provider reports, so they also apply to providers without a ranking strategy. Runtime `--credential`/`--prefer-credential` selectors and session stickiness take precedence. A list whose entries name one stored row twice (for example an email and `account:<id>` for the same login) is ignored as a whole and reported by `AuthStorage.findDuplicateCredentialPreferences()`.
+
+- Add Gemini 4 Argon (`gemini-4-argon`) and send `thinkingLevel` (low/medium/high) for Gemini 4 models instead of falling back to `thinkingBudget`.
+
+- Custom `openai-responses` relays whose base URL has a loopback hostname (`127.0.0.0/8`, `localhost`, `::1`) now send `session_id`/`x-client-request-id` affinity headers without an explicit opt-in. The ChatGPT codex backend only reuses a warmed prompt prefix for requests that carry a session identity, so such a relay previously reported zero cached tokens and replayed the entire context on every turn. Remote relays stay opt-in, known non-OpenAI provider IDs stay excluded, retention `none` still suppresses the headers, and `compat.supportsResponsesSessionAffinity: false` opts a loopback relay back out.
+
+- Added `ultrafast` as a first-class ServiceTier option, alongside existing tiers (auto, default, flex, scale, priority)
+- Support for OpenAI's ultrafast processing tier on OpenAI chat completions and Codex responses APIs
+- 6x ultrafast multiplier for API token pricing (per OpenAI's official pricing: $60 input, $300 output for gpt-6-astra)
+- Ultrafast service tier now properly resolves and sends to supported models
+
+### Changed
+
+- Use User-Agent-aware Antigravity model-cache validation so discovery catalogs are refreshed for the active client identity.
+
+- `ServiceTier` type now includes "ultrafast" as a valid option
+- `shouldSendServiceTier()` now includes ultrafast in provider send logic for OpenAI
+- OpenAI chat server schema updated to accept "ultrafast" in service_tier field
+- Codex included-usage estimates use the official Fast 2.5x and Ultrafast 8x multipliers
+
+### Fixed
+
+- Kiro streams now surface explicit content-filter refusal messages with category and explanation instead of the generic "no tokens" error when a refusal is detected. Both bearer token (via `messageMetadataEvent`) and API-key (`ksk_`, via `metadataEvent`) paths are supported, with proper provider safety-stop minting. Bearer-token text streams incrementally unless a thinking block precedes it; API-key text remains quarantined until clean EOF. Tool calls are emitted only at stream end (#6150).
+- Detail-free `stopReason: "CONTENT_FILTERED"` (without `stopDetails.refusal` object) is now treated as a refusal and suppresses unconfirmed content.
+- API-key text remains quarantined through `COMPLETED`/`TOOL_USE` metadata and is released only at clean EOF, so a later refusal or read failure cannot leak content across HTTP chunk boundaries.
+- A refusal takes precedence over ordinary errors or successful completion in the same batch or a later read. An active tool may finish its input after `TOOL_USE`, while `COMPLETED` fences tool fragments and later content.
+- Error events omit duplicate partial messages so credential-shaped upstream text cannot bypass gateway redaction or leak through SSE encoders.
+- Parser no longer resyncs into nested objects when an incomplete outer JSON frame is encountered. Incomplete frames are retained as remainder; EOF with incomplete frame throws an error.
+- Errors before clean EOF discard quarantined text and retain only explicitly completed tool calls.
+
+- API-key validation now accepts successful inference responses that contain reasoning output or end at the token limit before producing text, and reports empty or missing choices accurately.
+
+- An image Anthropic rejects with `Could not process image` no longer makes every later request in the session fail. The provider replaces the rejected image with a text placeholder and keeps omitting it on later turns and fallback models. The first repair omits the images of the newest message that has any; if the request still fails, the second omits every image (#6810).
+
+- Anthropic OAuth keeps one stored credential per organization when a single account belongs to several organizations (for example a Team workspace and a personal Max plan). Credentials now record the organization from the token response, their identity key is scoped to it, so logging in to a second organization no longer replaces or disables the first, and usage limits are reported per organization instead of being merged across them. Rows stored before this change keep working and are deduplicated once their next refresh records the organization.
+
+- Broker usage reports are matched to a credential by the identity (account, email, or project) and Anthropic organization they carry, checked against the current broker snapshot. A report without a matching identity is taken only when the provider has a single stored OAuth credential, so a lone report is no longer assigned to every credential of a provider that holds several. A credential stored without an Anthropic organization never takes a report whose organization another stored credential is scoped to, so a legacy row whose own usage fetch fails gets no fresh usage data instead of another row's or another account's limits.
+- An `org:` selector that matches more than one stored credential (organizations sharing a display name) is rejected with the candidate row ids instead of resolving to the first row, and an exact organization-id match is preferred over display-name matches. Pin ambiguity errors now list the candidate row ids.
+
+- Keep cached models from a different User-Agent out of failed-refresh fallbacks, and report the effective User-Agent in discovery diagnostics.
+
+- Replace user and tool-result images with text markers for Bedrock models without image input, including consecutive tool results, while preserving image payloads for image-capable models.
+
+- `--prefer-credential` now selects the designated OAuth account when the provider also stores API-key rows. The preferred row was matched by its index in the full credential list against OAuth-only candidate indices, so a mixed pool could move a different OAuth account to the front.
+
+- OpenAI Responses and Completions streams now use a model's configured idle timeout when no environment or request override is set, so long reasoning gaps on compatible proxies can be tuned per model. Longer request-level idle windows also bound SDK setup before response headers arrive, and SDK timers are kept within the platform-safe range. Kimi Code's Anthropic-compatible route also honors its model timeout, with environment and request overrides retaining precedence.
+
+- Normalize negative and non-finite model catalog prices to zero so bundled usage estimates cannot become negative.
+
+- Switching the model cache to a different database path now fully releases the previous database. A migration query left an unfinalized prepared statement, so closing the old connection left it open in the background; it kept the database locked and, on Windows, blocked deleting its directory.
+
+- Omit MCP tool-result image payloads from Ollama chat requests when the model does not support image input, retaining a text omission marker.
+
+- Closing AuthStorage and the model cache now deterministically finalizes their owned SQLite statements before releasing the database, allowing immediate removal of owned scratch directories on Windows.
+
+- Usage pricing now follows provider-reported effective tiers when available, and gateway responses preserve that tier for downstream clients.
+
+### Notes
+
+- Ultrafast tier is currently available for gpt-6-astra and gpt-6.1-sol. The gpt-5.6-sol model is Fast-only and is not eligible for ultrafast.
+- For unsupported models, ultrafast is omitted and provider-default processing is used; no unsupported tier is sent.
+
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Fixed
+
+- Exclude Claude Code and OAuth beta headers from API-key requests so subscription-provided API credits can be used, while preserving OAuth headers and feature betas.
+
+- Anthropic API-key requests no longer send the Claude Code `X-App: cli` marker, and Anthropic API-key model discovery (`/v1/models`) no longer sends the Claude Code beta list (`claude-code-20250219`, `oauth-2025-04-20`, …). Anthropic classified requests carrying these markers as Claude Code usage, which excluded them from API credit grants such as the Max plan's monthly API credit. OAuth requests are unchanged.
+
+- Finalize all outstanding SQLite auth statements on close, including usage-fetch leases, so Windows releases database file handles immediately.
+
+- Auth broker credential requests do not follow redirects, so a 307 or 308 cannot replay the JSON body to another host.
+
+- Preserve bounded terminal errors when Codex Responses times out mid-tool-call by dropping unvalidated partial arguments, retaining the call identity, and reporting `request_timeout`.
+
+- A project `.env` can no longer add Foundry request headers through `ANTHROPIC_CUSTOM_HEADERS`.
+
+- A project `.env` can no longer choose the Foundry CA or mTLS client certificate, including when the declaration uses `$` or backticks, and later deleting that file or changing directory does not turn the loaded value into an operator setting.
+
+- A tokenless auth gateway rejects data requests whose Host header is not the loopback bind.
+
+- HTTP 400 request dumps redact `x-goog-api-key` and `cf-aig-authorization` before the dump JSON is written, and the dump file is created owner-readable only.
+
+- Finalize cached SQLite statements when closing the shared model cache so Windows releases its database file handle before temporary roots are removed.
+
+## [0.18.8] - 2026-10-08
+
+### Added
+
+- Kiro OAuth now imports social-login profile metadata into requests and model discovery, refreshes imported social tokens through Kiro's auth service, and forwards reasoning effort while separating inline thinking from answer text.
+
+- `AuthStorage.forkConfigOwner()` captures independently scoped configuration keys while retaining shared credential storage, runtime keys, OAuth rotation, and session selectors. Scoped reset and final release do not replace parent or unowned configuration authority.
+
+- Add execution-local custom API callback registries for both `stream` and `streamSimple`. Explicit scopes never fall back to process-wide registrations, and snapshots retain their own callback mappings.
+
+- Added `getStreamIdleTimeoutRemediationMs()`, the `PI_STREAM_IDLE_TIMEOUT_MS` value to suggest after an idle-watchdog abort: always longer than both the active override and the longest built-in provider fallback.
+
+### Changed
+
+- Codex requests now send originator/User-Agent header `codex_cli_rs`, and the OAuth default originator changed from `opencode` to `codex_cli_rs`.
+
+### Fixed
+
+- Kiro streams now surface explicit content-filter refusal messages with category and explanation instead of the generic "no tokens" error when a refusal is detected. Both bearer token (via `messageMetadataEvent`) and API-key (`ksk_`, via `metadataEvent`) paths are supported, with proper provider safety-stop minting. Text is streamed incrementally unless a thinking block precedes it, in which case the entire answer (after thinking) is buffered until the stream end; tool calls are emitted only at stream end (#6150).
+
+- Remove hardcoded 272K context window override from Codex GPT-6 models, allowing them to inherit actual API limits from models.dev (1.05M context window).
+
+- Extend Anthropic's default stream idle window to 10 minutes so long reasoning pauses are less likely to be mistaken for a dead stream; the existing idle-timeout override remains available.
+
+- Fixed Anthropic requests with hidden thinking (`thinking.display: "omitted"`, set by `hideThinkingBlock`) failing with "Anthropic stream stalled while waiting for the next event" whenever the model thought for longer than one idle window. In that mode Anthropic streams nothing but `ping` keepalives until the thinking block ends, and pings did not count as progress. Pings now count as progress while a thinking block of a non-summarized request is open, bounded at three idle windows (30 min at the default) so a proxy that only pings still times out.
+
+- A tokenless auth broker rejects credential requests whose Host header is not the loopback bind.
+
+- Codex error details stored from a failed response no longer keep a reflected bearer token.
+
+- Warn in production when a transient Codex stream-close salvage is refused, including bounded event descriptors for diagnosis.
+
+- Retry Codex Responses streams once when a request timeout leaves only incomplete tool-call output.
+
+- Fix Cursor provider's context occupancy reporting: include cache tokens (cacheRead and cacheWrite) in the totalTokens calculation so context occupancy percentage and estimated costs are reported correctly instead of always showing zero.
+
+- Cursor's bundled models now carry token prices instead of zero rates, allowing usage reports to calculate estimated session costs.
+
+- Preserve exact stored-literal discovery cache provenance across session-local credential selection changes while continuing to invalidate credential availability.
+
+- An OAuth error callback with a different state no longer cancels the in-flight login.
+
+- Keep same-instance OAuth refresh leases held until every concurrent attempt releases them.
+
+- Recover rejected OAuth access tokens before expiry by retrying authentication failures once through the existing refresh lease, adopting peer-rotated broker credentials, and propagating canceled health checks without caching them as credential failures.
+- Fence command-key resolutions to their configuration generation so retired lookups cannot return stale credential values.
+
+- Isolate configuration fallback resolvers and evidence generations by their actual owner, copy resolver authority on configuration forks, and prevent stale disposers from removing replacement resolvers.
+- Keep stored command-key resolution coalesced across sibling configuration changes while shared credential-row replacement invalidates stale resolution and matching. Credentials, runtime selectors, and OAuth registration/dispatch remain shared.
+- Invalidate observed owned absence on a later fallback grant, resolver reinstall, or fallback-only fork release, while preserving the initial unobserved resolver setup and terminal owner-local evidence.
+
+- Replace Atomics.wait() with Bun.sleepSync() and add a 2-second timeout to tool-choice capability cache lock acquisition to prevent indefinite waits during concurrent process contention.
+
+- Preserve a fixed content-filter diagnostic for incomplete responses in the shared OpenAI Responses parser without changing truncation guards or retry/fallback authority.
+
+- Reject disposed or serialized registry capabilities before provider dispatch, and reject custom registrations that collide with built-in API names, including Kiro.
+
+## [0.18.7] - 2026-10-04
+
+### Fixed
+
+- Explicitly emit `strict: false` for non-strict OpenAI Responses and Codex Responses function tools.
+
+- Salvage finalized Codex tool calls when an empty assistant message item opens before a transient stream close, while still failing closed on non-empty text.
+
+- Preserve finalized Codex tool calls when the stream ends without a terminal event, including an empty trailing message; unfinished calls and visible text still fail closed.
+
+- Add Codex request-timeout salvage refusal diagnostics and replay coverage for complete `todo_write` calls.
+
+- Salvage complete Codex function calls when the SSE or WebSocket idle watchdog ends a stalled stream.
+
+- **Kiro OAuth CodeWhisperer wire protocol**: Corrected critical wire protocol issues in the streaming transport:
+  - Fixed typo in request header `amzn-X-amz-target` → `x-amz-target`
+  - Changed streaming service target from `AmazonCodeWhispererService.GenerateAssistantResponse` to `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
+  - Fixed content-type from `application/json` to `application/x-amz-json-1.0`
+  - Moved `profileArn` from header to request body `conversationState`
+  - Flattened `userInputMessageContext.tools` from nested `{tools: [...]}` to direct array
+  - Fixed event payload handling for flat `{content}` structure (not nested `{assistantResponseEvent: {content}}`)
+  - Implemented accumulation of streaming tool input fragments per `toolUseId` until `stop` signal
+  - Cross-verified against kiro-api-key.ts headers implementation
+  - Reported by: nomo via wire protocol validation failures
+
+## [0.18.6] - 2026-10-03
+
+### Added
+
+- `AuthStorage.hasLiteralConfigApiKey(provider, owner?)` reports whether a provider's config override is a literal `apiKey` rather than an `apiKeyEnv` indirection.
+
+- Bundled GPT-6.1 Sol for the Codex provider: `openai-codex/gpt-6.1-sol` (272K context, 128K output, reasoning effort low..max) with $2/$10 per MTok and $0.10 cached-input pricing (#6147).
+
+### Changed
+
+- GLM Coding Plan (`glm-zcode`) GLM-5.3 and GLM-5.3-Flash now expose the `max` thinking level on top of the existing `minimal`–`xhigh` budget ladder. These models ride the Anthropic Messages-compatible endpoint where thinking is a token budget, and the generic anthropic-messages fallback capped non-Anthropic models at `xhigh` (32768 tokens). The endpoint accepts budgets up to 65536 and reasoning volume scales with the budget, so the previous ceiling silently limited the GLM-5.3 generation.
+
+- The `glm-zcode` OAuth login guidance now names the exact `zcode://oauth/callback?code=…&state=…` redirect shape and tells users to copy it from the browser DevTools Network tab, because a custom-protocol redirect never appears in the address bar; the manual-code prompt is now `glm-zcode`-specific instead of the generic authorization-code wording, which previously led users to paste the address-bar URL and stall the login.
+
+### Fixed
+
+- Anthropic-adaptive models with high/xhigh/max reasoning now receive sufficient `max_tokens` to accommodate both thinking output and message completion. Previously, adaptive requests used the default 32,000-token budget, consuming all tokens for thinking and leaving no output. When reasoning is enabled with adaptive thinking, the budget is now raised to `model.maxTokens` to allow room for both thinking and output. Explicit or configured `maxTokens` values remain authoritative and are not overridden. The fix also treats `maxTokens: 0` (documented as unspecified) the same as `undefined`, matching the behavior of `resolveDefaultRequestMaxTokens` (#6156).
+
+- A Kiro CodeWhisperer HTTP 200 response whose body is not an AWS event stream (for example a JSON or HTML error) now reports its status, content type, and the first 1000 characters of the body. Previously the body was parsed as event-stream frames and surfaced only as `eventstream: truncated message at end of stream`. The event-stream media type is matched case-insensitively, and the truncation error now reports how many trailing bytes were left (#6158). The error carries the `provider_protocol_mismatch` code, so session retry and managed fallback surface it instead of replaying the request.
+
+- Kiro (OAuth CodeWhisperer transport) now sets `userInputMessage.origin: AI_EDITOR`. Without it the service ignored `modelId` and answered every request with `auto`, so selecting a specific Kiro model had no effect.
+- Kiro (OAuth CodeWhisperer transport) now sends every trailing result of a parallel tool batch in `currentMessage`. The earlier results were left as a separate history entry, so the turn after two or more parallel tool calls failed with HTTP 400 `TOOL_USE_RESULT_MISMATCH`.
+
+- Salvage Codex function calls when complete JSON arguments arrive but the stream closes before `response.output_item.done`, including empty-object no-argument calls and idle SSE stalls.
+- Fail closed on mismatched argument events, explicit non-transient errors, and unauthoritative whitespace-only deltas; close open reasoning blocks before salvage.
+
+- Codex SSE progress classification reads each event's `delta` once, so the idle-watchdog classifier added in #6226 can no longer observe a different value than the stream handler assembles.
+
+- End a silent Codex WebSocket stream at its idle bound after a completed `todo_write` tool-call start with zero usage.
+- Preserve Codex transport errors and eligible SSE recovery when provisional tool arguments parse to null or another non-record value.
+
+- Recover expired Codex websocket continuation anchors with one anchor-free full-context replay on the same model when fallback is managed, while still honoring disabled provider retries.
+
+- Preserve bounded session retries for content-free Codex `server_is_overloaded` stream errors with generic or absent prose.
+
+- Codex websocket streams with an idle or first-event timeout above `2147483647` ms (about 24.9 days), such as `PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS=99999999999` meant as "effectively never", no longer time out right after the request. `setTimeout` treats longer delays as 1 ms; the wait is now capped at the timer maximum.
+
+- Treat trailing whitespace after complete Codex function-call arguments as idle SSE events without changing WebSocket progress or replay semantics.
+
+- Prevent Cursor inline MCP, todo, and native tool announcements from being replayed locally after a completed or aborted turn. Keep one canonical provider-owned MCP call for its inline execution.
+
+- Release the cross-process OAuth refresh lease when a token refresh fails, and keep credentials active when their OAuth provider has not registered yet.
+
+- Start SQLite auth-storage read-then-write transactions immediately to prevent concurrent OAuth refresh processes from failing with `database is locked`.
+- Advance the OAuth lease clock by time spent waiting for the immediate write reservation so busy-timeout waits do not shorten leases.
+
+- Stream idle and first-event watchdogs with a timeout above `2147483647` ms (about 24.9 days), such as `PI_STREAM_IDLE_TIMEOUT_MS=99999999999` meant as "effectively never", no longer abort the stream right away. `setTimeout` treats longer delays as 1 ms; the watchdog delay is now capped at the timer maximum. `0` still disables the watchdog.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+### Added
+
+- Bundled Claude Sonnet 5.5: `anthropic/claude-sonnet-5-5` and Amazon Bedrock `anthropic.claude-sonnet-5-5` (plus `au.`/`eu.`/`global.`/`jp.`/`us.` inference profiles), with 1M context, 128K output, and $2/$10 per MTok pricing (#6111).
+
+- Bundled GPT-6.1 Sol for the Codex provider: `openai-codex/gpt-6.1-sol` (272K context, 128K output, reasoning effort low..max) with $2/$10 per MTok and $0.10 cached-input pricing (#6147). Presets and model-profile defaults are unchanged.
+
+### Removed
+
+- Removed `installH2Fetch`. Bun's HTTP/2 client can wedge a pooled connection while uploading a large request body (~300 KB, a typical long agent context): every later request on that connection waits indefinitely for response headers. All `fetch()` traffic now uses HTTP/1.1.
+
+### Fixed
+
+- A large (≥1 MB) request to a custom Anthropic-compatible endpoint is now retried when its connection drops before any response (ECONNRESET, socket closed, `Connection error`). Previously the one-upload ceiling meant for first-event stalls also covered these failures, so a single network blip ended the turn. Server responses (e.g. 529) and first-event timeouts still respect the ceiling (#6072).
+
+- Kiro (OAuth CodeWhisperer transport) now replays earlier tool calls as structured `toolUses` and sends each tool result as `{ toolUseId, status, content: [{ text }] }`, linked to the call it answers, instead of serializing calls into assistant text and nesting results. Parallel tool results share one history entry, and image results are marked `[image omitted]` rather than sent empty (#6079).
+
+- OpenAI-compatible completions requests now log OpenAI SDK connection timeouts and retries to the gjc log. Previously a request stalled before response headers retried silently for up to several minutes.
+
+## [0.18.1] - 2026-09-29
+
+### Changed
+
+- Bump the bundled Claude Code fingerprint floor from 2.1.281 to 2.1.284.
+- Anthropic OAuth requests now sign `claude-cli/<version>` and the billing `cc_version` with the latest published Claude Code release instead of a build-time constant. The version is resolved in the background from Anthropic's `latest` release channel and the npm dist-tag (higher wins), refreshed at most every 6 hours, cached in `~/.gjc/cache/claude-code-version.json`, and never blocks a request or drops below the bundled floor. Set `GJC_CLAUDE_CODE_VERSION=X.Y.Z` to pin it. A stale fingerprint is answered with HTTP 400 `claude_code_version_too_old` on newer models, so this no longer waits for a gjc release to recover.
+
+### Fixed
+
+- OpenGateway models discovered from `/v1/models` now take their capabilities from the bundled catalog entry for the same upstream model, and `-ultrafast` deployments resolve to their upstream model, so `opengateway/deepseek/deepseek-v4.1-flash-ultrafast` and the GLM/Kimi ultrafast models are registered with reasoning support and accept thinking levels (#6070).
+
+- Bound Codex turns that stall after an empty reasoning item and streamed tool-call start to the shared stream idle timeout.
+
+- Apply the shared stream idle timeout to Codex WebSocket responses when no WebSocket-specific timeout is configured, so a stalled preferred transport surfaces an error within the expected idle window.
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- `AuthStorage.setUsageProbeMode("cache-only")` limits credential ranking and quota checks to usage reports already cached in the shared store, so callers that never display usage can select credentials without calling provider usage endpoints.
+
+- `AssistantMessage.promptPrefix` (`PromptPrefixTelemetry`) carries the prompt-prefix fingerprint of the request that produced the message, so prompt-cache misses can be attributed to client prefix mutation or provider eviction (#5946).
+
+- Added bundled GPT-6 Sol and GPT-6 Luna model metadata and pricing for the OpenAI Codex transport.
+
+- Anthropic failures now carry an optional bounded `providerDiagnostic` (`category`, `httpStatus`, `code`, `evidence`) on the terminal assistant message, minted only from structured SDK error metadata or an explicit SSE `event: error` envelope. It distinguishes auth rejections, rate limits and upstream outages without exposing provider text, and contradictory or unreadable metadata produces no diagnostic; unsupported codes are discarded, while an independently valid status may still classify. The legacy `errorStatus`, error messages, retry admission and fallback behaviour are unchanged.
+
+### Changed
+
+- `AuthStorage.markUsageLimitReached` now reports the marked row identity and remaining unblocked same-kind credential IDs, distinguishing a vanished row from an exhausted pool.
+
+### Fixed
+
+- Share per-credential provider usage probes across processes through `agent.db`: a cross-process lease single-flights each credential's `/usage` request, a failed probe with no last-good report is now cooled down for about a minute instead of being retried on every credential selection, and loading credentials into a new process no longer purges the reports its peers already cached. Concurrent and back-to-back `gjc` processes no longer each hit the provider's usage endpoint and trip its 429 rate limit ([#5939](https://github.com/Yeachan-Heo/gajae-code/issues/5939)).
+
+- Kiro CodeWhisperer OAuth endpoint now correctly resolves to `codewhisperer.${region}.amazonaws.com` instead of the non-existent `amazoncodewhispererstreamingservice.${region}.amazonaws.com`. OAuth bearer token authentication requests targeting `AmazonCodeWhispererService.GenerateAssistantResponse` now route to a resolvable endpoint that matches the working endpoint used by API-key authentication. (#6002)
+
+- Direct `xai/grok-4.7` now advertises `reasoning_effort=xhigh`. xAI documents `xhigh` for grok-4.6 and later, but the thinking policy treated only grok-4.6 as xhigh-capable and clamped grok-4.7 to high, so the model picker could not select it.
+
+## [0.17.7] - 2026-09-25
+
+### Changed
+
+- Bump the spoofed Claude Code version from 2.1.280 to 2.1.281 and Gemini CLI version from 0.60.0 to 0.61.0. Anthropic gates newer models behind a minimum client version, so a stale `claude-cli` fingerprint can return HTTP 400 for an otherwise reachable model; the Gemini CLI fingerprint drifts the same way.
+
+### Fixed
+
+- Anthropic-compatible endpoints that leave `compat.supportsLongCacheRetention` unset no longer downgrade the default `long` prompt-cache retention to the ~5m TTL silently: GJC now logs one warning per provider session naming the provider and model and pointing at the flag. Set it to `true` for gateways that forward `ttl: "1h"`, or to `false` to accept the ~5m lifetime and silence the warning. (#5944)
+
+- Vertex AI Application Default Credentials now accept `type: "external_account"` (Workload Identity Federation): the subject token is read from `credential_source` (file, url, or opt-in executable), exchanged at STS, and optionally impersonated via `service_account_impersonation_url`, so gjc authenticates from GitHub Actions / GitLab CI without a long-lived service-account key. Unrecognised credential types now fail with a clear "Unsupported Google credential type" error instead of a misleading OAuth client error. (#5929)
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Added
+
+- `packages/ai/src/models.json` was regenerated against models.dev, bundling Claude Opus 5.5 across Anthropic (`claude-opus-5-5`), Bedrock (`anthropic.claude-opus-5-5` plus the `us.`/`eu.`/`au.`/`jp.`/`global.` inference profiles), OpenRouter, Vercel AI Gateway, Kilo, and Venice, alongside the rest of the upstream catalog drift (Grok 4.7, GLM 5.3 variants, Xiaomi MiMo V2.6 Flash/Pro/Pro-Ultraspeed, DeepSeek/Qwen token-plan rows). `VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS` declares generation 5.5 so the new rows pass the Opus vision tripwire instead of silently bypassing the generator correction.
+- Kiro bundles `claude-opus-5.5` (1M input / 128K output, text input only). Kiro's API-key request serializer drops images, so this model does not advertise image support until that transport can serialize them. Kiro's Anthropic model list is hand-maintained in `kiro-api-key.ts` rather than sourced from models.dev, so a regeneration alone left Kiro stranded on Opus 5 while every models.dev-backed provider advanced; the entry follows the existing dual dotted/dashed id convention already used for `claude-opus-4.5` through `4.8`.
+
+### Fixed
+
+- openai-completions treats a `compat.extraBody` `tool_choice` as an endpoint default instead of an override: it fills the gap only on ordinary turns that offer tools and resolved no directive of their own, leaving forced-tool directives and deliberate no-tools turns untouched (strict backends reject `tool_choice` with an empty `tools` list). The default also passes through the provider's existing tool-choice reasoning suppression so endpoint defaults do not bypass compatibility flags.
+
+- Cross-model assistant-history replay now collapses pathological runs of exact consecutive thinking paragraphs into one copy with the exact repeat count, preventing repeated reasoning from inflating custom OpenAI-compatible prompts while preserving stored history, final answers, tool content, and native same-model reasoning (#5805).
+
+- Keep provider evidence stable when the same runtime, configured, or environment API key is resolved.
+
+## [0.17.4] - 2026-09-23
+
+### Added
+
+- The Codex catalog now bundles `gpt-6-sol` and `gpt-6-luna` alongside `gpt-6-astra`, so both models are selectable the day they ship instead of waiting for an upstream `models.dev` refresh. Tiered pricing is declared from the published rates — Sol `$2`/`$10` per 1M (cached input `$0.20`, cached output `$2.50`) and Luna `$0.10`/`$0.50` (cached `$0.01`/`$0.125`) — including the above-272K multipliers (input 2x, output 1.5x).
+
+### Changed
+
+- Updated the Claude Code-compatible `claude-cli` header version to `2.1.280`, matching the published Claude Code npm release so Anthropic does not reject requests carrying a stale client version.
+
+## [0.17.3] - 2026-09-22
+
+### Added
+
+- Alibaba Token Plan now bundles `deepseek-v4.1-flash`, `deepseek-v4-pro-0813`, and `glm-5.3` with the reviewed sibling envelopes (DeepSeek V4 1M/384K, GLM 1M/128K) and low/high/max reasoning efforts, so Token Plan subscribers can select the current Model Studio IDs without waiting for authenticated catalog discovery.
+
+### Fixed
+
+- Stop a runaway reasoning stream instead of rendering every repeat. When an
+  openai-compatible model falls into a decode loop and emits the same line — or
+  the same short token run — 12 times in a row on the reasoning channel, the turn
+  is now cut short with `stopReason: "error"` and
+  `errorCode: "repetition_guard_tripped"` rather than dumping dozens of identical
+  lines into the terminal. Tool calls in the same message still stream and
+  execute normally, including ones the model emits *after* the repeats.
+
+  The stop is classified as a provider error rather than `aborted`, so the auth
+  gateway renders it as HTTP 502 `upstream_error` and telemetry no longer counts
+  it as a user cancellation. A genuine caller abort still wins and still reports
+  `aborted`. The trip is terminal and is not auto-retried: a decode loop is
+  deterministic for the submitted context, so replaying it would re-trip the
+  guard and re-bill the full context on every attempt.
+
+  The guard applies to the reasoning channel only. Visible text is opt-in via the
+  new `repetitionGuard` option (`{ thinking?: number | false; text?: number |
+  false }`), because visible output is a deliverable and intentional repetition
+  there — log dumps, fixtures, tables, generated code — must survive byte for
+  byte.
+- Keep a provider stall or transport error that lands *after* a repetition trip
+  classified as what it actually is. The guard drains the stream briefly after
+  tripping, and a fault arriving inside that window was being reported as a
+  decode loop — discarding the real error message, `errorStatus` and
+  `transportFailure`, and marking a retryable provider fault as terminal. The
+  guard's own abort is now tracked explicitly, so only it claims the trip.
+- Keep the repeated sample out of error payloads. The guard's `errorMessage`
+  interpolated the repeated unit, the channel and the repeat count, and the auth
+  gateway forwards `errorMessage` to API clients on the streaming path — so raw
+  model output was published verbatim, and a repeated `quota` or `forbidden` in
+  the sample could steer the HTTP status the gateway picked. The message is now
+  a fixed literal at the provider, the gateway substitutes the same bounded
+  envelope its non-streaming path already used, and the sample survives only in
+  local `logger.debug` diagnostics.
+- Classify a runaway turn whose final repeat arrives without a trailing newline.
+  The guard closed a line only on `\n` and a token only on whitespace, so a
+  stream that ended mid-unit left the last copy uncounted and the turn reported a
+  healthy completion. The guard is now finalized at end of stream — on the
+  normal-completion path only, so a stream that threw mid-repeat still keeps its
+  own transport facts.
+- Bound the post-trip drain on *every* consumed chunk. The drain budget was only
+  spent by chunks that carried a usable `choices[0]`; usage-only, keepalive-shaped,
+  `choices`-less and malformed frames skipped the check entirely, so a provider
+  answering a tripped stream with those frames held the request open with no
+  bound at all. The check now runs exactly once per consumed chunk, still after
+  that chunk is fully processed so late tool-call frames are never cut mid-flight.
+- Make `repetitionGuard` reachable from the public API. The option existed only
+  on the openai-completions provider type and was dropped by the
+  `streamSimple`/`completeSimple` options mapping, so callers on the normal path
+  could neither disable a channel nor change its threshold. It is now part of
+  `SimpleStreamOptions` (as the shared `RepetitionGuardOptions` type) and is
+  forwarded to the transport; defaults and semantics are unchanged.
+- Validate the repetition threshold before it sizes the guard's state. Now that
+  `repetitionGuard` is public, a caller could pass `NaN` — which made every
+  comparison false and silently disabled detection with no error — or `Infinity`
+  or a huge value, which left detection permanently off *and* made the guard's
+  token retention unbounded on a long stream. A fractional threshold was also
+  never reached exactly by an integer repeat counter. The threshold is now
+  normalized at the constructor: non-finite values fall back to the default,
+  fractions are floored, and the result is clamped into `[2,
+  MAX_REPETITION_THRESHOLD]`, so tracking capacity is finite by construction.
+  Bad input normalizes rather than throwing — a failed request would be worse
+  than the guard running at its default.
+- Stop persisting raw repeated model output in the default logs. The trip
+  diagnostic logged the repeated sample, and the default log transport is a
+  rotating file that JSON-stringifies metadata verbatim with no redaction, so a
+  model that looped on a secret or a private fragment of the prompt wrote it to
+  disk and into log rotation, support bundles and backups. The diagnostic now
+  carries bounded, derived metadata only (`sampleLength`, a number). The sample
+  remains on the in-memory trip object for callers.
+- Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
+  rendered thinking, including fences split across streaming chunk boundaries.
+  The visible text channel is deliberately untouched, so a fence token the
+  assistant mentions in prose still survives as text.
+
+- Serialize BigInt values safely at every Cursor payload and conversation-identity boundary without dropping generic tool-schema fields or truncating large schemas and contexts.
+
+- Track the current Claude Code release in the spoofed version constant (`2.1.273` → `2.1.278`). A stale `claude-cli/<version>` is rejected by the model with an HTTP 400, so the constant is not cosmetic. The daily spoofed-version drift guard had been red since 2026-09-16.
+
+- Preserve observed HTTP/2 reset and native error codes on Cursor failures without mutating native errors or replacing the first terminal diagnostic.
+
+### Performance
+
+- Drain completion-only stream events instead of retaining them, close idle-iterator sources once on early exit, and avoid repeated suffix scans in escape-dense JSON.
+
 ## [0.17.2] - 2026-09-18
 
 ### Added

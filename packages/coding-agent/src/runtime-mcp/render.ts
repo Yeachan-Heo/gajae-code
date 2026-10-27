@@ -22,6 +22,21 @@ import { formatExpandHint, truncateToWidth } from "../tools/render-utils";
 import { renderStatusLine } from "../tui";
 import type { MCPToolDetails } from "./tool-bridge";
 
+const UNTRUSTED_CONTENT_OPEN_LINE = "<untrusted-content>\n";
+const UNTRUSTED_CONTENT_CLOSE_LINE = "\n</untrusted-content>";
+
+/** Drop only the outer marker added for the model. The body stays escaped. */
+function unwrapMarkedToolText(text: string): string {
+	if (
+		text.startsWith(UNTRUSTED_CONTENT_OPEN_LINE) &&
+		text.endsWith(UNTRUSTED_CONTENT_CLOSE_LINE) &&
+		text.length >= UNTRUSTED_CONTENT_OPEN_LINE.length + UNTRUSTED_CONTENT_CLOSE_LINE.length
+	) {
+		return text.slice(UNTRUSTED_CONTENT_OPEN_LINE.length, text.length - UNTRUSTED_CONTENT_CLOSE_LINE.length);
+	}
+	return text;
+}
+
 /**
  * Render MCP tool call.
  */
@@ -68,7 +83,7 @@ export function renderMCPResult(
 	}
 
 	// Output section
-	const textContent = result.content?.find(c => c.type === "text")?.text ?? "";
+	const textContent = unwrapMarkedToolText(result.content?.find(c => c.type === "text")?.text ?? "");
 	const trimmedOutput = textContent.trimEnd();
 
 	if (!trimmedOutput) {

@@ -14,7 +14,6 @@ import {
 	type GjcModelAssignmentTargetId,
 	requiresExplicitThinkingChoice,
 } from "../config/model-registry";
-
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -22,6 +21,7 @@ import {
 	parseModelString,
 	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
+import type { ModelSelectorValue } from "../config/model-selector-value";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getAvailableThemes, getDetectedThemeSettingsPath, setTheme, theme } from "../modes/theme/theme";
@@ -31,18 +31,24 @@ import {
 	type InteractiveModeContext,
 } from "../modes/types";
 import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, uiString } from "../modes/ui-language";
+import { buildSessionProjectProgress } from "../progress/collect-project-progress";
+import { PROGRESS_COMMAND_ACP_DESCRIPTION } from "../progress/render-progress";
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
 import type { AgentSession, ExactMcpStatusSnapshot } from "../session/agent-session";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
-import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
+import {
+	formatModelOnboardingGuidance,
+	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
+} from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
+	reloadAndRefreshDiscoveryCatalog,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
@@ -51,7 +57,7 @@ import {
 	invalidateSessionTitleGeneration,
 	isSessionTitleGenerationCurrent,
 } from "../utils/session-title-generation";
-import { buildConversationTitleInput, generateSessionTitle } from "../utils/title-generator";
+import { buildConversationTitleInput, generateSessionTitle, titleInputObfuscator } from "../utils/title-generator";
 import { handleAsideAcp } from "./helpers/aside";
 import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
 import { buildContextReportText } from "./helpers/context-report";
@@ -59,6 +65,8 @@ import { switchSessionCredentialCommand } from "./helpers/credential-switch";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
+import { renderProgressReportLines, renderProgressReportText } from "./helpers/progress-report";
+import { buildProviderAuthStatusText } from "./helpers/provider-auth-status";
 import { handleSshAcp } from "./helpers/ssh";
 import { buildUsageReportText, collectCachedUsageReports } from "./helpers/usage-report";
 import type {
@@ -150,7 +158,9 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	try {
 		const generation = beginSessionTitleGeneration(runtime.sessionManager);
-		const input = buildConversationTitleInput(runtime.session.messages);
+		const activeCwd = runtime.sessionManager.getCwd();
+		const obfuscateText = await titleInputObfuscator(runtime.settings, activeCwd);
+		const input = buildConversationTitleInput(runtime.session.messages, obfuscateText);
 		if (!input) {
 			return usage("Nothing to summarize yet — pass a title: /rename <title>", runtime);
 		}
@@ -162,10 +172,11 @@ async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<Sla
 			runtime.session.credentialSessionId,
 			runtime.session.model,
 			provider => runtime.session.agent.metadataForProvider(provider),
+			activeCwd,
 		);
 		if (
 			!isSessionTitleGenerationCurrent(runtime.sessionManager, generation) ||
-			buildConversationTitleInput(runtime.session.messages) !== input
+			buildConversationTitleInput(runtime.session.messages, obfuscateText) !== input
 		)
 			return commandConsumed();
 		if (!generated) {
@@ -216,6 +227,7 @@ function parseProviderSetupSlashArgs(args: string): {
 	apiKeyEnv?: string;
 	rejectedRawApiKey: boolean;
 	force: boolean;
+	discover: boolean;
 	models: string[];
 } {
 	const tokens = args.split(/\s+/).filter(Boolean);
@@ -227,9 +239,11 @@ function parseProviderSetupSlashArgs(args: string): {
 		apiKeyEnv?: string;
 		rejectedRawApiKey: boolean;
 		force: boolean;
+		discover: boolean;
 		models: string[];
 	} = {
 		force: false,
+		discover: false,
 		models: [],
 		rejectedRawApiKey: false,
 	};
@@ -237,6 +251,10 @@ function parseProviderSetupSlashArgs(args: string): {
 		const token = tokens[i];
 		if (token === "--force" || token === "-f") {
 			result.force = true;
+			continue;
+		}
+		if (token === "--discover") {
+			result.discover = true;
 			continue;
 		}
 		if (!token.startsWith("-") && !result.preset) {
@@ -275,9 +293,10 @@ function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
-		"Aliases include minimax, zai, alibaba, cline, command-code, and goat.",
-		"API providers: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model> [--force]",
+		"Aliases include minimax, zai, alibaba, cline, command-code, goat, and ionet.",
+		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
+		"Credential status: /provider status",
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
 	].join("\n");
@@ -313,6 +332,13 @@ function renderExactMcpStatus(snapshot: ExactMcpStatusSnapshot): string {
 	return lines.join("\n");
 }
 
+/** One status row. Arrays keep the historical comma join; controls never reach the terminal. */
+function formatModelSelectorForStatus(value: ModelSelectorValue | undefined): string {
+	if (value == null) return "(unset)";
+	const raw = typeof value === "string" ? value : value.join(",");
+	return sanitizeDisplayLine(raw);
+}
+
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 	const agentModelOverrides = runtime.settings.get("task.agentModelOverrides");
 	const lines = ["Model assignments:"];
@@ -320,7 +346,9 @@ function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 		const modelSelector =
 			target.settingsPath === "modelRoles" ? runtime.settings.getModelRole(targetId) : agentModelOverrides[targetId];
-		lines.push(`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${modelSelector ?? "(unset)"}`);
+		lines.push(
+			`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${formatModelSelectorForStatus(modelSelector)}`,
+		);
 	}
 	return lines.join("\n");
 }
@@ -1048,14 +1076,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							const profileLabel = formatModelProfileDisplayLabel(
 								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
 							);
-							await activateModelProfile(
-								{
-									session: runtime.session,
-									modelRegistry: runtime.session.modelRegistry,
-									settings: runtime.settings,
-									profileName: presetName,
-								},
-								{ persistDefault: false },
+							runtime.session.markUserModelSelection();
+							await runtime.session.withSdkControlMutation(() =>
+								activateModelProfile(
+									{
+										session: runtime.session,
+										modelRegistry: runtime.session.modelRegistry,
+										settings: runtime.settings,
+										profileName: presetName,
+									},
+									{ persistDefault: false },
+								),
 							);
 							await runtime.output(`Model profile: ${profileLabel}`);
 							await runtime.notifyTitleChanged?.();
@@ -1095,6 +1126,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
 						}
 					}
+					if (includesRoleAgent && !includesDefault) runtime.session.markUserModelSelection();
 
 					const overrides = runtime.settings.get("task.agentModelOverrides");
 					const assignments = new Map<GjcModelAssignmentTargetId, string>();
@@ -1125,7 +1157,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
 						}
 					}
-
 					const materializedProfile = materializeActiveModelProfileAssignments({
 						session: runtime.session,
 						settings: runtime.settings,
@@ -1134,6 +1165,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					if (!materializedProfile) {
 						for (const [targetId, selector] of assignments) {
 							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
+							runtime.session.markProfileRoleOverrideManual?.(target.settingsPath, targetId);
 							if (target.settingsPath === "modelRoles") {
 								runtime.settings.setModelRole(targetId, selector);
 							} else {
@@ -1574,6 +1606,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "progress",
+		description:
+			"Show a read-only project progress overview from durable goal, todo, workflow, agent, and verification state",
+		// Production ACP advertises and dispatches `/progress` itself over the
+		// `session.progress` SDK query (modes/acp/acp-agent.ts) with the same copy.
+		acpDescription: PROGRESS_COMMAND_ACP_DESCRIPTION,
+		allowArgs: false,
+		handle: async (_command, runtime) => {
+			const report = await buildSessionProjectProgress(runtime.session, runtime.sessionManager);
+			await runtime.output(renderProgressReportText(report));
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			const ctx = runtime.ctx;
+			const report = await buildSessionProjectProgress(ctx.session, ctx.sessionManager);
+			ctx.chatContainer.addChild(new Spacer(1));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.chatContainer.addChild(new Text(renderProgressReportLines(report, theme).join("\n"), 1, 0));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.ui.requestRender();
+			ctx.editor.setText("");
+		},
+	},
+	{
 		name: "usage",
 		description: "Show provider usage and limits",
 		acpDescription: "Show token usage",
@@ -1612,7 +1668,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		aliases: ["account"],
 		description: "Switch this session's active stored account, or list accounts",
 		acpDescription: "Switch or list stored credentials for this session",
-		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|provider/<selector>]",
+		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|org:<id|name>|provider/<selector>]",
 		acpInputHint: "[selector]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -1858,13 +1914,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 
 	{
 		name: "provider",
-		description: "Set up API-compatible providers or login providers",
-		inlineHint: "add|login",
+		description: "Show provider credential status or set up providers",
+		inlineHint: "status|add|login",
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const args = command.args.trim();
 			if (!args || args === "help") {
 				await runtime.output(providerSetupUsage());
+				return commandConsumed();
+			}
+			if (args === "status") {
+				await runtime.output(await buildProviderAuthStatusText(runtime.session));
 				return commandConsumed();
 			}
 			if (args === "login" || args.startsWith("login ")) {
@@ -1888,7 +1948,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			if (!parsed.preset) {
 				if (!parsed.apiKeyEnv) missing.push("--api-key-env");
-				if (parsed.models.length === 0) missing.push("--model");
+				if (parsed.models.length === 0 && !parsed.discover) missing.push("--model or --discover");
 			}
 			if (missing.length > 0) {
 				return usage(
@@ -1904,10 +1964,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					baseUrl: parsed.baseUrl,
 					apiKeyEnv: parsed.apiKeyEnv,
 					models: parsed.models,
+					discover: parsed.discover,
 					force: parsed.force,
 				});
-				await runtime.session.modelRegistry.refresh("offline", runtime.session.credentialSessionId);
-				await runtime.output(formatProviderSetupResult(result));
+				let recoveryHint: string | null = null;
+				if (result.discoveryEnabled && !result.preset) {
+					recoveryHint = await reloadAndRefreshDiscoveryCatalog(
+						runtime.session.modelRegistry,
+						result.providerId,
+						runtime.session.credentialSessionId,
+					);
+				} else {
+					await runtime.session.modelRegistry.refresh("offline", runtime.session.credentialSessionId);
+				}
+				await runtime.output(
+					recoveryHint
+						? `${formatProviderSetupResult(result)}\n${recoveryHint}`
+						: formatProviderSetupResult(result),
+				);
 				await runtime.notifyConfigChanged?.();
 				return commandConsumed();
 			} catch (err) {
@@ -1918,6 +1992,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const args = command.args.trim();
 			if (!args) {
 				runtime.ctx.showProviderOnboarding();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (args === "status") {
+				runtime.ctx.showStatus(await buildProviderAuthStatusText(runtime.ctx.session));
 				runtime.ctx.editor.setText("");
 				return;
 			}
@@ -1945,10 +2024,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						baseUrl: parsed.baseUrl,
 						apiKeyEnv: parsed.apiKeyEnv,
 						models: parsed.models,
+						discover: parsed.discover,
 						force: parsed.force,
+						authStorage: runtime.ctx.session.modelRegistry.authStorage,
 					});
-					await runtime.ctx.session.modelRegistry.refresh("offline", runtime.ctx.session.credentialSessionId);
-					runtime.ctx.showStatus(formatProviderSetupResult(result));
+					let recoveryHint: string | null = null;
+					if (result.discoveryEnabled && !result.preset) {
+						recoveryHint = await reloadAndRefreshDiscoveryCatalog(
+							runtime.ctx.session.modelRegistry,
+							result.providerId,
+							runtime.ctx.session.credentialSessionId,
+						);
+					} else {
+						await runtime.ctx.session.modelRegistry.refresh("offline", runtime.ctx.session.credentialSessionId);
+					}
+					runtime.ctx.showStatus(
+						recoveryHint
+							? `${formatProviderSetupResult(result)}\n${recoveryHint}`
+							: formatProviderSetupResult(result),
+					);
 				} catch (err) {
 					runtime.ctx.showError(`Provider setup failed: ${errorMessage(err)}`);
 				}
@@ -2171,19 +2265,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "contribute-pr",
 		aliases: ["contribution-prep"],
-		description: "Dump redacted session context and spawn a fresh contribute-pr worker",
+		description: "Dump redacted session context and write a worker prompt for a separate terminal",
 		inlineHint: "[focus instructions]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			const result = await runtime.session.prepareContributionPrep({
+			const prepared = await runtime.session.prepareContributionPrep({
 				customInstructions: command.args || undefined,
-				spawnWorker: true,
+				// The interactive session owns the terminal; don't detach a second GJC
+				// process that can later be adopted by zsh when this session exits.
+				spawnWorker: false,
 			});
 			await runtime.output(
 				[
 					"Contribution prep artifacts written.",
-					`Manifest: ${result.manifestPath}`,
-					`Worker prompt: ${result.workerPromptPath}`,
+					`Manifest: ${prepared.manifestPath}`,
+					`Worker prompt: ${prepared.workerPromptPath}`,
+					"Run the worker prompt from a separate terminal when ready.",
 				].join("\n"),
 			);
 			return commandConsumed();
@@ -2434,7 +2531,7 @@ export function formatUnknownBuiltinSlashCommandDiagnostic(commandName: string):
 	return [
 		"Unknown slash command: /provicer.",
 		"Did you mean /provider?",
-		"Run: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model>",
+		`Run: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND}`,
 	].join("\n");
 }
 

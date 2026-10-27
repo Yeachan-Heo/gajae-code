@@ -281,6 +281,9 @@ export async function renderStickyViewportShowcase(
 				});
 			}
 		}
+		// Production startup paints the initial transcript before any rebuild; rebuilds before
+		// that first paint are no-ops (#6026).
+		mode.renderInitialMessages();
 		mode.rebuildChatFromMessages("replace-identity");
 		mode.settings.set("irc.enabled", true);
 		mode.settings.set("irc.sidebar.enabled", true);

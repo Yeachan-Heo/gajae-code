@@ -2,8 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { kProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
+import { TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/host/host";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -98,6 +100,7 @@ async function setup(
 	const sid = `order-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
+		getActivePromptHandle: () => undefined,
 		sessionManager: {
 			getSessionId: () => sid,
 			getSessionName: () => "Ordering Test",
@@ -1243,6 +1246,317 @@ test("lean bounds autonomous settlement composition to the receipt and latest ma
 		expect(turnStreams()[0]!.text).toContain("Completion receipt.");
 		expect(turnStreams()[0]!.text).toContain("Material update two.");
 		expect(turnStreams()[0]!.text).not.toContain("Material update one.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+/**
+ * Drives one real-shaped agent-loop turn: assistant text plus tool calls is
+ * followed by the tool results the loop emits as `message_end` before the next
+ * turn starts; a turn without tool calls settles.
+ */
+async function toolLoopTurn(
+	handlers: Map<string, Handler>,
+	ctx: unknown,
+	turnIndex: number,
+	text: string,
+	options: { toolCall?: string; steering?: string } = {},
+): Promise<void> {
+	await handlers.get("turn_start")!({ type: "turn_start", turnIndex }, ctx);
+	if (options.steering)
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: { role: "custom", customType: "async-result", attribution: "agent", content: options.steering },
+			},
+			ctx,
+		);
+	const content: Array<Record<string, unknown>> = [{ type: "text", text }];
+	if (options.toolCall)
+		content.push({ type: "toolCall", id: options.toolCall, name: "bash", arguments: { command: "true" } });
+	const message = { role: "assistant", content, stopReason: options.toolCall ? "toolUse" : "stop" };
+	await handlers.get("message_end")!({ type: "message_end", message }, ctx);
+	if (options.toolCall) {
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "bash", toolCallId: options.toolCall, args: {} },
+			ctx,
+		);
+		await handlers.get("tool_execution_end")!(
+			{
+				type: "tool_execution_end",
+				toolName: "bash",
+				toolCallId: options.toolCall,
+				result: { content: [] },
+				isError: false,
+			},
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: options.toolCall,
+					toolName: "bash",
+					content: [{ type: "text", text: "ok" }],
+				},
+			},
+			ctx,
+		);
+	}
+	await handlers.get("turn_end")!({ type: "turn_end", turnIndex, message }, ctx);
+}
+
+test("lean keeps the final answer when a same-run autonomous follow-up settles after it", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: all five steps are done and verified.";
+		const followUp = "Both background reviews were already handled above.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Work through the instruction file." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Now the code under fix.", { toolCall: "call-0" });
+		await toolLoopTurn(handlers, ctx, 1, "Checking the build output.", { toolCall: "call-1" });
+		await toolLoopTurn(handlers, ctx, 2, "Applying the edit.", { toolCall: "call-2" });
+		await toolLoopTurn(handlers, ctx, 3, finalAnswer);
+		// A queued background result continues the same busy run after the final answer.
+		await toolLoopTurn(handlers, ctx, 4, followUp, { steering: "2 background jobs have completed." });
+		await sleep(150);
+		expect(turnStreams().length).toBe(0);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text.indexOf(finalAnswer)).toBeLessThan(text.indexOf(followUp));
+		expect(text).not.toContain("Now the code under fix.");
+		expect(text).not.toContain("Applying the edit.");
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
+		await sleep(150);
+		expect(turnStreams().length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean keeps a provider-resolved final answer when a same-run async result follows it", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the provider ran the checks and they pass.";
+		const followUp = "The background job finished as well.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Run the checks." } },
+			ctx,
+		);
+		// Devin ACP reports tools its own agent ran as display-only blocks on a
+		// completed turn; the agent loop never dispatches them, so the turn settles.
+		const message = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: finalAnswer },
+				{
+					type: "toolCall",
+					id: "devin-0",
+					name: "bash",
+					arguments: { command: "bun test" },
+					[kProviderResolvedToolCall]: true,
+				},
+			],
+			stopReason: "stop",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message }, ctx);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 0, message }, ctx);
+		await toolLoopTurn(handlers, ctx, 1, followUp, { steering: "1 background job has completed." });
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text.indexOf(finalAnswer)).toBeLessThan(text.indexOf(followUp));
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean does not anchor tool-loop narration when autonomous input steers a run mid-flight", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the migration is complete.";
+		const followUp = "That review result was already applied.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Run the migration." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Reading the schema first.", { toolCall: "call-0" });
+		// A peer message steers into the running loop; the tool work continues.
+		await toolLoopTurn(handlers, ctx, 1, "Noted the peer message; continuing.", {
+			toolCall: "call-1",
+			steering: "peer message",
+		});
+		await toolLoopTurn(handlers, ctx, 2, "Running the migration.", { toolCall: "call-2" });
+		await toolLoopTurn(handlers, ctx, 3, finalAnswer);
+		await toolLoopTurn(handlers, ctx, 4, followUp, { steering: "review complete" });
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text).not.toContain("Reading the schema first.");
+		expect(text).not.toContain("Running the migration.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a tool-using user request keeps its final answer through a later autonomous ask lead-in", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the requested change is merged.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Merge the change." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Rebasing first.", { toolCall: "call-0" });
+		await toolLoopTurn(handlers, ctx, 1, finalAnswer);
+
+		// A queued background result continues the run and asks a follow-up question.
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: { role: "custom", customType: "async-result", attribution: "agent", content: "job done" },
+			},
+			ctx,
+		);
+		const leadIn = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Choose a follow-up action." },
+				{ type: "toolCall", id: "ask-2", name: "ask", arguments: {} },
+			],
+			stopReason: "toolUse",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message: leadIn }, ctx);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-2", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "autonomous ask lead-in");
+		await handlers.get("tool_execution_end")!(
+			{ type: "tool_execution_end", toolName: "ask", toolCallId: "ask-2", result: { content: [] }, isError: false },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "ask-2",
+					toolName: "ask",
+					content: [{ type: "text", text: "A" }],
+				},
+			},
+			ctx,
+		);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 2, message: leadIn }, ctx);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 2, 3000, "retained final answer after ask");
+		expect(turnStreams()[1]!.text).toContain(finalAnswer);
+		expect(turnStreams()[1]!.text).not.toContain("Rebasing first.");
+		expect(finalAnswerOf(turnStreams()[1]!)).toBe(true);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean does not re-emit tool-loop narration after an ask lead-in in the same run", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Pick a deployment target." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Listing the available targets.", { toolCall: "call-0" });
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		const leadIn = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Choose one:" },
+				{ type: "toolCall", id: "ask-0", name: "ask", arguments: {} },
+			],
+			stopReason: "toolUse",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message: leadIn }, ctx);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-0", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "ask lead-in");
+		expect(turnStreams()[0]!.text).toContain("Choose one:");
+		await handlers.get("tool_execution_end")!(
+			{ type: "tool_execution_end", toolName: "ask", toolCallId: "ask-0", result: { content: [] }, isError: false },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "ask-0",
+					toolName: "ask",
+					content: [{ type: "text", text: "A" }],
+				},
+			},
+			ctx,
+		);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 1, message: leadIn }, ctx);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(200);
+
+		expect(turnStreams().some(f => f.text?.includes("Listing the available targets."))).toBe(false);
+		expect(turnStreams().length).toBe(1);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;

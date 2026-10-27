@@ -13,6 +13,14 @@ import {
 	parseEventWebhookConfig,
 	type WebhookDelivery,
 } from "../src/coordinator-mcp/event-webhook";
+import { buildCoordinatorMcpConfig, coordinatorNamespacePath } from "../src/coordinator-mcp/policy";
+import {
+	appendCoordinatorEventForTest,
+	appendEventWebhookDiagnosticForTest,
+	awaitEventWebhookDeliveriesForTest,
+	createCoordinatorMcpServer,
+	webhookEventDiagnosticTokenForTest,
+} from "../src/coordinator-mcp/server";
 
 const tempDirs: string[] = [];
 
@@ -27,6 +35,30 @@ async function tempRoot(): Promise<string> {
 	const canonical = await fs.realpath(dir);
 	tempDirs.push(canonical);
 	return canonical;
+}
+
+function generatedWebhookDiagnosticCases(): Array<{ identifier: string; budget: number }> {
+	let state = 0x6739_cafe;
+	const random = (): number => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+	const randomInt = (max: number): number => Math.floor(random() * (max + 1));
+	const edgeCodeUnits = [
+		0x0000, 0x0009, 0x000a, 0x000d, 0x001f, 0x0020, 0x0041, 0x007e, 0x007f, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xffff,
+	];
+	const budgets = [0, 1, 2, 7, 239, 240, 241, 511, 512, 1024, 4096];
+
+	return Array.from({ length: 256 }, (_, sample) => {
+		const length = sample % 8 === 0 ? 4096 : randomInt(512);
+		const codeUnits = [...edgeCodeUnits];
+		for (let index = 0; index < length; index += 1) {
+			codeUnits.push(Math.floor(random() * 0x1_0000));
+		}
+		const identifier = codeUnits.map(codeUnit => String.fromCharCode(codeUnit)).join("");
+		const budget = budgets[sample] ?? randomInt(4096);
+		return { identifier, budget };
+	});
 }
 
 afterEach(async () => {
@@ -158,6 +190,29 @@ describe("parseEventWebhookConfig", () => {
 				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE: "relative/token",
 			}),
 		).toThrow("coordinator_event_webhook_token_file_invalid");
+	});
+
+	it("falls back to the defaults for timeout and attempts values that are not plain digits", () => {
+		for (const raw of ["1.5", "1e4", "10s", "+3", "-2", "0", "0x10"]) {
+			const config = parseEventWebhookConfig({
+				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test",
+				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS: raw,
+				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS: raw,
+			});
+			expect({ raw, timeoutMs: config?.timeoutMs, maxAttempts: config?.maxAttempts }).toEqual({
+				raw,
+				timeoutMs: DEFAULT_EVENT_WEBHOOK_TIMEOUT_MS,
+				maxAttempts: DEFAULT_EVENT_WEBHOOK_MAX_ATTEMPTS,
+			});
+		}
+
+		const padded = parseEventWebhookConfig({
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test",
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS: " 2500 ",
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS: "99999999999999999999",
+		});
+		expect(padded?.timeoutMs).toBe(2500);
+		expect(padded?.maxAttempts).toBe(MAX_EVENT_WEBHOOK_MAX_ATTEMPTS);
 	});
 });
 describe("webhook egress provenance", () => {
@@ -368,5 +423,85 @@ describe("deliverEventWebhook", () => {
 				.then(() => true)
 				.catch(() => false),
 		).resolves.toBe(false);
+	});
+
+	it("does not write a second diagnostic line when the event id contains a newline", async () => {
+		const root = await tempRoot();
+		const env = {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test/hook",
+		};
+		createCoordinatorMcpServer({
+			env,
+			services: {
+				eventWebhookDelivery: {
+					post: async () => ({ ok: false, status: 500, error: "unused" }),
+					sleep: async () => {},
+					now: () => Date.now(),
+				},
+			},
+		});
+		const namespaceDir = coordinatorNamespacePath(buildCoordinatorMcpConfig(env));
+		// Finish the empty startup replay before appending, so the diagnostic is one write.
+		await awaitEventWebhookDeliveriesForTest(namespaceDir);
+		const forged = "2099-01-01T00:00:00.000Z event=forged error=injected_line";
+		await appendCoordinatorEventForTest(namespaceDir, {
+			kind: "turn.completed",
+			summary: "hostile webhook event id",
+			stableId: `evt-real\r\n${forged}`,
+		});
+		await awaitEventWebhookDeliveriesForTest(namespaceDir);
+		const diagnostic = await fs.readFile(path.join(namespaceDir, "event-webhook-errors.log"), "utf8");
+		const lines = diagnostic.split("\n").filter(line => line.length > 0);
+		expect(lines).toHaveLength(1);
+		const record = lines[0] ?? "";
+		expect(record).toContain("event=evt-real");
+		expect(record).toContain("error=coordinator_event_webhook_event_id_invalid");
+		expect(record.startsWith("2099-")).toBe(false);
+		expect(diagnostic.endsWith("\n")).toBe(true);
+		expect(diagnostic.slice(0, -1)).not.toContain("\n");
+		expect(diagnostic).not.toContain("\r");
+		expect(Buffer.byteLength(diagnostic)).toBeLessThanOrEqual(512);
+	});
+});
+
+describe("webhook event diagnostic normalization properties", () => {
+	it("preserves printable ASCII order and is idempotent for seeded arbitrary UTF-16 inputs", () => {
+		for (const { identifier, budget } of generatedWebhookDiagnosticCases()) {
+			const token = webhookEventDiagnosticTokenForTest(identifier, budget);
+			const expected = identifier.replace(/[^\x20-\x7e]/g, "").slice(0, budget);
+
+			expect(token).toBe(expected);
+			expect(token).toMatch(/^[\x20-\x7e]*$/);
+			expect(token.length).toBeLessThanOrEqual(budget);
+			expect(webhookEventDiagnosticTokenForTest(token, budget)).toBe(token);
+		}
+	});
+
+	it("caps error codes at 240 characters and keeps long-ID records within one 512-byte line", async () => {
+		const eventId = `evt-${"a".repeat(4096)}`;
+		for (const errorLength of [239, 240, 241]) {
+			const namespaceDir = await tempRoot();
+			const errorCode = "e".repeat(errorLength);
+			await appendEventWebhookDiagnosticForTest(namespaceDir, eventId, new Error(errorCode));
+
+			const diagnostic = await fs.readFile(path.join(namespaceDir, "event-webhook-errors.log"), "utf8");
+			expect(diagnostic.endsWith("\n")).toBe(true);
+			expect(diagnostic.split("\n")).toHaveLength(2);
+			expect(diagnostic.slice(0, -1)).not.toContain("\n");
+			expect(diagnostic).not.toContain("\r");
+			expect(Buffer.byteLength(diagnostic, "utf8")).toBeLessThanOrEqual(512);
+			expect(diagnostic.endsWith(`error=${"e".repeat(Math.min(errorLength, 240))}\n`)).toBe(true);
+
+			const eventStart = diagnostic.indexOf(" event=") + " event=".length;
+			const errorStart = diagnostic.indexOf(" error=");
+			const writtenEventId = diagnostic.slice(eventStart, errorStart);
+			expect(writtenEventId.startsWith("evt-")).toBe(true);
+			expect(writtenEventId.length).toBeLessThan(eventId.length);
+		}
 	});
 });

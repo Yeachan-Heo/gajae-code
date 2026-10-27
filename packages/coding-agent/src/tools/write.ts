@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { isEnoent, isRecord, prompt, untilAborted } from "@gajae-code/utils";
+import { isEnoent, isRecord, pathIsWithin, prompt, sanitizeText, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { stripHashlinePrefixes } from "../edit";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -15,6 +15,7 @@ import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
+import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { formatFileWriteError, writeFileAtomically } from "./atomic-file-write";
 import { assertEditableFile } from "./auto-generated-guard";
@@ -178,6 +179,31 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 }
 
 /**
+ * `new Database` follows symlinks. A lexical path inside the workspace can
+ * still name a file outside it, so open only the real path that stays inside
+ * the same session workspace an ordinary write resolves against.
+ */
+async function realSqliteDatabaseInWorkspace(
+	workspaceRoot: string,
+	absolutePath: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	signal?.throwIfAborted();
+	let realPath: string;
+	try {
+		realPath = await fs.realpath(absolutePath);
+	} catch (error) {
+		if (isEnoent(error)) throw error;
+		throw new ToolError(error instanceof Error ? error.message : String(error));
+	}
+	signal?.throwIfAborted();
+	if (!pathIsWithin(workspaceRoot, realPath)) {
+		throw new ToolError(`SQLite write target resolves outside the workspace: ${absolutePath}`);
+	}
+	return realPath;
+}
+
+/**
  * Write tool implementation.
  *
  * Creates or overwrites files with optional LSP formatting and diagnostics.
@@ -192,6 +218,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly concurrency = "exclusive";
 	readonly loadMode = "discoverable";
 	readonly summary = "Write content to a file (creates or overwrites)";
+
+	/** Stream matchers should see the real file content, not its JSON-escaped argument encoding. */
+	matcherDigest(args: unknown): string | undefined {
+		if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+		const content = (args as Partial<WriteParams>).content;
+		return typeof content === "string" ? content : undefined;
+	}
 
 	readonly #writethrough: WritethroughCallback;
 
@@ -372,6 +405,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		displayPath: string,
 		content: string,
 		resolvedSqlitePath: ResolvedSqliteWritePath,
+		signal?: AbortSignal,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		let db: Database | null = null;
 		try {
@@ -379,7 +413,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
-			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
+			const realDatabasePath = await realSqliteDatabaseInWorkspace(
+				this.session.cwd,
+				resolvedSqlitePath.absolutePath,
+				signal,
+			);
+			signal?.throwIfAborted();
+			db = new Database(realDatabasePath, { create: false, strict: true });
 			db.run("PRAGMA busy_timeout = 3000");
 
 			const trimmedContent = content.trim();
@@ -462,6 +502,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const absolutePath = entry.absolutePath;
+		enforcePlanModeWrite(this.session, absolutePath, { op: "update" });
 		if (!(await fs.exists(absolutePath))) {
 			throw new ToolError(`Conflict #${entry.id} target '${entry.displayPath}' no longer exists.`);
 		}
@@ -717,7 +758,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 
-				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
+				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath, signal);
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -818,9 +859,14 @@ function normalizeDisplayText(text: string): string {
 	return text.replace(/\r/g, "");
 }
 
+/** Preview text only. The bytes written to disk stay the caller's content. */
+function displayWriteContent(content: string): string {
+	return normalizeDisplayText(sanitizeWithOptionalSixelPassthrough(content, sanitizeText));
+}
+
 function formatStreamingContent(content: string, language: string | undefined, uiTheme: Theme): string {
 	if (!content) return "";
-	const lines = normalizeDisplayText(content).split("\n");
+	const lines = displayWriteContent(content).split("\n");
 	const totalLines = lines.length;
 	const startIndex = Math.max(0, totalLines - WRITE_STREAMING_PREVIEW_LINES);
 	const visibleLines = lines.slice(startIndex);
@@ -849,7 +895,7 @@ function renderContentPreview(
 	uiTheme: Theme,
 ): string {
 	if (!content) return "";
-	const rawLines = normalizeDisplayText(content).split("\n");
+	const rawLines = displayWriteContent(content).split("\n");
 	const totalLines = rawLines.length;
 	const maxLines = expanded ? totalLines : Math.min(totalLines, WRITE_PREVIEW_LINES);
 	const visibleLines = rawLines.slice(0, maxLines);

@@ -60,6 +60,8 @@ export const __eventControllerPerfCounters = {
 const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
 const TEXTLESS_LENGTH_WARNING =
 	'Response ended with stopReason "length" before producing visible text or a tool call. Check the model\'s output and context token limits (maxTokens in models.yml) or lower the reasoning level (/reasoning), then retry.';
+const TEXTLESS_INCOMPLETE_WARNING =
+	"Response ended before producing visible text or a tool call. See the provider diagnostic for the reason.";
 
 function isTextlessLengthStop(message: AssistantMessage | undefined): boolean {
 	return (
@@ -714,7 +716,7 @@ export class EventController {
 	): Promise<void> {
 		this.ctx.showStatus(`Fallback model: ${event.from} → ${event.to}`);
 		this.ctx.statusLine.invalidate();
-		this.ctx.ui.requestRender();
+		this.ctx.updateEditorBorderColor();
 	}
 
 	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {
@@ -1090,10 +1092,10 @@ export class EventController {
 			event.stopReason !== "maintenance" &&
 			isTextlessLengthStop(lastAssistant)
 		) {
-			this.ctx.showWarning(TEXTLESS_LENGTH_WARNING);
+			this.ctx.showWarning(lastAssistant?.errorMessage ? TEXTLESS_INCOMPLETE_WARNING : TEXTLESS_LENGTH_WARNING);
 		}
 		this.sendCompletionNotification();
-		this.ctx.promptSuggestion?.onAgentEnd();
+		this.ctx.promptSuggestion?.onAgentEnd(event.stopReason);
 	}
 
 	async #handleAutoCompactionStart(
@@ -1372,15 +1374,20 @@ export class EventController {
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
 		const textlessLengthStop = isTextlessLengthStop(last);
+		const incompleteTitle = last?.errorMessage ? "Response incomplete" : "Output limit reached";
 		const title = textlessLengthStop
 			? sessionName
-				? `${sessionName}: Output limit reached`
-				: "Output limit reached"
+				? `${sessionName}: ${incompleteTitle}`
+				: incompleteTitle
 			: sessionName
 				? `${sessionName}: Complete`
 				: "Complete";
 		const summary = summaryFromMessage(last, 1000);
-		const body = textlessLengthStop ? TEXTLESS_LENGTH_WARNING : (summary ?? "Complete");
+		const body = textlessLengthStop
+			? last?.errorMessage
+				? TEXTLESS_INCOMPLETE_WARNING
+				: TEXTLESS_LENGTH_WARNING
+			: (summary ?? "Complete");
 		const sessionManager = this.ctx.sessionManager as { getCwd?: () => string; getSessionId?: () => string };
 		const payload: CompletionNotifyPayload = {
 			type: "agent-turn-complete",

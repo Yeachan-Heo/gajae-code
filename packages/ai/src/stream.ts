@@ -8,6 +8,7 @@ import {
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
 import {
+	attachProviderSafetyStopModelIdentity,
 	copyProviderSafetyStopAdapterInvocation,
 	isProviderSafetyStopModelTrusted,
 	withProviderSafetyStopAdapterInvocation,
@@ -24,7 +25,7 @@ function markManagedAttemptValidated<T extends object>(options: T): T {
 	return Object.assign(options, { [managedAttemptValidated]: true });
 }
 
-import { getCustomApi } from "./api-registry";
+import { CustomApiRegistry, resolveCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
 	getMiniMaxThinkingMode,
@@ -35,6 +36,7 @@ import {
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import {
+	hasAwsInstanceProfileCredentialSource,
 	hasResolvableAwsProfileSource,
 	isValidBedrockBearerToken,
 	readAwsStaticEnvironmentCredentials,
@@ -42,6 +44,7 @@ import {
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinAcpOptions } from "./providers/devin-acp";
 import type { GoogleOptions } from "./providers/google";
+import { getVertexCredentialSource, isValidVertexLocation } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
 import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
@@ -72,6 +75,7 @@ import type {
 	AssistantMessageEvent,
 	AuthRetryCredential,
 	Context,
+	FetchImpl,
 	Model,
 	OptionsForApi,
 	SimpleStreamOptions,
@@ -82,23 +86,44 @@ import type {
 import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 
-let cachedVertexAdcCredentialsExists: boolean | null = null;
+function assertCustomApiRegistryActive(registry: CustomApiRegistry | undefined): void {
+	if (registry !== undefined) CustomApiRegistry.assertActive(registry);
+}
+
+function isBuiltInApi(api: Api): boolean {
+	switch (api) {
+		case "openai-completions":
+		case "openai-responses":
+		case "openai-codex-responses":
+		case "azure-openai-responses":
+		case "anthropic-messages":
+		case "bedrock-converse-stream":
+		case "google-generative-ai":
+		case "google-gemini-cli":
+		case "google-vertex":
+		case "ollama-chat":
+		case "cursor-agent":
+		case "devin-acp":
+		case "kiro-codewhisperer-stream":
+			return true;
+		default:
+			return false;
+	}
+}
 
 function hasVertexAdcCredentials(): boolean {
-	if (cachedVertexAdcCredentialsExists === null) {
-		const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
-		if (gacPath) {
-			cachedVertexAdcCredentialsExists = fs.existsSync(gacPath);
-		} else {
-			cachedVertexAdcCredentialsExists = fs.existsSync(
-				path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"),
-			);
-		}
-	}
-	return cachedVertexAdcCredentialsExists;
+	const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
+	if (gacPath) return fs.existsSync(gacPath);
+	return fs.existsSync(path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"));
 }
 
 type KeyResolver = string | (() => string | undefined);
+
+export type EnvApiKeyCredentialSource =
+	| { kind: "environment"; name: string }
+	| { kind: "google-adc"; source: "explicit-file" | "default-file" | "metadata-server" }
+	| { kind: "aws"; source: "bearer-token" | "environment-credentials" | "profile" | "instance-profile" }
+	| { kind: "unknown" };
 
 const serviceProviderMap: Record<string, KeyResolver> = {
 	"alibaba-token-plan": "ALIBABA_TOKEN_PLAN_API_KEY",
@@ -197,6 +222,25 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	xiaomi: "XIAOMI_API_KEY",
 };
 
+const functionResolverEnvNames: Record<string, readonly string[]> = {
+	openai: ["OPENAI_API_KEY"],
+	kiro: ["KIRO_API_KEY", "AWS_BEARER_TOKEN_KIRO"],
+	"github-copilot": ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+	"google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+	"amazon-bedrock": ["AWS_BEARER_TOKEN_BEDROCK"],
+	huggingface: ["HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"],
+	"qwen-portal": ["QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"],
+};
+
+function getFunctionResolverEnvNames(provider: string): readonly string[] {
+	if (provider === "anthropic") {
+		return isFoundryEnabled()
+			? ["ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
+			: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"];
+	}
+	return functionResolverEnvNames[provider] ?? [];
+}
+
 /**
  * Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
  *
@@ -209,6 +253,82 @@ export function getEnvApiKey(provider: string): string | undefined {
 		return $credentialEnv(resolver);
 	}
 	return resolver?.();
+}
+
+/**
+ * List configured environment variable names consulted for a provider's
+ * environment credential. Values are never returned. This intentionally uses
+ * the same credential-only environment reader as {@link getEnvApiKey}.
+ */
+export function getEnvApiKeyEnvNames(provider: string): string[] {
+	const resolver = serviceProviderMap[provider];
+	const names = typeof resolver === "string" ? [resolver] : getFunctionResolverEnvNames(provider);
+	return names.filter(name => {
+		const value = $credentialEnv(name);
+		if (value === undefined) return false;
+		if (provider === "kiro" && name === "KIRO_API_KEY") {
+			return value.trim().startsWith("ksk_") && !/[\x00-\x1f\x7f]/.test(value);
+		}
+		if (provider === "amazon-bedrock" && name === "AWS_BEARER_TOKEN_BEDROCK") {
+			return isValidBedrockBearerToken(value);
+		}
+		return true;
+	});
+}
+
+/** Describe the selected source without exposing credential values or unvalidated ADC files. */
+export async function getEnvApiKeyCredentialSource(
+	provider: string,
+	options?: { fetch?: FetchImpl },
+): Promise<EnvApiKeyCredentialSource | undefined> {
+	return (await getEnvApiKeyCredentialSources(provider, options))[0];
+}
+
+/** Enumerate usable credential candidates in provider dispatch precedence without exposing credentials. */
+export async function getEnvApiKeyCredentialSources(
+	provider: string,
+	options?: { fetch?: FetchImpl },
+): Promise<EnvApiKeyCredentialSource[]> {
+	const sources: EnvApiKeyCredentialSource[] = getEnvApiKeyEnvNames(provider).map(
+		(name): EnvApiKeyCredentialSource =>
+			provider === "amazon-bedrock" && name === "AWS_BEARER_TOKEN_BEDROCK"
+				? { kind: "aws", source: "bearer-token" }
+				: { kind: "environment", name },
+	);
+
+	if (provider === "google-vertex") {
+		const project = $credentialEnv("GOOGLE_CLOUD_PROJECT") || $credentialEnv("GCLOUD_PROJECT");
+		const location = $credentialEnv("GOOGLE_CLOUD_LOCATION");
+		if (project && location && isValidVertexLocation(location)) {
+			const source = await getVertexCredentialSource({ fetch: options?.fetch });
+			if (source) sources.push({ kind: "google-adc", source });
+		}
+	} else if (provider === "amazon-bedrock") {
+		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
+		if (bearerToken && !isValidBedrockBearerToken(bearerToken)) return sources;
+		if (readAwsStaticEnvironmentCredentials()) {
+			sources.push({ kind: "aws", source: "environment-credentials" });
+		}
+		if (hasResolvableAwsProfileSource()) sources.push({ kind: "aws", source: "profile" });
+		if (await hasAwsInstanceProfileCredentialSource({ fetch: options?.fetch })) {
+			sources.push({ kind: "aws", source: "instance-profile" });
+		}
+	}
+
+	return sources;
+}
+
+/** Resolve Vertex ADC provenance, including metadata-server credentials, without acquiring a token. */
+export async function getGoogleVertexCredentialSource(options?: {
+	fetch?: FetchImpl;
+}): Promise<EnvApiKeyCredentialSource | undefined> {
+	return (await getEnvApiKeyCredentialSources("google-vertex", options))[0];
+}
+
+/** Name of the environment variable whose value is selected by `getEnvApiKey`, when identifiable. */
+export async function getEnvApiKeyEnvName(provider: string): Promise<string | undefined> {
+	const source = await getEnvApiKeyCredentialSource(provider);
+	return source?.kind === "environment" ? source.name : undefined;
 }
 
 /**
@@ -339,6 +459,7 @@ export function stream<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 	onStreamCreated?: () => void,
 ): AssistantMessageEventStream {
+	assertCustomApiRegistryActive(options?.customApiRegistry);
 	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
 		options = { ...options, requestMaxRetries: 0, streamMaxRetries: 0 } as OptionsForApi<TApi>;
@@ -352,9 +473,12 @@ export function stream<TApi extends Api>(
 		options = { ...options, maxTokens: undefined } as OptionsForApi<TApi>;
 	}
 	// Check custom API registry first (extension-provided APIs like "vertex-Anthropic model-api")
-	const customApiProvider = getCustomApi(model.api);
+	const customApiProvider = resolveCustomApi(model.api, options?.customApiRegistry);
 	if (customApiProvider) {
 		return customApiProvider.stream(model, context, options as StreamOptions);
+	}
+	if (options?.customApiRegistry !== undefined && !isBuiltInApi(model.api)) {
+		throw new Error(`Unhandled API: ${model.api}`);
 	}
 
 	if (model.provider === "gitlab-duo") {
@@ -395,10 +519,18 @@ export function stream<TApi extends Api>(
 			onStreamCreated,
 		);
 	} else if (model.api === "kiro-codewhisperer-stream") {
+		const kiroOptions = (options || {}) as KiroCodeWhispererOptions;
+		const identitySnapshot = isProviderSafetyStopModelTrusted(model);
+		let adapterKiroOptions = identitySnapshot ? withProviderSafetyStopAdapterInvocation(kiroOptions) : kiroOptions;
+		// Attach validated model identity snapshot to prevent TOCTOU attacks on getters
+		if (identitySnapshot) {
+			const wireModelId = (model as { wireModelId?: string }).wireModelId;
+			adapterKiroOptions = attachProviderSafetyStopModelIdentity(adapterKiroOptions, identitySnapshot, wireModelId);
+		}
 		return streamKiroCodeWhisperer(
 			model as Model<"kiro-codewhisperer-stream">,
 			context,
-			(options || {}) as KiroCodeWhispererOptions,
+			adapterKiroOptions,
 			onStreamCreated,
 		);
 	} else if (model.api === "devin-acp") {
@@ -584,6 +716,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertCustomApiRegistryActive(options?.customApiRegistry);
 	assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
 		options = {
@@ -719,7 +852,7 @@ export function streamSimple<TApi extends Api>(
 	}
 
 	// Check custom API registry (extension-provided APIs)
-	const customApiProvider = getCustomApi(model.api);
+	const customApiProvider = resolveCustomApi(model.api, options?.customApiRegistry);
 	if (customApiProvider) {
 		const events = customApiProvider.streamSimple(model, context, {
 			...options,
@@ -729,6 +862,9 @@ export function streamSimple<TApi extends Api>(
 		const forwarded = new AssistantMessageEventStream();
 		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
 		return forwarded;
+	}
+	if (options?.customApiRegistry !== undefined && !isBuiltInApi(model.api)) {
+		throw new Error(`Unhandled API: ${model.api}`);
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
@@ -869,7 +1005,7 @@ function resolveBedrockThinkingBudget(
 	model: Model<"bedrock-converse-stream">,
 	options?: SimpleStreamOptions,
 ): { budget: number; level: Effort } | null {
-	if (!options?.reasoning || !model.reasoning) return null;
+	if (!options?.reasoning || options.disableReasoning || !model.reasoning) return null;
 	const level = requireSupportedEffort(model, options.reasoning);
 	const budget = options.thinkingBudgets?.[level] ?? BEDROCK_CLAUDE_THINKING[level];
 	return { budget, level };
@@ -955,6 +1091,7 @@ function mapOptionsForApi<TApi extends Api>(
 		presencePenalty: options?.presencePenalty,
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
+		customApiRegistry: options?.customApiRegistry,
 		signal: options?.signal,
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
@@ -996,7 +1133,7 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
-			const reasoning = options?.reasoning;
+			const reasoning = options?.disableReasoning ? undefined : options?.reasoning;
 			if (!reasoning || !model.reasoning) {
 				return castApi<"anthropic-messages">({
 					...base,
@@ -1007,7 +1144,7 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
-			let thinkingBudget = options.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning];
+			let thinkingBudget = options?.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning];
 			if (thinkingBudget <= 0) {
 				return castApi<"anthropic-messages">({
 					...base,
@@ -1022,8 +1159,28 @@ function mapOptionsForApi<TApi extends Api>(
 			// For older models: use budget-based thinking
 			if (model.thinking?.mode === "anthropic-adaptive") {
 				const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
+
+				// Adaptive mode sends effort directly (no explicit budget_tokens).
+				// However, the thinking consumes tokens from the overall max_tokens budget.
+				// If max_tokens is capped at DEFAULT_REQUEST_MAX_TOKENS (32k),
+				// high/xhigh/max reasoning consumes all 32k, leaving no output tokens.
+				// Solution: when caller did not explicitly set maxTokens,
+				// increase the cap to model.maxTokens to allow room for output.
+				let adaptiveMaxTokens = base.maxTokens ?? model.maxTokens;
+				const hasExplicitMaxTokens = Number.isSafeInteger(options?.maxTokens) && (options?.maxTokens as number) > 0;
+				if (
+					!hasExplicitMaxTokens &&
+					adaptiveMaxTokens === DEFAULT_REQUEST_MAX_TOKENS &&
+					Number.isSafeInteger(model.maxTokens) &&
+					model.maxTokens > DEFAULT_REQUEST_MAX_TOKENS
+				) {
+					// Increase to model.maxTokens to leave room for both thinking and output
+					adaptiveMaxTokens = model.maxTokens;
+				}
+
 				return castApi<"anthropic-messages">({
 					...base,
+					maxTokens: adaptiveMaxTokens,
 					thinkingEnabled: true,
 					effort,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
@@ -1081,7 +1238,7 @@ function mapOptionsForApi<TApi extends Api>(
 		case "bedrock-converse-stream": {
 			const bedrockBase: BedrockOptions = {
 				...base,
-				reasoning: options?.reasoning,
+				reasoning: options?.disableReasoning ? undefined : options?.reasoning,
 				thinkingBudgets: options?.thinkingBudgets,
 				toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 				thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,

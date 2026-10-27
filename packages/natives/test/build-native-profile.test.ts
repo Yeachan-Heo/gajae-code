@@ -100,6 +100,16 @@ describe("native build Cargo profiles", () => {
 		expect(sections["profile.dist"]?.panic).toBe('"unwind"');
 	});
 
+	it("forces statically bundled PCRE2 in local and CI native builds", async () => {
+		const [buildScript, action] = await Promise.all([
+			fs.readFile(path.join(repoRoot, "packages/natives/scripts/build-native.ts"), "utf8"),
+			fs.readFile(path.join(repoRoot, ".github/actions/build-native/action.yml"), "utf8"),
+		]);
+
+		expect(buildScript).toContain('Bun.env.PCRE2_SYS_STATIC = "1";');
+		expect(action).toContain('PCRE2_SYS_STATIC: "1"');
+	});
+
 	it("rejects unsupported PI_NATIVE_PROFILE overrides before running a native build", async () => {
 		const proc = Bun.spawn({
 			cmd: ["bun", path.join(repoRoot, "packages/natives/scripts/build-native.ts")],

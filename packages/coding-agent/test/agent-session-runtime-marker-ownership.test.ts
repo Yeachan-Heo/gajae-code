@@ -84,7 +84,7 @@ async function nestedSession(cwd: string, scope: string): Promise<AgentSession> 
 		agent,
 		sessionManager: SessionManager.inMemory(cwd),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map([[tool.name, tool]]),
 		builtinToolIdentities: new Set<object>([tool]),
 		providerSessionId: scope,

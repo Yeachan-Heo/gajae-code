@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	assertCoordinatorArtifactPath,
+	assertCoordinatorSessionLocations,
 	assertCoordinatorWorkdir,
 	buildCoordinatorMcpConfig,
 	requireCoordinatorMutation,
@@ -30,6 +31,32 @@ describe("Hermes MCP safety policy", () => {
 		expect(config.namespace.profile).toBeNull();
 		expect(config.namespace.repo).toBeNull();
 		expect(config.artifactByteCap).toBe(65536);
+	});
+
+	it("falls back to defaults for malformed numeric env values instead of reading a digit prefix", () => {
+		const defaults = buildCoordinatorMcpConfig({});
+		for (const value of ["64KB", "1e6", "1.5", "0x10", "-5", "0", " ", "abc"]) {
+			const config = buildCoordinatorMcpConfig({
+				GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: value,
+				GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS: value,
+				GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS: value,
+			});
+			expect(config.artifactByteCap, value).toBe(defaults.artifactByteCap);
+			expect(config.sessionIdleTtlMs, value).toBe(defaults.sessionIdleTtlMs);
+			expect(config.sessionSweepIntervalMs, value).toBe(defaults.sessionSweepIntervalMs);
+		}
+	});
+
+	it("accepts plain digit env values with surrounding whitespace and keeps the byte cap ceiling", () => {
+		const config = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: " 4096 ",
+			GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS: "99999999999",
+		});
+		expect(config.artifactByteCap).toBe(4096);
+		expect(config.sessionIdleTtlMs).toBe(99999999999);
+		expect(buildCoordinatorMcpConfig({ GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: "99999999" }).artifactByteCap).toBe(
+			1024 * 1024,
+		);
 	});
 
 	it("scopes the default state root to GJC_SESSION_ID when present", () => {
@@ -76,6 +103,30 @@ describe("Hermes MCP safety policy", () => {
 		);
 	});
 
+	it("names the escaping persisted location without changing the authority error message", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const inside = path.join(root, "session");
+		await fs.mkdir(inside, { recursive: true });
+		const config = buildCoordinatorMcpConfig({
+			GJC_SESSION_ID: "coordinator-policy-test-session",
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		});
+		const canonicalOutside = await fs.realpath(outside);
+
+		await expect(assertCoordinatorSessionLocations(config, inside, inside)).resolves.toBeUndefined();
+
+		// isSessionAuthorityError() in server.ts compares the message verbatim, so it must stay exact.
+		const expectEscape = (cwd: string, workspace: string, detail: string) =>
+			expect(assertCoordinatorSessionLocations(config, cwd, workspace)).rejects.toMatchObject({
+				message: "coordinator_workdir_outside_allowed_roots",
+				cause: expect.objectContaining({ message: `outside allowed roots: ${detail}` }),
+			});
+		await expectEscape(outside, inside, `cwd ${canonicalOutside}`);
+		await expectEscape(inside, outside, `workspace ${canonicalOutside}`);
+		await expectEscape(outside, outside, `cwd ${canonicalOutside}, workspace ${canonicalOutside}`);
+	});
+
 	it("authorizes GJC-managed repository-local worktrees under the repository bucket", async () => {
 		const root = await tempRoot();
 		const bucket = path.join(root, ".worktrees");
@@ -99,6 +150,16 @@ describe("Hermes MCP safety policy", () => {
 		});
 
 		await expect(assertCoordinatorWorkdir(config, worktree)).resolves.toBe(worktree);
+	});
+
+	it("derives the managed worktree root from a repository name containing replacement-pattern characters", () => {
+		// `{repo}` used a string replacement, so `$&` in the directory name expanded to
+		// the placeholder itself and `$'` spliced the template remainder into the path.
+		for (const name of ["a$&b", "x$$y", "q$'z"]) {
+			const root = path.join(os.tmpdir(), name);
+			const config = buildCoordinatorMcpConfig({ GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root });
+			expect(config.managedWorktreeRoots).toEqual([path.join(root, ".worktrees")]);
+		}
 	});
 
 	it("rejects artifact symlink escapes and enforces byte caps", async () => {

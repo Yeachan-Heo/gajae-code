@@ -16,7 +16,7 @@
   - `packages/coding-agent/src/lsp/clients/lsp-linter-client.ts` — LSP-backed linter adapter
   - `packages/coding-agent/src/lsp/clients/biome-client.ts` — Biome CLI diagnostics/formatting adapter
   - `packages/coding-agent/src/lsp/clients/swiftlint-client.ts` — SwiftLint CLI diagnostics adapter
-  - `packages/coding-agent/src/tools/index.ts` — tool registration and `lsp.enabled` gating
+  - `packages/coding-agent/src/tools/descriptors.ts` — tool registration and `lsp.enabled` gating
   - `packages/coding-agent/src/tools/tool-timeouts.ts` — timeout defaults and clamping
   - `packages/coding-agent/src/lsp/defaults.json` — built-in server definitions for auto-detect
 
@@ -43,7 +43,7 @@
 - Many validation failures are returned as ordinary text results with `details.success: false`; aborts throw `ToolAbortError` instead.
 
 ## Flow
-1. `packages/coding-agent/src/tools/index.ts` registers `lsp: LspTool.createIf`; session creation also gates it behind `session.enableLsp !== false` and `settings.get("lsp.enabled")`.
+1. `packages/coding-agent/src/tools/descriptors.ts` registers `lsp: LspTool.createIf` and gates it behind `session.enableLsp !== false` and `settings.get("lsp.enabled")`.
 2. `LspTool.execute()` in `packages/coding-agent/src/lsp/index.ts` clamps `timeout` with `clampTimeout("lsp", ...)`, builds an `AbortSignal.timeout(...)`, and combines it with the caller signal.
 3. `getConfig()` loads and caches `LspConfig` per cwd, applies idle-timeout config via `setIdleTimeout()`, and reuses the cached config on later calls.
 4. Config loading in `packages/coding-agent/src/lsp/config.ts` merges `defaults.json` with JSON/YAML overrides. Project-controlled configuration may control declarative matching, activation, and capabilities, but cannot define launch fields, initialization options, or opaque server settings. Canonical trusted user configuration outside the project may retain those process-affecting fields. The loader can also preserve them from preloaded trusted external plugin roots outside the project, but no current production CLI/startup path supplies those roots; project-controlled plugin roots remain untrusted, and the quarantined `--plugin-dir` surface does not grant launch authority. With no overrides, auto-detection intersects root markers with trusted external executable discovery and rejects repository-owned lexical paths as well as symlink-resolved project binaries.

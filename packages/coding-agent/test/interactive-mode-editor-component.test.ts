@@ -19,6 +19,7 @@ import type {
 	ExtensionUIContext,
 } from "../src/extensibility/extensions";
 import { CustomEditor } from "../src/modes/components/custom-editor";
+import { HookSelectorComponent } from "../src/modes/components/hook-selector";
 import { computeIrcWorkLaneWidths, IrcSplitViewComponent } from "../src/modes/components/irc-sidebar";
 import { resolveWelcomeIntroTickMs, WelcomeComponent } from "../src/modes/components/welcome";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
@@ -46,6 +47,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let session: AgentSession;
+	let targetSession: AgentSession | undefined;
 	let mode: InteractiveMode;
 
 	beforeAll(() => {
@@ -91,6 +93,8 @@ describe("InteractiveMode.setEditorComponent", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		mode?.stop();
+		await targetSession?.dispose();
+		targetSession = undefined;
 		await session?.dispose();
 		authStorage?.close();
 		resetSettingsForTest();
@@ -101,6 +105,8 @@ describe("InteractiveMode.setEditorComponent", () => {
 		const reset = vi.spyOn(mode.ui, "resetViewportAnchorIntent");
 		const reconcile = vi.spyOn(mode.ui, "prepareViewportAnchorForTranscriptRebuild");
 		vi.spyOn(mode, "renderSessionContext").mockImplementation(() => undefined);
+		// Startup's first paint precedes every transcript rebuild.
+		mode.renderInitialMessages();
 
 		mode.rebuildChatFromMessages("replace-identity");
 		expect(reset).toHaveBeenCalledTimes(1);
@@ -293,7 +299,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(report).not.toHaveBeenCalled();
 	});
 
-	it("renders an idle extension custom message through the real rebuild boundary", async () => {
+	function initializeExtensionActions(): ExtensionActions {
 		let actions: ExtensionActions | undefined;
 		const extensionRunner = {
 			initialize(
@@ -310,15 +316,35 @@ describe("InteractiveMode.setEditorComponent", () => {
 			configurable: true,
 			value: extensionRunner as unknown as AgentSession["extensionRunner"],
 		});
-		const reconcile = vi.spyOn(mode.ui, "prepareViewportAnchorForTranscriptRebuild");
 		new ExtensionUiController(mode).initializeHookRunner({} as ExtensionUIContext, false);
 		if (!actions) throw new Error("Extension actions were not initialized");
+		return actions;
+	}
+
+	it("renders an idle extension custom message through the real rebuild boundary", async () => {
+		mode.renderInitialMessages();
+		const actions = initializeExtensionActions();
+		const reconcile = vi.spyOn(mode.ui, "prepareViewportAnchorForTranscriptRebuild");
 
 		actions.sendMessage({ customType: "test", content: "visible extension message", display: true });
 		await Bun.sleep(0);
 
 		expect(reconcile).toHaveBeenCalledTimes(1);
 		expect(mode.chatContainer.render(80).join("\n")).toContain("visible extension message");
+	});
+
+	it("renders a pre-paint extension message once and keeps pre-paint notices", async () => {
+		const actions = initializeExtensionActions();
+		mode.showWarning("pre-paint notice");
+
+		// session_start extensions send display messages before startup's first paint.
+		actions.sendMessage({ customType: "test", content: "pre-paint extension message", display: true });
+		await Bun.sleep(0);
+		mode.renderInitialMessages(undefined, { preserveExistingChat: true });
+
+		const rendered = mode.chatContainer.render(80).join("\n");
+		expect(rendered.split("pre-paint extension message")).toHaveLength(2);
+		expect(rendered).toContain("pre-paint notice");
 	});
 
 	it("renders the default composer as a closed rounded input box", () => {
@@ -523,6 +549,107 @@ describe("InteractiveMode.setEditorComponent", () => {
 			skipped.stop();
 			animated.stop();
 		}
+	});
+
+	it("keeps the welcome model pills in sync with extension model switches", async () => {
+		settings.set("startup.quiet", false);
+		settings.set("startup.skipLogoAnimation", true);
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		await mode.init();
+		const welcome = mode.ui.children.find(child => child instanceof WelcomeComponent);
+		if (!(welcome instanceof WelcomeComponent)) throw new Error("Expected welcome component");
+		const initial = session.model;
+		const next = session.modelRegistry.find("openai", "gpt-4o");
+		if (!initial || !next) throw new Error("Expected registry models");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const actions = initializeExtensionActions();
+		const renderWelcome = () => welcome.render(160).map(stripRenderControls).join("\n");
+		expect(renderWelcome()).toContain(initial.name);
+
+		expect(await actions.setModel(next)).toBe(true);
+		expect(session.model).toBe(next);
+
+		const rendered = renderWelcome();
+		expect(rendered).toContain(next.name);
+		expect(rendered).toContain(next.provider);
+		expect(rendered).not.toContain(initial.name);
+	});
+
+	it("refreshes welcome pills after choosing the current default on resume", async () => {
+		settings.set("startup.quiet", false);
+		settings.set("startup.skipLogoAnimation", true);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const savedModel = session.modelRegistry.find("openai", "gpt-4o");
+		const currentDefault = session.modelRegistry.find("anthropic", "claude-opus-4-8");
+		if (!savedModel || !currentDefault) throw new Error("Expected registry models");
+
+		targetSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: savedModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: session.settings,
+			modelRegistry: session.modelRegistry,
+		});
+		await targetSession.setModel(savedModel);
+		targetSession.agent.appendMessage({ role: "user", content: "saved resume message", timestamp: Date.now() });
+		const targetSessionFile = targetSession.sessionFile;
+		if (!targetSessionFile) throw new Error("Expected persisted target session");
+		await targetSession.sessionManager.ensureOnDisk();
+		await targetSession.sessionManager.flush();
+		session.settings.setModelRole("default", `${currentDefault.provider}/${currentDefault.id}`);
+		session.settings.set("session.resumeModelBehavior", "ask");
+
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		await mode.init();
+		const welcome = mode.ui.children.find(child => child instanceof WelcomeComponent);
+		if (!(welcome instanceof WelcomeComponent)) throw new Error("Expected welcome component");
+		const renderWelcome = () => welcome.render(160).map(stripRenderControls).join("\n");
+
+		await new SelectorController(mode).handleResumeSession(targetSessionFile);
+		expect(session.model?.id).toBe(savedModel.id);
+		const choice = mode.editorContainer.children.find(child => child instanceof HookSelectorComponent);
+		if (!(choice instanceof HookSelectorComponent)) throw new Error("Expected resume model choice");
+		choice.handleInput("\x1b[B");
+		const setModel = vi.spyOn(session, "setModel");
+		choice.handleInput("\n");
+		const selection = setModel.mock.results.at(-1)?.value;
+		if (!selection) throw new Error("Expected resume choice to set the current default model");
+		await selection;
+
+		expect(session.model?.id).toBe(currentDefault.id);
+		expect(renderWelcome()).toContain(currentDefault.name);
+		expect(renderWelcome()).not.toContain(savedModel.name);
+	});
+
+	it("strips terminal control sequences from initial and switched welcome model metadata", () => {
+		const initialAttack = "clipboard-initial-secret";
+		const switchedAttack = "clipboard-switched-secret";
+		const welcome = new WelcomeComponent(
+			"1.2.3",
+			`initial-\x1b]52;c;${initialAttack}\x07-model`,
+			`provider-\x1b]52;c;${initialAttack}\x07-name`,
+			[],
+			[],
+			"ascii",
+		);
+		const initialRender = welcome.render(120).join("\n");
+		expect(initialRender).not.toContain("\x1b]52;");
+		expect(initialRender).not.toContain(initialAttack);
+
+		welcome.setModel(
+			`switched-\x1b]52;c;${switchedAttack}\x07-model`,
+			`provider-\x1b]52;c;${switchedAttack}\x07-name`,
+		);
+		const switchedRender = welcome.render(120).join("\n");
+		expect(switchedRender).not.toContain("\x1b]52;");
+		expect(switchedRender).not.toContain(switchedAttack);
 	});
 
 	it("still renders no welcome surface at all under startup.quiet regardless of the motion flag", async () => {

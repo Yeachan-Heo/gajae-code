@@ -1,13 +1,30 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { type ChildProcess, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
-import { complete, getEnvApiKey, stream } from "@gajae-code/ai/stream";
-import type { Api, Context, ImageContent, Model, OptionsForApi, Tool, ToolResultMessage } from "@gajae-code/ai/types";
+import { complete, getEnvApiKey, stream, streamSimple } from "@gajae-code/ai/stream";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	ImageContent,
+	Model,
+	OptionsForApi,
+	Tool,
+	ToolResultMessage,
+} from "@gajae-code/ai/types";
 import { $which } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import {
+	CustomApiRegistry,
+	type CustomStreamFn,
+	type CustomStreamSimpleFn,
+	clearCustomApis,
+	registerCustomApi,
+} from "../src/api-registry";
+import { AssistantMessageEventStream } from "../src/utils/event-stream";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -31,6 +48,191 @@ function hasBedrockCredentials(): boolean {
 			(Bun.env.AWS_PROFILE && Bun.env.AWS_PROFILE.length > 0),
 	);
 }
+
+function createCustomApiModel(api: string): Model<Api> {
+	return {
+		id: "custom-model",
+		name: "Custom model",
+		api,
+		provider: "custom-provider",
+		baseUrl: "https://custom.invalid",
+		reasoning: false,
+		input: ["text"],
+		output: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 8192,
+		maxTokens: 1024,
+	};
+}
+
+function createCustomApiResult(model: Model<Api>, text: string): AssistantMessageEventStream {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 1,
+	};
+	const events = new AssistantMessageEventStream();
+	events.push({ type: "start", partial: message });
+	events.end(message);
+	return events;
+}
+
+function resultText(message: AssistantMessage): string | undefined {
+	const block = message.content[0];
+	return block?.type === "text" ? block.text : undefined;
+}
+
+async function collectCustomResult(events: AssistantMessageEventStream): Promise<AssistantMessage> {
+	let sawStart = false;
+	for await (const event of events) {
+		if (event.type === "start") sawStart = true;
+	}
+	expect(sawStart).toBe(true);
+	return events.result();
+}
+
+afterEach(() => {
+	clearCustomApis();
+});
+
+describe("scoped custom API stream dispatch", () => {
+	const context: Context = { messages: [] };
+
+	it("dispatches the same API and source independently in stream and streamSimple", async () => {
+		const registryA = new CustomApiRegistry();
+		const registryB = new CustomApiRegistry();
+		const streamSimpleA: CustomStreamSimpleFn = model => createCustomApiResult(model, "simple-a");
+		const streamSimpleB: CustomStreamSimpleFn = model => createCustomApiResult(model, "simple-b");
+		const streamA: CustomStreamFn = model => createCustomApiResult(model, "stream-a");
+		const streamB: CustomStreamFn = model => createCustomApiResult(model, "stream-b");
+		registryA.register("custom-isolated", streamSimpleA, "same-source", streamA);
+		registryB.register("custom-isolated", streamSimpleB, "same-source", streamB);
+		const model = createCustomApiModel("custom-isolated");
+
+		const aLowLevel = await collectCustomResult(stream(model, context, { customApiRegistry: registryA }));
+		const bLowLevel = await collectCustomResult(stream(model, context, { customApiRegistry: registryB }));
+		const aSimple = await collectCustomResult(streamSimple(model, context, { customApiRegistry: registryA }));
+		const bSimple = await collectCustomResult(streamSimple(model, context, { customApiRegistry: registryB }));
+
+		expect(resultText(aLowLevel)).toBe("stream-a");
+		expect(resultText(bLowLevel)).toBe("stream-b");
+		expect(resultText(aSimple)).toBe("simple-a");
+		expect(resultText(bSimple)).toBe("simple-b");
+		registryA.dispose();
+		registryB.dispose();
+	});
+
+	it("uses the explicit scope with structured-cloned and JSON-copied models", async () => {
+		const registry = new CustomApiRegistry();
+		let calls = 0;
+		registry.register("custom-copy", model => {
+			calls += 1;
+			return createCustomApiResult(model, "explicit-scope");
+		});
+		const model = createCustomApiModel("custom-copy");
+		const models = [structuredClone(model), JSON.parse(JSON.stringify(model)) as Model<Api>];
+
+		for (const copiedModel of models) {
+			const result = await collectCustomResult(streamSimple(copiedModel, context, { customApiRegistry: registry }));
+			expect(resultText(result)).toBe("explicit-scope");
+		}
+		expect(calls).toBe(2);
+		registry.dispose();
+	});
+
+	it("retains process-wide dispatch when no scope is supplied", async () => {
+		let calls = 0;
+		registerCustomApi(
+			"custom-global-dispatch",
+			model => {
+				calls += 1;
+				return createCustomApiResult(model, "global-simple");
+			},
+			"global-source",
+			model => {
+				calls += 1;
+				return createCustomApiResult(model, "global-stream");
+			},
+		);
+		const model = createCustomApiModel("custom-global-dispatch");
+
+		const simple = await collectCustomResult(streamSimple(model, context));
+		const lowLevel = await collectCustomResult(stream(model, context));
+
+		expect(resultText(simple)).toBe("global-simple");
+		expect(resultText(lowLevel)).toBe("global-stream");
+		expect(calls).toBe(2);
+	});
+
+	it("does not use global handlers for a missing scoped custom API", () => {
+		let globalCalls = 0;
+		registerCustomApi("custom-scoped-miss", model => {
+			globalCalls += 1;
+			return createCustomApiResult(model, "global");
+		});
+		const registry = new CustomApiRegistry();
+		const model = createCustomApiModel("custom-scoped-miss");
+
+		expect(() => stream(model, context, { customApiRegistry: registry })).toThrow(
+			"Unhandled API: custom-scoped-miss",
+		);
+		expect(() => streamSimple(model, context, { customApiRegistry: registry })).toThrow(
+			"Unhandled API: custom-scoped-miss",
+		);
+		expect(globalCalls).toBe(0);
+		registry.dispose();
+	});
+
+	it("rejects disposed and fabricated scopes before built-in API dispatch", () => {
+		const model = createCustomApiModel("openai-completions");
+		const disposed = new CustomApiRegistry();
+		disposed.dispose();
+		const fabricated = Object.create(CustomApiRegistry.prototype) as CustomApiRegistry;
+
+		for (const registry of [disposed, fabricated]) {
+			expect(() => stream(model, context, { customApiRegistry: registry })).toThrow();
+			expect(() => streamSimple(model, context, { customApiRegistry: registry })).toThrow();
+		}
+	});
+
+	it("preserves the explicit registry through custom callback auth retry", async () => {
+		const registry = new CustomApiRegistry();
+		const seenRegistries: CustomApiRegistry[] = [];
+		let calls = 0;
+		registry.register("custom-auth-retry", (_model, _context, options) => {
+			seenRegistries.push(options!.customApiRegistry!);
+			calls += 1;
+			if (calls === 1) throw Object.assign(new Error("unauthorized"), { status: 401 });
+			return createCustomApiResult(_model, "retried");
+		});
+		const result = await collectCustomResult(
+			streamSimple(createCustomApiModel("custom-auth-retry"), context, {
+				customApiRegistry: registry,
+				apiKey: "old-key",
+				onAuthError: async () => "new-key",
+			}),
+		);
+
+		expect(resultText(result)).toBe("retried");
+		expect(calls).toBe(2);
+		expect(seenRegistries).toHaveLength(2);
+		expect(seenRegistries[0]).toBe(registry);
+		expect(seenRegistries[1]).toBe(registry);
+		registry.dispose();
+	});
+});
 
 // Calculator tool definition (same as examples)
 const calculatorSchema = z.object({

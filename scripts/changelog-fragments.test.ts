@@ -213,4 +213,34 @@ describe("CLI entrypoints", () => {
 		expect(guarded.exitCode).toBe(1);
 		expect(guarded.stderr).toContain("edits the shared");
 	});
+
+	test("history guard admits only fragment deletions a reachable release tag consumed", async () => {
+		const fragment = "packages/coding-agent/changelog.d/shipped.md";
+		const stray = "packages/coding-agent/changelog.d/stray.md";
+		const root = await tempDir();
+		await init(root);
+		await put(root, fragment, "### Fixed\n\n- Shipped.\n");
+		await put(root, stray, "### Fixed\n\n- Pending.\n");
+		await commit(root, "notes");
+		const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+		// The release commit folds and deletes the shipped fragment and carries the tag.
+		await git(root, ["checkout", "-q", "-b", "main"]);
+		await put(root, "packages/coding-agent/CHANGELOG.md", CHANGELOG.replace("## [1.0.0]", "## [1.0.1] - 2026-02-01\n\n### Fixed\n\n- Shipped.\n\n## [1.0.0]"));
+		await fs.rm(path.join(root, fragment));
+		await commit(root, "chore: bump version to 1.0.1");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+
+		const backmerged = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(backmerged.stderr).toBe("");
+		expect(backmerged.exitCode).toBe(0);
+
+		// Absence at head is not provenance: an untagged deletion still fails.
+		await fs.rm(path.join(root, stray));
+		await commit(root, "drop a pending note");
+		const dropped = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(dropped.exitCode).toBe(1);
+		expect(dropped.stderr).toContain(`${stray}::is deleted by this pull request`);
+		expect(dropped.stderr).not.toContain(`${fragment}::`);
+	});
 });

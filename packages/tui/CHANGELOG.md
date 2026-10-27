@@ -2,6 +2,108 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+### Fixed
+
+- Kitty and iTerm2 image encoders now reject a payload that is not RFC 4648 base64 before writing the terminal escape, so an early APC or OSC terminator in the image data cannot inject further control sequences.
+
+- Normalize local Markdown links to absolute, percent-encoded `file://` OSC 8 destinations, resolving relative paths from the active working directory and `~/` paths from the home directory. Link destinations are read as URI references, so percent-escapes are decoded and `#fragment` / `?query` suffixes (for example `src/file.ts#L12`) stay URI components. Network-path references (`//host/path`) are left unchanged rather than read as local absolute paths. Targets containing control characters remain non-clickable.
+
+- The Gajae Pet sprite is uploaded as a single-escape lossless PNG instead of chunked kitty raw RGBA (`f=32`), and every kitty escape is bounded to the protocol's 4096-byte limit in both the pet and inline-image paths. A pet animation frame used to emit several ~4 KB raw-RGBA chunk continuations per tick; when the terminal dropped one mid-payload the remaining base64 was painted into the transcript as text and the frame desynchronized. A sprite frame now costs a few hundred payload characters inside one complete escape.
+
+## [0.18.12] - 2026-10-16
+
+### Added
+
+- Render ```svg fenced code blocks as rasterized terminal images (Kitty, iTerm2, SIXEL). SVG figures stream inline with partial source repair, theme-aware token resolution through reserved `--gjc-<palette-key>` CSS variables, and automatic fallback to plain code blocks on rasterization failure. Ported from oh-my-pi.
+
+### Fixed
+
+- TUI no longer goes blank after stop/restart cycles: `#hardwareCursorRow` is now properly reset during `stop()` to prevent stale cursor position state from corrupting viewport calculations on the next `start()`.
+
+- With `clearOnShrink` enabled, a live block that shrinks after the transcript has scrolled into history no longer leaves blank spacer rows above the pinned composer until the next resize. The contraction now clears the screen and history and replays the frame, so the viewport is filled again and no row appears twice in history.
+
+- Scrub credentials from TUI render debug dumps and write them mode 0600 beside the debug log, without following a symlink at the dump path.
+
+## [0.18.11] - 2026-10-12
+
+### Fixed
+
+- Fixed the viewport going blank above the status line and input box when a tall live block (task output, streaming tool output) collapsed with `clearOnShrink` off: the TUI now replays the frame when padding to the committed frontier would leave no transcript row on screen.
+
+## [0.18.10] - 2026-10-12
+
+### Fixed
+
+- TUI no longer goes blank after stop/restart cycles: `#hardwareCursorRow` is now properly reset during `stop()` to prevent stale cursor position state from corrupting viewport calculations on the next `start()`.
+
+- With `clearOnShrink` enabled, a live block that shrinks after the transcript has scrolled into history no longer leaves blank spacer rows above the pinned composer until the next resize. The contraction now clears the screen and history and replays the frame, so the viewport is filled again and no row appears twice in history.
+
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- With mouse support on, dragging over Markdown copies the original Markdown instead of the painted glyphs: prose is joined across soft wraps, fully selected blocks copy their original Markdown (code with its original tabs, quotes with `>`), a selection inside a single code block drops the fences and presentation indent, and a partial table selection copies tab-separated cells without box drawing.
+- A held drag keeps extending while the wheel scrolls the transcript, and auto-scrolls while the pointer rests on the top or bottom transcript edge. A drag that leaves the window or crosses editor chrome keeps its selection instead of clearing it.
+
+### Fixed
+
+- Preserve the committed viewport frontier through bottom-pinned frame contractions and temporary manual-history handoffs, preventing scrolled-off transcript rows from being added to scrollback twice.
+
+## [0.18.8] - 2026-10-08
+
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+## [0.18.1] - 2026-09-29
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Unix TTY writes and out-of-band terminal capability sequences now share a lazily loaded native FIFO writer on Unix. Terminal teardown and process exit perform a bounded flush; Windows remains on Bun's stdout path.
+
+## [0.17.7] - 2026-09-25
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Fixed
+
+- `Text` rows, including custom-background rows, no longer exceed the viewport width.
+
+### Performance
+
+- Layout-only frames reuse a cached transcript prefix instead of copying and re-normalizing every row. Off-screen prefix identity is still checked by reference, and only the viewport window is normalized. Emitted bytes stay the same.
+
+- `Text` measures each row once and slices overflow instead of measuring again. `Loader` no longer re-clamps its rows.
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Performance
+
+- Avoid unsupported Kitty placement extraction on ordinary non-Kitty input frames.
+- Reuse unchanged editor logical-line layouts, including keyboard shrink/join paths that previously retained deleted-line cache entries.
+- Reuse the byte/line admission decision for exact cached Markdown highlights instead of rescanning unchanged fenced code.
+- Add a native-highlight input-to-synchronized-write benchmark with same-frame visibility checks. Scheduling, preparation, force precedence, and output revisions are unchanged.
+
+- Avoid allocating fallback arrays while attributing Kitty placements during frame assembly. Emitted terminal bytes are unchanged.
+
+- Hold the raw frame by reference instead of copying every transcript line during frame assembly. Emitted terminal bytes are unchanged.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

@@ -1,4 +1,7 @@
-import { THINKING_EFFORTS } from "@gajae-code/ai/core";
+// Import the leaf module, not the `@gajae-code/ai/core` barrel: this file is on the
+// static startup path of every `gjc` invocation, and the barrel eagerly evaluates every
+// provider SDK (openai, @anthropic-ai/sdk, zod locales, mermaid) before argv is parsed.
+import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
 import { type FlagDescriptor, Flags } from "@gajae-code/utils/cli";
 
 export const ROOT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
@@ -7,8 +10,6 @@ export type RootThinkingLevel = (typeof ROOT_THINKING_LEVELS)[number];
 /** Public launch flags shared by root help, completion, and the launch command. */
 export const ROOT_LAUNCH_FLAGS = {
 	model: Flags.string({ description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")' }),
-	smol: Flags.string({ description: "Smol/fast model for lightweight tasks (or GJC_SMOL_MODEL env)" }),
-	slow: Flags.string({ description: "Slow/reasoning model for thorough analysis (or GJC_SLOW_MODEL env)" }),
 	plan: Flags.string({ description: "Plan model for architectural planning (or GJC_PLAN_MODEL env)" }),
 	mpreset: Flags.string({ description: "Model profile preset to activate for this session" }),
 	default: Flags.boolean({ description: "Persist --mpreset as the default model profile" }),
@@ -16,11 +17,11 @@ export const ROOT_LAUNCH_FLAGS = {
 	"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
 	credential: Flags.string({
 		description:
-			"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
+			"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, org:<id|name>, or provider/email:<addr>",
 	}),
 	"prefer-credential": Flags.string({
 		description:
-			"Preferred stored credential with quota fallback: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/id:<n>",
+			"Preferred stored credential with quota fallback: email:<addr>, id:<n>, account:<id>, project:<id>, org:<id|name>, or provider/id:<n>",
 	}),
 	"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 	"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),

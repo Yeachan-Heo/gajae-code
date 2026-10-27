@@ -6,6 +6,7 @@ export type StateAction =
 	| "write"
 	| "clear"
 	| "contract"
+	| "approve-execution"
 	| "handoff"
 	| "graph"
 	| "prune"
@@ -19,6 +20,7 @@ export const STATE_ACTION_NAMES: ReadonlySet<StateAction> = new Set([
 	"write",
 	"clear",
 	"contract",
+	"approve-execution",
 	"handoff",
 	"graph",
 	"prune",

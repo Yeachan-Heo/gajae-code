@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/utils.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no source
+// changes.
 #[macro_export]
 macro_rules! env_uint {
 	// With clamp range: ... => [$min, $max];

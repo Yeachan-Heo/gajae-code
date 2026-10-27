@@ -4,7 +4,7 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath } from "@gajae-code/utils";
+import { getMCPConfigPath, logger } from "@gajae-code/utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { Settings } from "../config/settings";
@@ -15,6 +15,14 @@ import { readDisabledServers } from "./config-writer";
 import { canonicalizeMCPEndpoint } from "./pool-key";
 import { isMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
+
+function logSkippedServer(name: string, reason: string): void {
+	logger.warn("Skipping MCP autoload registration", {
+		path: `mcp:${name}`,
+		serverName: name,
+		reason,
+	});
+}
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
@@ -37,6 +45,8 @@ export interface LoadMCPConfigsOptions {
 	nativeOnly?: boolean;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/** This exact file was written by the lifecycle host. Skips sensitive `${VAR}` expansion. */
+	lifecycleOrigin?: boolean;
 	/**
 	 * Agent directory that holds the user scope (`<agentDir>/mcp.json`).
 	 * Default: `getAgentDir()`. Sessions created with their own `agentDir` pass it
@@ -95,6 +105,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			url: server.url ?? "",
 		};
 		if (server.headers) config.headers = server.headers;
+		if (server.publicNetwork === true) config.publicNetwork = true;
 		canonicalizeMCPEndpoint(config.url);
 		return config;
 	}
@@ -137,7 +148,11 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let configurationWarning = false;
 	let warnings: string[] = [];
 	if (exactConfig) {
-		const result = await loadMCPJsonFile(options.configPath!, "project", { quiet: true });
+		const lifecycleOrigin = options?.lifecycleOrigin === true;
+		const result = await loadMCPJsonFile(options.configPath!, "project", {
+			quiet: true,
+			skipSensitiveEnvNames: lifecycleOrigin,
+		});
 		servers = result.items;
 		disabledServers = new Set(result.disabledServers);
 		warnings = result.warnings ?? [];
@@ -174,13 +189,23 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	for (const server of servers) {
 		const config = convertToLegacyConfig(server);
 		if (config.enabled === false || disabledServers.has(server.name)) {
+			if (!exactConfig) {
+				logSkippedServer(
+					server.name,
+					config.enabled === false ? "registration is disabled" : "server is listed in disabledServers",
+				);
+			}
 			continue;
 		}
 		if (autoloadOnly && config.autoload === false) {
+			if (!exactConfig) logSkippedServer(server.name, "autoload is disabled for this registration");
 			continue;
 		}
 		configs[server.name] = config;
-		sources[server.name] = server._source;
+		sources[server.name] =
+			exactConfig && options?.lifecycleOrigin === true
+				? { ...server._source, lifecycleOrigin: true }
+				: server._source;
 	}
 
 	let exaApiKeys: string[] = [];

@@ -2,10 +2,12 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
-import { APP_NAME, isEnoent } from "@gajae-code/utils";
+import { APP_NAME, isCredentialKey, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import { SessionManager } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
+import { cssColorOrFallback } from "./css-color";
+import { openHtmlExportDestination } from "./html-export-destination";
 import { TEMPLATE } from "./template.generated";
 
 export interface ExportOptions {
@@ -78,16 +80,16 @@ async function generateThemeVars(themeName?: string): Promise<string> {
 	const colors = await getResolvedThemeColors(themeName);
 	const lines: string[] = [];
 	for (const [key, value] of Object.entries(colors)) {
-		lines.push(`--${key}: ${value};`);
+		lines.push(`--${key}: ${cssColorOrFallback(value, "transparent")};`);
 	}
 
 	const themeExport = await getThemeExportColors(themeName);
 	const userMessageBg = colors.userMessageBg || "#343541";
 	const derived = deriveExportColors(userMessageBg);
 
-	lines.push(`--body-bg: ${themeExport.pageBg ?? derived.pageBg};`);
-	lines.push(`--container-bg: ${themeExport.cardBg ?? derived.cardBg};`);
-	lines.push(`--info-bg: ${themeExport.infoBg ?? derived.infoBg};`);
+	lines.push(`--body-bg: ${cssColorOrFallback(themeExport.pageBg, derived.pageBg)};`);
+	lines.push(`--container-bg: ${cssColorOrFallback(themeExport.cardBg, derived.cardBg)};`);
+	lines.push(`--info-bg: ${cssColorOrFallback(themeExport.infoBg, derived.infoBg)};`);
 
 	return lines.join(" ");
 }
@@ -168,11 +170,6 @@ const HTML_EXPORT_SOURCE_OPEN_FLAGS =
 	syncFs.constants.O_NONBLOCK |
 	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
 
-const HTML_EXPORT_DESTINATION_OPEN_FLAGS =
-	syncFs.constants.O_WRONLY |
-	syncFs.constants.O_CREAT |
-	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
-
 function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
@@ -192,7 +189,7 @@ async function openHtmlExportDescriptors(
 			}
 			await assertExportDoesNotAliasSource(sourcePath, outputPath);
 		}
-		destination = syncFs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o666);
+		destination = openHtmlExportDestination(outputPath);
 		if (source !== undefined) {
 			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
 			const destinationIdentity = syncFs.fstatSync(destination, { bigint: true });
@@ -229,18 +226,18 @@ async function writeSessionHtml(
 	};
 	try {
 		sink.write(themedTemplate.slice(0, markerOffset));
-		writeEncoded(`{"header":${JSON.stringify(sm.getHeader())},"entries":[`);
+		writeEncoded(`{"header":${sessionEmbedJson(sm.getHeader())},"entries":[`);
 		let first = true;
 		sm.visitEntriesForExport(entry => {
-			writeEncoded(`${first ? "" : ","}${JSON.stringify(entry)}`);
+			writeEncoded(`${first ? "" : ","}${sessionEmbedJson(entry)}`);
 			first = false;
 		});
-		writeEncoded(`],"leafId":${JSON.stringify(sm.getLeafId())}`);
+		writeEncoded(`],"leafId":${sessionEmbedJson(sm.getLeafId())}`);
 		if (state?.systemPrompt !== undefined)
-			writeEncoded(`,"systemPrompt":${JSON.stringify(state.systemPrompt.join("\n\n"))}`);
+			writeEncoded(`,"systemPrompt":${sessionEmbedJson(state.systemPrompt.join("\n\n"))}`);
 		if (state?.tools !== undefined)
 			writeEncoded(
-				`,"tools":${JSON.stringify(state.tools.map(tool => ({ name: tool.name, description: tool.description })))}`,
+				`,"tools":${sessionEmbedJson(state.tools.map(tool => ({ name: tool.name, description: tool.description })))}`,
 			);
 		writeEncoded("}");
 		const final = encoder.finish();
@@ -254,6 +251,86 @@ async function writeSessionHtml(
 		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
 		syncFs.closeSync(descriptors.destination);
 	}
+}
+
+/**
+ * Own `__proto__` stays a data property; a normal object would turn that assignment into the prototype.
+ * Credential keys mask every JSON value, and string values are scrubbed directly so JSON escaping
+ * cannot turn ordinary quote characters into credential-value delimiters.
+ */
+function redactJsonValue(value: unknown): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (Array.isArray(value)) {
+		const isFlatKeyValueArray =
+			value.length > 0 &&
+			value.length % 2 === 0 &&
+			value.every((item, index) => index % 2 === 1 || typeof item === "string");
+		if (isFlatKeyValueArray) {
+			return value.map((item, index) => {
+				if (index % 2 === 1) {
+					const key = value[index - 1];
+					if (typeof key === "string" && isCredentialKey(key)) return "«redacted»";
+				}
+				return redactJsonValue(item);
+			});
+		}
+		return value.map(item => redactJsonValue(item));
+	}
+	if (value === null || typeof value !== "object") return value;
+	const source = value as Record<string, unknown>;
+	const sourceKeys = Object.keys(source);
+	let hasCredentialHeaderName = false;
+	let hasHeaderValue = false;
+	for (const key of sourceKeys) {
+		const field = key.toLowerCase();
+		if (field === "value" || field === "values") hasHeaderValue = true;
+		if (field !== "name" && field !== "key") continue;
+		const headerName = source[key];
+		if (typeof headerName === "string" && isCredentialKey(headerName)) hasCredentialHeaderName = true;
+	}
+	const redactHeaderValue = hasCredentialHeaderName && hasHeaderValue;
+	const redacted = Object.create(null) as Record<string, unknown>;
+	const nextSuffixByKey = new Map<string, number>();
+	for (const key of sourceKeys) {
+		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key), nextSuffixByKey);
+		const field = key.toLowerCase();
+		if (redactHeaderValue && (field === "value" || field === "values")) {
+			const headerValue = source[key];
+			redacted[redactedKey] =
+				field === "values" && Array.isArray(headerValue) ? headerValue.map(() => "«redacted»") : "«redacted»";
+		} else {
+			redacted[redactedKey] = redactKeyedValue(key, source[key]);
+		}
+	}
+	return redacted;
+}
+
+// Resume after the last collision for this base key rather than rescanning prior suffixes.
+function uniqueJsonObjectKey(
+	target: Record<string, unknown>,
+	key: string,
+	nextSuffixByKey: Map<string, number>,
+): string {
+	if (!Object.hasOwn(target, key)) return key;
+	let suffix = nextSuffixByKey.get(key) ?? 2;
+	let candidate = `${key}#${suffix}`;
+	while (Object.hasOwn(target, candidate)) {
+		suffix += 1;
+		candidate = `${key}#${suffix}`;
+	}
+	nextSuffixByKey.set(key, suffix + 1);
+	return candidate;
+}
+
+function redactKeyedValue(key: string, value: unknown): unknown {
+	// A recognized key is authoritative for every JSON type, including a short
+	// string, a number, an array, or a nested object.
+	if (isCredentialKey(key)) return "«redacted»";
+	return typeof value === "string" ? redactCrashSecrets(value) : redactJsonValue(value);
+}
+
+function sessionEmbedJson(value: unknown): string {
+	return JSON.stringify(redactJsonValue(JSON.parse(JSON.stringify(value))));
 }
 
 /** Export session to HTML using SessionManager and AgentState. */

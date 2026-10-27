@@ -1,4 +1,11 @@
 export const MCP_MAX_CONTENT_BYTES = 16 * 1024 * 1024;
+// Match the pasted-image count limit; bound decode attempts as well as output count.
+export const MCP_MAX_IMAGES = 16;
+// Bound decoded source complexity before native image decoding.
+export const MCP_MAX_IMAGE_SOURCE_DIMENSION = 8_192;
+export const MCP_MAX_IMAGE_SOURCE_PIXELS = 16_000_000;
+// Decoded image-file bytes after resizing, before base64 encoding (per result).
+export const MCP_MAX_IMAGE_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const MCP_MAX_ERROR_BYTES = 16 * 1024;
 export const MCP_MAX_SSE_REQUEST_MESSAGES = 1024;
 export const MCP_MAX_SSE_BATCH_MESSAGES = 1024;

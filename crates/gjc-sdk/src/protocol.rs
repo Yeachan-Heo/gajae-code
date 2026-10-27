@@ -461,6 +461,9 @@ pub enum ServerMessage {
 	ToolActivity(ToolActivity),
 	/// A finalized, provider-supplied reasoning summary.
 	ReasoningSummary(ReasoningSummary),
+	/// Notify-only, content-free interactive input signal; gated by
+	/// `awaiting_input_v1`.
+	AwaitingInput(AwaitingInput),
 
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
 	#[serde(other)]
@@ -616,6 +619,25 @@ pub struct ReasoningSummary {
 	pub text:       String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub turn_ref:   Option<String>,
+}
+
+/// Notify-only interactive input signal, gated by `awaiting_input_v1`.
+/// Content-free: never contains a URL, code, command, or output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwaitingInput {
+	pub session_id:   String,
+	pub tool_call_id: String,
+	pub tool_name:    String,
+	pub kind:         AwaitingInputKind,
+}
+
+/// The content-free kind of interactive input needed by a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitingInputKind {
+	BrowserAuth,
+	DeviceCode,
 }
 
 /// An agent-produced image artifact for a session thread.
@@ -1209,6 +1231,9 @@ pub mod capabilities {
 	pub const CONTEXT: &str = "context";
 	/// Live + finalized turn streaming.
 	pub const TURN_STREAM: &str = "turn_stream";
+	/// Observe live turn content without owning the submission (requires
+	/// `TURN_STREAM`).
+	pub const SESSION_HOST_OBSERVER_V1: &str = "session_host_observer_v1";
 	/// Image attachments.
 	pub const IMAGES: &str = "images";
 	/// Config push/commands.
@@ -1239,6 +1264,8 @@ pub mod capabilities {
 	/// protocol change across native server call sites; its advertised value is
 	/// the v2 contract.
 	pub const TOOL_ACTIVITY_V1: &str = TOOL_ACTIVITY_V2;
+	/// Notify-only interactive input signal without prompt contents.
+	pub const AWAITING_INPUT_V1: &str = "awaiting_input_v1";
 	/// Ephemeral side-turn request, cancellation, and terminal result frames.
 	pub const EPHEMERAL_TURN_V1: &str = "ephemeral_turn_v1";
 }
@@ -1596,6 +1623,25 @@ mod tests {
 	}
 
 	#[test]
+	fn awaiting_input_round_trips_and_rejects_unknown_kind() {
+		let json = r#"{"type":"awaiting_input","sessionId":"s","toolCallId":"c","toolName":"bash","kind":"device_code"}"#;
+		let frame: ServerMessage = serde_json::from_str(json).unwrap();
+		assert_eq!(
+			frame,
+			ServerMessage::AwaitingInput(AwaitingInput {
+				session_id:   "s".into(),
+				tool_call_id: "c".into(),
+				tool_name:    "bash".into(),
+				kind:         AwaitingInputKind::DeviceCode,
+			})
+		);
+		assert_eq!(serde_json::to_string(&frame).unwrap(), json);
+		assert!(serde_json::from_str::<ServerMessage>(
+			r#"{"type":"awaiting_input","sessionId":"s","toolCallId":"c","toolName":"bash","kind":"unknown"}"#
+		).is_err());
+	}
+
+	#[test]
 	fn tool_activity_phase_snake_case() {
 		for (phase, expected) in [
 			(ToolActivityPhase::Started, "started"),
@@ -1905,7 +1951,7 @@ mod tests {
 			EphemeralTurnResult { message_id: 0, ..valid.clone() },
 			EphemeralTurnResult { message_id: MAX_SAFE_INTEGER + 1, ..valid.clone() },
 			EphemeralTurnResult { thread_id: "0".into(), ..valid.clone() },
-			EphemeralTurnResult { status: EphemeralTurnStatus::Busy, ..valid.clone() },
+			EphemeralTurnResult { status: EphemeralTurnStatus::Busy, ..valid },
 		] {
 			assert!(serde_json::to_string(&invalid).is_err(), "serialized {invalid:?}");
 		}

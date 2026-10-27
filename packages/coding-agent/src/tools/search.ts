@@ -5,12 +5,10 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { GrepMatch, GrepResult, grep as grepFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
-import searchDescription from "../prompts/tools/search.md" with { type: "text" };
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead } from "../session/streaming-output";
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -21,6 +19,7 @@ import {
 	openArchive,
 	parseArchivePathCandidates,
 } from "./archive-reader";
+import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import { formatMatchLine } from "./match-line-format";
@@ -35,6 +34,7 @@ import {
 	PREVIEW_LIMITS,
 	splitGroupsByBlankLine,
 } from "./render-utils";
+import { searchToolDescriptionForSession } from "./session-descriptions";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -259,11 +259,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 	readonly loadMode = "discoverable";
 	readonly summary = "Search file contents using ripgrep (fast text search)";
 	get description(): string {
-		const displayMode = resolveFileDisplayMode(this.session);
-		return prompt.render(searchDescription, {
-			IS_HL_MODE: displayMode.hashLines,
-			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
-		});
+		return searchToolDescriptionForSession(this.session);
 	}
 	readonly parameters = searchSchema;
 	readonly strict = true;
@@ -557,7 +553,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 					};
 					const text = warningNote ? `No matches found\n${warningNote}` : "No matches found";
-					const noMatchResult = toolResult(details).text(text).done();
+					const noMatchResult = toolResult(details).text(wrapUntrustedContent(text)).done();
 					await cleanupArchiveScratch();
 					throwIfSearchCancelled();
 					return noMatchResult;
@@ -681,7 +677,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				if (truncation.truncated) details.truncation = truncation;
 				if (linesTruncated) details.linesTruncated = true;
 				const resultBuilder = toolResult(details)
-					.text(output)
+					.text(wrapUntrustedContent(output))
 					.limits({ columnMax: linesTruncated ? DEFAULT_MAX_COLUMN : undefined });
 				if (truncation.truncated) {
 					resultBuilder.truncation(truncation, { direction: "head" });

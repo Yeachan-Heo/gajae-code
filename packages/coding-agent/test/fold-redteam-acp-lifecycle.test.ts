@@ -10,6 +10,7 @@
  */
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { AsyncJobManager } from "../src/async";
+import { Settings } from "../src/config/settings";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/client-bridge";
 import type { FoldAdapter } from "../src/session/fold-coordinator";
 import type { ToolSession } from "../src/tools";
@@ -31,12 +32,14 @@ function makeHarness(bridge: ClientBridge): Harness {
 		},
 	});
 	const adapters: FoldAdapter[] = [];
+	const shellSettings = Settings.isolated();
 	const session = {
 		cwd: "/tmp",
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
 		settings: {
+			getShellConfig: () => shellSettings.getShellConfig(),
 			get(key: string) {
 				if (key === "async.enabled") return true;
 				if (key === "bash.autoBackground.enabled") return false;

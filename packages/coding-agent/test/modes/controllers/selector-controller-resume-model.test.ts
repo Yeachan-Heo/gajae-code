@@ -218,4 +218,26 @@ describe("SelectorController resume model choice", () => {
 		expect(ctx.retryLoader).toBeUndefined();
 		expect(ctx.retryCountdownTimer).toBeUndefined();
 	});
+
+	it("cancels the next-prompt suggestion before switching sessions from the picker", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const { ctx } = createContext({
+			sessionModel: sonnet,
+			settings: Settings.isolated(),
+			setModel: vi.fn(async () => {}),
+		});
+		const order: string[] = [];
+		ctx.promptSuggestion = {
+			clear: vi.fn(() => order.push("clear")),
+		} as unknown as TestContext["promptSuggestion"];
+		(ctx.session as unknown as { switchSession: () => Promise<boolean> }).switchSession = vi.fn(async () => {
+			order.push("switch");
+			return true;
+		});
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/active.jsonl");
+
+		expect(order.slice(0, 2)).toEqual(["clear", "switch"]);
+	});
 });

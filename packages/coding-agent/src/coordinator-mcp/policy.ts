@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { coordinatorMcpStateRoot, gjcRoot } from "../gjc-runtime/session-layout";
 import {
 	DEFAULT_SESSION_IDLE_TTL_MS,
@@ -86,9 +87,19 @@ const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, CoordinatorMutationClass>(
 	["report", "reports"],
 ]);
 
+// Number.parseInt reads a leading digit prefix ("64KB" -> 64, "1e6" -> 1,
+// "1.5" -> 1), which would silently shrink a cap or TTL to a tiny value. Only
+// plain decimal digits count; anything else falls back to the default.
+function parsePositiveInt(value: string | undefined): number | undefined {
+	const trimmed = (value ?? "").trim();
+	if (!/^\d+$/.test(trimmed)) return undefined;
+	const parsed = Number.parseInt(trimmed, 10);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function parsePositiveIntMs(value: string | undefined, fallback: number, floor: number): number {
-	const parsed = Number.parseInt((value ?? "").trim(), 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+	const parsed = parsePositiveInt(value);
+	if (parsed === undefined) return fallback;
 	return Math.max(floor, parsed);
 }
 
@@ -111,9 +122,34 @@ function parseRootList(value: string | undefined): string[] {
 		.filter(Boolean);
 }
 
+const MANAGED_WORKTREE_DIR_ENV = "GJC_WORKTREE_DIR";
+/** Captured at load so a later chdir or dotenv delete cannot hide the declaration. */
+const startupManagedWorktreeSnapshot = projectEnvSnapshot();
+
+/**
+ * Operator value only. A project dotenv declaration, including a dynamic one,
+ * must not widen managed worktree roots. An operator value the project does
+ * not declare is kept.
+ */
+function trustedManagedWorktreeDir(env: NodeJS.ProcessEnv): string | undefined {
+	const raw = env[MANAGED_WORKTREE_DIR_ENV];
+	if (!raw) return undefined;
+	const key = canonicalEnvKey(MANAGED_WORKTREE_DIR_ENV);
+	const declared = startupManagedWorktreeSnapshot.values[key];
+	const trimmed = raw.trim();
+	if (
+		declared !== undefined &&
+		(startupManagedWorktreeSnapshot.dynamic.has(key) || declared === raw || declared === trimmed)
+	) {
+		return undefined;
+	}
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function resolveManagedWorktreeRoot(root: string, configured: string | undefined): string {
-	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, os.homedir());
-	const resolved = template.replaceAll("{repo}", path.basename(root));
+	// Function replacers so a `$` in the home or repository path is kept verbatim.
+	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, () => os.homedir());
+	const resolved = template.replaceAll("{repo}", () => path.basename(root));
 	return path.resolve(path.isAbsolute(resolved) ? resolved : path.join(path.dirname(root), resolved));
 }
 
@@ -133,8 +169,8 @@ function parseMutationClasses(value: string | undefined): Set<CoordinatorMutatio
 }
 
 function parseByteCap(value: string | undefined): number {
-	const parsed = Number.parseInt(value ?? "", 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_ARTIFACT_BYTE_CAP;
+	const parsed = parsePositiveInt(value);
+	if (parsed === undefined) return DEFAULT_ARTIFACT_BYTE_CAP;
 	return Math.min(parsed, MAX_ARTIFACT_BYTE_CAP);
 }
 
@@ -157,7 +193,7 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 	return {
 		allowedRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
 		managedWorktreeRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root =>
-			resolveManagedWorktreeRoot(path.resolve(root), env.GJC_WORKTREE_DIR),
+			resolveManagedWorktreeRoot(path.resolve(root), trustedManagedWorktreeDir(env)),
 		),
 		mutationClasses: parseMutationClasses(
 			env.GJC_COORDINATOR_MCP_MUTATIONS ?? env.GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES,
@@ -275,11 +311,16 @@ export async function assertCoordinatorSessionLocations(
 	]);
 	// Reauthorize both persisted locations independently. A managed worktree may
 	// differ from the requested cwd, but neither may escape the current roots.
-	if (
-		!roots.some(root => isInsideCanonicalRoot(canonicalCwd, root, platform)) ||
-		!roots.some(root => isInsideCanonicalRoot(canonicalWorkspace, root, platform))
-	)
-		throw new Error("coordinator_workdir_outside_allowed_roots");
+	const escaped: string[] = [];
+	if (!roots.some(root => isInsideCanonicalRoot(canonicalCwd, root, platform))) escaped.push(`cwd ${canonicalCwd}`);
+	if (!roots.some(root => isInsideCanonicalRoot(canonicalWorkspace, root, platform)))
+		escaped.push(`workspace ${canonicalWorkspace}`);
+	if (escaped.length > 0)
+		// The message stays exact because isSessionAuthorityError() in server.ts matches it
+		// verbatim; the escaping location rides in `cause` so a caller that logs can name it.
+		throw new Error("coordinator_workdir_outside_allowed_roots", {
+			cause: new Error(`outside allowed roots: ${escaped.join(", ")}`),
+		});
 }
 
 export async function assertCoordinatorArtifactPath(

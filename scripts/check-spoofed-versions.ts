@@ -10,12 +10,17 @@
  * so a stale `claude-cli/<version>` surfaces as an HTTP 400 on a model that
  * otherwise works. This script detects drift so we can bump before users hit it.
  *
+ * The Claude Code fingerprint also self-updates at runtime (see
+ * `packages/ai/src/providers/claude-code-version.ts`); the constant checked here
+ * is the bundled floor used before the first lookup succeeds or when offline.
+ *
  * Usage:
  *   bun scripts/check-spoofed-versions.ts           # check and report
  *   bun scripts/check-spoofed-versions.ts --update  # update source in-place
  */
 
 import * as path from "node:path";
+import { fetchLatestClaudeCodeVersion } from "../packages/ai/src/providers/claude-code-version";
 
 const REPO_ROOT = path.join(import.meta.dir, "..");
 
@@ -49,37 +54,6 @@ async function fetchLatestGitHubRelease(repo: string): Promise<string | null> {
 	}
 }
 
-/**
- * Anthropic's native-installer release channel. `stable` deliberately lags the
- * npm package during a staged rollout, so `latest` is the channel that matches
- * what a freshly updated Claude Code actually reports.
- */
-const CLAUDE_RELEASE_CHANNEL =
-	"https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/latest";
-
-const CLAUDE_NPM_DIST_TAG = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
-
-async function fetchClaudeReleaseChannel(): Promise<string | null> {
-	try {
-		const res = await fetch(CLAUDE_RELEASE_CHANNEL, { headers: { "User-Agent": USER_AGENT } });
-		if (!res.ok) return null;
-		return SEMVER_RE.exec((await res.text()).trim())?.[1] ?? null;
-	} catch {
-		return null;
-	}
-}
-
-async function fetchClaudeNpmVersion(): Promise<string | null> {
-	try {
-		const res = await fetch(CLAUDE_NPM_DIST_TAG, { headers: { "User-Agent": USER_AGENT } });
-		if (!res.ok) return null;
-		const data = (await res.json()) as { version?: string };
-		return data.version ? (SEMVER_RE.exec(data.version)?.[1] ?? null) : null;
-	} catch {
-		return null;
-	}
-}
-
 function compareSemver(a: string, b: string): number {
 	const left = a.split(".").map(Number);
 	const right = b.split(".").map(Number);
@@ -90,19 +64,12 @@ function compareSemver(a: string, b: string): number {
 	return 0;
 }
 
-/** Highest of the candidates, so one lagging or unavailable source cannot pin us back. */
-function highest(candidates: ReadonlyArray<string | null>): string | null {
-	const known = candidates.filter((value): value is string => value !== null);
-	if (known.length === 0) return null;
-	return known.reduce((best, value) => (compareSemver(value, best) > 0 ? value : best));
-}
-
 const checks: VersionCheck[] = [
 	{
 		name: "Claude Code",
-		file: "packages/ai/src/providers/anthropic.ts",
-		sourcePattern: /claudeCodeVersion\s*=\s*"(\d+\.\d+\.\d+)"/,
-		fetchLatest: async () => highest(await Promise.all([fetchClaudeReleaseChannel(), fetchClaudeNpmVersion()])),
+		file: "packages/ai/src/providers/claude-code-version.ts",
+		sourcePattern: /CLAUDE_CODE_BASELINE_VERSION\s*=\s*"(\d+\.\d+\.\d+)"/,
+		fetchLatest: () => fetchLatestClaudeCodeVersion(fetch, USER_AGENT),
 	},
 	{
 		name: "Gemini CLI",

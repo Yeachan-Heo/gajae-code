@@ -14,7 +14,7 @@ import { logger } from "@gajae-code/utils";
 import { isNoAuthBrowserOriginRequest, timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
 import type { Provider } from "../types";
-import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, hostHeaderMatchesBind, parseBind } from "../utils/parse-bind";
 import { AUTH_BROKER_EPOCH_HEADER } from "./client";
 import { cleanReason } from "./redact";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
@@ -51,6 +51,11 @@ export interface AuthBrokerServerOptions {
 	bind?: string;
 	/** Accept any of these bearer tokens. Empty disables auth (loopback only). */
 	bearerTokens: string[];
+	/**
+	 * Re-read the allow-list on each authenticated request. An empty result or a
+	 * throw keeps the previous list, so a failed read does not disable auth.
+	 */
+	readBearerTokens?: () => readonly string[] | Promise<readonly string[]>;
 	/** Broker version string surfaced on `/v1/healthz`. */
 	version?: string;
 	/** Refresh credentials expiring within this window. Default 5 min. */
@@ -553,8 +558,27 @@ function serveSnapshotStream(
 /** Boot the broker. Caller owns lifecycle; `handle.close()` to stop. */
 export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_BROKER_BIND);
-	const tokens = new Set<string>(opts.bearerTokens);
+	let tokens = new Set<string>(opts.bearerTokens);
+	let bearerReadSerial = 0;
+	let bearerPublishedSerial = 0;
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
+	async function bearerAllowList(signal: AbortSignal): Promise<ReadonlySet<string>> {
+		const read = opts.readBearerTokens;
+		if (!read || signal.aborted) return tokens;
+		const serial = ++bearerReadSerial;
+		let next: readonly string[];
+		try {
+			next = await read();
+		} catch {
+			return tokens;
+		}
+		// A read that started earlier must not replace a list already published
+		// by a later read, and this request authenticates with that current list.
+		if (signal.aborted || next.length === 0 || serial < bearerPublishedSerial) return tokens;
+		tokens = new Set(next);
+		bearerPublishedSerial = serial;
+		return tokens;
+	}
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
 	let epochSequence: number;
@@ -580,6 +604,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	refresher?.start();
 	const generationGate = new GenerationGate(opts.storage);
 
+	let listenPort = bind.port;
 	const server = Bun.serve({
 		hostname: bind.hostname,
 		port: bind.port,
@@ -594,7 +619,8 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const body: HealthzResponse = { ok: true, version };
 					return json(200, body);
 				}
-				if (isNoAuthBrowserOriginRequest(req, tokens)) {
+				const allow = await bearerAllowList(req.signal);
+				if (isNoAuthBrowserOriginRequest(req, allow)) {
 					logger.info("auth-broker no-auth browser-origin request rejected", {
 						method: req.method,
 						path: pathname,
@@ -603,7 +629,18 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					});
 					return json(403, { error: "no-auth rejects requests carrying Origin" });
 				}
-				if (!isAuthorized(req, tokens)) {
+				if (allow.size === 0) {
+					if (!hostHeaderMatchesBind(req.headers.get("host"), { hostname: bind.hostname, port: listenPort })) {
+						logger.info("auth-broker no-auth host rejected", {
+							method: req.method,
+							path: pathname,
+							peer,
+							hostPresent: req.headers.has("host"),
+						});
+						return json(403, { error: "no-auth rejects a host that is not the loopback bind" });
+					}
+				}
+				if (!isAuthorized(req, allow)) {
 					logger.info("auth-broker request unauthorized", { method: req.method, path: pathname, peer });
 					return json(401, { error: "unauthorized" });
 				}
@@ -661,7 +698,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						const parsed = await parseBody(req, credentialRefreshRequestSchema, { allowEmpty: true });
 						if (!parsed.ok) return parsed.response;
 						const refreshRequest: CredentialRefreshRequest = parsed.data;
-						const entry = await opts.storage.refreshCredentialById(id, req.signal, refreshRequest);
+						const entry = await opts.storage.refreshCredentialById(
+							id,
+							req.signal,
+							refreshRequest,
+							refreshRequest.expectedRevision,
+						);
 						const body: CredentialRefreshResponse = { entry };
 						logger.info("auth-broker credential refreshed", {
 							id,
@@ -757,6 +799,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 			}
 		},
 	});
+	listenPort = server.port ?? listenPort;
 
 	const boundHost = server.hostname ?? bind.hostname;
 	const boundPort = server.port ?? bind.port;

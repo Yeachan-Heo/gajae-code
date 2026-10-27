@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { installGjcBundle, loadAlwaysOnPluginTools, renderSkillAdvertisement } from "../src/extensibility/gjc-plugins";
+import { hashStableFile } from "../src/extensibility/gjc-plugins/runtime-adapters";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
@@ -226,5 +227,90 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 
 		const after = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
 		expect(after).toBe("");
+	});
+});
+
+describe("startup Node authority hashing (#5941)", () => {
+	test("hashes a multi-chunk file to its exact SHA-256 while following symlinks", async () => {
+		const cwd = await mkCwd();
+		// Larger than one 1 MiB read chunk and not chunk-aligned, so digest continuity is exercised.
+		const bytes = new Uint8Array(3 * 1024 * 1024 + 17);
+		for (let index = 0; index < bytes.length; index++) bytes[index] = (index * 31 + 7) & 0xff;
+		const target = path.join(cwd, "node");
+		await Bun.write(target, bytes);
+		const link = path.join(cwd, "node-link");
+		await fs.symlink(target, link);
+
+		const expected = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+		expect(await hashStableFile(target, "Node", bytes.length)).toBe(expected);
+		expect(await hashStableFile(link, "Node", bytes.length)).toBe(expected);
+	});
+
+	test("rejects files over the byte limit and non-regular files", async () => {
+		const cwd = await mkCwd();
+		const target = path.join(cwd, "node");
+		await Bun.write(target, new Uint8Array(4096));
+		await expect(hashStableFile(target, "Initial Node executable", 4095)).rejects.toThrow(
+			"Initial Node executable exceeds its byte limit",
+		);
+		await expect(hashStableFile(cwd, "Initial Node executable", 4096)).rejects.toThrow(
+			"Initial Node executable is not a regular file",
+		);
+	});
+
+	test.skipIf(process.platform !== "linux")(
+		"binds first-use digests to the startup file object and keeps hard-link aliases",
+		async () => {
+			// Temporary roots never become Node authority, so the fixture lives in the checkout.
+			const cwd = await fs.mkdtemp(path.join(import.meta.dir, ".node-authority-"));
+			tempDirs.push(cwd);
+			const dirs = ["kept", "alias", "swapped"].map(name => path.join(cwd, name));
+			for (const dir of dirs) await fs.mkdir(dir);
+			const [kept, alias, swapped] = dirs.map(dir => path.join(dir, "node"));
+			await Bun.write(kept, "startup-node");
+			// A hard link has its own realpath but shares the inode; both must stay authority.
+			await fs.link(kept, alias);
+			await Bun.write(swapped, "startup-swapped");
+			const sha = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
+			// A fresh process so the PATH snapshot is taken from real startup state.
+			const script = `
+				const fs = require("node:fs/promises");
+				const { getInitialNodeHash } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/extensibility/gjc-plugins/runtime-adapters"))});
+				await Bun.sleep(50);
+				await Bun.write(${JSON.stringify(`${swapped}.new`)}, "replaced-node");
+				await fs.rename(${JSON.stringify(`${swapped}.new`)}, ${JSON.stringify(swapped)});
+				console.log(JSON.stringify(await Promise.all(${JSON.stringify([kept, alias, swapped])}.map(p => getInitialNodeHash(p).then(h => h ?? null)))));
+			`;
+			const child = Bun.spawn([process.execPath, "-e", script], {
+				env: { ...process.env, PATH: dirs.join(path.delimiter) },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+			expect(JSON.parse(stdout.trim().split("\n").at(-1)!)).toEqual([
+				sha("startup-node"),
+				sha("startup-node"),
+				null,
+			]);
+		},
+	);
+
+	test("rejects a file that is not the expected startup object", async () => {
+		const cwd = await mkCwd();
+		const target = path.join(cwd, "node");
+		await Bun.write(target, "startup");
+		const stat = await fs.stat(target);
+		const identity = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+		expect(await hashStableFile(target, "Node", 1024, identity)).toBe(
+			new Bun.CryptoHasher("sha256").update("startup").digest("hex"),
+		);
+		await Bun.write(`${target}.new`, "startup");
+		await fs.rename(`${target}.new`, target);
+		await expect(hashStableFile(target, "Node", 1024, identity)).rejects.toThrow("Node is not the expected file");
 	});
 });

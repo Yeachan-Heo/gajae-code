@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
 import {
 	type CodexHandoffOriginV1,
@@ -21,6 +22,8 @@ import {
 	admitSessionClose,
 	advanceDeletion,
 	advanceDeliveryDiscoveryCursor,
+	bindCreationRequest,
+	type CanonicalCreateIntentV1,
 	claimPublicDelivery,
 	coordinatorStatePaths,
 	deterministicOutboxId,
@@ -42,6 +45,11 @@ import {
 import { MAX_REAP_FAILURES } from "../src/coordinator-mcp/session-reaper";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
+import {
+	BrokerWorkflowGateEmitter,
+	FileGateStore,
+	MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -66,6 +74,7 @@ import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 import { resolveSdkHostModel, type SdkHostModelRegistryLoader } from "../src/sdk/host/model-pin";
 import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import { writeDurableCoordinatorSession } from "./helpers/coordinator-session-fixture";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
 	cleanupFixtureRoot,
@@ -79,15 +88,15 @@ import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-author
 installExactIdentityNatives();
 
 /**
- * Resolution time for the stubbed workflow gate. It MUST stay inside the
- * coordinator's compaction retention window and therefore MUST NOT be a literal.
+ * Resolution time for the stubbed workflow gate. Keep it recent rather than
+ * pinning an arbitrary date: these cases exercise the ordinary accepted-answer
+ * path, while the skewed-timestamp cases below deliberately use old values.
  *
- * The product stamps this remote-supplied value onto the answer request's
- * `updated_at`, and `compactTransaction` deletes a `completed` request whose
- * `updated_at` is older than `RETENTION_MS` (30 days). A hardcoded date silently
- * turns these cases red exactly 30 days after the day it names, with no code
- * change and nothing in git history to point at: the previous literal
- * `2026-08-20T00:00:00.000Z` expired at `2026-09-19T00:00:00Z`.
+ * The product preserves this remote-supplied value as receipt metadata while
+ * stamping the answer request's `updated_at` from local persistence time, and
+ * `compactTransaction` deletes a `completed` request whose `updated_at` is older
+ * than `RETENTION_MS` (30 days). Remote receipt timestamps do not determine
+ * the request's retention age.
  */
 const GATE_RESOLVED_AT = new Date(Date.now() - 60_000).toISOString();
 
@@ -139,6 +148,33 @@ async function injectPendingDeliveryForTest(
 		registry.retained_sessions[sessionId] = { session_id: sessionId, updated_at: new Date().toISOString() };
 	});
 	await fs.access(transactionPath(paths, sessionId));
+}
+
+async function leaveStartSessionCreationIncomplete(
+	server: CoordinatorMcpServer,
+	root: string,
+	idempotencyKey: string,
+): Promise<void> {
+	const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+	const creationKeyDigest = createHash("sha256")
+		.update(`gjc_coordinator_start_session\0${idempotencyKey}`)
+		.digest("hex");
+	await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[creationKeyDigest];
+		if (!request?.canonical_create_intent) throw new Error("missing_start_session_creation_intent");
+		request.phase = "wal_committed";
+		delete request.safe_response;
+	});
+	const receiptFile = path.join(
+		coordinatorNamespace(root),
+		"idempotency",
+		`${createHash("sha256").update(idempotencyKey).digest("hex")}.json`,
+	);
+	const receipt = JSON.parse(await fs.readFile(receiptFile, "utf8")) as Record<string, unknown>;
+	delete receipt.response;
+	delete receipt.completed_at;
+	receipt.state = "in_progress";
+	await fs.writeFile(receiptFile, `${JSON.stringify(receipt)}\n`);
 }
 
 /** Real detached-broker fixtures are cleaned solely by cleanupFixtureRoot. */
@@ -267,7 +303,7 @@ function testBrokerDiscovery(): BrokerDiscovery {
 		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
 		port: 1,
-		url: "ws://broker.example.test",
+		url: "ws://127.0.0.1:1",
 		token: "test-token",
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
@@ -483,7 +519,10 @@ async function createSdkControlServer(
 							const sessionId = input.sessionId;
 							const index = brokerSessions.findIndex(session => session.sessionId === sessionId);
 							if (index >= 0) brokerSessions.splice(index, 1);
-							return { ok: true, result: { sessionId } };
+							return {
+								ok: true,
+								result: { sessionId, ...(input.forceRetireStale === true ? { retired: true } : {}) },
+							};
 						}
 						if (operation === "session.create") {
 							const target = input.target as Record<string, unknown> | undefined;
@@ -605,8 +644,8 @@ async function createSdkControlServer(
 		pid: process.pid,
 		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
-		port: 1,
-		url: "ws://sdk.example.test",
+		port: 2,
+		url: "ws://127.0.0.1:2",
 		token: "broker-discovery-secret",
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
@@ -714,6 +753,255 @@ async function patchTurnDelivery(
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
+	it("delivers active feedback as a correlated steer without creating a queued turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.steer"
+					? { ok: true, result: { accepted: true, status: "accepted", clientRef: control.input.clientRef } }
+					: undefined,
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work needing operator input",
+			idempotency_key: "feedback-work",
+			allow_mutation: true,
+		});
+		const transaction = await readSessionTransaction(
+			coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity),
+			"visible-session",
+		);
+		const activeTurn = transaction!.canonical.turns[String(sent.turn_id)]!;
+		const expectedSdkRunToken = `${activeTurn.delivery.runtime_command_id}:${activeTurn.delivery.runtime_turn_id}`;
+		const input = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			prompt: "requested source is ready",
+			steer: true,
+			idempotency_key: "feedback-source",
+			allow_mutation: true,
+		};
+		const feedback = await server.callTool("gjc_coordinator_send_prompt", input);
+		expect(feedback).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			queued: false,
+			turn_id: sent.turn_id,
+			consumption_verified: false,
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toEqual(feedback);
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", { ...input, prompt: "different evidence" }),
+		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				...input,
+				turn_id: undefined,
+				idempotency_key: "feedback-missing-turn",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_turn_id" } });
+		expect(controls.filter(control => control.operation === "turn.steer")).toEqual([
+			{
+				operation: "turn.steer",
+				input: {
+					text: input.prompt,
+					clientRef: feedback.steer_client_ref,
+					expectedSdkRunToken,
+				},
+				idempotencyKey: input.idempotency_key,
+			},
+		]);
+		expect(Object.keys(transaction!.canonical.turns)).toEqual([String(sent.turn_id)]);
+		const refused = await server.callTool("gjc_coordinator_send_prompt", {
+			...input,
+			queue: true,
+			idempotency_key: "feedback-invalid",
+		});
+		expect(refused).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		const stale = await server.callTool("gjc_coordinator_send_prompt", {
+			...input,
+			turn_id: "turn-11111111-2222-4333-8444-555555555555",
+			idempotency_key: "feedback-stale",
+		});
+		expect(stale).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
+		expect(controls.filter(control => control.operation === "turn.steer")).toHaveLength(1);
+	});
+
+	it.each([
+		"runtime_command_id",
+		"runtime_turn_id",
+	] as const)("refuses active-turn steering when %s is missing", async missingRuntimeId => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "missing-runtime-id-work",
+			allow_mutation: true,
+		});
+		const turnId = String(sent.turn_id);
+		await patchTurnDelivery(server, "visible-session", turnId, {
+			[missingRuntimeId]: undefined,
+			prompt_acknowledged: false,
+			state: "unacknowledged",
+		});
+
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				turn_id: turnId,
+				prompt: "evidence",
+				steer: true,
+				idempotency_key: `missing-${missingRuntimeId}-feedback`,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
+		expect(controls.filter(control => control.operation === "turn.steer")).toHaveLength(0);
+	});
+
+	it("retries an unobserved steer with the same durable client reference", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let attempts = 0;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => {
+				if (control.operation !== "turn.steer") return undefined;
+				attempts += 1;
+				return attempts === 1
+					? { ok: false, error: { code: "uncertain_after_send", message: "response lost" } }
+					: { ok: true, result: { accepted: true, clientRef: control.input.clientRef } };
+			},
+		});
+		await registerSdkSession(server, root);
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "steer-retry-work",
+			allow_mutation: true,
+		});
+		const input = {
+			session_id: "visible-session",
+			turn_id: turn.turn_id,
+			prompt: "evidence",
+			steer: true,
+			idempotency_key: "steer-retry-evidence",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toMatchObject({
+			ok: false,
+			error: { code: "uncertain_after_send" },
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			consumption_verified: false,
+		});
+		const steers = controls.filter(control => control.operation === "turn.steer");
+		expect(steers).toHaveLength(2);
+		expect(steers[0]).toEqual(steers[1]);
+	});
+
+	it("keeps nested delivery uncertainty in progress for an exact same-key steer retry", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let attempts = 0;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => {
+				if (control.operation !== "turn.steer") return undefined;
+				attempts += 1;
+				return attempts === 1
+					? {
+							ok: true,
+							result: {
+								accepted: false,
+								status: "uncertain",
+								error: { code: "delivery_uncertain", message: "delivery outcome is uncertain" },
+							},
+						}
+					: {
+							ok: true,
+							result: { accepted: true, status: "accepted", clientRef: control.input.clientRef },
+						};
+			},
+		});
+		await registerSdkSession(server, root);
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "nested-steer-work",
+			allow_mutation: true,
+		});
+		const transaction = await readSessionTransaction(
+			coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity),
+			"visible-session",
+		);
+		const activeTurn = transaction!.canonical.turns[String(turn.turn_id)]!;
+		const expectedSdkRunToken = `${activeTurn.delivery.runtime_command_id}:${activeTurn.delivery.runtime_turn_id}`;
+		const input = {
+			session_id: "visible-session",
+			turn_id: turn.turn_id,
+			prompt: "evidence",
+			steer: true,
+			idempotency_key: "nested-steer-retry-evidence",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toMatchObject({
+			ok: false,
+			result: {
+				accepted: false,
+				status: "uncertain",
+				error: { code: "unavailable", message: "Coordinator service is unavailable." },
+			},
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			consumption_verified: false,
+			result: { accepted: true, status: "accepted" },
+		});
+		const steers = controls.filter(control => control.operation === "turn.steer");
+		expect(steers).toHaveLength(2);
+		expect(steers.map(control => control.input)).toEqual([
+			{
+				text: input.prompt,
+				clientRef: expect.any(String),
+				expectedSdkRunToken,
+			},
+			{
+				text: input.prompt,
+				clientRef: steers[0]!.input.clientRef,
+				expectedSdkRunToken,
+			},
+		]);
+		expect(steers.map(control => control.idempotencyKey)).toEqual([input.idempotency_key, input.idempotency_key]);
+	});
+
+	it.each([
+		null,
+		"snapshot payload is unavailable",
+		"snapshot store is closing",
+	])("keeps absent assistant text distinct from missing resources: %s", async payload => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "session.last_assistant"
+				? payload === null
+					? { ok: true, page: { items: [null] } }
+					: { ok: false, error: { code: "resource_gone", message: payload } }
+				: { ok: true, page: { items: [{ isStreaming: true }], complete: true, revision: "test" } },
+		);
+		await registerSdkSession(server, root);
+		const tail = await server.callTool("gjc_coordinator_read_tail", { session_id: "visible-session" });
+		expect(tail).toMatchObject(
+			payload === "snapshot store is closing"
+				? { ok: false, error: { code: "resource_gone" } }
+				: { ok: true, source: "sdk", lines: [] },
+		);
+	});
+
 	it("refuses to register a running session without an established sidecar authority", async () => {
 		const root = await tempRoot();
 		const server = await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {
@@ -1203,6 +1491,76 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
 		expect(persisted.activity).toMatchObject({ phase: "exfiltrating", note: "LEAKY-NOTE" });
 		expect((report.session_state as Record<string, unknown>).activity).toBeUndefined();
+	});
+
+	it("recovers an incomplete start_session creation after observation time advances", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const idempotencyKey = "recover-start-after-timestamp-change";
+		const args = { cwd: root, idempotency_key: idempotencyKey, allow_mutation: true };
+		setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		try {
+			const server = await createSdkControlServer(root, controls);
+			const started = await server.callTool("gjc_coordinator_start_session", args);
+			expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+			await leaveStartSessionCreationIncomplete(server, root, idempotencyKey);
+
+			setSystemTime(new Date("2026-01-01T00:01:00.000Z"));
+			expect(new Date().toISOString()).toBe("2026-01-01T00:01:00.000Z");
+			const recovered = await server.callTool("gjc_coordinator_start_session", args);
+
+			expect(recovered).toMatchObject({
+				ok: true,
+				session: { session_id: "created-session-1" },
+				session_state: { state: "ready_for_input" },
+			});
+			expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("rejects incomplete start_session recovery when the saved intent changes semantically", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const idempotencyKey = "recover-start-semantic-conflict";
+		const args = {
+			cwd: root,
+			prompt: "original prompt",
+			idempotency_key: idempotencyKey,
+			allow_mutation: true,
+		};
+		setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		try {
+			const server = await createSdkControlServer(root, controls);
+			const started = await server.callTool("gjc_coordinator_start_session", args);
+			expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+			await leaveStartSessionCreationIncomplete(server, root, idempotencyKey);
+
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			const creationKeyDigest = createHash("sha256")
+				.update(`gjc_coordinator_start_session\0${idempotencyKey}`)
+				.digest("hex");
+			let originalIntent: CanonicalCreateIntentV1 | undefined;
+			await withNamespaceRegistry(paths, async registry => {
+				const intent = registry.creations[creationKeyDigest]?.canonical_create_intent;
+				if (intent?.kind !== "start" || !intent.initial_prompt)
+					throw new Error("missing_start_session_prompt_intent");
+				originalIntent = structuredClone(intent);
+				intent.initial_prompt.text = "different semantic prompt";
+			});
+			if (!originalIntent) throw new Error("missing_original_start_session_intent");
+			await expect(bindCreationRequest(paths, creationKeyDigest, originalIntent)).rejects.toThrow(
+				"idempotency_conflict",
+			);
+
+			const recovered = await server.callTool("gjc_coordinator_start_session", args);
+			expect(recovered).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+			expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+			expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+		} finally {
+			setSystemTime();
+		}
 	});
 
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
@@ -2437,6 +2795,78 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		expect(queries).toEqual(["Q12", "context.get"]);
 	});
+	it("returns await observation expiry without an MCP error or another prompt", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep working while the controller observes",
+			idempotency_key: "await-observation",
+			allow_mutation: true,
+		});
+		expect(sent).toMatchObject({ ok: true, status: "active" });
+		for (const timeoutMs of [1, 1, 1]) {
+			const response = await server.handleJsonRpc({
+				jsonrpc: "2.0",
+				id: timeoutMs,
+				method: "tools/call",
+				params: {
+					name: "gjc_coordinator_await_turn",
+					arguments: { turn_id: sent.turn_id, timeout_ms: timeoutMs },
+				},
+			});
+			expect(response.result.isError).toBe(false);
+			expect(JSON.parse(response.result.content[0].text)).toMatchObject({
+				ok: false,
+				reason: "timeout",
+				wait_expired: true,
+				turn: { turn_id: sent.turn_id, status: "active", completed_at: null },
+			});
+		}
+		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+		expect(await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).toMatchObject({
+			ok: true,
+			turn: { status: "active", completed_at: null },
+		});
+	}, 30_000);
+	it("keeps rejected awaits and SDK request timeouts as MCP errors", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {
+			controlResult: () => {
+				throw new SdkClientError("timeout", "SDK request timed out");
+			},
+		});
+		await registerSdkSession(server, root);
+		const unknown = await server.handleJsonRpc({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: {
+				name: "gjc_coordinator_await_turn",
+				arguments: { turn_id: "turn-00000000-0000-4000-8000-000000000000", timeout_ms: 0 },
+			},
+		});
+		expect(unknown.result.isError).toBe(true);
+		expect(JSON.parse(unknown.result.content[0].text)).toEqual({ ok: false, reason: "unknown_turn" });
+		const failed = await server.handleJsonRpc({
+			jsonrpc: "2.0",
+			id: 2,
+			method: "tools/call",
+			params: {
+				name: "gjc_coordinator_send_prompt",
+				arguments: {
+					session_id: "visible-session",
+					prompt: "work",
+					idempotency_key: "sdk-timeout",
+					allow_mutation: true,
+				},
+			},
+		});
+		expect(failed.result.isError).toBe(true);
+		expect(JSON.parse(failed.result.content[0].text)).toMatchObject({ ok: false, error: { code: "timeout" } });
+	});
 	it("uses the generation-bound broker endpoint when a stale local endpoint file is absent", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -2456,6 +2886,37 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			advisory_status: { authority: "sdk", live: null, reason: "endpoint_stale" },
 		});
 		expect(queries).toEqual([]);
+	});
+
+	it("surfaces distinct spawn causes instead of collapsing them to a bare spawn_failed", async () => {
+		const root = await tempRoot();
+		const causes = [
+			"Unable to spawn session: spawn ENOENT (binary not found)",
+			"Session created-session-1 exited before registering readiness. (exit=23)",
+		];
+		for (const [index, cause] of causes.entries()) {
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+				globalResult: operation =>
+					operation === "session.create"
+						? { ok: false, error: { code: "spawn_failed", message: cause } }
+						: undefined,
+			});
+			await expect(
+				server.callTool("gjc_coordinator_start_session", {
+					cwd: root,
+					idempotency_key: `spawn-cause-${index}`,
+					allow_mutation: true,
+				}),
+			).resolves.toEqual({
+				ok: false,
+				error: {
+					code: "spawn_failed",
+					message: `Session host could not be spawned. Cause: ${cause}`,
+					diagnostic: cause,
+				},
+			});
+		}
 	});
 
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
@@ -3249,6 +3710,40 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(journal.filter(event => event.kind === "turn.completed")).toHaveLength(1);
 	});
 
+	it("rejects outside-root report evidence as input and accepts corrected evidence with a new key", async () => {
+		const root = await tempRoot();
+		const outsideRoot = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const deniedPath = path.join(outsideRoot, "private-session.jsonl");
+		await fs.writeFile(deniedPath, "private session contents");
+		const request = {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "evidence validation",
+			evidence_paths: [deniedPath],
+			idempotency_key: "denied-evidence",
+			allow_mutation: true,
+		};
+		const rejected = await server.callTool("gjc_coordinator_report_status", request);
+		expect(rejected).toMatchObject({
+			ok: false,
+			reason: "artifact_outside_allowed_roots",
+			error: { code: "invalid_input" },
+		});
+		expect(JSON.stringify(rejected)).not.toContain(outsideRoot);
+		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toEqual(rejected);
+		const evidencePath = path.join(root, "evidence.txt");
+		await fs.writeFile(evidencePath, "approved evidence");
+		expect(
+			await server.callTool("gjc_coordinator_report_status", {
+				...request,
+				evidence_paths: [evidencePath],
+				idempotency_key: "corrected-evidence",
+			}),
+		).toMatchObject({ ok: true });
+	});
+
 	it("replays a committed report without revalidating deleted evidence", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3316,6 +3811,40 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				validateCoordinatorAskAnswer(codec, { action: "clarify", question: value }) !== null;
 			expect(runtimeAccepts).toBe(schemaAccepts);
 			expect(runtimeClarificationAccepts).toBe(schemaAccepts);
+		}
+	});
+
+	it("closes the advertised answer schema against a sibling property map, not against its branches", () => {
+		// `additionalProperties: false` is evaluated against the node that declares it.
+		// With no sibling `properties`, EVERY answer field is "additional" and a compliant
+		// client validator rejects selection, custom-answer, and clarification payloads
+		// before the server is ever called (#5801).
+		const schema = buildCoordinatorAskAnswerSchema(["opt_0", "opt_1"], true, true) as {
+			additionalProperties?: boolean;
+			properties?: Record<string, unknown>;
+			oneOf: Array<{ properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }>;
+		};
+		expect(schema.additionalProperties).toBe(false);
+		const outer = new Set(Object.keys(schema.properties ?? {}));
+		expect(outer.size).toBeGreaterThan(0);
+		const branchFields = new Set<string>();
+		for (const branch of schema.oneOf) {
+			// Each branch stays closed, so the union is still narrower than the outer map.
+			expect(branch.additionalProperties).toBe(false);
+			for (const field of Object.keys(branch.properties ?? {})) branchFields.add(field);
+			for (const field of branch.required ?? []) branchFields.add(field);
+		}
+		// Any field a branch can require or accept must survive the outer closure.
+		for (const field of branchFields) expect([field, outer.has(field)]).toEqual([field, true]);
+		// The three documented answer shapes must clear the outer closure.
+		const payloads: Array<Record<string, unknown>> = [
+			{ selected: ["opt_0"] },
+			{ selected: [], other: true, custom: "Refine the plan only; do not execute." },
+			{ action: "clarify", question: "Does option 1 include execution?" },
+		];
+		for (const payload of payloads) {
+			const rejected = Object.keys(payload).filter(field => !outer.has(field));
+			expect(rejected).toEqual([]);
 		}
 	});
 
@@ -3708,21 +4237,395 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(listScopes).toContain(worktree);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
-	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
+	it("reuses a delegate session through its persisted managed-worktree authority", async () => {
 		const root = await tempRoot();
+		await Bun.$`git init -q -b main`.cwd(root);
+		await Bun.$`git config user.email test@example.com`.cwd(root);
+		await Bun.$`git config user.name Test`.cwd(root);
+		await Bun.write(path.join(root, "tracked.txt"), "fixture\n");
+		await Bun.$`git add tracked.txt`.cwd(root);
+		await Bun.$`git commit -qm fixture`.cwd(root);
+		const worktree = path.join(root, "hermes-worktree");
+		await Bun.$`git worktree add -q -b hermes ${worktree}`.cwd(root);
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		const first = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			worktree: "hermes",
+			task: "first managed-worktree task",
+			idempotency_key: "managed-worktree-delegate-first",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const persistedSessionPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const persistedSession = JSON.parse(await fs.readFile(persistedSessionPath, "utf8")) as Record<string, unknown>;
+		const symlinkedWorktree = path.join(root, "hermes-link");
+		await fs.symlink(worktree, symlinkedWorktree, "dir");
+		await Bun.write(
+			persistedSessionPath,
+			JSON.stringify({ ...persistedSession, broker_workspace: `${symlinkedWorktree}${path.sep}` }),
+		);
+
+		const second = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "second managed-worktree task",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-second",
+			allow_mutation: true,
+		});
+		expect(second).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		if (process.platform !== "win32") {
+			await Bun.write(
+				persistedSessionPath,
+				JSON.stringify({ ...persistedSession, broker_workspace: worktree.toUpperCase() }),
+			);
+			await expect(
+				server.callTool("gjc_delegate_plan", {
+					cwd: root,
+					session_id: "created-session-1",
+					task: "case-mismatched worktree must not bind",
+					queue: true,
+					idempotency_key: "managed-worktree-delegate-case-mismatch",
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		}
+	}, 20_000);
+	it("does not seal transient managed-worktree canonicalization failures", async () => {
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		await fs.mkdir(worktree, { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let failCanonicalization = false;
+		const canonicalizePath = async (value: string): Promise<string> => {
+			if (failCanonicalization && value === worktree)
+				throw Object.assign(new Error("temporary canonicalization failure"), { code: "EACCES" });
+			return fs.realpath(value);
+		};
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{ canonicalizePath },
+		);
 		await expect(
-			server.callTool("gjc_coordinator_start_session", {
+			server.callTool("gjc_delegate_plan", {
 				cwd: root,
-				idempotency_key: "managed-worktree-status",
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-transient",
 				allow_mutation: true,
 			}),
 		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after transient canonicalization failure",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-transient",
+			allow_mutation: true,
+		};
+		failCanonicalization = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "unavailable" },
+		});
+		const receipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(receipt.state).toBe("in_progress");
+		expect(receipt.response).toBeUndefined();
+		expect(receipt.delegate_prompt_claim_started).toBe(false);
+		failCanonicalization = false;
+		// Real clients retry the original key. The failure happened before any prompt
+		// claim, so the same key must recover into a fresh claim, not terminal_uncertain.
+		const retried = await server.callTool("gjc_delegate_plan", retryArgs);
+		expect(retried).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		expect(await server.callTool("gjc_delegate_plan", retryArgs)).toEqual(retried);
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+	}, 20_000);
+	it("keeps a marker-less in-progress reused-delegate receipt uncertain on same-key retry", async () => {
+		const root = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
 		await expect(
-			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-legacy",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry over a legacy receipt",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-legacy",
+			allow_mutation: true,
+		};
+		// A receipt written by a coordinator that predates the claim marker: unknown
+		// provenance, so missing live prompt state must not be read as "never claimed".
+		const receiptFile = path.join(
+			coordinatorNamespace(root),
+			"idempotency",
+			`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+		);
+		// The request digest excludes the idempotency key, so a probe with the same
+		// canonical arguments yields the digest a legacy receipt for retryArgs carries.
+		const probe = await server.callTool("gjc_delegate_plan", {
+			...retryArgs,
+			idempotency_key: "managed-worktree-delegate-legacy-probe",
+		});
+		expect(probe).toMatchObject({ ok: true });
+		const probeReceipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update("managed-worktree-delegate-legacy-probe").digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		await fs.mkdir(path.dirname(receiptFile), { recursive: true });
+		await Bun.write(
+			receiptFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				tool: probeReceipt.tool,
+				key_digest: createHash("sha256").update(retryArgs.idempotency_key).digest("hex"),
+				request_digest: probeReceipt.request_digest,
+				state: "in_progress",
+				created_at: new Date().toISOString(),
+			})}\n`,
+		);
+		const dispatchesBefore = controls.filter(control => control.operation === "turn.follow_up").length;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(dispatchesBefore);
+	}, 20_000);
+	it("refuses a same-key delegate retry as uncertain once a prompt claim has started", async () => {
+		const root = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let crash = false;
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{
+				afterPromptReceiptPersisted: () => {
+					if (crash) throw new Error("injected post-claim crash");
+				},
+			},
+		);
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-claimed",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after post-claim crash",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-claimed",
+			allow_mutation: true,
+		};
+		crash = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({ ok: false });
+		const receiptFile = path.join(
+			coordinatorNamespace(root),
+			"idempotency",
+			`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+		);
+		const receipt = JSON.parse(await fs.readFile(receiptFile, "utf8")) as Record<string, unknown>;
+		expect(receipt).toMatchObject({ state: "in_progress", delegate_prompt_claim_started: true });
+		crash = false;
+		// Erase the claimed prompt so the retry sees no live receipt. The outer marker
+		// still proves a claim started, so missing state must not be read as a fresh key.
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const promptKey = createHash("sha256").update(`${retryArgs.idempotency_key}\0turn.follow_up`).digest("hex");
+		await withSessionTransaction(paths, "created-session-1", async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (!request) throw new Error("fixture expected a claimed prompt");
+			const turnId = request.coordinator_turn_id;
+			if (turnId) {
+				delete transaction.canonical.turns[turnId];
+				transaction.canonical.queue.ordered_turn_ids = transaction.canonical.queue.ordered_turn_ids.filter(
+					candidate => candidate !== turnId,
+				);
+			}
+			delete transaction.requests.prompts[promptKey];
+		});
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+	}, 20_000);
+	it("refuses delegate reuse when the persisted workspace escapes the current roots", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-escape",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const persistedSessionPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const persistedSession = JSON.parse(await fs.readFile(persistedSessionPath, "utf8")) as Record<string, unknown>;
+		const reuse = (key: string) => ({
+			cwd: root,
+			session_id: "created-session-1",
+			task: "reuse must be reauthorized",
+			queue: true,
+			idempotency_key: key,
+			allow_mutation: true,
+		});
+		// A projection redirected to an existing directory outside every root: the
+		// caller cwd still passes, so only persisted-pair reauthorization can refuse it.
+		await Bun.write(persistedSessionPath, JSON.stringify({ ...persistedSession, broker_workspace: outside }));
+		await expect(
+			server.callTool("gjc_delegate_plan", reuse("managed-worktree-delegate-redirected")),
+		).resolves.toMatchObject({ ok: false, error: { code: "workspace_mismatch" } });
+		// Narrowed roots: the caller cwd and persisted cwd stay identical and inside the
+		// new policy, so the earlier cwd identity guard passes; only the untouched
+		// persisted worktree has fallen outside the current roots.
+		const narrowed = path.join(root, "narrowed");
+		await fs.mkdir(narrowed);
+		await Bun.write(persistedSessionPath, JSON.stringify({ ...persistedSession, cwd: narrowed }));
+		server.config.allowedRoots = [narrowed];
+		server.config.managedWorktreeRoots = [path.join(narrowed, ".worktrees")];
+		const controlsBeforeNarrowedReuse = controls.length;
+		await expect(
+			server.callTool("gjc_delegate_plan", { ...reuse("managed-worktree-delegate-narrowed"), cwd: narrowed }),
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "workspace_mismatch" },
+		});
+		// Refusal happens before any broker lookup in the revoked workspace.
+		expect(controls.slice(controlsBeforeNarrowedReuse).map(control => control.operation)).toEqual([]);
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(0);
+	}, 20_000);
+	it("keeps endpoint authority separated across two actual managed worktrees", async () => {
+		const root = await tempRoot();
+		await Bun.$`git init -q -b main`.cwd(root);
+		await Bun.$`git config user.email test@example.com`.cwd(root);
+		await Bun.$`git config user.name Test`.cwd(root);
+		await Bun.write(path.join(root, "tracked.txt"), "fixture\n");
+		await Bun.$`git add tracked.txt`.cwd(root);
+		await Bun.$`git commit -qm fixture`.cwd(root);
+		const worktrees = new Map<string, string>();
+		for (const name of ["task-a", "task-b"]) {
+			const worktree = path.join(root, name);
+			await Bun.$`git worktree add -q -b ${name} ${worktree}`.cwd(root);
+			worktrees.set(name, worktree);
+		}
+		const controls: SdkControl[] = [];
+		const brokerSessions = [
+			...(["task-a", "task-b"] as const).map(name => {
+				const sessionCwd = worktrees.get(name)!;
+				return {
+					sessionId: `created-${name}`,
+					locator: {
+						cwd: sessionCwd,
+						worktreeRoot: sessionCwd,
+						stateRoot: path.join(sessionCwd, ".gjc", "state"),
+					},
+					live: true,
+					endpointGeneration: 1,
+					pid: process.pid,
+					endpointMtimeMs: 0,
+				};
+			}),
+		];
+		for (const session of brokerSessions) {
+			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
+			const endpointPath = path.join(sessionCwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({
+					sessionId: session.sessionId,
+					pid: process.pid,
+					url: "ws://sdk.example.test",
+					token: "test-token",
+				}),
+			);
+			// The durable fixture helper uses mtime=1 in its deterministic authority
+			// digest; the endpoint file itself still exists in the real worktree.
+			session.endpointMtimeMs = 1;
+		}
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			brokerSessions,
+			undefined,
+			undefined,
+			{ preserveEndpointAuthority: true },
+		);
+		const env = {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		};
+		for (const session of brokerSessions) {
+			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
+			await writeDurableCoordinatorSession({ sessionId: session.sessionId as string, cwd: sessionCwd, env });
+		}
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-a" }),
 		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
-	}, 15_000);
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-b" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+
+		const sessionListScopes = controls
+			.filter(control => control.operation === "session.list")
+			.map(control => control.input.cwd);
+		expect(sessionListScopes).toContain(worktrees.get("task-a"));
+		expect(sessionListScopes).toContain(worktrees.get("task-b"));
+	}, 30_000);
 	it("does not index a managed-worktree endpoint after its authority changes", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3777,6 +4680,21 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" }),
 		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
 	});
+	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-status",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+	}, 15_000);
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -4039,6 +4957,128 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
 		).resolves.toMatchObject({
 			turn: { status: "active" },
+		});
+	});
+
+	it("ignores accepted Q12 diagnostics during coordinator reconciliation", async () => {
+		const root = await tempRoot();
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: [
+								{
+									...sharedAskGate("accepted-q12", runtimeTurnId, "ralplan", "approval"),
+									id: "diagnostic:accepted-q12",
+									tag: "accepted" as const,
+									answer_recorded: true as const,
+									resolved_at: GATE_RESOLVED_AT,
+									post_accept_disposition: "advanced" as const,
+								},
+							],
+							complete: true,
+							revision: "accepted-diagnostic",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "ignore accepted diagnostic",
+			idempotency_key: "accepted-diagnostic-prompt",
+			allow_mutation: true,
+		});
+		const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+		if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+		runtimeTurnId = runtimeAcknowledgement.turn_id;
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-diagnostic", reason: null },
+		});
+	});
+
+	it("bounds accepted Q12 diagnostics so reconciliation stays complete", async () => {
+		const root = await tempRoot();
+		const emitter = new BrokerWorkflowGateEmitter(
+			"visible-session",
+			new FileGateStore(path.join(root, ".gjc", "state", "workflow-gates.json")),
+		);
+		const acceptedGateIds: string[] = [];
+		for (let index = 0; index < MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS + 1; index++) {
+			const continuation = emitter.emitGate({
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			});
+			const pending = emitter.listWorkflowGateQueryRecords!().find(record => record.tag === "pending");
+			if (!pending) throw new Error("Q12 did not expose the pending gate");
+			emitter.prepareTerminalization!(pending.gate_id, "not_published");
+			await emitter.resolveGate!({
+				gate_id: pending.gate_id,
+				answer: "approve",
+				idempotency_key: `accepted-q12-bound-${index}`,
+			});
+			await expect(continuation).resolves.toBe("approve");
+			acceptedGateIds.push(pending.gate_id);
+		}
+
+		const accepted = emitter.listWorkflowGateQueryRecords!().filter(record => record.tag === "accepted");
+		expect(accepted).toHaveLength(MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS);
+		expect(accepted.map(record => record.gate_id)).toEqual(
+			acceptedGateIds.slice(-MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS).reverse(),
+		);
+
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: emitter.listWorkflowGateQueryRecords!(),
+							complete: true,
+							revision: "accepted-q12-bound",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "reconcile bounded accepted diagnostics",
+			idempotency_key: "accepted-q12-bound-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-q12-bound", reason: null },
 		});
 	});
 
@@ -6365,7 +7405,8 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					force: true,
 					await_completion: false,
 				};
-				expect(await f.server.callTool("gjc_delegate_execute", request)).toMatchObject({ ok: true });
+				const result = await f.server.callTool("gjc_delegate_execute", request);
+				expect(result, `bounded-pin-${index}`).toMatchObject({ ok: true });
 				const file = receiptPath(f.root, request.idempotency_key);
 				const content = await Bun.file(file).text();
 				receipts.push({ promptKey: JSON.parse(content).delegate_response_pin.prompt_key_digest, file, content });
@@ -6392,7 +7433,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			expect(await pending()).toEqual([first.promptKey]);
 			expect(await survivor.callTool("gjc_coordinator_list_artifacts")).toMatchObject({ ok: true });
 			expect(await pending()).toEqual([]);
-		}, 30000);
+		}, 120_000);
 
 		it("bounds session discovery and wraps past missing sessions to later peer pins", async () => {
 			const f = await fixture(true, {
@@ -7336,6 +8377,99 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 
+	async function stageIdleEphemeralSessions(
+		root: string,
+		sessionIds: string[],
+		relocate: (sessionId: string) => { cwd?: string; workspace?: string } = () => ({}),
+	) {
+		const controls: SdkControl[] = [];
+		const brokerSessions = sessionIds.map((sessionId, index) => ({
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			live: true,
+			endpointGeneration: 1,
+			pid: 300 + index,
+			endpointMtimeMs: 2,
+		}));
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		const sessionsDir = path.join(coordinatorNamespace(root), "sessions");
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		for (const sessionId of sessionIds) {
+			await expect(
+				server.callTool("gjc_coordinator_register_session", {
+					session_id: sessionId,
+					cwd: root,
+					idempotency_key: `register-${sessionId}`,
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: true });
+			const file = path.join(sessionsDir, `${sessionId}.json`);
+			const record = JSON.parse(await fs.readFile(file, "utf8"));
+			await Bun.write(file, JSON.stringify({ ...record, ephemeral: true, created_at: staleAt }));
+			const moved = relocate(sessionId);
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				const nextRevision = transaction.revision + 1;
+				transaction.canonical.session.ephemeral = true;
+				transaction.canonical.session.created_at = staleAt;
+				transaction.canonical.session.updated_at = staleAt;
+				if (moved.cwd !== undefined) transaction.canonical.session.cwd = moved.cwd;
+				if (moved.workspace !== undefined) transaction.canonical.session.broker.workspace = moved.workspace;
+				transaction.projection.applied_turns_revision = nextRevision;
+				transaction.projection.applied_reports_revision = nextRevision;
+				transaction.projection.applied_session_revision = nextRevision;
+				transaction.projection.applied_active_revision = nextRevision;
+				transaction.projection.applied_events_revision = nextRevision;
+			});
+			await fs.rm(path.join(coordinatorNamespace(root), "session-states", `${sessionId}.json`), { force: true });
+		}
+		const closedSessionIds = () =>
+			controls
+				.filter(control => control.operation === "session.close")
+				.map(control => (control.input as { sessionId?: string }).sessionId);
+		return { server, sessionsDir, paths, closedSessionIds };
+	}
+
+	it("idle reaping skips a session persisted outside the allowed roots instead of refusing the whole sweep", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const { server, sessionsDir, paths, closedSessionIds } = await stageIdleEphemeralSessions(
+			root,
+			["idle-session", "escaped-session"],
+			sessionId => (sessionId === "escaped-session" ? { cwd: outside, workspace: outside } : {}),
+		);
+		const escapedBefore = await readSessionTransaction(paths, "escaped-session");
+		const warn = vi.spyOn(logger, "warn");
+		try {
+			// Before the fix the escaped session's authority error escaped listSessions and the
+			// whole sweep was refused, so the in-root idle session was never reaped either.
+			expect(await server.sessionReaper.sweepOnce()).toBe(1);
+			expect(closedSessionIds()).toEqual(["idle-session"]);
+			expect(await Bun.file(path.join(sessionsDir, "idle-session.json")).exists()).toBe(false);
+			// The unauthorized session is neither closed nor mutated.
+			expect(await Bun.file(path.join(sessionsDir, "escaped-session.json")).exists()).toBe(true);
+			expect(await readSessionTransaction(paths, "escaped-session")).toEqual(escapedBefore);
+			expect(warn).toHaveBeenCalledWith("Coordinator session reaper skipped an unauthorized session", {
+				sessionId: "escaped-session",
+				reason: "coordinator_workdir_outside_allowed_roots",
+				detail: expect.stringContaining(`cwd ${await fs.realpath(outside)}`),
+			});
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("idle reaping still refuses the sweep when no workdir roots are configured", async () => {
+		const root = await tempRoot();
+		const { server, sessionsDir, closedSessionIds } = await stageIdleEphemeralSessions(root, ["idle-session"]);
+		// An empty root list is a namespace-wide misconfiguration: it must surface once as a
+		// refused sweep rather than as a per-session skip.
+		server.config.allowedRoots = [];
+		await expect(server.sessionReaper.sweepOnce()).rejects.toThrow("coordinator_workdir_roots_required");
+		expect(closedSessionIds()).toEqual([]);
+		expect(await Bun.file(path.join(sessionsDir, "idle-session.json")).exists()).toBe(true);
+	});
+
 	it("idle reaping selects only stale ephemeral coordinator records and uses incarnation-bound session.close", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -7398,6 +8532,248 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		]);
 		expect(await Bun.file(idleFile).exists()).toBe(false);
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
+	});
+
+	async function stageDeadHostSession(
+		root: string,
+		sessionId: string,
+		options: {
+			globalResult?: (
+				operation: string,
+				input: Record<string, unknown>,
+				brokerSessions: Array<Record<string, unknown>>,
+			) => unknown;
+		} = {},
+	) {
+		const controls: SdkControl[] = [];
+		const brokerSessions: Array<Record<string, unknown>> = [
+			{
+				sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				lastHeartbeatAt: Date.now(),
+				endpointGeneration: 1,
+				pid: 404,
+				endpointMtimeMs: 2,
+			},
+		];
+		// Every close attempt reaches the broker, which answers endpoint_stale instead of
+		// closing — what the broker does for an identity-matching row with no live host.
+		const server = await createSdkControlServer(root, controls, [], undefined, brokerSessions, undefined, undefined, {
+			globalResult: (operation, input, sessions) => {
+				const override = options.globalResult?.(operation, input, sessions);
+				if (override !== undefined) return override;
+				return operation === "session.close" && input.sessionId === sessionId
+					? input.forceRetireStale === true
+						? { ok: true, result: { sessionId, retired: true } }
+						: { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } }
+					: undefined;
+			},
+		});
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: sessionId,
+				cwd: root,
+				idempotency_key: `register-${sessionId}`,
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", `${sessionId}.json`);
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		const record = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(sessionFile, JSON.stringify({ ...record, ephemeral: true, created_at: staleAt }));
+		await withSessionTransaction(paths, sessionId, async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+		const closeAttempts = () =>
+			controls.filter(
+				control =>
+					control.operation === "session.close" &&
+					(control.input as { sessionId?: string }).sessionId === sessionId,
+			).length;
+		const deletions = async () =>
+			Object.values(
+				(
+					(await withNamespaceRegistry(paths, async registry => JSON.parse(JSON.stringify(registry)))) as {
+						deletions?: Record<string, { deletion_id: string; session_id: string; phase: string }>;
+					}
+				).deletions ?? {},
+			).filter(entry => entry.session_id === sessionId);
+		return { server, brokerSessions, paths, sessionFile, closeAttempts, deletions };
+	}
+
+	it("force-evicts an idle session whose host is gone while the broker still indexes its unchanged endpoint identity", async () => {
+		const root = await tempRoot();
+		const { server, brokerSessions, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+			root,
+			"dead-host-session",
+		);
+		const walIncarnation = (await readSessionTransaction(paths, "dead-host-session"))?.endpoint?.incarnation;
+		expect(walIncarnation).toMatch(/^[a-f0-9]{64}$/);
+		// The broker keeps the row with the same generation and incarnation but reports no
+		// host behind it and has not heard from one for far longer than its freshness window.
+		// Before the fix each reap surfaced as close_failed, the reaper treated it as
+		// transient, and the session was retried forever without reaching force eviction.
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// One normal close per sweep plus the final atomic stale-authority fence.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "dead-host-session")).toBeNull();
+		await expect(Bun.file(transactionPath(paths, "dead-host-session")).exists()).resolves.toBe(false);
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		const recorded = await deletions();
+		expect(recorded).toContainEqual(
+			expect.objectContaining({
+				deletion_id: `force-evict:dead-host-session:${walIncarnation}`,
+				phase: "completed",
+			}),
+		);
+		// The first reap admitted its own delete intent before the broker answered
+		// endpoint_stale. It stays on record, but the completed force-evict record
+		// supersedes it, so a later stop reports the session closed instead of retrying
+		// the dead endpoint forever.
+		expect(recorded.filter(entry => entry.phase !== "completed")).toEqual([
+			expect.objectContaining({ deletion_id: expect.stringMatching(/^delete:dead-host-session:/), phase: "intent" }),
+		]);
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "dead-host-session", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+	});
+
+	it("never force-evicts a session whose broker row is still live even when every close answers endpoint_stale", async () => {
+		const root = await tempRoot();
+		const { server, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+			root,
+			"live-host-session",
+		);
+
+		for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// Every sweep reached the broker, so the eviction threshold was crossed and refused.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "live-host-session")).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+		expect((await deletions()).map(entry => entry.phase)).toEqual(["intent"]);
+	});
+
+	it("does not force-evict a not-live broker row whose host went silent only recently", async () => {
+		const root = await tempRoot();
+		const { server, brokerSessions, paths, sessionFile, closeAttempts } = await stageDeadHostSession(
+			root,
+			"quiet-host-session",
+		);
+		// Past the broker's two-interval freshness window, so the row already reads not
+		// live, but nowhere near long enough to rule out a host that is about to resume.
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 3 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "quiet-host-session")).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+	});
+
+	it("does not force-evict unresolved broker authority rows", async () => {
+		for (const flag of ["ambiguous", "terminalUncertain"] as const) {
+			const root = await tempRoot();
+			const sessionId = `unresolved-${flag}`;
+			const { server, brokerSessions, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+				root,
+				sessionId,
+			);
+			brokerSessions[0]!.live = false;
+			brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+			brokerSessions[0]![flag] = true;
+
+			for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+				expect(await server.sessionReaper.sweepOnce()).toBe(0);
+			}
+
+			expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+			expect(await readSessionTransaction(paths, sessionId)).not.toBeNull();
+			await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+			expect((await deletions()).filter(entry => entry.deletion_id.startsWith(`force-evict:${sessionId}:`))).toEqual(
+				[],
+			);
+		}
+	});
+
+	it("refuses cleanup when the broker authority recovers before the atomic fence", async () => {
+		const root = await tempRoot();
+		const sessionId = "recovered-before-fence";
+		const { server, brokerSessions, paths, sessionFile, deletions } = await stageDeadHostSession(root, sessionId, {
+			globalResult: (operation, input, sessions) => {
+				if (operation !== "session.close" || input.sessionId !== sessionId || input.forceRetireStale !== true)
+					return undefined;
+				sessions[0]!.live = true;
+				sessions[0]!.lastHeartbeatAt = Date.now();
+				return { ok: false, error: { code: "endpoint_stale", message: "authority recovered before fence" } };
+			},
+		});
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(await readSessionTransaction(paths, sessionId)).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+		expect((await deletions()).filter(entry => entry.deletion_id.startsWith(`force-evict:${sessionId}:`))).toEqual(
+			[],
+		);
+	});
+
+	it("escalates a close-time not_found race to bounded stale eviction", async () => {
+		const root = await tempRoot();
+		const sessionId = "close-not-found-race";
+		let closeRace = true;
+		const { server, brokerSessions, paths, sessionFile, deletions } = await stageDeadHostSession(root, sessionId, {
+			globalResult: (operation, input, sessions) => {
+				if (operation !== "session.close" || input.sessionId !== sessionId) return undefined;
+				if (input.forceRetireStale === true)
+					return { ok: false, error: { code: "not_found", message: "session disappeared before close" } };
+				if (closeRace) {
+					closeRace = false;
+					sessions.splice(0, 1);
+				}
+				return { ok: false, error: { code: "not_found", message: "session disappeared before close" } };
+			},
+		});
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(await readSessionTransaction(paths, sessionId)).toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		expect(await deletions()).toContainEqual(
+			expect.objectContaining({
+				deletion_id: expect.stringMatching(/^force-evict:close-not-found-race:/),
+				phase: "completed",
+			}),
+		);
 	});
 
 	it("force-evicts a session whose projection lost its endpoint incarnation once the broker endpoint has rotated away, retiring WAL, registry, retained deliveries, and projections", async () => {
@@ -7785,6 +9161,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				code: "broker_discovery_access_denied",
 			},
 			{ stage: "ensure", error: new Error("token-secret"), code: "broker_bootstrap_failed" },
+			{
+				stage: "ensure",
+				error: new SdkClientError("broker_unavailable", "attach-only refusal"),
+				code: "broker_unavailable",
+				message: "SDK broker is unavailable.",
+			},
 			{
 				stage: "read",
 				error: new UnsupportedStateVersionError("/secret/path", 2),
@@ -10659,6 +12041,88 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		});
 		expect(await server.callTool("gjc_coordinator_submit_question_answer", firstArgs)).toEqual(rejected);
 		expect(answerCalls).toBe(2);
+	});
+
+	it.each([
+		["an old", "old"],
+		["a future", "future"],
+		["a malformed", "malformed"],
+	] as const)("does not age a fresh answer receipt from %s remote resolved_at", async (_description, timestampKind) => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		const remoteResolvedAt =
+			timestampKind === "old"
+				? new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString()
+				: timestampKind === "future"
+					? new Date(Date.now() + 31 * 24 * 60 * 60 * 1000).toISOString()
+					: "not-a-timestamp";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("remote-old-answer", runtimeTurnId)],
+								complete: true,
+								revision: "remote-old-answer",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer"
+						? { ok: true, result: { status: "accepted", resolved_at: remoteResolvedAt } }
+						: undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "remote timestamp answer",
+			idempotency_key: "remote-old-answer-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		const accepted = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "remote-old-answer",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "remote-old-answer",
+			allow_mutation: true,
+		});
+		expect(accepted).toMatchObject({
+			ok: true,
+			operation: "workflow.gate_answer",
+			status: "accepted",
+			resolved_at: timestampKind === "malformed" ? expect.not.stringMatching(/not-a-timestamp/) : remoteResolvedAt,
+		});
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const persisted = await withSessionTransaction(paths, "visible-session", async current => current);
+		const request = Object.values(persisted.requests.answers).find(candidate => candidate.phase === "completed");
+		expect(request).toBeDefined();
+		expect(request?.safe_receipt).toMatchObject({ status: "accepted" });
+		if (timestampKind === "malformed") {
+			expect(request?.safe_receipt?.resolved_at).not.toBe(remoteResolvedAt);
+			expect(Date.parse(request?.safe_receipt?.resolved_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
+		} else {
+			expect(request?.safe_receipt).toMatchObject({ resolved_at: remoteResolvedAt });
+		}
+		expect(Date.parse(request?.updated_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
+		expect(Date.parse(persisted.canonical.questions["remote-old-answer"]?.updated_at ?? "")).toBeGreaterThan(
+			Date.now() - 5_000,
+		);
 	});
 
 	it("reverts an answer claim when runtime admission changes before dispatch and permits exact retry", async () => {

@@ -5,7 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
-import type { Settings } from "../src/config/settings";
+import {
+	DEFAULT_SDK_PROMPT_DEADLINE_MS,
+	DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
+	type Settings,
+} from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
@@ -58,6 +62,33 @@ function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): S
 		},
 		getAgentDir: () => cwd,
 	} as unknown as Settings;
+}
+
+/** Settings whose deadline reads all miss, so the bus must use the schema defaults. */
+function settingsWithoutDeadlineValues(cwd: string): Settings {
+	return { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+}
+
+async function git(root: string, args: string[]): Promise<string> {
+	const proc = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+	const [code, stdout, stderr] = await Promise.all([
+		proc.exited,
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
+	if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+	return stdout;
+}
+
+/** A real repo with one commit plus an uncommitted edit the deadline must autosave. */
+async function initDirtyGitRepo(root: string): Promise<void> {
+	await git(root, ["init", "--initial-branch=bus"]);
+	await git(root, ["config", "user.email", "test@example.com"]);
+	await git(root, ["config", "user.name", "Test"]);
+	await fsPromises.writeFile(path.join(root, "README.md"), "hello\n");
+	await git(root, ["add", "README.md"]);
+	await git(root, ["commit", "-m", "init"]);
+	await fsPromises.writeFile(path.join(root, "agent-work.ts"), "export const done = true;\n");
 }
 
 function context(
@@ -113,6 +144,7 @@ function start(
 	settings: Settings,
 	acceptFailure: AcceptFailure = { armed: false },
 	ledgerTools?: LedgerTools,
+	onSubmission?: (options: Parameters<ExtensionActions["sendUserMessage"]>[1]) => void,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -123,6 +155,7 @@ function start(
 			_content: Parameters<ExtensionActions["sendUserMessage"]>[0],
 			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
 		) => {
+			onSubmission?.(options);
 			const commit = options?.onPreflightAcceptCommit;
 			const accepted = options?.onPreflightAccepted;
 			// The prompt never settles on its own: the deadline is the only terminal.
@@ -184,6 +217,8 @@ interface BusSession {
 	acceptFailure: AcceptFailure;
 	/** Deadline callbacks the bus scheduled, captured around acceptance only. */
 	scheduled: (() => void)[];
+	/** Delays, in ms, of the callbacks captured in `scheduled`. */
+	scheduledDelays: number[];
 }
 
 /** Send one `turn.prompt` on an established session and return its acknowledgement. */
@@ -216,20 +251,28 @@ async function acceptPrompt(
 		captureSchedule?: boolean;
 		abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 		ledgerTools?: LedgerTools;
+		onSubmission?: (options: Parameters<ExtensionActions["sendUserMessage"]>[1]) => void;
+		/** Seed the session cwd before the bus starts (e.g. a real git repo). */
+		prepareCwd?: (cwd: string) => Promise<void>;
+		/** Replace the settings double, e.g. to opt out of the autosave. */
+		settings?: (cwd: string) => Settings;
 	} = {},
 ): Promise<BusSession> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
 	dirs.push(cwd);
+	await options.prepareCwd?.(cwd);
 	const sessionId = `sdk-bus-deadline-${label}-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId, options.abortPromptAndWait);
 	const acceptFailure: AcceptFailure = { armed: false };
 	const handlers = start(
 		sessionContext,
-		deadlineSettings(cwd, leaseMs, maxRuntimeMs),
+		options.settings?.(cwd) ?? deadlineSettings(cwd, leaseMs, maxRuntimeMs),
 		acceptFailure,
 		options.ledgerTools,
+		options.onSubmission,
 	);
 	const scheduled: (() => void)[] = [];
+	const scheduledDelays: number[] = [];
 
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -251,11 +294,16 @@ async function acceptPrompt(
 				delayMs?: number,
 				...rest: unknown[]
 			) => {
-				// The deadline is armed AFTER the awaited durable accept, so its
-				// remaining delay is the lease minus however long that write took.
-				// Match the whole upper half of the lease window: with the long lease
-				// these cases use, nothing else schedules anywhere near it.
-				if (delayMs !== undefined && delayMs > leaseMs / 2 && delayMs <= leaseMs) scheduled.push(callback);
+				// Attribute the timer to its arming site, never to its delay. The bus
+				// starts the SDK broker for its agent dir concurrently with this window,
+				// and that startup arms its own discovery timers (`ensure.ts`
+				// `readBrokerDiscoveryBeforeDeadline`, ~35s out) whose delay overlaps
+				// any lease-shaped filter. Renaming `armPromptDeadline` fails loudly on
+				// the "captured deadline schedule" wait below.
+				if (delayMs !== undefined && /\bat armPromptDeadline \(/.test(new Error().stack ?? "")) {
+					scheduled.push(callback);
+					scheduledDelays.push(delayMs);
+				}
 				return realSetTimeout(callback, delayMs, ...rest);
 			}) as never)
 		: undefined;
@@ -322,6 +370,7 @@ async function acceptPrompt(
 		cwd,
 		acceptFailure,
 		scheduled,
+		scheduledDelays,
 		extraCorrelations,
 		extraAcks,
 		handlers,
@@ -668,14 +717,16 @@ test("a prompt accepted with no agent_start keeps its pre-change public outcome"
 	}
 }, 30_000);
 
-test("current-run tool progress cannot renew a co-accepted follow-up correlation", async () => {
-	// Attribution invariant, on the real bus. Unlike `turn.prompt` (which sets
-	// rejectWhenBusy), `turn.follow_up` is admitted while a run is active, so a
-	// SECOND accepted correlation genuinely co-exists with the running one.
-	// Renewal resolves its submission by the active correlation's own key, so the
-	// running prompt's tool progress must not extend the follow-up's lease.
+test("current-run progress leaves a queued follow-up suspended until its own promotion", async () => {
+	// An accepted follow-up has not consumed execution yet. Its lease is suspended
+	// independently of root progress, then starts fresh at exact queue promotion.
 	const leaseMs = 900;
-	const session = await acceptPrompt("followup", leaseMs, 60_000);
+	let promoteFollowUp: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	const session = await acceptPrompt("followup", leaseMs, 60_000, {
+		onSubmission: options => {
+			if (options?.deliverAs === "followUp") promoteFollowUp = options.onQueuedPromoted;
+		},
+	});
 	const progress = setInterval(() => {
 		session.handlers.get("tool_execution_end")?.(
 			{ type: "tool_execution_end", toolCallId: `fu-tool-${Date.now()}`, toolName: "read", isError: false },
@@ -703,13 +754,25 @@ test("current-run tool progress cannot renew a co-accepted follow-up correlation
 		expect(ack.ok).toBe(true);
 		const followUp = { commandId: String(ack.result?.commandId), turnId: String(ack.result?.turnId) };
 		expect(followUp.commandId).not.toBe(session.correlation.commandId);
-		const followUpAcceptedAt = Date.now();
+		await Bun.sleep(leaseMs * 2);
+		expect(session.terminals(followUp)).toHaveLength(0);
+		expect(session.terminals(session.correlation)).toHaveLength(0);
+		expect(promoteFollowUp).toBeDefined();
 
-		// The follow-up is bounded by ITS OWN acceptance despite continuous
-		// attributable progress attributed to the running correlation.
-		await waitFor(() => session.terminals(followUp).length > 0, "co-accepted follow-up terminal");
-		expect(Date.now() - followUpAcceptedAt).toBeLessThan(leaseMs * 2);
-		// The running prompt is the one being renewed, so it has no deadline terminal.
+		const promotedAt = Date.now();
+		promoteFollowUp!({ startsOwnRun: true });
+		await Bun.sleep(leaseMs / 2);
+		expect(session.terminals(followUp)).toHaveLength(0);
+		await waitFor(() => session.terminals(followUp).length > 0, "promoted follow-up terminal");
+		expect(Date.now() - promotedAt).toBeGreaterThanOrEqual(leaseMs);
+		expect(Date.now() - promotedAt).toBeLessThan(leaseMs * 2);
+		// No agent_start attested the promoted run: expiry remains uncertain and
+		// must never borrow the unrelated root's abort authority or emit its deadline.
+		expect(session.terminals(followUp)[0]).toMatchObject({
+			type: "agent_failed",
+			error: { code: "terminal_uncertain" },
+		});
+		expect(session.terminals(session.correlation)).toHaveLength(0);
 		expect(session.deadlineTerminals()).toHaveLength(0);
 	} finally {
 		clearInterval(progress);
@@ -979,6 +1042,45 @@ test("the deadline abort lands after the running tool call reaches its boundary"
 	}
 }, 30_000);
 
+test("the bus deadline path autosaves the dirty worktree before ownership teardown", async () => {
+	// #5583 review round 2: the bus owns an independent deadline timer and
+	// terminalization path, so the host wiring in `session-runtime` never sees this
+	// expiry. Without the bus-side flush an active notification-bus session loses
+	// its dirty edits on a deadline — the exact work-loss this change prevents.
+	const session = await acceptPrompt("autosave", LEASE_MS, 60_000, {
+		prepareCwd: initDirtyGitRepo,
+		settings: cwd =>
+			({
+				get: (key: string) => {
+					if (key === "sdk.promptDeadlineMs") return LEASE_MS;
+					if (key === "sdk.promptMaxRuntimeMs") return 60_000;
+					if (key === "sdk.flushWorktreeOnDeadline") return true;
+					return undefined;
+				},
+				// Primary checkout: the bus autosave runs only for a user/global true.
+				getGlobal: (key: string) => (key === "sdk.flushWorktreeOnDeadline" ? true : undefined),
+				getAgentDir: () => cwd,
+			}) as unknown as Settings,
+	});
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
+
+		// The flush runs before the terminal is recorded and published, so the WIP
+		// commit already exists by the time that frame is observable.
+		expect(await git(session.cwd, ["log", "-1", "--pretty=%s"])).toBe("wip(bus): autosave on prompt deadline\n");
+		expect(await git(session.cwd, ["show", "HEAD:agent-work.ts"])).toBe("export const done = true;\n");
+		// Scoped to the agent's edit on purpose: the live session keeps writing its
+		// own state (agent.db, .gjc/) into the cwd, so the tree as a whole is never
+		// stably clean here.
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("");
+		// The terminal itself is untouched by the autosave.
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
 test("a tool still executing when the boundary grace expires is force-terminated and recorded", async () => {
 	// #5637 AC-2: the wait is bounded. A tool that never reaches its boundary must
 	// still be force-terminated exactly as before — and the fact that the run was
@@ -1163,6 +1265,33 @@ test("a tool the ledger reports running is not killed while its start event is s
 		forced.restore();
 		await shutdown(session);
 	}
+}, 40_000);
+
+test("sdk.flushWorktreeOnDeadline=false leaves the bus deadline worktree dirty", async () => {
+	const session = await acceptPrompt("autosave-off", LEASE_MS, 60_000, {
+		prepareCwd: initDirtyGitRepo,
+		settings: cwd =>
+			({
+				get: (key: string) => {
+					if (key === "sdk.promptDeadlineMs") return LEASE_MS;
+					if (key === "sdk.promptMaxRuntimeMs") return 60_000;
+					if (key === "sdk.flushWorktreeOnDeadline") return false;
+					return undefined;
+				},
+				getAgentDir: () => cwd,
+			}) as unknown as Settings,
+	});
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
+		await Bun.sleep(200);
+
+		// Opted out: no commit, and the edit is still sitting in the worktree.
+		expect((await git(session.cwd, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("?? agent-work.ts\n");
+		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		await shutdown(session);
+	}
 }, 30_000);
 
 test("a tool_execution_end delivered before its own start never forces a spurious mid-tool kill", async () => {
@@ -1311,3 +1440,61 @@ test("repeated tool_execution_updates at an already-due hard cap open exactly on
 		await shutdown(session);
 	}
 }, 60_000);
+
+test("a cancelled bus prompt never autosaves", async () => {
+	// Only the deadline path may commit: `turn.abort` is a real non-deadline
+	// terminal, and it must leave the worktree exactly as the user left it.
+	const leaseMs = 500;
+	const session = await acceptPrompt("autosave-cancel", leaseMs, 60_000, { prepareCwd: initDirtyGitRepo });
+	try {
+		const abortId = "autosave-cancel-abort";
+		session.socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: abortId,
+				operation: "turn.abort",
+				input: {},
+				idempotencyKey: "autosave-cancel-abort-key",
+			}),
+		);
+		await waitFor(
+			() => session.frames.some(frame => frame.type === "control_response" && frame.id === abortId),
+			"abort acknowledgement",
+		);
+		await waitFor(() => session.terminals(session.correlation).length > 0, "cancellation terminal");
+
+		// Past the original lease, so a late deadline autosave would have shown up.
+		await Bun.sleep(leaseMs * 3);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+		expect((await git(session.cwd, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("?? agent-work.ts\n");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the bus arms its deadline at the schema default when the setting read misses", async () => {
+	// #5584 fixed only the schema default and left the bus holding a hardcoded
+	// 1_800_000 fallback. `sdk-prompt-deadline-setting.test.ts` pins the schema
+	// default and the manager-armed lease; this pins the BUS-armed one, so a
+	// future divergent hardcode here fails the suite instead of shipping.
+	const session = await acceptPrompt(
+		"default-lease",
+		DEFAULT_SDK_PROMPT_DEADLINE_MS,
+		DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
+		{
+			settings: settingsWithoutDeadlineValues,
+			captureSchedule: true,
+		},
+	);
+	try {
+		const armed = session.scheduledDelays[0] ?? 0;
+		// Armed from the lease minus however long the durable accept write took.
+		expect(armed).toBeLessThanOrEqual(DEFAULT_SDK_PROMPT_DEADLINE_MS);
+		expect(armed).toBeGreaterThan(DEFAULT_SDK_PROMPT_DEADLINE_MS - 60_000);
+		// The regression this exists to catch: the old 30-minute hardcode.
+		expect(armed).toBeGreaterThan(1_800_000);
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);

@@ -25,10 +25,11 @@
  *
  * Destination symlinks are followed: the referent is replaced, the link stays.
  * The referent is re-resolved immediately before publication so a retargeted
- * link cannot silently repoint the write, and when the lexical destination
- * sits inside a session-scoped `gjc-local` root the resolved referent and its
- * parent must remain inside that root (a link there must not redirect the
- * write out of the trust boundary).
+ * link cannot silently repoint the write. When the lexical destination sits
+ * inside the active explicit artifacts local root (`<artifacts>/local`) or a
+ * session-scoped `gjc-local` root, the resolved referent and its parent must
+ * remain inside that root (a link there must not redirect the write out of
+ * the trust boundary).
  *
  * Staging uses exclusive create (`wx`) so a colliding leftover temp is never
  * truncated or unlinked; only the temp this call created is cleaned on failure.
@@ -44,6 +45,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
+import { LocalProtocolHandler } from "../internal-urls/local-protocol";
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
@@ -111,9 +113,10 @@ export function formatFileWriteError(error: unknown, dest: string, options: { de
 export interface WriteFileAtomicallyOptions {
 	/**
 	 * Trusted root that a resolved symlink referent and its parent must not
-	 * leave. When omitted, the helper still enforces the session-scoped
-	 * `gjc-local` boundary implied by a lexical destination under
-	 * `<tmpdir>/gjc-local/<session-id>`.
+	 * leave. When omitted, a destination inside the active explicit artifacts
+	 * local root (`<artifacts>/local`) uses that root. Otherwise the helper
+	 * still enforces the session-scoped `gjc-local` boundary implied by a
+	 * lexical destination under `<tmpdir>/gjc-local/<session-id>`.
 	 */
 	trustBoundary?: string;
 	/** Platform override used by deterministic retry tests. */
@@ -165,16 +168,52 @@ async function resolvePublishPath(dest: string, depth = 0): Promise<ResolvedPubl
 	}
 }
 
-function pathIsWithin(target: string, root: string): boolean {
-	return target === root || target.startsWith(`${root}${path.sep}`);
+function relativeStaysWithin(target: string, root: string): boolean {
+	// A prefix check treats the filesystem root as `//`, so a normal child is
+	// rejected. Compare the relative path instead. Callers pass real paths.
+	const relative = path.relative(root, target);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+/**
+ * Case-sensitive containment for canonical Windows paths. `path.win32.relative`
+ * folds directory case, but a volume can keep `local` and `Local` as different
+ * directories. Drive letters stay case-insensitive.
+ */
+export function canonicalWindowsPathWithin(root: string, candidate: string): boolean {
+	if (!path.win32.isAbsolute(root) || !path.win32.isAbsolute(candidate)) return false;
+	const canonicalRoot = path.win32.resolve(root);
+	const canonicalCandidate = path.win32.resolve(candidate);
+	const rootParts = path.win32.parse(canonicalRoot);
+	const candidateParts = path.win32.parse(canonicalCandidate);
+	if (rootParts.root.toLowerCase() !== candidateParts.root.toLowerCase()) return false;
+	const rootSegments = canonicalRoot.slice(rootParts.root.length).split(path.win32.sep).filter(Boolean);
+	const candidateSegments = canonicalCandidate.slice(candidateParts.root.length).split(path.win32.sep).filter(Boolean);
+	if (candidateSegments.length < rootSegments.length) return false;
+	return rootSegments.every((segment, index) => segment === candidateSegments[index]);
+}
+
+export function pathIsWithin(target: string, root: string): boolean {
+	if (!relativeStaysWithin(target, root)) return false;
+	if (process.platform !== "win32") return true;
+	return canonicalWindowsPathWithin(root, target);
 }
 
 async function realpathOrSelf(p: string): Promise<string> {
-	try {
-		return await fs.realpath(p);
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-		return path.resolve(p);
+	const resolved = path.resolve(p);
+	const missing: string[] = [];
+	let cursor = resolved;
+	for (;;) {
+		try {
+			const real = await fs.realpath(cursor);
+			return missing.length === 0 ? real : path.join(real, ...missing.reverse());
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			const parent = path.dirname(cursor);
+			if (parent === cursor) return resolved;
+			missing.push(path.basename(cursor));
+			cursor = parent;
+		}
 	}
 }
 
@@ -186,11 +225,30 @@ async function realpathOrSelf(p: string): Promise<string> {
 function sessionLocalRootFor(lexicalDest: string): string | undefined {
 	const resolvedDest = path.resolve(lexicalDest);
 	const localParent = path.join(os.tmpdir(), "gjc-local");
-	if (!pathIsWithin(resolvedDest, localParent)) return undefined;
+	if (!relativeStaysWithin(resolvedDest, localParent)) return undefined;
 	const rest = resolvedDest.slice(localParent.length + path.sep.length);
 	const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
 	if (sessionSegment.length === 0) return undefined;
 	return path.join(localParent, sessionSegment);
+}
+
+/**
+ * Active explicit artifacts root (`<artifacts>/local`) when `lexicalDest` is
+ * inside it. That root is not under `<tmpdir>/gjc-local`, so the tmp helper
+ * above would leave the write unbounded. Managed sessions keep the tmp root.
+ */
+function explicitLocalRootFor(lexicalDest: string): string | undefined {
+	const options = LocalProtocolHandler.resolveOptions();
+	if (!options || options.isManagedDestination?.()) return undefined;
+	const artifactsDir = options.getArtifactsDir?.();
+	if (!artifactsDir) return undefined;
+	const root = path.resolve(artifactsDir, "local");
+	if (!relativeStaysWithin(path.resolve(lexicalDest), root)) return undefined;
+	return root;
+}
+
+function trustBoundaryForDestination(lexicalDest: string): string | undefined {
+	return explicitLocalRootFor(lexicalDest) ?? sessionLocalRootFor(lexicalDest);
 }
 
 /**
@@ -201,8 +259,8 @@ function sessionLocalRootFor(lexicalDest: string): string | undefined {
  * This must run before any directory is created. A dangling symlink inside a
  * trusted root resolves to a path outside it, so creating parents first would
  * let an attacker-selected directory tree be materialized outside the sandbox
- * before publication is refused. Missing ancestors therefore resolve
- * lexically (`realpathOrSelf` tolerates ENOENT) and are still boundary-checked.
+ * before publication is refused. A missing path is resolved through the
+ * nearest existing ancestor's realpath, then the missing suffix is appended.
  */
 async function assertWithinTrustBoundary(publishPath: string, trustBoundary: string): Promise<void> {
 	const boundary = path.resolve(trustBoundary);
@@ -502,7 +560,7 @@ export async function writeFileAtomically(
 	try {
 		const platform = options.platform ?? process.platform;
 		const sleep = options.sleep ?? (async (delayMs: number): Promise<void> => await Bun.sleep(delayMs));
-		const trustBoundary = options.trustBoundary ?? sessionLocalRootFor(dest);
+		const trustBoundary = options.trustBoundary ?? trustBoundaryForDestination(dest);
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
 		// Boundary first, then create parents. A dangling symlink inside a trusted

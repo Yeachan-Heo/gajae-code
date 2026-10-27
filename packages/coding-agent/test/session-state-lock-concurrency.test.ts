@@ -26,6 +26,7 @@ setDefaultTimeout(120_000);
 
 afterEach(async () => {
 	SessionStateLockTestHooks.probeProcessSignal = undefined;
+	SessionStateLockTestHooks.probeLinuxProcPid = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -131,17 +132,19 @@ describe("coordinator session state lock under cross-process contention", () => 
 		const stateFile = path.join(root, "killed-owner.json");
 		const lockFile = `${stateFile}.lock`;
 		await Bun.write(stateFile, JSON.stringify({ marks: [] }));
+		const readyFile = `${stateFile}.ready`;
 
 		// A real process that takes the lock and is then killed mid-hold, so the owner
 		// record on disk is exactly what a crashed holder leaves.
-		const holder = Bun.spawn([process.execPath, PROBE, stateFile, "killed", "1", "60000"], {
+		const holder = Bun.spawn([process.execPath, PROBE, stateFile, "killed", "1", "60000", readyFile], {
 			cwd: REPO_ROOT,
 			env: { ...process.env, NO_COLOR: "1" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});
 		const deadline = Date.now() + 20_000;
-		while (!fsSync.existsSync(lockFile) && Date.now() < deadline) await Bun.sleep(25);
+		while (!fsSync.existsSync(readyFile) && Date.now() < deadline) await Bun.sleep(25);
+		expect(fsSync.existsSync(readyFile)).toBe(true);
 		expect(fsSync.existsSync(lockFile)).toBe(true);
 		const owner = JSON.parse(await Bun.file(lockFile).text()) as { pid: number; released?: boolean };
 		expect(owner.pid).toBe(holder.pid);
@@ -169,11 +172,12 @@ describe("coordinator session state lock under cross-process contention", () => 
 			const root = await tempRoot();
 			const stateFile = path.join(root, "zombie-owner.json");
 			const lockFile = `${stateFile}.lock`;
+			const readyFile = `${stateFile}.ready`;
 			await Bun.write(stateFile, JSON.stringify({ marks: [] }));
 
 			// A LIVE holder, so `kill(pid, 0)` genuinely succeeds and the signal probe alone
 			// cannot authorize the reclaim. Only the `/proc` state distinguishes the two.
-			const holder = Bun.spawn([process.execPath, PROBE, stateFile, "zombie", "1", "60000"], {
+			const holder = Bun.spawn([process.execPath, PROBE, stateFile, "zombie", "1", "60000", readyFile], {
 				cwd: REPO_ROOT,
 				env: { ...process.env, NO_COLOR: "1" },
 				stdout: "pipe",
@@ -181,7 +185,10 @@ describe("coordinator session state lock under cross-process contention", () => 
 			});
 			try {
 				const lockDeadline = Date.now() + 20_000;
-				while (!fsSync.existsSync(lockFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+				// The owner record exists before acquisition finishes releasing its transition claim.
+				// Inject zombie liveness only once the holder has entered the critical section.
+				while (!fsSync.existsSync(readyFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+				expect(fsSync.existsSync(readyFile)).toBe(true);
 				expect((JSON.parse(await Bun.file(lockFile).text()) as { pid: number }).pid).toBe(holder.pid);
 				expect(() => process.kill(holder.pid, 0)).not.toThrow();
 
@@ -215,8 +222,9 @@ describe("coordinator session state lock under cross-process contention", () => 
 				const stateFile = path.join(root, `live-proc-${probe.label}.json`);
 				const lockFile = `${stateFile}.lock`;
 				await Bun.write(stateFile, JSON.stringify({ marks: [] }));
+				const readyFile = `${stateFile}.ready`;
 
-				const holder = Bun.spawn([process.execPath, PROBE, stateFile, probe.label, "1", "60000"], {
+				const holder = Bun.spawn([process.execPath, PROBE, stateFile, probe.label, "1", "60000", readyFile], {
 					cwd: REPO_ROOT,
 					env: { ...process.env, NO_COLOR: "1" },
 					stdout: "pipe",
@@ -224,7 +232,8 @@ describe("coordinator session state lock under cross-process contention", () => 
 				});
 				try {
 					const lockDeadline = Date.now() + 20_000;
-					while (!fsSync.existsSync(lockFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+					while (!fsSync.existsSync(readyFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+					expect(fsSync.existsSync(readyFile)).toBe(true);
 					expect((JSON.parse(await Bun.file(lockFile).text()) as { pid: number }).pid).toBe(holder.pid);
 
 					SessionStateLockTestHooks.probeLinuxProcPid = pid =>

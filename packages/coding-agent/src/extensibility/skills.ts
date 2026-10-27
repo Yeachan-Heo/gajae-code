@@ -19,6 +19,7 @@ import {
 	getSkillFilesystemIdentity,
 	isCanonicalGjcWorkflowSkillFilesystemAlias,
 } from "../skill-state/canonical-skills";
+import { wrapUntrustedContent } from "../tools/fetch";
 import { expandTilde } from "../tools/path-utils";
 import type { LoadedSubskillActivation } from "./gjc-plugins";
 import { buildSubskillInjection } from "./gjc-plugins/injection";
@@ -125,6 +126,8 @@ export interface LoadSkillsOptions extends SkillsSettings {
 	agentDir?: string;
 	/** Resolver-owned classification for the selected agent directory. */
 	profileAuthority?: "default" | "custom";
+	/** User-owned permission to follow symlinks outside user skill scan roots. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 /**
@@ -167,6 +170,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	const projectTrusted = resolveSkillScopeTrust(options, "project");
 	const userTrusted = resolveSkillScopeTrust(options, "user");
+	const allowExternalUserSkillSymlinks = options.allowExternalUserSkillSymlinks ?? userTrusted;
 
 	// Skill scope trust decides which canonical locations are loaded: project
 	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
@@ -197,6 +201,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		userAgentDir: agentDir,
 		profileAuthority,
 		repoRoot: await findRepoRoot(cwd),
+		allowExternalUserSkillSymlinks,
 	};
 	const providerResults = await Promise.all(
 		providers.map(async provider => {
@@ -311,12 +316,13 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		customDirectories.map(async dir => {
 			const expandedDir = expandTilde(dir, home);
 			const scanResult = await scanSkillsFromDir(
-				{ cwd, home, repoRoot: null },
+				{ cwd, home, repoRoot: null, allowExternalUserSkillSymlinks },
 				{
 					dir: expandedDir,
 					providerId: "custom",
 					level: "user",
 					requireDescription: true,
+					allowExternalUserSkillSymlinks,
 				},
 			);
 			return { expandedDir, scanResult };
@@ -526,6 +532,118 @@ export function resolveSkillSlashCommands(
 	return commands;
 }
 
+/** Same character cap as session persistence, so a fenced skill prompt is not cut later. */
+const SKILL_PROMPT_PERSIST_CAP = 500_000;
+const SKILL_FENCE_OPEN = "<untrusted-content>\n";
+const SKILL_FENCE_CLOSE = "\n</untrusted-content>";
+const SKILL_FENCE_OVERHEAD = SKILL_FENCE_OPEN.length + SKILL_FENCE_CLOSE.length;
+/** Replacement produced by `escapeUntrustedContent` for both closer forms. */
+const ESCAPED_CLOSER = "&lt;/untrusted-content>";
+const CLOSER_PREFIX = "</untrusted-content";
+
+function sliceSkillHead(value: string, maxLength: number): string {
+	if (maxLength <= 0) return "";
+	if (value.length <= maxLength) return value;
+	let truncated = value.slice(0, maxLength);
+	const last = truncated.charCodeAt(truncated.length - 1);
+	if (last >= 0xd800 && last <= 0xdbff) truncated = truncated.slice(0, -1);
+	return truncated;
+}
+
+function isCloserWhitespace(code: number): boolean {
+	return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d || code === 0x0c;
+}
+
+function sameCloserChar(actual: number, expected: number): boolean {
+	if (actual === expected) return true;
+	return actual >= 0x41 && actual <= 0x5a && actual + 0x20 === expected;
+}
+
+/** Raw length of a closer at `index`, or 0. Reads the source; does not copy it. */
+function measureCloser(value: string, index: number): number {
+	const prefix = CLOSER_PREFIX.length;
+	if (index + prefix >= value.length) return 0;
+	for (let i = 0; i < prefix; i++) {
+		if (!sameCloserChar(value.charCodeAt(index + i), CLOSER_PREFIX.charCodeAt(i))) return 0;
+	}
+	let cursor = index + prefix;
+	const first = value.charCodeAt(cursor);
+	if (first === 0x3e) return prefix + 1;
+	if (!isCloserWhitespace(first)) return 0;
+	cursor += 1;
+	while (cursor < value.length && isCloserWhitespace(value.charCodeAt(cursor))) cursor += 1;
+	if (cursor < value.length && value.charCodeAt(cursor) === 0x3e) return cursor + 1 - index;
+	return 0;
+}
+
+/**
+ * One forward scan. Stops once the escaped form would pass `budget`.
+ * Closers are charged at their escaped size so the later wrap cannot grow the text.
+ */
+function boundSkillBody(body: string, budget: number): { text: string; consumedAll: boolean } {
+	if (budget <= 0 || body.length === 0) return { text: "", consumedAll: body.length === 0 };
+	const parts: string[] = [];
+	let used = 0;
+	let index = 0;
+	while (index < body.length && used < budget) {
+		const closer = body.charCodeAt(index) === 0x3c ? measureCloser(body, index) : 0;
+		if (closer > 0) {
+			if (used + ESCAPED_CLOSER.length > budget) break;
+			parts.push(ESCAPED_CLOSER);
+			used += ESCAPED_CLOSER.length;
+			index += closer;
+			continue;
+		}
+		const start = index;
+		let end = index;
+		while (end < body.length) {
+			const room = budget - used - (end - start);
+			if (room <= 0) break;
+			if (body.charCodeAt(end) === 0x3c && measureCloser(body, end) > 0) break;
+			const code = body.charCodeAt(end);
+			if (code >= 0xd800 && code <= 0xdbff) {
+				const low = end + 1 < body.length ? body.charCodeAt(end + 1) : 0;
+				if (low >= 0xdc00 && low <= 0xdfff) {
+					if (room < 2) break;
+					end += 2;
+					continue;
+				}
+			}
+			end += 1;
+		}
+		if (end === start) break;
+		parts.push(body.slice(start, end));
+		used += end - start;
+		index = end;
+	}
+	return { text: parts.join(""), consumedAll: index >= body.length };
+}
+
+/**
+ * Reserve the fence inside `cap`, then keep the body and host suffix.
+ * The attacker-sized body is bounded before `wrapUntrustedContent` runs once.
+ */
+export function frameSkillPromptWithinCap(
+	body: string,
+	suffix: string,
+	cap = SKILL_PROMPT_PERSIST_CAP,
+): { message: string; retained: string } {
+	const payload = Math.max(0, cap - SKILL_FENCE_OVERHEAD);
+	const whole = boundSkillBody(body, payload);
+	let bounded = whole.text;
+	let suffixKept = suffix;
+	if (whole.consumedAll) {
+		suffixKept = sliceSkillHead(suffix, payload - bounded.length);
+	} else if (suffix.length <= payload) {
+		bounded = boundSkillBody(body, payload - suffix.length).text;
+		suffixKept = suffix;
+	} else {
+		suffixKept = sliceSkillHead(suffix, Math.floor(payload / 2));
+		bounded = boundSkillBody(body, payload - suffixKept.length).text;
+	}
+	return { message: `${wrapUntrustedContent(bounded)}${suffixKept}`, retained: bounded };
+}
+
 export async function buildSkillPromptMessage(
 	skill: Pick<Skill, "name" | "filePath" | "content" | "loadContent">,
 	args: string,
@@ -542,12 +660,12 @@ export async function buildSkillPromptMessage(
 	if (trimmedArgs) {
 		metaLines.push(`User: ${trimmedArgs}`);
 	}
-	let message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
+	let suffix = `\n\n---\n\n${metaLines.join("\n")}`;
 	const details: SkillPromptDetails = {
 		name: skill.name,
 		path: skill.filePath,
 		args: trimmedArgs || undefined,
-		lineCount: body ? body.split("\n").length : 0,
+		lineCount: 0,
 	};
 	if (context?.subskillActivationSet) {
 		details.subskillActivationSet = context.subskillActivationSet;
@@ -563,7 +681,7 @@ export async function buildSkillPromptMessage(
 				})
 			: null;
 		if (injection) {
-			message += injection.block;
+			suffix += injection.block;
 			details.subskillActivation = injection.details ?? context.subskillActivation;
 		} else if (context.subskillActivation) {
 			details.subskillActivation = context.subskillActivation;
@@ -577,14 +695,17 @@ export async function buildSkillPromptMessage(
 					skillName: skill.name,
 					phase: context.currentPhase,
 				});
-				if (advert) message += `\n\n${advert}`;
+				if (advert) suffix += `\n\n${advert}`;
 			} catch {
 				// Advertisement is best-effort; never block skill prompt construction.
 			}
 		}
 	}
+	// Bound the body and suffix inside the persistence cap, then fence once.
+	const framed = frameSkillPromptWithinCap(body, suffix);
+	details.lineCount = framed.retained ? framed.retained.split("\n").length : 0;
 	return {
-		message,
+		message: framed.message,
 		details,
 	};
 }

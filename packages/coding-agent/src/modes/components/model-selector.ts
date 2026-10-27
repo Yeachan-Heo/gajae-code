@@ -9,6 +9,7 @@ import {
 import {
 	Container,
 	fuzzyFilter,
+	fuzzyMatch,
 	getKeybindings,
 	Input,
 	matchesKey,
@@ -99,6 +100,150 @@ function computeModelRank(model: Model, roles: Record<string, RoleAssignment | u
 	return roles.default && modelsAreEqual(roles.default.model, model) ? 0 : 1;
 }
 
+/**
+ * Compute and assign fuzzy scores to model items based on a query.
+ * Scores are based on fuzzy matching against the model's searchable text.
+ */
+function fuzzyTokensScore(query: string, text: string): number | undefined {
+	const tokens = query
+		.trim()
+		.split(/\s+/)
+		.filter(token => token.length > 0);
+	if (tokens.length === 0) return undefined;
+	let total = 0;
+	for (const token of tokens) {
+		const match = fuzzyMatch(token, text);
+		if (!match.matches) return undefined;
+		total += match.score;
+	}
+	return total;
+}
+
+export function assignFuzzyScoresToModels(items: ModelItem[], query: string): void {
+	if (!query.trim()) {
+		for (const item of items) item.fuzzyScore = undefined;
+		return;
+	}
+	for (const item of items) {
+		// Overwrite every item so a raw-query miss cannot retain an earlier score.
+		item.fuzzyScore = fuzzyTokensScore(query, `${item.id} ${item.provider}`);
+	}
+}
+
+/**
+ * Compute and assign fuzzy scores to canonical model items based on a query.
+ */
+export function assignFuzzyScoresToCanonicalModels(items: CanonicalModelItem[], query: string): void {
+	if (!query.trim()) {
+		for (const item of items) item.fuzzyScore = undefined;
+		return;
+	}
+	for (const item of items) {
+		item.fuzzyScore = fuzzyTokensScore(query, item.searchText);
+	}
+}
+
+export interface RankedModelOrderContext {
+	roles: RoleAssignments;
+	mruIndex: ReadonlyMap<string, number>;
+	providerAuthStateById: ReadonlyMap<string, ProviderAuthState>;
+}
+
+const MODEL_DATE_RE = /-(\d{8})$/;
+const MODEL_LATEST_RE = /-latest$/;
+
+/** Ranking shared by the provider view: fuzzy quality, default, MRU, provider, recency. */
+export function compareModelItemsForRanking(a: ModelItem, b: ModelItem, context: RankedModelOrderContext): number {
+	const { roles, mruIndex, providerAuthStateById } = context;
+	const aHasFuzzyScore = a.fuzzyScore !== undefined;
+	const bHasFuzzyScore = b.fuzzyScore !== undefined;
+	if (aHasFuzzyScore || bHasFuzzyScore) {
+		const aScore = a.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		const bScore = b.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		if (aScore !== bScore) return aScore - bScore;
+		// Ties keep the established default-first, then MRU/provider ordering.
+	}
+
+	const aRank = computeModelRank(a.model, roles);
+	const bRank = computeModelRank(b.model, roles);
+	if (aRank !== bRank) return aRank - bRank;
+
+	const aMru = mruIndex.get(a.selector) ?? Number.MAX_SAFE_INTEGER;
+	const bMru = mruIndex.get(b.selector) ?? Number.MAX_SAFE_INTEGER;
+	if (aMru !== bMru) return aMru - bMru;
+
+	const providerCmp = compareRankedProviders(
+		{ id: a.provider, label: a.provider, authState: providerAuthStateById.get(a.provider) ?? "none" },
+		{ id: b.provider, label: b.provider, authState: providerAuthStateById.get(b.provider) ?? "none" },
+	);
+	if (providerCmp !== 0) return providerCmp;
+
+	// Priority field (lower = better, e.g. OpenAI code backend priority values)
+	const aPri = a.model.priority ?? Number.MAX_SAFE_INTEGER;
+	const bPri = b.model.priority ?? Number.MAX_SAFE_INTEGER;
+	if (aPri !== bPri) return aPri - bPri;
+
+	// Version number descending (higher version = better model)
+	const aVer = extractVersionNumber(a.id);
+	const bVer = extractVersionNumber(b.id);
+	if (aVer !== bVer) return bVer - aVer;
+
+	const aIsLatest = MODEL_LATEST_RE.test(a.id);
+	const bIsLatest = MODEL_LATEST_RE.test(b.id);
+	const aDate = a.id.match(MODEL_DATE_RE)?.[1] ?? "";
+	const bDate = b.id.match(MODEL_DATE_RE)?.[1] ?? "";
+
+	const aHasRecency = aIsLatest || aDate !== "";
+	const bHasRecency = bIsLatest || bDate !== "";
+	if (aHasRecency !== bHasRecency) return aHasRecency ? -1 : 1;
+	if (!aHasRecency) return a.id.localeCompare(b.id);
+	if (aIsLatest !== bIsLatest) return aIsLatest ? -1 : 1;
+	if (aDate && bDate) return bDate.localeCompare(aDate);
+	return aIsLatest ? -1 : bIsLatest ? 1 : a.id.localeCompare(b.id);
+}
+
+/** Ranking shared by the canonical view: fuzzy quality, default, MRU, provider, then id. */
+export function compareCanonicalModelItemsForRanking(
+	a: CanonicalModelItem,
+	b: CanonicalModelItem,
+	context: RankedModelOrderContext,
+): number {
+	const { roles, mruIndex, providerAuthStateById } = context;
+	const aHasFuzzyScore = a.fuzzyScore !== undefined;
+	const bHasFuzzyScore = b.fuzzyScore !== undefined;
+	if (aHasFuzzyScore || bHasFuzzyScore) {
+		const aScore = a.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		const bScore = b.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		if (aScore !== bScore) return aScore - bScore;
+		// Ties keep the established default-first, then MRU/provider ordering.
+	}
+
+	const aRank = computeModelRank(a.model, roles);
+	const bRank = computeModelRank(b.model, roles);
+	if (aRank !== bRank) return aRank - bRank;
+
+	const aKey = `${a.model.provider}/${a.model.id}`;
+	const bKey = `${b.model.provider}/${b.model.id}`;
+	const aMru = mruIndex.get(aKey) ?? Number.MAX_SAFE_INTEGER;
+	const bMru = mruIndex.get(bKey) ?? Number.MAX_SAFE_INTEGER;
+	if (aMru !== bMru) return aMru - bMru;
+
+	const providerCmp = compareRankedProviders(
+		{
+			id: a.model.provider,
+			label: a.model.provider,
+			authState: providerAuthStateById.get(a.model.provider) ?? "none",
+		},
+		{
+			id: b.model.provider,
+			label: b.model.provider,
+			authState: providerAuthStateById.get(b.model.provider) ?? "none",
+		},
+	);
+	if (providerCmp !== 0) return providerCmp;
+	return a.id.localeCompare(b.id);
+}
+
 interface ModelItem {
 	kind: "provider";
 	provider: string;
@@ -107,6 +252,7 @@ interface ModelItem {
 	selector: string;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel?: boolean;
+	fuzzyScore?: number;
 }
 
 interface CanonicalModelItem {
@@ -120,6 +266,7 @@ interface CanonicalModelItem {
 	compactSearchText: string;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel?: boolean;
+	fuzzyScore?: number;
 }
 
 type ScopedModelItem = ScopedModelSelection;
@@ -646,7 +793,7 @@ export class ModelSelectorComponent extends Container {
 			this.#configuredDefaultChain ?? normalizeModelSelectorValue(this.#settings.getModelRole("default"));
 		if (configuredChain.length < 2) return false;
 
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = this.#modelRegistry.getAll(this.#authSessionId);
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		return configuredChain.slice(1).some(selector => {
 			const resolved = resolveModelRoleValue(selector, allModels, {
@@ -662,7 +809,7 @@ export class ModelSelectorComponent extends Container {
 
 	#loadRoleModels(): RoleAssignments {
 		const roles: RoleAssignments = {};
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = this.#modelRegistry.getAll(this.#authSessionId);
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		const agentModelOverrides = this.#settings.get("task.agentModelOverrides");
 		const activeProfile = this.#activeModelProfile
@@ -738,7 +885,6 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#sortModels(models: ModelItem[], roles: RoleAssignments = this.#roles): void {
-		// Sort: default-tagged model first, then MRU, then provider ranking
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
 		const providerAuthStateById = new Map<string, ProviderAuthState>();
@@ -747,74 +893,7 @@ export class ModelSelectorComponent extends Container {
 				providerAuthStateById.set(item.provider, this.#resolveProviderAuthState(item.provider));
 			}
 		}
-
-		const modelRank = (item: ModelItem) => computeModelRank(item.model, roles);
-
-		const dateRe = /-(\d{8})$/;
-		const latestRe = /-latest$/;
-
-		models.sort((a, b) => {
-			const aKey = a.selector;
-			const bKey = b.selector;
-
-			const aRank = modelRank(a);
-			const bRank = modelRank(b);
-			if (aRank !== bRank) return aRank - bRank;
-
-			// Then MRU order (models in mruIndex come before those not in it)
-			const aMru = mruIndex.get(aKey) ?? Number.MAX_SAFE_INTEGER;
-			const bMru = mruIndex.get(bKey) ?? Number.MAX_SAFE_INTEGER;
-			if (aMru !== bMru) return aMru - bMru;
-
-			// By provider, then recency within provider
-			const providerCmp = compareRankedProviders(
-				{
-					id: a.provider,
-					label: a.provider,
-					authState: providerAuthStateById.get(a.provider) ?? "none",
-				},
-				{
-					id: b.provider,
-					label: b.provider,
-					authState: providerAuthStateById.get(b.provider) ?? "none",
-				},
-			);
-			if (providerCmp !== 0) return providerCmp;
-
-			// Priority field (lower = better, e.g. OpenAI code backend priority values)
-			const aPri = a.model.priority ?? Number.MAX_SAFE_INTEGER;
-			const bPri = b.model.priority ?? Number.MAX_SAFE_INTEGER;
-			if (aPri !== bPri) return aPri - bPri;
-
-			// Version number descending (higher version = better model)
-			const aVer = extractVersionNumber(a.id);
-			const bVer = extractVersionNumber(b.id);
-			if (aVer !== bVer) return bVer - aVer;
-
-			const aIsLatest = latestRe.test(a.id);
-			const bIsLatest = latestRe.test(b.id);
-			const aDate = a.id.match(dateRe)?.[1] ?? "";
-			const bDate = b.id.match(dateRe)?.[1] ?? "";
-
-			// Both have dates or latest tags — sort by recency
-			const aHasRecency = aIsLatest || aDate !== "";
-			const bHasRecency = bIsLatest || bDate !== "";
-
-			// Models with recency info come before those without
-			if (aHasRecency !== bHasRecency) return aHasRecency ? -1 : 1;
-
-			// If neither has recency info, fall back to alphabetical
-			if (!aHasRecency) return a.id.localeCompare(b.id);
-
-			// -latest always sorts first within recency group
-			if (aIsLatest !== bIsLatest) return aIsLatest ? -1 : 1;
-
-			// Both have dates — descending (newest first)
-			if (aDate && bDate) return bDate.localeCompare(aDate);
-
-			// One has date, other is latest — latest first
-			return aIsLatest ? -1 : bIsLatest ? 1 : a.id.localeCompare(b.id);
-		});
+		models.sort((a, b) => compareModelItemsForRanking(a, b, { roles, mruIndex, providerAuthStateById }));
 	}
 
 	#sortCanonicalModels(models: CanonicalModelItem[], roles: RoleAssignments = this.#roles): void {
@@ -826,34 +905,7 @@ export class ModelSelectorComponent extends Container {
 				providerAuthStateById.set(item.model.provider, this.#resolveProviderAuthState(item.model.provider));
 			}
 		}
-
-		const modelRank = (item: CanonicalModelItem) => computeModelRank(item.model, roles);
-
-		models.sort((a, b) => {
-			const aRank = modelRank(a);
-			const bRank = modelRank(b);
-			if (aRank !== bRank) return aRank - bRank;
-
-			const aMru = mruIndex.get(`${a.model.provider}/${a.model.id}`) ?? Number.MAX_SAFE_INTEGER;
-			const bMru = mruIndex.get(`${b.model.provider}/${b.model.id}`) ?? Number.MAX_SAFE_INTEGER;
-			if (aMru !== bMru) return aMru - bMru;
-
-			const providerCmp = compareRankedProviders(
-				{
-					id: a.model.provider,
-					label: a.model.provider,
-					authState: providerAuthStateById.get(a.model.provider) ?? "none",
-				},
-				{
-					id: b.model.provider,
-					label: b.model.provider,
-					authState: providerAuthStateById.get(b.model.provider) ?? "none",
-				},
-			);
-			if (providerCmp !== 0) return providerCmp;
-
-			return a.id.localeCompare(b.id);
-		});
+		models.sort((a, b) => compareCanonicalModelItemsForRanking(a, b, { roles, mruIndex, providerAuthStateById }));
 	}
 
 	#buildScopedModelItems(): ModelItem[] {
@@ -869,7 +921,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#buildAvailableModelItems(): ModelItem[] {
-		return this.#modelRegistry.getAvailable().map((model: Model) => ({
+		return this.#modelRegistry.getAvailable(this.#authSessionId).map((model: Model) => ({
 			kind: "provider",
 			provider: model.provider,
 			id: model.id,
@@ -1205,10 +1257,12 @@ export class ModelSelectorComponent extends Container {
 							? alphaFiltered
 							: baseCanonicalModels;
 				const fuzzyMatches = fuzzyFilter(fuzzySource, query, ({ searchText }) => searchText);
+				assignFuzzyScoresToCanonicalModels(fuzzyMatches, query);
 				this.#sortCanonicalModels(fuzzyMatches);
 				this.#filteredCanonicalModels = fuzzyMatches;
 			} else {
 				const fuzzyMatches = fuzzyFilter(baseModels, query, ({ id, provider }) => `${id} ${provider}`);
+				assignFuzzyScoresToModels(fuzzyMatches, query);
 				this.#sortModels(fuzzyMatches);
 				this.#filteredModels = fuzzyMatches;
 			}
@@ -1256,7 +1310,7 @@ export class ModelSelectorComponent extends Container {
 			if (isInheritedRoleSelector(configuredSelector)) continue;
 			const selectors = resolveConfiguredModelPatterns(configuredSelector, this.#settings);
 			for (const selector of selectors.length > 0 ? selectors : [configuredSelector]) {
-				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
 					settings: this.#settings,
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
@@ -1369,10 +1423,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#getProfileAvailableModels(): Model[] {
-		const getAvailableForProfileActivation = this.#modelRegistry.getAvailableForProfileActivation;
-		return typeof getAvailableForProfileActivation === "function"
-			? getAvailableForProfileActivation.call(this.#modelRegistry)
-			: this.#modelRegistry.getAvailable();
+		return this.#modelRegistry.getAvailable(this.#authSessionId);
 	}
 
 	#createProfileResolutionRegistry(availableModels: readonly Model[]) {
@@ -1385,6 +1436,7 @@ export class ModelSelectorComponent extends Container {
 			resolveModelByLookupAlias: this.#modelRegistry.resolveModelByLookupAlias?.bind(this.#modelRegistry),
 			lookupAliasExists: this.#modelRegistry.lookupAliasExists?.bind(this.#modelRegistry),
 			clearCanonicalVariant: this.#modelRegistry.clearCanonicalVariant?.bind(this.#modelRegistry),
+			isSelectorCircuitOpen: this.#modelRegistry.isSelectorCircuitOpen?.bind(this.#modelRegistry) ?? (() => false),
 		};
 	}
 
@@ -2110,7 +2162,7 @@ export class ModelSelectorComponent extends Container {
 		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
 			const selector = profile.modelMapping[role];
 			if (!selector) continue;
-			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
 				settings: this.#settings,
 				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,

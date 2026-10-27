@@ -4,6 +4,7 @@ import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
 import modelsJson from "../src/models.json" with { type: "json" };
+import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 
 function gemini37SiblingId(modelId: string): string {
 	return modelId.replaceAll("gemini-3.6-flash", "gemini-3.7-flash").replaceAll("gemini-3-6-flash", "gemini-3-7-flash");
@@ -14,7 +15,7 @@ describe("preset catalog model entries", () => {
 		const astra = getBundledModel("openai-codex", "gpt-6-astra");
 		expect(astra).toMatchObject({
 			id: "gpt-6-astra",
-			name: "GPT-6-Astra",
+			name: "GPT-6 Astra",
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: "https://chatgpt.com/backend-api",
@@ -246,7 +247,21 @@ describe("preset catalog model entries", () => {
 		expect(model.name).toBe("MiniMax-M3");
 		expect(model.reasoning).toBe(true);
 		expect(model.contextWindow).toBe(1_000_000);
-		expect(model.maxTokens).toBe(128_000);
+		expect(model.maxTokens).toBe(512_000);
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.High, maxLevel: Effort.High });
+	});
+
+	// #830
+	test("uses Sonnet 5 as the first-class Anthropic default while preserving older Sonnet entries", () => {
+		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "anthropic");
+		expect(descriptor).toBeDefined();
+		expect(descriptor?.defaultModel).toBe("claude-sonnet-5");
+		expect(DEFAULT_MODEL_PER_PROVIDER.anthropic).toBe("claude-sonnet-5");
+
+		const sonnet5 = getBundledModel("anthropic", "claude-sonnet-5");
+		const sonnet46 = getBundledModel("anthropic", "claude-sonnet-4-6");
+		expect(sonnet5?.api).toBe("anthropic-messages");
+		expect(sonnet5?.reasoning).toBe(true);
+		expect(sonnet46?.api).toBe("anthropic-messages");
 	});
 });

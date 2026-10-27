@@ -104,6 +104,9 @@ export interface DefaultGjcDefinitionInstallResult {
 	retired: RetiredGjcDefinitionFile[];
 }
 function sourcePathForBundledEntry(entry: BundledGjcSkillCatalogEntry): string {
+	// Prefer the embedded asset path: `import.meta.dir` is `/$bunfs/root` in a
+	// compiled binary, where the `gjc/` tree is not laid out as files.
+	if (entry.sourcePath) return entry.sourcePath;
 	const relative = entry.kind === "skill" ? entry.relativePath : entry.relativePath.replace(/^skill-fragments\//, "");
 	return entry.kind === "skill"
 		? path.join(import.meta.dir, "gjc", relative)

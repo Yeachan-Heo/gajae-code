@@ -10,7 +10,7 @@ import * as path from "node:path";
 import type { ToolCallContext } from "@gajae-code/agent-core";
 import type { Component, Ellipsis } from "@gajae-code/tui";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { pluralize } from "@gajae-code/utils";
+import { pluralize, sanitizeText } from "@gajae-code/utils";
 import { settings } from "../config/settings";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
@@ -175,7 +175,7 @@ export function formatMeta(meta: string[], theme: Theme): string {
 }
 
 export function formatErrorMessage(message: string | undefined, theme: Theme): string {
-	const clean = (message ?? "").replace(/^Error:\s*/, "").trim();
+	const clean = sanitizeText((message ?? "").replace(/^Error:\s*/, "").trim());
 	return `${theme.styledSymbol("status.error", "error")} ${theme.fg("error", `Error: ${clean || "Unknown error"}`)}`;
 }
 

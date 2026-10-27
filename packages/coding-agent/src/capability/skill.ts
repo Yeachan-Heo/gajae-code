@@ -41,6 +41,8 @@ export interface Skill {
 	name: string;
 	/** Absolute path to skill file */
 	path: string;
+	/** Lexical path used to discover the file, preserving symlink provenance for management operations. */
+	discoveryPath?: string;
 	/** Skill content (markdown) */
 	/** Lazily load the markdown body when the caller needs prompt content. */
 	loadContent?: () => Promise<string>;

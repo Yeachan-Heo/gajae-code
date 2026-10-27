@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { Api, Model } from "@gajae-code/ai";
 import { kNoAuth, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
-	type ModelLookupRegistry,
+	type ChainResolutionRegistry,
 	resolveModelOverrideWithAuthFallback,
 } from "@gajae-code/coding-agent/config/model-resolver";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -80,26 +80,26 @@ interface MockRegistryOptions {
 	authedProviders: Set<string>;
 }
 
-function createMockRegistry(options: MockRegistryOptions): ModelLookupRegistry & {
-	getApiKey(model: Model<Api>): Promise<string | undefined>;
-} {
+function createMockRegistry(options: MockRegistryOptions): ChainResolutionRegistry {
 	return {
 		getAvailable: () => options.models,
+		isSelectorCircuitOpen: () => false,
 		getApiKey: async (model: Model<Api>) =>
 			options.authedProviders.has(model.provider) ? "sk-test-token" : undefined,
-	} as unknown as ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> };
+	};
 }
 
 describe("issue #985: subagent dispatch auth fallback", () => {
 	test("uses the parent session's canonical stickiness for bare subagent overrides only", async () => {
-		const registry = {
+		const registry: ChainResolutionRegistry = {
 			getAvailable: () => [parentModel, unauthedTaskModel],
+			isSelectorCircuitOpen: () => false,
 			getApiKey: async () => "sk-test-token",
-			resolveCanonicalModel: (canonicalId: string, options?: { sessionId?: string }) => {
+			resolveCanonicalModel: (canonicalId, options) => {
 				if (canonicalId !== "task-canonical") return undefined;
 				return options?.sessionId === "parent-session" ? parentModel : unauthedTaskModel;
 			},
-		} as unknown as ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> };
+		};
 
 		const bare = await resolveModelOverrideWithAuthFallback(
 			["task-canonical"],
@@ -225,10 +225,11 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 	});
 
 	test("rebases to a keyless parent fallback", async () => {
-		const registry: ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> } = {
+		const registry: ChainResolutionRegistry = {
 			getAvailable: () => [parentModel, unauthedTaskModel],
+			isSelectorCircuitOpen: () => false,
 			getApiKey: async (model: Model<Api>) => (model.provider === "deepseek" ? kNoAuth : undefined),
-		} as never;
+		};
 		const result = await resolveModelOverrideWithAuthFallback(
 			["qwen3.6-plus-free"],
 			"deepseek/deepseek-v4-pro",
@@ -315,14 +316,15 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		// credentials. The helper treats this as authenticated so an explicitly
 		// configured local model is never silently rerouted to the parent's
 		// remote provider (see #1008).
-		const registry: ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> } = {
+		const registry: ChainResolutionRegistry = {
 			getAvailable: () => [parentModel, unauthedTaskModel],
+			isSelectorCircuitOpen: () => false,
 			getApiKey: async (model: Model<Api>) => {
 				if (model.provider === "deepseek") return "sk-test";
 				if (model.provider === "opencode-zen") return kNoAuth;
 				return undefined;
 			},
-		} as never;
+		};
 
 		const result = await resolveModelOverrideWithAuthFallback(
 			["qwen3.6-plus-free"],
@@ -337,10 +339,9 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 
 	test("passes parent session id when checking role override auth", async () => {
 		const sessionIds: Array<string | undefined> = [];
-		const registry: ModelLookupRegistry & {
-			getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined>;
-		} = {
+		const registry: ChainResolutionRegistry = {
 			getAvailable: () => [parentModel, unauthedTaskModel],
+			isSelectorCircuitOpen: () => false,
 			getApiKey: async (_model: Model<Api>, sessionId?: string) => {
 				sessionIds.push(sessionId);
 				return sessionId === "parent-session" ? "sk-session-token" : undefined;
@@ -448,6 +449,7 @@ describe("preset-equivalent alias boundaries with the real registry", () => {
 		const clearCanonicalVariant = vi.fn();
 		const registry = {
 			getAvailable: () => [alpha, beta],
+			isSelectorCircuitOpen: () => false,
 			getApiKey: async (candidate: Model) => (candidate.provider === "beta" ? "beta-key" : undefined),
 			lookupAliasExists: (alias: string) => alias === "flare-alias",
 			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>

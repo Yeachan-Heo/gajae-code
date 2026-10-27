@@ -1,0 +1,23 @@
+{
+  "schema": "gjc.iso-diff-golden/v1",
+  "recordedAgainst": "pre-sync pi-iso native at d84ec8697170486d822e17c064be15804857df3c (Phase 0 inventory base)",
+  "diff": {
+    "files": [
+      {
+        "path": "added.txt",
+        "op": 0,
+        "diff": "diff --git a/added.txt b/added.txt\nnew file mode 100644\n--- /dev/null\n+++ b/added.txt\n@@ -0,0 +1 @@\n+added content\n"
+      },
+      {
+        "path": "nested/changed.txt",
+        "op": 1,
+        "diff": "diff --git a/nested/changed.txt b/nested/changed.txt\n--- a/nested/changed.txt\n+++ b/nested/changed.txt\n@@ -1,2 +1,3 @@\n-before line one\n-before line two\n+after line one\n+new line two\n+last line\n"
+      },
+      {
+        "path": "removed.txt",
+        "op": 2,
+        "diff": "diff --git a/removed.txt b/removed.txt\ndeleted file mode 100644\n--- a/removed.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed content\n"
+      }
+    ]
+  }
+}

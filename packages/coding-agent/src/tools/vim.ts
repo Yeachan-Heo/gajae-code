@@ -2,12 +2,13 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Component } from "@gajae-code/tui";
 import { extractSegments, sliceWithWidth, Text } from "@gajae-code/tui";
 import { isEnoent, logger, prompt, untilAborted } from "@gajae-code/utils";
-import * as Diff from "diff";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { getNativeDiffBindings } from "../internal/native-diff";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import vimDescription from "../prompts/tools/vim.md" with { type: "text" };
+import { wrapUntrustedContent } from "../session/messages";
 import { CachedOutputBlock } from "../tui/output-block";
 import { renderStatusLine } from "../tui/status-line";
 import { VimBuffer } from "../vim/buffer";
@@ -86,8 +87,9 @@ function buildModelDiff(beforeText: string, afterText: string): string | undefin
 	if (beforeText === afterText) {
 		return undefined;
 	}
-	const patch = Diff.structuredPatch("", "", beforeText, afterText, "", "", { context: 3 });
-	const diff = patch.hunks
+	const hunks = getNativeDiffBindings().structuredPatchHunks(beforeText, afterText, 3);
+
+	const diff = hunks
 		.flatMap(hunk => [`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`, ...hunk.lines])
 		.join("\n");
 	return diff.length > 0 ? diff : undefined;
@@ -524,7 +526,8 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 			errorLocation,
 			statusMessage,
 		);
-		const resultText = modelDiff ? `${renderVimDetails(details)}\n\nDiff:\n${modelDiff}` : renderVimDetails(details);
+		const rendered = modelDiff ? `${renderVimDetails(details)}\n\nDiff:\n${modelDiff}` : renderVimDetails(details);
+		const resultText = wrapUntrustedContent(rendered);
 		const builder = toolResult<VimToolDetails>(details).text(resultText);
 		if (engine.diagnostics) {
 			builder.diagnostics(engine.diagnostics.summary, engine.diagnostics.messages ?? []);
@@ -833,7 +836,7 @@ export const vimToolRenderer = {
 			};
 		}
 
-		// Fallback: no previous viewport available (first vim call)
+		// The first vim call has no previous viewport.
 		if (argsDescription) {
 			return renderText(`${uiTheme.bold("Edit")} ${argsDescription}`);
 		}

@@ -148,9 +148,11 @@ function buildAnthropicDiscoveryHeaders(apiKey: string): Record<string, string> 
 	const headers: Record<string, string> = {
 		"anthropic-version": "2023-06-01",
 		"anthropic-dangerous-direct-browser-access": "true",
-		"anthropic-beta": ANTHROPIC_OAUTH_BETA,
 	};
 	if (oauthToken) {
+		// Claude Code identity betas are OAuth-only; API-key requests carrying them are
+		// classified as Claude Code usage and excluded from API credit grants.
+		headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA;
 		headers.Authorization = `Bearer ${apiKey}`;
 	} else {
 		headers["x-api-key"] = apiKey;
@@ -1175,15 +1177,52 @@ export interface OpenGatewayModelManagerConfig {
 	baseUrl?: string;
 }
 
+const OPENGATEWAY_BASE_URL = "https://apis.opengateway.ai/v1";
+/** OpenGateway serves accelerated deployments of an upstream model as `<upstream id>-ultrafast`. */
+const OPENGATEWAY_ULTRAFAST_SUFFIX = "-ultrafast";
+
 /**
  * OpenGateway by Sionic AI — an OpenAI-compatible gateway that fronts OpenAI,
- * Anthropic, and Google models behind one API key. Models are discovered from
- * the OpenAI-compatible `/v1/models` endpoint.
+ * Anthropic, Google, DeepSeek, Z.ai, Moonshot and Qwen models behind one API key.
+ * Models are discovered from the OpenAI-compatible `/v1/models` endpoint, which
+ * reports no capability metadata, so capabilities come from the bundled catalog:
+ * the OpenGateway entry first, then the same upstream id from any bundled
+ * provider, with `-ultrafast` deployments resolved to their upstream model.
  */
 export function opengatewayModelManagerOptions(
 	config?: OpenGatewayModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	return createSimpleOpenAICompletionsOptions("opengateway", "https://apis.opengateway.ai/v1", config);
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? OPENGATEWAY_BASE_URL;
+	const resolveReference = createReferenceResolver(createBundledReferenceMap<"openai-completions">("opengateway"));
+	return {
+		providerId: "opengateway",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "opengateway",
+					baseUrl,
+					apiKey,
+					mapModel: (entry, defaults) => {
+						const reference =
+							resolveReference(defaults.id) ??
+							(defaults.id.endsWith(OPENGATEWAY_ULTRAFAST_SUFFIX)
+								? resolveReference(defaults.id.slice(0, -OPENGATEWAY_ULTRAFAST_SUFFIX.length))
+								: undefined);
+						const mapped = mapWithBundledReference(entry, defaults, reference);
+						return {
+							...mapped,
+							contextWindow: toPositiveNumber(entry.context_window, mapped.contextWindow),
+							maxTokens: toPositiveNumber(entry.max_output_tokens, mapped.maxTokens),
+							api: "openai-completions",
+							provider: "opengateway",
+							baseUrl,
+						};
+					},
+				}),
+		}),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1316,31 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 				provider: "kilo",
 				baseUrl,
 				apiKey,
+				// Kilo serves the OpenRouter catalog shape: nested limits/modalities and
+				// per-token USD string prices (GJC costs are per million tokens).
+				mapModel: (entry, defaults) => {
+					const topProvider = isRecord(entry.top_provider) ? entry.top_provider : undefined;
+					const architecture = isRecord(entry.architecture) ? entry.architecture : undefined;
+					const pricing = isRecord(entry.pricing) ? entry.pricing : undefined;
+					const params = Array.isArray(entry.supported_parameters) ? entry.supported_parameters : [];
+					const perMillion = (value: unknown): number => {
+						const perToken = toNumber(value);
+						return perToken !== undefined && perToken >= 0 ? perToken * 1_000_000 : 0;
+					};
+					return {
+						...defaults,
+						reasoning: params.includes("reasoning"),
+						input: toInputCapabilities(architecture?.input_modalities),
+						cost: {
+							input: perMillion(pricing?.prompt),
+							output: perMillion(pricing?.completion),
+							cacheRead: perMillion(pricing?.input_cache_read),
+							cacheWrite: perMillion(pricing?.input_cache_write),
+						},
+						contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
+						maxTokens: toPositiveNumber(topProvider?.max_completion_tokens, defaults.maxTokens),
+					};
+				},
 			}),
 	};
 }
@@ -2086,6 +2150,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 								...(api === "openai-completions"
 									? {
 											compat: {
+												...(reference.compat ?? {}),
 												supportsStore: false,
 												supportsDeveloperRole: false,
 												supportsReasoningEffort: false,

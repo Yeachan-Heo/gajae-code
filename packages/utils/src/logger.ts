@@ -11,15 +11,164 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type * as winston from "winston";
 import { getEffectiveLogsDir } from "./dirs";
 
-/** Ensure a logs directory exists; return the resolved path. */
-function ensureDir(dir: string): string {
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
+const LOG_DIR_MODE = 0o700;
+const LOG_FILE_MODE = 0o600;
+
+type LogPathPlatform = NodeJS.Platform | "posix";
+
+function logPathKind(platform: LogPathPlatform): "posix" | "win32" {
+	return platform === "win32" ? "win32" : "posix";
+}
+
+function isLogSeparator(char: string, platform: LogPathPlatform): boolean {
+	return char === "/" || (logPathKind(platform) === "win32" && char === "\\");
+}
+
+/** A filesystem root. On POSIX a backslash is a file name, not a root or a separator. */
+export function isFsRoot(target: string, platform: LogPathPlatform = process.platform): boolean {
+	if (logPathKind(platform) === "win32") {
+		return target === "/" || target === "\\" || /^[A-Za-z]:[\\/]$/.test(target);
 	}
-	return dir;
+	if (target.length === 0) return false;
+	for (const char of target) {
+		if (char !== "/") return false;
+	}
+	return true;
+}
+
+/**
+ * Drop trailing separators without changing the directory name.
+ * POSIX removes only `/`. Windows also removes `\`.
+ * A root keeps one separator so `C:\` does not become the drive-relative name `C:`.
+ */
+export function lexicalLogPath(target: string, platform: LogPathPlatform = process.platform): string {
+	if (target.length === 0) return target;
+	let end = target.length;
+	while (end > 0 && isLogSeparator(target[end - 1] ?? "", platform)) {
+		const kept = target.slice(0, end);
+		const shorter = target.slice(0, end - 1);
+		if (isFsRoot(kept, platform) && !isFsRoot(shorter, platform)) break;
+		if (end === 1) break;
+		end -= 1;
+	}
+	return target.slice(0, end);
+}
+
+function pathFor(platform: LogPathPlatform): { normalize(target: string): string } {
+	return logPathKind(platform) === "win32" ? path.win32 : path.posix;
+}
+
+/** True when "." / ".." collapse to a filesystem root. Does not follow symlinks. */
+export function resolvesAsFsRoot(target: string, platform: LogPathPlatform = process.platform): boolean {
+	const lexical = lexicalLogPath(target, platform);
+	if (isFsRoot(lexical, platform)) return true;
+	const collapsed = lexicalLogPath(pathFor(platform).normalize(lexical), platform);
+	return isFsRoot(collapsed, platform);
+}
+
+/** Skip mode repair for every spelling of a filesystem root. The transport path stays unchanged. */
+function skipRootModeRepair(target: string): boolean {
+	const lexical = lexicalLogPath(target);
+	if (resolvesAsFsRoot(lexical) || resolvesAsFsRoot(path.resolve(lexical))) return true;
+	try {
+		return resolvesAsFsRoot(fs.realpathSync.native(lexical));
+	} catch {
+		return false;
+	}
+}
+
+/** Drop a trailing "/." so "./link/." is judged as "./link". ".." is not collapsed. */
+function pathForSymlinkCheck(target: string): string {
+	let current = lexicalLogPath(target);
+	const win = process.platform === "win32";
+	for (;;) {
+		const dot = current.endsWith("/.") || (win && current.endsWith("\\."));
+		if (!dot) return current;
+		current = lexicalLogPath(current.slice(0, -2));
+	}
+}
+
+function isFinalSymlink(target: string): boolean {
+	try {
+		return fs.lstatSync(pathForSymlinkCheck(target)).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+/** True when this inode is the filesystem root. Unknown identity fails closed. */
+function inodeIsFsRoot(st: fs.Stats): boolean {
+	if (process.platform === "win32") return false;
+	try {
+		const root = fs.statSync("/");
+		return st.dev === root.dev && st.ino === root.ino;
+	} catch {
+		return true;
+	}
+}
+
+/** Clear group/world bits on this inode. A symlink, including a "." suffix, is not opened. */
+function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "file"): void {
+	const lexical = lexicalLogPath(target);
+	if (skipRootModeRepair(lexical) || isFinalSymlink(lexical)) return;
+	// A trailing "/." is not the directory. lstat and O_NOFOLLOW must use the
+	// same path the symlink check used, or a swapped link is followed.
+	const repairPath = kind === "directory" ? pathForSymlinkCheck(lexical) : lexical;
+	let fd: number | undefined;
+	try {
+		const listed = fs.lstatSync(repairPath);
+		if (kind === "directory" ? !listed.isDirectory() : !listed.isFile()) return;
+		if (inodeIsFsRoot(listed) || (listed.mode & 0o077) === 0) return;
+		const noFollow = (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+		const directoryFlag = kind === "directory" ? (fs.constants.O_DIRECTORY ?? 0) : 0;
+		const writeOnly = fs.constants.O_WRONLY | noFollow;
+		const readOnly = fs.constants.O_RDONLY | noFollow | directoryFlag;
+		try {
+			fd = fs.openSync(repairPath, kind === "file" ? writeOnly : readOnly);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "EACCES" && code !== "EPERM") throw error;
+			try {
+				if (kind !== "file") throw error;
+				fd = fs.openSync(repairPath, fs.constants.O_RDONLY | noFollow);
+			} catch (again) {
+				const againCode = (again as NodeJS.ErrnoException).code;
+				if (againCode !== "EACCES" && againCode !== "EPERM") throw again;
+				reportSkippedRepair(kind);
+				return;
+			}
+		}
+		const opened = fs.fstatSync(fd);
+		if (opened.dev !== listed.dev || opened.ino !== listed.ino || inodeIsFsRoot(opened)) return;
+		if (kind === "directory" ? !opened.isDirectory() : !opened.isFile()) return;
+		if ((opened.mode & 0o077) === 0) return;
+		fs.fchmodSync(fd, mode);
+	} catch {
+		// A mode repair must not take logging down.
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// The mode was already repaired, or the close raced an exit.
+			}
+		}
+	}
+}
+
+/** Ensure a logs directory exists at mode 0700; return the path the transport should use. */
+function ensureDir(dir: string): string {
+	const lexical = lexicalLogPath(dir);
+	if (skipRootModeRepair(lexical) || isFinalSymlink(lexical)) return lexical;
+	if (!fs.existsSync(lexical)) {
+		fs.mkdirSync(lexical, { recursive: true, mode: LOG_DIR_MODE });
+	}
+	tightenOwnerOnly(lexical, LOG_DIR_MODE, "directory");
+	return lexical;
 }
 
 type WinstonModule = typeof import("winston");
@@ -34,6 +183,7 @@ let dailyRotateFileCtor: DailyRotateFileCtor | undefined;
 let winstonLogger: Logger | undefined;
 let loggerInit: Promise<Logger> | undefined;
 let flushingBufferedLogs = false;
+let repairNoteQueued = false;
 const bufferedLogs: LogRecord[] = [];
 /** Cap pre-init buffering so a hung/failed winston import cannot grow heap unboundedly. */
 const MAX_BUFFERED_LOGS = 10_000;
@@ -87,15 +237,42 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
  * is what let the transport write somewhere the readers never looked.
  */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
-	return new DailyRotateFile({
-		dirname: ensureDir(dir ?? getEffectiveLogsDir()),
+	const dirname = ensureDir(dir ?? getEffectiveLogsDir());
+	const transport = new DailyRotateFile({
+		dirname,
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
 		maxSize: "10m",
 		maxFiles: 5,
 		zippedArchive: true,
+		// `options` replaces the library default `{ flags: "a" }`. Keep append so
+		// an existing log is not truncated. `mode` applies when the file is created.
+		options: { flags: "a", mode: LOG_FILE_MODE },
 	});
+	// winston-daily-rotate-file never listens on its file-stream-rotator stream,
+	// so a failed open or write of the log file (EACCES, EISDIR, EMFILE, the log
+	// directory removed under a live process) is emitted with no listener and
+	// becomes an uncaught exception from a single `logger.warn()`.
+	const stream = transport.logStream as unknown as NodeJS.EventEmitter;
+	let currentLog: string | undefined;
+	const repairLog = (): void => {
+		if (!currentLog) return;
+		tightenOwnerOnly(currentLog, LOG_FILE_MODE, "file");
+	};
+	// `new` names the active file (including one that already existed at 0666).
+	// `open` runs after a newly created file exists, so a late create is covered.
+	stream.on("new", (file: unknown) => {
+		if (typeof file !== "string") return;
+		currentLog = file;
+		repairLog();
+	});
+	stream.on("open", repairLog);
+	stream.on("error", ignoreSinkError);
+	return transport;
 }
+
+/** Logging failures must never take the process down; the record is dropped. */
+function ignoreSinkError(): void {}
 
 function makeConsoleTransport(winston: WinstonModule): Transport {
 	return new winston.transports.Console({ format: makeLogFormat(winston) });
@@ -130,6 +307,9 @@ async function getWinstonLogger(): Promise<Logger> {
 			// Don't exit on error - logging failures shouldn't crash the app
 			exitOnError: false,
 		});
+		// winston re-emits every transport `error` on the logger itself; with no
+		// listener that re-emit throws.
+		logger.on("error", ignoreSinkError);
 		applyTransports(logger, modules);
 		winstonLogger = logger;
 		flushBufferedLogs();
@@ -153,6 +333,35 @@ function flushBufferedLogs(): void {
 	} finally {
 		flushingBufferedLogs = false;
 	}
+}
+
+/**
+ * A skipped mode repair is logged through the transports already configured.
+ * The default is file-only, so this must not write the terminal. Console
+ * output stays opt-in via {@link setTransports}(`{ console: true }`).
+ */
+function reportSkippedRepair(kind: "directory" | "file"): void {
+	if (flushingBufferedLogs) return;
+	if (!transportOptions.console && !transportOptions.file) return;
+	bufferedLogs.push({
+		level: "error",
+		message: `rotating log mode repair skipped for an unopenable ${kind}`,
+	});
+	if (bufferedLogs.length > MAX_BUFFERED_LOGS) {
+		bufferedLogs.splice(0, bufferedLogs.length - MAX_BUFFERED_LOGS);
+	}
+	// Init flushes after the transports exist. A later repair runs from a
+	// stream callback, so deliver it after that callback returns.
+	if (!winstonLogger || repairNoteQueued) return;
+	repairNoteQueued = true;
+	queueMicrotask(() => {
+		repairNoteQueued = false;
+		try {
+			flushBufferedLogs();
+		} catch {
+			// A repair notice must not take logging down.
+		}
+	});
 }
 
 function writeLog(level: LogLevel, message: string, context?: Record<string, unknown>): void {

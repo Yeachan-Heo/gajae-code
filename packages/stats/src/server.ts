@@ -167,14 +167,16 @@ async function handleApi(req: Request, context: ApiContext): Promise<Response> {
 	}
 
 	if (path === "/api/stats/recent") {
-		const limit = url.searchParams.get("limit");
-		const stats = await getRecentRequests(limit ? parseInt(limit, 10) : undefined);
+		const limit = parseLimitParam(url.searchParams.get("limit"));
+		if (limit === null) return badRequest();
+		const stats = await getRecentRequests(limit);
 		return Response.json(stats);
 	}
 
 	if (path === "/api/stats/errors") {
-		const limit = url.searchParams.get("limit");
-		const stats = await getRecentErrors(limit ? parseInt(limit, 10) : undefined);
+		const limit = parseLimitParam(url.searchParams.get("limit"));
+		if (limit === null) return badRequest();
+		const stats = await getRecentErrors(limit);
 		return Response.json(stats);
 	}
 
@@ -194,9 +196,9 @@ async function handleApi(req: Request, context: ApiContext): Promise<Response> {
 	}
 
 	if (path.startsWith("/api/request/")) {
-		const id = path.split("/").pop();
-		if (!id) return new Response("Bad Request", { status: 400 });
-		const details = await getRequestDetails(parseInt(id, 10));
+		const id = parseIntegerParam(path.slice("/api/request/".length));
+		if (id === null) return badRequest();
+		const details = await getRequestDetails(id);
 		if (!details) return new Response("Not Found", { status: 404 });
 		return Response.json(details);
 	}
@@ -216,6 +218,25 @@ async function handleApi(req: Request, context: ApiContext): Promise<Response> {
 	}
 
 	return new Response("Not Found", { status: 404 });
+}
+
+/**
+ * A request parameter that must be a whole decimal number. `parseInt` alone
+ * accepts "1abc" and "-1", and SQLite rejects NaN with a datatype mismatch and
+ * treats a negative LIMIT as unlimited, so anything but plain digits is refused.
+ */
+function parseIntegerParam(value: string): number | null {
+	if (!/^\d{1,15}$/.test(value)) return null;
+	return Number(value);
+}
+
+/** `?limit=`: absent keeps the query's own default; present must be a whole number. */
+function parseLimitParam(value: string | null): number | undefined | null {
+	return value === null ? undefined : parseIntegerParam(value);
+}
+
+function badRequest(): Response {
+	return new Response("Bad Request", { status: 400 });
 }
 
 function forbidden(): Response {

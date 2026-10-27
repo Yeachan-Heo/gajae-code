@@ -12,6 +12,7 @@ import {
 	visibleWidth,
 } from "@gajae-code/tui";
 import { logger, sanitizeText } from "@gajae-code/utils";
+import { projectDeclaredSpawnHookNames, projectSafeHomeOverride } from "@gajae-code/utils/shell-config";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Settings } from "../config/settings";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
@@ -323,6 +324,14 @@ export interface InteractivePtyControls {
 	detachForegroundCancellation: () => void;
 }
 
+function ptyUnsetHookNames(explicit: Record<string, string> | undefined): string[] {
+	return projectDeclaredSpawnHookNames().filter(name => !Object.hasOwn(explicit ?? {}, name));
+}
+
+function ptyHomeOverride(explicit: Record<string, string> | undefined): Record<string, string> {
+	return projectSafeHomeOverride(explicit);
+}
+
 export async function runInteractiveBashPty(
 	ui: NonNullable<AgentToolContext["ui"]>,
 	options: {
@@ -331,6 +340,7 @@ export async function runInteractiveBashPty(
 		timeoutMs: number;
 		signal?: AbortSignal;
 		env?: Record<string, string>;
+		unsetEnv?: string[];
 		artifactPath?: string;
 		artifactId?: string;
 		artifactPublisher?: TerminalArtifactPublisher;
@@ -421,7 +431,11 @@ export async function runInteractiveBashPty(
 				command: options.command,
 				cwd: options.cwd,
 				timeoutMs: options.timeoutMs,
-				env: { ...NON_INTERACTIVE_ENV, ...options.env },
+				// The PTY child inherits the process env; drop project hook variables
+				// unless this call sets them explicitly. A dropped HOME is replaced by
+				// the trusted account home so the shell and git still have one.
+				env: { ...ptyHomeOverride(options.env), ...NON_INTERACTIVE_ENV, ...options.env },
+				unsetEnv: [...(options.unsetEnv ?? []), ...ptyUnsetHookNames(options.env)],
 				signal: processAbortController.signal,
 				cols: initialPtySize.cols,
 				rows: initialPtySize.rows,

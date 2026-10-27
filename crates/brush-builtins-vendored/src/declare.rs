@@ -1,9 +1,9 @@
+// Vendored from can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-builtins/src/declare.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, uses local EnvironmentLookup and shell variable APIs.
 use std::{io::Write, sync::LazyLock};
 
 use brush_core::{
 	ErrorKind, ExecutionResult, builtins,
 	env::{self, EnvironmentLookup, EnvironmentScope},
-	error,
 	parser::ast,
 	variables::{
 		self, ArrayLiteral, ShellValue, ShellValueLiteral, ShellValueUnsetType, ShellVariable,
@@ -132,9 +132,6 @@ impl builtins::Command for DeclareCommand {
 			return Ok(ExecutionResult::general_error());
 		}
 
-		if self.locals_inherit_from_prev_scope {
-			return error::unimp("declare -I");
-		}
 
 		let mut result = ExecutionResult::success();
 		if !self.declarations.is_empty() {
@@ -303,7 +300,28 @@ impl DeclareCommand {
 				ShellValueUnsetType::Untyped
 			};
 
-			let mut var = ShellVariable::new(ShellValue::Unset(unset_type));
+			let mut var = if create_var_local
+				&& (self.locals_inherit_from_prev_scope
+					|| context.shell.options().local_vars_inherit_value_and_attrs)
+			{
+				if let Some(prev_var) = context
+					.shell
+					.env()
+					.get_using_policy(name.as_str(), EnvironmentLookup::Anywhere)
+				{
+					if prev_var.is_readonly() {
+						return Err(ErrorKind::ReadonlyVariable.into());
+					}
+
+					let mut var = prev_var.clone();
+					var.unset_treat_as_nameref();
+					var
+				} else {
+					ShellVariable::new(ShellValue::Unset(unset_type))
+				}
+			} else {
+				ShellVariable::new(ShellValue::Unset(unset_type))
+			};
 
 			self.apply_attributes_before_update(&mut var)?;
 

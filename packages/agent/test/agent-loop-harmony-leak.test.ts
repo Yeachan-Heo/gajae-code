@@ -35,7 +35,7 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		});
 		const audits: Array<{ action: string }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onHarmonyLeak: e => {
 				audits.push(e);
@@ -83,7 +83,7 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		const events: AgentEvent[] = [];
 		const callbackEvents: AssistantMessageEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onAssistantMessageEvent: (_message, event) => callbackEvents.push(event),
 		};
@@ -129,7 +129,7 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		};
 		const audits: Array<{ action: string }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			fallbackManaged: true,
 			onHarmonyLeak: event => {
@@ -152,7 +152,7 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		});
 		const audits: Array<{ action: string }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onHarmonyLeak: e => {
 				audits.push(e);
@@ -177,7 +177,7 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		});
 		const audits: Array<{ action: string }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onHarmonyLeak: e => {
 				audits.push(e);

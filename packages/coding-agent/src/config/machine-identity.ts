@@ -135,7 +135,7 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 	const runCommand =
 		deps.runCommand ??
 		((command: string, args: readonly string[]) =>
-			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore" }));
+			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore", windowsHide: true }));
 
 	let rawId: string | undefined;
 	if (platform === "linux") {

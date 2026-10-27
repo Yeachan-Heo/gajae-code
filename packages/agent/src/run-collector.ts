@@ -16,6 +16,7 @@
  */
 
 import type { AssistantMessage, Model, StopReason } from "@gajae-code/ai";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import type { Span } from "@opentelemetry/api";
 
 /** Terminal status reported by an `execute_tool` span. */
@@ -711,12 +712,14 @@ export function emptyAgentRunCoverage(): AgentRunCoverage {
  * Distinguishable error class thrown when `beforeToolCall` returns
  * `{ block: true }`. Lets the catch arm of `runTool` set the terminal status
  * on the execute_tool span to `"blocked"` instead of conflating with a real
- * tool exception.
+ * tool exception. A block is a designed refusal, so it carries the designed-
+ * outcome marker and never reaches the handled-error crash store.
  */
 export class ToolCallBlockedError extends Error {
 	override readonly name = "ToolCallBlockedError";
 	constructor(reason?: string) {
 		super(reason ?? "Tool execution was blocked");
+		markDesignedError(this);
 	}
 }
 

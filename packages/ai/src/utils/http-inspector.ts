@@ -26,7 +26,16 @@ type ErrorWithStatus = {
 	status?: unknown;
 };
 
-const SENSITIVE_HEADERS = ["authorization", "x-api-key", "api-key", "cookie", "set-cookie", "proxy-authorization"];
+const SENSITIVE_HEADERS = [
+	"authorization",
+	"x-api-key",
+	"api-key",
+	"cookie",
+	"set-cookie",
+	"proxy-authorization",
+	"x-goog-api-key",
+	"cf-aig-authorization",
+];
 
 /**
  * Connection-level failure codes, meaning the request never reached the
@@ -56,6 +65,12 @@ const TRANSPORT_FAILURE_CODES: ReadonlySet<string> = new Set([
 	"ETIMEDOUT",
 	"UND_ERR_CONNECT_TIMEOUT",
 	"UND_ERR_SOCKET",
+]);
+
+const CONNECT_STAGE_FAILURE_CODES: ReadonlySet<string> = new Set([
+	"ConnectionRefused",
+	"FailedToOpenSocket",
+	"ECONNREFUSED",
 ]);
 
 /**
@@ -156,7 +171,8 @@ export async function appendRawHttpRequestDumpFor400(
 	const filePath = path.join(dumpDir, fileName);
 
 	try {
-		await Bun.write(filePath, `${JSON.stringify(sanitizedDump, null, 2)}\n`);
+		await fs.mkdir(dumpDir, { recursive: true });
+		await fs.writeFile(filePath, `${JSON.stringify(sanitizedDump, null, 2)}\n`, { mode: 0o600 });
 		await pruneHttpRequestDumps(dumpDir);
 		return `${message}\nraw-http-request=${filePath}\n${RAW_HTTP_REQUEST_PRIVACY_NOTE}`;
 	} catch (writeError) {
@@ -185,6 +201,12 @@ function findTransportFailure(error: unknown, depth: number): { code: string; ur
 		return { code: info.code, url: redactRequestUrl(info.path) ?? redactRequestUrl(info.url) };
 	}
 	return findTransportFailure(info.cause, depth + 1);
+}
+
+/** Whether the error indicates that the request failed while opening its connection. */
+export function isConnectStageTransportFailure(error: unknown): boolean {
+	const failure = findTransportFailure(error, 0);
+	return failure !== undefined && CONNECT_STAGE_FAILURE_CODES.has(failure.code);
 }
 
 /**

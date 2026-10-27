@@ -66,7 +66,7 @@ ownership, or occupancy verification. Risk classes: `config-change`,
 |`install.repair-managed-link`|`link`|requires an explicit `--ref` candidate|
 |`plugin.restore-known-artifact`|`plugin`|requires `--ref` and `--sha256`|
 |`plugin.quarantine-selected`|`plugin`|disables without deleting|
-|`service.restart-owned`|`service`|broker, Discord, Slack, Telegram|
+|`service.restart-owned`|`service`|broker, Discord, Slack, Telegram; the broker refuses with `attach_only_refused` under `GJC_SDK_BROKER_AUTOSTART=0`|
 |`service.detach-owned-stale-artifact`|`artifact`|detach only, never deletes a live owner's file|
 
 ### Pinned repairs

@@ -20,7 +20,7 @@ It reflects the current implementation, including partial semantics and metadata
 - [`../src/sdk/session.ts`](../packages/coding-agent/src/sdk/session.ts)
 - [`../src/system-prompt.ts`](../packages/coding-agent/src/system-prompt.ts)
 - [`../src/internal-urls/rule-protocol.ts`](../packages/coding-agent/src/internal-urls/rule-protocol.ts)
-- [`../src/utils/frontmatter.ts`](../packages/coding-agent/src/utils/frontmatter.ts)
+- [`packages/utils/src/frontmatter.ts`](../packages/utils/src/frontmatter.ts)
 
 ## 1. Canonical rule shape
 
@@ -35,6 +35,7 @@ interface Rule {
   alwaysApply?: boolean;
   description?: string;
   condition?: string[];
+  astCondition?: string[];
   scope?: string[];
   interruptMode?: "never" | "prose-only" | "tool-only" | "always";
   _source: SourceMeta;
@@ -66,7 +67,7 @@ Normalization:
 - `name` = filename without `.md`/`.mdc`
 - frontmatter parsed via `parseFrontmatter`
 - `content` = body (frontmatter stripped)
-- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` are parsed by `buildRuleFromMarkdown`
+- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` are parsed by `buildRuleFromMarkdown`
 
 Important caveat: `condition` values that look like file globs are converted into `tool:edit(...)` / `tool:write(...)` scope shorthands with catch-all condition `.*`.
 
@@ -82,7 +83,7 @@ Normalization (`transformMDCRule`):
 - `description`: kept only if string
 - `alwaysApply`: only `true` is preserved (`false` becomes `undefined`)
 - `globs`: accepts array (string elements only) or single string
-- `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` are parsed by shared rule helpers
+- `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` are parsed by shared rule helpers
 - `name` from filename without extension
 
 ### Windsurf provider (`windsurf.ts`)
@@ -95,7 +96,7 @@ Loads from:
 Normalization:
 
 - `globs`: array-of-string or single string
-- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` parsed by shared rule helpers
+- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` parsed by shared rule helpers
 - `name` is fixed to `global_rules` for the user global file and derived from filename for project rules
 
 ### Cline provider (`cline.ts`)
@@ -108,7 +109,7 @@ Searches upward from `cwd` for nearest `.clinerules`:
 Normalization:
 
 - `globs`: array-of-string or single string
-- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` parsed by shared rule helpers
+- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` parsed by shared rule helpers
 - `name` is fixed to `clinerules` for a `.clinerules` file and derived from filename for `.clinerules/*.md`
 
 ## 3. Frontmatter parsing behavior and ambiguity
@@ -161,7 +162,7 @@ Notable source-order differences:
 After rule discovery in `createAgentSession` (`sdk.ts`):
 
 1. All discovered rules are scanned.
-2. Rules with `condition` entries are registered into `TtsrManager`; legacy `ttsr_trigger` / `ttsrTrigger` are accepted during rule parsing as condition fallbacks.
+2. Rules with `condition` or `astCondition` entries are registered into `TtsrManager`; legacy `ttsr_trigger` / `ttsrTrigger` are accepted during rule parsing as condition fallbacks.
 3. A separate `rulebookRules` list is built with this predicate:
 
 ```ts
@@ -176,7 +177,7 @@ After rule discovery in `createAgentSession` (`sdk.ts`):
 
 ### Bucket behavior
 
-- **TTSR bucket**: any rule with a non-empty parsed `condition` that `TtsrManager.addRule(...)` accepts. Takes priority over other buckets.
+- **TTSR bucket**: any rule with a non-empty parsed `condition` or `astCondition` that `TtsrManager.addRule(...)` accepts. Takes priority over other buckets.
 - **Always-apply bucket**: `alwaysApply === true`, not TTSR. Full content injected into system prompt. Resolvable via `rule://`.
 - **Rulebook bucket**: must have description, must not be TTSR, must not be `alwaysApply`. Listed in system prompt by name+description; content read on demand via `rule://`.
 - A rule with both `condition` and `alwaysApply` goes to TTSR only (TTSR takes priority).
@@ -205,9 +206,11 @@ After rule discovery in `createAgentSession` (`sdk.ts`):
 - **Full rule content is auto-injected into the system prompt** (before the rulebook rules section).
 - Rule is also addressable via `rule://<name>` for re-reading.
 
-### `condition`, `scope`, and `interruptMode`
+### `condition`, `astCondition`, `scope`, and `interruptMode`
 
-- `condition` is the current TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing.
+- `condition` is the regex-based TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing. It is evaluated on streamed assistant text, thinking, and tool-argument deltas.
+- `astCondition` (string or string[]) holds ast-grep patterns. It is evaluated in `beforeToolCall`, on finalized in-memory source digests, never on streamed deltas or the existing file. `write` supplies its full content; `edit` supplies only added source in replace, patch, hashline, and apply_patch modes. Vim keystrokes have no static digest and are not evaluated. Multi-file edits are checked per file, with language inferred from that file's extension and `scope`, `globs`, and repeat gating applied independently. Unsupported languages and native match failures do not match. Grammars are never downloaded: only the languages compiled into the default native build match (Bash, C, C++, C#, CSS, Go, HTML, Java, JavaScript, JSON, Markdown, PHP, Python, Ruby, Rust, TOML, TypeScript/TSX, YAML); any other language never matches. With `interruptMode: "always"`, a match blocks the call before it runs (the file is unchanged) and retries with the reminder; with `"never"`, the call runs and its result carries the reminder.
+- A rule may have `condition`, `astCondition`, or both (either one triggers it). A rule needs at least one of them to be registered as a TTSR rule.
 - `scope` narrows TTSR matching scope. A condition token that looks like a file glob becomes `tool:edit(<glob>)` and `tool:write(<glob>)` scope entries plus catch-all condition `.*`.
 - `interruptMode` can override the global TTSR interrupt mode for the rule.
 

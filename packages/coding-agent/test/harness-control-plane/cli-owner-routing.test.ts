@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
-import { RECEIPT_SPOOL_FILENAME, type ReceiptSpoolRecord } from "../../src/harness-control-plane/receipt-spool";
+import {
+	RECEIPT_SPOOL_DIR_ENV,
+	RECEIPT_SPOOL_FILENAME,
+	type ReceiptSpoolRecord,
+} from "../../src/harness-control-plane/receipt-spool";
 import { type CompletionEvidence, validateReceipt } from "../../src/harness-control-plane/receipts";
 import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
@@ -151,6 +155,123 @@ describe("gjc harness CLI -> live owner routing", () => {
 		const state = res.json?.state as Record<string, unknown>;
 		expect((evidence.finalize as Record<string, unknown>).completed).toBe(true);
 		expect(state.lifecycle).toBe("completed");
+	}, 30_000);
+
+	async function finalizeFromProject(
+		repo: string,
+		extra: Record<string, string | undefined> = {},
+		input: Record<string, unknown> = {},
+	): Promise<{ code: number; json: Record<string, unknown> | null; stderr: string }> {
+		const env: Record<string, string> = {};
+		for (const [name, value] of Object.entries(cliEnv.env)) {
+			if (value !== undefined) env[name] = value;
+		}
+		delete env.NODE_ENV;
+		delete env[RECEIPT_SPOOL_DIR_ENV];
+		env.GJC_HARNESS_STATE_ROOT = root;
+		for (const [name, value] of Object.entries(extra)) {
+			if (value === undefined) delete env[name];
+			else env[name] = value;
+		}
+		const proc = Bun.spawn(
+			["bun", cliEntry, "harness", "finalize", "--session", SID, "--input", JSON.stringify(input)],
+			{
+				cwd: repo,
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		const code = await proc.exited;
+		let json: Record<string, unknown> | null = null;
+		try {
+			json = JSON.parse(stdout.trim()) as Record<string, unknown>;
+		} catch {
+			json = null;
+		}
+		if (code !== 0 || !json) throw new Error(`harness finalize failed (${code}): ${stderr || stdout}`);
+		return { code, json, stderr };
+	}
+
+	it("does not forward a project dotenv spool directory to an owner started elsewhere", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const attacker = await mkdtemp(path.join(tmpdir(), "harness-owner-attacker-"));
+		try {
+			await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+			const res = await finalizeFromProject(repo);
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(attacker, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("does not forward a project dotenv spool directory supplied in the command input", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const attacker = await mkdtemp(path.join(tmpdir(), "harness-owner-attacker-"));
+		try {
+			await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+			const res = await finalizeFromProject(repo, {}, { [RECEIPT_SPOOL_DIR_ENV]: attacker });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(attacker, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("keeps an explicit spool directory when the project declares none", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const operator = await mkdtemp(path.join(tmpdir(), "harness-owner-operator-"));
+		try {
+			const res = await finalizeFromProject(repo, {}, { [RECEIPT_SPOOL_DIR_ENV]: operator });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(true);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(operator, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("uses an explicit spool directory instead of a project dotenv value", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const attacker = await mkdtemp(path.join(tmpdir(), "harness-owner-attacker-"));
+		const operator = await mkdtemp(path.join(tmpdir(), "harness-owner-operator-"));
+		try {
+			await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+			const res = await finalizeFromProject(repo, {}, { [RECEIPT_SPOOL_DIR_ENV]: operator });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(true);
+			expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(attacker, { recursive: true, force: true });
+			await rm(operator, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("keeps a shell spool directory for an owner started outside the project", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const attacker = await mkdtemp(path.join(tmpdir(), "harness-owner-attacker-"));
+		const operator = await mkdtemp(path.join(tmpdir(), "harness-owner-operator-"));
+		try {
+			await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+			const res = await finalizeFromProject(repo, { [RECEIPT_SPOOL_DIR_ENV]: operator });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(true);
+			expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(attacker, { recursive: true, force: true });
+			await rm(operator, { recursive: true, force: true });
+		}
 	}, 30_000);
 
 	it("passes --receipt-spool-dir through live owner routing", async () => {

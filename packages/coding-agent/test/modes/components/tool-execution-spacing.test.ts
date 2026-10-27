@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { type IrcSidebarTheme, IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
@@ -64,6 +64,54 @@ describe("ToolExecutionComponent spacing", () => {
 		const { trailing } = countEdgeBlanks(a);
 		const { leading } = countEdgeBlanks(b);
 		expect(trailing + leading).toBe(1);
+	});
+});
+
+describe("ToolExecutionComponent partial await animation", () => {
+	it("keeps subagent await rows producer-gated", () => {
+		vi.useFakeTimers();
+		const requestRender = vi.fn();
+		const ui = { requestRender, terminal: { columns: 80 } } as unknown as TUI;
+		const component = new ToolExecutionComponent("subagent", {}, {}, undefined, ui);
+		try {
+			component.updateResult(
+				{
+					content: [],
+					details: {
+						subagents: [
+							{
+								id: "0-child",
+								jobId: "0-child",
+								status: "running",
+								label: "child",
+								agent: "executor",
+								agentSource: "bundled",
+								durationMs: 0,
+								liveProgressAvailable: true,
+								progress: {
+									id: "0-child",
+									status: "running",
+									toolCount: 1,
+									contextTokens: 50,
+									contextWindow: 100,
+									lastActivityMs: Date.now(),
+								},
+							},
+						],
+					},
+				},
+				true,
+			);
+			const initialRequests = requestRender.mock.calls.length;
+
+			vi.advanceTimersByTime(80 * 5);
+
+			expect(requestRender).toHaveBeenCalledTimes(initialRequests);
+		} finally {
+			component.stopAnimation();
+			component.dispose();
+			vi.useRealTimers();
+		}
 	});
 });
 it("preserves manual expansion through automatic updates and drops it on remount", () => {

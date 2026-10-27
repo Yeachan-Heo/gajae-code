@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -74,6 +75,10 @@ export interface LifecycleDurableEffectsReceipt {
 export interface LifecycleLedgerEntry {
 	operationKey?: string;
 	fingerprint?: string;
+	/** True only when a session.close request supplied immutable generation authority. */
+	closeAuthorityBound?: boolean;
+	/** Set only on unkeyed rows that mirror a spawn-authority claim; see `hasLegacyIdentity`. */
+	spawnAnchor?: true;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -128,6 +133,10 @@ type BoundedSourceRead =
 
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
 const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
+const recordedSessionIds = (entry: LifecycleLedgerEntry): string[] =>
+	[entry.intendedSessionId, entry.resultSessionId].filter(
+		(sessionId): sessionId is string => typeof sessionId === "string" && sessionId.length > 0,
+	);
 export interface LifecycleLedgerLimits {
 	maxBytes?: number;
 	maxLineBytes?: number;
@@ -143,6 +152,11 @@ function canonicalCleanupSessionId(value: unknown): value is string {
 }
 
 const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+	// Terminal evidence intentionally has no time-based expiry: forgetting a
+	// completed close would allow a delayed duplicate to reach a later host
+	// generation. The row/byte bounds below are storage limits; compaction keeps
+	// each identity's accepted anchor and latest terminal state instead of
+	// expiring replay authority.
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
 	maxRows: 10_000,
@@ -188,6 +202,7 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 		typeof entry.ts === "number" &&
 		Number.isSafeInteger(entry.ts) &&
 		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.spawnAnchor === undefined || entry.spawnAnchor === true) &&
 		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
@@ -206,6 +221,20 @@ function pendingCleanupSessionId(response: unknown): string | undefined {
 	if (!response || typeof response !== "object") return undefined;
 	const cleanup = (response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup;
 	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
+}
+
+function retirementCreateIdentity(response: unknown): string | undefined {
+	if (!response || typeof response !== "object") return undefined;
+	const error = (response as { error?: unknown }).error;
+	if (!error || typeof error !== "object") return undefined;
+	const cleanup = (error as { cleanup?: unknown }).cleanup;
+	if (!cleanup || typeof cleanup !== "object") return undefined;
+	const receipt = (cleanup as { uncertainRetirement?: unknown }).uncertainRetirement;
+	if (!receipt || typeof receipt !== "object") return undefined;
+	const identity = (receipt as { identity?: unknown }).identity;
+	if (!identity || typeof identity !== "object") return undefined;
+	const createIdentity = (identity as { createIdentity?: unknown }).createIdentity;
+	return typeof createIdentity === "string" && createIdentity.length > 0 ? createIdentity : undefined;
 }
 
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
@@ -263,8 +292,10 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 export class LifecycleLedger {
 	#file: string;
 	#corruptFile: string;
+	#spawnAnchorAttestationFile: string;
 	#entries: LifecycleLedgerEntry[] = [];
 	#byIdentity = new Map<string, LifecycleLedgerEntry>();
+	#attestedSpawnAnchors: ReadonlySet<string> = new Set();
 	#limits: Required<LifecycleLedgerLimits>;
 	#rowCount = 0;
 	#byteCount = 0;
@@ -286,6 +317,7 @@ export class LifecycleLedger {
 	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
 		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 		this.#corruptFile = `${this.#file}.corrupt`;
+		this.#spawnAnchorAttestationFile = path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json");
 		this.#limits = {
 			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
 			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
@@ -301,6 +333,7 @@ export class LifecycleLedger {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
 		this.#byIdentity.clear();
+		this.#attestedSpawnAnchors = new Set();
 		this.#warnings = [];
 		this.#rowCount = 0;
 		this.#byteCount = 0;
@@ -374,6 +407,7 @@ export class LifecycleLedger {
 			}
 		}
 		if (tornTail) await this.#sealTornTail();
+		await this.#loadAttestedSpawnAnchors(new Set([...invalidIdentities, ...uncertainAfterCorruption]));
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
@@ -401,6 +435,12 @@ export class LifecycleLedger {
 	 * `terminal_uncertain` is a durable terminal record too: an operation that concluded
 	 * uncertainly persists that conclusion, and refusing to read it back would report a
 	 * synced row as unpersisted and replace its true reason with a generic one.
+	 *
+	 * Shape damage is scoped to the identity that asks. A decodable row naming a
+	 * different identity cannot verify this request, and startup already quarantines
+	 * it; letting one unrelated oversized receipt reject the whole file made every
+	 * later lifecycle result unverifiable on that agent directory (#7134). Rows for
+	 * this identity, undecodable rows, and unsupported state versions stay strict.
 	 */
 	async readTerminal(identity: string, requestHash: string): Promise<TerminalReadBack> {
 		const sourceRead = await this.#readBoundedSourceReadOnly();
@@ -425,6 +465,12 @@ export class LifecycleLedger {
 			try {
 				const value = parseLifecycleJson(line);
 				assertSupportedStateVersion(this.#file, value);
+				// A decodable row that names another identity cannot verify this request.
+				// Skip it before full validation so one unrelated malformed row (for
+				// example an artifact snapshot over the JSON bounds) does not withhold
+				// proof for every identity. A row naming this identity stays strict.
+				const rowIdentity = (value as { identity?: unknown }).identity;
+				if (typeof rowIdentity === "string" && rowIdentity !== identity) continue;
 				if (!isLifecycleLedgerEntry(value)) return { kind: "rejected", reason: "shape" };
 				entry = value;
 			} catch {
@@ -634,6 +680,9 @@ export class LifecycleLedger {
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
 	async #syncDirectory(): Promise<void> {
+		// Windows does not support fsync on directory handles; the temporary file is
+		// still synced before its atomic rename. Same rule as lifecycle.ts syncDirectory.
+		if (process.platform === "win32") return;
 		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
 		try {
 			await directory.sync();
@@ -641,23 +690,91 @@ export class LifecycleLedger {
 			await directory.close();
 		}
 	}
-	async #compact(replacement?: LifecycleLedgerEntry): Promise<boolean> {
+	async #compact(
+		replacement?: LifecycleLedgerEntry,
+		incoming?: { readonly bytes: number; readonly rows: number },
+	): Promise<boolean> {
 		const anchors = new Map<string, LifecycleLedgerEntry>();
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
 			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
 				anchors.set(entry.identity, entry);
 		}
-		const snapshot: LifecycleLedgerEntry[] = [];
 		const compacted = new Map(this.#byIdentity);
 		if (replacement) compacted.set(replacement.identity, replacement);
-		for (const [identity, latest] of compacted) {
-			const anchor = anchors.get(identity);
-			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-			snapshot.push(anchor);
-			if (latest.state !== "accepted") snapshot.push(latest);
+		const buildSnapshot = (): LifecycleLedgerEntry[] => {
+			const next: LifecycleLedgerEntry[] = [];
+			for (const [identity, latest] of compacted) {
+				const anchor = anchors.get(identity);
+				if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
+				next.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
+				if (latest.state !== "accepted") next.push(latest);
+			}
+			return next;
+		};
+		let snapshot = buildSnapshot();
+		let contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		const needsEviction = incoming
+			? snapshot.length + incoming.rows > this.#limits.maxRows ||
+				contents.length + incoming.bytes > this.#limits.maxBytes
+			: replacement === undefined
+				? snapshot.length >= this.#limits.maxRows || contents.length >= this.#limits.maxBytes
+				: snapshot.length > this.#limits.maxRows || contents.length > this.#limits.maxBytes;
+		if (needsEviction) {
+			const protectedCreateIdentities = new Set<string>();
+			for (const entry of compacted.values()) {
+				const createIdentity =
+					retirementCreateIdentity(entry.response) ?? retirementCreateIdentity(entry.unresolvedCleanupResponse);
+				if (createIdentity !== undefined) protectedCreateIdentities.add(createIdentity);
+			}
+			const evictable = [...compacted.values()]
+				.filter(
+					latest =>
+						latest.identity !== replacement?.identity &&
+						terminal(latest.state) &&
+						latest.operationKey !== undefined &&
+						latest.fingerprint !== undefined &&
+						(!latest.operationKey.startsWith("session.close\u0000") || latest.closeAuthorityBound === true) &&
+						!protectedCreateIdentities.has(latest.identity) &&
+						pendingCleanupSessionId(latest.response) === undefined &&
+						pendingCleanupSessionId(latest.unresolvedCleanupResponse) === undefined,
+				)
+				.sort((left, right) => left.ts - right.ts);
+			const rowsByIdentity = new Map<string, number>();
+			const bytesByIdentity = new Map<string, number>();
+			for (const entry of snapshot) {
+				rowsByIdentity.set(entry.identity, (rowsByIdentity.get(entry.identity) ?? 0) + 1);
+				bytesByIdentity.set(
+					entry.identity,
+					(bytesByIdentity.get(entry.identity) ?? 0) + Buffer.byteLength(`${JSON.stringify(entry)}\n`),
+				);
+			}
+			let remainingRows = snapshot.length;
+			let remainingBytes = contents.length;
+			const evicted = new Set<string>();
+			for (const latest of evictable) {
+				if (
+					remainingRows <= this.#limits.maxRows / 2 &&
+					remainingBytes <= this.#limits.maxBytes / 2 &&
+					remainingRows + (incoming?.rows ?? 0) <= this.#limits.maxRows &&
+					remainingBytes + (incoming?.bytes ?? 0) <= this.#limits.maxBytes
+				)
+					break;
+				evicted.add(latest.identity);
+				remainingRows -= rowsByIdentity.get(latest.identity) ?? 0;
+				remainingBytes -= bytesByIdentity.get(latest.identity) ?? 0;
+			}
+			for (const identity of evicted) compacted.delete(identity);
+			snapshot = buildSnapshot();
+			contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+			// Replay is guaranteed only for identities retained in the compacted ledger.
 		}
-		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		if (
+			incoming &&
+			(snapshot.length + incoming.rows > this.#limits.maxRows ||
+				contents.length + incoming.bytes > this.#limits.maxBytes)
+		)
+			throw new Error("Lifecycle ledger append exceeds configured bounds.");
 		if (
 			snapshot.length > this.#limits.maxRows ||
 			contents.length > this.#limits.maxBytes ||
@@ -696,32 +813,92 @@ export class LifecycleLedger {
 		}
 		return replacement !== undefined;
 	}
-	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
-		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	findByOperationKey(operationKey: string, fingerprint?: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(
+			entry =>
+				entry.operationKey === operationKey && (fingerprint === undefined || entry.fingerprint === fingerprint),
+		);
+	}
+	findAnyByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
 	}
 	/**
-	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
-	 * identities cannot establish that a different target is safe, so callers
-	 * must reject rather than create a second admission.
+	 * Live legacy rows predate the operation/key index. Their opaque identities
+	 * cannot establish that a different target is safe, so callers must reject
+	 * rather than create a second admission. Spawn-claim anchors are unkeyed but
+	 * are not legacy requests and never fence (see #isSpawnAnchor). A fresh
+	 * session.create may ignore final legacy rows: exact legacy identities are
+	 * still resolved before this check, and uncertain rows retain their
+	 * session-scoped fences.
+	 *
+	 * A session-targeted request passes `sessionTarget` to ignore terminal legacy
+	 * rows that record only other sessions, unless the row is the caller's key
+	 * reused across targets (`keyReuseIdentities`). Terminal rows recording the
+	 * target or no session, uncertain rows, and live rows keep the fence because
+	 * they cannot prove the requested target is unrelated.
 	 */
-	hasLegacyIdentity(): boolean {
-		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	hasLegacyIdentity(
+		excludedIdentities?: ReadonlySet<string>,
+		options: {
+			ignoreFinalRows?: boolean;
+			sessionTarget?: { sessionId: string; keyReuseIdentities: ReadonlySet<string> };
+		} = {},
+	): boolean {
+		const target = options.sessionTarget;
+		const unrelatedTerminal = (entry: LifecycleLedgerEntry): boolean => {
+			if (!target || !terminal(entry.state) || target.keyReuseIdentities.has(entry.identity)) return false;
+			const sessionIds = recordedSessionIds(entry);
+			return sessionIds.length > 0 && !sessionIds.includes(target.sessionId);
+		};
+		return [...this.#byIdentity.values()].some(
+			entry =>
+				entry.operationKey === undefined &&
+				!this.#isSpawnAnchor(entry) &&
+				!(options.ignoreFinalRows && final(entry.state)) &&
+				!unrelatedTerminal(entry) &&
+				!excludedIdentities?.has(entry.identity),
+		);
+	}
+	/** Sessions recorded by terminal legacy rows, for deriving key-reuse identities. */
+	terminalLegacySessionIds(): Set<string> {
+		const sessionIds = new Set<string>();
+		for (const entry of this.#byIdentity.values())
+			if (entry.operationKey === undefined && terminal(entry.state))
+				for (const sessionId of recordedSessionIds(entry)) sessionIds.add(sessionId);
+		return sessionIds;
 	}
 	async migrateIdentity(
 		from: string,
 		to: string,
-		metadata: { operationKey: string; fingerprint: string },
+		metadata: { operationKey: string; fingerprint: string; closeAuthorityBound?: boolean },
 	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
-			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const existing = this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
-			if (!entry) return undefined;
-			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
-			// Retire the legacy row so hasLegacyIdentity() returns false and future
-			// unrelated lifecycle requests are not globally blocked. The legacy
-			// identity gets a metadata-bearing replacement row in the append-only
-			// log, superseding the original metadata-free entry in #byIdentity.
-			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			if (!entry) return existing;
+			if (existing) {
+				if (entry.operationKey === undefined) {
+					await this.#compact({ ...entry, ...metadata, ts: Date.now() });
+				}
+				return existing;
+			}
+			// A migrated identity needs the same accepted anchor as a fresh request;
+			// appending only a terminal row would be quarantined on the next restart.
+			await this.#append({
+				version: SDK_STATE_VERSION,
+				identity: to,
+				requestHash: entry.requestHash,
+				...metadata,
+				state: "accepted",
+				ts: Date.now(),
+			});
+			const migrated =
+				entry.state === "accepted"
+					? this.#byIdentity.get(to)
+					: await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire metadata-free legacy rows by rewriting their latest row in place;
+			// appending a duplicate terminal row would violate the ledger history rules.
+			if (entry.operationKey === undefined) await this.#compact({ ...entry, ...metadata, ts: Date.now() });
 			return migrated;
 		});
 	}
@@ -734,9 +911,12 @@ export class LifecycleLedger {
 		);
 		if (line.length - 1 > this.#limits.maxLineBytes)
 			throw new Error("Lifecycle ledger row exceeds the maximum byte length.");
+		if (line.length > this.#limits.maxBytes) throw new Error("Lifecycle ledger append exceeds configured bounds.");
 		let replacementCompacted = false;
 		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
-			replacementCompacted = await this.#compact(this.#byIdentity.has(entry.identity) ? entry : undefined);
+			replacementCompacted = this.#byIdentity.has(entry.identity)
+				? await this.#compact(entry)
+				: await this.#compact(undefined, { bytes: line.length, rows: 1 });
 		if (replacementCompacted) return entry;
 		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
 			throw new Error("Lifecycle ledger append exceeds configured bounds.");
@@ -753,10 +933,93 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
+	/**
+	 * Spawn-claim anchors are unkeyed rows that only mirror a spawn-authority claim;
+	 * they are never target-inclusive lifecycle requests, so they never fence a
+	 * different admission, even after their claim leaves the spawn-authority
+	 * journal. Current writers mark them with `spawnAnchor: true` in the row, which
+	 * survives migration, compaction, eviction and restarts.
+	 *
+	 * Mirrors written before that marker carry no durable field that tells them
+	 * apart from a pre-index legacy request: file position and `ts` are not
+	 * provenance, because `migrateIdentity` rewrites accepted legacy rows in place
+	 * with the current wall clock. Such rows therefore stay fenced unless an
+	 * operator lists them in {@link #spawnAnchorAttestationFile}; see
+	 * {@link #loadAttestedSpawnAnchors}.
+	 */
+	#isSpawnAnchor(entry: LifecycleLedgerEntry): boolean {
+		return entry.spawnAnchor === true || this.#attestedSpawnAnchors.has(entry.identity);
+	}
+	/**
+	 * Loads the operator-written spawn-anchor attestation. The broker never writes
+	 * or derives this file. A listed identity is exempt only while its whole
+	 * history is the single unkeyed, unmarked `accepted` row a spawn mirror writes,
+	 * with no session target and no quarantined or corruption-uncertain history; any
+	 * other listed identity, and every identity of an unreadable file, stays fenced.
+	 * The file is optional and only ever lifts fences, so failing to read it leaves
+	 * the attested set empty instead of failing the ledger open.
+	 */
+	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
+		let text: string;
+		try {
+			text = await fs.readFile(this.#spawnAnchorAttestationFile, "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") return;
+			this.#warnings.push("Unreadable spawn-anchor attestation ignored");
+			logger.warn("sdk broker: spawn-anchor attestation is unreadable; pre-marker mirrors stay fenced", {
+				code: code ?? "unknown",
+			});
+			return;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch {
+			value = undefined;
+		}
+		const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+		if (
+			record?.version !== 1 ||
+			!Array.isArray(record.identities) ||
+			!record.identities.every(identity => typeof identity === "string")
+		) {
+			this.#warnings.push("Malformed spawn-anchor attestation ignored");
+			return;
+		}
+		const rowCounts = new Map<string, number>();
+		for (const entry of this.#entries) rowCounts.set(entry.identity, (rowCounts.get(entry.identity) ?? 0) + 1);
+		const attested = new Set<string>();
+		let rejected = 0;
+		for (const identity of new Set(record.identities as string[])) {
+			const entry = this.#byIdentity.get(identity);
+			if (
+				entry !== undefined &&
+				rowCounts.get(identity) === 1 &&
+				!quarantined.has(identity) &&
+				entry.state === "accepted" &&
+				entry.operationKey === undefined &&
+				entry.spawnAnchor === undefined &&
+				entry.fingerprint === undefined &&
+				entry.intendedSessionId === undefined &&
+				entry.closeAuthorityBound === undefined
+			)
+				attested.add(identity);
+			else rejected += 1;
+		}
+		if (rejected > 0) this.#warnings.push("Spawn-anchor attestation entries that are not spawn-mirror rows ignored");
+		this.#attestedSpawnAnchors = attested;
+	}
 	async begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string } = {},
+		metadata: {
+			operationKey?: string;
+			fingerprint?: string;
+			intendedSessionId?: string;
+			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
+		} = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
@@ -764,7 +1027,13 @@ export class LifecycleLedger {
 	async #begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string },
+		metadata: {
+			operationKey?: string;
+			fingerprint?: string;
+			intendedSessionId?: string;
+			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
+		},
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
@@ -776,6 +1045,9 @@ export class LifecycleLedger {
 					requestHash,
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
+					intendedSessionId: metadata.intendedSessionId,
+					closeAuthorityBound: metadata.closeAuthorityBound,
+					spawnAnchor: metadata.spawnAnchor,
 					state: "accepted",
 					ts: Date.now(),
 				}),
@@ -803,6 +1075,9 @@ export class LifecycleLedger {
 		return this.#mutate(async () => {
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
+			// Match replay validation: proven terminal records admit no successor.
+			// A late failure must not append a row that will be quarantined on reopen.
+			if (terminal(previous.state)) return previous;
 			const next = {
 				...previous,
 				...fields,

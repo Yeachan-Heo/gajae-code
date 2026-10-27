@@ -84,6 +84,17 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
 	/** Readiness publication mode; defaults to the stock immediate contract. */
 	readiness?: SessionReadinessMode;
+	/**
+	 * Cross-process authority for each started event generation. Every host
+	 * process starts a fresh event stream, so a resumed session must not reuse an
+	 * earlier host's `(generation, seq)` namespace: notification publication ids
+	 * and replay cursors are keyed by it, and the session index prefers the
+	 * highest endpoint generation. The result must be at least `floor` and
+	 * strictly above every generation previously issued for the session by any
+	 * host. Without an authority the generation only advances within this host's
+	 * own stream, which suits hosts that never publish to a shared session index.
+	 */
+	allocateEventGeneration?: (sessionId: string, floor: number) => Promise<number>;
 
 	/**
 	 * Authorization for a deferred activation. It is consulted on every attempt
@@ -103,14 +114,28 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  must see the same capability-gated event kinds on both legs, or live and
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+export const AWAITING_INPUT_CAPABILITY = "awaiting_input_v1";
+/** Capability for non-replayable streamed turn content. */
+export const TURN_STREAM_CAPABILITY = "turn_stream";
 /** Capability used by notification adapters that observe a host without owning its work. */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
-export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
+/**
+ * Opts notification adapters into positioned-only delivery for matching live
+ * effects: the host excludes a negotiating connection from the raw native leg
+ * of every frame its positioned envelope already reached.
+ */
+export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
+export const CAP_GATED_FRAME_KINDS: ReadonlyMap<string, string> = new Map([
+	["tool_activity", TOOL_ACTIVITY_CAPABILITY],
+	["reasoning_summary", TOOL_ACTIVITY_CAPABILITY],
+	["awaiting_input", AWAITING_INPUT_CAPABILITY],
+]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
 /** Keep live delivery and replay on one capability gate. */
 export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
-	return !CAP_GATED_FRAME_KINDS.has(kind) || capabilities?.has(TOOL_ACTIVITY_CAPABILITY) === true;
+	const requiredCapability = CAP_GATED_FRAME_KINDS.get(kind);
+	return requiredCapability === undefined || capabilities?.has(requiredCapability) === true;
 }
 
 /** Safe, identifier-free explanations for every refused activation status. */
@@ -224,6 +249,10 @@ export class SessionSdkHost {
 	#readyGeneration?: number;
 	/** Serializes activation attempts so a concurrent pair cannot both publish. */
 	#activation: Promise<SessionActivationOutcome> = Promise.resolve("not_prepared");
+	/** In-flight start, which may be awaiting its event-generation allocation. */
+	#startPromise?: Promise<"started">;
+	/** Whether the authority issued the current generation (or there is no authority). */
+	#generationReserved = true;
 
 	constructor(options: SessionSdkHostOptions) {
 		this.#options = options;
@@ -286,8 +315,26 @@ export class SessionSdkHost {
 
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
+		const pending = this.#startPromise;
+		if (pending) {
+			await pending;
+			return "already";
+		}
+		const startPromise = this.#startHost();
+		this.#startPromise = startPromise;
+		try {
+			return await startPromise;
+		} finally {
+			if (this.#startPromise === startPromise) this.#startPromise = undefined;
+		}
+	}
+
+	async #startHost(): Promise<"started"> {
+		// Allocated before any host state changes, so nothing is emitted under a
+		// generation the authority has not issued.
+		const floor = await this.#allocateGeneration();
 		this.#reportedActivityState = undefined;
-		this.events.restart();
+		this.events.restart(floor);
 		if (isAutoroutingInactive(this)) this.emitAutoroutingInactiveNotice();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
 		else
@@ -303,12 +350,7 @@ export class SessionSdkHost {
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;
 		this.#started = true;
 		try {
-			if (this.#registration)
-				await this.#registration.writer.register({
-					sessionId: this.#options.sessionId,
-					stateRoot: this.#options.stateRoot,
-					endpointGeneration: this.events.generation,
-				});
+			if (this.#registration) await this.#publishRegistration(this.#registration.writer);
 			void this.reportActivity("idle").catch(error =>
 				logger.warn(`sdk: initial idle activity checkpoint failed: ${String(error)}`),
 			);
@@ -319,6 +361,54 @@ export class SessionSdkHost {
 			this.#started = false;
 			throw error;
 		}
+	}
+
+	/**
+	 * Take this start's generation from the authority. A host whose authority is
+	 * unavailable (an unusable agent dir) still serves its local endpoint under a
+	 * wall-clock generation, but that generation stays unreserved: it is never
+	 * published to a session index until {@link #publishRegistration} reserves it.
+	 */
+	async #allocateGeneration(): Promise<number> {
+		const allocate = this.#options.allocateEventGeneration;
+		this.#generationReserved = allocate === undefined;
+		if (!allocate) return 0;
+		try {
+			const generation = await allocate(this.#options.sessionId, Date.now());
+			this.#generationReserved = true;
+			return generation;
+		} catch (error) {
+			logger.warn("sdk: event generation authority unavailable; host stays unpublished until it is reserved", {
+				error: String(error),
+			});
+			return Date.now();
+		}
+	}
+
+	/**
+	 * Register the current generation with the session index. An unreserved
+	 * generation is reserved first, and only when the authority can still issue
+	 * exactly that generation: one it already issued to another host, or issued
+	 * below, would collide with or rank behind that host in the index.
+	 */
+	async #publishRegistration(writer: BrokerIndexWriter): Promise<void> {
+		const generation = this.events.generation;
+		if (!this.#generationReserved) {
+			const reserved = await this.#options.allocateEventGeneration!(this.#options.sessionId, generation);
+			// A stop during the reservation leaves nothing to publish, and a restart
+			// published its own generation.
+			if (!this.#started || this.events.generation !== generation) return;
+			if (reserved !== generation)
+				throw new Error(
+					`SDK event generation ${generation} was superseded by ${reserved}; restart the host to publish it.`,
+				);
+			this.#generationReserved = true;
+		}
+		await writer.register({
+			sessionId: this.#options.sessionId,
+			stateRoot: this.#options.stateRoot,
+			endpointGeneration: generation,
+		});
 	}
 
 	#publishReadiness(): void {
@@ -382,6 +472,10 @@ export class SessionSdkHost {
 		options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {},
 	): Promise<"stopped" | "already"> {
 		if (this.#stopPromise) return this.#stopPromise;
+		// A stop issued while a start is still allocating its generation applies to
+		// that start instead of observing a not-yet-started host and returning.
+		if (this.#startPromise) await this.#startPromise.catch(() => undefined);
+		if (this.#stopPromise) return this.#stopPromise;
 		if (!this.#started) return "already";
 		const stopPromise = this.#stopStartedHost(options);
 		this.#stopPromise = stopPromise;
@@ -429,12 +523,7 @@ export class SessionSdkHost {
 
 	async registerWithBroker(writer: BrokerIndexWriter): Promise<void> {
 		this.#registration = { writer, generation: this.events.generation };
-		if (this.#started)
-			await writer.register({
-				sessionId: this.#options.sessionId,
-				stateRoot: this.#options.stateRoot,
-				endpointGeneration: this.events.generation,
-			});
+		if (this.#started) await this.#publishRegistration(writer);
 		if (this.#started)
 			void this.reportActivity("idle").catch(error =>
 				logger.warn(`sdk: initial idle activity checkpoint failed: ${String(error)}`),

@@ -1,7 +1,7 @@
 import { $credentialEnv, $pickCredentialEnv } from "@gajae-code/utils";
 import type { Context, Model, StreamFunction } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { getVertexAccessToken } from "./google-auth";
+import { getVertexAccessToken, isValidVertexLocation } from "./google-auth";
 import {
 	buildGoogleGenerateContentParams,
 	type GoogleGenAIRequestPlan,
@@ -99,10 +99,8 @@ function resolveEndpointHost(location: string): string {
  * Both halves are needed: trusted resolution keeps a repository from setting it,
  * and the shape check keeps any source from turning a region into an authority.
  */
-const VERTEX_LOCATION_RE = /^[a-z0-9-]+$/;
-
 function assertVertexLocation(location: string): string {
-	if (!VERTEX_LOCATION_RE.test(location)) {
+	if (!isValidVertexLocation(location)) {
 		throw new Error(
 			`Invalid Vertex AI location ${JSON.stringify(location)}. Expected a region label such as "us-central1" or "global".`,
 		);

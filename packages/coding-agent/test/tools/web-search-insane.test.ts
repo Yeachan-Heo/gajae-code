@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as dns from "node:dns/promises";
 import { hookFetch } from "@gajae-code/utils";
 import type { AuthStorage } from "../../src/session/auth-storage";
+import * as urlGuard from "../../src/web/insane/url-guard";
 import { runSearchQuery, setPreferredSearchProvider } from "../../src/web/search";
 import { InsaneProvider, routeInsanePublicUrl, searchInsane } from "../../src/web/search/providers/insane";
 
@@ -43,7 +45,26 @@ function fakeAuth(): AuthStorage {
 	return { hasAuth: () => false, hasOAuth: () => false, getApiKey: () => undefined } as unknown as AuthStorage;
 }
 
+function interceptedUrl(input: string | URL | Request, init?: RequestInit): string {
+	const raw = input instanceof Request ? input.url : input.toString();
+	try {
+		const url = new URL(raw);
+		const host = init?.headers ? new Headers(init.headers).get("host") : null;
+		if (host) url.host = host;
+		return url.toString();
+	} catch {
+		return raw;
+	}
+}
+
+beforeEach(() => {
+	vi.spyOn(dns, "lookup").mockImplementation((async () => [
+		{ address: "93.184.216.34", family: 4 },
+	]) as unknown as typeof dns.lookup);
+});
+
 afterEach(() => {
+	vi.restoreAllMocks();
 	setPreferredSearchProvider("auto");
 });
 
@@ -55,8 +76,8 @@ describe("Insane public-route provider", () => {
 	});
 
 	it("routes Reddit URLs through RSS instead of blocked JSON/browser bypasses", async () => {
-		using _hook = hookFetch(input => {
-			const url = input.toString();
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
 			if (url === "https://www.reddit.com/r/test/.rss") return new Response(REDDIT_FEED, { status: 200 });
 			return new Response("Access Denied", { status: 403 });
 		});
@@ -197,8 +218,8 @@ describe("Insane public-route provider", () => {
 	});
 
 	it("continues discovery after an oversized candidate", async () => {
-		using _hook = hookFetch(input => {
-			const url = input.toString();
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
 			if (url.startsWith("https://html.duckduckgo.com")) {
 				return new Response(
 					[
@@ -226,8 +247,8 @@ describe("Insane public-route provider", () => {
 	});
 
 	it("routes X status URLs through public tweet-result metadata", async () => {
-		using _hook = hookFetch(input => {
-			const url = input.toString();
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
 			if (url.startsWith("https://cdn.syndication.twimg.com/tweet-result")) {
 				return Response.json({
 					text: "public tweet text",
@@ -248,8 +269,8 @@ describe("Insane public-route provider", () => {
 	});
 
 	it("discovers platform URLs with DuckDuckGo and enriches them through safe routes", async () => {
-		using _hook = hookFetch(input => {
-			const url = input.toString();
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
 			if (url.startsWith("https://html.duckduckgo.com")) {
 				return new Response(
 					`<a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent("https://www.reddit.com/r/test")}">Result</a><a class="result__snippet">snippet</a>`,
@@ -267,8 +288,8 @@ describe("Insane public-route provider", () => {
 
 	it("emits a diagnostic when configured Insane falls back to DuckDuckGo", async () => {
 		setPreferredSearchProvider("insane");
-		using _hook = hookFetch(input => {
-			const url = input.toString();
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
 			if (url.startsWith("https://html.duckduckgo.com")) {
 				return new Response(
 					`<a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent("https://example.com/plain")}">Plain</a><a class="result__snippet">plain snippet</a>`,
@@ -299,5 +320,177 @@ describe("Insane public-route provider", () => {
 		await expect(searchInsane({ query: "https://example.com/private" })).rejects.toThrow(
 			/unsafe upstream TLS\/browser\/auth bypasses/,
 		);
+	});
+
+	it("does not return the body of a loopback feed", async () => {
+		const sentinel = "INSANE_DIRECT_LOOPBACK_SENTINEL_215";
+		let hits = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				hits++;
+				if (new URL(request.url).pathname !== "/feed") return new Response("missing", { status: 404 });
+				return new Response(
+					`<?xml version="1.0"?><rss><channel><item><title>${sentinel}</title><link>http://127.0.0.1/feed</link><description>${sentinel}</description></item></channel></rss>`,
+					{ status: 200, headers: { "content-type": "application/rss+xml" } },
+				);
+			},
+		});
+		const feedUrl = new URL("/feed", server.url).href;
+		const validateSpy = vi.spyOn(urlGuard, "validatePublicHttpUrl");
+		const dialSpy = vi.spyOn(urlGuard, "guardedPublicFetch");
+		try {
+			using _hook = hookFetch((input, init) => {
+				const url = interceptedUrl(input, init);
+				expect(init?.redirect).not.toBe("follow");
+				if (url.startsWith("http://127.0.0.1")) {
+					hits++;
+					return new Response(sentinel, { status: 200 });
+				}
+				return new Response(null, {
+					status: 302,
+					headers: { location: feedUrl },
+				});
+			});
+
+			const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+			expect(result).not.toBeNull();
+			if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected a refused route");
+			expect(result.attempts.length).toBeGreaterThan(0);
+			expect(result.attempts.every(item => item.note === "public_url_rejected")).toBe(true);
+			expect(JSON.stringify(result)).not.toContain(sentinel);
+			expect(validateSpy.mock.calls.some(call => call[0] === feedUrl)).toBe(true);
+			expect(dialSpy.mock.calls.some(call => String(call[0]).includes("127.0.0.1"))).toBe(false);
+			expect(hits).toBe(0);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("does not read a redirect to a second loopback address", async () => {
+		const sentinel = "INSANE_REDIRECT_LOOPBACK_SENTINEL_215";
+		let secretHits = 0;
+		const secret = Bun.serve({
+			hostname: "::1",
+			port: 0,
+			fetch() {
+				secretHits++;
+				return new Response(
+					`<?xml version="1.0"?><feed><entry><title>${sentinel}</title><link href="http://[::1]/feed"/></entry></feed>`,
+					{ status: 200, headers: { "content-type": "application/atom+xml" } },
+				);
+			},
+		});
+		let redirectHits = 0;
+		const redirect = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				redirectHits++;
+				expect(request.headers.get("authorization")).toBeNull();
+				return new Response(null, { status: 302, headers: { Location: new URL("/feed", secret.url).href } });
+			},
+		});
+		try {
+			using _hook = hookFetch((input, init, next) => {
+				const url = interceptedUrl(input, init);
+				if (url.startsWith("https://www.reddit.com/")) {
+					expect(init?.body).toBeUndefined();
+					expect(init?.redirect).toBe("manual");
+					const headers = new Headers(init?.headers);
+					expect(headers.get("authorization")).toBeNull();
+					return next(new URL("/feed", redirect.url).href, {
+						method: "GET",
+						headers,
+						redirect: init?.redirect,
+						signal: init?.signal ?? undefined,
+					});
+				}
+				return next(input, init);
+			});
+
+			const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+			expect(redirectHits).toBeGreaterThan(0);
+			expect(secretHits).toBe(0);
+			expect(JSON.stringify(result)).not.toContain(sentinel);
+		} finally {
+			await redirect.stop(true);
+			await secret.stop(true);
+		}
+	});
+
+	it("follows a public redirect to the same feed result", async () => {
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
+			if (url === "https://www.reddit.com/r/test/.rss") {
+				return new Response(null, { status: 301, headers: { location: "/r/test.rss" } });
+			}
+			if (url === "https://www.reddit.com/r/test.rss") return new Response(REDDIT_FEED, { status: 200 });
+			return new Response("", { status: 404 });
+		});
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("sources" in result)) throw new Error("expected route success");
+		expect(result.sources[0]?.title).toBe("Reddit Post");
+	});
+
+	it("rejects a public feed when a proxy environment variable is set", async () => {
+		const previousProxy = process.env.HTTPS_PROXY;
+		const previousNoProxy = process.env.NO_PROXY;
+		process.env.HTTPS_PROXY = "http://127.0.0.1:9";
+		process.env.NO_PROXY = "www.reddit.com";
+		let fetches = 0;
+		try {
+			using _hook = hookFetch(() => {
+				fetches++;
+				return new Response(REDDIT_FEED, { status: 200 });
+			});
+			const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+			expect(fetches).toBe(0);
+			if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected a refused route");
+			expect(result.attempts.every(item => item.note === "public_url_rejected")).toBe(true);
+		} finally {
+			if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
+			else process.env.HTTPS_PROXY = previousProxy;
+			if (previousNoProxy === undefined) delete process.env.NO_PROXY;
+			else process.env.NO_PROXY = previousNoProxy;
+		}
+	});
+
+	it("follows a public redirect after validating the next hop", async () => {
+		let fetches = 0;
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
+			expect(init?.redirect).toBe("manual");
+			fetches++;
+			if (url === "https://www.reddit.com/r/test/.rss") {
+				return new Response(null, { status: 301, headers: { location: "/r/test.rss" } });
+			}
+			if (url === "https://www.reddit.com/r/test.rss") return new Response(REDDIT_FEED, { status: 200 });
+			return new Response("", { status: 404 });
+		});
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("sources" in result)) throw new Error("expected route success");
+		expect(result.sources[0]?.title).toBe("Reddit Post");
+		expect(fetches).toBe(2);
+	});
+
+	it("refuses the sixth redirect hop", async () => {
+		let fetches = 0;
+		using _hook = hookFetch(() => {
+			fetches++;
+			return new Response(null, {
+				status: 308,
+				headers: { location: `https://www.reddit.com/r/test/.rss?hop=${fetches}` },
+			});
+		});
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected a refused route");
+		expect(result.attempts.every(item => item.note === "public_url_rejected")).toBe(true);
+		expect(fetches).toBe(12);
+		expect(JSON.stringify(result)).not.toContain("hop=");
 	});
 });

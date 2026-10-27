@@ -1,0 +1,7 @@
+{
+	"schemaVersion": 1,
+	"kind": "native",
+	"class": "native_panic",
+	"crashed": true,
+	"payload": "opt-in crash diagnostics test"
+}

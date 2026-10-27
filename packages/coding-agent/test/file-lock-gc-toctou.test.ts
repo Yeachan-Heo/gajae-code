@@ -88,7 +88,7 @@ test("exhaustion reports a valid owner published after parsing a null owner obse
 		return parsed;
 	});
 
-	const attempt = withFileLock(filePath, contender, { retries: 1, retryDelayMs: 1 });
+	const attempt = withFileLock(filePath, contender, { retries: 2, retryDelayMs: 1 });
 	await expect(attempt).rejects.toBeInstanceOf(FileLockAcquireError);
 	await expect(attempt).rejects.toMatchObject({
 		holder:
@@ -1071,16 +1071,14 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"adopts and finishes an aged scrubbed removal transition instead of wedging",
+		"adopts and finishes an aged empty removal transition instead of wedging",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "state.json");
 			const lockDir = `${lockedFile}.lock`;
 			const detachedPath = `${lockDir}.removing`;
-			const infoPath = path.join(detachedPath, "info");
 			await fs.mkdir(detachedPath);
-			await Bun.write(infoPath, "");
 			const old = new Date(Date.now() - 120_000);
-			await fs.utimes(infoPath, old, old);
+			await fs.utimes(detachedPath, old, old);
 			let entered = false;
 
 			await withFileLock(
@@ -1096,6 +1094,61 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			expect(await fs.exists(lockDir)).toBe(false);
 			expect(await fs.exists(detachedPath)).toBe(false);
 			expect(await fs.readdir(path.dirname(lockDir))).toEqual([]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"reclaims an eight-second orphan transition within the default retry budget",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "default-transition-age.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			// Default callers keep the 10-second stale threshold and 5-second wait budget.
+			const old = new Date(Date.now() - 8_000);
+			await fs.utimes(detachedPath, old, old);
+			let entered = false;
+
+			await withFileLock(lockedFile, async () => {
+				entered = true;
+			});
+
+			expect(entered).toBe(true);
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
+	test.each([
+		-1,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+	])("rejects invalid orphan-transition adoption age %s", async orphanTransitionAgeMs => {
+		const lockedFile = path.join(await makeTemp(), "invalid-transition-age.json");
+		await expect(withFileLock(lockedFile, async () => undefined, { orphanTransitionAgeMs })).rejects.toThrow(
+			"orphanTransitionAgeMs must be a finite, non-negative number",
+		);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"reclaims a young orphan transition within a longer acquisition budget",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "short-grace-transition.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			const old = new Date(Date.now() - 20_000);
+			await fs.utimes(detachedPath, old, old);
+			vi.spyOn(Bun, "sleep").mockImplementation(async () => {});
+			let entered = false;
+
+			await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 2, retryDelayMs: 30_000 },
+			);
+
+			expect(entered).toBe(true);
+			expect(await fs.exists(detachedPath)).toBe(false);
 		},
 	);
 
@@ -1124,15 +1177,13 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	];
 	test.each(
 		invalidOrphanAdoptionReceipts,
-	)("keeps an aged scrubbed transition when adoption returns %s", async (_label, makeReceipt) => {
+	)("keeps an aged empty transition when adoption returns %s", async (_label, makeReceipt) => {
 		const lockedFile = path.join(await makeTemp(), "state.json");
 		const lockDir = `${lockedFile}.lock`;
 		const detachedPath = `${lockDir}.removing`;
-		const infoPath = path.join(detachedPath, "info");
 		await fs.mkdir(detachedPath);
-		await Bun.write(infoPath, "");
 		const old = new Date(Date.now() - 120_000);
-		await fs.utimes(infoPath, old, old);
+		await fs.utimes(detachedPath, old, old);
 		let exactRemoveCalls = 0;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
@@ -1225,7 +1276,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 				code: "orphan_transition",
 				reason: "orphan_transition",
 				orphanPath: detachedPath,
-				attempts: 1,
+				attempts: 2,
 			});
 			expect(entered).toBe(false);
 			expect(await fs.exists(detachedPath)).toBe(true);
@@ -1279,22 +1330,97 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"classifies a dead removal transition owner as abandoned without deleting it",
+		"recovers a dead removal transition owner and acquires (#6101)",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "dead-transition.json");
 			const detachedPath = `${lockedFile}.lock.removing`;
 			await writeInfo(detachedPath, { pid: DEAD_PID, timestamp: Date.now(), owner_token: "dead-transition" });
 
-			const failure = await withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }).catch(
-				error => error,
-			);
-			expect(failure).toMatchObject({
-				code: "acquire_timeout",
-				reason: "acquire_timeout",
-				attempts: 2,
-				holder: expect.stringContaining("blocked by abandoned removal transition"),
+			await expect(
+				withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }),
+			).resolves.toBeUndefined();
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"retries a refused orphan adoption and acquires after the cleanup race clears",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "orphan-adoption-retry.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			const old = new Date(Date.now() - 20_000);
+			await fs.utimes(detachedPath, old, old);
+			let removalAttempts = 0;
+			FileLockTestHooks.nativeQuarantineBindings = () => ({
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: (target, snapshot) => {
+					if (target === detachedPath) {
+						removalAttempts++;
+						if (removalAttempts === 1) return { ok: false, code: "identity_mismatch" } as NativeExactUnlinkResult;
+					}
+					return exactRemoveDirectoryTree(target, snapshot);
+				},
 			});
+
+			let entered = false;
+			await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 3, retryDelayMs: 1 },
+			);
+			expect(entered).toBe(true);
+			expect(removalAttempts).toBe(2);
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"retries a refused dead transition and reports its retained adoption generation (#6253)",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "dead-transition-refused.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await writeInfo(detachedPath, {
+				pid: DEAD_PID,
+				timestamp: Date.now(),
+				owner_token: "dead-transition-refused",
+			});
+			const retainedInfo = await fs.readFile(path.join(detachedPath, "info"), "utf8");
+			let removalAttempts = 0;
+			FileLockTestHooks.nativeQuarantineBindings = () => ({
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: target => {
+					removalAttempts++;
+					expect(target).toBe(detachedPath);
+					// The identity-bound guard refuses: the tree is no longer the one the
+					// stale verdict judged. No path-only fallback may be attempted.
+					return { ok: false, code: "identity_mismatch" } as NativeExactUnlinkResult;
+				},
+			});
+
+			let entered = false;
+			const failure = await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 2, retryDelayMs: 1 },
+			).catch(error => error);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(failure).toMatchObject({
+				code: "orphan_transition",
+				reason: "orphan_transition",
+				attempts: 2,
+				orphanPath: detachedPath,
+				holder: expect.stringContaining("orphan transition retained"),
+			});
+			expect(entered).toBe(false);
+			expect(removalAttempts).toBe(2);
 			expect(await fs.exists(detachedPath)).toBe(true);
+			expect(await fs.readFile(path.join(detachedPath, "info"), "utf8")).toBe(retainedInfo);
+			expect(await Bun.file(`${detachedPath}.owner`).json()).toMatchObject({ owner: { pid: process.pid } });
 		},
 	);
 
@@ -2266,6 +2392,86 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		await expect(attempt).rejects.toThrow(/could not be reaped on this host/);
 	});
 
+	test("reports repeated identity-bound owner_changed refusals for the same dead owner", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		const timestamp = Date.now() - 60_000;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp });
+		let refusalCount = 0;
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				refusalCount++;
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		let observed: unknown;
+		try {
+			await withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
+		} catch (error) {
+			observed = error;
+		}
+
+		expect(observed).toBeInstanceOf(FileLockAcquireError);
+		const lockError = observed as FileLockAcquireError;
+		expect(lockError.holder).toContain("(dead but not reaped)");
+		expect(lockError.removalFailure).toMatchObject({
+			outcome: "owner_changed",
+			message: expect.stringContaining("identity-bound removal guard returned owner_changed"),
+		});
+		expect(lockError.message).toContain("could not be reaped on this host");
+		const cleanupCommand =
+			process.platform === "win32"
+				? `Remove-Item -LiteralPath '${lockDir.replace(/'/g, "''")}' -Recurse -Force`
+				: `rm -rf -- '${lockDir.replace(/'/g, "'\\''")}'`;
+		expect(lockError.removalFailure?.manualCleanupCommand).toBe(cleanupCommand);
+		expect(lockError.message).toContain(cleanupCommand);
+		expect(refusalCount).toBe(3);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toContain(`"timestamp":${timestamp}`);
+	});
+
+	test("does not report a refusal after a byte-identical legacy lock directory is replaced", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		const infoPath = path.join(lockDir, "info");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		const legacyInfoBytes = await fs.readFile(infoPath, "utf8");
+		let replaced = false;
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				if (!replaced) {
+					renameSync(lockDir, `${lockDir}.previous`);
+					mkdirSync(lockDir);
+					writeFileSync(infoPath, legacyInfoBytes);
+					replaced = true;
+				}
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		let observed: unknown;
+		try {
+			await withFileLock(file, async () => undefined, { retries: 1, retryDelayMs: 1 });
+		} catch (error) {
+			observed = error;
+		}
+		expect(observed).toBeInstanceOf(FileLockAcquireError);
+		const lockError = observed as FileLockAcquireError;
+		expect(lockError.code).toBe("acquire_timeout");
+		expect(replaced).toBe(true);
+		expect(lockError.removalFailure).toBeUndefined();
+		expect(lockError.message).not.toContain("could not be reaped on this host");
+		expect(lockError.message).not.toContain("rm -rf");
+		expect(lockError.message).not.toContain("Remove-Item -LiteralPath");
+		expect(await fs.readFile(infoPath, "utf8")).toBe(legacyInfoBytes);
+	});
+
 	test("surfaces the native refusal code when strict removal is refused", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "index.jsonl");
@@ -2312,7 +2518,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		const lockDir = `${file}.lock`;
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
 		let replaced = false;
-		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: () => {
@@ -2325,11 +2531,12 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 						JSON.stringify({
 							pid: process.pid,
 							start_time: processStartTime(process.pid),
+							start_time_format: "utc-v1",
 							timestamp: Date.now(),
 						}),
 					);
 				}
-				return { ok: false, code: "sharing_violation" };
+				return { ok: false, code: "identity_mismatch" };
 			},
 		});
 
@@ -2345,48 +2552,49 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped");
+		expect(lockError.message).not.toContain("rm -rf");
+		expect(lockError.message).not.toContain("Remove-Item -LiteralPath");
+		expect(await fs.exists(lockDir)).toBe(true);
+		expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).pid).toBe(process.pid);
 	});
 
-	test("drops a recorded refusal when a live successor takes over during the final retry sleep", async () => {
+	test("drops a recorded refusal when a live successor replaces the lock after the removal snapshot", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "index.jsonl");
 		const lockDir = `${file}.lock`;
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
-		const retries = 3;
+		let replaced = false;
 		FileLockTestHooks.nativeExactRemovalProbe = () => false;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
-			exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+			exactRemoveDirectoryTree: () => {
+				if (!replaced) {
+					renameSync(lockDir, `${lockDir}.previous`);
+					mkdirSync(lockDir);
+					writeFileSync(
+						path.join(lockDir, "info"),
+						JSON.stringify({
+							pid: process.pid,
+							start_time: processStartTime(process.pid),
+							start_time_format: "utc-v1",
+							timestamp: Date.now(),
+						}),
+					);
+					replaced = true;
+				}
+				return { ok: false, code: "identity_mismatch" };
+			},
 		});
-		// Publish a live successor after the loop's final snapshot, so only the
-		// exhaustion-time generation re-read can keep the refusal off the message.
-		const realSleep = Bun.sleep;
-		let sleeps = 0;
-		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
-			sleeps++;
-			if (sleeps === retries) {
-				rmSync(lockDir, { recursive: true, force: true });
-				mkdirSync(lockDir);
-				writeFileSync(
-					path.join(lockDir, "info"),
-					JSON.stringify({
-						pid: process.pid,
-						start_time: processStartTime(process.pid),
-						timestamp: Date.now(),
-					}),
-				);
-			}
-			return await realSleep(ms ?? 0);
-		}) as typeof Bun.sleep);
 
 		let observed: unknown;
 		try {
-			await withFileLock(file, async () => undefined, { retries, retryDelayMs: 1 });
+			await withFileLock(file, async () => undefined, { retries: 1, retryDelayMs: 1 });
 		} catch (error) {
 			observed = error;
 		}
 		expect(observed).toBeInstanceOf(FileLockAcquireError);
 		const lockError = observed as FileLockAcquireError;
+		expect(replaced).toBe(true);
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped");

@@ -21,6 +21,7 @@ const kimiK3: Model<"openai-completions"> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 1_048_576,
 	maxTokens: 32_000,
+	streamIdleTimeoutMs: 25,
 };
 
 const context: Context = {
@@ -72,5 +73,6 @@ describe("OpenAI-Anthropic compatibility shim", () => {
 		]);
 
 		expect(routed.thinking).toEqual(kimiK3.thinking);
+		expect(routed.streamIdleTimeoutMs).toBe(25);
 	});
 });

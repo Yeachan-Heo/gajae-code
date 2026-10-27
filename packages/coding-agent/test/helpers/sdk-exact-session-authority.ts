@@ -25,6 +25,7 @@ export interface ExactSessionAuthorityOptions {
 	url: string;
 	token: string;
 	endpointGeneration?: number;
+	indexSeq?: number;
 }
 
 export async function prepareExactSessionAuthority(
@@ -79,13 +80,13 @@ export async function publishExactSessionAuthority(
 		endpointMtimeMs: authority.endpointMtimeMs,
 		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
 		version: SESSION_INDEX_EVENT_VERSION,
-		indexSeq: 1,
+		indexSeq: options.indexSeq ?? 1,
 		ts: Date.now(),
 	} satisfies Omit<SessionIndexEvent, "checksum">;
-	await Bun.write(
-		path.join(indexDirectory, "index.jsonl"),
-		`${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) })}\n`,
-	);
+	const indexPath = path.join(indexDirectory, "index.jsonl");
+	const line = `${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) })}\n`;
+	if ((options.indexSeq ?? 1) > 1) await fs.appendFile(indexPath, line);
+	else await Bun.write(indexPath, line);
 }
 
 export async function registerExactSessionAuthority(

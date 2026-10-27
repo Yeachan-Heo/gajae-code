@@ -1,6 +1,8 @@
 /**
  * OpenAI code provider (ChatGPT OAuth) flow — browser and device-code flows.
  */
+
+import { OPENAI_HEADER_VALUES } from "../../providers/openai-codex/constants";
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "./callback-server";
 import { generatePKCE } from "./pkce";
 import type { OAuthController, OAuthCredentials } from "./types";
@@ -61,6 +63,41 @@ interface PKCE {
 	challenge: string;
 }
 
+/**
+ * Extract a readable error message from OpenAI OAuth error response.
+ * Handles both string errors (error + error_description) and object errors (code/type + message).
+ */
+function extractOpenAIErrorMessage(body: unknown): string {
+	if (typeof body !== "object" || body === null) return "";
+
+	const obj = body as Record<string, unknown>;
+	const error = obj.error;
+
+	if (typeof error === "string") {
+		// String error: "invalid_grant", optionally explained by error_description.
+		// Parts are joined so an empty error string never leaves a dangling separator.
+		const desc = obj.error_description;
+		const parts = desc !== undefined && typeof desc === "string" && desc.length > 0 ? [error, desc] : [error];
+		return parts.filter(part => part.length > 0).join(": ");
+	}
+
+	if (typeof error === "object" && error !== null) {
+		// Object error: {message, type, code}. `code` wins over `type`, but only when
+		// it is a usable string — a numeric or empty code must fall back to the type
+		// rather than silently dropping both.
+		const err = error as Record<string, unknown>;
+		const code = typeof err.code === "string" && err.code.length > 0 ? err.code : err.type;
+		const msg = err.message;
+
+		const parts: string[] = [];
+		if (typeof code === "string" && code.length > 0) parts.push(code);
+		if (typeof msg === "string" && msg.length > 0) parts.push(msg);
+		return parts.join(": ");
+	}
+
+	return "";
+}
+
 class OpenAICodexOAuthFlow extends OAuthCallbackFlow {
 	constructor(
 		ctrl: OAuthController,
@@ -118,9 +155,9 @@ async function exchangeCodeForToken(code: string, verifier: string, redirectUri:
 	if (!tokenResponse.ok) {
 		let detail = `${tokenResponse.status}`;
 		try {
-			const body = (await tokenResponse.json()) as { error?: string; error_description?: string };
-			if (body.error)
-				detail = `${tokenResponse.status} ${body.error}${body.error_description ? `: ${body.error_description}` : ""}`;
+			const body = await tokenResponse.json();
+			const errorMsg = extractOpenAIErrorMessage(body);
+			if (errorMsg) detail = `${tokenResponse.status} ${errorMsg}`;
 		} catch {}
 		throw new Error(`Token exchange failed: ${detail}`);
 	}
@@ -153,13 +190,13 @@ async function exchangeCodeForToken(code: string, verifier: string, redirectUri:
  * Login with OpenAI code provider OAuth
  */
 export type OpenAICodexLoginOptions = OAuthController & {
-	/** Optional originator value for OpenAI code provider OAuth. Default: "opencode". */
+	/** Optional originator value for OpenAI code provider OAuth. Default: codex_cli_rs. */
 	originator?: string;
 };
 
 export async function loginOpenAICodex(options: OpenAICodexLoginOptions): Promise<OAuthCredentials> {
 	const pkce = await generatePKCE();
-	const originator = options.originator?.trim() || "opencode";
+	const originator = options.originator?.trim() || OPENAI_HEADER_VALUES.ORIGINATOR_CODEX;
 	const flow = new OpenAICodexOAuthFlow(options, pkce, originator);
 
 	return flow.login();
@@ -270,9 +307,9 @@ export async function refreshOpenAICodexToken(refreshToken: string): Promise<OAu
 	if (!response.ok) {
 		let detail = `${response.status}`;
 		try {
-			const body = (await response.json()) as { error?: string; error_description?: string };
-			if (body.error)
-				detail = `${response.status} ${body.error}${body.error_description ? `: ${body.error_description}` : ""}`;
+			const body = await response.json();
+			const errorMsg = extractOpenAIErrorMessage(body);
+			if (errorMsg) detail = `${response.status} ${errorMsg}`;
 		} catch {}
 		throw new Error(`OpenAI Codex token refresh failed: ${detail}`);
 	}

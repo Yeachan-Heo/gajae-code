@@ -217,11 +217,11 @@ export async function describeManagedLink(
 	const parent = await fs.lstat(parentPath, { bigint: true }).catch(() => undefined);
 	const trustedReceipt =
 		!!body && ownedReceipt(receipt) && publicCandidates.some(candidate => candidate.path === body.source);
+	// The recorded st_dev is not compared: macOS APFS gives the same volume a new st_dev after a reboot,
+	// which made every pre-reboot receipt look foreign (#5990). The inode binds the link, and the volume
+	// is re-derived from the parent directory observed in the same snapshot.
 	const identityMatches =
-		!!body &&
-		!!link &&
-		body.identity.dev === link.stat.dev.toString() &&
-		body.identity.ino === link.stat.ino.toString();
+		!!body && !!link && body.identity.ino === link.stat.ino.toString() && link.stat.dev === link.parent.dev;
 	const owned = trustedReceipt && (link ? identityMatches : occupant === undefined);
 	const recordedCandidate = body && publicCandidates.find(candidate => candidate.path === body.source);
 	let status: ManagedLinkDescriptor["status"] = "unknown";

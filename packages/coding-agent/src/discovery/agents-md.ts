@@ -43,7 +43,7 @@ async function readBoundedAgentsMdFile(
 	const homeIsStable = async (): Promise<boolean> => {
 		if (!options?.home || !options.homeIdentity) return true;
 		try {
-			const current = await fs.stat(options.home);
+			const current = await fs.stat(options.home, { bigint: true });
 			return current.dev === options.homeIdentity.dev && current.ino === options.homeIdentity.ino;
 		} catch {
 			return false;

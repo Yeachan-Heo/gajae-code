@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import { logger } from "@gajae-code/utils";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
+import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
 // honors it. Startup used to discard it anyway: one batch-wide timer decided
@@ -22,6 +24,8 @@ rl.on('line', line => {
     }, ${initializeDelayMs});
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: '${toolName}', inputSchema: { type: 'object' } }] } }) + '\\n');
+  } else if (msg.method === 'tools/call') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'pong' }] } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }
@@ -91,8 +95,47 @@ describe("MCP startup and the declared connection window", () => {
 		}
 	}, 15_000);
 
+	test("cleans up an expired pending connection and reconnects cached tools", async () => {
+		const cache = {
+			get: vi.fn(async () => [{ name: "ping", inputSchema: { type: "object" } }]),
+			set: vi.fn(async () => {}),
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		const source = {
+			provider: "test",
+			providerName: "Test provider",
+			path: "/test/mcp.json",
+			level: "user" as const,
+		};
+		try {
+			const result = await manager.connectServers(
+				{
+					cached: {
+						command: process.execPath,
+						args: ["-e", delayedStdioServer("ping", 5_000)],
+					},
+				},
+				{ cached: source },
+			);
+
+			expect(cache.get).toHaveBeenCalledWith("cached", expect.anything());
+			expect(result.errors.get("cached")).toContain("timed out");
+			expect(result.tools).toHaveLength(1);
+			expect(manager.getTools().map(tool => tool.name)).toContain("mcp__cached_ping");
+			expect(manager.getConnectionStatus("cached")).toBe("disconnected");
+			expect(manager.getSource("cached")).toEqual(source);
+
+			const toolResult = await result.tools[0]!.execute("cached-call", {}, undefined, {} as never);
+			expect(toolResult.details?.isError).not.toBe(true);
+			expect(manager.getConnectedServers()).toContain("cached");
+		} finally {
+			await manager.disconnectAll();
+		}
+	}, 15_000);
+
 	test("gives up on a server once its declared window has actually elapsed", async () => {
 		const manager = new MCPManager(process.cwd());
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const result = await manager.connectServers(
 				{
@@ -110,8 +153,81 @@ describe("MCP startup and the declared connection window", () => {
 			expect(result.connectedServers).toEqual([]);
 			expect(result.errors.get("brief")).toContain("timed out");
 			expect(manager.getConnectionStatus("brief")).toBe("disconnected");
+			expect(warning).toHaveBeenCalledWith(
+				"MCP server connection failed during startup",
+				expect.objectContaining({
+					path: "mcp:brief",
+					remediation: expect.stringContaining("--timeout"),
+				}),
+			);
 		} finally {
+			warning.mockRestore();
 			await manager.disconnectAll();
 		}
 	});
+
+	test("does not persist remote startup error text in the default warning", async () => {
+		const secret = "STARTUP_HTTP_SECRET";
+		const server = Bun.serve({
+			port: 0,
+			fetch() {
+				return new Response(`server rejected ${secret}`, { status: 500 });
+			},
+		});
+		const manager = new MCPManager(process.cwd());
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const result = await manager.connectServers(
+				{
+					remote: { type: "http", url: server.url.href, timeout: 1_000 },
+				},
+				{},
+			);
+
+			expect(result.errors.get("remote")).toContain(secret);
+			const startupWarning = warning.mock.calls.find(
+				([message]) => message === "MCP server connection failed during startup",
+			);
+			expect(startupWarning).toBeDefined();
+			expect(startupWarning?.[1]).toMatchObject({ error: "http-status:500" });
+			expect(JSON.stringify(startupWarning)).not.toContain(secret);
+		} finally {
+			warning.mockRestore();
+			await manager.disconnectAll();
+			await server.stop(true);
+		}
+	});
+
+	test("keeps every server in a large untimed batch diagnosable", async () => {
+		const manager = new MCPManager(process.cwd());
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const configs = Object.fromEntries(
+			Array.from({ length: 22 }, (_, index) => [
+				`untimed-${String(index + 1).padStart(2, "0")}`,
+				{
+					command: process.execPath,
+					args: ["-e", delayedStdioServer("ping", 5_000)],
+				},
+			]),
+		);
+		try {
+			const result = await manager.connectServers(configs, {});
+
+			expect(result.connectedServers).toEqual([]);
+			expect(result.errors.size).toBe(22);
+			for (const name of Object.keys(configs)) {
+				expect(result.errors.get(name)).toContain("timed out");
+				expect(warning).toHaveBeenCalledWith(
+					"MCP server connection timed out during startup",
+					expect.objectContaining({
+						path: `mcp:${name}`,
+						remediation: expect.stringContaining("--timeout"),
+					}),
+				);
+			}
+		} finally {
+			warning.mockRestore();
+			await manager.disconnectAll();
+		}
+	}, 30_000);
 });

@@ -95,6 +95,32 @@ describe("CustomizationDashboard", () => {
 		expect(lines).not.toContain("fixture");
 	});
 
+	test("project hooks are displayed as stored-only and cannot be enabled", async () => {
+		await fs.mkdir(path.join(projectDir, ".gjc", "hooks", "pre"), { recursive: true });
+		const hookPath = path.join(projectDir, ".gjc", "hooks", "pre", "bash.ts");
+		await fs.writeFile(hookPath, "export {}\n");
+		const dashboard = await CustomizationDashboard.create(projectDir, undefined, homeDir);
+		dashboard.handleInput("\x1b[C"); // hooks section
+		const before = Bun.stripANSI(dashboard.render(240).join("\n")).split("\n");
+		expect(before.join("\n")).toContain("stored-only");
+
+		dashboard.handleInput("e");
+		const after = Bun.stripANSI(dashboard.render(240).join("\n")).split("\n");
+		expect(after.join("\n")).toContain("project hooks are stored-only");
+		expect(after).toHaveLength(before.length);
+		const changedCells = before.reduce((total, line, index) => {
+			const afterLine = after[index] ?? "";
+			const lineWidth = Math.max(line.length, afterLine.length);
+			let changed = 0;
+			for (let column = 0; column < lineWidth; column++) {
+				if (line[column] !== afterLine[column]) changed++;
+			}
+			return total + changed;
+		}, 0);
+		expect(changedCells / (before.length * 240)).toBeLessThan(0.1);
+		expect(await fs.readFile(hookPath, "utf-8")).toBe("export {}\n");
+	});
+
 	test("skills master switch marks native skills disabled", async () => {
 		await seedProjectSkill();
 		const settings = {
@@ -170,6 +196,8 @@ describe("ImportWizard", () => {
 	test("drives product → scope → surfaces → policy → preview, enter applies", async () => {
 		await fs.mkdir(path.join(projectDir, ".claude", "skills", "wiz-skill"), { recursive: true });
 		await fs.writeFile(path.join(projectDir, ".claude", "skills", "wiz-skill", "SKILL.md"), SKILL_MD);
+		await fs.mkdir(path.join(projectDir, ".claude", "hooks", "pre"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".claude", "hooks", "pre", "bash.ts"), "export {}\n");
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
 		const previewReady = Promise.withResolvers<void>();
 		const applyFinished = Promise.withResolvers<void>();
@@ -188,11 +216,18 @@ describe("ImportWizard", () => {
 		expect(wizard.step).toBe("preview");
 		expect(wizard.hasVisibleSelector).toBe(false);
 		expect(wizard.preview?.entries.some(e => e.surface === "skills" && e.destinationName === "wiz-skill")).toBe(true);
+		expect(wizard.preview?.warnings.join(" ")).toContain("Project-scope hooks are stored-only");
+		expect(Bun.stripANSI(wizard.render(120).join("\n"))).toContain("Project-scope hooks are stored-only");
 		wizard.handleInput("\r"); // confirm apply
 		await applyFinished.promise;
 		expect(wizard.step).toBe("result");
 		expect(wizard.result?.ok).toBe(true);
+		expect(wizard.result?.entries.some(entry => entry.surface === "hooks" && entry.outcome === "imported")).toBe(
+			true,
+		);
+		expect(Bun.stripANSI(wizard.render(120).join("\n"))).toContain("Project-scope hooks are stored-only");
 		await fs.stat(path.join(projectDir, ".gjc", "skills", "wiz-skill", "SKILL.md"));
+		await fs.stat(path.join(projectDir, ".gjc", "hooks", "pre", "bash.ts"));
 	});
 
 	test("a failed apply closes with applied=false, never a false success", async () => {

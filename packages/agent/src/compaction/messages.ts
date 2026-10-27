@@ -75,12 +75,52 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 	return [{ type: "text", text }];
 }
 
+/**
+ * Encode a stored summary before it is placed in the summary template.
+ * `prompt.render` does not escape, and the summary can contain tool output,
+ * repository text, or fetched pages. Newlines stay so the summary remains readable.
+ */
+function escapeSummaryMarkup(value: string): string {
+	return value.replace(
+		/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g,
+		(char, offset) => {
+			const code = char.charCodeAt(0);
+			const next = value.charCodeAt(offset + 1);
+			const prev = value.charCodeAt(offset - 1);
+			if (
+				(code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) ||
+				(code >= 0xdc00 && code <= 0xdfff && prev >= 0xd800 && prev <= 0xdbff)
+			) {
+				return char;
+			}
+			if (char === "\n" || char === "\t") return char;
+			switch (char) {
+				case "&":
+					return "&amp;";
+				case "<":
+					return "&lt;";
+				case ">":
+					return "&gt;";
+				case '"':
+					return "&quot;";
+				default:
+					return `\\u${code.toString(16).padStart(4, "0")}`;
+			}
+		},
+	);
+}
+
+function renderFencedSummary(template: string, summary: string): string {
+	const framed = `<untrusted-content>\n${escapeSummaryMarkup(summary)}\n</untrusted-content>`;
+	return prompt.render(template, { summary: framed });
+}
+
 export function renderBranchSummaryContext(summary: string): string {
-	return prompt.render(BRANCH_SUMMARY_TEMPLATE, { summary });
+	return renderFencedSummary(BRANCH_SUMMARY_TEMPLATE, summary);
 }
 
 export function renderCompactionSummaryContext(summary: string): string {
-	return prompt.render(COMPACTION_SUMMARY_TEMPLATE, { summary });
+	return renderFencedSummary(COMPACTION_SUMMARY_TEMPLATE, summary);
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {

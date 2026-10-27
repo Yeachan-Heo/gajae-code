@@ -9,8 +9,16 @@ import * as mcpClient from "../../src/runtime-mcp/client";
 import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
-import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
-import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
+import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
+import type {
+	JsonRpcMessage,
+	MCPServerConfig,
+	MCPServerConnection,
+	MCPToolDefinition,
+	MCPTransport,
+} from "../../src/runtime-mcp/types";
+import { MCPExpectedFailure, MCPHttpRequestError } from "../../src/runtime-mcp/types";
+import { wrapUntrustedContent } from "../../src/tools/fetch";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
 async function mkdtempExact(prefix: string): Promise<string> {
@@ -102,6 +110,318 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
 	});
+	test("notifies independent tool subscribers for catalog changes and stops after unsubscribe", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const secondConnection = makeConnection("second", async () => {});
+		const definitions: MCPToolDefinition[][] = [
+			[{ name: "first", inputSchema: { type: "object" } }],
+			[{ name: "renamed", inputSchema: { type: "object" } }],
+			[],
+			[{ name: "after_unsubscribe", inputSchema: { type: "object" } }],
+			[{ name: "published", inputSchema: { type: "object" } }],
+		];
+		const changes: string[][] = [];
+		const remainingChanges: string[][] = [];
+		const snapshotMutationResults: Array<{ frozen: boolean; mutationRejected: boolean; catalog: string[] }> = [];
+		let ownerChanges = 0;
+		let throwOwnerCallback = false;
+		const connect = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation(async name => (name === "second" ? secondConnection : connection));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => definitions.shift() ?? []);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		manager.setOnToolsChanged(() => {
+			ownerChanges++;
+			if (throwOwnerCallback) throw new Error("owner callback failed");
+		});
+		const unsubscribe = manager.subscribeToToolsChanged(tools => {
+			changes.push(tools.map(tool => tool.name));
+		});
+		const unsubscribeRemaining = manager.subscribeToToolsChanged(tools => {
+			remainingChanges.push(tools.map(tool => tool.name));
+		});
+		const unsubscribeReadOnly = manager.subscribeToToolsChanged(tools => {
+			let mutationRejected = false;
+			try {
+				(tools as unknown as unknown[]).pop();
+			} catch {
+				mutationRejected = true;
+			}
+			snapshotMutationResults.push({
+				frozen: Object.isFrozen(tools),
+				mutationRejected,
+				catalog: manager.getTools().map(tool => tool.name),
+			});
+		});
+		try {
+			const result = await manager.connectServers({ late: { type: "http", url: "http://127.0.0.1:1" } }, {});
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__late_first"]);
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_first"]]);
+			await manager.refreshServerTools("late");
+			await manager.refreshServerTools("late");
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_first"], ["mcp__late_renamed"], []]);
+
+			unsubscribe();
+			throwOwnerCallback = true;
+			await manager.refreshServerTools("late");
+			throwOwnerCallback = false;
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__late_after_unsubscribe"]);
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_first"], ["mcp__late_renamed"], []]);
+			expect(remainingChanges).toEqual([
+				["mcp__late_first"],
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+			]);
+			expect(snapshotMutationResults).toHaveLength(5);
+			expect(snapshotMutationResults.every(result => result.frozen && result.mutationRejected)).toBe(true);
+			expect(snapshotMutationResults.map(result => result.catalog)).toEqual([
+				["mcp__late_first"],
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+			]);
+			expect(warning.mock.calls.map(([message]) => message)).toContain("MCP tool catalog owner callback failed");
+
+			const bulkResult = await manager.connectServers({ second: { type: "http", url: "http://127.0.0.1:2" } }, {});
+			expect(bulkResult.tools.map(tool => tool.name)).toEqual(["mcp__second_published"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__second_published"]);
+			expect(remainingChanges).toEqual([
+				["mcp__late_first"],
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+				["mcp__late_after_unsubscribe", "mcp__second_published"],
+				["mcp__second_published"],
+			]);
+			expect(snapshotMutationResults.map(result => result.catalog)).toEqual(remainingChanges);
+			expect(ownerChanges).toBe(7);
+			expect(connect).toHaveBeenCalledTimes(2);
+
+			await manager.disconnectAll();
+			expect(manager.getTools()).toEqual([]);
+			expect(remainingChanges).toHaveLength(8);
+			expect(remainingChanges.at(-1)).toEqual([]);
+			expect(snapshotMutationResults).toHaveLength(8);
+			expect(snapshotMutationResults.at(-1)).toEqual({
+				frozen: true,
+				mutationRejected: true,
+				catalog: [],
+			});
+			expect(ownerChanges).toBe(8);
+		} finally {
+			unsubscribe();
+			unsubscribeRemaining();
+			unsubscribeReadOnly();
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+	test("retains a post-return background tool-load failure in the result errors", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const backgroundFailure = Promise.withResolvers<never>();
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		const listToolsSpy = vi
+			.spyOn(mcpClient, "listTools")
+			.mockImplementation(async () => await backgroundFailure.promise);
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const result = await manager.connectServers(
+				{ late: { type: "http", url: "http://127.0.0.1:1", timeout: 10_000 } },
+				{},
+			);
+			expect(connectSpy).toHaveBeenCalledTimes(1);
+			expect(listToolsSpy).toHaveBeenCalledTimes(1);
+			expect(result.errors.has("late")).toBe(false);
+
+			backgroundFailure.reject(new Error("background tools failure"));
+			await waitFor(() => result.errors.get("late") === "background tools failure");
+			expect(result.errors.get("late")).toBe("background tools failure");
+			expect(error).toHaveBeenCalledWith("MCP tool load failed", {
+				path: "mcp:late",
+				serverName: "late",
+				error: "transport-error",
+			});
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+	test("retains exact-config registration after pending startup expiry for reconnect", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-exact-timeout-reconnect-");
+		const configPath = join(cwd, "mcp.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		const firstTools = Promise.withResolvers<never>();
+		const firstConnection = makeConnection("exact", async () => {});
+		const replacementConnection = makeConnection("exact", async () => {});
+		let connectCount = 0;
+		let listToolsCount = 0;
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockImplementation(async () => {
+			connectCount++;
+			return connectCount === 1 ? firstConnection : replacementConnection;
+		});
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => {
+			listToolsCount++;
+			if (listToolsCount === 1) return await firstTools.promise;
+			return [];
+		});
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({ mcpServers: { exact: { type: "http", url: "http://127.0.0.1:1", timeout: 100 } } }),
+			);
+			const result = await manager.discoverAndConnect({ configPath });
+
+			expect(result.errors.get("exact")).toBe("MCP server unavailable");
+			expect(connect).toHaveBeenCalledTimes(1);
+			expect(await manager.reconnectServer("exact")).toBe(replacementConnection);
+			expect(connect).toHaveBeenCalledTimes(2);
+		} finally {
+			firstTools.reject(new Error("abandoned initial tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps cached fallback tools published after background disconnect finishes", async () => {
+		const cache = {
+			get: vi.fn(async () => [{ name: "ping", inputSchema: { type: "object" } }]),
+			set: vi.fn(async () => {}),
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		const pendingTools = Promise.withResolvers<never>();
+		const closeStarted = Promise.withResolvers<void>();
+		const closeRelease = Promise.withResolvers<void>();
+		const connection = makeConnection("cached", async () => {
+			closeStarted.resolve();
+			await closeRelease.promise;
+		});
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => await pendingTools.promise);
+		try {
+			const result = await manager.connectServers({ cached: { type: "http", url: "http://127.0.0.1:1" } }, {});
+			expect(result.tools.map(tool => tool.name)).toContain("mcp__cached_ping");
+			await closeStarted.promise;
+			expect(manager.getTools().map(tool => tool.name)).toContain("mcp__cached_ping");
+
+			closeRelease.resolve();
+			await Bun.sleep(10);
+			expect(manager.getTools().map(tool => tool.name)).toContain("mcp__cached_ping");
+		} finally {
+			closeRelease.resolve();
+			pendingTools.reject(new Error("abandoned tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
+	test("limits session manager cache reads and writes to allowed server names", async () => {
+		const cachedTools = [{ name: "stale_plugin", inputSchema: { type: "object" } }];
+		const cacheGet = vi.fn(async (_name: string, _config: MCPServerConfig) => cachedTools);
+		const cacheSet = vi.fn(async (_name: string, _config: MCPServerConfig, _tools: MCPToolDefinition[]) => {});
+		const cache = { get: cacheGet, set: cacheSet } as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache, {
+			toolCacheServerNames: new Set(["conventional"]),
+		});
+		const pendingPluginTools = Promise.withResolvers<never>();
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async name => makeConnection(name, async () => {}));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async connection => {
+			if (connection.name === "plugin-pending") return await pendingPluginTools.promise;
+			return [{ name: `tool_${connection.name}`, inputSchema: { type: "object" } }];
+		});
+		try {
+			const result = await manager.connectServers(
+				{
+					conventional: { type: "http", url: "http://127.0.0.1:1" },
+					"plugin-success": { type: "http", url: "http://127.0.0.1:2" },
+					"plugin-pending": { type: "http", url: "http://127.0.0.1:3" },
+				},
+				{},
+			);
+			expect(cacheGet).not.toHaveBeenCalled();
+			expect(cacheSet.mock.calls.map(([name]) => name)).toEqual(["conventional"]);
+			expect(result.tools.some(tool => tool.mcpServerName === "plugin-pending")).toBe(false);
+			expect(result.tools.some(tool => tool.mcpServerName === "plugin-success")).toBe(true);
+		} finally {
+			pendingPluginTools.reject(new Error("abandoned plugin tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
+	test("refreshes conventional cache scope when rediscovering MCP configuration", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-cache-scope-refresh-");
+		const cacheSet = vi.fn(async (_name: string, _config: MCPServerConfig, _tools: MCPToolDefinition[]) => {});
+		const cache = {
+			get: vi.fn(async (_name: string, _config: MCPServerConfig) => null),
+			set: cacheSet,
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(cwd, cache, { toolCacheServerNames: new Set(["old"]) });
+		const oldConfig: MCPServerConfig = { type: "http", url: "http://127.0.0.1:1" };
+		const source = {
+			provider: "native",
+			providerName: "GJC",
+			level: "project" as const,
+			path: join(cwd, ".gjc", "mcp.json"),
+		};
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async name => makeConnection(name, async () => {}));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async connection => [
+			{ name: `tool_${connection.name}`, inputSchema: { type: "object" } },
+		]);
+		try {
+			await manager.connectServers({ old: oldConfig }, { old: source });
+			await Bun.write(
+				join(cwd, ".gjc", "mcp.json"),
+				JSON.stringify({ mcpServers: { fresh: { type: "http", url: "http://127.0.0.1:2" } } }),
+			);
+			await manager.disconnectAll();
+			const reloaded = await manager.discoverAndConnect({ nativeOnly: true });
+
+			expect(reloaded.connectedServers).toContain("fresh");
+			expect(cacheSet.mock.calls.map(([name]) => name)).toEqual(["old", "fresh"]);
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("classifies remote errors that reject background tool loading before logging", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const backgroundFailure = Promise.withResolvers<never>();
+		const secret = "DELAYED_MCP_RESPONSE_SECRET";
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => await backgroundFailure.promise);
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const result = await manager.connectServers(
+				{ late: { type: "http", url: "http://127.0.0.1:1", timeout: 10_000 } },
+				{},
+			);
+			expect(result.errors.has("late")).toBe(false);
+
+			backgroundFailure.reject(
+				new MCPExpectedFailure(new MCPHttpRequestError(502, `remote response included ${secret}`)),
+			);
+			await waitFor(() => result.errors.get("late")?.includes(secret) === true);
+			expect(result.errors.get("late")).toContain(secret);
+			const loggedFailure = error.mock.calls.find(([message]) => message === "MCP tool load failed");
+			expect(loggedFailure).toBeDefined();
+			expect(loggedFailure?.[1]).toMatchObject({ error: "http-status:502" });
+			expect(JSON.stringify(loggedFailure)).not.toContain(secret);
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
 	// The long startup ceiling is ACP-scoped (PR #3164 Option B): a slow gateway
 	// gets its configured window only when the caller supplies an explicit
 	// budget, as ACP lifecycle launches do. Without one, the short default
@@ -1313,7 +1633,7 @@ setInterval(() => {}, 1000);
 			expect(result.connectedServers).toEqual(["exact"]);
 			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__exact_tool"]);
 			const toolResult = await result.tools[0]!.execute("exact-call", {}, undefined, {} as never);
-			expect(toolResult.content).toEqual([{ type: "text", text: "exact-ok" }]);
+			expect(toolResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("exact-ok") }]);
 			expect(toolCallCount).toBe(1);
 			expect(initializeCapabilities).toEqual({});
 			// auto preference probes server/discover first; this stub answers like a real legacy server.

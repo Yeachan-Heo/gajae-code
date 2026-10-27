@@ -965,7 +965,7 @@ export class ToolExecutionComponent extends Container {
 			if (this.#expanded && !previews?.some(preview => preview.diff)) {
 				const editMode = this.#editMode;
 				const strategy = editMode ? EDIT_MODE_STRATEGIES[editMode] : undefined;
-				const fallback = strategy?.renderStreamingFallback(this.#args, theme);
+				const fallback = strategy?.renderStreamingPlaceholder(this.#args, theme);
 				if (fallback) context.editStreamingFallback = fallback;
 			}
 			context.renderDiff = renderDiff;

@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import type { ServerWebSocket } from "bun";
 import type { Broker } from "./broker";
 
@@ -7,6 +8,8 @@ const PROTOCOL_VERSION = 3;
 const MAX_BROKER_JSON_FRAME_BYTES = 4 * 1024 * 1024;
 
 const BROKER_OPERATIONS = new Set([
+	// Observation-only published diagnostics; it starts, ensures and recovers nothing.
+	"broker.diagnostics",
 	"session.list",
 	"session.get_endpoint",
 	"session.create",
@@ -25,6 +28,7 @@ const BROKER_OPERATIONS = new Set([
 	"broker.lookup_lifecycle",
 	"model.resolve",
 	"session.spawn",
+	"task.dag",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {
@@ -62,6 +66,7 @@ export class BrokerTransport {
 	readonly #requestedPort: number;
 	#server: Bun.Server<undefined> | null = null;
 	#port = 0;
+	readonly #clients = new Set<ServerWebSocket<unknown>>();
 	readonly #shutdownBackpressured = new WeakSet<ServerWebSocket<unknown>>();
 	#shutdownRequested = false;
 	constructor(broker: Broker, token: string, port = 0) {
@@ -72,6 +77,10 @@ export class BrokerTransport {
 	get port(): number {
 		if (!this.#server) throw new Error("Broker transport is not running");
 		return this.#port;
+	}
+	/** Sockets a client holds open right now; the broker outlives every one of them. */
+	get clientCount(): number {
+		return this.#clients.size;
 	}
 	async start(): Promise<number> {
 		if (this.#server) return this.#port;
@@ -91,7 +100,12 @@ export class BrokerTransport {
 			websocket: {
 				maxPayloadLength: MAX_BROKER_JSON_FRAME_BYTES * 2,
 				open: socket => {
+					this.#clients.add(socket);
 					send(socket, { type: "broker_hello", protocolVersion: PROTOCOL_VERSION });
+				},
+				close: socket => {
+					this.#clients.delete(socket);
+					this.#shutdownBackpressured.delete(socket);
 				},
 				message: (socket, message) => void this.#handleMessage(socket, message),
 				drain: socket => {
@@ -143,6 +157,16 @@ export class BrokerTransport {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
 			return;
 		}
+		// After initial publication, the owner retains the authenticated endpoint
+		// so it can stop this exact broker even after discovery is lost. Before
+		// publication readiness, shutdown remains unavailable.
+		if (
+			!this.#broker.ownsDiscovery &&
+			!(frame.operation === "broker.shutdown" && this.#broker.hasPublishedDiscovery)
+		) {
+			sendError(socket, frame.id, "unavailable", "broker publication is unavailable");
+			return;
+		}
 		if (frame.operation === "broker.shutdown") {
 			const action = brokerShutdownSendAction(
 				send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } }),
@@ -155,11 +179,12 @@ export class BrokerTransport {
 		try {
 			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
 			send(socket, { type: "broker_response", id: frame.id, ...result });
-		} catch {
+		} catch (error) {
+			logger.warn(`sdk broker request failed: ${error instanceof Error ? error.message : String(error)}`);
 			sendError(socket, frame.id, "unavailable", "broker request failed");
 		}
 	}
 	#scheduleStopAfterShutdownResponse(): void {
-		setTimeout(() => void this.#broker.stop(), 25);
+		setTimeout(() => void this.#broker.stop({ kind: "shutdown-request" }), 25);
 	}
 }

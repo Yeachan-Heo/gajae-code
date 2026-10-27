@@ -2,6 +2,7 @@
  * Shared types and utilities for web-fetch handlers
  */
 import { ptree } from "@gajae-code/utils";
+import type { Settings } from "../../config/settings";
 import type { AgentStorage } from "../../session/agent-storage";
 import { ToolAbortError } from "../../tools/tool-errors";
 import type { AddressResolver } from "../insane/url-guard";
@@ -20,11 +21,18 @@ export interface RenderResult {
 	notes: string[];
 }
 
+/**
+ * `settings` is the caller's session settings. Handlers must read through it
+ * rather than the process-global singleton: the SDK/ACP host path runs tools
+ * without ever calling `Settings.init()`, where a global read throws
+ * "Settings not initialized" instead of scraping the page.
+ */
 export type SpecialHandler = (
 	url: string,
 	timeout: number,
 	signal?: AbortSignal,
 	storage?: AgentStorage | null,
+	settings?: Settings,
 ) => Promise<RenderResult | null>;
 
 export const MAX_OUTPUT_CHARS = 500_000;
@@ -78,7 +86,10 @@ export interface LoadPageOptions {
 
 export interface LoadPageResult {
 	content: string;
+	/** The bounded response bytes retained for binary classification/conversion. */
+	buffer?: Uint8Array;
 	contentType: string;
+	contentDisposition?: string;
 	finalUrl: string;
 	ok: boolean;
 	status?: number;
@@ -173,6 +184,7 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 				}
 
 				const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+				const contentDisposition = response.headers.get("content-disposition") || undefined;
 				const finalUrl = logicalUrl;
 
 				const reader = response.body?.getReader();
@@ -196,16 +208,33 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 					}
 				}
 
-				const content = Buffer.concat(chunks).toString("utf-8");
+				const bytes = Buffer.concat(chunks);
+				const content = bytes.toString("utf-8");
+				const buffer =
+					contentType.length === 0 ||
+					contentType === "application/octet-stream" ||
+					contentType === "binary/octet-stream" ||
+					contentType === "unknown" ||
+					contentDisposition !== undefined
+						? bytes
+						: undefined;
 				if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
 					continue attempts;
 				}
 
 				if (!response.ok) {
-					return { content, contentType, finalUrl, ok: false, status: response.status };
+					return {
+						content,
+						buffer,
+						contentType,
+						contentDisposition,
+						finalUrl,
+						ok: false,
+						status: response.status,
+					};
 				}
 
-				return { content, contentType, finalUrl, ok: true, status: response.status };
+				return { content, buffer, contentType, contentDisposition, finalUrl, ok: true, status: response.status };
 			}
 			return {
 				content: "",

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
+import { readBrokerExitRecord } from "../src/sdk/broker/broker-exit";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { brokerShutdownSendAction } from "../src/sdk/broker/transport";
 import { SdkClient } from "../src/sdk/client/client";
@@ -47,6 +48,17 @@ async function connect(url: string): Promise<WebSocket> {
 
 function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+}
+
+function lifecycleTargetHash(target: Record<string, unknown>): string {
+	return createHash("sha256")
+		.update(
+			`{${Object.keys(target)
+				.sort()
+				.map(key => `${JSON.stringify(key)}:${JSON.stringify(target[key])}`)
+				.join(",")}}`,
+		)
+		.digest("hex");
 }
 
 type TerminalLifecycleState = "terminal_ok" | "terminal_error" | "terminal_uncertain";
@@ -150,6 +162,67 @@ describe("SDK broker WebSocket transport", () => {
 			await broker.stop();
 		}
 	});
+	it("rejects control RPCs until retained publication readiness", async () => {
+		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-readiness-"));
+		const publicationWritten = Promise.withResolvers<void>();
+		const allowRetention = Promise.withResolvers<void>();
+		const broker = new Broker({
+			agentDir,
+			packageGeneration: "test",
+			startupAfterDiscoveryWriteTestHook: async () => {
+				publicationWritten.resolve();
+				await allowRetention.promise;
+			},
+		});
+		const starting = broker.start();
+		let ws: WebSocket | undefined;
+		try {
+			await publicationWritten.promise;
+			const discovery = broker.discovery;
+			expect(discovery).not.toBeNull();
+			expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(true);
+			expect(broker.ownsDiscovery).toBe(false);
+			expect(broker.hasPublishedDiscovery).toBe(false);
+			ws = await connect(`${discovery!.url}/?token=${discovery!.token}`);
+			expect(await nextFrame(ws)).toEqual({ type: "broker_hello", protocolVersion: 3 });
+			const beforeReady = nextFrame(ws);
+			ws.send(
+				JSON.stringify({
+					type: "broker_request",
+					id: "shutdown-before-ready",
+					operation: "broker.shutdown",
+					input: {},
+				}),
+			);
+			expect(await beforeReady).toEqual({
+				type: "broker_response",
+				id: "shutdown-before-ready",
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+			expect(broker.ownsDiscovery).toBe(false);
+
+			allowRetention.resolve();
+			await starting;
+			expect(broker.ownsDiscovery).toBe(true);
+			expect(broker.hasPublishedDiscovery).toBe(true);
+			const afterReady = nextFrame(ws);
+			ws.send(
+				JSON.stringify({ type: "broker_request", id: "status-after-ready", operation: "broker.status", input: {} }),
+			);
+			expect(await afterReady).toMatchObject({
+				type: "broker_response",
+				id: "status-after-ready",
+				ok: true,
+			});
+		} finally {
+			allowRetention.resolve();
+			await starting.catch(() => {});
+			ws?.close();
+			await broker.stop().catch(() => {});
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 	it("dispatches durable lifecycle lookup outcomes through the broker transport", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-"));
 		const broker = new Broker({ agentDir, packageGeneration: "test" });
@@ -173,6 +246,7 @@ describe("SDK broker WebSocket transport", () => {
 				broker.settings.agentDir,
 				"session.close",
 				"lookup-error",
+				lifecycleTargetHash(closeInput),
 			);
 			expect(broker.ledger.get(closeIdentity)).toMatchObject({
 				operationKey: "session.close\0lookup-error",
@@ -353,6 +427,7 @@ describe("SDK broker WebSocket transport", () => {
 
 		await broker.completion;
 		expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(false);
+		expect(await readBrokerExitRecord(agentDir)).toMatchObject({ mode: "owned-root", reason: "shutdown-request" });
 	});
 	it("rejects oversized frames without disrupting other authenticated clients", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-transport-"));

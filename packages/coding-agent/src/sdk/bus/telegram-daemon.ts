@@ -71,6 +71,7 @@ export {
 	TELEGRAM_TRANSPORT_GENERATION,
 } from "./telegram-daemon-contract";
 
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../host/host";
 import {
 	type AgentDirSessionLifecycleService,
 	createSessionLifecycleService,
@@ -301,10 +302,13 @@ export const ASK_SELECTED_ACK_CAPABILITY = "ask_selected_ack_v1";
 export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 /** Capability for the closed tool phase set: started, completed, failed, and cancelled. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+/** Receive content-free notifications when a running command needs host-side authentication. */
+export const AWAITING_INPUT_CAPABILITY = "awaiting_input_v1";
 /** Receive-only compatibility capability for pre-v2 hosts. */
 export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
-/** Opts notification adapters into positioned-only delivery for matching live effects. */
-export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
+/** Public `sdk/bus/telegram-daemon` path for the canonical `sdk/host` capability token. */
+export { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY };
+
 type ToolActivityCapability = "v1" | "v2";
 
 function negotiateToolActivityCapability(
@@ -362,6 +366,7 @@ const BOT_API_RETRY_ATTEMPTS = 3;
 // Backoff after a failed getUpdates long-poll so a persistent outage does not
 // busy-loop the daemon.
 const POLL_BACKOFF_MS = 1_000;
+const CONTROL_STOP_WATCH_INTERVAL_MS = 750;
 const AUTOMATIC_RELOAD_COOLDOWN_MS = 10 * 60 * 1_000;
 // Default freshness-poll window a cooldown contender waits for a sibling's
 // replacement daemon to publish a fresh ready owner before reloading itself.
@@ -4186,6 +4191,12 @@ interface AttachmentSession {
 	};
 }
 
+/** The exact closed attachment fenced by an authorized session_closed. */
+interface ClosedEndpointTombstone {
+	chatId: string;
+	attachmentKey: string;
+}
+
 interface ModelChoiceRoute {
 	/** Exact transport socket that rendered this choice. */
 	session: AttachmentSession;
@@ -4567,6 +4578,7 @@ export class TelegramNotificationDaemon {
 	private stopRequested = false;
 	/** First observed stop cause wins, including an explicit stop. */
 	#stopCause: TelegramDaemonStopCause | undefined;
+	#controlStopCheck: Promise<boolean> | undefined;
 	/** Signal cause resolution is asynchronous because control requests are file-backed. */
 	#stopCauseResolution: Promise<void> | undefined;
 
@@ -4642,8 +4654,12 @@ export class TelegramNotificationDaemon {
 	private readonly preservedInitiatorTopics = new Set<string>();
 	/** Non-identity frames held until identity creates the correct thread. */
 	private readonly pendingThreadedFrames = new Map<string, PendingThreadedFrame[]>();
-	/** Durable endpoint leases for sessions that already sent an authorized session_closed. */
-	private readonly closedEndpointKeys = new Map<string, TopicEndpointBinding>();
+	/**
+	 * Exact attachments that already sent an authorized session_closed, keyed by
+	 * logical session. The tombstone fences that attachment's late frames; a
+	 * successor attachment resuming the same session id is not the closed endpoint.
+	 */
+	private readonly closedEndpointKeys = new Map<string, ClosedEndpointTombstone>();
 	/** Endpoints rejected by strict topic admission are not retried until their authority changes. */
 	readonly #rejectedTopicEndpointKeys = new Map<string, string>();
 	readonly #rejectedTopicCleanupTimers = new Map<string, Timer | NodeJS.Timeout>();
@@ -5300,6 +5316,7 @@ export class TelegramNotificationDaemon {
 	attachmentRoutingHarnessForTest() {
 		return {
 			attach: (subscription: NotificationSubscription) => this.#onAttachment(subscription),
+			ready: (subscription: NotificationSubscription) => this.#onAttachmentReady(subscription),
 			remove: async (
 				subscription: NotificationSubscription,
 				reason: "removed" | "replaced" | "replaced_same_generation",
@@ -5424,17 +5441,22 @@ export class TelegramNotificationDaemon {
 					ASK_CONTROLS_CAPABILITY,
 					ASK_SELECTED_ACK_CAPABILITY,
 					TOOL_ACTIVITY_CAPABILITY,
+					AWAITING_INPUT_CAPABILITY,
 					LEGACY_TOOL_ACTIVITY_CAPABILITY,
 					POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 					"ephemeral_turn_v1",
 				],
 			});
+			// A stored cursor positions only the host generation that produced it. A
+			// resumed session's host opens a new generation, and replaying from another
+			// generation answers with a generation reset that strict admission refuses.
 			const cursor = this.topics.replayCursor(session.sessionId);
+			const currentCursor = cursor?.generation === session.replayGeneration ? cursor : undefined;
 			await this.#sendAttachment(session, {
 				type: "event_replay",
 				id: session.replayId,
-				sinceGeneration: cursor?.generation ?? session.replayGeneration,
-				sinceSeq: cursor?.seq ?? 0,
+				sinceGeneration: session.replayGeneration,
+				sinceSeq: currentCursor?.seq ?? 0,
 				capabilities: [TOOL_ACTIVITY_CAPABILITY],
 			});
 		} catch (error) {
@@ -5786,10 +5808,16 @@ export class TelegramNotificationDaemon {
 					await this.#withRecoveryBindingClaim(async () => {
 						if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
 
-						const closedBinding = this.#endpointBinding(session);
+						const closedBinding: ClosedEndpointTombstone = {
+							chatId: String(this.opts.chatId),
+							attachmentKey: session.attachmentKey,
+						};
 						const closedBindingMatches = () => {
 							const current = this.closedEndpointKeys.get(logicalSessionId);
-							return current?.chatId === closedBinding.chatId;
+							return (
+								current?.chatId === closedBinding.chatId &&
+								current.attachmentKey === closedBinding.attachmentKey
+							);
 						};
 						const closeTopicAuthority = this.topics.captureArchiveAuthority(logicalSessionId);
 						const previousClosedBinding = this.closedEndpointKeys.get(logicalSessionId);
@@ -5807,7 +5835,7 @@ export class TelegramNotificationDaemon {
 								this.topics.restoreArchiveAuthority(closeTopicAuthority);
 								if (previousClosedBinding === undefined) this.closedEndpointKeys.delete(logicalSessionId);
 								else if (closedBindingMatches())
-									this.closedEndpointKeys.set(session.sessionId, previousClosedBinding);
+									this.closedEndpointKeys.set(logicalSessionId, previousClosedBinding);
 							},
 						);
 						if (
@@ -6511,6 +6539,18 @@ export class TelegramNotificationDaemon {
 		return this.toolShutdownBarrier;
 	}
 
+	/**
+	 * Replay admission is the only path that binds an attachment to a topic, so a
+	 * refusal silences that attachment until the session re-attaches. Leave local
+	 * evidence of the refusal instead of dropping the subscription silently.
+	 */
+	#dropRejectedRecovery(session: AttachmentSession, cause: string): void {
+		logger.warn(
+			`notifications: Telegram refused attachment recovery for session ${session.sessionId}: ${cause}; its notifications stop until the session re-attaches`,
+		);
+		this.#dropSession(session, "recovery_rejected");
+	}
+
 	#dropSession(session: AttachmentSession, reason: string): void {
 		// Capture the exact callback lease before revoking recovery authority. A
 		// predecessor transport can remain keyed by its own session id after a
@@ -6985,8 +7025,7 @@ export class TelegramNotificationDaemon {
 	): boolean {
 		if (this.#droppedSessions.has(session)) return false;
 		if (!this.#topicAdmissionAllows(session)) return false;
-		const closedBinding = this.closedEndpointKeys.get(logicalSessionId);
-		if (closedBinding && closedBinding.chatId === String(this.opts.chatId)) return false;
+		if (this.#isClosedEndpoint(logicalSessionId, String(this.opts.chatId), session)) return false;
 		if (!session.logicalSessionIdTrusted) return true;
 		// Trusted leases require both the current transport socket and exact logical owner.
 		if (this.sessions.get(session.sessionId) !== session) return false;
@@ -7251,6 +7290,7 @@ export class TelegramNotificationDaemon {
 		"config_update",
 		"control_command_result",
 		"tool_activity",
+		"awaiting_input",
 		"reasoning_summary",
 	]);
 
@@ -7280,11 +7320,25 @@ export class TelegramNotificationDaemon {
 		};
 	}
 
+	/**
+	 * Whether `session` is the exact attachment that closed `logicalSessionId` in
+	 * this chat. A later attachment for the same id is a resumed successor: it was
+	 * published by a new host registration, and only replay authentication plus
+	 * the inactive-successor topic rotation decide whether it may bind.
+	 */
+	#isClosedEndpoint(
+		logicalSessionId: string | undefined,
+		chatId: string,
+		session: AttachmentSession | undefined,
+	): boolean {
+		if (logicalSessionId === undefined) return false;
+		const closed = this.closedEndpointKeys.get(logicalSessionId);
+		return closed?.chatId === chatId && (session === undefined || closed.attachmentKey === session.attachmentKey);
+	}
+
 	#endpointAuthority(binding: TopicEndpointBinding, excludedSession?: AttachmentSession) {
-		const tombstoned = [...this.closedEndpointKeys.entries()].some(
-			([sessionId, closed]) => closed.chatId === binding.chatId && sessionId === binding.logicalSessionId,
-		);
-		if (tombstoned) return { state: "ambiguous" as const };
+		if (this.#isClosedEndpoint(binding.logicalSessionId, binding.chatId, excludedSession))
+			return { state: "ambiguous" as const };
 		const authority = this.topics.endpointAuthority(binding, excludedSession);
 		const competingLiveClaim = [...this.sessions.values()].some(
 			session => session !== excludedSession && this.#logicalSessionId(session) === binding.logicalSessionId,
@@ -10340,7 +10394,10 @@ export class TelegramNotificationDaemon {
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
 			if (!replayCandidateSessionId) {
-				this.#dropSession(session, "recovery_rejected");
+				this.#dropRejectedRecovery(
+					session,
+					`no admissible identity (endpoint authority ${endpointAuthority.state})`,
+				);
 				return;
 			}
 			const recovered = await this.#recoverTopicBinding(
@@ -10353,14 +10410,17 @@ export class TelegramNotificationDaemon {
 			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
 				if (session.replayGeneration === msg.generation && session.recoveryLease?.state !== "pending")
-					this.#dropSession(session, "recovery_rejected");
+					this.#dropRejectedRecovery(
+						session,
+						`topic binding refused (topic authority ${this.topics.get(replayCandidateSessionId)?.authorityState ?? "none"})`,
+					);
 				return;
 			}
 			if (
 				!this.#ownsLiveOpenEndpoint(session, endpointBinding) ||
 				!this.#leaseAllows(session, this.#logicalSessionId(session))
 			) {
-				this.#dropSession(session, "recovery_rejected");
+				this.#dropRejectedRecovery(session, "recovered lease is not current");
 				return;
 			}
 			session.replayPending = false;
@@ -10870,8 +10930,12 @@ export class TelegramNotificationDaemon {
 				this.failLegacyToolStart(toolActivity);
 				await this.#failPublicationPreSend(publicationId, "topic authority is inactive or malformed");
 			}
+			const flatSend =
+				threadedFrame.type === "awaiting_input"
+					? { ...send, text: `${send.text} · ${sessionTag(logicalSessionId)}` }
+					: send;
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(logicalSessionId)) {
-				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease, publicationId);
+				await this.deliverFlatFallback(logicalSessionId, flatSend, toolActivity, socketLease, publicationId);
 				return;
 			}
 			const topicId =
@@ -10892,7 +10956,7 @@ export class TelegramNotificationDaemon {
 					abandonStaleToolStart();
 					return;
 				}
-				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease, publicationId);
+				await this.deliverFlatFallback(logicalSessionId, flatSend, toolActivity, socketLease, publicationId);
 				return;
 			}
 			if (send.identity) {
@@ -12875,6 +12939,9 @@ export class TelegramNotificationDaemon {
 				throw new Error("validation forum destination must be the exact supergroup forum returned by getChat");
 		}
 		let ownershipProved = false;
+		let controlWatchTimer: Timer | NodeJS.Timeout | undefined;
+		let controlWatchActive = true;
+		const clearTimeoutImpl = this.opts.clearTimeoutImpl ?? clearTimeout;
 		try {
 			const renewed = await renewDaemonHeartbeat({
 				settings: this.opts.settings,
@@ -12935,6 +13002,19 @@ export class TelegramNotificationDaemon {
 			}
 			await this.#attachmentRouter.start();
 			let idleSince = this.runtime.now();
+			const setTimeoutImpl = this.opts.setTimeoutImpl ?? setTimeout;
+			const watchControl = () => {
+				if (!controlWatchActive || !this.running || !this.opts.control) return;
+				controlWatchTimer = setTimeoutImpl(() => {
+					controlWatchTimer = undefined;
+					void this.controlStopRequested()
+						.catch(() => false)
+						.finally(() => {
+							if (controlWatchActive && this.running) watchControl();
+						});
+				}, CONTROL_STOP_WATCH_INTERVAL_MS);
+			};
+			if (this.opts.control) watchControl();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
 				// A thrown renewal (e.g. a transient Windows EPERM/EACCES/EBUSY while
@@ -13003,6 +13083,8 @@ export class TelegramNotificationDaemon {
 			this.requestStop("unexpected_exception");
 			throw error;
 		} finally {
+			controlWatchActive = false;
+			if (controlWatchTimer !== undefined) clearTimeoutImpl(controlWatchTimer);
 			this.requestStop();
 			await this.#stopCauseResolution;
 			this.running = false;
@@ -13089,8 +13171,21 @@ export class TelegramNotificationDaemon {
 	private async controlStopRequested(): Promise<boolean> {
 		if (this.runtime.stopRequested) return true;
 		if (!this.opts.control) return false;
+		if (this.#controlStopCheck) return this.#controlStopCheck;
+		const check = this.checkControlStopRequested();
+		this.#controlStopCheck = check;
 		try {
-			const requested = await this.opts.control.shouldStop(this.opts.ownerId);
+			return await check;
+		} finally {
+			if (this.#controlStopCheck === check) this.#controlStopCheck = undefined;
+		}
+	}
+
+	private async checkControlStopRequested(): Promise<boolean> {
+		try {
+			const control = this.opts.control;
+			if (!control) return false;
+			const requested = await control.shouldStop(this.opts.ownerId);
 			if (!requested) return false;
 			this.#resolveControlStopCause("stop");
 			this.requestStop();

@@ -2,6 +2,7 @@ import { expect, test, vi } from "bun:test";
 import { rm } from "node:fs/promises";
 import { legacyMcpMethodNotFound } from "../../test/mcp-test-utils";
 import * as configValue from "../config/resolve-config-value";
+import { wrapUntrustedContent } from "../tools/fetch";
 import { MCPManager } from "./manager";
 import { MCPConnectionPool } from "./pool";
 import { computeMCPPoolKey } from "./pool-key";
@@ -1386,8 +1387,8 @@ test("shared noReplay request failure coordinates one replacement without resend
 		expect(second.getTools()[0]?.mcpToolName).toBe("shared-2");
 		const firstResult = await first.getTools()[0]!.execute("first-later", {}, undefined, {} as never);
 		const secondResult = await second.getTools()[0]!.execute("second-later", {}, undefined, {} as never);
-		expect(firstResult.content).toEqual([{ type: "text", text: "ok-2" }]);
-		expect(secondResult.content).toEqual([{ type: "text", text: "ok-2" }]);
+		expect(firstResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("ok-2") }]);
+		expect(secondResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("ok-2") }]);
 	} finally {
 		await first.disconnectAll().catch(() => {});
 		await second.disconnectAll().catch(() => {});
@@ -1474,8 +1475,8 @@ test("shared restart rebinds every surviving manager lease before subsequent cal
 		expect(second.getTools()[0]?.mcpToolName).toBe("shared-2");
 		const firstResult = await first.getTools()[0]!.execute("first", {}, undefined, {} as never);
 		const secondResult = await second.getTools()[0]!.execute("second", {}, undefined, {} as never);
-		expect(firstResult.content).toEqual([{ type: "text", text: "ok-2" }]);
-		expect(secondResult.content).toEqual([{ type: "text", text: "ok-2" }]);
+		expect(firstResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("ok-2") }]);
+		expect(secondResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("ok-2") }]);
 	} finally {
 		await first.disconnectAll().catch(() => {});
 		await second.disconnectAll().catch(() => {});

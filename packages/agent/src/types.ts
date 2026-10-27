@@ -6,6 +6,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderDiagnostic,
 	SimpleStreamOptions,
 	Static,
 	streamSimple,
@@ -20,6 +21,7 @@ import type {
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptMinter, AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
+import type { PromptPrefixTracker } from "./prompt-prefix-telemetry";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
 
@@ -144,7 +146,8 @@ export interface RunResourceLedger {
 	pending(resourceRunId: string): RunResourceEntry[];
 	/** Seal a run after terminal event publication; only sealed empty runs settle. */
 	seal(resourceRunId: string): void;
-	waitForSettlement(resourceRunId: string, options: { graceMs: number }): Promise<RunSettlementProof>;
+	/** A null grace period waits for settlement or quarantine without a deadline timer. */
+	waitForSettlement(resourceRunId: string, options: { graceMs: number | null }): Promise<RunSettlementProof>;
 	/** Terminally detach a run; its bounded tombstone remains unfenced forever. */
 	quarantine(resourceRunId: string): RunResourceEntry[];
 }
@@ -233,6 +236,8 @@ export function isContinuingMidRunMaintenanceOutcome(outcome: unknown): boolean 
  * Configuration for the agent loop.
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
+	/** Session policy owns context overflow; successful empty stops remain terminal. */
+	contextOverflowManaged?: boolean;
 	model: Model;
 	/**
 	 * Supplies a fresh opaque token at each concrete managed transport invocation.
@@ -481,6 +486,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * `_i` intent fields.
 	 */
 	appendOnlyContext?: AppendOnlyContextManager;
+	/**
+	 * Fingerprints every provider request against the previous one from the same
+	 * agent and stamps the result on the assistant message as `promptPrefix`.
+	 */
+	promptPrefixTracker?: PromptPrefixTracker;
 
 	/**
 	 * Inspect assistant streaming events before they are published to the outer agent event stream.
@@ -758,6 +768,28 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * - function: `_i` is NOT injected; intent is derived dynamically from (potentially partial / streaming) args.
 	 */
 	intent?: "omit" | "optional" | "require" | ((args: Partial<Static<TParameters>>) => string | undefined);
+
+	/**
+	 * Project a call's finalized arguments into the plain source it introduces,
+	 * without wire grammar such as patch prefixes or JSON string escaping. The
+	 * session calls this in `beforeToolCall`, before the tool runs, so
+	 * pre-execution matchers (TTSR `astCondition` rules) inspect the content.
+	 * Return `undefined` when the call has no static digest; it is then not
+	 * matched.
+	 */
+	matcherDigest?: (args: unknown) => string | undefined;
+
+	/**
+	 * Per-file projection of a call's finalized arguments, pairing each touched
+	 * file path with the digest of only the lines added to that file.
+	 * Path-scoped pre-execution matchers (TTSR) evaluate each entry in isolation, so a
+	 * scoped rule like `tool:edit(*.ts)` never fires on text that actually
+	 * belongs to a sibling Markdown hunk in a multi-file payload. Takes
+	 * precedence over {@link matcherDigest} when present;
+	 * returns `undefined` (or empty) to fall back to the combined hook.
+	 */
+	matcherEntries?: (args: unknown) => readonly { path: string; digest: string }[] | undefined;
+
 	/**
 	 * Argument fields (dotted paths into the arguments object) that render to
 	 * the user as pure display text — question wording and option labels, never
@@ -800,6 +832,13 @@ export interface AgentContext {
 export interface AgentFailureDiagnostic {
 	code: string;
 	message: string;
+	/**
+	 * Bounded provider failure family, present only when the provider adapter
+	 * itself classified the failure from structured metadata (its private
+	 * carrier). Additive diagnostics: the `code` and the fixed `message` above
+	 * are unchanged by its presence or absence.
+	 */
+	providerDiagnostic?: ProviderDiagnostic;
 }
 
 /**

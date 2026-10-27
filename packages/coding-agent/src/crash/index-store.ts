@@ -628,6 +628,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	if (existing) {
 		const updated: CrashSignatureEntry = {
 			...existing,
+			fpv: event.fpv,
 			lifetimeCount: existing.lifetimeCount + 1,
 			firstSeen: Math.min(existing.firstSeen, event.at),
 			lastAppendRecordId: event.recordId,
@@ -673,7 +674,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * Recover never-indexed signatures from bound records, then recompute retained counts.
  *
  * Journal counts remain authoritative for known signatures. A never-seen
- * signature is admitted only from complete v1 records that recompute to their
+ * signature is admitted only from complete, supported-version records that recompute to their
  * marker fingerprint; its initial lifetime is the number of distinct retained
  * record ids. Repeated compaction cannot add those records again.
  *
@@ -720,7 +721,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 				continue;
 			}
 			entry = {
-				fpv: newest.fpv,
+				fpv: lastAppended.fpv,
 				errorName: newest.errorName,
 				messageClass: boundMessageClass(newest.messageClass),
 				lifetimeCount: records.length,

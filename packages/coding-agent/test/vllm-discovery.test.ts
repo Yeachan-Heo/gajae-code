@@ -203,6 +203,9 @@ describe("ModelRegistry vLLM Discovery", () => {
 		const model = registry.find("vllm", "legacy-sentinel-vllm-model");
 		expect(model).toBeDefined();
 		expect(await registry.getApiKey(model!)).toBe("env-vllm-key");
+		const resolved = await registry.getApiKeyWithCredentialRowId(model!);
+		expect(resolved.apiKey).toBe("env-vllm-key");
+		expect(resolved.credentialRowId).toBeUndefined();
 	});
 
 	test("maps a stored legacy sentinel to keyless auth when no environment key exists", async () => {
@@ -221,6 +224,9 @@ describe("ModelRegistry vLLM Discovery", () => {
 		const model = registry.find("vllm", "legacy-keyless-vllm-model");
 		expect(model).toBeDefined();
 		expect(await registry.getApiKey(model!)).toBe(kNoAuth);
+		const resolved = await registry.getApiKeyWithCredentialRowId(model!);
+		expect(resolved.apiKey).toBe(kNoAuth);
+		expect(resolved.credentialRowId).toBeUndefined();
 	});
 
 	test("does not let the empty-login vLLM sentinel authorize remote discovery", async () => {

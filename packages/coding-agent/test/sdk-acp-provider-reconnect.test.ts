@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
-import { PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
+import { PROVIDER_ACTIVATION_BUDGET_MS, PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
-
 import type { SessionAttachment } from "../src/sdk/router";
+import { SessionRouter } from "../src/sdk/router/session-router";
 
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
 	const deadline = Date.now() + 2_000;
@@ -14,6 +14,156 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 	throw new Error(`Timed out waiting for ${label}`);
 };
 
+test("SessionRouter rejects request preparation when reconciliation outlives its deadline", async () => {
+	let refreshes = 0;
+	let reconciliationFinished = false;
+	let dispatches = 0;
+	const reconciliationGate = Promise.withResolvers<void>();
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			if (refreshes > 1) {
+				reconciliationFinished = false;
+				await reconciliationGate.promise;
+			}
+			reconciliationFinished = true;
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-deadline-repro",
+		deps: {
+			createIndex: () => index as never,
+			setInterval: (() => 0) as never,
+			clearInterval: (() => {}) as never,
+		},
+	});
+	await router.start();
+	try {
+		await expect(
+			router.request("missing", { type: "command" }, undefined, undefined, {
+				deadline: Date.now() + 5,
+				beforeDispatch: () => {
+					dispatches += 1;
+				},
+			}),
+		).rejects.toMatchObject({
+			phase: "pre_send",
+			message: "SDK session request deadline elapsed during router preparation.",
+		});
+		expect(reconciliationFinished).toBe(false);
+		expect(dispatches).toBe(0);
+	} finally {
+		reconciliationGate.resolve();
+		await router.stop();
+	}
+});
+
+test("SessionRouter preserves reconciliation throws without dispatching", async () => {
+	let refreshes = 0;
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			if (refreshes > 1) throw new Error("reconcile failed");
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	let dispatches = 0;
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-reconcile-throw",
+		deps: {
+			createIndex: () => index as never,
+			createClient: async () => {
+				dispatches += 1;
+				throw new Error("unexpected dispatch");
+			},
+		},
+	});
+	await router.start();
+	try {
+		await expect(
+			router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() + 500 }),
+		).rejects.toThrow("reconcile failed");
+		expect(dispatches).toBe(0);
+	} finally {
+		await expect(router.stop()).rejects.toThrow("SessionRouter shutdown failed.");
+	}
+});
+
+test("SessionRouter does not reconcile an already expired request", async () => {
+	let refreshes = 0;
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-expired",
+		deps: { createIndex: () => index as never },
+	});
+	await router.start();
+	const before = refreshes;
+	try {
+		await expect(
+			router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() - 1 }),
+		).rejects.toMatchObject({
+			phase: "pre_send",
+			message: "SDK session request deadline elapsed during router preparation.",
+		});
+		expect(refreshes).toBe(before);
+	} finally {
+		await router.stop();
+	}
+});
+
+test("SessionRouter cancels pending reconciliation during teardown without dispatch", async () => {
+	let refreshes = 0;
+	const gate = Promise.withResolvers<void>();
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			if (refreshes > 1) await gate.promise;
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	let dispatches = 0;
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-teardown",
+		deps: {
+			createIndex: () => index as never,
+			createClient: async () => {
+				dispatches += 1;
+				throw new Error("unexpected dispatch");
+			},
+		},
+	});
+	await router.start();
+	const request = router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() + 500 });
+	await Bun.sleep(5);
+	const stopping = router.stop();
+	gate.resolve();
+	await stopping;
+	await expect(request).rejects.toMatchObject({ phase: "pre_send" });
+	expect(dispatches).toBe(0);
+});
+
 test("ACP provider activation retries the current Router attachment after rotation during registration", async () => {
 	let currentGeneration = 1;
 	const firstRegistration = Promise.withResolvers<Record<string, unknown>>();
@@ -21,6 +171,7 @@ test("ACP provider activation retries the current Router attachment after rotati
 		frame: Record<string, unknown>;
 		generation: number | undefined;
 		attachment: SessionAttachment | undefined;
+		options: Record<string, unknown> | undefined;
 	}> = [];
 	const router = {
 		request: async (
@@ -28,8 +179,9 @@ test("ACP provider activation retries the current Router attachment after rotati
 			frame: Record<string, unknown>,
 			generation?: number,
 			attachment?: SessionAttachment,
+			options?: Record<string, unknown>,
 		) => {
-			registrations.push({ frame, generation, attachment });
+			registrations.push({ frame, generation, attachment, options });
 			if (registrations.length === 1) return await firstRegistration.promise;
 			return {
 				ok: true,
@@ -62,12 +214,94 @@ test("ACP provider activation retries the current Router attachment after rotati
 		await start;
 		await waitFor(() => registrations.length === 2, "provider registration on rotated attachment");
 		expect(registrations[0]).toMatchObject({ generation: 1, attachment: firstAttachment });
+		expect(registrations[0]?.options?.timeoutMs).toBeGreaterThan(0);
 		expect(registrations[1]).toMatchObject({
 			generation: 2,
 			attachment: secondAttachment,
 			frame: { type: "register_provider", capability: "ui" },
 		});
 	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation preserves registration uncertainty at the deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const uncertainty = new SdkClientError(
+		"uncertain_after_send",
+		"Provider registration response was lost after dispatch.",
+		{ operation: "register_provider", idempotencyKey: "registration-1" },
+	);
+	let registrations = 0;
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				registrations += 1;
+				now = startedAt + PROVIDER_ACTIVATION_BUDGET_MS;
+				throw uncertainty;
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toBe(uncertainty);
+		expect(registrations).toBe(1);
+		expect(adapter.leaseIds.size).toBe(0);
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation preserves registration uncertainty when the attachment rotates at the deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const uncertainty = new SdkClientError(
+		"uncertain_after_send",
+		"Provider registration response was lost after dispatch.",
+		{ operation: "register_provider", idempotencyKey: "registration-rotated" },
+	);
+	let adapter!: AcpSdkAdapter;
+	const attachment = (generation: number, isCurrent: () => boolean): SessionAttachment => ({
+		authorityId: `session-1:${generation}`,
+		sessionId: "session-1",
+		generation,
+		isCurrent,
+		send: async () => {},
+		sendMaintenance: () => {},
+	});
+	const firstAttachment = attachment(1, () => true);
+	const rotatedAttachment = attachment(2, () => false);
+	adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				adapter.acceptAttachment(rotatedAttachment);
+				now = startedAt + PROVIDER_ACTIVATION_BUDGET_MS;
+				throw uncertainty;
+			},
+		} as never,
+		attachment: firstAttachment,
+		sessionId: firstAttachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toBe(uncertainty);
+		expect(adapter.leaseIds.size).toBe(0);
+	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });
@@ -107,6 +341,153 @@ test("ACP provider activation gives up with an attributable error when the attac
 		// The budget is spent in attempts, not wall clock, so the loop terminates promptly.
 		expect(registrations).toBe(PROVIDER_ACTIVATION_MAX_ATTEMPTS);
 	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP sequential provider registrations share one activation deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const registrations: Array<{ capability: unknown; timeoutMs?: number; deadline?: number }> = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (
+				_sessionId: string,
+				frame: Record<string, unknown>,
+				_generation?: number,
+				_attachment?: SessionAttachment,
+				options?: { timeoutMs: number; deadline?: number },
+			) => {
+				registrations.push({ capability: frame.capability, ...options });
+				if (registrations.length === 1) now += PROVIDER_ACTIVATION_BUDGET_MS - 1;
+				if (registrations.length === 2) now += 2;
+				return { ok: true, result: { leaseId: `lease-${String(frame.capability)}` } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [
+			{ capability: "fs", definitions: [] },
+			{ capability: "permission", definitions: [] },
+		],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(registrations).toEqual([
+			{
+				capability: "fs",
+				timeoutMs: PROVIDER_ACTIVATION_BUDGET_MS,
+				deadline: startedAt + PROVIDER_ACTIVATION_BUDGET_MS,
+			},
+			{ capability: "permission", timeoutMs: 1, deadline: startedAt + PROVIDER_ACTIVATION_BUDGET_MS },
+		]);
+		expect(adapter.leaseIds.get("fs")).toBe("lease-fs");
+		expect(adapter.leaseIds.get("permission")).toBeUndefined();
+		await adapter.start();
+		expect(registrations.map(registration => registration.capability)).toEqual([
+			"fs",
+			"permission",
+			"fs",
+			"permission",
+		]);
+		expect(adapter.leaseIds.get("permission")).toBe("lease-permission");
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation includes delayed Router transport preparation in its deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	let registrationOptions: { timeoutMs: number; deadline?: number } | undefined;
+	let registrations = 0;
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (
+				_sessionId: string,
+				_frame: Record<string, unknown>,
+				_generation?: number,
+				_attachment?: SessionAttachment,
+				options?: { timeoutMs: number; deadline?: number },
+			) => {
+				registrations += 1;
+				registrationOptions = options;
+				if (registrations === 1) now += PROVIDER_ACTIVATION_BUDGET_MS + 1;
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(registrationOptions).toEqual({
+			timeoutMs: PROVIDER_ACTIVATION_BUDGET_MS,
+			deadline: startedAt + PROVIDER_ACTIVATION_BUDGET_MS,
+		});
+		expect(adapter.leaseIds.size).toBe(0);
+		now = startedAt + PROVIDER_ACTIVATION_BUDGET_MS + 1;
+		await adapter.start();
+		expect(registrations).toBe(2);
+		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP rejects a successful final provider registration at the activation deadline without caching activation", async () => {
+	let now = 1_000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	let registrations = 0;
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				registrations += 1;
+				if (registrations === 1) now += PROVIDER_ACTIVATION_BUDGET_MS;
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(adapter.leaseIds.size).toBe(0);
+		await adapter.start();
+		expect(registrations).toBe(2);
+		expect(adapter.leaseIds.get("ui")).toBe("lease-1");
+	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });

@@ -5,7 +5,8 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
@@ -47,6 +48,7 @@ import {
 	buildConversationTitleInput,
 	generateSessionTitle,
 	setSessionTerminalTitle,
+	titleInputObfuscator,
 } from "../../utils/title-generator";
 import { addChatChild, prepareTranscriptRebuild, syncPendingExecutionComponents } from "../utils/ui-helpers";
 
@@ -107,6 +109,266 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 	].join("\n");
 }
 
+const GH_SHARE_TRUST_KEYS = [
+	"GH_HOST",
+	"GH_CONFIG_DIR",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_ENTERPRISE_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"XDG_CONFIG_HOME",
+	"HOME",
+	"USERPROFILE",
+	"APPDATA",
+	"BASH_ENV",
+	"BUN_OPTIONS",
+	"ENV",
+	"ZDOTDIR",
+	"NODE_OPTIONS",
+	"NODE_PATH",
+	"PYTHONHOME",
+	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
+	"JULIA_DEPOT_PATH",
+	"JULIA_LOAD_PATH",
+	"JULIA_PROJECT",
+	"TCL_LIBRARY",
+	"TCLLIBPATH",
+	"LUA_INIT",
+	"LUA_INIT_5_1",
+	"LUA_INIT_5_2",
+	"LUA_INIT_5_3",
+	"LUA_INIT_5_4",
+	"LUA_INIT_5_5",
+	"LUA_PATH",
+	"LUA_CPATH",
+	"LUA_PATH_5_1",
+	"LUA_PATH_5_2",
+	"LUA_PATH_5_3",
+	"LUA_PATH_5_4",
+	"LUA_PATH_5_5",
+	"LUA_CPATH_5_1",
+	"LUA_CPATH_5_2",
+	"LUA_CPATH_5_3",
+	"LUA_CPATH_5_4",
+	"LUA_CPATH_5_5",
+	"R_ENVIRON",
+	"R_ENVIRON_USER",
+	"R_PROFILE",
+	"R_PROFILE_USER",
+	"ELIXIR_ERL_OPTIONS",
+	"ERL_AFLAGS",
+	"ERL_FLAGS",
+	"ERL_ZFLAGS",
+	"BUNDLER_SETUP",
+	"BUNDLE_GEMFILE",
+	"GEM_HOME",
+	"GEM_PATH",
+	"RUBYGEMS_GEMDEPS",
+	"RUBYOPT",
+	"RUBYLIB",
+	"PERL5OPT",
+	"PERL5LIB",
+	"PERLLIB",
+	"JAVA_HOME",
+	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
+	"_JAVA_OPTIONS",
+	"CLASSPATH",
+	"PHPRC",
+	"PHP_INI_SCAN_DIR",
+	"DOTNET_STARTUP_HOOKS",
+	"DOTNET_ROOT",
+	"DOTNET_ROOT_X86",
+	"DOTNET_ROOT_X64",
+	"DOTNET_ROOT_ARM",
+	"DOTNET_ROOT_ARM64",
+	"CORECLR_ENABLE_PROFILING",
+	"DOTNET_ENABLE_PROFILING",
+	"CORECLR_PROFILER",
+	"DOTNET_PROFILER",
+	"CORECLR_PROFILER_PATH",
+	"CORECLR_PROFILER_PATH_32",
+	"CORECLR_PROFILER_PATH_64",
+	"CORECLR_PROFILER_PATH_ARM32",
+	"CORECLR_PROFILER_PATH_ARM64",
+	"DOTNET_PROFILER_PATH",
+	"DOTNET_PROFILER_PATH_32",
+	"DOTNET_PROFILER_PATH_64",
+	"DOTNET_PROFILER_PATH_ARM32",
+	"DOTNET_PROFILER_PATH_ARM64",
+	"PATH",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"OPENSSL_CONF",
+	"OPENSSL_CONF_INCLUDE",
+	"OPENSSL_MODULES",
+	"OPENSSL_ENGINES",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"LD_AUDIT",
+	"DYLD_INSERT_LIBRARIES",
+	"DYLD_LIBRARY_PATH",
+	"DYLD_FRAMEWORK_PATH",
+	"DYLD_FALLBACK_LIBRARY_PATH",
+	"DYLD_FALLBACK_FRAMEWORK_PATH",
+	"DYLD_ROOT_PATH",
+] as const;
+const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUpperCase()));
+
+/**
+ * Project dotenv at import, before `/move` changes cwd. Those declarations are
+ * already in the process environment, and a later `setProjectDir` does not
+ * remove them.
+ */
+const ghShareProjectSnapshot = projectEnvSnapshot();
+const ghShareOperatorPath = process.env.PATH;
+const ghShareLaunchRoot = path.resolve(process.cwd());
+
+function isInsideDirectory(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function findCheckoutRoots(directory: string): Promise<string[] | undefined> {
+	const resolvedDirectory = await fs.realpath(directory).catch(() => undefined);
+	if (!resolvedDirectory) return undefined;
+	const roots: string[] = [];
+	let ancestor = resolvedDirectory;
+	while (true) {
+		try {
+			await fs.lstat(path.join(ancestor, ".git"));
+			roots.push(ancestor);
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") return undefined;
+		}
+		const parent = path.dirname(ancestor);
+		if (parent === ancestor) break;
+		ancestor = parent;
+	}
+	return roots;
+}
+
+function isInsideAnyDirectory(roots: readonly string[], candidate: string): boolean {
+	return roots.some(root => isInsideDirectory(root, candidate));
+}
+
+async function resolveGhShareExecutable(): Promise<{ executable: string; searchPath: string } | undefined> {
+	const operatorPath = ghShareOperatorPath;
+	const key = canonicalEnvKey("PATH");
+	const declared = ghShareProjectSnapshot.values[key];
+	if (
+		!operatorPath ||
+		(declared !== undefined && (ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === operatorPath.trim()))
+	)
+		return undefined;
+	const checkoutRoots = new Set<string>();
+	for (const directory of new Set([ghShareLaunchRoot, path.resolve(process.cwd())])) {
+		const roots = await findCheckoutRoots(directory);
+		if (!roots) return undefined;
+		for (const root of roots) checkoutRoots.add(root);
+	}
+	const untrustedDirectories = [...checkoutRoots];
+	const trustedDirectories: string[] = [];
+	const seenDirectories = new Set<string>();
+	let executable: string | undefined;
+	for (const directory of operatorPath.split(path.delimiter)) {
+		if (!path.isAbsolute(directory)) continue;
+		const absoluteDirectory = path.resolve(directory);
+		if (isInsideAnyDirectory(untrustedDirectories, absoluteDirectory)) continue;
+		const realDirectory = await fs.realpath(absoluteDirectory).catch(() => undefined);
+		if (
+			!realDirectory ||
+			isInsideAnyDirectory(untrustedDirectories, realDirectory) ||
+			seenDirectories.has(realDirectory)
+		)
+			continue;
+		const candidate = Bun.which("gh", { PATH: realDirectory });
+		if (candidate) {
+			const absoluteCandidate = path.resolve(candidate);
+			if (isInsideAnyDirectory(untrustedDirectories, absoluteCandidate)) continue;
+			const realExecutable = await fs.realpath(absoluteCandidate).catch(() => undefined);
+			if (!realExecutable || isInsideAnyDirectory(untrustedDirectories, realExecutable)) continue;
+			executable ??= realExecutable;
+		}
+		seenDirectories.add(realDirectory);
+		trustedDirectories.push(realDirectory);
+	}
+	return executable ? { executable, searchPath: trustedDirectories.join(path.delimiter) } : undefined;
+}
+
+/**
+ * Environment for the default `/share` `gh` children. GitHub CLI routing,
+ * config, authentication, proxy, certificate, shell/runtime startup, executable-search,
+ * and dynamic loader overrides that match the project dotenv are omitted so a repository
+ * cannot redirect the upload, substitute the `gh` binary, authenticate with a
+ * project-provided token, or intercept its HTTPS request. The executable itself
+ * and its child search path use absolute operator PATH directories whose real
+ * paths are outside actual launch and active checkout roots. Operator values the project
+ * does not declare are kept.
+ */
+function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const child: NodeJS.ProcessEnv = { ...env };
+	for (const name of Object.keys(child)) {
+		if (!GH_SHARE_TRUST_KEY_SET.has(name.toUpperCase())) continue;
+		const raw = child[name];
+		if (typeof raw !== "string") continue;
+		const key = canonicalEnvKey(name);
+		const declared = ghShareProjectSnapshot.values[key];
+		if (declared === undefined) continue;
+		if (!(ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === raw.trim())) continue;
+		delete child[name];
+		if (process.platform === "win32") {
+			for (const present of Object.keys(child)) {
+				if (canonicalEnvKey(present) === key) delete child[present];
+			}
+		}
+	}
+	const ghConfigDirKey = canonicalEnvKey("GH_CONFIG_DIR");
+	const xdgConfigHomeKey = canonicalEnvKey("XDG_CONFIG_HOME");
+	for (const name of Object.keys(child)) {
+		const key = canonicalEnvKey(name);
+		if (key !== ghConfigDirKey && key !== xdgConfigHomeKey) continue;
+		const value = child[name];
+		if (typeof value !== "string" || value.length === 0 || path.isAbsolute(value)) continue;
+		// `gh` children use the filesystem root as cwd to avoid project Bun
+		// preloads, so retain the launch-directory meaning of relative config paths.
+		child[name] = path.resolve(ghShareLaunchRoot, value);
+	}
+	const certFileKey = canonicalEnvKey("SSL_CERT_FILE");
+	const certDirKey = canonicalEnvKey("SSL_CERT_DIR");
+	for (const name of Object.keys(child)) {
+		const key = canonicalEnvKey(name);
+		const value = child[name];
+		if (typeof value !== "string" || value.length === 0) continue;
+		if (key === certFileKey && !path.isAbsolute(value)) {
+			// Certificate overrides retain their launch-directory meaning even
+			// though `gh` children run from the filesystem root.
+			child[name] = path.resolve(ghShareLaunchRoot, value);
+		} else if (key === certDirKey) {
+			child[name] = value
+				.split(path.delimiter)
+				.map(directory =>
+					directory.length > 0 && !path.isAbsolute(directory)
+						? path.resolve(ghShareLaunchRoot, directory)
+						: directory,
+				)
+				.join(path.delimiter);
+		}
+	}
+	const pathKey = canonicalEnvKey("PATH");
+	for (const name of Object.keys(child)) {
+		if (canonicalEnvKey(name) === pathKey) delete child[name];
+	}
+	child.PATH = trustedPath;
+	return child;
+}
+
 export class CommandController {
 	constructor(private readonly ctx: InteractiveModeContext) {}
 
@@ -147,6 +409,7 @@ export class CommandController {
 	}
 
 	async handleDebugTranscriptCommand(): Promise<void> {
+		let tempDir: string | undefined;
 		try {
 			const width = Math.max(1, this.ctx.ui.terminal.columns);
 			const renderedLines = this.ctx.chatContainer.render(width).map(line => replaceTabs(Bun.stripANSI(line)));
@@ -155,10 +418,22 @@ export class CommandController {
 				this.ctx.showError("No messages to dump yet.");
 				return;
 			}
-			const tmpPath = path.join(os.tmpdir(), `${Snowflake.next()}-tmp.txt`);
-			await Bun.write(tmpPath, `${rendered}\n`);
+			// Random directory plus an exclusive create: a preexisting symlink under the
+			// shared temp directory is not opened, and the transcript is not left world-readable.
+			tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-debug-transcript-"));
+			if (process.platform !== "win32") await fs.chmod(tempDir, 0o700);
+			const tmpPath = path.join(tempDir, "transcript.txt");
+			const handle = await fs.open(tmpPath, "wx", 0o600);
+			try {
+				await handle.writeFile(`${rendered}\n`);
+			} finally {
+				await handle.close();
+			}
+			if (process.platform !== "win32") await fs.chmod(tmpPath, 0o600);
 			this.ctx.showStatus(`Debug transcript written to:\n${tmpPath}`);
+			tempDir = undefined;
 		} catch (error: unknown) {
+			if (tempDir) await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 			this.ctx.showError(
 				`Failed to write debug transcript: ${error instanceof Error ? error.message : "Unknown error"}`,
 			);
@@ -242,9 +517,21 @@ export class CommandController {
 			return;
 		}
 
+		const ghShare = await resolveGhShareExecutable();
+		if (!ghShare) {
+			this.ctx.showError(
+				"GitHub CLI (gh) is not installed on the trusted operator PATH. Install it from https://cli.github.com/",
+			);
+			return;
+		}
+		const ghShareExecutable = ghShare.executable;
+		// Bun wrappers load project bunfig.toml preloads from their working directory.
+		const ghShareCwd = path.parse(ghShareLaunchRoot).root;
+		const ghEnv = ghShareChildEnv(ghShare.searchPath);
 		try {
-			const authProcess = Bun.spawn(["gh", "auth", "status"], {
-				env: process.env,
+			const authProcess = Bun.spawn([ghShareExecutable, "auth", "status"], {
+				cwd: ghShareCwd,
+				env: ghEnv,
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
@@ -277,8 +564,9 @@ export class CommandController {
 
 		let cancellationRequested = false;
 		try {
-			const gistProcess = Bun.spawn(["gh", "gist", "create", "--public=false", tmpFile], {
-				env: process.env,
+			const gistProcess = Bun.spawn([ghShareExecutable, "gist", "create", "--public=false", tmpFile], {
+				cwd: ghShareCwd,
+				env: ghEnv,
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
@@ -488,7 +776,8 @@ export class CommandController {
 			const provider = this.ctx.session.model?.provider;
 			const mode = resolveAppendOnlyMode(setting, provider ?? "");
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
-			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
+			const settingLabel =
+				setting === "auto" ? `${setting} (${provider ?? "?"})` : sanitizeDisplayLine(String(setting));
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
 		}
 		if (stats.sessionMemory) {
@@ -577,8 +866,12 @@ export class CommandController {
 			for (const server of this.ctx.lspServers) {
 				const statusColor = server.status === "ready" ? "success" : server.status === "error" ? "error" : "warning";
 				const statusText =
-					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
-				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
+					server.status === "error" && server.error
+						? `${server.status}: ${sanitizeDisplayLine(server.error)}`
+						: server.status;
+				const fileTypes = server.fileTypes.map(fileType => sanitizeDisplayLine(fileType)).join(", ");
+				const serverLabel = sanitizeDisplayLine(server.name);
+				info += `${theme.fg("dim", `${serverLabel}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${fileTypes})`)}\n`;
 			}
 		}
 
@@ -591,7 +884,7 @@ export class CommandController {
 				for (const name of mcpServers) {
 					const conn = this.ctx.mcpManager.getConnection(name);
 					const toolCount = conn?.tools?.length ?? 0;
-					info += `${theme.fg("dim", `${name}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
+					info += `${theme.fg("dim", `${sanitizeDisplayLine(name)}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
 				}
 			}
 		}
@@ -1176,7 +1469,9 @@ export class CommandController {
 		try {
 			if (!title?.trim()) {
 				const generation = beginSessionTitleGeneration(this.ctx.sessionManager);
-				const input = buildConversationTitleInput(this.ctx.session.messages);
+				const activeCwd = this.ctx.sessionManager.getCwd();
+				const obfuscateText = await titleInputObfuscator(this.ctx.settings, activeCwd);
+				const input = buildConversationTitleInput(this.ctx.session.messages, obfuscateText);
 				if (!input) {
 					this.ctx.showError("Nothing to summarize yet — pass a title: /rename <title>");
 					return;
@@ -1189,10 +1484,11 @@ export class CommandController {
 					this.ctx.session.credentialSessionId,
 					this.ctx.session.model,
 					provider => this.ctx.session.agent.metadataForProvider(provider),
+					activeCwd,
 				);
 				if (
 					!isSessionTitleGenerationCurrent(this.ctx.sessionManager, generation) ||
-					buildConversationTitleInput(this.ctx.session.messages) !== input
+					buildConversationTitleInput(this.ctx.session.messages, obfuscateText) !== input
 				)
 					return;
 				if (!generated) {

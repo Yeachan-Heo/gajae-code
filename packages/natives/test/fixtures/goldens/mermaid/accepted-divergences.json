@@ -1,0 +1,152 @@
+{
+  "divergences": [
+    {
+      "caseId": "golden/ascii/backlink_from_bottom.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/backlink_from_bottom.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/backlink_from_top.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/backlink_from_top.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/backlink_with_short_y_padding.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/backlink_with_short_y_padding.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/comments.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/comments.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/preserve_order_of_definition.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/preserve_order_of_definition.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/subgraph_direction_override.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/subgraph_direction_override.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/subgraph_multiple_edges.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/ascii/subgraph_multiple_edges.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/backlink_from_bottom.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/backlink_from_bottom.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/backlink_from_top.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/backlink_from_top.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/comments.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/comments.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/preserve_order_of_definition.txt@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "golden/unicode/preserve_order_of_definition.txt@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/cjk_labels@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/cjk_labels@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/wide_multiline@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/wide_multiline@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/state_full@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/state_full@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/edge_kinds@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/edge_kinds@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/markdown_labels@ascii",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "extra/markdown_labels@unicode",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "layout/small@force_td",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "layout/small@force_bt",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "layout/nested@force_lr",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "layout/nested@force_bt",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    },
+    {
+      "caseId": "layout/nested@force_rl",
+      "reason": "Upstream Mermaid layout and terminal-glyph behavior intentionally supersedes the prior output for this corpus case (D6)."
+    }
+  ]
+}

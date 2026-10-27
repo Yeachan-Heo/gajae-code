@@ -1,6 +1,8 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as timers from "node:timers/promises";
 import { logger, untilAborted } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import { type OwnedProcess, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { DapClient } from "./client";
@@ -106,8 +108,18 @@ interface DapSession {
 	initializedSeen: boolean;
 	needsConfigurationDone: boolean;
 	configurationDoneSent: boolean;
+	/** Containment root. Distinct from `cwd`, which is the caller execution directory. */
+	workspace: string;
+	closing: boolean;
+	disposed: boolean;
+	inflightTerminal: number;
+	terminalIdle?: Promise<void>;
+	resolveTerminalIdle?: () => void;
 	runInTerminalProcesses: Set<OwnedProcess>;
 }
+
+/** Test seam: pauses after cwd containment and before the debuggee spawn. */
+export const runInTerminalTestHooks: { beforeSpawn?: () => Promise<void> } = {};
 
 export interface DapOutputSnapshot {
 	snapshot: DapSessionSummary;
@@ -210,6 +222,53 @@ function buildSummary(session: DapSession): DapSessionSummary {
 	};
 }
 
+function isEnoent(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/** Walk missing leaves so a not-yet-created debug cwd can still be contained. */
+async function canonicalizeRunInTerminalCwd(absolute: string): Promise<string> {
+	try {
+		return await fs.realpath(absolute);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	const missing: string[] = [];
+	let cursor = absolute;
+	for (;;) {
+		const parent = path.dirname(cursor);
+		if (parent === cursor) throw new Error("runInTerminal cwd escapes the workspace");
+		missing.unshift(path.basename(cursor));
+		cursor = parent;
+		try {
+			return path.join(await fs.realpath(cursor), ...missing);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+}
+
+export function cwdEscapesWorkspace(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+}
+
+/**
+ * The validated cwd is the cwd that is spawned. Relative paths resolve against
+ * the session workspace, then both sides are canonicalized before containment.
+ */
+async function resolveRunInTerminalCwd(workspace: string, requested: string | undefined): Promise<string> {
+	if (typeof requested === "string" && requested.trim() === "") {
+		throw new Error("runInTerminal cwd escapes the workspace");
+	}
+	const root = await fs.realpath(workspace);
+	const candidate = await canonicalizeRunInTerminalCwd(path.resolve(workspace, requested ?? workspace));
+	if (cwdEscapesWorkspace(root, candidate)) {
+		throw new Error("runInTerminal cwd escapes the workspace");
+	}
+	return candidate;
+}
+
 export class DapSessionManager {
 	#sessions = new Map<string, DapSession>();
 	#activeSessionId: string | null = null;
@@ -234,13 +293,19 @@ export class DapSessionManager {
 	}
 
 	async launch(
-		options: DapLaunchSessionOptions,
+		options: DapLaunchSessionOptions & { workspace?: string },
 		signal?: AbortSignal,
 		timeoutMs: number = 30_000,
 	): Promise<DapSessionSummary> {
 		await this.#ensureLaunchSlot();
 		const client = await DapClient.spawn({ adapter: options.adapter, cwd: options.cwd });
-		const session = this.#registerSession(client, options.adapter, options.cwd, options.program);
+		const session = this.#registerSession(
+			client,
+			options.adapter,
+			options.cwd,
+			options.workspace ?? options.cwd,
+			options.program,
+		);
 		try {
 			session.capabilities = await client.initialize(
 				this.#buildInitializeArguments(options.adapter),
@@ -299,13 +364,13 @@ export class DapSessionManager {
 	}
 
 	async attach(
-		options: DapAttachSessionOptions,
+		options: DapAttachSessionOptions & { workspace?: string },
 		signal?: AbortSignal,
 		timeoutMs: number = 30_000,
 	): Promise<DapSessionSummary> {
 		await this.#ensureLaunchSlot();
 		const client = await DapClient.spawn({ adapter: options.adapter, cwd: options.cwd });
-		const session = this.#registerSession(client, options.adapter, options.cwd);
+		const session = this.#registerSession(client, options.adapter, options.cwd, options.workspace ?? options.cwd);
 		try {
 			session.capabilities = await client.initialize(
 				this.#buildInitializeArguments(options.adapter),
@@ -886,24 +951,29 @@ export class DapSessionManager {
 		const session = this.#getActiveSessionOrNull();
 		if (!session) return null;
 		session.lastUsedAt = Date.now();
-		if (session.status !== "terminated") {
-			if (session.capabilities?.supportsTerminateRequest) {
+		// Close before the first await. A runInTerminal paused on cwd resolution
+		// must not spawn while terminate or disconnect is still outstanding.
+		session.closing = true;
+		try {
+			if (session.status !== "terminated") {
+				if (session.capabilities?.supportsTerminateRequest) {
+					await untilAborted(
+						signal,
+						session.client.sendRequest("terminate", undefined, signal, timeoutMs).catch(() => undefined),
+					);
+				}
 				await untilAborted(
 					signal,
-					session.client.sendRequest("terminate", undefined, signal, timeoutMs).catch(() => undefined),
+					session.client
+						.sendRequest("disconnect", { terminateDebuggee: true }, signal, timeoutMs)
+						.catch(() => undefined),
 				);
 			}
-			await untilAborted(
-				signal,
-				session.client
-					.sendRequest("disconnect", { terminateDebuggee: true }, signal, timeoutMs)
-					.catch(() => undefined),
-			);
+			session.status = "terminated";
+			return buildSummary(session);
+		} finally {
+			await this.#disposeSession(session);
 		}
-		session.status = "terminated";
-		const summary = buildSummary(session);
-		await this.#disposeSession(session);
-		return summary;
 	}
 
 	#startCleanupTimer(): void {
@@ -945,12 +1015,22 @@ export class DapSessionManager {
 		throw new Error(`Debug session ${active.id} is still active. Terminate it before launching another.`);
 	}
 
-	#registerSession(client: DapClient, adapter: DapResolvedAdapter, cwd: string, program?: string): DapSession {
+	#registerSession(
+		client: DapClient,
+		adapter: DapResolvedAdapter,
+		cwd: string,
+		workspace: string,
+		program?: string,
+	): DapSession {
 		const session: DapSession = {
 			id: `debug-${++this.#nextId}`,
 			adapter,
 			cwd,
+			workspace,
 			program,
+			closing: false,
+			disposed: false,
+			inflightTerminal: 0,
 			client,
 			status: "launching",
 			launchedAt: Date.now(),
@@ -975,24 +1055,40 @@ export class DapSessionManager {
 			if (!Array.isArray(args.args) || args.args.length === 0) {
 				throw new Error("runInTerminal request did not include a command");
 			}
-			const env = Object.fromEntries(
-				Object.entries(args.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
-			);
-			const owner = spawnOwnedProcess(args.args, {
-				cwd: args.cwd ?? session.cwd,
-				stdin: "ignore",
-				env: {
-					...Bun.env,
-					...NON_INTERACTIVE_ENV,
-					...env,
-				},
-				name: `dap:${session.id}:runInTerminal`,
-			});
-			drainStream(owner.child.stdout);
-			drainStream(owner.child.stderr);
-			session.runInTerminalProcesses.add(owner);
-			owner.exited.finally(() => session.runInTerminalProcesses.delete(owner));
-			return { processId: owner.pid } satisfies DapRunInTerminalResponse;
+			if (session.closing) throw new Error("runInTerminal session is closed");
+			this.#beginTerminal(session);
+			try {
+				if (session.closing) throw new Error("runInTerminal session is closed");
+				const env = Object.fromEntries(
+					Object.entries(args.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
+				);
+				const cwd = await resolveRunInTerminalCwd(session.workspace, args.cwd ?? session.cwd);
+				await runInTerminalTestHooks.beforeSpawn?.();
+				if (session.closing || !this.#sessions.has(session.id)) {
+					throw new Error("runInTerminal session is closed");
+				}
+				const owner = spawnOwnedProcess(args.args, {
+					cwd,
+					stdin: "ignore",
+					env: {
+						...projectSafeSpawnEnv(),
+						...NON_INTERACTIVE_ENV,
+						...env,
+					},
+					name: `dap:${session.id}:runInTerminal`,
+				});
+				if (session.closing || !this.#sessions.has(session.id)) {
+					await owner.dispose();
+					throw new Error("runInTerminal session is closed");
+				}
+				drainStream(owner.child.stdout);
+				drainStream(owner.child.stderr);
+				session.runInTerminalProcesses.add(owner);
+				owner.exited.finally(() => session.runInTerminalProcesses.delete(owner));
+				return { processId: owner.pid } satisfies DapRunInTerminalResponse;
+			} finally {
+				this.#endTerminal(session);
+			}
 		});
 		client.onReverseRequest("startDebugging", async rawArgs => {
 			const startArgs = (rawArgs ?? {}) as Partial<DapStartDebuggingArguments>;
@@ -1319,7 +1415,36 @@ export class DapSessionManager {
 		return session;
 	}
 
+	#beginTerminal(session: DapSession): void {
+		session.inflightTerminal++;
+		if (session.inflightTerminal !== 1) return;
+		session.terminalIdle = new Promise(resolve => {
+			session.resolveTerminalIdle = resolve;
+		});
+	}
+
+	#endTerminal(session: DapSession): void {
+		session.inflightTerminal = Math.max(0, session.inflightTerminal - 1);
+		if (session.inflightTerminal !== 0) return;
+		session.resolveTerminalIdle?.();
+		session.resolveTerminalIdle = undefined;
+		session.terminalIdle = undefined;
+	}
+
+	async #waitTerminalIdle(session: DapSession): Promise<void> {
+		while (session.inflightTerminal > 0 && session.terminalIdle) {
+			await session.terminalIdle;
+		}
+	}
+
 	async #disposeSession(session: DapSession) {
+		session.closing = true;
+		if (session.disposed) {
+			await this.#waitTerminalIdle(session);
+			return;
+		}
+		session.disposed = true;
+		await this.#waitTerminalIdle(session);
 		if (this.#activeSessionId === session.id) {
 			this.#activeSessionId = null;
 		}

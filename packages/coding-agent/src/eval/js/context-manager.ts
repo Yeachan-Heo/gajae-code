@@ -1,4 +1,5 @@
 import { isCompiledBinary, logger, Snowflake } from "@gajae-code/utils";
+import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { registerResourceOwner } from "../../runtime/process-lifecycle";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
@@ -460,13 +461,11 @@ function reasonToError(reason: unknown, fallback: string): Error {
 }
 
 function errorFromPayload(payload: RunErrorPayload): Error {
-	if (payload.isAbort) {
-		const err = new ToolAbortError(payload.message || "Execution aborted");
-		if (payload.stack) err.stack = payload.stack;
-		return err;
-	}
-	const ctor = payload.isToolError ? ToolError : Error;
-	const error = new ctor(payload.message);
+	const error = payload.isDesigned
+		? payload.isAbort
+			? new ToolAbortError(payload.message || "Execution aborted")
+			: new ToolError(payload.message)
+		: new Error(payload.message);
 	if (payload.name) error.name = payload.name;
 	if (payload.stack) error.stack = payload.stack;
 	return error;
@@ -479,7 +478,8 @@ function toErrorPayload(error: unknown): RunErrorPayload {
 			message: error.message,
 			stack: error.stack,
 			isAbort: error.name === "AbortError" || error.name === "ToolAbortError",
-			isToolError: error instanceof ToolError || error.name === "ToolError",
+			isToolError: error instanceof ToolError,
+			isDesigned: isDesignedError(error),
 		};
 	}
 	return { message: String(error) };
@@ -523,15 +523,41 @@ async function spawnJsWorker(): Promise<WorkerHandle> {
 }
 
 function wrapBunWorker(worker: Worker): WorkerHandle {
+	// Cells share parentPort, so worker→host frames use a port transferred before
+	// the first cell. worker "message" events are accepted only until ready.
+	const channel = new MessageChannel();
+	const hostPort = channel.port2;
+	const queued: WorkerOutbound[] = [];
+	let onFrame: ((msg: WorkerOutbound) => void) | undefined;
+	let acceptWorkerEvent = true;
+	const deliver = (msg: WorkerOutbound): void => {
+		if (msg?.type === "ready" || msg?.type === "init-failed") acceptWorkerEvent = false;
+		if (onFrame) onFrame(msg);
+		else queued.push(msg);
+	};
+	const onPort = (event: Event): void => {
+		deliver((event as MessageEvent).data as WorkerOutbound);
+	};
+	const onWorker = (event: Event): void => {
+		if (!acceptWorkerEvent) return;
+		deliver((event as MessageEvent).data as WorkerOutbound);
+	};
+	hostPort.addEventListener("message", onPort);
+	worker.addEventListener("message", onWorker);
+	worker.postMessage({ type: "gjc-bind", port: channel.port1 }, { transfer: [channel.port1] });
 	return {
 		mode: "worker",
 		send(msg) {
 			worker.postMessage(msg);
 		},
 		onMessage(handler) {
-			const wrap = (event: MessageEvent): void => handler(event.data as WorkerOutbound);
-			worker.addEventListener("message", wrap);
-			return () => worker.removeEventListener("message", wrap);
+			onFrame = handler;
+			for (const msg of queued.splice(0)) handler(msg);
+			return () => {
+				if (onFrame === handler) onFrame = undefined;
+				hostPort.removeEventListener("message", onPort);
+				worker.removeEventListener("message", onWorker);
+			};
 		},
 		async terminate() {
 			worker.terminate();

@@ -18,6 +18,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { TempDir } from "@gajae-code/utils";
+import { attachExactMcpControls } from "../src/runtime-mcp/redaction";
 
 describe("AgentSession handoff", () => {
 	let tempDir: TempDir;
@@ -136,6 +137,203 @@ describe("AgentSession handoff", () => {
 		const created = await session.newSession();
 		expect(created).toBe(true);
 		expect(sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-sonnet-4-5");
+	});
+
+	it("awaits UI identity listeners after starting a new session", async () => {
+		const previousSessionId = session.sessionId;
+		const listenerStarted = Promise.withResolvers<string>();
+		const releaseListener = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribeSessionIdentityChanges(async () => {
+			listenerStarted.resolve(session.sessionId);
+			await releaseListener.promise;
+		});
+		const transition = session.newSession();
+		try {
+			const observedSessionId = await listenerStarted.promise;
+			expect(observedSessionId).not.toBe(previousSessionId);
+			let transitionSettled = false;
+			void transition.then(() => {
+				transitionSettled = true;
+			});
+			await Promise.resolve();
+			expect(transitionSettled).toBe(false);
+
+			releaseListener.resolve();
+			await expect(transition).resolves.toBe(true);
+			expect(transitionSettled).toBe(true);
+		} finally {
+			releaseListener.resolve();
+			unsubscribe();
+			await transition.catch(() => {});
+		}
+	});
+
+	it("notifies after a new-session identity commit even when initialization rejects", async () => {
+		const previousSessionId = session.sessionId;
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
+		vi.spyOn(sessionManager, "appendThinkingLevelChange").mockImplementationOnce(() => {
+			throw new Error("new session initialization boom");
+		});
+
+		await expect(session.newSession()).rejects.toThrow("new session initialization boom");
+		expect(session.sessionId).not.toBe(previousSessionId);
+		expect(observedSessionIds).toEqual([session.sessionId]);
+		unsubscribe();
+	});
+
+	it("does not notify when a new session fails before identity commit", async () => {
+		const previousSessionId = session.sessionId;
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
+		vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValueOnce(new Error("new session readiness boom"));
+
+		await expect(session.newSession()).rejects.toThrow("new session readiness boom");
+		expect(session.sessionId).toBe(previousSessionId);
+		expect(observedSessionIds).toEqual([]);
+		unsubscribe();
+	});
+
+	it("notifies UI identity listeners after a successful handoff", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue from here");
+		const previousSessionId = session.sessionId;
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
+
+		const result = await session.handoff();
+		expect(result?.document).toBe("## Goal\nContinue from here");
+		expect(session.sessionId).not.toBe(previousSessionId);
+		expect(observedSessionIds).toEqual([session.sessionId]);
+		unsubscribe();
+	});
+
+	it("notifies after a committed session switch even when transition cleanup rejects", async () => {
+		const previousSessionFile = sessionManager.getSessionFile();
+		if (!previousSessionFile) throw new Error("Expected the current session file to exist");
+		const nextSessionFile = path.join(tempDir.path(), "resume-target.jsonl");
+		await fs.copyFile(previousSessionFile, nextSessionFile);
+		attachExactMcpControls(session, {
+			grantSource: "root-interactive-exact-config",
+			configPath: path.join(tempDir.path(), "mcp.json"),
+		});
+		const observed: Array<{ sessionFile: string | undefined; hasExactMcpControls: boolean }> = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observed.push({
+				sessionFile: session.sessionFile,
+				hasExactMcpControls: session.hasExactMcpControls,
+			});
+		});
+		const unregisterCleanup = session.registerToolSessionTransitionCleanup(() => {
+			throw new Error("switch cleanup boom");
+		});
+
+		try {
+			await expect(session.switchSession(nextSessionFile)).rejects.toThrow("Tool session transition cleanup failed");
+			expect(session.sessionFile).toBe(nextSessionFile);
+			expect(session.hasExactMcpControls).toBe(false);
+			expect(observed).toEqual([{ sessionFile: nextSessionFile, hasExactMcpControls: false }]);
+		} finally {
+			unregisterCleanup();
+			unsubscribe();
+		}
+	});
+
+	it("notifies after a committed branch even when transition cleanup rejects", async () => {
+		const previousSessionId = session.sessionId;
+		const userEntry = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "user");
+		if (!userEntry) throw new Error("Expected a user entry to branch from");
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
+		const unregisterCleanup = session.registerToolSessionTransitionCleanup(() => {
+			throw new Error("branch cleanup boom");
+		});
+
+		try {
+			await expect(session.branch(userEntry.id)).rejects.toThrow("Tool session transition cleanup failed");
+			expect(session.sessionId).not.toBe(previousSessionId);
+			expect(observedSessionIds).toEqual([session.sessionId]);
+		} finally {
+			unregisterCleanup();
+			unsubscribe();
+		}
+	});
+
+	it("refreshes identity projections after command setup changes cwd, including setup failure", async () => {
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const projectAfterSetup = path.join(tempDir.path(), "after-setup");
+		const projectAfterFailedSetup = path.join(tempDir.path(), "after-failed-setup");
+		await fs.mkdir(projectAfterSetup);
+		await fs.mkdir(projectAfterFailedSetup);
+
+		const observedCwds: string[] = [];
+		let commandCalls = 0;
+		let failedSetupObservedCwd: string | undefined;
+		let commandError: string | undefined;
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				appendOnlyContext: createAppendOnlyContextManager(model.provider),
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			customCommands: [
+				{
+					path: "identity-setup-test",
+					resolvedPath: "identity-setup-test",
+					source: "project",
+					command: {
+						name: "setup-project",
+						description: "Move the successor to a project during setup",
+						async execute(args, context) {
+							commandCalls++;
+							const failSetup = args[0] === "fail";
+							try {
+								await context.newSession({
+									setup: async manager => {
+										await manager.moveTo(failSetup ? projectAfterFailedSetup : projectAfterSetup);
+										if (failSetup) throw new Error("setup failure");
+									},
+								});
+							} catch (error) {
+								failedSetupObservedCwd = observedCwds.at(-1);
+								commandError = error instanceof Error ? error.message : String(error);
+							}
+						},
+					},
+				},
+			],
+		});
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedCwds.push(sessionManager.getCwd());
+		});
+
+		const initialCwd = sessionManager.getCwd();
+		expect(session.customCommands.map(command => command.command.name)).toContain("setup-project");
+		await session.prompt("/setup-project");
+		expect(commandCalls).toBe(1);
+		expect(commandError).toBeUndefined();
+		expect(observedCwds).toEqual([initialCwd, projectAfterSetup]);
+
+		await session.prompt("/setup-project fail");
+		expect(commandCalls).toBe(2);
+		expect(observedCwds).toEqual([initialCwd, projectAfterSetup, projectAfterSetup, projectAfterFailedSetup]);
+		expect(commandError).toBe("setup failure");
+		expect(failedSetupObservedCwd).toBe(projectAfterFailedSetup);
+		unsubscribe();
 	});
 
 	it("releases append-only provider-normalized history at the handoff rewrite boundary", async () => {
@@ -558,7 +756,7 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(() => handoffSpy.mock.calls.length === 1);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		expect(handoffSpy).toHaveBeenCalledWith(expect.stringContaining("Threshold-triggered maintenance"), {
@@ -647,6 +845,11 @@ describe("AgentSession handoff", () => {
 		session.subscribe(event => {
 			events.push(event);
 		});
+		const previousSessionId = session.sessionId;
+		const observedSessionIds: string[] = [];
+		session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
 
 		const generateHandoffSpy = vi
 			.spyOn(compactionModule, "generateHandoff")
@@ -655,6 +858,8 @@ describe("AgentSession handoff", () => {
 
 		expect(mock.calls).toHaveLength(1);
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(session.sessionId).not.toBe(previousSessionId);
+		expect(observedSessionIds).toEqual([session.sessionId]);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
 		expect(endEvents[0]).toMatchObject({ type: "auto_compaction_end", action: "handoff", aborted: false });
@@ -886,16 +1091,23 @@ describe("AgentSession handoff", () => {
 		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
 		const beforeId = session.sessionId;
 		const beforeFile = session.sessionFile;
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
 		vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValueOnce(new Error("local readiness boom"));
 
 		await expect(session.handoff()).rejects.toThrow("local readiness boom");
 		expect(session.sessionId).toBe(beforeId);
 		expect(session.sessionFile).toBe(beforeFile);
+		expect(observedSessionIds).toEqual([]);
 		expect(sessionManager.getBranch().filter(entry => entry.type === "custom_message")).toHaveLength(0);
 
 		const result = await session.handoff();
 		expect(result?.document).toBe(handoffText);
 		expect(session.sessionId).not.toBe(beforeId);
+		expect(observedSessionIds).toEqual([session.sessionId]);
+		unsubscribe();
 	});
 
 	it("is non-destructive when the post-generation switch fails: session stays active and document is retained", async () => {
@@ -904,6 +1116,10 @@ describe("AgentSession handoff", () => {
 		const beforeId = session.sessionId;
 		const beforeFile = session.sessionFile;
 		const beforeMessageCount = session.agent.state.messages.length;
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
 
 		// Force a failure in staged injection before successor adoption.
 		const appendSpy = vi.spyOn(sessionManager, "appendPreparedCustomMessageEntry").mockImplementationOnce(() => {
@@ -925,6 +1141,7 @@ describe("AgentSession handoff", () => {
 		expect(session.sessionId).toBe(beforeId);
 		expect(session.sessionFile).toBe(beforeFile);
 		expect(session.agent.state.messages.length).toBe(beforeMessageCount);
+		expect(observedSessionIds).toEqual([]);
 		// No handoff custom entry leaked into the restored session.
 		expect(
 			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
@@ -936,6 +1153,8 @@ describe("AgentSession handoff", () => {
 		const result = await session.handoff();
 		expect(result?.document).toBe(handoffText);
 		expect(session.sessionId).not.toBe(beforeId);
+		expect(observedSessionIds).toEqual([session.sessionId]);
+		unsubscribe();
 	});
 
 	it.each([
@@ -996,6 +1215,10 @@ describe("AgentSession handoff", () => {
 		const handoffText = "## Goal\nContinue from here";
 		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
 		const beforeId = session.sessionId;
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
 		// clearKind("async-result") runs at the commit boundary, after `committed`
 		// is set. A failure there must NOT roll back the already-committed switch.
 		vi.spyOn(session.yieldQueue, "clearKind").mockImplementationOnce(() => {
@@ -1016,9 +1239,11 @@ describe("AgentSession handoff", () => {
 		expect((caught as Error).cause).toBeInstanceOf(Error);
 		expect(((caught as Error).cause as Error).message).toContain("post-commit boom");
 		expect(session.sessionId).not.toBe(beforeId);
+		expect(observedSessionIds).toEqual([session.sessionId]);
 		expect(
 			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
 		).toHaveLength(1);
+		unsubscribe();
 	});
 
 	it("fences background async idle delivery during a handoff transition", async () => {

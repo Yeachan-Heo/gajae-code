@@ -5,11 +5,36 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { selectCanaryTests } from "./ci-risk-canary-manifest";
+import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
 
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
+const telegramDaemonGenerationGuardFiles = new Set([
+	"scripts/telegram-daemon-generation-guard.ts",
+	"scripts/telegram-daemon-generation-manifest.json",
+	...Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory)),
+	...Object.keys(telegramDaemonGenerationManifest.nativeAuthoritySha256),
+]);
+const daemonLikePathSegment = /(?:^|[-_.])daemon(?:[-_.]|$)/i;
+
+function isDaemonLikePath(changedPath: string): boolean {
+	// Keep the planner conservative for a newly-added or renamed daemon source
+	// that has not been added to the manifest yet. The exact manifest-derived set
+	// remains authoritative for known files; this fallback preserves the old
+	// daemon-name trigger so an omitted entry cannot make the guard disappear.
+	return changedPath.split("/").some(segment => daemonLikePathSegment.test(segment));
+}
+
+export function isTelegramDaemonGenerationGuardFile(changedPath: string): boolean {
+	return telegramDaemonGenerationGuardFiles.has(changedPath) || isDaemonLikePath(changedPath);
+}
+
+export function needsTelegramDaemonGenerationGuard(paths: readonly string[]): boolean {
+	return paths.some(isTelegramDaemonGenerationGuardFile);
+}
+
 // The coding-agent package has hundreds of test files; keep affected validation
 // below the shard timeout by splitting package-wide/full-workspace TypeScript
 // suites across the matrix. Dev keeps the default; Main CI full mode overrides
@@ -88,15 +113,33 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
 ] as const;
 
-// The MiniMax thinking contract is enriched while bundled catalog entries are
-// loaded, so the catalog assertions must run when either the normalization
-// rules or their generated source data changes. Neither source file has a
-// basename-matched `*.test.ts` sibling for the canonical catalog contract.
-const AI_MODEL_CATALOG_OWNER_TESTS = [
-	"packages/ai/test/model-thinking.test.ts",
-	"packages/ai/test/minimax-thinking.test.ts",
-	"packages/ai/test/preset-catalog-models.test.ts",
-] as const;
+// These inputs produce, transform, or define the bundled model catalog. Partial
+// owner-test mapping misses catalog-wide contracts, so changes to these surfaces
+// run the full AI suite.
+const AI_MODEL_CATALOG_FULL_TEST_PATHS: ReadonlySet<string> = new Set([
+	"packages/ai/src/models.json",
+	"packages/ai/src/models.json.d.ts",
+	"packages/ai/src/models.ts",
+	"packages/ai/scripts/generate-models.ts",
+	"packages/ai/src/model-manager.ts",
+	"packages/ai/src/model-retirements.ts",
+	"packages/ai/src/model-thinking.ts",
+	"packages/ai/src/context-cap-policy.ts",
+	"packages/ai/src/model-pricing.ts",
+	"packages/ai/src/openai-completions-compat.ts",
+	"packages/ai/src/bedrock-claude-cache-policy.ts",
+	"packages/ai/src/providers/gitlab-duo.ts",
+	"packages/ai/src/providers/kiro-api-key.ts",
+	"packages/ai/src/providers/openai-codex/constants.ts",
+	"packages/ai/src/utils/discovery/antigravity.ts",
+	"packages/ai/src/utils/discovery/codex.ts",
+	"packages/ai/src/utils/tool-choice-capability.ts",
+]);
+const AI_PROVIDER_MODELS_PATH_PREFIX = "packages/ai/src/provider-models/";
+
+function isAiCatalogModelPath(changedPath: string): boolean {
+	return AI_MODEL_CATALOG_FULL_TEST_PATHS.has(changedPath) || changedPath.startsWith(AI_PROVIDER_MODELS_PATH_PREFIX);
+}
 
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
@@ -108,7 +151,12 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
-	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	"packages/coding-agent/src/config/model-registry.ts": [
+		"packages/coding-agent/test/model-registry-runtime-provider.test.ts",
+		// This module owns the general-vs-profile-activation availability split, so a
+		// change here must also exercise the suite that asserts that split.
+		"packages/coding-agent/test/model-profile-activation.test.ts",
+	],
 	// Making this module asynchronous (e.g. a top-level `await import(...)`)
 	// propagates async-ness through every importer, and bun 1.4.0 drops it on the
 	// `model-registry` <-> `model-resolver` import cycle: the bundle then carries a
@@ -116,14 +164,9 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	// at parse time with `SyntaxError: Unexpected identifier 'init_model_registry'`.
 	// Basename matching would never reach that test from this file, which is how
 	// #5674 shipped to dev. Compile-and-run coverage must run on any change here.
-	"packages/coding-agent/src/utils/mupdf-wasm.ts": [
-		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
-		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
-	],
-	"packages/coding-agent/src/utils/mupdf-wasm-embedded.ts": [
-		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
-		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
-	],
+	"crates/pi-natives/src/pdf.rs": ["packages/coding-agent/test/pdf-native.test.ts", "packages/coding-agent/test/pdf-native-compiled.test.ts"],
+	"packages/coding-agent/src/utils/markit.ts": ["packages/coding-agent/test/pdf-native.test.ts"],
+	"packages/coding-agent/src/utils/pdf.ts": ["packages/coding-agent/test/pdf-native.test.ts", "packages/coding-agent/test/pdf-native-compiled.test.ts"],
 	"packages/coding-agent/src/modes/components/model-selector.ts": [
 		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
 		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",
@@ -133,11 +176,44 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
 		"packages/ai/test/anthropic-stream-envelope.test.ts",
 	],
-	"packages/ai/src/model-thinking.ts": AI_MODEL_CATALOG_OWNER_TESTS,
-	"packages/ai/src/models.json": AI_MODEL_CATALOG_OWNER_TESTS,
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
+	"crates/pi-natives/src/fd.rs": ["packages/natives/test/fd-workspace-golden.test.ts"],
+	"crates/pi-natives/src/iofs.rs": ["packages/natives/test/native.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
+	"crates/pi-natives/src/svg.rs": ["packages/natives/test/native.test.ts"],
+	"crates/pi-natives/src/tty_writer.rs": ["packages/tui/test/terminal-writer.test.ts"],
+	"crates/pi-edit/src/fuzzy.rs": ["packages/natives/test/differential/edit-fuzzy.test.ts"],
+	"crates/pi-edit/src/modes/replace.rs": ["packages/natives/test/differential/edit-fuzzy.test.ts"],
+	"crates/pi-natives/src/edit.rs": [
+		"packages/natives/test/differential/edit-fuzzy.test.ts",
+		"packages/coding-agent/test/core/native-embed-smoke.test.ts",
+	],
+	"packages/coding-agent/src/cli/native-smoke.ts": ["packages/coding-agent/test/core/native-embed-smoke.test.ts"],
+	"packages/coding-agent/src/edit/diff.ts": [
+		"packages/coding-agent/test/edit-diff.test.ts",
+		"packages/coding-agent/test/tools/edit-diff.test.ts",
+	],
+	"packages/coding-agent/src/edit/modes/patch.ts": [
+		"packages/coding-agent/test/core/apply-patch.test.ts",
+		"packages/coding-agent/test/core/apply-patch-regression.test.ts",
+		"packages/coding-agent/test/tools.test.ts",
+	],
+	"packages/coding-agent/src/edit/modes/replace.ts": [
+		"packages/coding-agent/test/edit-diff.test.ts",
+		"packages/coding-agent/test/core/edit-hotspots-golden.test.ts",
+		"packages/coding-agent/test/core/h02-fuzzy-parity.test.ts",
+		"packages/coding-agent/test/core/native-embed-smoke.test.ts",
+		"packages/coding-agent/test/tools.test.ts",
+		"packages/coding-agent/test/tools/edit-diff.test.ts",
+	],
+	"crates/pi-natives/src/workspace.rs": [
+		"packages/natives/test/fd-workspace-golden.test.ts",
+		"packages/coding-agent/test/workspace-tree.test.ts",
+	],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	// The broker lifecycle e2e suite is not named after lifecycle.ts, so basename
+	// mapping misses its Linux-only regressions on lifecycle changes (#6145 review).
+	"packages/coding-agent/src/sdk/broker/lifecycle.ts": ["packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	// The prompt-deadline docs guard derives its expected figure from this schema's
@@ -149,6 +225,11 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts",
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
+	],
+	// Session-manager owns the in-memory session lifecycle, whose integration
+	// contract is not basename-matched and needs explicit behavioral-owner coverage.
+	"packages/coding-agent/src/session/session-manager.ts": [
+		"packages/coding-agent/test/session/session-memory-integration.test.ts",
 	],
 	// The managed-scope owner-only self-heal budget/latency contract is verified by
 	// a dedicated suite that exercises the bounded walk, targeted repair, and
@@ -170,7 +251,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
-	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
+	"packages/coding-agent/src/tools/tool-catalog.generated.ts": [
+		"packages/coding-agent/test/tools/tool-catalog.test.ts",
+		"packages/coding-agent/test/tools/discoverable-description-stable.test.ts",
+	],
 	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 	// Function Hooks and the extension/hook adapters share one bounded owner
 	// shard: changing any layer can alter registration, dispatch, or payload
@@ -190,7 +274,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/extensibility/gjc-plugins/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
-	"packages/coding-agent/src/sdk/session.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/sdk/session.ts": [
+		...EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
+	],
 };
 
 export interface PackageManifest {
@@ -488,8 +575,21 @@ function isRustTestKey(key: string): boolean {
 
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || isRustTestKey(key) || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return (
+		key === "rust-check" ||
+		isRustTestKey(key) ||
+		key === "ci-selftest" ||
+		key === "ci-dry-run" ||
+		key === "affected-selftest" ||
+		key === "affected-dry-run" ||
+		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts" ||
+		// Builds pi-natives with the `task-panic-test` feature via `napi build`; without the
+		// provisioned toolchain and rust-cache the cold compile exceeds the test timeout.
+		key === `test:${NATIVE_TASK_PANIC_TEST}`
+	);
 }
+
+const NATIVE_TASK_PANIC_TEST = "packages/natives/test/task-panic-to-rejection.test.ts";
 
 // Build the machine-readable descriptor list for the current changed-path plan.
 // `cwd` is emitted repo-relative so the JSON stays portable across runners.
@@ -510,8 +610,8 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
 // planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
-// smoke flag. Downstream jobs reuse the planner's exact diff via
-// CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
+// smoke and daemon-guard flags. Downstream jobs reuse the planner's exact diff
+// via CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
 // Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
 // predicate in the planner: dev-ci consumes its emitted flag rather than copying
 // path checks into individual jobs.
@@ -540,11 +640,11 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 
 // Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
 // `node:fs` resident-cache write semantics, session-index snapshot fsync
-// semantics, or native-loader Windows capability probing the fix governs. On
-// Ubuntu the windows-canonical-path regression suite and the live win32 AVX2
-// probe suite are skipped by `describe.skipIf`, so a Linux shard cannot verify
-// those fixes; dev-ci consumes this emitted flag to run and require the
-// windows-latest job whenever any of these change.
+// semantics, fail-closed lock retirement, marketplace backup detachment,
+// native path identity, or native-loader Windows capability probing the fix governs. On Ubuntu the
+// Windows-only regression suites cannot verify those fixes; dev-ci consumes
+// this emitted flag to run and require the windows-latest job whenever any of
+// these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
 	return (
 		changedPath === "packages/coding-agent/src/sdk/broker/lifecycle.ts" ||
@@ -561,8 +661,13 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-index-lock-contention.test.ts" ||
+		changedPath === "packages/coding-agent/test/file-lock-signed-identity.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
 		changedPath === "packages/coding-agent/src/config/file-lock.ts" ||
+		changedPath === "packages/coding-agent/test/file-lock-empty-dir.test.ts" ||
+		changedPath === "packages/coding-agent/src/extensibility/plugins/marketplace/manager.ts" ||
+		changedPath === "packages/coding-agent/test/doctor-plugin-restore.test.ts" ||
+		changedPath === "crates/pi-natives/src/path_identity.rs" ||
 		// The session-state lock and empty-delete receipt GC consume the native
 		// identity-bound direct unlink, whose Windows semantics (handle-bound delete,
 		// no quarantine exchange; cross-platform name guards) cannot be exercised on
@@ -579,6 +684,13 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/utils/src/dirs.ts" ||
 		changedPath === "packages/utils/src/env.ts" ||
 		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
+		// 2.3 walker Rayon pool failures are constrained-host-sensitive: only the
+		// Windows Job Object test can prove that no implicit worker threads spawn.
+		changedPath.startsWith("crates/pi-vfs/") ||
+		changedPath.startsWith("crates/pi-walker/") ||
+		changedPath === "crates/pi-natives/src/iofs.rs" ||
+		changedPath === "crates/pi-natives/src/glob.rs" ||
+		changedPath.startsWith("packages/natives/test/walker-pool-unavailable") ||
 		changedPath === "packages/natives/native/loader-state.js" ||
 		changedPath === "scripts/host-detect.ts" ||
 		// Rust shell-spawn surfaces cannot be executed on an Ubuntu shard; the
@@ -599,7 +711,9 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "Cargo.lock" ||
 		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
 		changedPath === "crates/pi-shell/Cargo.toml" ||
-		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
+		changedPath === "packages/natives/test/windows-runtime-install.windows.test.ts" ||
+		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts" ||
+		changedPath === "packages/natives/test/windows-shell-path.windows.test.ts"
 	);
 }
 
@@ -634,6 +748,7 @@ async function emitFullMatrix(): Promise<void> {
 		`has_native=${hasNative}`,
 		`has_python=${hasPython}`,
 		`has_risk_canaries=${hasRiskCanaries}`,
+		"has_protected_daemon_decl=true",
 		"",
 	];
 	await fs.appendFile(githubOutput, lines.join("\n"));
@@ -674,6 +789,7 @@ async function emitMatrix(): Promise<void> {
 		`has_risk_canaries=${hasRiskCanaries}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
+		`has_protected_daemon_decl=${needsTelegramDaemonGenerationGuard(paths)}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -960,6 +1076,9 @@ export function planTasks(
 	if (paths.some(isSdkPackageSmokePath)) {
 		add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
+	if (paths.some(isSchemaContractPath)) {
+		addSchemaSyncTask(tasks);
+	}
 
 	if (rustChanged) {
 		add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
@@ -1032,6 +1151,10 @@ export function planTargetedTasks(
 
 	for (const changedPath of relevant) {
 		if (isFullWorkspacePath(changedPath)) continue;
+		if (isAiCatalogModelPath(changedPath)) {
+			const aiPackage = packages.find(workspacePackage => workspacePackage.name === "@gajae-code/ai");
+			if (aiPackage) addPackageTestTasks(tasks, aiPackage);
+		}
 		if (isWorkflowPath(changedPath)) {
 			needYamlParse = true;
 			needCiSelftest = true;
@@ -1061,6 +1184,9 @@ export function planTargetedTasks(
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 			}
 		}
+		if (isSchemaContractPath(changedPath)) {
+			addSchemaSyncTask(tasks);
+		}
 		if (isSdkPackageSmokePath(changedPath)) {
 			add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 			const sdkClientOwner = owningPackage(changedPath, packages);
@@ -1088,15 +1214,18 @@ export function planTargetedTasks(
 			addCodingAgentSdkProductionHostTask(tasks);
 		}
 
+		// Lint/typecheck is cheap and test mapping never covers it: every touched
+		// package gets its check, even when a mapped test replaces its suite.
+		const owner = owningPackage(changedPath, packages);
+		if (owner?.manifest.scripts?.check) {
+			add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+		}
+
 		if (mappedTests.length > 0) {
 			continue;
 		}
 
-		const owner = owningPackage(changedPath, packages);
 		if (owner) {
-			if (owner.manifest.scripts?.check) {
-				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
-			}
 			if (isCodingAgentRuntimePath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
@@ -1182,12 +1311,34 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 		);
 		return;
 	}
+	if (workspacePackage.name === "@gajae-code/natives") {
+		// The task-panic regression builds pi-natives with Cargo; it runs only as its own
+		// Rust-provisioned task, never inside the Rust-less package shard.
+		add(
+			tasks,
+			`test:${workspacePackage.name}`,
+			`Test ${workspacePackage.name}`,
+			["bun", "test", `--path-ignore-patterns=${NATIVE_TASK_PANIC_TEST.slice("packages/natives/".length)}`],
+			resolvePackageCwd(workspacePackage.dir),
+		);
+		// Use the separate build script that compiles the native addon outside the test timeout.
+		add(
+			tasks,
+			`test:${NATIVE_TASK_PANIC_TEST}`,
+			`Test ${NATIVE_TASK_PANIC_TEST}`,
+			["bun", "packages/natives/scripts/run-task-panic-test.ts"],
+			undefined,
+			{ rust: true, nextest: false, nativeConsumer: false, nativeProducer: false },
+		);
+		return;
+	}
 	if (workspacePackage.name !== "@gajae-code/coding-agent") {
 		add(tasks, `test:${workspacePackage.name}`, `Test ${workspacePackage.name}`, packageScriptCommand("test"), resolvePackageCwd(workspacePackage.dir));
 		return;
 	}
 
 	const total = codingAgentTestShards();
+	addTestFileTask(tasks, "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts");
 	for (let shard = 1; shard <= total; shard++) {
 		addCodingAgentTestShard(tasks, shard, total);
 	}
@@ -1228,7 +1379,11 @@ function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
 // collisions fall back to package-level checks instead of selecting arbitrary tests.
 function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
 	if (isTestFilePath(changedPath)) {
-		return testFiles.includes(changedPath) ? [changedPath] : [];
+		// Discovery can miss a test added in this diff. An existing package test is
+		// still its own focused task. A deleted path is in neither the index nor the
+		// checkout, so it stays off the plan.
+		if (testFiles.includes(changedPath) || packageTestExists(changedPath)) return [changedPath];
+		return [];
 	}
 	const base = path.posix.basename(changedPath).replace(/\.(tsx?|jsx?|mts|cts)$/, "");
 	if (base === "") {
@@ -1284,6 +1439,26 @@ function isEmbeddedDocsSourcePath(changedPath: string): boolean {
 
 function isTestFilePath(changedPath: string): boolean {
 	return /\.test\.tsx?$/.test(changedPath);
+}
+
+export function isPackageTestPath(changedPath: string): boolean {
+	return changedPath.startsWith("packages/") && !changedPath.includes("node_modules/") && /\.test\.tsx?$/.test(changedPath);
+}
+
+function packageTestExists(changedPath: string): boolean {
+	if (!isPackageTestPath(changedPath)) return false;
+	if (changedPath.split("/").some(part => part === "" || part === "." || part === "..")) return false;
+	return fsSync.existsSync(path.join(repoRoot, changedPath));
+}
+
+/** Existing package tests with no `test:<path>` task. A path that is not on disk is not an omission. */
+export function omittedPackageTestPaths(
+	paths: readonly string[],
+	taskKeys: readonly string[],
+	fileExists: (changedPath: string) => boolean = packageTestExists,
+): string[] {
+	const keys = new Set(taskKeys);
+	return paths.filter(changedPath => isPackageTestPath(changedPath) && fileExists(changedPath) && !keys.has(`test:${changedPath}`));
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
@@ -1377,6 +1552,18 @@ export function isFullWorkspacePath(changedPath: string): boolean {
 	].includes(changedPath);
 }
 
+// `schemas/*.json` is generated from the settings schema by
+// `scripts/generate-json-schemas.ts`. Either side can drift from the other, and
+// the `--check` gate that catches it lives only inside `ci:check:full`, which an
+// affected-path run does not select for a change confined to these two files.
+export function isSchemaContractPath(changedPath: string): boolean {
+	return changedPath.startsWith("schemas/") || changedPath === "packages/coding-agent/src/config/settings-schema.ts";
+}
+
+function addSchemaSyncTask(tasks: Map<string, Task>): void {
+	add(tasks, "check-schemas", "Generated JSON schema sync check", ["bun", "run", "check:schemas"]);
+}
+
 function isRootPackageReleaseHarnessOnly(paths: readonly string[]): boolean {
 	return (
 		paths.includes("package.json") &&
@@ -1421,6 +1608,8 @@ function isInstallPath(changedPath: string): boolean {
 }
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
+	// Changelogs don't constitute runtime changes requiring native build or validation
+	if (isDocOrChangelogPath(changedPath)) return false;
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 
@@ -2144,6 +2333,10 @@ async function loadCanonicalPlan(): Promise<Task[] | null> {
 		new Set(tasks.map(task => task.key)).size !== tasks.length ||
 		new Set(tasks.map(task => task.identity)).size !== tasks.length
 	) throw new Error("affected-plan-invalid: duplicate task key or identity");
+	if (decoded.mode === "pr") {
+		const omitted = omittedPackageTestPaths(paths, tasks.map(task => task.key));
+		if (omitted.length > 0) throw new Error(`affected-plan-invalid: changed package test omitted from canonical plan: ${omitted.join(", ")}`);
+	}
 	const matrixKey = Bun.env.CI_DEV_MATRIX_KEY?.trim();
 	if (matrixKey) {
 		const task = tasks.find(candidate => candidate.key === matrixKey);

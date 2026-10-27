@@ -54,6 +54,7 @@ async function tempDir(): Promise<string> {
 	await Bun.write(path.join(dir, "README.md"), "initial\n");
 	await runGit(dir, ["add", "README.md"]);
 	await runGit(dir, ["commit", "-m", "initial"]);
+	await runGit(dir, ["update-ref", "refs/remotes/origin/dev", "HEAD"]);
 	return dir;
 }
 

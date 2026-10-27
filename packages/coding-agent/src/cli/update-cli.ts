@@ -10,8 +10,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exactReplaceRetained, exactUnlink } from "@gajae-code/natives";
-import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import { exactReplaceRetained, exactUnlink, exactUnlinkDirect } from "@gajae-code/natives";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { acquireFileLock } from "../config/file-lock";
@@ -38,6 +38,7 @@ import {
 	createActivationRecordFile,
 	type DirectoryIdentity,
 	type FileIdentity,
+	type ReconcileResult,
 	readActivationRecord,
 	reconcileActivationRecord,
 	sameDirectoryIdentity,
@@ -106,6 +107,60 @@ export interface BinaryReplacementOptions {
 	candidate?: { readonly channel: string; readonly ref: string; readonly sha256: string };
 	verifyStagedVersion?: (stagingPath: string, expectedVersion: string) => Promise<void>;
 	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+}
+
+function formatRetainedActivationPaths(
+	paths:
+		| Pick<
+				ReconcileResult,
+				"detachedPath" | "retainedSuccessorPath" | "retainedPlaceholderPath" | "retainedUnknownPath"
+		  >
+		| undefined,
+): string {
+	if (!paths) return "";
+	const entries = [
+		paths.detachedPath !== undefined ? `detached=${paths.detachedPath}` : undefined,
+		paths.retainedSuccessorPath !== undefined ? `successor=${paths.retainedSuccessorPath}` : undefined,
+		paths.retainedPlaceholderPath !== undefined ? `placeholder=${paths.retainedPlaceholderPath}` : undefined,
+		paths.retainedUnknownPath !== undefined ? `unknown=${paths.retainedUnknownPath}` : undefined,
+	].filter((entry): entry is string => entry !== undefined);
+	return entries.length > 0 ? `; retained paths: ${entries.join("|")}` : "";
+}
+
+export class InstallationAccessDeniedError extends Error {
+	readonly code = "access_denied";
+
+	constructor(
+		readonly targetPath: string,
+		readonly windowsErrorCode?: string,
+		readonly stagingCleanupWarning?: string,
+		readonly retainedPaths?: Pick<
+			ReconcileResult,
+			"detachedPath" | "retainedSuccessorPath" | "retainedPlaceholderPath" | "retainedUnknownPath"
+		>,
+	) {
+		super(
+			`access_denied during exact replacement of ${targetPath}${windowsErrorCode ? ` (${windowsErrorCode})` : ""}${stagingCleanupWarning ? `; ${stagingCleanupWarning}` : ""}${formatRetainedActivationPaths(retainedPaths)}`,
+		);
+		this.name = "InstallationAccessDeniedError";
+	}
+}
+
+export class ActivationRetryCandidateRepointError extends Error {
+	readonly reasonCode: string;
+
+	constructor(
+		readonly candidatePath: string,
+		cause: unknown,
+	) {
+		const reasonCode =
+			cause instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(cause.message)
+				? cause.message
+				: "activation_record_repoint_failed";
+		super(`${reasonCode}; retained retry candidate: ${candidatePath}`, { cause });
+		this.name = "ActivationRetryCandidateRepointError";
+		this.reasonCode = reasonCode;
+	}
 }
 
 /**
@@ -232,6 +287,40 @@ function resolveNpmManagedTarget(
 	return undefined;
 }
 
+/**
+ * Detect a project-local package install: `<...>/node_modules/.bin/<name>` with
+ * or without an executable extension.
+ *
+ * On Windows a dependency-installed CLI is a real `.exe` copied into
+ * `node_modules/.bin`, so the `.cmd`/`.ps1` shim rules never match it and
+ * `gjc update` used to treat it as a standalone binary and try to replace it
+ * (#6842). That file belongs to the package manager and to the project's
+ * dependency tree: replacing it breaks the lockfile contract and, on Windows,
+ * fails on the file's ACL. The caller must redirect to the package manager
+ * instead of downloading a replacement.
+ */
+function resolveProjectLocalPackageInstall(
+	ompPath: string,
+	platform: PathPlatform = process.platform,
+): { packageRoot: string } | undefined {
+	const pathApi = pathApiForPlatform(platform);
+	const resolved = pathApi.normalize(ompPath);
+	const binDir = pathApi.dirname(resolved);
+	if (pathApi.basename(binDir).toLowerCase() !== ".bin") return undefined;
+	if (pathApi.basename(pathApi.dirname(binDir)).toLowerCase() !== "node_modules") return undefined;
+	const extension = pathApi.extname(resolved).toLowerCase();
+	const basename = extension ? pathApi.basename(resolved, extension) : pathApi.basename(resolved);
+	if (basename.toLowerCase() !== APP_NAME.toLowerCase()) return undefined;
+	return { packageRoot: pathApi.dirname(binDir) };
+}
+
+export function resolveProjectLocalPackageInstallForTest(
+	ompPath: string,
+	platform: PathPlatform,
+): { packageRoot: string } | undefined {
+	return resolveProjectLocalPackageInstall(ompPath, platform);
+}
+
 function resolveUpdateMethod(ompPath: string, bunBinDir: string | undefined): "bun" | "npm" | "binary" {
 	if (resolveNpmManagedTarget(ompPath)) return "npm";
 	if (!bunBinDir) return "binary";
@@ -342,6 +431,15 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 		throw new Error(
 			formatUnsupportedTargetMessage(
 				`Refusing to overwrite source checkout or dev-link at ${ompPath}. Update that checkout's original workflow instead`,
+			),
+		);
+	}
+
+	const projectLocalInstall = ompPath ? resolveProjectLocalPackageInstall(ompPath) : undefined;
+	if (ompPath && projectLocalInstall) {
+		throw new Error(
+			formatUnsupportedTargetMessage(
+				`${APP_NAME} at ${ompPath} is installed by a package manager in this project's node_modules; update the dependency instead of replacing that file`,
 			),
 		);
 	}
@@ -782,6 +880,95 @@ export async function recoverWindowsUpdateJournal(journalPath: string): Promise<
 	throw new Error("legacy_update_journal_requires_manual_review");
 }
 
+async function removeExactStagingFile(filePath: string, identity: FileIdentity): Promise<void> {
+	const quarantineName = `.${path.basename(filePath)}.cleanup.${randomUUID()}`;
+	const removed = exactUnlink(filePath, toNativeIdentity(identity, quarantineName));
+	let pathStillExists = false;
+	let snapshotFailure: string | undefined;
+	try {
+		pathStillExists = (await snapshotRegularFile(filePath)) !== undefined;
+	} catch (error) {
+		snapshotFailure = error instanceof Error ? error.message : String(error);
+	}
+	const recoveryPaths = [
+		removed.detachedPath ? `detached=${removed.detachedPath}` : undefined,
+		removed.retainedPlaceholderPath ? `placeholder=${removed.retainedPlaceholderPath}` : undefined,
+		removed.retainedUnknownPath ? `unknown=${removed.retainedUnknownPath}` : undefined,
+		removed.retainedSuccessorPath ? `successor=${removed.retainedSuccessorPath}` : undefined,
+	].filter((value): value is string => value !== undefined);
+	if (
+		(!removed.ok && removed.code !== "not_found") ||
+		pathStillExists ||
+		snapshotFailure !== undefined ||
+		recoveryPaths.length > 0
+	) {
+		const reason =
+			removed.code ?? (pathStillExists ? "path_still_exists" : snapshotFailure ? "snapshot_failed" : "unverified");
+		const details = [
+			`path=${filePath}`,
+			...recoveryPaths,
+			...(snapshotFailure !== undefined ? [`snapshot=${snapshotFailure}`] : []),
+		].join("|");
+		throw new Error(`activation_retry_staging_cleanup_failed:${reason}:${details}`);
+	}
+}
+
+async function tryRemoveExactStagingFile(filePath: string, identity: FileIdentity): Promise<string | undefined> {
+	try {
+		await removeExactStagingFile(filePath, identity);
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+}
+
+async function repointActivationRecordToRetryCandidate(
+	record: ActivationRecordV1,
+	recordIdentity: FileIdentity,
+	candidatePath: string,
+): Promise<FileIdentity> {
+	try {
+		return await updateActivationRecordFile(record, recordIdentity);
+	} catch (error) {
+		throw new ActivationRetryCandidateRepointError(candidatePath, error);
+	}
+}
+
+function activationRecordMatchesCandidate(
+	record: ActivationRecordV1,
+	options: BinaryReplacementOptions,
+	staged: { readonly identity: FileIdentity } | undefined,
+): boolean {
+	const digest = options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256;
+	return (
+		(digest === undefined || record.candidate.digest === digest) &&
+		record.candidate.version === options.expectedVersion &&
+		(!options.candidate ||
+			(record.candidate.ref === options.candidate.ref && record.candidate.channel === options.candidate.channel))
+	);
+}
+
+/**
+ * True only for a `staged`/`pending_activation` record whose live target is
+ * still byte- and identity-exact to the recorded baseline (or still absent for
+ * a fresh install), so no promotion ever reached the installed binary.
+ */
+function isSupersedablePrePromotionRecord(
+	record: ActivationRecordV1,
+	targetPath: string,
+	current: { readonly identity: FileIdentity } | undefined,
+): boolean {
+	if (record.phase !== "staged" && record.phase !== "pending_activation") return false;
+	if (path.resolve(record.targetPath) !== targetPath) return false;
+	if (!record.baseline.exists) return current === undefined;
+	return (
+		current !== undefined &&
+		record.targetIdentity !== undefined &&
+		sameFileIdentity(record.targetIdentity, current.identity) &&
+		current.identity.sha256 === record.baseline.digest
+	);
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -805,8 +992,17 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		throw new Error("installation_original_target_changed");
 	const existing = await readActivationRecord(targetPath);
 	if (existing.status === "malformed" || existing.status === "foreign") throw new Error("activation_record_untrusted");
+	// A pre-promotion record for a different candidate never mutated the install:
+	// its live target is still the recorded baseline. Pinning it would refuse every
+	// later release with activation_transaction_requires_reconciliation (#6096), so
+	// let a fresh transaction supersede it. Anything past promotion stays pinned.
+	const supersedable =
+		existing.status === "valid" &&
+		!activationRecordMatchesCandidate(existing.record, options, undefined) &&
+		isSupersedablePrePromotionRecord(existing.record, targetPath, current);
 	const resumePinned =
 		existing.status === "valid" &&
+		!supersedable &&
 		existing.record.phase !== "verified" &&
 		existing.record.phase !== "rolled_back" &&
 		options.candidate !== undefined;
@@ -830,17 +1026,52 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 	let record: ActivationRecordV1;
 	let recordIdentity: FileIdentity;
-	if (existing.status === "valid" && existing.record.phase !== "verified" && existing.record.phase !== "rolled_back") {
-		if (
-			existing.record.candidate.digest !== (options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256) ||
-			existing.record.candidate.version !== options.expectedVersion ||
-			(options.candidate &&
-				(existing.record.candidate.ref !== options.candidate.ref ||
-					existing.record.candidate.channel !== options.candidate.channel))
-		)
+	let redundantStage: { readonly path: string; readonly identity: FileIdentity } | undefined;
+	if (
+		existing.status === "valid" &&
+		!supersedable &&
+		existing.record.phase !== "verified" &&
+		existing.record.phase !== "rolled_back"
+	) {
+		if (!activationRecordMatchesCandidate(existing.record, options, staged))
 			throw new Error("activation_transaction_requires_reconciliation");
-		record = existing.record;
-		recordIdentity = existing.identity;
+		const currentStagingPath = path.resolve(options.tempPath);
+		const recordedStagingPath = path.resolve(existing.record.stagingPath);
+		if (currentStagingPath !== recordedStagingPath) {
+			const retryCandidate = staged ?? (await snapshotRegularFile(currentStagingPath));
+			if (retryCandidate && retryCandidate.identity.sha256 !== existing.record.candidate.digest)
+				throw new Error("activation_retry_candidate_digest_mismatch");
+			const activationNeedsStagedCandidate =
+				existing.record.phase === "staged" || existing.record.phase === "pending_activation";
+			const recordedStage = activationNeedsStagedCandidate
+				? await snapshotRegularFile(recordedStagingPath)
+				: undefined;
+			const recordedStageIsValid =
+				recordedStage &&
+				existing.record.stagingIdentity &&
+				sameFileIdentity(existing.record.stagingIdentity, recordedStage.identity) &&
+				recordedStage.identity.sha256 === existing.record.candidate.digest;
+			if (activationNeedsStagedCandidate && !recordedStageIsValid) {
+				if (!retryCandidate) throw new Error("activation_retry_candidate_missing");
+				record = {
+					...existing.record,
+					stagingPath: currentStagingPath,
+					stagingIdentity: retryCandidate.identity,
+				};
+				recordIdentity = await repointActivationRecordToRetryCandidate(
+					record,
+					existing.identity,
+					currentStagingPath,
+				);
+			} else {
+				if (retryCandidate) redundantStage = { path: currentStagingPath, identity: retryCandidate.identity };
+				record = existing.record;
+				recordIdentity = existing.identity;
+			}
+		} else {
+			record = existing.record;
+			recordIdentity = existing.identity;
+		}
 	} else {
 		if (!staged) throw new Error("installation_staging_unavailable");
 		record = {
@@ -873,26 +1104,97 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		allowPromotion: true,
 		expectedRecordIdentity: recordIdentity,
 	});
-	if (promoted.status === "pending_activation") throw new Error("installation_pending_activation");
+	if (promoted.reason === "candidate_changed" && redundantStage) {
+		logger.warn("Activation staging path changed during reconciliation; leaving it untouched", {
+			changedStagingPath: record.stagingPath,
+			retryCandidatePath: redundantStage.path,
+		});
+		await repointActivationRecordToRetryCandidate(
+			{
+				...record,
+				phase: "pending_activation",
+				stagingPath: redundantStage.path,
+				stagingIdentity: redundantStage.identity,
+			},
+			recordIdentity,
+			redundantStage.path,
+		);
+		throw new Error("installation_pending_activation");
+	}
+	if (promoted.status === "pending_activation") {
+		if (promoted.reason === "candidate_missing" && redundantStage) {
+			await repointActivationRecordToRetryCandidate(
+				{
+					...record,
+					phase: "pending_activation",
+					stagingPath: redundantStage.path,
+					stagingIdentity: redundantStage.identity,
+				},
+				recordIdentity,
+				redundantStage.path,
+			);
+		} else {
+			const stagingCleanupWarning = redundantStage
+				? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+				: undefined;
+			if (stagingCleanupWarning)
+				logger.warn("Update staging cleanup failed while activation is pending", {
+					warning: stagingCleanupWarning,
+				});
+		}
+		throw new Error("installation_pending_activation");
+	}
 	if (
 		(promoted.status !== "reconciled" &&
 			promoted.status !== "applied_unverified" &&
 			promoted.status !== "verified") ||
 		!promoted.record ||
 		!promoted.recordIdentity
-	)
+	) {
+		const stagingCleanupWarning = redundantStage
+			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+			: undefined;
+		if (promoted.reason === "access_denied")
+			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode, stagingCleanupWarning, {
+				detachedPath: promoted.detachedPath,
+				retainedSuccessorPath: promoted.retainedSuccessorPath,
+				retainedPlaceholderPath: promoted.retainedPlaceholderPath,
+				retainedUnknownPath: promoted.retainedUnknownPath,
+			});
+		if (stagingCleanupWarning)
+			logger.warn("Update staging cleanup failed after activation reconciliation failed", {
+				reason: promoted.reason ?? promoted.status,
+				warning: stagingCleanupWarning,
+			});
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
+	}
 	record = promoted.record;
 	recordIdentity = promoted.recordIdentity;
+	const cleanupWarnings: string[] = [];
 	try {
-		const verification = await options.verifyInstalledVersion(options.expectedVersion);
+		let verification = await options.verifyInstalledVersion(options.expectedVersion);
 		if (!verification.ok) throw new Error(formatVerificationFailure(verification, options.expectedVersion));
 		const after = await snapshotRegularFile(targetPath);
 		if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
 			throw new Error("installation_postcheck_identity_changed");
+		if (redundantStage) {
+			const cleanupWarning = await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
+			if (cleanupWarning) {
+				cleanupWarnings.push(cleanupWarning);
+				verification = { ...verification, cleanupWarning };
+			}
+		}
 		await updateActivationRecordFile({ ...record, phase: "verified" }, recordIdentity);
 		return verification;
 	} catch (primary) {
+		const rollbackCleanupWarning = redundantStage
+			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+			: undefined;
+		if (rollbackCleanupWarning) cleanupWarnings.push(rollbackCleanupWarning);
+		if (cleanupWarnings.length > 0)
+			logger.warn("Update staging cleanup failed before activation rollback", {
+				warning: cleanupWarnings.join("\n"),
+			});
 		try {
 			const after = await snapshotRegularFile(targetPath);
 			if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
@@ -1129,14 +1431,185 @@ export interface BinaryUpdateFlow {
 	beforeReplace?(): void;
 }
 
+function binaryStagingPath(targetPath: string, stamp: string): string {
+	const extension = path.extname(targetPath);
+	if (!extension) return `${targetPath}.new.${stamp}`;
+	return `${targetPath.slice(0, -extension.length)}.new.${stamp}${extension}`;
+}
+
+const UPDATE_FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const EXACT_REPLACE_DESTINATION_NAME = /^\.gjc-exact-replace-destination-([0-9a-f]+)-([0-9a-f]+)$/u;
+// Do not race a separate process that is still completing a native replacement in this directory.
+const EXACT_REPLACE_CLEANUP_GRACE_MS = 10 * 60 * 1000;
+
+function isUpdateStagingName(targetPath: string, name: string): boolean {
+	const extension = path.extname(targetPath);
+	const prefix = `${path.basename(targetPath, extension)}.new.`;
+	if (!name.startsWith(prefix)) return false;
+	const suffix = name.slice(prefix.length);
+	if (extension && !suffix.endsWith(extension)) return false;
+	const id = extension ? suffix.slice(0, -extension.length) : suffix;
+	return UPDATE_FILE_ID.test(id);
+}
+
+function isUpdateBackupName(targetPath: string, name: string): boolean {
+	const prefix = `${path.basename(targetPath)}.bak.`;
+	if (name.startsWith(prefix) && UPDATE_FILE_ID.test(name.slice(prefix.length))) return true;
+	const legacyPrefix = `${path.basename(targetPath)}-`;
+	if (!name.startsWith(legacyPrefix)) return false;
+	const legacyName = name.slice(legacyPrefix.length);
+	const marker = legacyName.indexOf(".bak.");
+	if (marker < 0) return false;
+	const version = legacyName.slice(0, marker);
+	const timestamp = legacyName.slice(marker + ".bak.".length);
+	return (
+		/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(version) && /^[0-9A-Za-z._-]+$/u.test(timestamp)
+	);
+}
+
+export function isUpdateStagingNameForTest(targetPath: string, name: string): boolean {
+	return isUpdateStagingName(targetPath, name);
+}
+
+export function isUpdateBackupNameForTest(targetPath: string, name: string): boolean {
+	return isUpdateBackupName(targetPath, name);
+}
+
+async function removeExactUpdateArtifact(filePath: string, parent: DirectoryIdentity): Promise<string | undefined> {
+	try {
+		const snapshot = await snapshotRegularFile(filePath);
+		if (!snapshot) return undefined;
+		if (snapshot.identity.parentDev !== parent.dev || snapshot.identity.parentIno !== parent.ino)
+			return `parent_identity_changed:${filePath}`;
+		const removed = exactUnlinkDirect(
+			filePath,
+			toNativeIdentity(snapshot.identity, `.gjc-update-cleanup-${randomUUID()}`),
+		);
+		if (removed.ok || removed.code === "not_found") return undefined;
+		const retained = [
+			removed.detachedPath ? `detached=${removed.detachedPath}` : undefined,
+			removed.retainedPlaceholderPath ? `placeholder=${removed.retainedPlaceholderPath}` : undefined,
+			removed.retainedUnknownPath ? `unknown=${removed.retainedUnknownPath}` : undefined,
+			removed.retainedSuccessorPath ? `successor=${removed.retainedSuccessorPath}` : undefined,
+		].filter((entry): entry is string => entry !== undefined);
+		return `exact_unlink_${removed.code ?? "failed"}:${filePath}${retained.length ? `|${retained.join("|")}` : ""}`;
+	} catch (error) {
+		return `snapshot_failed:${filePath}:${error instanceof Error ? error.message : String(error)}`;
+	}
+}
+
+/**
+ * Reclaim only generated update artifacts while holding the install lock.
+ * Keep a stage only while an active activation record owns it, and retain at
+ * most the rollback backup the record can still need.
+ */
+async function cleanupBinaryUpdateArtifacts(
+	targetPath: string,
+	originalParent: DirectoryIdentity,
+	retainedRetryCandidatePath?: string,
+): Promise<string | undefined> {
+	const parentPath = path.dirname(path.resolve(targetPath));
+	const warnings: string[] = [];
+	try {
+		const currentParent = await snapshotDirectory(parentPath);
+		if (!sameDirectoryIdentity(originalParent, currentParent)) return "installation_parent_changed";
+		const entries = await fs.promises.readdir(parentPath, { withFileTypes: true });
+		const activation = await readActivationRecord(targetPath);
+		if (activation.status === "malformed" || activation.status === "foreign") {
+			warnings.push(`activation_record_untrusted:${activation.reason}`);
+		} else {
+			const record = activation.status === "valid" ? activation.record : undefined;
+			const terminal = record?.phase === "verified" || record?.phase === "rolled_back";
+			const pinnedStages = new Set<string>();
+			if (record && !terminal) pinnedStages.add(path.resolve(record.stagingPath));
+			if (retainedRetryCandidatePath) pinnedStages.add(path.resolve(retainedRetryCandidatePath));
+			for (const entry of entries) {
+				if (!isUpdateStagingName(targetPath, entry.name)) continue;
+				const stagingPath = path.join(parentPath, entry.name);
+				if (pinnedStages.has(stagingPath)) continue;
+				const warning = await removeExactUpdateArtifact(stagingPath, originalParent);
+				if (warning) warnings.push(warning);
+			}
+
+			const recognizedBackup = record && isUpdateBackupName(targetPath, record.backupName);
+			let preserveBackup: string | undefined;
+			let mayPruneBackups = activation.status === "missing";
+			if (record && recognizedBackup) {
+				if (record.phase === "rolled_back" || !record.baseline.exists) {
+					mayPruneBackups = true;
+				} else if (record.phase === "verified" || record.phase === "published" || record.phase === "uncertain") {
+					if (record.backupIdentity) {
+						const baseline = await snapshotRegularFile(path.join(parentPath, record.backupName));
+						if (baseline && sameFileIdentity(record.backupIdentity, baseline.identity)) {
+							preserveBackup = record.backupName;
+							mayPruneBackups = true;
+						}
+					}
+				} else if (record.phase === "staged" || record.phase === "pending_activation") {
+					const current = await snapshotRegularFile(targetPath);
+					const baselineUnchanged = record.baseline.exists
+						? !!current && !!record.targetIdentity && sameFileIdentity(record.targetIdentity, current.identity)
+						: current === undefined;
+					if (baselineUnchanged) {
+						const transactionBackup = await snapshotRegularFile(path.join(parentPath, record.backupName));
+						if (!transactionBackup) mayPruneBackups = true;
+						else if (
+							record.backupIdentity &&
+							sameFileIdentity(record.backupIdentity, transactionBackup.identity)
+						) {
+							preserveBackup = record.backupName;
+							mayPruneBackups = true;
+						}
+					}
+				}
+			}
+			if (mayPruneBackups) {
+				for (const entry of entries) {
+					if (!isUpdateBackupName(targetPath, entry.name) || entry.name === preserveBackup) continue;
+					const warning = await removeExactUpdateArtifact(path.join(parentPath, entry.name), originalParent);
+					if (warning) warnings.push(warning);
+				}
+			}
+		}
+
+		if (process.platform !== "win32") {
+			const staleBefore = BigInt(Date.now() - EXACT_REPLACE_CLEANUP_GRACE_MS) * 1_000_000n;
+			for (const entry of entries) {
+				const match = EXACT_REPLACE_DESTINATION_NAME.exec(entry.name);
+				if (!match) continue;
+				const placeholderPath = path.join(parentPath, entry.name);
+				const placeholder = await snapshotRegularFile(placeholderPath);
+				if (!placeholder) continue;
+				const { identity } = placeholder;
+				if (
+					identity.parentDev !== originalParent.dev ||
+					identity.parentIno !== originalParent.ino ||
+					identity.size !== "0" ||
+					identity.nlink !== "1" ||
+					BigInt(identity.ino).toString(16) !== match[1]
+				)
+					continue;
+				// The current flow has returned from its synchronous native calls; older
+				// process IDs get the grace window above before their residue is reaped.
+				if (match[2] !== process.pid.toString(16) && BigInt(identity.mtimeNs) >= staleBefore) continue;
+				const warning = await removeExactUpdateArtifact(placeholderPath, originalParent);
+				if (warning) warnings.push(warning);
+			}
+		}
+	} catch (error) {
+		warnings.push(error instanceof Error ? error.message : String(error));
+	}
+	return warnings.length > 0 ? warnings.join("\n") : undefined;
+}
+
 /**
  * Orchestrate download → fsync → replace → verify with a strict ordering
  * contract: the downloaded temp binary MUST be flushed to stable storage
  * before it is published (renamed into place) or exec'd for verification.
  *
  * If fsync fails the temp bytes are not durable, so we abort before
- * replacement/verification and retain the staging artifact rather than risk
- * deleting a substituted pathname or installing a possibly-truncated binary.
+ * replacement/verification. Final cleanup removes the exact staging identity
+ * only when no activation record still owns it.
  */
 export async function runBinaryUpdateFlow(
 	targetPath: string,
@@ -1145,18 +1618,22 @@ export async function runBinaryUpdateFlow(
 	flow: BinaryUpdateFlow,
 ): Promise<InstalledVersionVerification> {
 	const stamp = randomUUID();
-	const tempPath = `${targetPath}.new.${stamp}`;
+	const tempPath = binaryStagingPath(targetPath, stamp);
 	const backupPath = `${targetPath}.bak.${stamp}`;
 	const releaseLock = await acquireBinaryUpdateLock(targetPath);
+	let originalParent: DirectoryIdentity | undefined;
+	let verification: InstalledVersionVerification | undefined;
+	let failed = false;
+	let failure: unknown;
 	try {
 		const originalTarget = await snapshotRegularFile(targetPath);
-		const originalParent = await snapshotDirectory(path.dirname(targetPath));
+		originalParent = await snapshotDirectory(path.dirname(targetPath));
 		if (!originalParent) throw new Error("installation_parent_unavailable");
 		await flow.download(url, tempPath);
 		await flow.fsync(tempPath);
 
 		flow.beforeReplace?.();
-		return await flow.replace({
+		verification = await flow.replace({
 			targetPath,
 			tempPath,
 			backupPath,
@@ -1165,9 +1642,38 @@ export async function runBinaryUpdateFlow(
 			originalParent,
 			verifyInstalledVersion: flow.verifyInstalledVersion,
 		});
-	} finally {
-		await releaseLock();
+	} catch (error) {
+		failed = true;
+		failure = error;
 	}
+	const retainedRetryCandidatePath =
+		failure instanceof ActivationRetryCandidateRepointError ? failure.candidatePath : undefined;
+	const cleanupWarning = originalParent
+		? await cleanupBinaryUpdateArtifacts(targetPath, originalParent, retainedRetryCandidatePath)
+		: undefined;
+	try {
+		await releaseLock();
+	} catch (error) {
+		if (!failed) {
+			failed = true;
+			failure = error;
+		} else {
+			logger.warn("Update install lock cleanup failed", {
+				warning: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	if (failed) {
+		if (cleanupWarning)
+			logger.warn("Update artifact cleanup failed after unsuccessful update", { warning: cleanupWarning });
+		throw failure;
+	}
+	if (!verification) throw new Error("binary_update_verification_missing");
+	if (!cleanupWarning) return verification;
+	return {
+		...verification,
+		cleanupWarning: [verification.cleanupWarning, cleanupWarning].filter(Boolean).join("\n"),
+	};
 }
 
 export async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
@@ -1280,7 +1786,8 @@ async function updateViaBinaryAt(
 		beforeReplace: () => console.log(chalk.dim("Installing update...")),
 	});
 
-	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
+	if (verification.cleanupWarning)
+		logger.warn("Update staging cleanup failed", { warning: verification.cleanupWarning });
 	return verification;
 }
 

@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { $credentialEnv } from "@gajae-code/utils";
 
 import type { Model } from "../types";
 
@@ -19,6 +20,8 @@ interface HealthPayload {
 	ok?: unknown;
 	pid?: unknown;
 	port?: unknown;
+	status?: unknown;
+	service?: unknown;
 	version?: unknown;
 }
 
@@ -70,8 +73,73 @@ function healthPort(endpoint: string): number {
 	return Number(new URL(endpoint).port);
 }
 
+const OPENCODEX_HOME_ENV = "OPENCODEX_HOME";
+
+/** Trusted directory, or empty when the live value is rejected with no trusted directory. Captured once. */
+let pinnedOpenCodexHome = "";
+let spawnFilterInstalled = false;
+
+function envForOpenCodexChild(env: Record<string, string | undefined> | undefined): Record<string, string> {
+	const source = env ?? process.env;
+	const out: Record<string, string> = {};
+	for (const key of Object.keys(source)) {
+		const value = source[key];
+		if (typeof value !== "string") continue;
+		if (key === OPENCODEX_HOME_ENV) continue;
+		out[key] = value;
+	}
+	// Always set the pinned value. A missing name, or an older rejected value, would let the child cwd reload `.env`.
+	out[OPENCODEX_HOME_ENV] = pinnedOpenCodexHome;
+	return out;
+}
+
+/** After a project value is rejected, later Bun spawns pin that name so cwd `.env` cannot restore it. */
+function installOpenCodexSpawnFilter(): void {
+	if (spawnFilterInstalled) return;
+	spawnFilterInstalled = true;
+	const bun = Bun as unknown as {
+		spawn: (first: unknown, second?: { env?: Record<string, string | undefined> }) => unknown;
+		spawnSync: (first: unknown, second?: { env?: Record<string, string | undefined> }) => unknown;
+	};
+	const spawn = bun.spawn.bind(Bun);
+	const spawnSync = bun.spawnSync.bind(Bun);
+	const call = (
+		run: (first: unknown, second?: { env?: Record<string, string | undefined> }) => unknown,
+		first: unknown,
+		second?: { env?: Record<string, string | undefined> },
+	) => {
+		if (Array.isArray(first)) return run(first, { ...second, env: envForOpenCodexChild(second?.env) });
+		const options = (first ?? {}) as { env?: Record<string, string | undefined> };
+		return run({ ...options, env: envForOpenCodexChild(options.env) });
+	};
+	bun.spawn = (first, second) => call(spawn, first, second);
+	bun.spawnSync = (first, second) => call(spawnSync, first, second);
+}
+
+/**
+ * Directory for `runtime-port.json`. `$credentialEnv` keeps the launching shell
+ * and user-owned env files and skips a project `.env`. A rejected live value is
+ * removed from `process.env`. Later `Bun.spawn` and `Bun.spawnSync` calls set
+ * that name to the trusted directory, or to an empty string when none is
+ * trusted. The pin is captured at the first rejection and a later discovery
+ * does not replace it. Every later child env gets that pin, including an
+ * omitted name or a copy that still holds an older rejected value, so the
+ * child cwd `.env` cannot restore it. `node:child_process` omits a key
+ * deleted from `process.env`.
+ */
+function trustedOpenCodexHome(): string | undefined {
+	const trusted = $credentialEnv(OPENCODEX_HOME_ENV)?.trim();
+	const live = process.env[OPENCODEX_HOME_ENV]?.trim();
+	if (live && live !== trusted) {
+		if (!spawnFilterInstalled) pinnedOpenCodexHome = trusted || "";
+		delete process.env[OPENCODEX_HOME_ENV];
+		installOpenCodexSpawnFilter();
+	}
+	return trusted || undefined;
+}
+
 async function readRuntimeEndpoint(): Promise<string | undefined> {
-	const home = process.env.OPENCODEX_HOME?.trim() || path.join(os.homedir(), ".opencodex");
+	const home = trustedOpenCodexHome() || path.join(os.homedir(), ".opencodex");
 	try {
 		const raw = JSON.parse(await fs.readFile(path.join(home, "runtime-port.json"), "utf8")) as RuntimePortFile;
 		const hostname =
@@ -103,7 +171,10 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
 function isOpenCodexHealth(payload: unknown, expectedPort: number): boolean {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
 	const health = payload as HealthPayload;
-	return health.ok === true && health.version === "opencodex" && health.port === expectedPort;
+	const identityOk =
+		(health.ok === true && health.version === "opencodex") ||
+		(health.status === "ok" && health.service === "opencodex");
+	return identityOk && health.port === expectedPort;
 }
 
 export async function resolveOpenCodexEndpoint(signal?: AbortSignal): Promise<OpenCodexEndpoint | undefined> {
@@ -144,6 +215,7 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		Array.isArray(modalities) && modalities.every(value => value === "text" || value === "image")
 			? modalities
 			: ["text"];
+	const reasoning = (row.reasoning ?? row.capabilities?.supports_reasoning) !== false;
 	return {
 		id: publicId,
 		wireModelId: rawId,
@@ -151,8 +223,8 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		api: "openai-responses",
 		provider: "opencodex",
 		baseUrl: `${endpoint.baseUrl}/v1`,
-		compat: { supportsServiceTier: true },
-		reasoning: (row.reasoning ?? row.capabilities?.supports_reasoning) !== false,
+		compat: reasoning ? { supportsServiceTier: true, supportsReasoningEffort: true } : { supportsServiceTier: true },
+		reasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: asPositiveNumber(row.contextWindow ?? row.capabilities?.context_length, 128_000),

@@ -6,8 +6,37 @@ import { Broker, resolveBrokerPackageGeneration } from "../src/sdk/broker/broker
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { brokerOwnerIdentityMatchesForTest, ensureBroker } from "../src/sdk/broker/ensure";
+import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
+import { SdkClient } from "../src/sdk/client/client";
 
 const currentGeneration = (packageJson as { version: string }).version;
+
+async function shutdownPublishedBroker(agentDir: string): Promise<void> {
+	const discovery = await readBrokerDiscovery(agentDir);
+	if (!discovery) return;
+	const client = await SdkClient.connect(discovery.url, discovery.token, { timeoutMs: 2_000 });
+	try {
+		await client.global("broker.shutdown", {});
+	} finally {
+		await client.close().catch(() => undefined);
+	}
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (discovery.pid === process.pid) {
+			const current = await readBrokerDiscovery(agentDir);
+			if (!current || current.ownerId !== discovery.ownerId) return;
+		} else {
+			const observation = observeProcessIncarnation(discovery.pid);
+			if (
+				observation.status === "absent" ||
+				(observation.status === "present" && observation.incarnation !== discovery.incarnation)
+			)
+				return;
+		}
+		await Bun.sleep(20);
+	}
+	throw new Error(`Broker ${discovery.pid} did not exit after authenticated test cleanup.`);
+}
 
 describe("sdk broker stale-generation fence (#5227)", () => {
 	test("stale retirement requires the exact broker process incarnation", () => {
@@ -55,8 +84,7 @@ describe("sdk broker stale-generation fence (#5227)", () => {
 			// Must be a different owner than the stale broker
 			expect(results[0].ownerId).not.toBe(staleDiscovery.ownerId);
 
-			// Stale process should be gone (broker.shutdown kills it, fallback SIGTERM)
-			// Give it a moment to exit
+			// Stale ownership must be gone after the authenticated shutdown request.
 			await Bun.sleep(500);
 			const after = await readBrokerDiscovery(agentDir);
 			expect(after).not.toBeNull();
@@ -64,15 +92,7 @@ describe("sdk broker stale-generation fence (#5227)", () => {
 			expect(after!.ownerId).not.toBe(staleDiscovery.ownerId);
 		} finally {
 			await staleBroker.stop().catch(() => {});
-			// Stop the replacement too via discovery pid if needed
-			try {
-				const cur = await readBrokerDiscovery(agentDir);
-				if (cur) {
-					try {
-						process.kill(cur.pid, "SIGTERM");
-					} catch {}
-				}
-			} catch {}
+			await shutdownPublishedBroker(agentDir);
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
@@ -89,14 +109,7 @@ describe("sdk broker stale-generation fence (#5227)", () => {
 			await Bun.sleep(300);
 		} finally {
 			await staleBroker.stop().catch(() => {});
-			try {
-				const cur = await readBrokerDiscovery(agentDir);
-				if (cur) {
-					try {
-						process.kill(cur.pid, "SIGTERM");
-					} catch {}
-				}
-			} catch {}
+			await shutdownPublishedBroker(agentDir);
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});

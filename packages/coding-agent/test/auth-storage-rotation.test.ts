@@ -87,10 +87,15 @@ describe("AuthStorage account rotation", () => {
 		const sessionId = "issue-55-session";
 		const firstKey = await authStorage.getApiKey("openai-codex", sessionId);
 		expect(firstKey).toMatch(/^api-acct-/);
+		const failedRowId = authStorage.getSessionCredentialRowId("openai-codex", sessionId)!;
 
 		usageExhausted = true;
-		const switched = await authStorage.markUsageLimitReached("openai-codex", sessionId);
-		expect(switched).toBe(true);
+		const result = await authStorage.markUsageLimitReached("openai-codex", sessionId);
+		expect(result.state).toBe("marked");
+		expect(result.failedRowId).toBe(failedRowId);
+		expect(result.credentialKind).toBe("oauth");
+		expect(result.remainingCredentialIds.length).toBeGreaterThan(0);
+		expect(result.remainingCredentialIds).not.toContain(failedRowId);
 
 		const exhaustedFallbackKey = await authStorage.getApiKey("openai-codex", sessionId);
 		expect(exhaustedFallbackKey).toMatch(/^api-acct-/);

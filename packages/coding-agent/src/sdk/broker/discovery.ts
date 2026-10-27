@@ -264,6 +264,11 @@ async function rollbackPublishedBrokerDiscovery(agentDir: string, discovery: Bro
 	}
 }
 
+/** Remove only the exact discovery record this broker published. */
+export async function rollbackBrokerDiscoveryIfCurrent(agentDir: string, discovery: BrokerDiscovery): Promise<void> {
+	await rollbackPublishedBrokerDiscovery(agentDir, discovery);
+}
+
 class NativeRetainedBrokerDiscovery implements RetainedBrokerDiscovery {
 	#closed = false;
 	#publication: NativeRetainedBrokerPublication;
@@ -381,6 +386,14 @@ export interface BrokerDiscovery {
 	ownerId: string;
 	pid: number;
 	incarnation: string;
+	/**
+	 * Public publication-incarnation id for diagnostic observation, fixed at startup.
+	 * Absent on publications written before the capability existed; an observer then
+	 * reports `unsupported` instead of synthesizing compatibility.
+	 */
+	diagnosticGeneration?: string;
+	/** Diagnostic protocol the publisher answers; absent means no capability. */
+	diagnosticProtocol?: number;
 	host: "127.0.0.1";
 	port: number;
 	url: string;
@@ -468,21 +481,33 @@ export async function publishBrokerDiscovery(
 	agentDir: string,
 	discovery: BrokerDiscoveryWrite,
 	platform: NodeJS.Platform = process.platform,
+	signal?: AbortSignal,
+	afterWriteForTest?: () => Promise<void>,
 ): Promise<RetainedBrokerDiscovery> {
+	if (signal?.aborted) throw new Error("Broker startup was interrupted before discovery publication.");
 	const incarnation = discovery.incarnation ?? brokerProcessIncarnation(discovery.pid);
 	if (!incarnation) throw new Error(`Broker process incarnation is unavailable for pid ${discovery.pid}.`);
-	await writeBrokerDiscovery(agentDir, { ...discovery, incarnation });
-	const published: BrokerDiscovery = {
-		...discovery,
-		incarnation,
-		rootDigest: await canonicalServiceRootDigest(agentDir),
-	};
-	if (platform === "win32") return new LegacyWindowsBrokerDiscovery(agentDir, published);
+	const expectedPublication: BrokerDiscovery = { ...discovery, incarnation };
+	let retained: RetainedBrokerDiscovery | undefined;
 	try {
-		return new NativeRetainedBrokerDiscovery(requireRetainedBrokerPublication(agentDir));
+		await writeBrokerDiscovery(agentDir, expectedPublication);
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		await afterWriteForTest?.();
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		const published: BrokerDiscovery = {
+			...discovery,
+			incarnation,
+			rootDigest: await canonicalServiceRootDigest(agentDir),
+		};
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		if (platform === "win32") retained = new LegacyWindowsBrokerDiscovery(agentDir, published);
+		else retained = new NativeRetainedBrokerDiscovery(requireRetainedBrokerPublication(agentDir));
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		return retained;
 	} catch (error) {
+		retained?.close();
 		try {
-			await rollbackPublishedBrokerDiscovery(agentDir, published);
+			await rollbackPublishedBrokerDiscovery(agentDir, expectedPublication);
 		} catch (rollbackError) {
 			// The aggregate message is the only thing the durable startup-failure
 			// marker persists (`AggregateError.errors` is not serialized), so the named
@@ -505,6 +530,22 @@ export function heartbeatBrokerDiscoveryRetained(
 ): Promise<boolean> {
 	return publication.heartbeat(heartbeatAt);
 }
+
+/**
+ * Publication url the broker writes for itself: `ws://127.0.0.1:<port>` with an
+ * optional trailing slash, and that port equal to the record's port. The host
+ * field check stays; this is the url field beside it.
+ */
+const OWNED_LOOPBACK_WS_URL = /^ws:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/?$/;
+
+function ownedLoopbackBrokerUrl(url: unknown, port: unknown): boolean {
+	if (typeof url !== "string" || typeof port !== "number" || !Number.isSafeInteger(port)) return false;
+	const match = OWNED_LOOPBACK_WS_URL.exec(url);
+	if (!match) return false;
+	const parsed = Number(match[1]);
+	return parsed === port && parsed >= 1 && parsed <= 65_535;
+}
+
 export async function readBrokerDiscovery(
 	agentDir: string,
 	ttlMs = BROKER_HEARTBEAT_TTL_MS,
@@ -518,6 +559,7 @@ export async function readBrokerDiscovery(
 			d.version !== SDK_STATE_VERSION ||
 			d.protocolVersion !== 3 ||
 			d.host !== "127.0.0.1" ||
+			!ownedLoopbackBrokerUrl(d.url, d.port) ||
 			!d.token ||
 			!Number.isSafeInteger(d.pid) ||
 			d.pid <= 0 ||

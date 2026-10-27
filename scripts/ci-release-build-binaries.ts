@@ -151,8 +151,11 @@ async function resetArtifacts(): Promise<void> {
 		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --reset");
 		return;
 	}
-	await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native", "--reset"], repoRoot);
-	await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--reset"], repoRoot);
+	try {
+		await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native", "--reset"], repoRoot);
+	} finally {
+		await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--reset"], repoRoot);
+	}
 }
 
 async function main(): Promise<void> {
@@ -181,8 +184,8 @@ async function main(): Promise<void> {
 	}
 
 	await fs.mkdir(binariesDir, { recursive: true });
-	await generateBundle();
 	try {
+		await generateBundle();
 		for (const target of selectedTargets) {
 			await buildBinary(target);
 		}

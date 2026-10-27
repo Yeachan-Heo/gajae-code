@@ -394,6 +394,15 @@ export interface CommandEntry {
 	name: string;
 	load: () => Promise<CommandCtor>;
 	aliases?: string[];
+	/** Owns parsing, help, loading and failures for this family when supplied. */
+	dispatch?: (argv: string[], context: CommandEntryContext) => Promise<void>;
+}
+
+export interface CommandEntryContext {
+	bin: string;
+	version: string;
+	/** Canonical registered entry name, including when invoked through an alias. */
+	command: string;
 }
 
 export interface RunOptions {
@@ -436,6 +445,12 @@ export async function run(opts: RunOptions): Promise<void> {
 	// Version
 	if (commandId === "--version" || commandId === "-v") {
 		process.stdout.write(`${bin}/${version}\n`);
+		return;
+	}
+
+	const dispatchedEntry = findEntry(opts.commands, commandId);
+	if (dispatchedEntry?.dispatch) {
+		await dispatchedEntry.dispatch(commandArgv, { bin, version, command: dispatchedEntry.name });
 		return;
 	}
 

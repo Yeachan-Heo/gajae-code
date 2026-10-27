@@ -184,6 +184,23 @@ export function buildCoordinatorAskAnswerSchema(
 	return {
 		title: "CoordinatorQuestionAnswerV1",
 		type: "object",
+		// `additionalProperties: false` is scoped by the SIBLING `properties` map, not by
+		// the `oneOf` branches: a standards-compliant validator evaluates the keyword
+		// against this node alone. Without this map every answer field was "additional",
+		// so selection, custom-answer, and clarification payloads were all rejected
+		// client-side before the server saw them (#5801). Each branch stays closed too,
+		// so the union still rejects field combinations this map alone would allow.
+		properties: {
+			selected: selectedBase,
+			other: { type: "boolean", description: "set true to provide a free-text answer in `custom`" },
+			custom: boundedAnswerText("free-text answer; required when `other` is true"),
+			action: {
+				type: "string",
+				enum: ["answer", "clarify"],
+				description: "set to `clarify` to ask about the choices without answering the round",
+			},
+			question: boundedAnswerText("clarification question; required when action is `clarify`"),
+		},
 		additionalProperties: false,
 		oneOf: [
 			{

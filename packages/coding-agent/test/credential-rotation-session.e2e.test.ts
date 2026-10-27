@@ -5,6 +5,7 @@ import { Agent, type AgentOptions } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import * as oauth from "@gajae-code/ai/utils/oauth";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -123,6 +124,78 @@ describe("AgentSession credential pin — no mutation on a pinned provider", () 
 		await session.prompt("unpinned provider may rotate");
 		await session.waitForIdle();
 		expect(markUsageLimitReached).toHaveBeenCalled();
+	});
+
+	it("does not back off a sticky OAuth row for a later env-backed turn failure", async () => {
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "anthropic-oauth-token",
+				refresh: "anthropic-refresh-token",
+				expires: Date.now() + 3_600_000,
+				accountId: "anthropic-account",
+			},
+		]);
+		vi.spyOn(oauth, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials.anthropic;
+			return credential ? { apiKey: credential.access, newCredentials: credential } : null;
+		});
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const modelRegistry = new ModelRegistry(authStorage);
+		let anthropicRequests = 0;
+		const anthropicApiKeys: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => {
+				if (!session) throw new Error("Session not initialized");
+				return modelRegistry.getApiKeyForProvider(provider, session.credentialSessionId);
+			},
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, options) => {
+				if (model.provider === "anthropic") {
+					anthropicApiKeys.push(String(options?.apiKey));
+					if (anthropicRequests++ > 0) return quotaStream(model);
+				}
+				return successfulStream(model);
+			}) satisfies AgentOptions["streamFn"],
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.enabled": false,
+			"retry.maxRetries": 0,
+		});
+		settings.set("modelRoles", { default: [selector(primary), selector(fallback)] });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("establish the sticky OAuth account");
+		await session.waitForIdle();
+		const oauthRowId = authStorage.getSessionCredentialRowId("anthropic", session.credentialSessionId);
+		if (oauthRowId === undefined) throw new Error("Expected the first request to establish an OAuth row");
+		expect(anthropicApiKeys[0]).toBe("anthropic-oauth-token");
+		expect(authStorage.getSessionCredentialType("anthropic", session.credentialSessionId)).toBe("oauth");
+
+		authStorage.setConfigApiKey("anthropic", "anthropic-env-key", {
+			envSourced: true,
+			owner: modelRegistry.getAuthStorageOwner(),
+		});
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const invalidateCredentialMatching = vi.spyOn(authStorage, "invalidateCredentialMatching");
+
+		await session.prompt("fail using the env-backed key");
+		await session.waitForIdle();
+
+		expect(anthropicApiKeys[1]).toBe("anthropic-env-key");
+		expect(markUsageLimitReached).not.toHaveBeenCalled();
+		expect(invalidateCredentialMatching).not.toHaveBeenCalled();
+		expect(authStorage.getSessionCredentialRowId("anthropic", session.credentialSessionId)).toBe(oauthRowId);
+		expect(authStorage.isCredentialAvailable("anthropic", oauthRowId)).toBe(true);
 	});
 
 	it("never rotates a `--credential`-pinned row, and therefore never announces a switch", async () => {

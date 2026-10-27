@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Write as _, io::Write};
 use brush_core::{
 	ExecutionExitCode, ExecutionResult, builtins,
 	completion::{self, CompleteAction, CompleteOption, Spec},
-	error, escape,
+	escape,
 };
 use clap::Parser;
 
@@ -188,6 +188,30 @@ impl CommonCompleteCommandArgs {
 
 		actions
 	}
+
+	const fn has_completion_spec(&self) -> bool {
+		!self.options.is_empty()
+			|| !self.actions.is_empty()
+			|| self.glob_pattern.is_some()
+			|| self.word_list.is_some()
+			|| self.function_name.is_some()
+			|| self.command.is_some()
+			|| self.filter_pattern.is_some()
+			|| self.prefix.is_some()
+			|| self.suffix.is_some()
+			|| self.action_alias
+			|| self.action_builtin
+			|| self.action_command
+			|| self.action_directory
+			|| self.action_exported
+			|| self.action_file
+			|| self.action_group
+			|| self.action_job
+			|| self.action_keyword
+			|| self.action_service
+			|| self.action_user
+			|| self.action_variable
+	}
 }
 
 /// Configure programmable command completion.
@@ -234,7 +258,7 @@ impl builtins::Command for CompleteCommand {
 			|| self.use_for_initial_word
 			|| self.names.is_empty()
 		{
-			self.process_global(&mut context)?;
+			result = self.process_global(&mut context)?;
 		} else {
 			for name in &self.names {
 				if !self.try_process_for_command(&mut context, name.as_str())? {
@@ -251,7 +275,7 @@ impl CompleteCommand {
 	fn process_global(
 		&self,
 		context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
-	) -> Result<(), brush_core::Error> {
+	) -> Result<ExecutionResult, brush_core::Error> {
 		// Read options before taking mutable borrow on completion_config
 		let extended_globbing = context.shell.options().extended_globbing;
 
@@ -272,13 +296,20 @@ impl CompleteCommand {
 		};
 
 		// Treat 'complete' with no options the same as 'complete -p'.
-		if self.print || (!self.remove && target_spec.is_none()) {
+		if self.print
+			|| (!self.remove && target_spec.is_none() && !self.common_args.has_completion_spec())
+		{
 			if let Some(target_spec) = target_spec {
 				if let Some(existing_spec) = target_spec {
 					let existing_spec = existing_spec.clone();
 					Self::display_spec(context, Some(special_option_name), None, &existing_spec)?;
 				} else {
-					return error::unimp("special spec not found");
+					writeln!(
+						context.stderr(),
+						"complete: {}: no completion specification",
+						Self::special_spec_name(special_option_name)
+					)?;
+					return Ok(ExecutionResult::general_error());
 				}
 			} else {
 				for (command_name, spec) in context.shell.completion_config().iter() {
@@ -297,11 +328,22 @@ impl CompleteCommand {
 				let mut new_spec = Some(self.common_args.create_spec(extended_globbing));
 				std::mem::swap(&mut new_spec, target_spec);
 			} else {
-				return error::unimp("set unspecified spec");
+				debug_assert!(self.common_args.has_completion_spec());
+				writeln!(context.stderr(), "complete: invalid usage")?;
+				return Ok(ExecutionExitCode::InvalidUsage.into());
 			}
 		}
 
-		Ok(())
+		Ok(ExecutionResult::success())
+	}
+
+	fn special_spec_name(option_name: &str) -> &'static str {
+		match option_name {
+			"-D" => "_DefaultCmD_",
+			"-E" => "_EmptycmD_",
+			"-I" => "_InitialWorD_",
+			_ => "",
+		}
 	}
 
 	fn try_display_spec_for_command(
@@ -510,7 +552,7 @@ impl builtins::Command for CompGenCommand {
 				}
 			},
 			completion::Answer::RestartCompletionProcess => {
-				return error::unimp("restart completion");
+				return Ok(ExecutionResult::general_error());
 			},
 		}
 

@@ -69,6 +69,9 @@
 							"supportsServiceTier": {
 								"type": "boolean"
 							},
+							"supportsUltrafastTier": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -524,6 +527,9 @@
 										"supportsServiceTier": {
 											"type": "boolean"
 										},
+										"supportsUltrafastTier": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -748,6 +754,11 @@
 										"short",
 										"long"
 									]
+								},
+								"streamIdleTimeoutMs": {
+									"type": "integer",
+									"minimum": 0,
+									"maximum": 2147483647
 								}
 							},
 							"required": [
@@ -915,6 +926,9 @@
 										"supportsServiceTier": {
 											"type": "boolean"
 										},
+										"supportsUltrafastTier": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -1139,6 +1153,11 @@
 										"short",
 										"long"
 									]
+								},
+								"streamIdleTimeoutMs": {
+									"type": "integer",
+									"minimum": 0,
+									"maximum": 2147483647
 								}
 							},
 							"additionalProperties": false
@@ -1158,6 +1177,11 @@
 							"short",
 							"long"
 						]
+					},
+					"streamIdleTimeoutMs": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 2147483647
 					},
 					"openaiCompat": {
 						"type": "object",

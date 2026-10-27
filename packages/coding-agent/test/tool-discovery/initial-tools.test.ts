@@ -20,6 +20,7 @@ const allToolsSettings = Settings.isolated({
 	"astGrep.enabled": true,
 	"astEdit.enabled": true,
 	"renderMermaid.enabled": true,
+	"reportIssue.enabled": true,
 	"debug.enabled": true,
 	"find.enabled": true,
 	"search.enabled": true,

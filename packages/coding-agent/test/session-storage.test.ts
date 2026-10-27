@@ -5,10 +5,14 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
+	ensureManagedDirectory,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedCommittedMutationError,
+	type ManagedFileIdentity,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -89,6 +93,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			["interrupted", "interrupted"],
 		] as const) {
@@ -135,6 +140,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			// A signal landing on the no-replace rename syscall before it enters the
 			// kernel never mutates the filesystem, so a pre-mutation "interrupted"
@@ -176,6 +182,14 @@ describe("native publish outcome classification", () => {
 				...preMutation,
 				reason: "cross_device",
 				code: "cross_device",
+				phase: "preflight",
+			}).reason,
+		).toBe("unknown");
+		expect(
+			classifyNativePublishOutcome({
+				...preMutation,
+				reason: "access_denied",
+				code: "access_denied",
 				phase: "preflight",
 			}).reason,
 		).toBe("unknown");
@@ -339,6 +353,54 @@ describe("native publish outcome classification", () => {
 				},
 			}).reason,
 		).toBe("unknown");
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("managed recovery authority warnings", () => {
+	it("warns about an unavailable recovery directory before child retention throws", () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-reaper-warning-"));
+		const root = managedDirectoryRoot(tempDir);
+		const rootAuthority = native.openRecoveryFsRoot(root.canonicalPath);
+		const events: string[] = [];
+		const metrics = {
+			ok: false,
+			code: "recovery_directory_unavailable",
+			scannedEntries: "0",
+			reapedFiles: "0",
+			reapedBytes: "0",
+			preservedEntries: "0",
+			failures: "0",
+			scanLimited: false,
+			totalReapedFiles: "0",
+			totalReapedBytes: "0",
+			totalFailures: "0",
+		} satisfies native.RecoveryFsReaperMetrics;
+		const openSpy = vi.spyOn(native, "openRecoveryFsRoot").mockReturnValue(rootAuthority);
+		const metricsSpy = vi.spyOn(rootAuthority, "recoveryReaperMetrics").mockImplementation(() => {
+			events.push("metrics");
+			return metrics;
+		});
+		const retainSpy = vi.spyOn(rootAuthority, "retainManagedDirectory").mockImplementation(() => {
+			events.push("retain");
+			throw new Error("unsafe recovery directory");
+		});
+		const warningSpy = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message === "Managed recovery sidecar reaping") events.push("warn");
+		});
+		try {
+			expect(() => retainManagedDirectoryAuthority(root, tempDir)).toThrow("unsafe recovery directory");
+			expect(events).toEqual(["metrics", "warn", "retain"]);
+			expect(warningSpy).toHaveBeenCalledWith(
+				"Managed recovery sidecar reaping",
+				expect.objectContaining({ ok: false, code: "recovery_directory_unavailable" }),
+			);
+			expect(openSpy).toHaveBeenCalledTimes(1);
+			expect(metricsSpy).toHaveBeenCalledTimes(1);
+			expect(retainSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.restoreAllMocks();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -507,54 +569,744 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
-describe("managed descriptor reads", () => {
-	it("returns transcript identity without exposing file bytes", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
+describe("MemorySessionStorageWriter owned append publication", () => {
+	let storage: MemorySessionStorage;
+
+	beforeEach(() => {
+		storage = new MemorySessionStorage();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("publishes unbuffered appends immediately and keeps read snapshots isolated", () => {
+		const sessionPath = "/sessions/immediate.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		writer.writeLineSync("first\n");
+
+		const firstStat = storage.statSync(sessionPath);
+		const snapshot = storage.readSnapshotSync(sessionPath);
+		const range = storage.readRangeSync(sessionPath, 0, firstStat.size);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe("first\n");
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe("first\n");
+		expect(firstStat.size).toBe(6);
+
+		writer.writeLineSync("second\n");
+		expect(storage.readTextSync(sessionPath)).toBe("first\nsecond\n");
+		expect(storage.statSync(sessionPath).size).toBe(13);
+		expect(storage.statSync(sessionPath).ino).toBe(firstStat.ino);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe("first\n");
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe("first\n");
+
+		snapshot.bytes[0] = 0;
+		range.bytes[0] = 0;
+		expect(storage.readTextSync(sessionPath)).toBe("first\nsecond\n");
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("keeps appended input isolated and publishes buffered bytes only on flush", () => {
+		const sessionPath = "/sessions/buffered.jsonl";
+		const writer = storage.openBufferedWriter(sessionPath, { flags: "w" });
+		const input = Buffer.from("first");
+		writer.writeBytesSync(input);
+		input.fill(0);
+
+		expect(storage.statSync(sessionPath).size).toBe(0);
+		expect(storage.readTextSync(sessionPath)).toBe("");
+		writer.flushSync();
+		expect(storage.readTextSync(sessionPath)).toBe("first");
+		const inode = storage.statSync(sessionPath).ino;
+
+		const nextInput = Buffer.from("+second");
+		writer.writeBytesSync(nextInput);
+		nextInput.fill(0);
+		expect(storage.readTextSync(sessionPath)).toBe("first");
+		writer.flushSync();
+		expect(storage.readTextSync(sessionPath)).toBe("first+second");
+		expect(storage.statSync(sessionPath).size).toBe(12);
+		expect(storage.statSync(sessionPath).ino).toBe(inode);
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("grows at the visible-length boundary without changing the prior prefix", () => {
+		const sessionPath = "/sessions/growth.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		const prefix = `${"a".repeat(4095)}\n`;
+		writer.writeLineSync(prefix);
+		const snapshot = storage.readSnapshotSync(sessionPath);
+		const range = storage.readRangeSync(sessionPath, 0, prefix.length);
+
+		writer.writeLineSync("b\n");
+		expect(storage.statSync(sessionPath).size).toBe(prefix.length + 2);
+		expect(storage.readTextSync(sessionPath)).toBe(`${prefix}b\n`);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe(prefix);
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe(prefix);
+		writer.closeSync();
+	});
+
+	it("retains a renamed published prefix while the writer continues at its old path", () => {
+		const sessionPath = "/sessions/renamed.jsonl";
+		const retainedPath = "/sessions/retained.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		writer.writeLineSync("prefix\n");
+		const retainedInode = storage.statSync(sessionPath).ino;
+
+		storage.renameSync(sessionPath, retainedPath);
+		writer.writeLineSync("continued\n");
+		expect(storage.readTextSync(retainedPath)).toBe("prefix\n");
+		expect(storage.readTextSync(sessionPath)).toBe("prefix\ncontinued\n");
+		expect(storage.statSync(retainedPath).ino).toBe(retainedInode);
+		expect(storage.statSync(sessionPath).ino).not.toBe(retainedInode);
+		writer.closeSync();
+	});
+
+	it("retains an exactly replaced prefix while its source writer continues", () => {
+		const sessionPath = "/sessions/replacement-source.jsonl";
+		const retainedPath = "/sessions/replacement-destination.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
 		try {
-			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
-			const bytes = Buffer.from("descriptor payload\n");
-			store.publishNoReplaceSync("session.jsonl", bytes);
-			const readSpy = vi.spyOn(fs, "readSync");
-			const descriptor = store.descriptorExpected("session.jsonl");
-			expect(descriptor).toMatchObject({ size: bytes.byteLength, isFile: true });
-			expect(descriptor?.dev).toBeTypeOf("bigint");
-			expect(descriptor?.ino).toBeTypeOf("bigint");
-			expect(store.descriptorExpected("missing.jsonl")).toBeNull();
-			expect(readSpy).not.toHaveBeenCalled();
+			writer.writeLineSync("prefix\n");
+			const retainedInode = storage.statSync(sessionPath).ino;
+			storage.writeTextSync(retainedPath, "original destination\n");
+			const destination = storage.readSnapshotSync(retainedPath);
+			expect(
+				storage.replaceExactSync(sessionPath, retainedPath, {
+					stat: destination.stat,
+					sha256: createHash("sha256").update(destination.bytes).digest("hex"),
+				}),
+			).toBe(true);
+			writer.writeLineSync("continued\n");
+			expect(storage.readTextSync(retainedPath)).toBe("prefix\n");
+			expect(storage.readTextSync(sessionPath)).toBe("prefix\ncontinued\n");
+			expect(storage.statSync(retainedPath).ino).toBe(retainedInode);
+			expect(storage.statSync(sessionPath).ino).not.toBe(retainedInode);
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			writer.closeSync();
 		}
 	});
 
-	it("reads bounded ranges and rejects a pathname swap before returning bytes", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-")));
-		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
-		const transcript = path.join(root, "session.jsonl");
+	it("reuses geometric backing allocations across many complete publications", () => {
+		const sessionPath = "/sessions/allocations.jsonl";
+		const seed = "s".repeat(32 * 1024);
+		storage.writeTextSync(sessionPath, seed);
+		const writer = storage.openWriter(sessionPath);
+		const realWriteBytesOwnedSync = storage.writeBytesOwnedSync.bind(storage);
+		const publishedBackings = new Set<ArrayBufferLike>();
+		const publishSpy = vi.spyOn(storage, "writeBytesOwnedSync").mockImplementation((path, content) => {
+			publishedBackings.add(content.buffer);
+			realWriteBytesOwnedSync(path, content);
+		});
+		const chunk = `${"x".repeat(8192)}\n`;
+		const appendCount = 20;
+
+		for (let index = 0; index < appendCount; index++) writer.writeLineSync(chunk);
+
+		const expected = seed + chunk.repeat(appendCount);
+		expect(storage.readTextSync(sessionPath)).toBe(expected);
+		expect(storage.statSync(sessionPath).size).toBe(Buffer.byteLength(expected));
+		// The writer grows geometrically (four backing buffers here); copying each
+		// whole visible prefix would instead allocate one distinct 8 KiB+ buffer per append.
+		expect(publishedBackings.size).toBeLessThanOrEqual(5);
+		publishSpy.mockRestore();
+		writer.closeSync();
+	});
+
+	it("keeps close errors stable and rejects writes after an uncertain close", () => {
+		const sessionPath = "/sessions/close-error.jsonl";
+		let closeCalls = 0;
+		const writer = storage.openWriter(sessionPath, {
+			flags: "w",
+			closeAdapter: {
+				close() {
+					closeCalls++;
+					throw new Error("memory close outcome unknown");
+				},
+			},
+		});
+		writer.writeLineSync("published\n");
+
+		expect(() => writer.closeSync()).toThrow("memory close outcome unknown");
+		const closeError = writer.getCloseError();
+		expect(closeError?.message).toBe("memory close outcome unknown");
+		expect(writer.getCloseState()).toBe("close_unknown");
+		expect(() => writer.closeSync()).toThrow("memory close outcome unknown");
+		expect(writer.getCloseError()).toBe(closeError);
+		expect(closeCalls).toBe(1);
+		expect(() => writer.writeLineSync("rejected\n")).toThrow("memory close outcome unknown");
+		expect(storage.readTextSync(sessionPath)).toBe("published\n");
+	});
+});
+
+describe("managed descriptor reads", () => {
+	const cjsFs = require("node:fs") as typeof fs;
+	const realCjsReadSync = cjsFs.readSync;
+	const realCjsCloseSync = cjsFs.closeSync;
+	const realCjsFstatSync = cjsFs.fstatSync;
+	const realCjsLstatSync = cjsFs.lstatSync;
+	const realCjsOpenSync = cjsFs.openSync;
+
+	function forwardFstatSync(fd: number): fs.Stats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+	function forwardFstatSync(fd: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+		return options === undefined ? realCjsFstatSync(fd) : realCjsFstatSync(fd, options);
+	}
+
+	function forwardLstatSync(file: fs.PathLike): fs.Stats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+	): fs.Stats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+	): fs.BigIntStats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+	): fs.Stats | undefined;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+	): fs.BigIntStats | undefined;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+	): fs.Stats | fs.BigIntStats;
+	function forwardLstatSync(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined;
+	function forwardLstatSync(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined {
+		return options === undefined ? realCjsLstatSync(file) : realCjsLstatSync(file, options);
+	}
+
+	function capturePathLstatError(
+		pathname: string,
+		onPathnameError: (error: NodeJS.ErrnoException) => void,
+	): typeof fs.lstatSync {
+		function lstat(file: fs.PathLike): fs.Stats;
+		function lstat(
+			file: fs.PathLike,
+			options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+		): fs.Stats;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+		): fs.BigIntStats;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+		): fs.Stats | undefined;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+		): fs.BigIntStats | undefined;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+		): fs.Stats | fs.BigIntStats;
+		function lstat(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined;
+		function lstat(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined {
+			try {
+				return forwardLstatSync(file, options);
+			} catch (error) {
+				if (path.resolve(String(file)) === pathname && (error as NodeJS.ErrnoException).code === "ENOENT")
+					onPathnameError(error as NodeJS.ErrnoException);
+				throw error;
+			}
+		}
+		return lstat;
+	}
+
+	function forwardReadSync(
+		fd: number,
+		buffer: NodeJS.ArrayBufferView,
+		offset: number,
+		length: number,
+		position: fs.ReadPosition | null,
+	): number;
+	function forwardReadSync(fd: number, buffer: NodeJS.ArrayBufferView, options?: fs.ReadOptions): number;
+	function forwardReadSync(
+		fd: number,
+		buffer: NodeJS.ArrayBufferView,
+		offsetOrOptions?: number | fs.ReadOptions,
+		length?: number,
+		position?: fs.ReadPosition | null,
+	): number {
+		if (typeof offsetOrOptions === "number") {
+			if (length === undefined || position === undefined) throw new Error("Invalid positional read arguments");
+			return realCjsReadSync(fd, buffer, offsetOrOptions, length, position);
+		}
+		return realCjsReadSync(fd, buffer, offsetOrOptions);
+	}
+
+	function instrumentReadSync(afterRead: () => void): typeof fs.readSync {
+		function read(
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: fs.ReadPosition | null,
+		): number;
+		function read(fd: number, buffer: NodeJS.ArrayBufferView, options?: fs.ReadOptions): number;
+		function read(
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offsetOrOptions?: number | fs.ReadOptions,
+			length?: number,
+			position?: fs.ReadPosition | null,
+		): number {
+			let count: number;
+			if (typeof offsetOrOptions === "number") {
+				if (length === undefined || position === undefined) throw new Error("Invalid positional read arguments");
+				count = forwardReadSync(fd, buffer, offsetOrOptions, length, position);
+			} else {
+				count = forwardReadSync(fd, buffer, offsetOrOptions);
+			}
+			afterRead();
+			return count;
+		}
+		return read;
+	}
+
+	function closeAfterForwarding(failure: Error | undefined, closedDescriptors: number[]): Mock<typeof fs.closeSync> {
+		return vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			realCjsCloseSync(fd);
+			closedDescriptors.push(fd);
+			if (failure) throw failure;
+		});
+	}
+
+	function descriptorsAreClosed(descriptors: number[]): boolean {
+		let closed = true;
+		let failed = false;
+		let failure: unknown;
+		for (const fd of descriptors) {
+			let error: unknown;
+			try {
+				realCjsFstatSync(fd);
+			} catch (caught) {
+				error = caught;
+			}
+			if ((error as NodeJS.ErrnoException | undefined)?.code !== "EBADF") closed = false;
+			try {
+				expect(error).toMatchObject({ code: "EBADF" });
+			} catch (caught) {
+				if (!failed) {
+					failed = true;
+					failure = caught;
+				}
+			}
+		}
+		if (failed) throw failure;
+		return closed;
+	}
+
+	function cleanupReaderTest(
+		root: string,
+		store: ManagedSessionDescendantStore | undefined,
+		closedDescriptors: number[],
+		spies: Array<{ mockRestore(): void } | undefined>,
+		bodyFailed: boolean,
+		ownedDescriptor?: number,
+	): void {
+		let cleanupFailed = false;
+		let cleanupError: unknown;
+		let resourcesDischarged = true;
+		const attempt = (cleanup: () => void): void => {
+			try {
+				cleanup();
+			} catch (error) {
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+		};
+		for (const spy of spies) {
+			if (spy) attempt(() => spy.mockRestore());
+		}
+		if (store) {
+			try {
+				store.close();
+			} catch (error) {
+				resourcesDischarged = false;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+		}
+		const ownedDescriptorIsClosed = (): boolean => {
+			if (ownedDescriptor === undefined) return true;
+			try {
+				realCjsFstatSync(ownedDescriptor);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBADF") return true;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+				return false;
+			}
+			let closeFailure: unknown;
+			try {
+				realCjsCloseSync(ownedDescriptor);
+			} catch (error) {
+				closeFailure = error;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+			try {
+				realCjsFstatSync(ownedDescriptor);
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = closeFailure ?? new Error("Owned descriptor remained open during test cleanup");
+				}
+				return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBADF") return true;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = closeFailure ?? error;
+				}
+				return false;
+			}
+		};
+		if (!ownedDescriptorIsClosed()) resourcesDischarged = false;
 		try {
-			store.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
-			expect(Buffer.from(store.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe("2345");
-			expect(() => store.readRangeExpectedSync("session.jsonl", Number.MAX_SAFE_INTEGER, 1)).toThrow(
+			if (!descriptorsAreClosed(closedDescriptors)) resourcesDischarged = false;
+		} catch (error) {
+			resourcesDischarged = false;
+			if (!cleanupFailed) {
+				cleanupFailed = true;
+				cleanupError = error;
+			}
+		}
+		if (resourcesDischarged) attempt(() => fs.rmSync(root, { recursive: true, force: true }));
+		if (!bodyFailed && cleanupFailed) throw cleanupError;
+	}
+
+	async function prepareReadOnlyStore(
+		root: string,
+		relativePath: string,
+		contents: string,
+	): Promise<ManagedSessionDescendantStore> {
+		fs.chmodSync(root, 0o700);
+		const pathname = path.join(root, relativePath);
+		await Bun.write(pathname, contents);
+		fs.chmodSync(pathname, 0o600);
+		const identity = managedDirectoryRoot(root);
+		return new ManagedSessionDescendantStore(identity, root, undefined, "default", root, identity, "read-only");
+	}
+
+	it("forwards both actual positional and options readSync overloads", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-read-overloads-")));
+		const pathname = path.join(root, "session.jsonl");
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let descriptor: number | undefined;
+		let bodyFailed = false;
+		try {
+			await Bun.write(pathname, "0123456789\n");
+			const actualDescriptor = realCjsOpenSync(pathname, fs.constants.O_RDONLY);
+			descriptor = actualDescriptor;
+			readSpy = vi.spyOn(fs, "readSync").mockImplementation(forwardReadSync);
+
+			const positionalBytes = Buffer.alloc(4);
+			expect(fs.readSync(actualDescriptor, positionalBytes, 0, positionalBytes.byteLength, 0n)).toBe(4);
+			expect(positionalBytes.toString("utf8")).toBe("0123");
+
+			const optionsBytes = Buffer.alloc(4);
+			expect(
+				fs.readSync(actualDescriptor, optionsBytes, {
+					offset: 0,
+					length: optionsBytes.byteLength,
+					position: 6n,
+				}),
+			).toBe(4);
+			expect(optionsBytes.toString("utf8")).toBe("6789");
+			expect(readSpy).toHaveBeenCalledTimes(2);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, undefined, [], [readSpy], bodyFailed, descriptor);
+		}
+	});
+
+	it("returns transcript identity from an actual path-backed read-only descriptor", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
+		const closedDescriptors: number[] = [];
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let store: ManagedSessionDescendantStore | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
+			store = actualStore;
+			readSpy = vi.spyOn(fs, "readSync");
+			closeSpy = closeAfterForwarding(undefined, closedDescriptors);
+			const descriptor = actualStore.descriptorExpected("session.jsonl");
+			expect(descriptor).toMatchObject({ size: Buffer.byteLength("descriptor payload\n"), isFile: true });
+			expect(descriptor?.dev).toBeTypeOf("bigint");
+			expect(descriptor?.ino).toBeTypeOf("bigint");
+			expect(actualStore.descriptorExpected("missing.jsonl")).toBeNull();
+			expect(readSpy).not.toHaveBeenCalled();
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [readSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("returns descriptor identity through the separate genuine owned native authority control", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-native-")));
+		let store: ManagedSessionDescendantStore | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("native descriptor payload\n"));
+			readSpy = vi.spyOn(fs, "readSync");
+			expect(actualStore.descriptorExpected("session.jsonl")).toMatchObject({
+				size: Buffer.byteLength("native descriptor payload\n"),
+				isFile: true,
+			});
+			expect(readSpy).not.toHaveBeenCalled();
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, [], [readSpy], bodyFailed);
+		}
+	});
+
+	it("preserves descriptor metadata errors when actual descriptor close also fails", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-close-")));
+		const closedDescriptors: number[] = [];
+		const primaryFailure = new Error("descriptor metadata inspection failed");
+		const secondaryFailure = new Error("descriptor close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let fstatSpy: Mock<typeof fs.fstatSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
+			store = actualStore;
+			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation((fd: number, options?: fs.StatOptions) => {
+				forwardFstatSync(fd, options);
+				throw primaryFailure;
+			});
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [fstatSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("preserves the actual post-open pathname ENOENT over a secondary close error", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-disappear-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = path.join(root, "session.detached.jsonl");
+		const closedDescriptors: number[] = [];
+		const secondaryFailure = new Error("descriptor close failed after unlink");
+		let store: ManagedSessionDescendantStore | undefined;
+		let fstatSpy: Mock<typeof fs.fstatSync> | undefined;
+		let lstatSpy: Mock<typeof fs.lstatSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let originalPathnameError: NodeJS.ErrnoException | undefined;
+		let fileDisplaced = false;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor before unlink\n");
+			store = actualStore;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+			function fstatAfterOpen(fd: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+				const stats = forwardFstatSync(fd, options);
+				if (!fileDisplaced) {
+					fs.renameSync(pathname, detached);
+					fileDisplaced = true;
+				}
+				return stats;
+			}
+			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation(fstatAfterOpen);
+			lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation(
+				capturePathLstatError(pathname, error => {
+					originalPathnameError = error;
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(fileDisplaced).toBe(true);
+			expect(originalPathnameError).toMatchObject({ code: "ENOENT" });
+			expect(caught).toBe(originalPathnameError);
+			expect((caught as NodeJS.ErrnoException).code).toBe("ENOENT");
+			expect(caught).not.toBe(secondaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [fstatSpy, lstatSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("propagates a healthy descriptor close-only failure", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-close-only-")));
+		const closedDescriptors: number[] = [];
+		const closeFailure = new Error("descriptor close-only failure");
+		let store: ManagedSessionDescendantStore | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
+			store = actualStore;
+			closeSpy = closeAfterForwarding(closeFailure, closedDescriptors);
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(closeFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [closeSpy], bodyFailed);
+		}
+	});
+
+	it("reads bounded ranges and rejects a pathname swap before returning bytes", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-")));
+		const closedDescriptors: number[] = [];
+		const secondaryFailure = new Error("range descriptor close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		const transcript = path.join(root, "session.jsonl");
+		const replacement = path.join(root, "attacker.jsonl");
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
+			await Bun.write(replacement, "attacker\n");
+			closeSpy = closeAfterForwarding(undefined, closedDescriptors);
+			expect(Buffer.from(actualStore.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe(
+				"2345",
+			);
+			closeSpy.mockRestore();
+			closeSpy = undefined;
+			expect(() => actualStore.readRangeExpectedSync("session.jsonl", Number.MAX_SAFE_INTEGER, 1)).toThrow(
 				"Managed range read start overflows",
 			);
 
-			const readSync = fs.readSync;
-			const spy = vi.spyOn(fs, "readSync").mockImplementationOnce(((
-				fd: number,
-				buffer: NodeJS.ArrayBufferView,
-				offset: number,
-				length: number,
-				position: number | null,
-			) => {
-				const count = readSync(fd, buffer, offset, length, position);
-				fs.renameSync(transcript, `${transcript}.detached`);
-				fs.writeFileSync(transcript, "attacker\n", { mode: 0o600 });
-				return count;
-			}) as never);
-			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
-			spy.mockRestore();
+			readSpy = vi.spyOn(fs, "readSync").mockImplementationOnce(
+				instrumentReadSync(() => {
+					fs.renameSync(transcript, `${transcript}.detached`);
+					fs.renameSync(replacement, transcript);
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+			expect(() => actualStore.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
+			expect(closedDescriptors).toHaveLength(2);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
 		} finally {
-			store.close();
-			fs.rmSync(root, { recursive: true, force: true });
+			cleanupReaderTest(root, store, closedDescriptors, [readSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("preserves range read error identity when actual descriptor close also fails", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-error-")));
+		const closedDescriptors: number[] = [];
+		const primaryFailure = new Error("range read failed after reading from the descriptor");
+		const secondaryFailure = new Error("range close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("range payload\n"));
+			readSpy = vi.spyOn(fs, "readSync").mockImplementationOnce(
+				instrumentReadSync(() => {
+					throw primaryFailure;
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.readRangeExpectedSync("session.jsonl", 0, 4);
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [readSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("propagates a healthy range-reader close-only failure", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-close-only-")));
+		const closedDescriptors: number[] = [];
+		const closeFailure = new Error("range close-only failure");
+		let store: ManagedSessionDescendantStore | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("range payload\n"));
+			closeSpy = closeAfterForwarding(closeFailure, closedDescriptors);
+			let caught: unknown;
+			try {
+				actualStore.readRangeExpectedSync("session.jsonl", 0, 4);
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(closeFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [closeSpy], bodyFailed);
 		}
 	});
 	it("binds ranges to the caller's committed descriptor generation", () => {
@@ -624,6 +1376,189 @@ describe("managed descriptor reads", () => {
 			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
 			spy.mockRestore();
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("admits the opened descriptor before allocation, closes it, and preserves the admission failure", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		const bytes = Buffer.from("admitted descriptor bytes\n");
+		store.publishNoReplaceSync("session.jsonl", bytes);
+		const expectedStat = fs.statSync(transcript, { bigint: true });
+		const originalOpenReadLease = store.openReadLease.bind(store);
+		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
+		let admissionObserved = false;
+		let forwardedClose = false;
+		let closeInjectionCount = 0;
+		const injectedCloseFailure = new Error("injected terminal close failure");
+		let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+		const primaryFailure = new Error("admission rejected before allocation");
+		const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
+			const lease = originalOpenReadLease(relativePath, expectedDescriptor);
+			actualLease = lease;
+			return {
+				readRange: (start, length) => lease.readRange(start, length),
+				close: () => {
+					lease.close();
+					if (admissionObserved) {
+						forwardedClose = true;
+						closeInjectionCount++;
+						throw injectedCloseFailure;
+					}
+				},
+			};
+		});
+		const read = vi.spyOn(fs, "readSync");
+		const allocate = vi.spyOn(Buffer, "alloc");
+		let caught: unknown;
+		try {
+			try {
+				store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
+					admissionObserved = true;
+					observedAdmission = { size, descriptor };
+					throw primaryFailure;
+				});
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(observedAdmission?.size).toBe(bytes.byteLength);
+			expect(observedAdmission?.descriptor).toMatchObject({
+				dev: expectedStat.dev,
+				ino: expectedStat.ino,
+				nlink: 1n,
+				size: bytes.byteLength,
+				mtimeNs: expectedStat.mtimeNs,
+				ctimeNs: expectedStat.ctimeNs,
+			});
+			if (!actualLease) throw new Error("managed capture read lease was not opened");
+			expect(forwardedClose).toBe(true);
+			expect(admissionObserved).toBe(true);
+			expect(closeInjectionCount).toBe(1);
+			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+			expect(read).not.toHaveBeenCalled();
+			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			openLease.mockRestore();
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects growth during bounded capture without reading beyond the admitted size", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-growth-")));
+		const pathname = path.join(root, "session.jsonl");
+		const initial = Buffer.from("initial-sized transcript\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let grew = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!grew) {
+				grew = true;
+				fs.truncateSync(pathname, initial.byteLength + 9);
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.statSync(pathname).size).toBe(initial.byteLength + 9);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects pathname replacement during bounded capture after reading only the original generation", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-replacement-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = `${pathname}.detached`;
+		const initial = Buffer.from("original generation bytes\n");
+		const replacement = Buffer.from("replacement generation must not be read\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let replaced = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!replaced) {
+				replaced = true;
+				fs.renameSync(pathname, detached);
+				fs.writeFileSync(pathname, replacement, { mode: 0o600 });
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.readFileSync(detached)).toEqual(initial);
+			expect(fs.readFileSync(pathname)).toEqual(replacement);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fences lease ranges to their initial size and returns fresh exact bytes and digest", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lease-fence-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		try {
+			const firstBytes = Buffer.from("first descriptor generation\n");
+			store.publishNoReplaceSync("session.jsonl", firstBytes);
+			const firstDescriptor = store.descriptorExpected("session.jsonl");
+			if (!firstDescriptor) throw new Error("first managed descriptor missing");
+			const firstLease = store.openReadLease("session.jsonl", firstDescriptor);
+			expect(() => firstLease.readRange(firstBytes.byteLength - 1, 2)).toThrow("range_not_present");
+			expect(Buffer.from(firstLease.readRange(0, firstBytes.byteLength))).toEqual(firstBytes);
+			firstLease.close();
+
+			const freshBytes = Buffer.from("fresh positive exact transcript bytes\n");
+			store.replaceSync("session.jsonl", freshBytes);
+			const freshDescriptor = store.descriptorExpected("session.jsonl");
+			if (!freshDescriptor) throw new Error("fresh managed descriptor missing");
+			const freshLease = store.openReadLease("session.jsonl", freshDescriptor);
+			const exactBytes = Buffer.from(freshLease.readRange(0, freshBytes.byteLength));
+			freshLease.close();
+			const snapshot = store.readExpectedBounded("session.jsonl", freshBytes.byteLength);
+			if (!snapshot) throw new Error("fresh bounded snapshot missing");
+			expect(exactBytes).toEqual(freshBytes);
+			expect(snapshot.bytes).toEqual(freshBytes);
+			expect(snapshot.identity.sha256).toBe(createHash("sha256").update(freshBytes).digest("hex"));
+			expect(snapshot.identity.size).toBe(freshBytes.byteLength);
+		} finally {
+			store.close();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -1353,6 +2288,42 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "concurrent-reconcile"))).toBe(true);
 	});
 
+	it("accepts a real native lost-source result only for the exact peer-promoted orphan receipt", () => {
+		const { pending, receipt } = pendingReceipt();
+		const originalBytes = fs.readFileSync(pending);
+		const originalInode = fs.statSync(pending).ino;
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			expect(realRename(source, destination).ok).toBe(true);
+			return realRename(source, destination);
+		});
+
+		replay("native-concurrent-reconcile");
+
+		expect(fs.existsSync(pending)).toBe(false);
+		expect(fs.statSync(receipt).ino).toBe(originalInode);
+		expect(fs.readFileSync(receipt).equals(originalBytes)).toBe(true);
+		expect(fs.existsSync(path.join(root, "native-concurrent-reconcile"))).toBe(true);
+	});
+
+	it("refuses a real native lost-source result when the promoted receipt was replaced", () => {
+		const { pending, receipt } = pendingReceipt();
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			expect(realRename(source, destination).ok).toBe(true);
+			const replacement = `${destination}.replacement`;
+			fs.copyFileSync(destination, replacement);
+			fs.renameSync(replacement, destination);
+			return realRename(source, destination);
+		});
+
+		expect(() => replay("unproven-native-reconcile")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "unproven-native-reconcile"))).toBe(false);
+	});
+
 	it("canonicalizes signed file ids from an interrupted pending Windows receipt", () => {
 		const destination = path.join(root, "session.jsonl");
 		const staging = path.join(root, ".session.replacement");
@@ -1693,6 +2664,33 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "cleanup-io-error-retry"))).toBe(true);
 	});
 
+	it("retries a retained canonical receipt after a transient access-denied failure", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realExactUnlink = native.exactUnlink;
+		let firstAttempt = true;
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname === receipt && firstAttempt) {
+				firstAttempt = false;
+				return { ok: false, code: "access_denied" };
+			}
+			return realExactUnlink(pathname, expected);
+		});
+		replay("cleanup-access-denied-first-attempt");
+		expect(fs.existsSync(receipt)).toBe(true);
+
+		replay("cleanup-access-denied-retry");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "cleanup-access-denied-retry"))).toBe(true);
+	});
+
 	it("keeps canonical receipt identity failures fail-closed", () => {
 		const predecessorPath = path.join(root, "predecessor");
 		fs.writeFileSync(predecessorPath, "predecessor\n");
@@ -1712,6 +2710,92 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		);
 		expect(fs.existsSync(receipt)).toBe(true);
 		expect(fs.existsSync(path.join(root, "cleanup-identity-mismatch"))).toBe(false);
+	});
+
+	it("defers a canonical receipt whose retirement slot a peer has already claimed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const contents = JSON.stringify({ arbitrary: "receipt contents are advisory" });
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, contents);
+		// A peer's native exact-unlink claims the slot with an empty exchange
+		// placeholder before it swaps the receipt out of its canonical name.
+		const slot = receiptQuarantine(receiptIdentity, predecessor);
+		fs.writeFileSync(slot, "");
+		const peerClaim = snapshot(slot);
+		const retainedReceipt = snapshot(receipt);
+		const exactUnlink = vi.spyOn(native, "exactUnlink");
+
+		replay("peer-claimed-slot");
+
+		expect(exactUnlink.mock.results.find(result => result.type === "return")?.value).toMatchObject({
+			ok: false,
+			code: "quarantine_collision",
+		});
+		expect(snapshot(receipt)).toEqual(retainedReceipt);
+		expect(snapshot(slot)).toEqual(peerClaim);
+		expect(fs.existsSync(path.join(root, "peer-claimed-slot"))).toBe(true);
+
+		// Once the claim is released without retiring the receipt, the retained
+		// receipt is reconciled by the next mutation.
+		fs.unlinkSync(slot);
+		replay("peer-released-slot");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.readFileSync(slot, "utf8")).toBe(contents);
+		expect(fs.existsSync(path.join(root, "peer-released-slot"))).toBe(true);
+	});
+
+	it("defers a detached receipt placeholder whose retirement slot a peer has already claimed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		// A peer detached the receipt and left its empty exchange placeholder at the
+		// canonical name; a second peer already claimed the placeholder's slot.
+		const detachedReceipt = receiptQuarantine(receiptIdentity, predecessor);
+		fs.renameSync(receipt, detachedReceipt);
+		fs.writeFileSync(receipt, "");
+		const placeholder = snapshot(receipt);
+		const hex = (value: string) => BigInt(value).toString(16);
+		const placeholderSlot = path.join(
+			root,
+			`.gjc-receipt-placeholder-remove-${hex(placeholder.dev)}-${hex(placeholder.ino)}-${hex(predecessor.dev)}-${hex(predecessor.ino)}-${hex(receiptIdentity.dev)}-${hex(receiptIdentity.ino)}`,
+		);
+		fs.writeFileSync(placeholderSlot, "");
+		const peerClaim = snapshot(placeholderSlot);
+
+		replay("peer-claimed-placeholder-slot");
+
+		expect(snapshot(receipt)).toEqual(placeholder);
+		expect(snapshot(placeholderSlot)).toEqual(peerClaim);
+		expect(snapshot(detachedReceipt)).toMatchObject({ ino: receiptIdentity.ino, sha256: receiptIdentity.sha256 });
+		expect(fs.existsSync(path.join(root, "peer-claimed-placeholder-slot"))).toBe(true);
+	});
+
+	it("keeps a receipt slot collision that retained receipt state fail-closed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
+			if (pathname === receipt)
+				return { ok: false, code: "quarantine_collision", retainedUnknownPath: path.join(root, ".unknown") };
+			throw new Error(`Unexpected exact unlink: ${pathname}`);
+		});
+
+		expect(() => replay("collision-retained-state")).toThrow(
+			"managed_replace_receipt_cleanup_pending:quarantine_collision",
+		);
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "collision-retained-state"))).toBe(false);
 	});
 
 	it.skipIf(process.platform !== "darwin")(
@@ -1930,7 +3014,188 @@ describe.skipIf(process.platform !== "linux")("managed native security result va
 	});
 });
 
+describe("path-backed managed descendant binding", () => {
+	it("rejects a base-directory symlink to the same inode for reads and tree capture", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-path-binding-"));
+		const artifacts = path.join(root, "artifacts");
+		const detached = path.join(root, "detached-artifacts");
+		fs.mkdirSync(artifacts, { mode: 0o700 });
+		fs.writeFileSync(path.join(artifacts, "payload.bin"), "unchanged payload", { mode: 0o600 });
+		const expected = managedDirectoryRoot(artifacts);
+		const store = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(root),
+			artifacts,
+			undefined,
+			"default",
+			root,
+			expected,
+			"read-only",
+		);
+		try {
+			expect(store.readExpected("payload.bin")?.bytes).toEqual(Buffer.from("unchanged payload"));
+			expect(store.captureTree("").rootIno).toBe(expected.ino.toString());
+
+			fs.renameSync(artifacts, detached);
+			fs.symlinkSync(detached, artifacts, "dir");
+			const followed = fs.statSync(artifacts, { bigint: true });
+			expect(followed.dev).toBe(expected.dev);
+			expect(followed.ino).toBe(expected.ino);
+			expect(fs.lstatSync(artifacts).isSymbolicLink()).toBe(true);
+
+			expect(() => store.assertBound()).toThrow("root binding changed");
+			expect(() => store.readExpected("payload.bin")).toThrow("root binding changed");
+			expect(() => store.captureDirectoryIdentity("")).toThrow("root binding changed");
+			expect(() => store.captureTree("")).toThrow("root binding changed");
+			expect(fs.readFileSync(path.join(detached, "payload.bin"), "utf8")).toBe("unchanged payload");
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe.skipIf(process.platform !== "darwin")("path-backed managed descendant publication binding", () => {
+	it("refuses publication through a base symlink and preserves its unchanged target", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-path-publish-binding-"));
+		const artifacts = path.join(root, "artifacts");
+		const detached = path.join(root, "detached-artifacts");
+		await fsp.mkdir(artifacts, { mode: 0o700 });
+		await fsp.writeFile(path.join(artifacts, "payload.bin"), "unchanged payload", { mode: 0o600 });
+		const expected = managedDirectoryRoot(artifacts);
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifacts);
+		try {
+			expect(store.readExpected("payload.bin")?.bytes).toEqual(Buffer.from("unchanged payload"));
+			await store.publishNoReplace("control.bin", Buffer.from("authorized control"));
+			expect(store.captureTree("").rootIno).toBe(expected.ino.toString());
+
+			await fsp.rename(artifacts, detached);
+			await fsp.symlink(detached, artifacts, "dir");
+			const followed = await fsp.stat(artifacts, { bigint: true });
+			expect(followed.dev).toBe(expected.dev);
+			expect(followed.ino).toBe(expected.ino);
+			expect(() => store.assertBound()).toThrow("root binding changed");
+			expect(() => store.readExpected("payload.bin")).toThrow("root binding changed");
+			expect(() => store.captureTree("")).toThrow("root binding changed");
+			await expect(store.publishNoReplace("must-not-publish.bin", Buffer.from("unauthorized"))).rejects.toThrow(
+				"root binding changed",
+			);
+			expect(await fsp.readdir(detached)).toEqual(expect.arrayContaining(["control.bin", "payload.bin"]));
+			expect(await fsp.readdir(detached)).toHaveLength(2);
+			expect(await fsp.readFile(path.join(detached, "control.bin"), "utf8")).toBe("authorized control");
+			expect(await fsp.readFile(path.join(detached, "payload.bin"), "utf8")).toBe("unchanged payload");
+		} finally {
+			store.close();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(process.platform !== "linux")("managed descendant retained binding", () => {
+	it("owns only a newly derived authority and closes it once", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-derived-owner-"));
+		const rootIdentity = managedDirectoryRoot(root);
+		const parent = new ManagedSessionDescendantStore(rootIdentity, root);
+		const borrowedAuthority = parent.retainAuthority();
+		if (!borrowedAuthority) throw new Error("Expected a retained native authority");
+		const borrowedStore = new ManagedSessionDescendantStore(rootIdentity, root, {
+			authority: borrowedAuthority,
+			authorityBaseDir: root,
+		});
+		const realRetain = native.RecoveryFsRoot.prototype.retainManagedDirectory;
+		const realClose = native.RecoveryFsRoot.prototype.close;
+		const retainedChildren: native.RecoveryFsRoot[] = [];
+		const closedAuthorities: native.RecoveryFsRoot[] = [];
+		const retainSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expectedDev, expectedIno) {
+				const retained = realRetain.call(this, relativePath, expectedDev, expectedIno);
+				retainedChildren.push(retained);
+				return retained;
+			});
+		const closeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			closedAuthorities.push(this);
+			return realClose.call(this);
+		});
+		let derived: ManagedSessionDescendantStore | undefined;
+		try {
+			borrowedStore.close();
+			expect(borrowedAuthority.identity()).toMatchObject({ ok: true });
+
+			derived = parent.deriveSubtree("derived");
+			expect(retainedChildren).toHaveLength(1);
+			const childAuthority = retainedChildren[0];
+			if (!childAuthority) throw new Error("Expected the real retained child authority");
+			derived.close();
+			derived.close();
+			expect(closedAuthorities.filter(authority => authority === childAuthority)).toHaveLength(1);
+			expect(childAuthority.identity()).toMatchObject({ ok: false, code: "closed" });
+			expect(borrowedAuthority.identity()).toMatchObject({ ok: true });
+
+			parent.assertBound();
+			parent.publishNoReplaceSync("parent-after-child-close.bin", Buffer.from("parent remains open"));
+			expect(borrowedAuthority.readManaged("parent-after-child-close.bin")).toMatchObject({ ok: true });
+		} finally {
+			closeSpy.mockRestore();
+			retainSpy.mockRestore();
+			derived?.close();
+			borrowedStore.close();
+			borrowedAuthority.close();
+			parent.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("closes a newly retained child when constructor binding fails", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-derived-constructor-failure-"));
+		const rootIdentity = managedDirectoryRoot(root);
+		const parent = new ManagedSessionDescendantStore(rootIdentity, root);
+		const childPath = path.join(root, "derived");
+		const displacedPath = path.join(root, "displaced-derived");
+		const realRetain = native.RecoveryFsRoot.prototype.retainManagedDirectory;
+		const realClose = native.RecoveryFsRoot.prototype.close;
+		let retainedChild: native.RecoveryFsRoot | undefined;
+		const closeCalls: native.RecoveryFsRoot[] = [];
+		const retainSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expectedDev, expectedIno) {
+				const retained = realRetain.call(this, relativePath, expectedDev, expectedIno);
+				if (relativePath === "derived") {
+					retainedChild = retained;
+					fs.renameSync(childPath, displacedPath);
+					fs.symlinkSync(displacedPath, childPath, "dir");
+				}
+				return retained;
+			});
+		const closeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			closeCalls.push(this);
+			return realClose.call(this);
+		});
+		try {
+			expect(() => parent.deriveSubtree("derived")).toThrow("Managed descendant root binding changed");
+			if (!retainedChild) throw new Error("Expected the real retained child authority");
+			expect(closeCalls.filter(authority => authority === retainedChild)).toHaveLength(1);
+			expect(retainedChild.identity()).toMatchObject({ ok: false, code: "closed" });
+			parent.assertBound();
+			parent.publishNoReplaceSync("parent-after-constructor-failure.bin", Buffer.from("parent remains open"));
+			expect(fs.readFileSync(path.join(root, "parent-after-constructor-failure.bin"), "utf8")).toBe(
+				"parent remains open",
+			);
+		} finally {
+			closeSpy.mockRestore();
+			retainSpy.mockRestore();
+			if (fs.lstatSync(childPath).isSymbolicLink()) {
+				fs.unlinkSync(childPath);
+				fs.renameSync(displacedPath, childPath);
+			}
+			parent.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects publication after the retained subtree pathname is replaced", async () => {
 		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-store-binding-"));
 		try {
@@ -3248,6 +4513,17 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	let storage: MemorySessionStorage;
 	const sessionsRoot = "/sessions";
+	const ownerTargetFields = [
+		"taskArtifactOwnerStorageContext",
+		"taskArtifactOwnerDeletionEvidence",
+		"taskArtifactOwnerRetirementOutcome",
+		"taskArtifactOwnerTranscriptDeleted",
+		"deferTaskArtifactOwnerRetirement",
+		"taskArtifactOwnerRetired",
+		"taskArtifactOwnerRetirementContinuation",
+		"taskArtifactOwnerPayloadRetired",
+		"taskArtifactOwnerNamespaceRetained",
+	] as const satisfies readonly (keyof VerifiedSessionDeleteTarget)[];
 
 	beforeEach(() => {
 		storage = new MemorySessionStorage();
@@ -3275,6 +4551,7 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("deletes a verified matching transcript", async () => {
 		const transcriptPath = path.join(sessionsRoot, "s.jsonl");
 		seedTranscript(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
 		const result = await storage.deleteSessionVerified({
 			sessionsRoot,
 			transcriptPath,
@@ -3284,6 +4561,161 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		});
 		expect(result).toEqual({ kind: "deleted" });
 		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.existsSync(`${transcriptPath}.spill.idx`)).toBe(false);
+	});
+
+	it("refuses a task-artifact owner in the header without mutating the transcript or spill keys", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owned-header.jsonl");
+		const ownerLocator = {
+			schemaVersion: 1,
+			ownerId: "a".repeat(64),
+			directoryDev: "1",
+			directoryIno: "2",
+		};
+		seedTranscript(transcriptPath, {
+			type: "session",
+			id: "session-id",
+			cwd: "/cwd",
+			taskArtifactOwner: ownerLocator,
+		});
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		const transcriptBefore = storage.readTextSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it("refuses a replayed task-artifact owner header patch without mutating transcript or spill keys", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owned-patch.jsonl");
+		const ownerLocator = {
+			schemaVersion: 1,
+			ownerId: "b".repeat(64),
+			directoryDev: "3",
+			directoryIno: "4",
+		};
+		storage.writeTextSync(
+			transcriptPath,
+			`${JSON.stringify({ type: "session", id: "session-id", cwd: "/cwd", version: 4 })}\n${JSON.stringify({
+				type: "header_patch",
+				patch: { taskArtifactOwner: ownerLocator },
+			})}\n`,
+		);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		const transcriptBefore = storage.readTextSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it("rejects an absent-transcript retry carrying durable owner retirement proof", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owner-retired.jsonl");
+		seedTranscript(transcriptPath);
+		const transcriptIdentity = verifiedIdentity(transcriptPath);
+		storage.unlinkSync(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity,
+				taskArtifactOwnerRetired: true,
+				taskArtifactOwnerTranscriptDeleted: true,
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it.each([
+		true,
+		false,
+	])("refuses every defined owner field before mutation (transcript present=%s)", async present => {
+		for (const field of ownerTargetFields) {
+			for (const [valueIndex, value] of [false, null, {}].entries()) {
+				const transcriptPath = path.join(sessionsRoot, `${field}-${valueIndex}.jsonl`);
+				seedTranscript(transcriptPath);
+				const transcriptBefore = storage.readTextSync(transcriptPath);
+				const target: VerifiedSessionDeleteTarget = {
+					sessionsRoot,
+					transcriptPath,
+					sessionId: "session-id",
+					cwd: "/cwd",
+					transcriptIdentity: verifiedIdentity(transcriptPath),
+				};
+				if (!present) storage.unlinkSync(transcriptPath);
+				storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+				storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+				Object.defineProperty(target, field, { value, enumerable: true });
+				const failure: unknown = await storage.deleteSessionVerified(target).catch((error: unknown) => error);
+				if (!(failure instanceof SessionDeleteVerificationError)) throw new Error(`Missing refusal for ${field}`);
+				expect(failure.kind).toBe("artifacts");
+				expect(failure.message).toBe("task_artifact_owner_memory_backend_unsupported");
+				expect(storage.existsSync(transcriptPath)).toBe(present);
+				if (present) expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+				expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+				expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+			}
+		}
+	});
+
+	it.each([
+		true,
+		false,
+	])("treats explicitly undefined owner fields as omitted (transcript present=%s)", async present => {
+		const transcriptPath = path.join(sessionsRoot, "undefined-owner-fields.jsonl");
+		seedTranscript(transcriptPath);
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: "/cwd",
+			transcriptIdentity: verifiedIdentity(transcriptPath),
+		};
+		if (!present) storage.unlinkSync(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		for (const field of ownerTargetFields)
+			Object.defineProperty(target, field, { value: undefined, enumerable: true });
+		expect(await storage.deleteSessionVerified(target)).toEqual({ kind: "deleted" });
+		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.existsSync(`${transcriptPath}.spill.idx`)).toBe(!present);
+		expect(storage.existsSync(`${transcriptPath}.spill.commit`)).toBe(!present);
 	});
 
 	it("rejects a transcript outside the sessions root (containment parity)", async () => {
@@ -3470,5 +4902,118 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures).toHaveLength(1);
 		expect(result.failures[0].kind).toBe("scan");
 		expect(result.failures[0].message).not.toContain("EIO");
+	});
+});
+
+describe.skipIf(process.platform !== "win32")("managed session security: owner_mismatch repair", () => {
+	let tempRoot: string;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-mismatch-"));
+		tempDir = path.join(tempRoot, "sessiondir");
+		fs.mkdirSync(tempDir, { mode: 0o700 });
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		fs.rmSync(tempRoot, { recursive: true, force: true });
+	});
+
+	it("owner_mismatch -> repair succeeds -> directory accepted", () => {
+		const stat = fs.lstatSync(tempDir, { bigint: true });
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "owner_mismatch",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
+
+		expect(verifyMock).toHaveBeenCalledWith(tempDir, "directory", stat.dev, stat.ino);
+		expect(repairMock).toHaveBeenCalledWith(tempDir, "directory", stat.dev, stat.ino);
+	});
+
+	it("owner_mismatch -> repair fails with io_error -> security error with actionable message", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "owner_mismatch",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "io_error",
+		} as const);
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).toThrow(
+			/directory owner mismatch: unable to take ownership.*administrator privileges/,
+		);
+
+		expect(verifyMock).toHaveBeenCalled();
+		expect(repairMock).toHaveBeenCalled();
+	});
+
+	it("other verify codes throw immediately without calling repair", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "identity_mismatch",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).toThrow();
+
+		expect(repairMock).not.toHaveBeenCalled();
+		expect(verifyMock).toHaveBeenCalled();
+	});
+
+	it("acl_verify_failed also triggers repair attempt", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "acl_verify_failed",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
+
+		expect(verifyMock).toHaveBeenCalled();
+		expect(repairMock).toHaveBeenCalled();
+	});
+
+	it("verify ok immediately returns without calling repair", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
+
+		expect(repairMock).not.toHaveBeenCalled();
+		expect(verifyMock).toHaveBeenCalled();
+	});
+
+	it("default policy applies security without repair attempt", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
+
+		vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+
+		expect(() => ensureManagedDirectory(tempDir, root, "default")).not.toThrow();
+
+		expect(repairMock).not.toHaveBeenCalled();
 	});
 });

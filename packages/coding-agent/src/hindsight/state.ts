@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { logger } from "@gajae-code/utils";
+import { redactMemorySecretsForTesting as redactMemorySecrets } from "../memories";
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, ensureBankMission } from "./bank";
 import type { HindsightApi, MemoryItemInput } from "./client";
@@ -149,8 +150,8 @@ export class HindsightRetainQueue {
 		try {
 			await ensureBankMission(state.client, state.bankId, state.config, state.missionsSet);
 			const batch: MemoryItemInput[] = items.map(item => ({
-				content: item.content,
-				context: item.context ?? state.config.retainContext,
+				content: redactMemorySecrets(item.content),
+				context: item.context === undefined ? state.config.retainContext : redactMemorySecrets(item.context),
 				metadata: { session_id: sessionId },
 				tags: state.retainTags,
 			}));
@@ -316,8 +317,10 @@ export class HindsightSessionState {
 			documentId = `${this.sessionId}-${Date.now()}`;
 		}
 
-		const { transcript } = prepareRetentionTranscript(target, true);
-		if (!transcript) return false;
+		const prepared = prepareRetentionTranscript(target, true);
+		if (!prepared.transcript) return false;
+		// Same scrub the local memory backend applies before it stores consolidation text.
+		const transcript = redactMemorySecrets(prepared.transcript);
 
 		await ensureBankMission(this.client, this.bankId, this.config, this.missionsSet);
 		await this.client.retain(this.bankId, transcript, {

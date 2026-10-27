@@ -65,7 +65,7 @@ describe("GJC MCP quarantine surface", () => {
 		expect(normalizedStandaloneMcp).toContain(
 			"there is no public MCP OAuth authorization or reauthorization entry path",
 		);
-		expect(normalizedStandaloneMcp).toContain("nor a public `/mcp` reconnection or reload contract");
+		expect(normalizedStandaloneMcp).toContain("no `/mcp reload` contract");
 		expect(normalizedStandaloneMcp).not.toContain("except `/mcp reload`");
 	});
 });

@@ -21,15 +21,13 @@ import {
 } from "@gajae-code/tui";
 import { encodeITerm2Multipart, wrapITerm2RecordsForTmux } from "../src/terminal-capabilities";
 
-function decodeIterm2Png(sequence: string): {
+function decodePngBase64(base64: string): {
 	width: number;
 	height: number;
 	rgba: Uint8Array;
 	chunks: Array<{ type: string; data: Buffer; crc: number }>;
 } {
-	const match = sequence.match(/^\x1b\]1337;File=[^:]+:([A-Za-z0-9+/=]+)\x1b\\$/u);
-	if (!match) throw new Error("Invalid iTerm2 image sequence");
-	const png = Buffer.from(match[1], "base64");
+	const png = Buffer.from(base64, "base64");
 	expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
 	const chunks: Array<{ type: string; data: Buffer; crc: number }> = [];
 	for (let offset = 8; offset < png.length; ) {
@@ -51,6 +49,31 @@ function decodeIterm2Png(sequence: string): {
 		rgba.set(scanlines.subarray(y * (width * 4 + 1) + 1, (y + 1) * (width * 4 + 1)), y * width * 4);
 	}
 	return { width, height, rgba, chunks };
+}
+
+function decodeIterm2Png(sequence: string): {
+	width: number;
+	height: number;
+	rgba: Uint8Array;
+	chunks: Array<{ type: string; data: Buffer; crc: number }>;
+} {
+	const match = sequence.match(/^\x1b\]1337;File=[^:]+:([A-Za-z0-9+/=]+)\x1b\\$/u);
+	if (!match) throw new Error("Invalid iTerm2 image sequence");
+	return decodePngBase64(match[1]);
+}
+
+/** Every complete kitty APC escape in a rendered frame. */
+function kittyEscapes(frame: string): string[] {
+	return frame.match(/\x1b_G[^\x1b]*\x1b\\/gu) ?? [];
+}
+
+/** Decode the PNG payload of a kitty PNG transmit (`f=100`). */
+function decodeKittyPng(frame: string) {
+	const transmit = kittyEscapes(frame).find(sequence => sequence.includes("f=100"));
+	if (!transmit) throw new Error("Invalid kitty PNG transmit");
+	const match = transmit.match(/^(.+);([A-Za-z0-9+/=]*)\x1b\\$/u);
+	if (!match) throw new Error("Invalid kitty PNG payload");
+	return decodePngBase64(match[2]);
 }
 
 function pngCrc(type: string, data: Uint8Array): number {
@@ -185,14 +208,22 @@ describe("gajae pixel frames", () => {
 		expect(victory).toEqual(["VGVVGV", "GVGGVG", "VVVVVV"]); // ^ ^
 	});
 
-	it("encodes kitty frames as chunked raw-RGBA transmits with delete-first", () => {
+	it("encodes kitty frames as delete-first single-escape PNG transmits", () => {
 		const built = buildGajaePixelFrames({ protocol: "kitty", cellWidthPx: 9, cellHeightPx: 18, targetRows: 2 });
 		const frame = built.frames.base;
+		const escapes = kittyEscapes(frame);
 		expect(frame.startsWith("\x1b_Ga=d,d=I,i=")).toBe(true);
-		expect(frame).toContain("a=T,f=32,s=36,v=36");
-		// 36x36 RGBA exceeds one kitty payload chunk.
-		expect(frame).toContain(",m=1;");
-		expect(frame).toContain("\x1b_Gm=0;");
+		// A sprite upload must not depend on chunk continuation: every escape is
+		// complete and inside the kitty 4096-byte APC cap, so a terminal that
+		// drops one can never print the payload as text.
+		expect(escapes).toHaveLength(2);
+		expect(escapes[1]).toContain("a=T,f=100,c=4,r=2");
+		expect(escapes[1]).not.toContain(",m=");
+		expect(frame).not.toContain("f=32");
+		for (const sequence of escapes) expect(sequence.length).toBeLessThanOrEqual(4096);
+		const decoded = decodeKittyPng(frame);
+		expect(decoded.width).toBe(36);
+		expect(decoded.height).toBe(36);
 	});
 
 	it("horizontally pads the kitty image so a non-2:1 cell ratio does not stretch the sprite", () => {
@@ -201,7 +232,10 @@ describe("gajae pixel frames", () => {
 		// letting kitty stretch it to fill the wider cell block.
 		const built = buildGajaePixelFrames({ protocol: "kitty", cellWidthPx: 14, cellHeightPx: 18, targetRows: 2 });
 		expect(built.columns).toBe(3);
-		expect(built.frames.base).toContain("s=42,v=36,c=3,r=2");
+		expect(built.frames.base).toContain("c=3,r=2");
+		const decoded = decodeKittyPng(built.frames.base);
+		expect(decoded.width).toBe(42);
+		expect(decoded.height).toBe(36);
 	});
 
 	it("keeps a minimum 1x scale for tiny cells", () => {
@@ -244,11 +278,13 @@ describe("gajae pixel frames", () => {
 		);
 	});
 
-	it("keeps Kitty and Sixel fixtures unchanged while iTerm2 uses the reserved cell block", () => {
+	it("keeps Sixel geometry unchanged while kitty and iTerm2 share the PNG canvas", () => {
 		const sixel = buildGajaePixelFrames({ protocol: "sixel", cellWidthPx: 9, cellHeightPx: 18 });
 		const kitty = buildGajaePixelFrames({ protocol: "kitty", cellWidthPx: 9, cellHeightPx: 18 });
 		expect(sixel.frames.base).toStartWith('\x1bP0;1;0q"1;1;36;36');
-		expect(kitty.frames.base).toContain("a=T,f=32,s=36,v=36,c=4,r=2");
+		expect(kitty.frames.base).toContain("a=T,f=100,c=4,r=2");
+		const kittyPng = decodeKittyPng(kitty.frames.base);
+		expect([kittyPng.width, kittyPng.height]).toEqual([36, 36]);
 
 		for (const fixture of ITERM_PET_GEOMETRY_FIXTURES) {
 			const iterm2 = buildGajaePixelFrames({

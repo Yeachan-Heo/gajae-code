@@ -13,6 +13,7 @@ class FakeKernel {
 	#result: KernelExecuteResult;
 	#onExecute?: (options?: KernelExecuteOptions) => void;
 	#alive: boolean;
+	#exitCode: number | null = null;
 	readonly executeCalls: string[] = [];
 	shutdownCalls = 0;
 
@@ -39,6 +40,14 @@ class FakeKernel {
 		this.shutdownCalls += 1;
 		this.#alive = false;
 		return { confirmed: true };
+	}
+
+	getExitCode(): number | null {
+		return this.#exitCode;
+	}
+
+	setExitCode(code: number | null): void {
+		this.#exitCode = code;
 	}
 
 	async ping(): Promise<boolean> {
@@ -169,9 +178,11 @@ describe("executePython session lifecycle", () => {
 		let startCount = 0;
 		let shutdownCount = 0;
 
-		PythonKernel.start = async () => {
+		PythonKernel.start = async options => {
 			startCount += 1;
-			return kernels.shift() as unknown as PythonKernel;
+			const kernel = kernels.shift() as unknown as PythonKernel;
+			options.onKernelCreated?.(kernel);
+			return kernel;
 		};
 
 		kernelA.shutdown = async (): Promise<KernelShutdownResult> => {

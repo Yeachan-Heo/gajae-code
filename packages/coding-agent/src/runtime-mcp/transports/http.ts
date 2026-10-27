@@ -28,7 +28,8 @@ import {
 	MCP_MAX_SSE_REQUEST_MESSAGES,
 	readMCPResponseText,
 } from "../content-limits";
-import { fetchPluginMcpRequest, isPluginMcpPublicNetworkBound } from "../plugin-network-boundary";
+import { fetchMcpRespectingOrigin } from "../mcp-redirect";
+import { fetchPluginMcpRequest, usesPublicNetworkMcpFetch } from "../plugin-network-boundary";
 import { buildModernMcpHeaders, type MCPModernClientContext, type MCPProtocolEra, withModernMeta } from "../protocol";
 
 /**
@@ -155,9 +156,9 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	#fetch(init: BunFetchRequestInit): Promise<Response> {
-		return isPluginMcpPublicNetworkBound(this.config)
+		return usesPublicNetworkMcpFetch(this.config)
 			? fetchPluginMcpRequest(this.config.url, init)
-			: fetch(this.config.url, init);
+			: fetchMcpRespectingOrigin(this.config.url, init);
 	}
 
 	#trackReader(promise: Promise<void>, controller?: AbortController): void {

@@ -7,6 +7,7 @@ import {
 } from "../coordinator/contract";
 import { runCoordinatorMcpStdio } from "../coordinator-mcp/server";
 import { type BrokerDiscovery, readBrokerDiscovery } from "../sdk/broker/discovery";
+import { SDK_BROKER_AUTOSTART_ENV } from "../sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { runSdkMcpStdio, SDK_MCP_TOOL_NAMES } from "../sdk/mcp/server";
 
@@ -104,6 +105,10 @@ export default class McpServe extends Command {
 	static flags = {
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: false }),
 		check: Flags.boolean({ description: "Validate server configuration and print a smoke summary", default: false }),
+		"attach-only": Flags.boolean({
+			description: "Attach only to a live SDK broker; never start one (same as GJC_SDK_BROKER_AUTOSTART=0)",
+			default: false,
+		}),
 	};
 
 	async run(): Promise<void> {
@@ -121,6 +126,8 @@ export default class McpServe extends Command {
 			process.exitCode = 1;
 			return;
 		}
+
+		if (flags["attach-only"]) process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 
 		if (flags.check) {
 			if (!flags.json) {

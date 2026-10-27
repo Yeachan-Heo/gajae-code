@@ -18,6 +18,7 @@ const stateFile = process.argv[2];
 const writerId = process.argv[3];
 const writes = Number(process.argv[4] ?? "1");
 const holdMs = Number(process.argv[5] ?? "1");
+const readyFile = process.argv[6];
 if (!stateFile || !writerId || !Number.isSafeInteger(writes) || writes <= 0 || !Number.isFinite(holdMs))
 	throw new Error("usage: <stateFile> <writerId> <writes> <holdMs>");
 
@@ -33,6 +34,7 @@ let committed = 0;
 for (let index = 0; index < writes; index++) {
 	try {
 		await withSessionStateFileLock(stateFile, async () => {
+			if (readyFile) await Bun.write(readyFile, "ready");
 			const file = Bun.file(stateFile);
 			const marks =
 				((await file.exists()) ? (JSON.parse(await file.text()) as { marks?: string[] }).marks : []) ?? [];

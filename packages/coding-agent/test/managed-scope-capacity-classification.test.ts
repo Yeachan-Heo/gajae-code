@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	listManagedCandidates,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
 } from "../src/session/internal/managed-session-scope";
@@ -34,8 +35,29 @@ function scopeFor(input: { cwd: string; agentDir: string; sessionsRoot: string }
 	return resolved.scope;
 }
 
-// A managed scope grows past the native tree-snapshot budget purely from GJC's
-// own session artifacts (tool logs, subagent transcripts). The snapshot then
+it("reports denied native workspace identity as permission_denied", async () => {
+	const input = fixture();
+	const scope = scopeFor(input);
+	expect(prepareManagedSessionScopeForWriteSync(scope).kind).toBe("resolved");
+	await Bun.write(
+		path.join(scope.directoryPath, "access-denied-cwd.jsonl"),
+		`${JSON.stringify({ type: "session", id: "access-denied-cwd", cwd: input.cwd })}\n`,
+	);
+
+	const canonicalIdentity = native.canonicalExistingDirectoryIdentity;
+	vi.spyOn(native, "canonicalExistingDirectoryIdentity").mockImplementation(pathname =>
+		pathname === input.cwd ? { ok: false, code: "access_denied" } : canonicalIdentity(pathname),
+	);
+
+	expect(resolveManagedScope(input)).toMatchObject({ kind: "error", code: "permission_denied" });
+	const listing = listManagedCandidates(scope);
+	expect(listing.kind).toBe("complete");
+	if (listing.kind !== "complete") return;
+	expect(listing.invalid).toContainEqual({ code: "permission_denied", sessionId: "access-denied-cwd" });
+});
+
+// A managed scope grows past a scan budget purely from GJC's own session artifacts
+// (tool logs, subagent transcripts). The snapshot then
 // fails with `content_too_large`, which the resolver used to collapse into
 // `binding_invalid` — reporting a corrupt binding for a scope whose binding is
 // byte-for-byte canonical, and sending operators to delete a healthy file.

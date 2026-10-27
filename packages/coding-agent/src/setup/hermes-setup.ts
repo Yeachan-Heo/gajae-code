@@ -201,7 +201,10 @@ function parseMutationClasses(values: string[] | undefined): HermesMutationClass
 function parseByteCap(value: string | undefined): number | undefined {
 	if (value === undefined) return undefined;
 	const parsed = Number(value);
-	if (!Number.isInteger(parsed) || parsed <= 0) {
+	// Safe integers only: the cap is serialized with String(), and the runtime policy
+	// parser accepts plain digits, so an unsafe integer such as 1e21 ("1e+21") would
+	// silently fall back to the default cap there.
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) {
 		throw new HermesSetupError("--artifact-byte-cap must be a positive integer.", 2);
 	}
 	return parsed;

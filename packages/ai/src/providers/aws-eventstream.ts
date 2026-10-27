@@ -178,7 +178,8 @@ export async function* decodeEventStream(source: ReadableStream<Uint8Array>): As
 			if (offset > 0) buf = buf.slice(offset);
 			if (done) break;
 		}
-		if (buf.length > 0) throw new Error("eventstream: truncated message at end of stream");
+		if (buf.length > 0)
+			throw new Error(`eventstream: truncated message at end of stream (${buf.length} trailing bytes)`);
 	} finally {
 		reader.releaseLock();
 	}

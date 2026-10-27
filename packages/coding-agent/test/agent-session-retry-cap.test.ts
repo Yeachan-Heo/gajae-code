@@ -5,6 +5,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -277,7 +278,11 @@ describe("AgentSession retry admission: repetition guard", () => {
 	});
 
 	/** A terminal provider error with no transport facts, exactly as the guard emits it. */
-	function repetitionTripStream(model: Model, errorCode: string | undefined): AssistantMessageEventStream {
+	function repetitionTripStream(
+		model: Model,
+		errorCode: string | undefined,
+		errorMessage: string,
+	): AssistantMessageEventStream {
 		const stream = new AssistantMessageEventStream();
 		queueMicrotask(() => {
 			const message: AssistantMessage = {
@@ -295,7 +300,7 @@ describe("AgentSession retry admission: repetition guard", () => {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: "error",
-				errorMessage: REPETITION_TRIP_MESSAGE,
+				errorMessage,
 				...(errorCode ? { errorCode } : {}),
 				timestamp: Date.now(),
 			};
@@ -306,7 +311,10 @@ describe("AgentSession retry admission: repetition guard", () => {
 	}
 
 	/** Drives one turn that fails as above; any retry recovers, so a retry is observable. */
-	async function runTurn(errorCode: string | undefined): Promise<AutoRetryStartEvent[]> {
+	async function runTurn(
+		errorCode: string | undefined,
+		errorMessage = REPETITION_TRIP_MESSAGE,
+	): Promise<AutoRetryStartEvent[]> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
@@ -320,7 +328,7 @@ describe("AgentSession retry admission: repetition guard", () => {
 			streamFn: (requestedModel, context, options) => {
 				calls += 1;
 				return calls === 1
-					? repetitionTripStream(requestedModel, errorCode)
+					? repetitionTripStream(requestedModel, errorCode, errorMessage)
 					: recovered.stream(requestedModel, context, options);
 			},
 		});
@@ -367,5 +375,24 @@ describe("AgentSession retry admission: repetition guard", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		const last = lastAssistant(session!);
 		expect(last.stopReason).toBe("stop");
+	});
+
+	const PROTOCOL_MISMATCH_MESSAGE =
+		"Kiro CodeWhisperer returned a non-eventstream 200 response (text/plain): HTTP 503 service unavailable";
+
+	it("does not retry a provider protocol mismatch even when its body reads as transient", async () => {
+		const retryStartEvents = await runTurn(PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE, PROTOCOL_MISMATCH_MESSAGE);
+
+		expect(retryStartEvents).toEqual([]);
+		const last = lastAssistant(session!);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorCode).toBe(PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE);
+	});
+
+	it("still retries the same transient-looking text without the protocol mismatch code", async () => {
+		const retryStartEvents = await runTurn(undefined, PROTOCOL_MISMATCH_MESSAGE);
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(lastAssistant(session!).stopReason).toBe("stop");
 	});
 });

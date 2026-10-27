@@ -2,7 +2,6 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ImageContent } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import { Markdown, Text } from "@gajae-code/tui";
-import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend } from "../eval/backend";
@@ -10,7 +9,6 @@ import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, 
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
-import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
 import { resolveEvalBackends, type ToolSession } from ".";
@@ -21,7 +19,8 @@ import {
 	stripOutputNotice,
 } from "./output-meta";
 import { formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
-import { ToolAbortError, ToolError } from "./tool-errors";
+import { evalToolDescriptionForSession } from "./session-descriptions";
+import { ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
@@ -134,19 +133,22 @@ function renderJsonTree(value: unknown, theme: Theme, expanded: boolean, maxDept
 	return renderNode(value, "", 0, true);
 }
 
-export interface EvalToolDescriptionOptions {
-	py?: boolean;
-	js?: boolean;
-}
-
-export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
-	const py = options.py ?? true;
-	const js = options.js ?? true;
-	return prompt.render(evalDescription, { py, js });
-}
+export { type EvalToolDescriptionOptions, getEvalToolDescription } from "./session-descriptions";
 
 export interface EvalToolOptions {
 	proxyExecutor?: EvalProxyExecutor;
+}
+
+/**
+ * In-process eval is not a shell command, so a bash allowlist cannot authorize it.
+ * The same flags that turn the bash tool's allowlist on refuse eval outright.
+ * Blank prefixes match `checkBashAllowedPrefixes`: they do not restrict.
+ */
+function bashRestrictionBlocksEval(
+	session: Pick<ToolSession, "bashAllowedPrefixes" | "bashRestrictionProfile">,
+): boolean {
+	if (session.bashRestrictionProfile === "read-only") return true;
+	return (session.bashAllowedPrefixes ?? []).some(prefix => prefix.trim().length > 0);
 }
 
 interface ResolvedBackend {
@@ -204,9 +206,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly loadMode = "discoverable";
 	readonly label = "Eval";
 	get description(): string {
-		if (!this.session) return getEvalToolDescription();
-		const backends = resolveEvalBackends(this.session);
-		return getEvalToolDescription({ py: backends.python, js: backends.js });
+		return evalToolDescriptionForSession(this.session);
 	}
 	readonly parameters = evalSchema;
 	readonly concurrency = "exclusive";
@@ -237,6 +237,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		onUpdate?: AgentToolUpdateCallback,
 		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
+		if (this.session && bashRestrictionBlocksEval(this.session)) {
+			throw new ToolError("Eval is unavailable while this session's bash allowlist or read-only profile is active.");
+		}
 		if (this.#proxyExecutor) {
 			return this.#proxyExecutor(params, signal);
 		}
@@ -245,24 +248,23 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw new ToolError("Eval tool requires a session when not using proxy executor");
 		}
 		const session = this.session;
-
-		const cells: ResolvedEvalCell[] = [];
-		for (let i = 0; i < params.cells.length; i++) {
-			const cell = params.cells[i];
-			const language: EvalLanguage = cell.language === "py" ? "python" : "js";
-			const resolved = await resolveBackend(session, language);
-			cells.push({
-				index: i,
-				title: cell.title,
-				code: cell.code,
-				timeoutMs: (cell.timeout ?? 30) * 1000,
-				reset: cell.reset ?? false,
-				resolved,
-			});
-		}
-		const languages = uniqueEvalLanguages(cells);
-		const notice = detailsNotice(cells);
+		session.assertEvalExecutionAllowed?.();
+		const cwd = session.cwd;
+		const settings = session.settings;
+		const sessionFile = session.getSessionFile?.() ?? null;
+		const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? null;
+		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
+		const evalSession = {
+			...session,
+			cwd,
+			settings,
+			getSessionFile: () => sessionFile,
+			getEvalKernelOwnerId: () => kernelOwnerId,
+		};
 		const sessionAbortController = new AbortController();
+		const abortFromCaller = (): void => sessionAbortController.abort(signal?.reason);
+		if (signal?.aborted) abortFromCaller();
+		else signal?.addEventListener("abort", abortFromCaller, { once: true });
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
 		let outputDumped = false;
@@ -273,12 +275,30 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			return outputSummary;
 		};
 
-		const execution = (async (): Promise<AgentToolResult<EvalToolDetails | undefined>> => {
+		const execution = Promise.resolve().then(async (): Promise<AgentToolResult<EvalToolDetails | undefined>> => {
 			try {
-				if (signal?.aborted) {
-					throw new ToolAbortError();
-				}
+				throwIfAborted(sessionAbortController.signal);
 				session.assertEvalExecutionAllowed?.();
+				const cells: ResolvedEvalCell[] = [];
+				for (let i = 0; i < params.cells.length; i++) {
+					throwIfAborted(sessionAbortController.signal);
+					session.assertEvalExecutionAllowed?.();
+					const cell = params.cells[i];
+					const language: EvalLanguage = cell.language === "py" ? "python" : "js";
+					const resolved = await resolveBackend(evalSession, language);
+					throwIfAborted(sessionAbortController.signal);
+					session.assertEvalExecutionAllowed?.();
+					cells.push({
+						index: i,
+						title: cell.title,
+						code: cell.code,
+						timeoutMs: (cell.timeout ?? 30) * 1000,
+						reset: cell.reset ?? false,
+						resolved,
+					});
+				}
+				const languages = uniqueEvalLanguages(cells);
+				const notice = detailsNotice(cells);
 
 				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 				const jsonOutputs: unknown[] = [];
@@ -332,31 +352,28 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					});
 				};
 
-				const sessionFile = session.getSessionFile?.() ?? undefined;
-				const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? undefined;
+				throwIfAborted(sessionAbortController.signal);
+				session.assertEvalExecutionAllowed?.();
 				const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.("eval")) ?? {};
+				throwIfAborted(sessionAbortController.signal);
 				session.assertEvalExecutionAllowed?.();
 				outputSink = new OutputSink({
 					artifactPath,
 					artifactId,
-					headBytes: resolveOutputSinkHeadBytes(session.settings),
-					maxColumns: resolveOutputMaxColumns(session.settings),
+					headBytes: resolveOutputSinkHeadBytes(settings),
+					maxColumns: resolveOutputMaxColumns(settings),
 					onChunk: chunk => {
 						appendTail(chunk);
 						pushUpdate();
 					},
 				});
-				const sessionId = sessionFile ? `session:${sessionFile}:cwd:${session.cwd}` : `cwd:${session.cwd}`;
-
 				for (let i = 0; i < cells.length; i++) {
 					const cell = cells[i];
 					const backend = cell.resolved.backend;
 					const timeoutSec = timeoutSecondsFromMs(cell.timeoutMs);
 					const deadlineMs = Date.now() + timeoutSec * 1000;
 					const timeoutSignal = AbortSignal.timeout(Math.max(0, deadlineMs - Date.now()));
-					const combinedSignal = signal
-						? AbortSignal.any([signal, timeoutSignal, sessionAbortController.signal])
-						: AbortSignal.any([timeoutSignal, sessionAbortController.signal]);
+					const combinedSignal = AbortSignal.any([timeoutSignal, sessionAbortController.signal]);
 
 					const cellResult = cellResults[i];
 					cellResult.status = "running";
@@ -365,15 +382,17 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					cellResult.exitCode = undefined;
 					cellResult.durationMs = undefined;
 					pushUpdate();
+					throwIfAborted(sessionAbortController.signal);
+					session.assertEvalExecutionAllowed?.();
 
 					const startTime = Date.now();
 					const result = await backend.execute(cell.code, {
-						cwd: session.cwd,
+						cwd,
 						sessionId,
 						sessionFile: sessionFile ?? undefined,
-						kernelOwnerId,
+						kernelOwnerId: kernelOwnerId ?? undefined,
 						signal: combinedSignal,
-						session,
+						session: evalSession,
 						deadlineMs,
 						reset: cell.reset,
 						artifactPath,
@@ -523,9 +542,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					} catch {}
 				}
 			}
-		})();
+		});
 
-		return await (session.trackEvalExecution?.(execution, sessionAbortController) ?? execution);
+		try {
+			return await (session.trackEvalExecution?.(execution, sessionAbortController) ?? execution);
+		} finally {
+			signal?.removeEventListener("abort", abortFromCaller);
+		}
 	}
 }
 

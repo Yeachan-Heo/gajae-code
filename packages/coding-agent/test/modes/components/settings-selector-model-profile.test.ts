@@ -80,4 +80,23 @@ describe("SettingsSelectorComponent Default Model Profile", () => {
 
 		expect(component.render(120).join("\n")).toContain("No matching commands");
 	});
+
+	it("refreshes open profile choices without losing the selected draft", () => {
+		const { component, changedSettings } = createSelector(["first", "selected"]);
+		focusModelTab(component);
+
+		component.handleInput("\n"); // Open Default Model Profile submenu.
+		component.handleInput("\x1b[B"); // Draft selection: selected.
+
+		settings.set("modelProfile.default", "externally-saved");
+		component.refreshFromConfiguration(["externally-saved"]);
+
+		const refreshed = component.render(120).join("\n");
+		expect(refreshed).toContain("selected (unavailable)");
+		expect(refreshed).toContain("externally-saved");
+		expect(refreshed).not.toContain("first");
+
+		component.handleInput("\n"); // The still-selected draft remains selected and can be accepted.
+		expect(changedSettings).toContainEqual({ path: "modelProfile.default", value: "selected" });
+	});
 });

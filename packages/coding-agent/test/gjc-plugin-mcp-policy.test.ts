@@ -58,6 +58,8 @@ describe("GJC MCP policy: IP ranges", () => {
 			"172.31.255.255",
 			"192.168.0.1",
 			"169.254.169.254",
+			"100.64.0.1",
+			"100.127.255.255",
 			"0.0.0.0",
 			"224.0.0.1",
 		]) {
@@ -65,6 +67,9 @@ describe("GJC MCP policy: IP ranges", () => {
 		}
 		expect(isDeniedIpv4("8.8.8.8")).toBe(false);
 		expect(isDeniedIpv4("172.32.0.1")).toBe(false);
+		expect(isDeniedIpv4("100.63.255.255")).toBe(false);
+		expect(isDeniedIpv4("100.128.0.1")).toBe(false);
+		expect(isDeniedIpv6("::ffff:100.64.0.1")).toBe(true);
 	});
 	test("ipv6 deny set", () => {
 		for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::3", "ff02::1", "::ffff:127.0.0.1"]) {

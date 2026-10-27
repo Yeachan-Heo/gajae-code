@@ -43,7 +43,7 @@ Available `config` fields:
 
 ## Current limitations
 
-`RenderMermaid` uses the `beautiful-mermaid` ASCII renderer. It works best for flowcharts and small diagrams.
+`RenderMermaid` uses the native Rust ASCII renderer. It supports flowcharts, state, sequence, class, ER, and XY chart diagrams; layout, glyph, spacing, and invalid-input behavior may differ from earlier output.
 
 Complex sequence diagrams, especially with `alt` / `else` blocks, can become very wide in a terminal. That is current renderer behavior, not a provider or model configuration problem.
 

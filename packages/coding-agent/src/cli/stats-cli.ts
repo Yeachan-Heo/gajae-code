@@ -4,7 +4,7 @@
  * Handles `gjc stats` subcommand for viewing AI usage statistics.
  */
 
-import { APP_NAME, formatDuration, formatNumber, formatPercent } from "@gajae-code/utils";
+import { APP_NAME, formatDuration, formatNumber, formatPercent, sanitizeDisplayLine } from "@gajae-code/utils";
 import chalk from "chalk";
 import { openPath } from "../utils/open";
 
@@ -70,41 +70,6 @@ export interface StatsCommandArgs {
 	summary: boolean;
 }
 
-// =============================================================================
-// Argument Parser
-// =============================================================================
-
-/**
- * Parse stats subcommand arguments.
- * Returns undefined if not a stats command.
- */
-export function parseStatsArgs(args: string[]): StatsCommandArgs | undefined {
-	if (args.length === 0 || args[0] !== "stats") {
-		return undefined;
-	}
-
-	const result: StatsCommandArgs = {
-		port: 3847,
-		json: false,
-		summary: false,
-	};
-
-	for (let i = 1; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === "--json" || arg === "-j") {
-			result.json = true;
-		} else if (arg === "--summary" || arg === "-s") {
-			result.summary = true;
-		} else if ((arg === "--port" || arg === "-p") && i + 1 < args.length) {
-			result.port = parseInt(args[++i], 10);
-		} else if (arg.startsWith("--port=")) {
-			result.port = parseInt(arg.split("=")[1], 10);
-		}
-	}
-
-	return result;
-}
-
 function formatCost(n: number): string {
 	if (n < 0.01) return `$${n.toFixed(4)}`;
 	if (n < 1) return `$${n.toFixed(3)}`;
@@ -131,7 +96,10 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const { processed, files } = await syncAllSessions({ onProgress: progress.onProgress });
 	progress.finish();
 	const total = await getTotalMessageCount();
-	console.log(`Synced ${processed} new entries from ${files} files (${total} total)\n`);
+	const synced = `Synced ${processed} new entries from ${files} files (${total} total)\n`;
+	// `--json` stdout must be exactly the JSON document so it can be piped into a parser.
+	if (cmd.json) process.stderr.write(`${synced}\n`);
+	else console.log(synced);
 
 	if (cmd.json) {
 		const stats = await getDashboardStats();
@@ -168,7 +136,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 async function printStatsSummary(): Promise<void> {
 	const { getDashboardStats } = await import("@gajae-code/stats");
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder } = stats;
+	const { overall, failures, byModel, byFolder, byAgent, cacheMissAttribution } = stats;
 
 	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
 
@@ -187,11 +155,29 @@ async function printStatsSummary(): Promise<void> {
 		console.log(`  Avg Tokens/s: ${overall.avgTokensPerSecond.toFixed(1)}`);
 	}
 
+	console.log(chalk.bold("\nProvider Failures:"));
+	console.log(
+		`  Error+Abort Share: ${formatPercent(failures.failureShare)} (${formatNumber(failures.erroredRequests)} errors, ${formatNumber(failures.abortedRequests)} aborts)`,
+	);
+	console.log(`  Failed Duration: ${formatDuration(failures.failedDurationMs)}`);
+	console.log(
+		`  Post-Failure Full-Miss Tokens: ${formatNumber(failures.postFailureFullMissTokens)} (${formatNumber(failures.postFailureFullMissRequests)}/${formatNumber(failures.postFailureRequests)} requests)`,
+	);
+
 	if (byModel.length > 0) {
 		console.log(chalk.bold("\nBy Model:"));
 		for (const m of byModel.slice(0, 10)) {
 			console.log(
-				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+				`  ${sanitizeDisplayLine(m.model)}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+			);
+		}
+	}
+
+	if (byAgent.length > 0) {
+		console.log(chalk.bold("\nBy Agent Role:"));
+		for (const agent of byAgent) {
+			console.log(
+				`  ${sanitizeDisplayLine(agent.agent)}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
 			);
 		}
 	}
@@ -199,7 +185,28 @@ async function printStatsSummary(): Promise<void> {
 	if (byFolder.length > 0) {
 		console.log(chalk.bold("\nBy Folder:"));
 		for (const f of byFolder.slice(0, 10)) {
-			console.log(`  ${f.folder}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`);
+			console.log(
+				`  ${sanitizeDisplayLine(f.folder)}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`,
+			);
+		}
+	}
+
+	if (cacheMissAttribution.trackedRequests > 0) {
+		const misses = cacheMissAttribution;
+		console.log(chalk.bold("\nCache Prefix Misses:"));
+		console.log(
+			`  Misses: ${formatNumber(misses.prefixMisses)} of ${formatNumber(misses.trackedRequests)} tracked follow-up requests`,
+		);
+		console.log(
+			`  Client-caused: ${formatNumber(misses.clientCausedMisses)} (${formatPercent(misses.clientCausedShare)})`,
+		);
+		console.log(`  Provider-side (prefix intact): ${formatNumber(misses.providerSideMisses)}`);
+		console.log(`  Model switch: ${formatNumber(misses.modelSwitchMisses)}`);
+		for (const cause of misses.byCause) {
+			const label = sanitizeDisplayLine(
+				cause.divergedRole ? `${cause.change} (${cause.divergedRole})` : cause.change,
+			);
+			console.log(`    ${label}: ${formatNumber(cause.misses)}`);
 		}
 	}
 
@@ -231,8 +238,10 @@ ${chalk.bold("Examples:")}
 ${chalk.bold("Metrics:")}
   - Total requests and error rate
   - Token usage (input, output, cache)
+  - Role usage (default, executor, planner, architect, critic)
   - Cost breakdown
   - Average duration and time to first token (TTFT)
   - Tokens per second throughput
+  - Cache prefix misses split into client-caused vs provider-side
 `);
 }

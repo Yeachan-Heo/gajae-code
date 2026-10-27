@@ -11,6 +11,8 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
+import { buildSessionProjectProgress } from "../progress/collect-project-progress";
+import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -123,6 +125,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getCredentialSessionId: () => session.credentialSessionId,
 			isIdle: () => !session.isStreaming,
 			getActivePromptHandle: () => session.activePromptHandle,
+			getSessionWorkLease: () => session.sessionWorkLease,
 			abort: () => session.abort(),
 			abortPromptAndWait: (handle, abortOptions) => session.abortPromptAndWait(handle, abortOptions),
 			hasPendingMessages: () => session.queuedMessageCount > 0,
@@ -200,8 +203,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return { bytes: new Uint8Array(await file.slice(start, end).arrayBuffer()), totalBytes: file.size };
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
+			getProjectProgress: async () =>
+				toProjectProgressSnapshot(await buildSessionProjectProgress(session, session.sessionManager)),
 			onJobFold: listener => session.onJobFold(listener),
-			onSessionEvent: listener => session.subscribe(listener),
+			onSessionEvent: listener => session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
@@ -257,7 +262,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						const slashIndex = selector.indexOf("/");
 						const model =
 							slashIndex > 0
-								? session.modelRegistry.find(selector.slice(0, slashIndex), selector.slice(slashIndex + 1))
+								? session.modelRegistry.find(
+										selector.slice(0, slashIndex),
+										selector.slice(slashIndex + 1),
+										session.credentialSessionId,
+									)
 								: undefined;
 						if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
 							throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {

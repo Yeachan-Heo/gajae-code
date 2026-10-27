@@ -12,6 +12,7 @@ import {
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import {
+	type CoordinatorAtomicWriteOptions,
 	ensureCoordinatorDirectory,
 	syncCoordinatorDirectory,
 	syncCoordinatorFile,
@@ -21,6 +22,7 @@ import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
 	isValidOwnerIntent,
 	lifecyclePaths,
@@ -51,9 +53,9 @@ export const GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV = "GJC_COORDINATOR_S
  * children. The process environment is deliberately scrubbed synchronously even when the
  * key is malformed, so a rejected launch cannot leak it to descendants.
  */
-const coordinatorSidecarSigningBootstrapUrl = process.env[GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL_ENV]?.trim();
+const coordinatorSidecarSigningBootstrapUrl = trustedCoordinatorEnv(GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL_ENV);
 const coordinatorSidecarSigningKeyBootstrap = await (async (): Promise<string | undefined> => {
-	if (!coordinatorSidecarSigningBootstrapUrl) return process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	if (!coordinatorSidecarSigningBootstrapUrl) return trustedCoordinatorEnv(GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV);
 	try {
 		const response = await fetch(coordinatorSidecarSigningBootstrapUrl);
 		if (!response.ok) return undefined;
@@ -177,7 +179,24 @@ export const __sessionStateSidecarTestHooks: {
 	beforeRescopeJournalWrite?: (cwd: string) => void | Promise<void>;
 	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
 	beforeRescopePublish?: () => void | Promise<void>;
+	disableCoordinatorFileSyncForTests?: boolean;
 } = {};
+
+/** Create coordinator atomic write options with test hook support for disabling fsync. */
+function coordinatorAtomicWriteOptionsForTests<T extends CoordinatorAtomicWriteOptions>(
+	overrides?: T,
+): CoordinatorAtomicWriteOptions {
+	const options = overrides ?? ({} as T);
+	if (!__sessionStateSidecarTestHooks.disableCoordinatorFileSyncForTests) {
+		return options;
+	}
+	return {
+		...options,
+		syncFile: async () => {
+			/* skip fsync in tests */
+		},
+	};
+}
 
 interface RuntimeStateEvent {
 	type: string;
@@ -1806,35 +1825,39 @@ async function writeStateFileSyncConditional(
 	expectedDestination: NativeExactFileIdentity | null,
 ): Promise<void> {
 	const contents = `${JSON.stringify(finalizeSidecarPayload(payload, keyId))}\n`;
-	await writeCoordinatorAtomic(stateFile, contents, {
-		rename: async (source, destination) => {
-			if (!expectedDestination) {
-				const published = renameNoReplacePath(source, destination);
-				if (!published.ok) throw new PreviousRuntimeStateReadError();
-				return;
-			}
-			const stat = fsSync.lstatSync(source, { bigint: true });
-			const parent = fsSync.lstatSync(path.dirname(source), { bigint: true });
-			if (!stat.isFile() || stat.isSymbolicLink() || !parent.isDirectory() || parent.isSymbolicLink())
-				throw new PreviousRuntimeStateReadError();
-			const replaced = exactReplacePath(
-				source,
-				destination,
-				{
-					dev: stat.dev,
-					ino: stat.ino,
-					nlink: stat.nlink,
-					parentDev: parent.dev,
-					parentIno: parent.ino,
-					size: stat.size,
-					mtimeNs: stat.mtimeNs,
-					sha256: createHash("sha256").update(contents).digest("hex"),
-				},
-				expectedDestination,
-			);
-			if (!replaced.ok) throw new PreviousRuntimeStateReadError();
-		},
-	});
+	await writeCoordinatorAtomic(
+		stateFile,
+		contents,
+		coordinatorAtomicWriteOptionsForTests({
+			rename: async (source: string, destination: string) => {
+				if (!expectedDestination) {
+					const published = renameNoReplacePath(source, destination);
+					if (!published.ok) throw new PreviousRuntimeStateReadError();
+					return;
+				}
+				const stat = fsSync.lstatSync(source, { bigint: true });
+				const parent = fsSync.lstatSync(path.dirname(source), { bigint: true });
+				if (!stat.isFile() || stat.isSymbolicLink() || !parent.isDirectory() || parent.isSymbolicLink())
+					throw new PreviousRuntimeStateReadError();
+				const replaced = exactReplacePath(
+					source,
+					destination,
+					{
+						dev: stat.dev,
+						ino: stat.ino,
+						nlink: stat.nlink,
+						parentDev: parent.dev,
+						parentIno: parent.ino,
+						size: stat.size,
+						mtimeNs: stat.mtimeNs,
+						sha256: createHash("sha256").update(contents).digest("hex"),
+					},
+					expectedDestination,
+				);
+				if (!replaced.ok) throw new PreviousRuntimeStateReadError();
+			},
+		}),
+	);
 }
 
 /**
@@ -1967,7 +1990,7 @@ async function withStateFileLocks<T>(stateFiles: readonly string[], operation: (
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
-	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload)}\n`);
+	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload)}\n`, coordinatorAtomicWriteOptionsForTests());
 }
 
 function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {
@@ -2471,12 +2494,16 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 					).toString("base64");
 				}
 				const writeJournal = async (journalFile: string): Promise<void> => {
-					await writeCoordinatorAtomic(journalFile, `${JSON.stringify(journal)}\n`, {
-						rename: async (source, destination) => {
-							const published = renameNoReplacePath(source, destination);
-							if (!published.ok) throw new PreviousRuntimeStateReadError();
-						},
-					});
+					await writeCoordinatorAtomic(
+						journalFile,
+						`${JSON.stringify(journal)}\n`,
+						coordinatorAtomicWriteOptionsForTests({
+							rename: async (source: string, destination: string) => {
+								const published = renameNoReplacePath(source, destination);
+								if (!published.ok) throw new PreviousRuntimeStateReadError();
+							},
+						}),
+					);
 				};
 				await __sessionStateSidecarTestHooks.beforeRescopeJournalWrite?.(previousCwd);
 				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
@@ -2532,28 +2559,32 @@ export async function markCoordinatorRuntimeStateRescopePublishing(
 			).toString("base64");
 		}
 		const contents = `${JSON.stringify(journal)}\n`;
-		await writeCoordinatorAtomic(journalFile, contents, {
-			rename: async (source, destination) => {
-				const sourceStat = fsSync.lstatSync(source, { bigint: true });
-				const sourceParent = fsSync.lstatSync(path.dirname(source), { bigint: true });
-				const replaced = exactReplacePath(
-					source,
-					destination,
-					{
-						dev: sourceStat.dev,
-						ino: sourceStat.ino,
-						nlink: sourceStat.nlink,
-						parentDev: sourceParent.dev,
-						parentIno: sourceParent.ino,
-						size: sourceStat.size,
-						mtimeNs: sourceStat.mtimeNs,
-						sha256: createHash("sha256").update(contents).digest("hex"),
-					},
-					observed.identity,
-				);
-				if (!replaced.ok) throw new PreviousRuntimeStateReadError();
-			},
-		});
+		await writeCoordinatorAtomic(
+			journalFile,
+			contents,
+			coordinatorAtomicWriteOptionsForTests({
+				rename: async (source: string, destination: string) => {
+					const sourceStat = fsSync.lstatSync(source, { bigint: true });
+					const sourceParent = fsSync.lstatSync(path.dirname(source), { bigint: true });
+					const replaced = exactReplacePath(
+						source,
+						destination,
+						{
+							dev: sourceStat.dev,
+							ino: sourceStat.ino,
+							nlink: sourceStat.nlink,
+							parentDev: sourceParent.dev,
+							parentIno: sourceParent.ino,
+							size: sourceStat.size,
+							mtimeNs: sourceStat.mtimeNs,
+							sha256: createHash("sha256").update(contents).digest("hex"),
+						},
+						observed.identity,
+					);
+					if (!replaced.ok) throw new PreviousRuntimeStateReadError();
+				},
+			}),
+		);
 	}
 }
 

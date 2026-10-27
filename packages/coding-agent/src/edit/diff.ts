@@ -5,8 +5,11 @@
  * used when not in patch mode.
  */
 
-import * as Diff from "diff";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
+import { getNativeDiffBindings } from "../internal/native-diff";
+
 import { resolveToCwd } from "../tools/path-utils";
+import { ToolError } from "../tools/tool-errors";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
 import { adjustIndentation, normalizeToLF, stripBom } from "./normalize";
 import { readEditFileText } from "./read-file";
@@ -37,6 +40,8 @@ export class ParseError extends Error {
 	) {
 		super(lineNumber !== undefined ? `Line ${lineNumber}: ${message}` : message);
 		this.name = "ParseError";
+		// A malformed patch or diff hunk is the model's input, not a fault.
+		markDesignedError(this);
 	}
 }
 
@@ -44,6 +49,8 @@ export class ApplyPatchError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "ApplyPatchError";
+		// A patch that does not apply is the tool answering the model's input, not a fault.
+		markDesignedError(this);
 	}
 }
 
@@ -55,64 +62,6 @@ function formatNumberedDiffLine(prefix: "+" | "-" | " ", lineNum: number, conten
 	return `${prefix}${lineNum}|${content}`;
 }
 
-type DiffLinePart = {
-	added?: boolean;
-	removed?: boolean;
-	value: string;
-};
-
-type DiffLinesFn = (oldStr: string, newStr: string) => DiffLinePart[];
-
-const DIFF_LINES_TEST_OVERRIDE_UNSET = Symbol("DIFF_LINES_TEST_OVERRIDE_UNSET");
-
-let cachedNativeDiffLines: DiffLinesFn | null | undefined;
-let diffLinesTestOverride: DiffLinesFn | null | typeof DIFF_LINES_TEST_OVERRIDE_UNSET = DIFF_LINES_TEST_OVERRIDE_UNSET;
-
-function resolveNativeDiffLines(): DiffLinesFn | undefined {
-	if (diffLinesTestOverride !== DIFF_LINES_TEST_OVERRIDE_UNSET) {
-		return diffLinesTestOverride ?? undefined;
-	}
-
-	if (cachedNativeDiffLines !== undefined) {
-		return cachedNativeDiffLines ?? undefined;
-	}
-
-	try {
-		const natives = require("@gajae-code/natives") as { diffLines?: unknown };
-		cachedNativeDiffLines = typeof natives.diffLines === "function" ? (natives.diffLines as DiffLinesFn) : null;
-	} catch {
-		cachedNativeDiffLines = null;
-	}
-
-	return cachedNativeDiffLines ?? undefined;
-}
-
-function diffLinesWithFallback(oldContent: string, newContent: string): DiffLinePart[] {
-	const nativeDiffLines = resolveNativeDiffLines();
-	if (nativeDiffLines) {
-		try {
-			return nativeDiffLines(oldContent, newContent);
-		} catch {
-			// Fall through to the JS implementation if the native export fails at runtime.
-		}
-	}
-
-	return Diff.diffLines(oldContent, newContent);
-}
-
-export function __setDiffLinesForTest(diffLines: DiffLinesFn | null): void {
-	diffLinesTestOverride = diffLines;
-}
-
-export function __clearDiffLinesForTest(): void {
-	diffLinesTestOverride = DIFF_LINES_TEST_OVERRIDE_UNSET;
-	cachedNativeDiffLines = undefined;
-}
-
-export function __getNativeDiffLinesForTest(): DiffLinesFn | undefined {
-	return resolveNativeDiffLines();
-}
-
 /**
  * Generate a unified diff string with line numbers and context.
  * Returns both the diff string and the first changed line number (in the new file).
@@ -120,7 +69,8 @@ export function __getNativeDiffLinesForTest(): DiffLinesFn | undefined {
 export function generateDiffString(oldContent: string, newContent: string, contextLines = 4): DiffResult {
 	// Native line diff (Rust port of jsdiff `Diff.diffLines`, byte-identical
 	// output) — avoids the pure-JS Myers blowup (>1s on ~1MB files).
-	const parts = diffLinesWithFallback(oldContent, newContent);
+	const parts = getNativeDiffBindings().diffLines(oldContent, newContent);
+
 	const output: string[] = [];
 
 	let oldLineNum = 1;
@@ -247,10 +197,11 @@ export interface ReplaceResult {
  * Returns both the diff string and the first changed line number (in the new file).
  */
 export function generateUnifiedDiffString(oldContent: string, newContent: string, contextLines = 3): DiffResult {
-	const patch = Diff.structuredPatch("", "", oldContent, newContent, "", "", { context: contextLines });
+	const hunks = getNativeDiffBindings().structuredPatchHunks(oldContent, newContent, contextLines);
+
 	const output: string[] = [];
 	let firstChangedLine: number | undefined;
-	for (const hunk of patch.hunks) {
+	for (const hunk of hunks) {
 		output.push(`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`);
 		let oldLine = hunk.oldStart;
 		let newLine = hunk.newStart;
@@ -719,9 +670,14 @@ export function parseDiffHunks(diff: string): DiffHunk[] {
 /**
  * Find and replace text in content using fuzzy matching.
  */
-export function replaceText(content: string, oldText: string, newText: string, options: ReplaceOptions): ReplaceResult {
+export async function replaceText(
+	content: string,
+	oldText: string,
+	newText: string,
+	options: ReplaceOptions,
+): Promise<ReplaceResult> {
 	if (oldText.length === 0) {
-		throw new Error("oldText must not be empty.");
+		throw new ToolError("oldText must not be empty.");
 	}
 	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
 	let normalizedContent = normalizeToLF(content);
@@ -741,7 +697,7 @@ export function replaceText(content: string, oldText: string, newText: string, o
 
 		// No exact matches - try fuzzy matching iteratively
 		while (true) {
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+			const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 				allowFuzzy: options.fuzzy,
 				threshold,
 			});
@@ -771,13 +727,13 @@ export function replaceText(content: string, oldText: string, newText: string, o
 	}
 
 	// Single replacement mode
-	const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+	const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 		allowFuzzy: options.fuzzy,
 		threshold,
 	});
 
 	if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-		throw new Error(formatOccurrenceMatchError(matchOutcome.occurrences, matchOutcome.occurrencePreviews));
+		throw new ToolError(formatOccurrenceMatchError(matchOutcome.occurrences, matchOutcome.occurrencePreviews));
 	}
 
 	if (!matchOutcome.match) {
@@ -830,7 +786,7 @@ export async function computeEditDiff(
 		const normalizedOldText = normalizeToLF(oldText);
 		const normalizedNewText = normalizeToLF(newText);
 
-		const result = replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
+		const result = await replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
 			fuzzy,
 			all,
 			threshold,
@@ -838,7 +794,7 @@ export async function computeEditDiff(
 
 		if (result.count === 0) {
 			// Get closest match for error message
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+			const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 				allowFuzzy: fuzzy,
 				threshold: threshold ?? DEFAULT_FUZZY_THRESHOLD,
 			});

@@ -1,8 +1,14 @@
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { resetSettingsForTest, Settings, settings } from "../../src/config/settings";
 import type { Theme } from "../../src/modes/theme/theme";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
-import type { SubagentLiveProgress, SubagentSnapshot, SubagentToolDetails } from "../../src/tools/subagent";
+import {
+	type SubagentLiveProgress,
+	type SubagentSnapshot,
+	type SubagentToolDetails,
+	subagentCompactRenderedStateSignature,
+} from "../../src/tools/subagent";
 import {
 	subagentAwaitRenderedStateSignature,
 	subagentBodyCacheTestHooks,
@@ -29,6 +35,10 @@ function progress(overrides: Partial<AgentProgress> & Pick<AgentProgress, "id">)
 		...(overrides.recentOutput && overrides.recentOutput.length > 0
 			? { recentOutputSummary: { lineCount: Math.min(overrides.recentOutput.length, 6) } }
 			: {}),
+		...(overrides.toolCount ? { toolCount: overrides.toolCount } : {}),
+		...(overrides.contextTokens ? { contextTokens: overrides.contextTokens } : {}),
+		...(overrides.contextWindow ? { contextWindow: overrides.contextWindow } : {}),
+		...(overrides.lastActivityMs !== undefined ? { lastActivityMs: overrides.lastActivityMs } : {}),
 		...(overrides.fastMode ? { fastMode: true } : {}),
 		...(retryState
 			? {
@@ -85,6 +95,56 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("read");
 		expect(out).toContain("recent output available (1 line)");
 	});
+	it("quantizes last-activity age on the producer cadence", () => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(20_000);
+		try {
+			const details: SubagentToolDetails = {
+				subagents: [
+					snapshot({
+						id: "0-Stats",
+						liveProgressAvailable: true,
+						progress: progress({
+							id: "0-Stats",
+							currentTool: "read",
+							toolCount: 12,
+							contextTokens: 48_000,
+							contextWindow: 200_000,
+							lastActivityMs: 13_000,
+						}),
+					}),
+				],
+			};
+			const first = render(details);
+			expect(first).toContain("12 tools");
+			expect(first).toContain("48K/200K ctx");
+			expect(first).toMatch(/last activity 5(?:\.0)?s ago/);
+
+			// Re-rendering the same snapshot inside one age bucket must not mutate its row.
+			now.mockReturnValue(22_999);
+			expect(render(details)).toBe(first);
+
+			now.mockReturnValue(23_000);
+			expect(render(details)).toMatch(/last activity 10(?:\.0)?s ago/);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it("omits live stats when the live producer is gone", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-Gone",
+					liveProgressAvailable: false,
+					progress: progress({ id: "0-Gone", toolCount: 3, contextTokens: 9_000, lastActivityMs: 1 }),
+				}),
+			],
+		});
+		expect(out).not.toContain("3 tools");
+		expect(out).not.toContain("ctx");
+		expect(out).not.toContain("last activity");
+	});
+
 	it("renders the fast glyph on the model line only when fast mode is enabled", () => {
 		const out = render({
 			subagents: [
@@ -406,6 +466,62 @@ describe("interrupted await receipts", () => {
 		expect(out).not.toContain("0-Terminal\n  Inspect");
 	});
 
+	it("wraps await-timeout guidance to the terminal width instead of cutting it to one line", () => {
+		const guidance =
+			"Still running after the await timeout; timeout only bounded this wait and is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong.";
+		for (const width of [60, 80]) {
+			const component = subagentToolRenderer.renderResult(
+				{
+					content: [{ type: "text", text: "" }],
+					details: {
+						awaitOutcome: "timed_out",
+						subagents: [snapshot({ id: "0-Slow", status: "running", guidance })],
+					},
+				},
+				{ expanded: false, isPartial: false, spinnerFrame: 0 },
+				theme,
+			);
+			const lines = component.render(width).map(line => Bun.stripANSI(line));
+			for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
+			const text = lines.join(" ").replace(/\s+/g, " ");
+			expect(text).toContain("Inspect progress");
+			expect(text).toContain("never cancel just because an await timed out");
+			expect(text).toContain("unrecoverably wrong.");
+		}
+	});
+
+	it("never exceeds the terminal width with guidance on very narrow terminals", () => {
+		for (const width of [0, 1, 2, 3]) {
+			const component = subagentToolRenderer.renderResult(
+				{
+					content: [{ type: "text", text: "" }],
+					details: { subagents: [snapshot({ id: "0-Narrow", status: "running", guidance: "A" })] },
+				},
+				{ expanded: false, isPartial: false, spinnerFrame: 0 },
+				theme,
+			);
+			for (const line of component.render(width))
+				expect(Bun.stringWidth(Bun.stripANSI(line))).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("keeps pathological guidance bounded", () => {
+		const component = subagentToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: { subagents: [snapshot({ id: "0-Long", status: "running", guidance: "word ".repeat(400) })] },
+			},
+			{ expanded: false, isPartial: false, spinnerFrame: 0 },
+			theme,
+		);
+		const guidanceLines = component
+			.render(40)
+			.map(line => Bun.stripANSI(line))
+			.filter(line => line.includes("word"));
+		expect(guidanceLines).toHaveLength(12);
+		expect(guidanceLines.at(-1)).toEndWith("…");
+	});
+
 	it("includes changed interruption guidance in the receipt signature and body cache key", () => {
 		const active = snapshot({ id: "0-Await", guidance: "Await interrupted; inspect it." });
 		const terminal = snapshot({ id: "0-Await", guidance: undefined });
@@ -680,5 +796,232 @@ describe("subagent await renderer body cache (PR2)", () => {
 		expect(theme.icon.fast).toBeTruthy();
 		expect(fast.join("\n")).toContain(theme.icon.fast);
 		expect(slow.join("\n")).not.toContain(theme.icon.fast);
+	});
+});
+
+describe("compact subagent panel (#6774)", () => {
+	beforeEach(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		subagentBodyCacheTestHooks.reset();
+	});
+	afterEach(() => {
+		resetSettingsForTest();
+	});
+
+	function liveGroup(count: number, idle: number): SubagentSnapshot[] {
+		const now = Date.now();
+		return Array.from({ length: count }, (_, index) => {
+			const id = `0-Worker${index}`;
+			return snapshot({
+				id,
+				description: `worker ${index}`,
+				liveProgressAvailable: true,
+				progress: progress({
+					id,
+					currentTool: "bash",
+					toolCount: index + 1,
+					lastActivityMs: index < idle ? now - 45_000 : now - 1_000,
+				}),
+			});
+		});
+	}
+
+	it("renders 15 live subagents as a constant-height summary when collapsed", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const out = render({ subagents: liveGroup(15, 3) }, false);
+		const lines = out.split("\n");
+		expect(lines).toEqual([
+			expect.stringContaining("awaiting 15 of 15"),
+			"  15 subagents running · 3 idle >30s",
+			expect.stringMatching(/^ {2}\(.* to list each · ctrl\+s to observe sessions\)$/),
+		]);
+		expect(out).not.toContain("0-Worker");
+		// The heavy per-subagent bodies are never built in compact mode.
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(0);
+	});
+
+	it("keeps the line count independent of the number of subagents", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const few = render({ subagents: liveGroup(2, 0) }, false).split("\n");
+		const many = render({ subagents: liveGroup(40, 0) }, false).split("\n");
+		expect(many.length).toBe(few.length);
+	});
+
+	it("summarizes mixed terminal states", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const out = render(
+			{
+				subagents: [
+					...liveGroup(1, 0),
+					snapshot({ id: "0-Queued", status: "queued" }),
+					snapshot({ id: "0-Done", status: "completed" }),
+					snapshot({ id: "0-Failed", status: "failed" }),
+					snapshot({ id: "0-Cancelled", status: "cancelled" }),
+				],
+			},
+			false,
+		);
+		expect(out).toContain("1 subagent running · 1 failed · 1 queued · 1 done · 1 cancelled");
+	});
+
+	it("keeps failures visible and marks truncation on a narrow terminal", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const component = subagentToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					subagents: [
+						...liveGroup(9, 1),
+						snapshot({ id: "0-Queued", status: "queued" }),
+						snapshot({ id: "0-Paused", status: "paused" }),
+						snapshot({ id: "0-Done", status: "completed" }),
+						snapshot({ id: "0-Failed", status: "failed" }),
+					],
+				},
+			},
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		const summary = Bun.stripANSI(component.render(40)[1]!);
+		expect(summary).toStartWith("  9 subagents running · 1 failed");
+		expect(summary).toEndWith("…");
+	});
+
+	it("keeps the full receipt, including timeout guidance, once the await result is final", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const guidance =
+			"Subagent is still running after the await timeout; never cancel just because an await timed out.";
+		const subagents = liveGroup(15, 0).map(item => ({ ...item, guidance }));
+		const component = subagentToolRenderer.renderResult(
+			{ content: [{ type: "text", text: "" }], details: { subagents, awaitOutcome: "timed_out" } },
+			{ expanded: false, isPartial: false, spinnerFrame: 0 },
+			theme,
+		);
+		const out = Bun.stripANSI(component.render(160).join("\n"));
+		expect(out).toContain("0-Worker14");
+		expect(out).toContain("still running after the await timeout");
+		expect(out).not.toContain("to list each");
+	});
+
+	it("keeps the provider degradation warning in the compact summary", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const retryState = {
+			attempt: 2,
+			maxAttempts: 5,
+			kind: "provider_error" as const,
+			provider: "anthropic",
+			delayMs: 10_000,
+			errorMessage: "overloaded",
+			startedAtMs: Date.now(),
+		};
+		const subagents = liveGroup(12, 0).map((item, index) =>
+			index < 4 ? { ...item, progress: progress({ id: item.id, retryState }) } : item,
+		);
+		const lines = render({ subagents }, false).split("\n");
+		expect(lines).toEqual([
+			expect.stringContaining("awaiting 12 of 12"),
+			"  12 subagents running · 4 retrying",
+			"  provider degraded: 4 subagents retrying on anthropic",
+			expect.stringContaining("to list each"),
+		]);
+	});
+
+	it("caps provider degradation at one row however many providers degrade", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const providers = ["anthropic", "openai", "google", "xai", "mistral", "groq", "deepseek"];
+		const subagents = liveGroup(15, 0).map((item, index) => {
+			if (index >= 14) return item;
+			const retryState = {
+				attempt: 1,
+				maxAttempts: 3,
+				kind: "provider_error" as const,
+				provider: providers[index % providers.length],
+				delayMs: 10_000,
+				errorMessage: "overloaded",
+				startedAtMs: Date.now(),
+			};
+			return { ...item, progress: progress({ id: item.id, retryState }) };
+		});
+		const lines = render({ subagents }, false).split("\n");
+		expect(lines).toHaveLength(4);
+		expect(lines[2]).toBe("  provider degraded: 2 subagents retrying on anthropic (+6 more providers)");
+		// Same height as a single degraded provider.
+		const single = liveGroup(15, 0).map((item, index) =>
+			index < 2
+				? {
+						...item,
+						progress: progress({
+							id: item.id,
+							retryState: {
+								attempt: 1,
+								maxAttempts: 3,
+								kind: "provider_error" as const,
+								provider: "anthropic",
+								delayMs: 10_000,
+								errorMessage: "overloaded",
+								startedAtMs: Date.now(),
+							},
+						}),
+					}
+				: item,
+		);
+		expect(render({ subagents: single }, false).split("\n")).toHaveLength(4);
+		// The expanded view keeps one row per degraded provider.
+		expect(render({ subagents }, true).match(/provider degraded:/g)).toHaveLength(7);
+	});
+
+	it("counts a running subagent with no activity yet as idle once its job outlives the threshold", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const subagents = [
+			snapshot({ id: "0-Stalled", durationMs: 45_000 }),
+			snapshot({ id: "0-Fresh", durationMs: 5_000 }),
+			snapshot({
+				id: "0-NoStamp",
+				durationMs: 45_000,
+				liveProgressAvailable: true,
+				progress: progress({ id: "0-NoStamp", lastActivityMs: undefined }),
+			}),
+		];
+		expect(render({ subagents }, false).split("\n")[1]).toBe("  3 subagents running · 2 idle >30s");
+	});
+
+	it("signs only the visible degradation row, not per-provider churn", () => {
+		const withProviders = (providers: string[]) =>
+			liveGroup(providers.length, 0).map((item, index) => ({
+				...item,
+				progress: progress({
+					id: item.id,
+					retryState: {
+						attempt: 1,
+						maxAttempts: 3,
+						kind: "provider_error" as const,
+						provider: providers[index],
+						delayMs: 10_000,
+						errorMessage: "overloaded",
+						startedAtMs: 0,
+					},
+				}),
+			}));
+		const now = Date.now();
+		const base = subagentCompactRenderedStateSignature(withProviders(["a", "a", "a", "b", "c"]), now);
+		// A lone retrying subagent moving between providers changes nothing on screen.
+		expect(subagentCompactRenderedStateSignature(withProviders(["a", "a", "a", "b", "d"]), now)).toBe(base);
+		// A second degraded provider does change the visible row.
+		expect(subagentCompactRenderedStateSignature(withProviders(["a", "a", "a", "b", "b"]), now)).not.toBe(base);
+	});
+
+	it("lists every subagent when tool output is expanded", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const out = render({ subagents: liveGroup(15, 3) }, true);
+		for (let index = 0; index < 15; index++) expect(out).toContain(`0-Worker${index}`);
+		expect(out).not.toContain("idle >30s");
+	});
+
+	it("keeps the per-subagent list when the setting is off", () => {
+		const out = render({ subagents: liveGroup(3, 0) }, false);
+		expect(out).toContain("0-Worker0");
+		expect(out).toContain("0-Worker2");
+		expect(out).not.toContain("subagents running");
 	});
 });

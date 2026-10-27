@@ -3,7 +3,15 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { completeSimple, Effort, type Model } from "@gajae-code/ai/core";
+import { estimateTextTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import {
+	ANTHROPIC_THINKING,
+	completeSimple,
+	Effort,
+	type Model,
+	resolveDefaultRequestMaxTokens,
+} from "@gajae-code/ai/core";
+import { clampThinkingLevelForModel } from "@gajae-code/ai/model-thinking";
 import { getAgentDbPath, getMemoriesDir, logger, parseJsonlLenient, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
@@ -72,6 +80,20 @@ const DEFAULTS: MemoryRuntimeConfig = {
 	fallbackTokenLimit: 16_000,
 	summaryInjectionTokenLimit: 5_000,
 };
+
+const PHASE2_RAW_MEMORIES_TOKEN_LIMIT = 20_000;
+const PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT = 12_000;
+// Ceiling for the phase 2 response. Phase 2 rewrites MEMORY.md, the summary and every
+// skill in one JSON response, and on adaptive-thinking / reasoning-effort models the
+// reasoning shares this budget. Twice the (approximate) input caps is a generous
+// practical ceiling, not a guarantee that every response fits; a response that still
+// overruns it is reported as truncation.
+const PHASE2_MAX_OUTPUT_TOKENS = 2 * (PHASE2_RAW_MEMORIES_TOKEN_LIMIT + PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT);
+// On a small context window phase 2 shrinks its inputs rather than let the response
+// budget drop below the previous fixed budget.
+const PHASE2_MIN_OUTPUT_TOKENS = 8_192;
+// Request framing plus estimator error when fitting input + output into the context window.
+const PHASE2_CONTEXT_SAFETY_TOKENS = 2_048;
 
 interface Stage1Stats {
 	claimed: number;
@@ -615,7 +637,7 @@ async function runStage1Job(options: {
 				apiKey,
 				metadata: options.metadata,
 				maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
-				reasoning: Effort.Low,
+				reasoning: clampThinkingLevelForModel(model, Effort.Low),
 			},
 		);
 
@@ -659,23 +681,27 @@ async function runStage1Job(options: {
 async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[]): Promise<void> {
 	const summariesDir = path.join(memoryRoot, "rollout_summaries");
 	await fs.mkdir(summariesDir, { recursive: true });
+	const summariesRoot = path.resolve(summariesDir);
 
 	const keepFiles = new Set<string>();
 	for (const row of outputs) {
-		const stem = formatRolloutFilename(row.threadId, row.rolloutSlug);
-		const filename = `${stem}.md`;
+		const target = rolloutSummaryDestination(summariesRoot, row.threadId, row.rolloutSlug);
+		if (!target) continue;
+		const filename = path.basename(target);
 		keepFiles.add(filename);
 		const body = [`thread_id: ${row.threadId}`, `updated_at: ${row.sourceUpdatedAt}`, "", row.rolloutSummary].join(
 			"\n",
 		);
-		await Bun.write(path.join(summariesDir, filename), `${body.trim()}\n`);
+		await Bun.write(target, `${body.trim()}\n`);
 	}
 
 	const currentFiles = await fs.readdir(summariesDir).catch(() => [] as string[]);
 	for (const file of currentFiles) {
 		if (!file.endsWith(".md")) continue;
 		if (keepFiles.has(file)) continue;
-		await fs.rm(path.join(summariesDir, file), { force: true });
+		const target = containedExistingSummary(summariesRoot, file);
+		if (!target) continue;
+		await fs.rm(target, { force: true });
 	}
 
 	const rawBody = buildRawMemoriesMarkdown(outputs);
@@ -737,26 +763,38 @@ async function runConsolidationModel(options: {
 	const { memoryRoot, model, apiKey } = options;
 	const rawMemories = await Bun.file(path.join(memoryRoot, "raw_memories.md")).text();
 	const rolloutSummaries = await readRolloutSummaries(memoryRoot);
-	const input = prompt.render(consolidationTemplate, {
-		raw_memories: truncateByApproxTokens(rawMemories, 20_000),
-		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
-	});
+	const reasoning = clampThinkingLevelForModel(model, Effort.Low);
+	const { input, maxTokens } = buildPhase2Request(model, rawMemories, rolloutSummaries, reasoning);
 
 	const response = await completeSimple(
 		model,
 		{
 			messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
 		},
-		{ apiKey, metadata: options.metadata, maxTokens: 8192, reasoning: Effort.Medium },
+		{
+			apiKey,
+			metadata: options.metadata,
+			maxTokens,
+			reasoning,
+		},
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");
+	}
+	if (response.stopReason === "length") {
+		throw new Error(`phase2 output truncated at the max output token limit (${response.usage.output} output tokens)`);
 	}
 	const text = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map(c => c.text)
 		.join("\n")
 		.trim();
+	if (!text) {
+		const thinkingBlocks = response.content.filter(c => c.type === "thinking").length;
+		throw new Error(
+			`phase2 returned no text (stopReason=${response.stopReason}, ${response.usage.output} output tokens, ${thinkingBlocks} thinking blocks)`,
+		);
+	}
 	const parsed = parseJsonObject(text);
 	if (!parsed) throw new Error("phase2 JSON parse failure");
 	const schemaOutput = parseConsolidationOutputSchema(parsed);
@@ -891,6 +929,55 @@ function formatRolloutFilename(threadId: string, rolloutSlug: string | null): st
 	return `${threadId}-${normalized}`;
 }
 
+/** Lexical containment for one summary file name. A backslash is a separator only when the platform says so. */
+function lexicalSummaryTarget(summariesRoot: string, filename: string): string | undefined {
+	if (filename.length === 0 || filename.includes("\0") || filename.includes("/")) return undefined;
+	if (filename === "." || filename === "..") return undefined;
+	if (path.basename(filename) !== filename) return undefined;
+	const target = path.resolve(summariesRoot, filename);
+	const relative = path.relative(summariesRoot, target);
+	if (
+		relative.length === 0 ||
+		relative === ".." ||
+		relative.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relative) ||
+		relative !== filename
+	) {
+		return undefined;
+	}
+	return target;
+}
+
+/** New summary names stay portable: reject separators, including backslash. */
+function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
+	if (filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+/** Existing directory entries may contain a backslash on POSIX. Still refuse a name that leaves the directory. */
+function containedExistingSummary(summariesRoot: string, filename: string): string | undefined {
+	if (!filename.endsWith(".md")) return undefined;
+	if (path.sep === "\\" && filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+function rolloutSummaryDestination(
+	summariesRoot: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return containedSummaryFilename(summariesRoot, `${formatRolloutFilename(threadId, rolloutSlug)}.md`);
+}
+
+/** Test seam for the rollout summary path gate. */
+export function rolloutSummaryDestinationForTesting(
+	summariesDir: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return rolloutSummaryDestination(path.resolve(summariesDir), threadId, rolloutSlug);
+}
+
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
 	if (!text) return undefined;
 	try {
@@ -1007,6 +1094,29 @@ function redactSecrets(input: string): string {
 	for (const pattern of patterns) {
 		out = out.replace(pattern, "[REDACTED]");
 	}
+	return redactBearerAndBasicAssignments(out);
+}
+
+/**
+ * Bearer and Basic assignments have no vendor prefix, so the rules above miss
+ * them. A following word with no digit, "+", "/", or "=" stays, which keeps
+ * phrases such as "Basic authentication" and "the bearer of".
+ */
+function bearerOrBasicValueIsCredential(value: string): boolean {
+	if (value.length < 8) return false;
+	if (value.includes("+") || value.includes("/") || value.includes("=")) return true;
+	return value.length >= 12 && /[0-9]/.test(value);
+}
+
+function redactBearerAndBasicAssignments(input: string): string {
+	const labeled = /(["']?authorization["']?\s*[:=]\s*["']?)((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	const bare = /\b((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	let out = input.replace(labeled, (match, label: string, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${label}${scheme}[REDACTED]` : match,
+	);
+	out = out.replace(bare, (match, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${scheme}[REDACTED]` : match,
+	);
 	return out;
 }
 
@@ -1095,6 +1205,59 @@ function truncateByApproxTokens(text: string, tokenLimit: number): string {
 	return `${text.slice(0, head)}\n\n...[truncated]...\n\n${text.slice(-tail)}`;
 }
 
+/**
+ * Render the phase 2 prompt and choose its response budget.
+ *
+ * The budget is the model's output limit capped at PHASE2_MAX_OUTPUT_TOKENS (or the
+ * provider layer's request default when the limit is unknown). When the context window
+ * is known, input + response + any thinking budget the provider adds on top must fit
+ * in it: the response budget is clamped to the remaining room, and the inputs are
+ * shrunk when that room would fall below PHASE2_MIN_OUTPUT_TOKENS.
+ */
+function buildPhase2Request(
+	model: Model,
+	rawMemories: string,
+	rolloutSummaries: string,
+	reasoning: Effort | undefined,
+): { input: string; maxTokens: number | undefined } {
+	const outputLimit =
+		Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
+			? Math.min(model.maxTokens, PHASE2_MAX_OUTPUT_TOKENS)
+			: undefined;
+	let rawTokens = Math.min(PHASE2_RAW_MEMORIES_TOKEN_LIMIT, Math.ceil(rawMemories.length / 4));
+	let rolloutTokens = Math.min(PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT, Math.ceil(rolloutSummaries.length / 4));
+	const render = () =>
+		prompt.render(consolidationTemplate, {
+			raw_memories: truncateByApproxTokens(rawMemories, rawTokens),
+			rollout_summaries: truncateByApproxTokens(rolloutSummaries, rolloutTokens),
+		});
+
+	const contextWindow =
+		Number.isSafeInteger(model.contextWindow) && model.contextWindow > 0 ? model.contextWindow : undefined;
+	if (contextWindow === undefined) return { input: render(), maxTokens: outputLimit };
+
+	const responseCeiling = resolveDefaultRequestMaxTokens(model, outputLimit);
+	const minResponse = Math.min(PHASE2_MIN_OUTPUT_TOKENS, responseCeiling);
+	// Budget-mode providers may add the thinking budget on top of maxTokens.
+	const addsThinkingBudget = model.thinking?.mode === "budget" || model.thinking?.mode === "anthropic-budget-effort";
+	const thinkingReserve = reasoning && addsThinkingBudget ? ANTHROPIC_THINKING[reasoning] : 0;
+	const inputRoom = contextWindow - PHASE2_CONTEXT_SAFETY_TOKENS - thinkingReserve - minResponse;
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const input = render();
+		const inputTokens = estimateTextTokensHeuristic(input);
+		if (inputTokens <= inputRoom) {
+			const room = contextWindow - PHASE2_CONTEXT_SAFETY_TOKENS - thinkingReserve - inputTokens;
+			return { input, maxTokens: Math.min(responseCeiling, room) };
+		}
+		if (inputRoom <= 0 || rawTokens + rolloutTokens === 0) break;
+		const scale = (inputRoom / inputTokens) * 0.9;
+		rawTokens = Math.floor(rawTokens * scale);
+		rolloutTokens = Math.floor(rolloutTokens * scale);
+	}
+	throw new Error(`phase2 input does not fit the model context window (${contextWindow} tokens)`);
+}
+
 function computeModelTokenBudget(model: Model, config: MemoryRuntimeConfig): number {
 	const maxTokens =
 		Number.isFinite(model.contextWindow) && model.contextWindow > 0 ? model.contextWindow : config.fallbackTokenLimit;
@@ -1109,7 +1272,7 @@ async function resolveMemoryModel(options: {
 	const { modelRegistry, session, fallbackRole } = options;
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
+		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(session.credentialSessionId), {
 			settings: session.settings,
 			matchPreferences: { usageOrder: session.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry,
@@ -1123,7 +1286,7 @@ async function resolveMemoryModel(options: {
 	// before lazy model resolution): prefer the most recently used model over
 	// raw registry order. `getAll()[0]` can be a retired model the provider
 	// now rejects with 404, which permanently fails consolidation jobs.
-	const allModels = modelRegistry.getAll();
+	const allModels = modelRegistry.getAll(session.credentialSessionId);
 	const usageOrder = session.settings.getStorage()?.getModelUsageOrder() ?? [];
 	for (const usedKey of usageOrder) {
 		const match = allModels.find(model => `${model.provider}/${model.id}` === usedKey);

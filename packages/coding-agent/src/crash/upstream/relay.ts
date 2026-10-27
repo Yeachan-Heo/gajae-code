@@ -371,6 +371,7 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		const envelope = buildCrashEnvelope({
 			eventId,
 			fingerprint: signature.fingerprint,
+			fpv: signature.fpv,
 			errorName: record.errorName,
 			messageClass: record.messageClass,
 			frames: toEventFrames(record.body),

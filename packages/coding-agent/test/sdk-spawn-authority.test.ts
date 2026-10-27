@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { Broker, spawnRegistrationMatches } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import type { IndexedSession } from "../src/sdk/broker/session-index";
 import {
 	isSpawnClaimV2,
@@ -125,8 +126,8 @@ describe("SpawnAuthorityStore", () => {
 		const second = store.claimOrJoin("identity", bindingMac);
 		gate.resolve();
 		const [owner, joiner] = await Promise.all([first, second]);
-		expect(owner.kind).toBe("owner");
-		expect(joiner.kind).toBe("in_progress");
+		if (owner.kind !== "owner") throw new Error("expected owner claim");
+		if (joiner.kind !== "in_progress") throw new Error("expected in-progress joiner");
 		expect(owner.claim.claimId).toBe(joiner.claim.claimId);
 		expect(owner.claim).toMatchObject({ state: "prepared", preSendLease: { status: "owned" } });
 		expect((await Bun.file(store.file).text()).split("\n").filter(Boolean)).toHaveLength(1);
@@ -139,8 +140,8 @@ describe("SpawnAuthorityStore", () => {
 		const initial = await store.claimOrJoin("identity", bindingMac);
 		await store.releaseOwner("identity");
 		const conflict = await store.claimOrJoin("identity", "c".repeat(64));
-		expect(initial.kind).toBe("owner");
-		expect(conflict.kind).toBe("idempotency_conflict");
+		if (initial.kind !== "owner") throw new Error("expected initial owner claim");
+		if (conflict.kind !== "idempotency_conflict") throw new Error("expected idempotency conflict");
 		expect(conflict.claim).toEqual(initial.claim);
 		expect((await Bun.file(store.file).text()).split("\n").filter(Boolean)).toHaveLength(1);
 	});
@@ -315,6 +316,174 @@ describe("SpawnAuthorityStore", () => {
 				await broker.stop();
 			}
 		});
+	});
+
+	it("does not let a completed spawn mirror fence an unrelated lifecycle request", async () => {
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: { verifyMasterCapability: async () => ({ allowed: true }) },
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
+		await broker.start();
+		try {
+			await expect(
+				broker.handleRequest(
+					"session.spawn",
+					{
+						task: "spawn-mirror-task",
+						masterCapability: "spawn-mirror-capability",
+						ownerSessionId: "spawn-mirror-owner",
+						attestationEpoch: "spawn-mirror-epoch",
+						cwd: agentDir,
+					},
+					"spawn-mirror-key",
+				),
+			).resolves.toMatchObject({
+				ok: true,
+				result: { code: "spawn_accepted" },
+			});
+			await expect(
+				broker.handleRequest("session.delete", { sessionId: "unrelated-session" }, "unrelated-delete-key"),
+			).resolves.toEqual({ ok: true, result: { sessionId: "unrelated-session" } });
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("marks the spawn mirror so it never fences once its claim leaves the journal", async () => {
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: { verifyMasterCapability: async () => ({ allowed: true }) },
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
+		await broker.start();
+		try {
+			await expect(
+				broker.handleRequest(
+					"session.spawn",
+					{
+						task: "spawn-anchor-task",
+						masterCapability: "spawn-anchor-capability",
+						ownerSessionId: "spawn-anchor-owner",
+						attestationEpoch: "spawn-anchor-epoch",
+						cwd: agentDir,
+					},
+					"spawn-anchor-key",
+				),
+			).resolves.toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
+		} finally {
+			await broker.stop();
+		}
+		const rows = (await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text())
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { operationKey?: string; spawnAnchor?: boolean });
+		const mirrors = rows.filter(row => row.operationKey === undefined);
+		expect(mirrors.length).toBeGreaterThan(0);
+		expect(mirrors.every(row => row.spawnAnchor === true)).toBe(true);
+		// Without the spawn-authority claims (the orphaned case), the mirror still does not fence.
+		const reopened = await new LifecycleLedger(agentDir).open();
+		expect(reopened.hasLegacyIdentity(new Set(), { ignoreFinalRows: true })).toBe(false);
+		expect(reopened.hasLegacyIdentity()).toBe(false);
+	});
+
+	it("admits after the spawn-authority journal is deleted and the broker restarts, fencing pre-marker mirrors until attested", async () => {
+		const agentDir = await temp();
+		const sdkDir = path.join(agentDir, "sdk");
+		const ledgerPath = path.join(sdkDir, "lifecycle-ledger.jsonl");
+		const journalPath = path.join(sdkDir, "spawn-authority.jsonl");
+		const attestationPath = path.join(sdkDir, "lifecycle-ledger.spawn-anchor-attestation.json");
+		const options = {
+			agentDir,
+			masterCapabilityVerifier: { verifyMasterCapability: async () => ({ allowed: true }) },
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		};
+		const spawner = new Broker(options);
+		await spawner.start();
+		try {
+			await expect(
+				spawner.handleRequest(
+					"session.spawn",
+					{
+						task: "journal-loss-task",
+						masterCapability: "journal-loss-capability",
+						ownerSessionId: "journal-loss-owner",
+						attestationEpoch: "journal-loss-epoch",
+						cwd: agentDir,
+					},
+					"journal-loss-key",
+				),
+			).resolves.toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
+		} finally {
+			await spawner.stop();
+		}
+		const closeUnrelated = async (key: string) => {
+			const broker = new Broker(options);
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(agentDir, "missing-gjc"), args: [] }));
+			await broker.start();
+			try {
+				expect(broker.ledger.get(mirrorIdentity)).toBeDefined();
+				return await broker.handleRequest("session.close", { sessionId: "unrelated-session" }, key);
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+			}
+		};
+		const ledgerRows = async () =>
+			(await fs.readFile(ledgerPath, "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+		const mirrors = (await ledgerRows()).filter(row => row.operationKey === undefined);
+		expect(mirrors).toHaveLength(1);
+		expect(mirrors[0]).toMatchObject({ state: "accepted", spawnAnchor: true });
+		const mirrorIdentity = mirrors[0]!.identity as string;
+		const ambiguous = {
+			ok: false,
+			error: { code: "legacy_lifecycle_ambiguous", message: "legacy lifecycle request has an ambiguous target" },
+		};
+		const notIndexed = { ok: false, error: { code: "not_found", message: "session is not indexed" } };
+
+		// The claim leaves the journal entirely; the marked mirror still never fences.
+		await fs.rm(journalPath);
+		await expect(closeUnrelated("after-journal-loss")).resolves.toEqual(notIndexed);
+
+		// The same mirror written by a pre-marker broker stays fenced: nothing durable proves it.
+		const rows = await ledgerRows();
+		const premarker = rows.map(row => {
+			if (row.identity !== mirrorIdentity) return row;
+			const { spawnAnchor: _marker, ...rest } = row;
+			return rest;
+		});
+		await fs.writeFile(ledgerPath, premarker.map(row => `${JSON.stringify(row)}\n`).join(""));
+		await fs.rm(journalPath, { force: true });
+		await expect(closeUnrelated("premarker-unattested")).resolves.toEqual(ambiguous);
+		expect(await Bun.file(attestationPath).exists()).toBe(false);
+
+		// An unreadable attestation never blocks broker start; the mirror stays fenced.
+		await fs.mkdir(attestationPath);
+		await expect(closeUnrelated("premarker-attestation-directory")).resolves.toEqual(ambiguous);
+		await fs.rmdir(attestationPath);
+		if (process.platform !== "win32" && process.getuid?.() !== 0) {
+			await fs.writeFile(attestationPath, `${JSON.stringify({ version: 1, identities: [mirrorIdentity] })}\n`);
+			await fs.chmod(attestationPath, 0o000);
+			try {
+				await expect(closeUnrelated("premarker-attestation-unreadable")).resolves.toEqual(ambiguous);
+			} finally {
+				await fs.chmod(attestationPath, 0o600);
+			}
+			await fs.rm(attestationPath);
+		}
+
+		// An operator attestation for that identity lifts the fence after the next restart.
+		await fs.writeFile(attestationPath, `${JSON.stringify({ version: 1, identities: [mirrorIdentity] })}\n`);
+		await fs.rm(journalPath, { force: true });
+		await expect(closeUnrelated("premarker-attested")).resolves.toEqual(notIndexed);
 	});
 });
 

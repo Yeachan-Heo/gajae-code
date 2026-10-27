@@ -132,6 +132,13 @@ describe("isPrivateOrSpecialAddress", () => {
 		expect(isPrivateOrSpecialAddress("127.0.0.1")).toBe(true);
 		expect(isPrivateOrSpecialAddress("10.0.0.1")).toBe(true);
 		expect(isPrivateOrSpecialAddress("169.254.0.1")).toBe(true);
+		expect(isPrivateOrSpecialAddress("192.88.99.2")).toBe(true);
+		expect(isPrivateOrSpecialAddress("192.88.99.1")).toBe(true);
+		expect(isPrivateOrSpecialAddress("::ffff:192.88.99.2")).toBe(true);
+		expect(isPrivateOrSpecialAddress("192.88.98.2")).toBe(false);
+		expect(isPrivateOrSpecialAddress("192.31.196.1")).toBe(false);
+		expect(isPrivateOrSpecialAddress("192.52.193.1")).toBe(false);
+		expect(isPrivateOrSpecialAddress("192.175.48.1")).toBe(false);
 		expect(isPrivateOrSpecialAddress("::1")).toBe(true);
 		expect(isPrivateOrSpecialAddress("::ffff:10.0.0.1")).toBe(true);
 		expect(isPrivateOrSpecialAddress("::ffff:8.8.8.8")).toBe(false);

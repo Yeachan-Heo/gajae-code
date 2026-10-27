@@ -30,7 +30,7 @@ test("shrinking releases trailing layouts before the next render", () => {
 
 test("keyboard Ctrl+A Ctrl+U releases deleted layouts before and after render", () => {
 	const editor = new Editor(defaultEditorTheme);
-	const original = "first\n" + "long ".repeat(10000);
+	const original = `first\n${"long ".repeat(10000)}`;
 	editor.focused = true;
 	editor.setText(original);
 	editor.render(40);
@@ -62,7 +62,7 @@ for (const [name, key, forward] of [
 	test(`keyboard ${name} trims repeated joins and undo restores layouts`, () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.focused = true;
-		const original = ["first 한글", "second 👩‍💻", "third " + "word ".repeat(30)];
+		const original = ["first 한글", "second 👩‍💻", `third ${"word ".repeat(30)}`];
 		editor.setText(original.join("\n"));
 		editor.render(40);
 		for (const remaining of [2, 1]) {
@@ -92,7 +92,7 @@ for (const [name, key, forward] of [
 test("reuse never survives text, geometry, cursor, or invalidation changes incorrectly", () => {
 	const editor = new Editor(defaultEditorTheme);
 	editor.focused = true;
-	editor.setText("first 한글\nsecond 👩‍💻\nthird " + "word ".repeat(30));
+	editor.setText(`first 한글\nsecond 👩‍💻\nthird ${"word ".repeat(30)}`);
 	for (const input of [
 		"x",
 		"\x1b[A",

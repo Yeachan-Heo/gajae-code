@@ -37,6 +37,9 @@ Step 6 does not execute those files. Each is scanned line by line for literal `e
 
 Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
 
+`NODE_TLS_REJECT_UNAUTHORIZED` is never taken from the project `.env` (step 2): a project declaration is removed from the process environment at startup, including one Bun already loaded, so a repository cannot turn off TLS certificate verification. A value exported by the launching shell or set in a user-owned file (steps 3-6) is still honored.
+The bash tool's shell processes (the isolated worker chain, the in-process native shell used on Windows, and interactive PTY sessions), GJC's own git and gh calls, and the tool servers GJC starts (stdio MCP servers, LSP servers, the Biome and SwiftLint linters, and DAP adapters), and the helpers GJC runs on its own while starting (the `ps` process-identity probe, `tmux -V` multiplexer detection, the tmux window rename and its branch lookup, and the `lspci`/`wmic` GPU probe) also drop project-provided `BUN_OPTIONS` before starting Bun workers, along with `BASH_ENV`, `ENV`, `ZDOTDIR`, `HOME`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `XDG_CONFIG_HOME`, `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND`, `GIT_TEMPLATE_DIR`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_SEQUENCE_EDITOR`, `GIT_EXTERNAL_DIFF`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, and the interpreter/loader injection variables `NODE_OPTIONS`, `PYTHONPATH`, `PYTHONUSERBASE`, `PYTHONSTARTUP`, `PERL5OPT`, `PERL5LIB`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, and the macOS library/framework search overrides (`DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`, `DYLD_FRAMEWORK_PATH`, `DYLD_FALLBACK_FRAMEWORK_PATH`, `DYLD_VERSIONED_LIBRARY_PATH`, `DYLD_VERSIONED_FRAMEWORK_PATH`), the sibling spellings `PERLLIB`, `_JAVA_OPTIONS`, and npm's `node-options`/`script-shell` (`npm_config_*` in any case, with `_` or `-`), and tool configuration that names a program (`RIPGREP_CONFIG_PATH`, `TAR_OPTIONS`, `RSYNC_RSH`, `MAKEFLAGS`, `MAKEFILES`, and `SHELLOPTS`/`PS4`) when their value comes from the project `.env` (step 2), because the shell, git, or a runtime the command starts would execute code from them (for example `BUN_OPTIONS` can preload repository code before a worker entrypoint, and `core.fsmonitor` from `$HOME/.gitconfig` during `git status`, `GIT_EXEC_PATH` helpers, `GIT_PROXY_COMMAND` on `git://` remotes, or hooks installed from `GIT_TEMPLATE_DIR`). When removing a project home selector leaves `HOME` unset, the trusted account home is supplied when available, preventing Git for Windows from falling back to a project-controlled profile. A value the launching shell exported is passed through, unless the project declares the same key with the same value or dynamically: provenance is then ambiguous and, as for credentials, the variable is dropped. This applies only to the bash tool; the Python kernel keeps its own documented environment allowlist. GJC's own `git` and `gh` invocations (for example `/commit`, the github tool's checkout/push/create operations, and task worktree trees) apply the same filter, and `gh` additionally runs with `GH_PAGER=cat` and without `GH_FORCE_TTY` because its output is captured.
+
 Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
@@ -101,6 +104,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | `CLINE_API_KEY`                 | Cline API / ClinePass auth                       | Using the `cline-pass` provider preset                         | Create under Settings > API Keys in the Cline dashboard                                              |
 | `CMD_API_KEY`                   | Command Code Provider API auth                   | Using the `commandcode-goat` provider preset                   | The GOAT coding plan may use this API according to its plan entitlement                              |
 | `DEEPSEEK_API_KEY`              | DeepSeek auth                                    | Using DeepSeek models                                          |                                                                                                     |
+| `IONET_API_KEY`                 | IO Intelligence (io.net) auth                    | Using the `ionet` provider preset                              | Create at https://io.net/docs/guides/intelligence/api-keys-and-secrets                                 |
 | `KILO_API_KEY`                  | Kilo auth                                        | Using Kilo models                                              |                                                                                                     |
 | `OLLAMA_CLOUD_API_KEY`          | Ollama Cloud auth                                | Using `ollama-cloud` provider                                  |                                                                                                     |
 | `GITLAB_TOKEN`                  | GitLab Duo auth                                  | Using `gitlab-duo` provider                                    |                                                                                                     |
@@ -134,14 +138,16 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### External CLI credential import roots
 
-`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code and Codex CLI credentials on disk. Both CLIs relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. This is what makes an account selected by an external account switcher (which launches the shell with these variables set) the account gjc imports.
+`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code, Codex CLI, and Kiro CLI social-login credentials on disk. Claude Code and Codex CLI relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. Kiro CLI stores social tokens in its local `data.sqlite3`; GJC reads only the `auth_kv` entry and never modifies that database.
 
 | Variable             | Used for                                                              | Required when                                        | Notes / precedence                                                                                                                                     |
 | -------------------- | --------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLAUDE_CONFIG_DIR`  | Directory holding Claude Code's `.credentials.json`                   | Claude Code's config root is not `~/.claude`         | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.claude`.                 |
 | `CODEX_HOME`         | Directory holding Codex CLI's `auth.json`                             | Codex CLI's home is not `~/.codex`                   | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.codex`.                  |
+| `XDG_DATA_HOME`      | Kiro CLI data directory on Linux                                       | Kiro CLI data root is not `~/.local/share`            | Read through `$credentialEnv`; relative or blank values fall back to `~/.local/share`. GJC reads `kiro-cli/data.sqlite3` from this directory.                 |
+| `LOCALAPPDATA`       | Kiro CLI data directory on Windows                                     | Kiro CLI data root is not `%LOCALAPPDATA%`            | Read through `$credentialEnv`; relative or blank values fall back to `~/AppData/Local`. GJC reads `kiro-cli/data.sqlite3` from this directory.                  |
 
-Redacted summaries name the variable (`Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)`), never the resolved path. macOS Keychain discovery is unaffected: it is still only consulted when no credential file is found.
+Redacted summaries name environment redirects, never resolved paths. Kiro CLI's default database path is `~/Library/Application Support/kiro-cli/data.sqlite3` on macOS, `~/.local/share/kiro-cli/data.sqlite3` on Linux, and `%LOCALAPPDATA%/kiro-cli/data.sqlite3` on Windows. macOS Keychain discovery is unaffected: it is still only consulted when no Claude Code credential file is found.
 
 ---
 
@@ -170,6 +176,14 @@ When `CLAUDE_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry 
 | `NODE_EXTRA_CA_CERTS`       | PEM path or inline PEM                         | Extra CA chain for server certificate validation                              |
 | `CLAUDE_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
 | `CLAUDE_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
+
+### Claude Code client version
+
+Anthropic OAuth requests sign `claude-cli/<version>` and the billing header's `cc_version` with the latest published Claude Code release: the higher of Anthropic's `latest` native-installer channel and the `@anthropic-ai/claude-code` npm dist-tag. The lookup runs in the background at most every 6 hours, is cached at `~/.gjc/cache/claude-code-version.json`, and never blocks a request; until it succeeds (or when offline) the bundled floor in `packages/ai/src/providers/claude-code-version.ts` is used, and the signed version never drops below that floor.
+
+| Variable | Default / behavior |
+| --- | --- |
+| `GJC_CLAUDE_CODE_VERSION` | Unset: auto-resolve as above. Exact `X.Y.Z`: sign with that version and skip the network lookup. Other values are ignored. |
 
 ### Amazon Bedrock
 
@@ -260,14 +274,15 @@ providers:
 
 `models.yml` is strict: unsupported provider/model keys fail validation before the provider request is dispatched.
 
-### GJC workflow bridge commands
+### GJC workflow commands
 
-`gjc ralplan`, `gjc deep-interview`, and `gjc state` are private runtime bridge commands. They require `GJC_RUNTIME_BINARY` (or legacy `GJC_LEGACY_RUNTIME_BINARY`) to point at the private runtime executable; public bundled workflow use remains through `/skill:ralplan` and `/skill:deep-interview` inside a GJC session.
+`gjc ralplan`, `gjc deep-interview`, and `gjc state` are native CLI commands (`packages/coding-agent/src/commands/{ralplan,deep-interview,state}.ts`). They need no environment variable or external runtime binary; the retired `GJC_RUNTIME_BINARY` and `GJC_LEGACY_RUNTIME_BINARY` variables are not read. Inside a GJC session, the bundled workflows remain available as `/skill:ralplan` and `/skill:deep-interview`.
 
-| Variable | Behavior |
+| Command | Behavior |
 | --- | --- |
-| `GJC_RUNTIME_BINARY` | Private runtime bridge binary for `gjc ralplan`, `gjc deep-interview`, and `gjc state` |
-| `GJC_LEGACY_RUNTIME_BINARY` | Legacy fallback bridge binary name |
+| `gjc ralplan` | Runs the native RALPLAN consensus planning workflow |
+| `gjc deep-interview` | Runs the native deep-interview workflow |
+| `gjc state` | Reads or updates current-session workflow state receipts under `.gjc/_session-{sessionid}/state` |
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 
@@ -279,11 +294,12 @@ providers:
 
 This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support is disabled by default, so the host terminal or tmux retains wheel and selection behavior. Add `set -g mouse on` to your own `~/.tmux.conf` when you want tmux copy-mode scrolling.
 
-Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Double-click selects the word under the cursor and triple-click selects the row; both copy on release, and dragging afterwards extends by whole words or rows. Because GJC owns the mouse while this is on, the terminal's own selection is reached with a modifier held — Option on macOS, Shift on most other terminals. That modifier makes the host terminal keep the click instead of forwarding it, so GJC never sees it and does not copy: whether the resulting selection reaches the clipboard is entirely the host terminal's own copy-on-select behavior, which is off by default in most terminals. GJC's own selection is the one that copies automatically.
+Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Over assistant Markdown the copy is the original Markdown rather than the painted glyphs: wrapped prose is rejoined, fully selected blocks copy their original Markdown (code with its tabs, quotes with `>`), a selection inside one code block drops the fences and indent, and a partial table selection copies tab-separated cells. Holding a drag while scrolling the wheel, or resting it on the top or bottom transcript row, extends the selection through scrolled history. Double-click selects the word under the cursor and triple-click selects the row; both copy on release, and dragging afterwards extends by whole words or rows. Because GJC owns the mouse while this is on, the terminal's own selection is reached with a modifier held — Option on macOS, Shift on most other terminals. That modifier makes the host terminal keep the click instead of forwarding it, so GJC never sees it and does not copy: whether the resulting selection reaches the clipboard is entirely the host terminal's own copy-on-select behavior, which is off by default in most terminals. GJC's own selection is the one that copies automatically.
 
 | Variable | Behavior |
 | --- | --- |
 | `GJC_LAUNCH_POLICY` | Launch policy for `--tmux` startup: `tmux` (default) or `direct` (skip the tmux session) |
+| `GJC_NO_TMUX` | `1` or `true` (exact spelling) has the same effect as `GJC_LAUNCH_POLICY=direct`. A `GJC_LAUNCH_POLICY` of `tmux` or `direct` wins over it. |
 | `GJC_TMUX_SESSION` | Explicit tmux session name override for `--tmux` startup. Use a unique value (for example `GJC_TMUX_SESSION=gjc-fresh-$(date +%s) gjc --tmux`) to force a fresh named session. |
 | `GJC_TMUX_COMMAND` | tmux binary/name override for every GJC tmux flow. This is not a shell command line; include only the executable path/name, not flags. |
 | `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
@@ -324,7 +340,10 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | --- | --- |
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
 | `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
-| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
+| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). The value must be plain decimal digits (surrounding whitespace is ignored); anything else, such as `64KB`, `1e6`, or `0`, falls back to the default. On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
+| `GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS` | Idle time in milliseconds before the coordinator reaps an idle coordinator-created session (never a registered resident session) (default `1800000`, 30 minutes; values below `60000` are raised to `60000`). Plain decimal digits only; anything else falls back to the default. |
+| `GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS` | Interval in milliseconds between idle-session sweeps (default `300000`, 5 minutes; values below `30000` are raised to `30000`, and values above `2147483647`, the longest timer delay, are lowered to it). Plain decimal digits only; anything else falls back to the default. |
+| `GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS` | How long, in milliseconds, the coordinator waits for the GJC runtime to acknowledge a delivered prompt (`turn.prompt`, `turn.follow_up`, `turn.abort_and_prompt`) before it gives up (default `10000`, capped at `300000`). A tmux-delivered prompt that is not acknowledged and never emits `turn_start` in that window is recorded as a failed turn with the recoverable error `runtime_prompt_ack_timeout`. The value must be plain decimal digits (surrounding whitespace is ignored); anything else, including `0`, falls back to the default. |
 | `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). Coordinator durable state only — it does **not** select the broker agent directory; that is `GJC_CODING_AGENT_DIR`, rendered by `gjc setup hermes --coding-agent-dir <abs-path>` (absolute path required; home/filesystem-root refused; preserved across managed re-installs unless the flag overrides it). |
 | `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` | Root for managed Codex handoff token files (default `<state-root>/codex-tokens`). Registered files must be owner-only regular non-symlink files beneath this root. Authenticated token-file handoff is unavailable on native Windows unless an equivalent secure ACL proof is provided; registration fails closed with `codex_authenticated_handoff_unavailable_windows`. |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
@@ -336,8 +355,8 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL` | Opt-in webhook destination for existing `watch_events` journal rows (`https:` anywhere, or `http:` loopback only). Unset or empty = the feature is fully off. Resolved through the trusted credential environment, never the checkout's `.env`; a project `.env` cannot select where coordinator rows are POSTed. No redirect following. |
 | `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE` | Absolute path to a file whose trimmed content is sent as `Authorization: Bearer …`; raw tokens are never accepted inline in env. Resolved through the trusted credential environment. |
 | `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_SESSION_IDS` | Optional comma-separated session-id allowlist; only journal rows carrying one of these `session_id` values are delivered. |
-| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS` | Per-attempt webhook POST timeout (default `5000`, capped at `30000`). |
-| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS` | Delivery attempts per journal row (default `5`, capped at `10`) with exponential backoff (`500ms` base, `15s` cap) through a durable per-row outbox. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS` | Per-attempt webhook POST timeout (default `5000`, capped at `30000`). Plain decimal digits only; anything else uses the default. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS` | Delivery attempts per journal row (plain decimal digits; default `5`, capped at `10`) with exponential backoff (`500ms` base, `15s` cap) through a durable per-row outbox. |
 
 ### Google Vertex AI
 
@@ -360,6 +379,15 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 
 OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth.kimi.com`.
 
+### Grok Build (Grok CLI) provider
+
+| Variable | Default / behavior |
+| -------- | ------------------ |
+| `GJC_GROK_CLI_BASE_URL` | Base URL override for the bundled Grok Build provider (default `https://cli-chat-proxy.grok.com/v1`; trailing slashes are trimmed). `GROK_CLI_BASE_URL` is read when it is unset. A value declared in the project dotenv (`.env`, `.env.local`, `.env.$NODE_ENV`, `.env.$NODE_ENV.local`) is ignored. An operator override is honored only for `https://cli-chat-proxy.grok.com`; any other URL is ignored with a session warning and the default is used. |
+| `GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL` | Exactly `1` in the operator environment honors a base URL override on any other host. A project dotenv declaration of this flag is ignored, so a repository cannot approve its own redirect. For trusted local testing only: the OAuth bearer token is sent to that host. |
+| `GJC_GROK_CLI_MODELS` | Comma-separated model ids that replace the built-in model list, in that order. Known ids keep their built-in metadata; unknown ids are added as text-only reasoning models with a 1,000,000-token context window. |
+| `GROK_CLI_OAUTH_TOKEN` | Bearer token bypass for local use. No refresh and no model discovery; a session warning recommends `/login grok-build` instead. |
+
 ### Gemini CLI compatibility
 
 | Variable                   | Default / behavior                                              |
@@ -376,7 +404,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`    | Non-negative integer override (default 5)            |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS`  | Positive integer base backoff override (default 500) |
-| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer OpenAI stream idle timeout override. Unset: 120s, except xAI Grok / Grok Build providers and Grok model ids on any OpenAI-compatible host use 300s (same floor as Anthropic long-reasoning). `0` disables. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
+| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer stream idle timeout override (also applies to Anthropic). Unset: 120s generally, 600s for Anthropic long-reasoning gaps, and 300s for xAI Grok / Grok Build and Grok models on OpenAI-compatible hosts. `0` disables. For `openai-completions` and `openai-responses`, `models.yml` can set `streamIdleTimeoutMs` per provider/model; this environment variable takes precedence. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
 
 ### Cursor provider debug
 
@@ -414,6 +442,10 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `PARALLEL_API_KEY`                                  | Parallel search provider                                      |
 | `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`                 | SearXNG endpoint and optional bearer token                    |
 | `SEARXNG_BASIC_USERNAME`, `SEARXNG_BASIC_PASSWORD`  | SearXNG HTTP Basic Auth credentials                           |
+
+Codex web search prefers `gpt-6.1-sol`, then `gpt-6-luna`, intersected with the current account's subscription model discovery using the existing `fetchCodexModels` helper (`GET /codex/models`, with its supported `/models` alternative). It does not use bundled model presence or a merged discovery cache as evidence of account availability. Legacy GPT-5 defaults are removed. Unavailable discovery or no advertised preferred candidate produces a provider error before search; there is no unadvertised or arbitrary model fallback. Known unsupported-model HTTP 400 errors advance only to the next advertised preferred candidate.
+
+Both preferred models have hosted web-search metadata in the [upstream Codex catalog](https://github.com/openai/codex/blob/091008729d5572712ac08964a9602eb71cf31428/codex-rs/models-manager/models.json). Subscription discovery establishes current model advertisement, not acceptance of GJC's exact `/codex/responses` search payload; account and workspace restrictions still apply. `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` (ahead of legacy `PI_CODEX_WEB_SEARCH_MODEL`) is an explicit override: it bypasses discovery and is sent once without model fallback.
 
 SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.basicUsername`, and `searxng.basicPassword` settings from `~/.gjc/agent/config.yml`; environment variables are fallbacks.
 
@@ -465,16 +497,16 @@ Extra conditional behavior:
 
 | Variable                     | Default / behavior                                                                                 |
 | ---------------------------- | -------------------------------------------------------------------------------------------------- |
-| `GJC_SMOL_MODEL`              | Ephemeral model-role override for `smol` (CLI `--smol` takes precedence)                           |
-| `GJC_SLOW_MODEL`              | Ephemeral model-role override for `slow` (CLI `--slow` takes precedence)                           |
 | `GJC_PLAN_MODEL`              | Ephemeral model-role override for `plan` (CLI `--plan` takes precedence)                           |
 | `GJC_MODEL_PRESET_REGISTRY_URL` | HTTPS URL for the signed preset registry `latest.json`. Defaults to the public `Yeachan-Heo/gajae-code-presets` `dev` pointer. Redirects, credentials, non-HTTPS URLs, untrusted keys, and off-namespace content are rejected. |
 | `GJC_MODEL_PRESET_REGISTRY_DISABLED` | `1`, `true`, `yes`, or `on` disables registry network refresh and excludes cached registry data without deleting accepted history. Embedded presets and user `models.yml` remain available. |
 | `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message         |
 | `GJC_NO_CMUX_RENAME`         | If set (any non-empty value), disables renaming the containing cmux workspace to the current session name |
+| `GJC_NO_WEBP`                | `1` or `true` (case-insensitive) keeps WebP out of image re-encoding: results are PNG or JPEG, and a WebP input is re-encoded even when it already fits. Use it for backends that cannot decode WebP (for example llama.cpp's STB loader). Read on every resize; any other value leaves WebP enabled. |
 | `NULL_PROMPT`                | If `true`, system prompt builder returns empty string                                              |
 | `GJC_BLOCKED_AGENT`           | Blocks a specific subagent type in task tool                                                       |
 | `GJC_SUBPROCESS_CMD`          | Overrides subagent spawn command (`gjc` / `gjc.cmd` resolution bypass)                             |
+| `GJC_SDK_BROKER_AUTOSTART` | `0` puts SDK clients in attach-only mode: `gjc sdk session`, `gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve` attach to a live broker for the agent directory and never start, retire or restart one; with no live broker they fail with `broker_unavailable`. Any other value, or unset, keeps autostart. `--attach-only` is the per-invocation flag form. Set it for every client when a host supervises its own broker (for example a system service); the broker entrypoints ignore it. |
 | `GJC_TASK_MAX_OUTPUT_BYTES`   | Max captured output bytes per subagent (default `500000`)                                          |
 | `GJC_TASK_MAX_OUTPUT_LINES`   | Max captured output lines per subagent (default `5000`)                                            |
 | `GJC_FALLBACK_MAX_STAGED_EVENTS` | Positive-integer cap on events staged by the provisional staging transaction before it is rejected as a local overflow (default `10000`, hard ceiling `2000000`). Surrounding whitespace is ignored by the trusted environment resolver. Applies to both managed fallback and ordinary (non-managed lossless) sessions; in non-managed sessions the cap only decides how much reasoning buffers before the batch flushes and streams through. Invalid or non-positive values fall back to the default; values above the ceiling clamp to it with a warning — the staging guard stays bounded. Resolved from trusted environment sources only (process/agent/user config); a project `.env` cannot change these guardrails. |
@@ -497,6 +529,8 @@ Extra conditional behavior:
 | `GJC_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `GJC_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `GJC_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `GJC_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |
+| `GJC_SKIP_NOFILE_CHECK` | macOS only. `1` or `true` (exact spelling) skips the startup check that warns when `ulimit -n` is below `4096`. |
+| `GJC_CLEANUP_DEADLINE_MS` | How long a signal, fatal-error, broken-pipe, or `quit()` exit waits for in-flight shutdown cleanup before it exits anyway (default `5000`). Finite values `>= 0` are honored, and values above `2147483647` are lowered to it. Empty, negative, or non-numeric values fall back to the default. |
 | `GJC_SESSION_CONTEXT_BUDGET_BYTES` | Overrides the synchronous session-context materialization budget in bytes (default `536870912` = 512 MiB, ceiling `8589934592` = 8 GiB). Only a canonical positive-integer value is honored; anything invalid (empty, non-numeric, negative, zero, overflowing a safe integer, or above the ceiling) fail-closes to the 512 MiB default with a warning. Raise it above your measured session size to suppress the `SessionContextTooLargeError` preflight, or lower it to restore the old tight bound. |
 
 LSP project configuration may control declarative matching, activation, and capabilities, but it cannot define a command, arguments, executable, client factory, initialization options, or opaque server settings. Trusted user-wide configuration outside the project—including the recommended `~/.gjc/agent/lsp.*` files and supported legacy user locations—can override LSP launches and server options; automatic discovery uses trusted external executables and rejects project-owned lexical paths as well as symlink-resolved project binaries.
@@ -533,18 +567,15 @@ export GJC_WORKTREE_DIR='/Volumes/dev/worktrees/{repo}'
 
 | Variable                   | Behavior                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------ |
-| `GJC_BASH_NO_CI`            | Suppresses automatic `CI=true` injection into spawned shell env                |
-| `PI_BASH_NO_CI`             | Legacy alias fallback for `GJC_BASH_NO_CI`                                     |
-| `CLAUDE_BASH_NO_CI`         | Legacy alias fallback for `GJC_BASH_NO_CI`                                     |
 | `GJC_BASH_NO_LOGIN`         | Disables login-shell mode; shell args become `['-c']` instead of `['-l','-c']` |
 | `PI_BASH_NO_LOGIN`          | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
 | `CLAUDE_BASH_NO_LOGIN`      | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
 | `PI_SHELL_PREFIX`           | Optional command prefix wrapper                                                |
 | `CLAUDE_CODE_SHELL_PREFIX`  | Legacy alias fallback for `PI_SHELL_PREFIX`                                    |
-| `VISUAL`                   | Preferred external editor command                                              |
-| `EDITOR`                   | Fallback external editor command                                               |
+| `VISUAL`                   | Preferred external editor command (ignored when declared in a project `.env`)  |
+| `EDITOR`                   | Fallback external editor command (ignored when declared in a project `.env`)   |
 
-Current implementation: `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` are resolved first, then the `PI_*` and `CLAUDE_*` aliases above. Both are boolean-like: only `1`/`Y`/`TRUE`/`YES`/`ON` (case-insensitive) enable them, so an explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias is truthy. The shell prefix is read from `PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX` only; `GJC_SHELL_PREFIX` is not currently honored.
+Current implementation: `GJC_BASH_NO_LOGIN` is resolved first, then the `PI_BASH_NO_LOGIN` and `CLAUDE_BASH_NO_LOGIN` aliases above. It is boolean-like: only `1`/`Y`/`TRUE`/`YES`/`ON` (case-insensitive) enable it, so an explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias is truthy. The spawned shell no longer injects `CI`; an inherited `CI` is passed through unchanged. The shell prefix is read from `PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX` only; `GJC_SHELL_PREFIX` is not currently honored.
 
 ---
 
@@ -583,6 +614,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `GJC_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
 | `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. GJC automatically skips the modifyOtherKeys fallback on Windows and Apple Terminal because it breaks CJK/Hangul IME composition there; use the full opt-out for other affected terminals such as Android Termius. |
 | `GJC_TUI_SYNCHRONIZED_OUTPUT` | Synchronized-output framing (`CSI ?2026h/l`) is enabled by default. Set `0` / `false` / `off` / `no` before starting or restarting GJC to remove that framing for terminal parsers that render it incorrectly. This is a process-wide compatibility and diagnostic switch, not tmux/Byobu client detection or per-client negotiation. Disabling it may expose visible tearing; return to the default after diagnosis unless the client requires the workaround. |
+| `GJC_TUI_WIDTH_SETTLE_MS` | Trailing debounce in ms before the full repaint that repairs the transcript after a terminal width change (default `1000`; `0` turns the settled repair off). Read once when the TUI starts. A negative or non-numeric value falls back to the default. `PI_TUI_WIDTH_SETTLE_MS` is the legacy alias. |
 
 ---
 
@@ -635,6 +667,14 @@ See [External control readiness](./external-control-readiness.md#jetbrains-air-c
 | `GJC_DEVIN_PERMISSION_MODE` | `allow`, `deny` | `allow` | How GJC answers Devin's ACP permission requests for Devin's own tool calls. `allow` grants `allow_once`; a request that offers none is answered `cancelled`, because GJC never grants a persistent approval on its own. `deny` selects `reject_once`/`reject_always`. Invalid values fail closed to `deny`. |
 
 Devin authentication lives entirely in the Devin CLI (`devin auth login`, or `WINDSURF_API_KEY` for enterprise builds); GJC stores no Devin credential. See [Devin CLI provider (ACP)](./devin-provider.md) for the integration boundary, model discovery, and billing.
+
+---
+
+## 12b) Host-terminal agent status
+
+| Variable | Values | Default | Behavior |
+| --- | --- | --- | --- |
+| `GJC_HOST_STATUS` | `terax` | unset | Opts the interactive TUI into per-turn agent status markers (`ESC ] 777 ; notify;Terax;gjc;<working\|attention\|finished> BEL`). Unset, or set to anything else, emits no bytes. `777;notify` is the rxvt notification extension: Ghostty and cmux raise a desktop notification for it, so the marker is opt-in rather than sniffed. A host opts in by exporting this from its shell integration. |
 
 ---
 

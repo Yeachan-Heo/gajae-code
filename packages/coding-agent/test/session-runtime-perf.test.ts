@@ -28,7 +28,11 @@ function createSession(cwd: string, reply = "ok", tools: AgentTool[] = []) {
 		agent,
 		sessionManager: SessionManager.inMemory(cwd),
 		settings: Settings.isolated({ "compaction.enabled": false, "edit.streamingAbort": true }),
-		modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [model] } as never,
+		modelRegistry: {
+			getApiKey: async () => "test-key",
+			getAvailable: () => [model],
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 	});
 	sessions.push(session);

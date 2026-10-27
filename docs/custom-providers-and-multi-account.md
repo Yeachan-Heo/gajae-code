@@ -79,6 +79,8 @@ A direct-broker client has no local hard-removal targets for individual rows, so
 
 The explicit checker probes active stored rows sequentially, then checks synthetic runtime/config/environment API-key sources sequentially. OAuth checks refresh an expired credential before probing when possible. Plain `/usage` never turns a presentation refresh into a provider request.
 
+Codex usage probes also recover an HTTP 401 on an unexpired OAuth token: adopt a peer's newer credential or renew through the credential store, then retry the probe once. This applies to both explicit checks and ordinary network usage retrieval. Concurrent local refreshes share the existing refresh lease, and a lease-persisted token is not written a second time over a newer peer rotation. A repeated 401 or failed renewal is reported as an authentication failure, not an unknown/no-data reading; the checker does not disable the account. HTTP 403, rate limits, server errors, and transport failures do not trigger this renewal path.
+
 ### `gjc accounts` command grammar
 
 The command is intentionally payload-free and has four actions:
@@ -102,6 +104,8 @@ gjc accounts check anthropic --json
 gjc accounts pin anthropic me@example.com --persistent
 gjc accounts pin anthropic id:42 --persistent
 gjc accounts pin anthropic --clear --persistent
+gjc accounts prefer anthropic low-cost@example.com shared@example.com=75
+gjc accounts prefer anthropic --clear
 gjc accounts logout anthropic --account me@example.com
 gjc accounts logout anthropic --all
 ```
@@ -109,6 +113,7 @@ gjc accounts logout anthropic --all
 - `list` shows stored OAuth rows and configured API-key sources, with safe identity/source/health/usage-freshness fields. It does not probe.
 - `check` performs the explicit sequential checker. `--json` emits safe machine-readable rows; a failed probe sets a non-zero exit status.
 - `pin` requires `--persistent`. `<selector>` is a bare email, `id:<positive-row-id>`, `email:<email>`, or `account:<account-id>`. The command validates an active OAuth row and writes the canonical `id:<row-id>` selector to global configuration. `--clear` removes the provider's persistent pin.
+- `prefer` writes the provider's ordered preference list (see `auth.credentialPreferences` below). Accounts are given in order; append `=<percent>` to cap one. Each account accepts the same selectors as `pin`; the command checks that it names exactly one active OAuth row and stores that row's email (as `email:<address>` when the bare text would not read back as that address, for example one with `:` in its local part or one starting with `account:` or `email:`), or its account id when another row shares the email, so the file never holds a store-bound row id and every written list is read back by startup. A cap is the text after the last `=` that follows the account, so `user=2@example.com` is an account and `user=2@example.com=75` caps it at 75%. Nothing is written when any account is missing, ambiguous, duplicated, or has an invalid cap. `--clear` removes the provider's list. The change applies to new sessions.
 - `logout` requires exactly one of `--account <id|email>` or `--all`; it removes only OAuth rows from the local store. It never removes API-key source rows, and it refuses to mutate a broker-backed store.
 
 API-key rows remain visible and checkable so operators can see which source is selected, but they are not part of OAuth account pooling, cannot be pinned by `gjc accounts pin`, and cannot be removed by `gjc accounts logout`.
@@ -131,6 +136,11 @@ auth:
     anthropic: id:42
     openai-codex: email:me@example.com
   credentialPinStoreIdentity: broker:https://broker.example.test:8765
+  credentialPreferences:
+    anthropic:
+      - low-cost@example.com
+      - shared@example.com: 75
+    openai-codex: me@example.com
 ```
 
 - `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values; nested values may be literal strings or trusted `$ENV_NAME` references. Resolution order remains explicit env → nested value (after indirection) → the owner-only `<config-dir>/auth-broker.token` file, so an unresolved nested token does not displace the token-file authority. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite. An absent config file leaves broker mode disabled, while malformed or unreadable global startup-auth config fails closed with a typed `StartupAuthConfigError`.
@@ -138,6 +148,8 @@ auth:
 - `auth.credentialPins` is a global-only record of provider → selector. Project-scoped pins are ignored; do not place this record in project settings.
 - Numeric `id:<positive-row-id>` pins are bound to the credential-store authority fingerprint (`broker:<normalized-url>` or `local:<absolute-agent-db-path>`). Changing broker URL or local database invalidates those numeric pins instead of retargeting a row with the same number; `email:` and `account:` selectors remain portable.
 - `auth.credentialPinStoreIdentity` is managed alongside persistent pins and contains no credential material. Numeric pins are applied only when this value exactly matches the current store authority; missing or mismatched metadata invalidates the numeric pin rather than retargeting a same-number row. Email/account selectors remain portable across store changes.
+- `auth.credentialPreferences` is a global-only record of provider → ordered soft preference list. `gjc accounts prefer` writes it; hand edits use the same shape. A value is one account or a list. Each entry is an account (`me@example.com`, `email:me@example.com`, or `account:<account-id>`) or an account with a usage cap in percent (`me@example.com: 75`, greater than 0 and at most 100). Numeric `id:` selectors are rejected because a preference has no store-identity binding. An invalid entry or an account listed twice fails startup closed rather than silently changing the order; this includes two entries that name the same stored account through different selectors (for example `me@example.com` and `account:<its account id>`), which startup detects once the credential store is loaded. If a later login makes two entries name one account during a running session, that provider's list is ignored and its accounts are ranked normally until the list is fixed.
+- Selection walks the list in order and uses the first account that is usable and under its cap. An uncapped account stays first until a quota or rate-limit failure blocks it. A capped account counts as full once its most-used known usage window (for example Claude 5h or 7d, or Codex primary/secondary) reaches the cap; unknown usage never counts as full. When every listed account is blocked or full, the unlisted accounts are ranked normally, and full listed accounts are used only after those. Unlike a pin, a preference never blocks the provider.
 - Literal dotted root keys such as `auth.broker.url: ...`, `auth.credentialRankingMode: ...`, or `auth.credentialPins: ...` are rejected. Startup reports the keys and prints manual rewrite guidance. Rewrite `config.yml` by hand using the nested shape above; there is no automatic migration, and secret values must not be copied into command output.
 
 ### Pin and credential precedence
@@ -148,9 +160,10 @@ API-key overrides are outside OAuth pinning:
 2. A `models.yml` provider `apiKey` config override comes next and beats stored/broker OAuth.
 3. If no API-key override is active, an explicit session selector wins: `--credential ...` or an account selected in `/login <provider>`.
 4. A global `auth.credentialPins` entry seeds that provider's selector when a new session starts. Session **AUTO** masks it for that session.
-5. With no selector, OAuth accounts use automatic ranking (`balanced` or `earliest-reset`).
+5. With no selector, a runtime `--prefer-credential` moves its account ahead of automatic ranking while that account is usable. Without one, the global `auth.credentialPreferences` list orders the accounts as described above.
+6. Otherwise OAuth accounts use automatic ranking (`balanced` or `earliest-reset`).
 
-Ranking is performed at session start, or when the session's preferred account is blocked; a running session keeps its selected credential. Blocked/exhausted accounts sort last. Persistent pins and session selectors are valid only for active OAuth credentials. An API-key override (including a configured environment API-key source when creating a pin) makes OAuth pinning unavailable for that provider.
+Ranking is performed at session start, or when the session's preferred account is blocked; a running session keeps its selected credential. Preference caps are therefore evaluated when an account is selected; a session keeps its account after that account crosses its cap, until a quota or rate-limit failure moves the session to the next listed account. Caps are read from the shared usage cache, so concurrent sessions that start before the cache refreshes can each select the same account and carry it somewhat past its cap. Blocked/exhausted accounts sort last. Persistent pins and session selectors are valid only for active OAuth credentials. An API-key override (including a configured environment API-key source when creating a pin) makes OAuth pinning unavailable for that provider.
 
 ## Local, direct-broker, and gateway capabilities
 

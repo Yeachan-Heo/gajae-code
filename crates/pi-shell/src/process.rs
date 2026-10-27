@@ -351,6 +351,52 @@ mod platform {
 			self.status() == ProcessStatus::Running
 				&& read_start_time(self.pid) == Some(self.start_time)
 		}
+
+		pub(super) fn same_incarnation_is_present(&self) -> Option<bool> {
+			read_start_time(self.pid).map(|start_time| start_time == self.start_time)
+		}
+
+		pub(super) fn reap_if_child(&self) -> Option<bool> {
+			// SAFETY: `siginfo_t` is a C record where zero is a valid initial state;
+			// this also handles kernels that leave it unchanged for WNOHANG/no event.
+			let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+			loop {
+				// SAFETY: `pidfd` is a live descriptor for this exact process
+				// incarnation. P_PIDFD makes waitid reap only this pinned child, never a
+				// different process that later reuses its numeric PID.
+				let result = unsafe {
+					libc::waitid(
+						libc::P_PIDFD,
+						self.pidfd.as_raw_fd() as libc::id_t,
+						&raw mut info,
+						libc::WEXITED | libc::WNOHANG,
+					)
+				};
+				if result == 0 {
+					// SAFETY: `info` was initialized above and waitid populated the
+					// SIGCHLD fields when a child was reaped.
+					return Some(unsafe { info.si_pid() } > 0);
+				}
+				match std::io::Error::last_os_error().raw_os_error() {
+					Some(libc::EINTR) => {},
+					Some(libc::ECHILD) => return Some(false),
+					_ => return None,
+				}
+			}
+		}
+	}
+
+	pub fn is_child_reaper() -> bool {
+		if std::process::id() == 1 {
+			return true;
+		}
+		let mut enabled = 0;
+		// SAFETY: PR_GET_CHILD_SUBREAPER writes one `c_int` to the supplied
+		// pointer; the remaining prctl arguments are unused for this option.
+		unsafe {
+			libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut enabled as *mut libc::c_int, 0, 0, 0) == 0
+				&& enabled != 0
+		}
 	}
 
 	pub fn processes_in_group(pgid: i32) -> Option<Vec<Process>> {
@@ -604,17 +650,23 @@ mod platform {
 		}
 
 		pub fn unique_id(&self) -> Option<u64> {
-			self.live_bsdinfo()?;
 			let mut info = std::mem::MaybeUninit::<ProcUniqueIdentifierInfo>::zeroed();
 			let size = i32::try_from(std::mem::size_of::<ProcUniqueIdentifierInfo>()).ok()?;
 			// SAFETY: `info` is a writable buffer of the exact flavor-17 structure
 			// size and libproc initializes it completely on a full-size result.
 			let read = unsafe { proc_pidinfo(self.pid, 17, 0, info.as_mut_ptr().cast(), size) };
 			if read != size {
+				// Entitled/setuid children may deny this optional identity query.
+				// Callers must corroborate process death separately.
 				return None;
 			}
 			// SAFETY: the full structure size was reported initialized above.
 			let unique_id = unsafe { info.assume_init() }.unique_id;
+			// Re-check liveness after reading to protect against pid reuse between the read
+			// and this verification: if the start time has changed, the pid was
+			// recycled. For entitled children that deny bsdinfo access (EPERM),
+			// returning None is appropriate since the caller must corroborate liveness
+			// separately (e.g., via incarnation records with empty unique_id).
 			self.live_bsdinfo()?;
 			Some(unique_id)
 		}
@@ -635,7 +687,7 @@ mod platform {
 			let Some(tree) = build_process_tree() else {
 				return Vec::new();
 			};
-			Self::children_from_tree(self.pid, &tree)
+			Self::children_from_tree(self, &tree)
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -679,47 +731,81 @@ mod platform {
 		/// that terminate descendants MUST NOT treat that as an empty
 		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
+			match self.walk_identity() {
+				WalkIdentity::Unreadable => return None,
+				WalkIdentity::ConfirmedGone => return Some(Vec::new()),
+				WalkIdentity::Same => {},
+			}
 			// One process-table snapshot per walk — building it inside the recursion
 			// would re-scan every pid for every visited node, producing an `O(N · D)`
 			// kernel call pattern. Mirrors the Windows implementation.
 			let tree = build_process_tree()?;
+			match self.walk_identity() {
+				WalkIdentity::Unreadable => return None,
+				WalkIdentity::ConfirmedGone => return Some(Vec::new()),
+				WalkIdentity::Same => {},
+			}
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
-			Self::collect_descendants_from_tree(self.pid, &tree, &mut visited, &mut out);
-			Some(out)
+			Self::collect_descendants_from_tree(self, &tree, &mut visited, &mut out);
+			match self.walk_identity() {
+				WalkIdentity::Unreadable => None,
+				WalkIdentity::ConfirmedGone => Some(Vec::new()),
+				WalkIdentity::Same => Some(out),
+			}
 		}
 
-		fn children_from_tree(parent: i32, tree: &HashMap<i32, Vec<i32>>) -> Vec<Self> {
-			let Some(child_pids) = tree.get(&parent) else {
+		fn child_from_snapshot(parent: &Self, snapshot: ProcInfo) -> Option<Self> {
+			if snapshot.ppid != parent.pid {
+				return None;
+			}
+			let child = Self {
+				pid:          snapshot.pid,
+				start_tvsec:  snapshot.start_tvsec,
+				start_tvusec: snapshot.start_tvusec,
+			};
+			if child.live_bsdinfo()?.ppid != parent.pid {
+				return None;
+			}
+			// The child identity and parent edge must both still match the snapshot
+			// before the child becomes a retained process authority. In particular,
+			// reopening a recycled child PID must not capture an unrelated process.
+			parent.live_bsdinfo()?;
+			Some(child)
+		}
+
+		fn children_from_tree(parent: &Self, tree: &HashMap<i32, Vec<ProcInfo>>) -> Vec<Self> {
+			let Some(child_snapshots) = tree.get(&parent.pid) else {
 				return Vec::new();
 			};
-			child_pids
+			child_snapshots
 				.iter()
 				.copied()
-				.filter_map(Self::from_pid)
+				.filter_map(|snapshot| Self::child_from_snapshot(parent, snapshot))
 				.collect()
 		}
 
 		fn collect_descendants_from_tree(
-			parent: i32,
-			tree: &HashMap<i32, Vec<i32>>,
+			parent: &Self,
+			tree: &HashMap<i32, Vec<ProcInfo>>,
 			visited: &mut HashSet<i32>,
 			out: &mut Vec<Self>,
 		) {
-			let Some(child_pids) = tree.get(&parent) else {
+			let Some(child_snapshots) = tree.get(&parent.pid) else {
 				return;
 			};
-			for &child_pid in child_pids {
+			for &snapshot in child_snapshots {
+				let child_pid = snapshot.pid;
 				if !visited.insert(child_pid) {
 					continue;
 				}
-				let Some(child) = Self::from_pid(child_pid) else {
+				let Some(child) = Self::child_from_snapshot(parent, snapshot) else {
 					continue;
 				};
 				// Post-order: grandchildren first, so leaf processes get signalled
 				// before their parents during tree termination.
-				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
+				Self::collect_descendants_from_tree(&child, tree, visited, out);
 				out.push(child);
 			}
 		}
@@ -741,6 +827,26 @@ mod platform {
 				Some(info)
 			} else {
 				None
+			}
+		}
+
+		fn walk_identity(&self) -> WalkIdentity {
+			#[cfg(test)]
+			if let Some(scripted) = take_scripted_walk_identity() {
+				return scripted;
+			}
+			let info = read_bsdinfo(self.pid);
+			if BSD_LOOKUP_UNREADABLE.with(|flag| flag.get()) {
+				return WalkIdentity::Unreadable;
+			}
+			match info {
+				Some(info)
+					if info.start_tvsec == self.start_tvsec
+						&& info.start_tvusec == self.start_tvusec =>
+				{
+					WalkIdentity::Same
+				},
+				_ => WalkIdentity::ConfirmedGone,
 			}
 		}
 	}
@@ -849,9 +955,9 @@ mod platform {
 	///
 	/// Used as the foundation of `Process::children` and `Process::descendants`
 	/// on macOS where `proc_listchildpids` returns no children for self-queries.
-	pub(super) fn build_process_tree() -> Option<HashMap<i32, Vec<i32>>> {
+	pub(super) fn build_process_tree() -> Option<HashMap<i32, Vec<ProcInfo>>> {
 		let pids = snapshot_all_pids()?;
-		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(pids.len() / 2);
+		let mut tree: HashMap<i32, Vec<ProcInfo>> = HashMap::with_capacity(pids.len() / 2);
 		for pid in pids {
 			if pid <= 0 {
 				continue;
@@ -861,11 +967,10 @@ mod platform {
 				// race, not an observation failure: skip it and keep the snapshot.
 				continue;
 			};
-			let ppid = info.ppid;
-			if ppid <= 0 {
+			if info.ppid <= 0 {
 				continue;
 			}
-			tree.entry(ppid).or_default().push(pid);
+			tree.entry(info.ppid).or_default().push(info);
 		}
 		Some(tree)
 	}
@@ -972,7 +1077,36 @@ mod platform {
 		read_i32(KINFO_PROC_PID) == pid && read_i32(KINFO_PROC_STAT) == SZOMB
 	}
 
+	#[derive(Clone, Copy)]
+	enum WalkIdentity {
+		Same,
+		ConfirmedGone,
+		Unreadable,
+	}
+
+	thread_local! {
+		static BSD_LOOKUP_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+
+	#[cfg(test)]
+	thread_local! {
+		static WALK_IDENTITY_SCRIPT: std::cell::RefCell<Vec<WalkIdentity>> = const { std::cell::RefCell::new(Vec::new()) };
+	}
+
+	#[cfg(test)]
+	fn take_scripted_walk_identity() -> Option<WalkIdentity> {
+		WALK_IDENTITY_SCRIPT.with(|script| {
+			let mut queued = script.borrow_mut();
+			if queued.is_empty() {
+				None
+			} else {
+				Some(queued.remove(0))
+			}
+		})
+	}
+
 	fn read_bsdinfo(pid: i32) -> Option<ProcInfo> {
+		BSD_LOOKUP_UNREADABLE.with(|flag| flag.set(false));
 		let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
 		let mut buffer = [0u8; KINFO_PROC_SIZE];
 		let mut len = buffer.len();
@@ -989,8 +1123,11 @@ mod platform {
 				0,
 			)
 		};
-		// A pid that does not exist returns success with zero bytes written.
-		if rc != 0 || len != KINFO_PROC_SIZE {
+		if rc != 0 || (len != 0 && len != KINFO_PROC_SIZE) {
+			BSD_LOOKUP_UNREADABLE.with(|flag| flag.set(true));
+			return None;
+		}
+		if len != KINFO_PROC_SIZE {
 			return None;
 		}
 		let read_i32 = |offset: usize| {
@@ -1099,6 +1236,51 @@ mod platform {
 			offset = end + 1;
 		}
 		args
+	}
+
+	#[cfg(test)]
+	#[path = "tests/macos_walk_identity.rs"]
+	mod macos_walk_identity;
+
+	#[cfg(test)]
+	#[test]
+	fn descendants_observed_skips_reused_pid() {
+		use std::{process::Command, thread, time::Duration};
+
+		let mut child = Command::new("sleep")
+			.arg("30")
+			.stdin(std::process::Stdio::null())
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.spawn()
+			.expect("spawn sleep");
+		let child_pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
+		let live = Process::from_pid(self_pid).expect("live self");
+		let mut visible = false;
+		for _ in 0..40 {
+			if live
+				.descendants()
+				.iter()
+				.any(|descendant| descendant.pid() == child_pid)
+			{
+				visible = true;
+				break;
+			}
+			thread::sleep(Duration::from_millis(25));
+		}
+		let stale = Process { pid: self_pid, start_tvsec: 0, start_tvusec: 0 };
+		let observed = stale.descendants_observed().expect("process table");
+		let _ = child.kill();
+		let _ = child.wait();
+		assert!(visible, "child pid {child_pid} never appeared under the live process");
+		assert_ne!(live.incarnation(), stale.incarnation());
+		assert!(
+			observed
+				.iter()
+				.all(|descendant| descendant.pid() != child_pid),
+			"recycled pid handle adopted child {child_pid}"
+		);
 	}
 }
 #[cfg(target_os = "windows")]
@@ -2264,6 +2446,45 @@ impl TerminationTargets {
 			.collect();
 		for process in descendants {
 			self.add_process(process);
+		}
+	}
+
+	/// Reap retained descendants adopted by this Linux init or child subreaper.
+	/// The direct PTY child is omitted because its `Child` handle owns that
+	/// wait.
+	#[cfg(target_os = "linux")]
+	pub fn reap_adopted_descendants(&self, direct_child_pid: Option<i32>, timeout: Duration) {
+		if !platform::is_child_reaper() {
+			return;
+		}
+		let deadline = std::time::Instant::now() + timeout;
+		loop {
+			let mut pending = false;
+			for process in self
+				.processes
+				.iter()
+				.filter(|process| Some(process.pid()) != direct_child_pid)
+			{
+				let Some(reaped) = process.inner.reap_if_child() else {
+					// P_PIDFD waitid is unavailable or failed; never fall back to a
+					// numeric-PID wait that could reap a replacement process.
+					return;
+				};
+				if reaped {
+					continue;
+				}
+				if process.inner.same_incarnation_is_present() != Some(false) {
+					pending = true;
+				}
+			}
+			if !pending || std::time::Instant::now() >= deadline {
+				return;
+			}
+			std::thread::sleep(
+				deadline
+					.saturating_duration_since(std::time::Instant::now())
+					.min(Duration::from_millis(10)),
+			);
 		}
 	}
 }

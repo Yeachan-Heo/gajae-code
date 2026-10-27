@@ -34,31 +34,41 @@ describe("daemon command timeout validation", () => {
 		const invalidTokens = ["", " ", "22junk", "1.5", "1e3", "+1", "-1", "0", "9007199254740992"];
 
 		for (const flag of ["--graceful-timeout-ms", "--kill-timeout-ms"]) {
-			const missing = runDaemon(["status", "unknown-kind", flag], path.join(tempRoot, "missing"));
-			expect(missing.exitCode, `${flag} missing operand unexpectedly succeeded`).not.toBe(0);
-			expect(missing.stderr).toContain(flag);
-			expect(missing.stderr).not.toContain("Unknown daemon kind");
+			const missing = runDaemon(["restart", "unknown-kind", "--json", flag], path.join(tempRoot, "missing"));
+			expect(missing.exitCode).toBe(2);
+			expect(missing.stderr).toBe("");
+			expect(JSON.parse(missing.stdout).error.code).toBe("usage");
 
 			for (const token of invalidTokens) {
 				const effectDir = path.join(tempRoot, `${flag.slice(2)}-${invalidTokens.indexOf(token)}`);
-				const result = runDaemon(["status", "unknown-kind", `${flag}=${token}`], effectDir);
-				expect(result.exitCode, `${flag} accepted ${JSON.stringify(token)}`).not.toBe(0);
-				expect(result.stderr).toContain(`Expected ${flag} to be a positive safe integer`);
-				expect(result.stderr).not.toContain("Unknown daemon kind");
+				const result = runDaemon(["restart", "unknown-kind", "--json", `${flag}=${token}`], effectDir);
+				expect(result.exitCode, `${flag} accepted ${JSON.stringify(token)}`).toBe(2);
+				expect(result.stderr).toBe("");
+				expect(JSON.parse(result.stdout).error.code).toBe("usage");
 				expect(fs.existsSync(effectDir), `${flag} dispatched for ${JSON.stringify(token)}`).toBe(false);
 			}
 		}
 	}, 30_000);
 
-	test("preserves valid timeout values and omission", () => {
+	test("valid timeout values reach runtime kind validation without operations", () => {
 		for (const token of [undefined, "1", "2500", "9007199254740991"]) {
-			const args = ["status", "--json"];
+			const args = ["restart", "unknown-kind", "--json"];
 			if (token !== undefined) {
 				args.push("--graceful-timeout-ms", token, "--kill-timeout-ms", token);
 			}
 			const result = runDaemon(args, path.join(tempRoot, `valid-${token ?? "omitted"}`));
-			expect(result.exitCode, result.stderr).toBe(0);
-			expect(JSON.parse(result.stdout)).toBeArray();
+			expect(result.exitCode, result.stderr).toBe(1);
+			expect(JSON.parse(result.stdout).error.code).toBe("operation_failed");
 		}
 	}, 15_000);
+
+	test("public help hides worker grammar without initializing state", () => {
+		const agentDir = path.join(tempRoot, "help-only");
+		const result = runDaemon(["restart", "--help", "--json"], agentDir);
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		for (const token of ["discord-internal", "slack-internal", "owner-id", "smoke"])
+			expect(result.stdout).not.toContain(token);
+		expect(fs.existsSync(agentDir)).toBe(false);
+	});
 });

@@ -42,6 +42,44 @@
 				},
 				"credentialPinStoreIdentity": {
 					"type": "string"
+				},
+				"credentialPreferences": {
+					"type": "object",
+					"additionalProperties": {
+						"anyOf": [
+							{
+								"type": "string",
+								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"uniqueItems": true,
+								"items": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+										},
+										{
+											"type": "object",
+											"minProperties": 1,
+											"maxProperties": 1,
+											"propertyNames": {
+												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+											},
+											"additionalProperties": {
+												"type": "number",
+												"exclusiveMinimum": 0,
+												"maximum": 100
+											}
+										}
+									]
+								}
+							}
+						]
+					},
+					"default": {}
 				}
 			},
 			"additionalProperties": false
@@ -148,9 +186,21 @@
 					"minimum": 60000,
 					"maximum": 86400000
 				},
+				"flushWorktreeOnDeadline": {
+					"type": "boolean",
+					"description": "Autosave uncommitted changes in the session's linked worktree by default as a WIP commit when a prompt deadline retires a prompt; primary checkouts require an explicit true opt-in.",
+					"default": true
+				},
 				"masterOrphanGraceMs": {
 					"type": "integer",
 					"description": "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+					"default": 120000,
+					"minimum": 60000,
+					"maximum": 3600000
+				},
+				"brokerAbandonedGraceMs": {
+					"type": "integer",
+					"description": "Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
 					"default": 120000,
 					"minimum": 60000,
 					"maximum": 3600000
@@ -448,6 +498,75 @@
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
 				},
+				"ownership": {
+					"type": "object",
+					"properties": {
+						"schemaVersion": {
+							"type": "integer",
+							"const": 1
+						},
+						"version": {
+							"type": "integer",
+							"minimum": 0,
+							"maximum": 9007199254740991
+						},
+						"marker": {
+							"type": "object",
+							"oneOf": [
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "inherit"
+										}
+									},
+									"required": [
+										"kind"
+									],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "cleared"
+										}
+									},
+									"required": [
+										"kind"
+									],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "profile"
+										},
+										"profile": {
+											"type": "string",
+											"minLength": 1
+										}
+									},
+									"required": [
+										"kind",
+										"profile"
+									],
+									"additionalProperties": false
+								}
+							]
+						}
+					},
+					"required": [
+						"schemaVersion",
+						"version",
+						"marker"
+					],
+					"additionalProperties": false
+				},
 				"proxyProvider": {
 					"type": "string",
 					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints."
@@ -744,8 +863,8 @@
 				},
 				"maxInlineResultBytes": {
 					"type": "number",
-					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
-					"default": 0
+					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. Default 12 KB (live A/B, #5945); 0 disables.",
+					"default": 12
 				},
 				"intentTracing": {
 					"type": "boolean",
@@ -935,10 +1054,11 @@
 				"flex",
 				"scale",
 				"priority",
+				"ultrafast",
 				"openai-only",
 				"claude-only"
 			],
-			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
+			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; ultrafast is a 6x premium tier. Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
 			"default": "none"
 		},
 		"task": {
@@ -954,6 +1074,7 @@
 						"flex",
 						"scale",
 						"priority",
+						"ultrafast",
 						"openai-only",
 						"claude-only"
 					],
@@ -1006,6 +1127,21 @@
 					"description": "Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 					"default": false
 				},
+				"delegationHint": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"off",
+								"hint"
+							],
+							"description": "Opt in to transient local-only Kev advice after observable edit activity. Notices never alter prompts, task arguments, or saved sessions.",
+							"default": "off"
+						}
+					},
+					"additionalProperties": false
+				},
 				"simple": {
 					"type": "string",
 					"enum": [
@@ -1020,6 +1156,11 @@
 					"type": "number",
 					"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
 					"default": 8
+				},
+				"compactSubagentPanel": {
+					"type": "boolean",
+					"description": "Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
+					"default": false
 				},
 				"enableLsp": {
 					"type": "boolean",
@@ -1278,6 +1419,14 @@
 				"maxAttempts": {
 					"type": "number",
 					"default": 3
+				},
+				"circuitCooldownMs": {
+					"type": "number",
+					"default": 60000
+				},
+				"circuitMaxCooldownMs": {
+					"type": "number",
+					"default": 1800000
 				}
 			},
 			"additionalProperties": false
@@ -1427,7 +1576,7 @@
 		},
 		"promptSuggestions": {
 			"type": "boolean",
-			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+			"description": "Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 			"default": false
 		},
 		"telemetry": {
@@ -1595,7 +1744,7 @@
 				},
 				"thresholdPercent": {
 					"type": "number",
-					"description": "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+					"description": "Percent threshold for context maintenance; the 300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
 					"default": -1
 				},
 				"thresholdTokens": {
@@ -2227,6 +2376,9 @@
 				"settingsPath": {
 					"type": "string"
 				},
+				"settingsHash": {
+					"type": "string"
+				},
 				"only": {
 					"type": "array",
 					"items": true,
@@ -2384,6 +2536,17 @@
 				"enabled": {
 					"type": "boolean",
 					"description": "Enable the render_mermaid tool for Mermaid-to-ASCII rendering",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"reportIssue": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the report_issue tool: the model records tool behavior that contradicts the tool's description into the local ~/.gjc/tool-issues.db. Nothing is sent anywhere.",
 					"default": false
 				}
 			},
@@ -2850,6 +3013,10 @@
 					"type": "array",
 					"items": true,
 					"default": []
+				},
+				"discoveryDeferAutoload": {
+					"type": "boolean",
+					"default": false
 				},
 				"notifications": {
 					"type": "boolean",

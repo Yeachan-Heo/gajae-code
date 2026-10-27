@@ -158,6 +158,17 @@ function isAbortError(error: unknown): boolean {
 	return error instanceof Error && error.name === "AbortError";
 }
 
+export const DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS = 300_000;
+
+export function isDefaultAutoThresholdCeilingApplied(contextWindow: number, settings: CompactionSettings): boolean {
+	const thresholdTokens = settings.thresholdTokens;
+	if (typeof thresholdTokens === "number" && Number.isFinite(thresholdTokens) && thresholdTokens > 0) return false;
+	const thresholdPercent = settings.thresholdPercent;
+	if (typeof thresholdPercent === "number" && Number.isFinite(thresholdPercent) && thresholdPercent > 0) return false;
+	if (settings.adaptive?.enabled) return false;
+	return contextWindow - effectiveReserveTokens(contextWindow, settings) > DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS;
+}
+
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	strategy: "context-full",
@@ -431,7 +442,10 @@ export function resolveThresholdTokens(
 	const thresholdPercent = settings.thresholdPercent;
 	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
 		if (!settings.adaptive?.enabled) {
-			return contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens);
+			return Math.min(
+				contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens),
+				DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS,
+			);
 		}
 		const adaptiveBasePercent = Number.isFinite(settings.adaptive.baseThresholdPercent)
 			? Math.min(99, Math.max(1, settings.adaptive.baseThresholdPercent))
@@ -969,6 +983,51 @@ export function boundConversationTextForSummary(
 	return fitsBudget(bareMarker) ? bareMarker : "";
 }
 
+const SUMMARY_FENCE_OPEN = "<untrusted-content>\n";
+const SUMMARY_FENCE_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Closers that would end the summary fence or the surrounding conversation
+ * block. Whitespace before ">" still closes the tag, so those spellings go too.
+ */
+function escapeSummaryFenceClosers(text: string): string {
+	return text
+		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/conversation>/gi, "&lt;/conversation>")
+		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "&lt;/conversation>");
+}
+
+/**
+ * Frame a conversation excerpt after {@link boundConversationTextForSummary}.
+ * A head cut or a tail cut can drop an opener that was added earlier; the fence
+ * belongs on the text that is about to enter the summary prompt.
+ */
+export function frameSummaryConversationAfterClip(excerpt: string): string {
+	return `${SUMMARY_FENCE_OPEN}${escapeSummaryFenceClosers(excerpt)}${SUMMARY_FENCE_CLOSE}`;
+}
+
+function clippedSummaryConversation(serialized: string, model: Model, outputMaxTokens: number): string {
+	return frameSummaryConversationAfterClip(boundConversationTextForSummary(serialized, model, outputMaxTokens));
+}
+
+/** Convert a stored summary the same way as conversation text, for the outbound prompt only. */
+function outboundSummaryText(text: string, convert: ConvertToLlm): string {
+	const [message] = convert([
+		{
+			role: "user",
+			content: [{ type: "text", text }],
+			timestamp: 0,
+		},
+	]);
+	if (!message) return text;
+	if (typeof message.content === "string") return message.content;
+	for (const block of message.content) {
+		if (block.type === "text") return block.text;
+	}
+	return text;
+}
+
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model,
@@ -993,12 +1052,14 @@ export async function generateSummary(
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(currentMessages);
-	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
+	const conversationText = clippedSummaryConversation(serializeConversation(llmMessages), model, maxTokens);
 
-	// Build the prompt with conversation wrapped in tags
+	// Build the prompt with conversation wrapped in tags.
+	// The stored summary stays unchanged; only this outbound copy is converted.
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+		const outboundPreviousSummary = outboundSummaryText(previousSummary, options?.convertToLlm ?? convertToLlm);
+		promptText += `<previous-summary>\n${outboundPreviousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
 	promptText += basePrompt;
@@ -1218,6 +1279,22 @@ export interface PrepareCompactionOptions {
 	contextWindow?: number;
 }
 
+/**
+ * Leave reserve headroom below the compaction trigger for the kept history.
+ * When the default 300K ceiling applies, cap that headroom to half the threshold
+ * so large context windows do not reduce the safe keep window to zero. The caller
+ * separately clamps an oversized configured keep floor and corrected budget below
+ * the threshold so they cannot prevent an actual compaction.
+ */
+function resolveThresholdSafeKeepRecentTokens(contextWindow: number, settings: CompactionSettings): number {
+	const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
+	const reserveTokens = effectiveReserveTokens(contextWindow, settings, 0);
+	const headroomTokens = isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+		? Math.min(reserveTokens, Math.floor(thresholdTokens * 0.5))
+		: reserveTokens;
+	return Math.max(1, thresholdTokens - headroomTokens);
+}
+
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
@@ -1250,11 +1327,9 @@ export function prepareCompaction(
 	const contextWindow = options.contextWindow;
 	const thresholdSafeKeepRecentTokens =
 		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 1
-			? Math.max(
-					1,
-					resolveThresholdTokens(contextWindow, settings) - effectiveReserveTokens(contextWindow, settings, 0),
-				)
+			? resolveThresholdSafeKeepRecentTokens(contextWindow, settings)
 			: configuredKeepRecentTokens;
+
 	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
 	// Preserve the legacy fixed window for smaller models. At 66k and above,
 	// retain up to 30% of the model context, but never enough to leave the
@@ -1275,13 +1350,26 @@ export function prepareCompaction(
 	const historyTokens = pathEntries
 		.slice(boundaryStart, boundaryEnd)
 		.reduce((tokens, entry) => tokens + estimateEntryTokens(entry), 0);
+	// Under the default ceiling a configured floor above the threshold-safe window
+	// would keep more than the trigger allows (or skip compaction entirely), so the
+	// floor is bounded by that window there.
+	const keepFloorTokens =
+		contextWindow !== undefined && isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+			? keepRecentTokens
+			: configuredKeepRecentTokens;
 	const effectiveKeepRecentTokens =
-		configuredKeepRecentTokens > historyTokens
-			? configuredKeepRecentTokens
+		keepFloorTokens > historyTokens
+			? keepFloorTokens
 			: scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
 				? keepRecentTokens
 				: scaledKeepRecentTokens;
-	const keepRecentTokensCorrected = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
+	const correctedKeepRecentTokens = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
+	const keepRecentTokensCorrected =
+		contextWindow !== undefined &&
+		Number.isFinite(contextWindow) &&
+		isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+			? Math.min(correctedKeepRecentTokens, resolveThresholdTokens(contextWindow, settings) - 1)
+			: correctedKeepRecentTokens;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokensCorrected);
 
@@ -1365,8 +1453,7 @@ const TURN_PREFIX_SUMMARIZATION_PROMPT = prompt.render(compactionTurnPrefixPromp
  * Reasoning effort for a maintenance one-shot call (summary, turn-prefix
  * summary, handoff), sized against the model that will actually run it.
  *
- * These calls want `high`, but they must never *demand* it: the fallback
- * chain hands them whatever same-provider model has the most context, and a
+ * These calls want `high`, but they must never *demand* it: a
  * reasoning-capable model on a transport without reasoning control (the
  * registry strips `thinking` for a proxied `openai-codex` baseUrl) rejects any
  * explicit effort inside the provider mapper. The agent turn already clamps
@@ -1570,7 +1657,7 @@ async function generateTurnPrefixSummary(
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
-	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
+	const conversationText = clippedSummaryConversation(serializeConversation(llmMessages), model, maxTokens);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{

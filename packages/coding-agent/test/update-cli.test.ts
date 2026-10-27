@@ -3,17 +3,21 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { VERSION } from "@gajae-code/utils";
+import * as native from "@gajae-code/natives";
+import { logger, VERSION } from "@gajae-code/utils";
 import { runCli } from "../src/cli";
+import * as installActivation from "../src/cli/install-activation";
 import {
 	buildActivationRecord,
 	createActivationRecordFile,
+	readActivationRecord,
 	snapshotDirectory,
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
 import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
 import type { BinaryReplacementOptions, BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
 import {
+	ActivationRetryCandidateRepointError,
 	assertSupportedLinuxLibcForTest,
 	buildReleaseBinaryUrlForTest,
 	compareVersionsForTest,
@@ -25,13 +29,17 @@ import {
 	fsyncFileForTest,
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
+	InstallationAccessDeniedError,
 	isProtectedSourcePathForTest,
+	isUpdateBackupNameForTest,
+	isUpdateStagingNameForTest,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	recoverWindowsUpdateJournal,
 	replaceBinaryForUpdate,
 	resolveGjcPathForTest,
 	resolveNpmManagedTargetForTest,
+	resolveProjectLocalPackageInstallForTest,
 	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
@@ -40,10 +48,12 @@ import {
 	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
 	sanitizeVerificationOutputForTest,
+	smokeTestPinnedCandidate,
 	verifyInstalledVersionForTest,
 	verifyMigrationTargetAdapterForTest,
 	verifyMigrationTargetForTest,
 } from "../src/cli/update-cli";
+import { runUpdateRecoveryCommand } from "../src/commands/update";
 import { Settings } from "../src/config/settings";
 import { distTagForChannel, isUpdateChannel } from "../src/config/update-channel";
 import { initTheme } from "../src/modes/theme/theme";
@@ -61,6 +71,23 @@ async function makeTempDir(): Promise<string> {
 async function writeFixtureFile(filePath: string, content: string | Uint8Array, mode = 0o755): Promise<void> {
 	await fs.writeFile(filePath, content, { mode });
 	await fs.chmod(filePath, mode);
+}
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function generatedHex(random: () => number, length: number): string {
+	const digits = "0123456789abcdef";
+	return Array.from({ length }, () => digits.charAt(Math.floor(random() * digits.length))).join("");
+}
+
+function generatedUpdateId(random: () => number): string {
+	return `${generatedHex(random, 8)}-${generatedHex(random, 4)}-${generatedHex(random, 4)}-${generatedHex(random, 4)}-${generatedHex(random, 12)}`;
 }
 
 afterEach(async () => {
@@ -541,6 +568,30 @@ describe("update-cli install target detection", () => {
 		expect(target).toBeUndefined();
 	});
 
+	it("recognizes a project-local node_modules/.bin install on every platform", () => {
+		// #6842: on Windows the dependency-installed CLI is a real .exe, so the
+		// .cmd/.ps1 shim rules never matched it and `gjc update` tried to replace a
+		// package-manager-owned file.
+		expect(resolveProjectLocalPackageInstallForTest("C:\\proj\\node_modules\\.bin\\gjc.exe", "win32")).toEqual({
+			packageRoot: "C:\\proj\\node_modules",
+		});
+		expect(resolveProjectLocalPackageInstallForTest("/proj/node_modules/.bin/gjc", "linux")).toEqual({
+			packageRoot: "/proj/node_modules",
+		});
+	});
+
+	it("does not treat a global or standalone install as project-local", () => {
+		for (const candidate of [
+			"/usr/local/bin/gjc",
+			"/home/me/.gjc/bin/gjc",
+			"C:\\Users\\me\\AppData\\Local\\gjc\\gjc.exe",
+			"/proj/node_modules/.bin/other",
+			"/proj/node_modules/gjc",
+		]) {
+			expect(resolveProjectLocalPackageInstallForTest(candidate, "linux")).toBeUndefined();
+		}
+	});
+
 	it("keeps non-Windows package-manager-like shims on the existing bun/binary classifier", () => {
 		const target = resolveNpmManagedTargetForTest("/usr/local/bin/gjc", "linux", () => true);
 
@@ -999,6 +1050,60 @@ describe("update-cli command verification failures", () => {
 });
 
 describe("update-cli managed notification recovery", () => {
+	it("reports injected stop failures without throwing and gives manual recovery guidance", async () => {
+		const stderr: string[] = [];
+		const write = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+			return true;
+		});
+		const priorExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			await runUpdateRecoveryCommand(async () =>
+				runManagedNotifyRecovery({
+					settings: async () => configuredSettings(),
+					stopDaemon: async () => {
+						throw new Error("stop failed");
+					},
+				}),
+			);
+			expect(process.exitCode).toBe(1);
+			expect(stderr.join("")).toContain("Post-update recovery failed");
+			expect(stderr.join("")).toContain("Post-update daemon stop --force failed: stop failed");
+			expect(stderr.join("")).toContain("gjc daemon stop <kind> --force");
+			expect(stderr.join("")).toContain("gjc daemon reload <kind>");
+			expect(stderr.join("")).toContain("gjc notify recovery");
+			expect(stderr.join("")).not.toContain("gjc daemon stop telegram");
+		} finally {
+			write.mockRestore();
+			process.exitCode = priorExitCode ?? 0;
+		}
+	});
+
+	it("gives provider-neutral recovery guidance when a non-Telegram stage fails", async () => {
+		const stderr: string[] = [];
+		const write = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+			return true;
+		});
+		const priorExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			await runUpdateRecoveryCommand(async () => {
+				throw new Error("Post-update notify recovery failed: slack socket refused");
+			});
+			expect(process.exitCode).toBe(1);
+			const out = stderr.join("");
+			expect(out).toContain("slack socket refused");
+			expect(out).toContain("gjc notify recovery");
+			expect(out).not.toContain("gjc daemon stop telegram");
+			expect(out).not.toContain("gjc daemon reload telegram");
+		} finally {
+			write.mockRestore();
+			process.exitCode = priorExitCode ?? 0;
+		}
+	});
+
 	const release = {
 		tag: "v999.0.0",
 		version: "999.0.0",
@@ -1811,6 +1916,652 @@ async function replaceBinaryFixture(options: Omit<BinaryReplacementOptions, "ori
 }
 
 describe("update-cli binary replacement", () => {
+	it("supersedes a pre-promotion record for an older candidate instead of refusing the newer release (#6096)", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const staleStage = path.join(dir, "gjc.new.stale.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(staleStage, "stale binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stale = (await snapshotRegularFile(staleStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		// A failed promotion toward 15.1.7 left a staged record; the live target is
+		// still the exact recorded baseline.
+		await createActivationRecordFile(
+			buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: staleStage,
+				stagingIdentity: stale.identity,
+				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
+			}),
+		);
+		await writeFixtureFile(nextStage, "new binary");
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status).toBe("valid");
+		if (record.status === "valid") {
+			expect(record.record.phase).toBe("verified");
+			expect(record.record.candidate.version).toBe("15.1.8");
+		}
+	});
+
+	it("keeps refusing a different candidate once the recorded target has drifted from its baseline", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const staleStage = path.join(dir, "gjc.new.stale.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(staleStage, "stale binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stale = (await snapshotRegularFile(staleStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile(
+			buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: staleStage,
+				stagingIdentity: stale.identity,
+				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
+			}),
+		);
+		// The installed bytes no longer match the recorded baseline: a promotion may
+		// have reached the target, so the transaction must stay pinned.
+		await writeFixtureFile(targetPath, "changed binary");
+		await writeFixtureFile(nextStage, "new binary");
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	it("reports a denied promotion and reuses its pending stage without leaving a duplicate", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const firstStage = path.join(dir, "gjc.new.first.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(firstStage, "new binary");
+
+		const replaceNative = native.exactReplaceRetained;
+		let attempts = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (attempts++ === 0) return { ok: false, code: "access_denied", windowsErrorCode: "0xC0000022" };
+			return replaceNative(...args);
+		});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: firstStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow(`access_denied during exact replacement of ${targetPath} (0xC0000022)`);
+
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(firstStage).text()).toBe("new binary");
+			const pending = await readActivationRecord(targetPath);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") {
+				expect(pending.record.phase).toBe("pending_activation");
+				expect(pending.record.stagingPath).toBe(firstStage);
+			}
+
+			await writeFixtureFile(retryStage, "new binary");
+			const retried = await replaceBinaryFixture({
+				targetPath,
+				tempPath: retryStage,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			});
+
+			expect(retried.ok).toBe(true);
+			expect(await Bun.file(targetPath).text()).toBe("new binary");
+			expect(await Bun.file(firstStage).exists()).toBe(false);
+			expect(await Bun.file(retryStage).exists()).toBe(false);
+			const verified = await readActivationRecord(targetPath);
+			expect(verified.status).toBe("valid");
+			if (verified.status === "valid") expect(verified.record.phase).toBe("verified");
+			expect(replaceSpy).toHaveBeenCalledTimes(2);
+		} finally {
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it("includes retained native paths when denied publication cannot restore the predecessor", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const stagingPath = path.join(dir, "gjc.new.exe");
+		const detachedPath = path.join(dir, "gjc.exe.detached");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(stagingPath, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(stagingPath))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockReturnValue({
+			ok: false,
+			code: "access_denied",
+			windowsErrorCode: "0xC0000022",
+			detachedPath,
+			retainedUnknownPath: targetPath,
+		});
+		try {
+			let caught: unknown;
+			try {
+				await replaceBinaryFixture({
+					targetPath,
+					tempPath: stagingPath,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				});
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(InstallationAccessDeniedError);
+			if (!(caught instanceof InstallationAccessDeniedError)) throw new Error("expected access-denied error");
+			expect(caught.retainedPaths).toMatchObject({ detachedPath, retainedUnknownPath: targetPath });
+			expect(caught.message).toContain(`retained paths: detached=${detachedPath}|unknown=${targetPath}`);
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+		} finally {
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it("preserves retained paths without blocking activation when redundant-stage cleanup fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) {
+				fsNode.renameSync(retryStage, detachedPath);
+				fsNode.mkdirSync(retryStage);
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath,
+					retainedPlaceholderPath: retryStage,
+				};
+			}
+			return exactUnlink(filePath, identity);
+		});
+		try {
+			const result = await replaceBinaryFixture({
+				targetPath,
+				tempPath: retryStage,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			});
+
+			expect(result.ok).toBe(true);
+			expect(result.cleanupWarning).toContain("activation_retry_staging_cleanup_failed");
+			expect(result.cleanupWarning).toContain(`detached=${detachedPath}`);
+			expect(result.cleanupWarning).toContain(`placeholder=${retryStage}`);
+			expect(result.cleanupWarning).toContain("snapshot=target_not_regular");
+			expect(await Bun.file(targetPath).text()).toBe("new binary");
+			expect(await Bun.file(detachedPath).text()).toBe("new binary");
+			expect(fsNode.statSync(retryStage).isDirectory()).toBe(true);
+		} finally {
+			unlinkSpy.mockRestore();
+		}
+	});
+
+	it("logs redundant-stage cleanup failure when activation remains pending", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		const activationRecord = {
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation" as const,
+		};
+		const recordIdentity = await createActivationRecordFile(activationRecord);
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) return { ok: false, code: "sharing_violation" };
+			return exactUnlink(filePath, identity);
+		});
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async filePath => {
+				if (filePath === targetPath)
+					return {
+						status: "pending_activation",
+						record: activationRecord,
+						recordIdentity,
+						reason: "sharing_violation",
+					};
+				return reconcile(filePath, { allowPromotion: true });
+			});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("installation_pending_activation");
+
+			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed while activation is pending", {
+				warning: expect.stringContaining("activation_retry_staging_cleanup_failed"),
+			});
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+		} finally {
+			warnSpy.mockRestore();
+			reconcileSpy.mockRestore();
+			unlinkSpy.mockRestore();
+		}
+	});
+
+	it("reports and preserves the retry candidate when the initial record repoint fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+		await fs.unlink(recordedStage);
+		await writeFixtureFile(retryStage, "new binary");
+
+		const recordSpy = vi.spyOn(installActivation, "updateActivationRecordFile").mockImplementation(async () => {
+			throw new Error("activation_record_compare_and_swap_failed");
+		});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow(`activation_record_compare_and_swap_failed; retained retry candidate: ${retryStage}`);
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+			const pending = await readActivationRecord(targetPath);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") expect(pending.record.stagingPath).toBe(recordedStage);
+		} finally {
+			recordSpy.mockRestore();
+		}
+	});
+
+	it("repoints a missing activation candidate and reuses it with a new staging path", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async (filePath, options) => {
+				if (filePath === targetPath) await fs.unlink(recordedStage);
+				return reconcile(filePath, options);
+			});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("installation_pending_activation");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+		} finally {
+			reconcileSpy.mockRestore();
+		}
+
+		const pending = await readActivationRecord(targetPath);
+		expect(pending.status).toBe("valid");
+		if (pending.status === "valid") {
+			expect(pending.record.phase).toBe("pending_activation");
+			expect(pending.record.stagingPath).toBe(retryStage);
+		}
+
+		await writeFixtureFile(nextStage, "new binary");
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(retryStage).exists()).toBe(false);
+		expect(await Bun.file(nextStage).exists()).toBe(false);
+		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+
+	it("repoints a changed activation candidate and reuses the retry stage", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async (filePath, options) => {
+				if (filePath === targetPath) {
+					await fs.unlink(recordedStage);
+					await writeFixtureFile(recordedStage, "changed binary");
+				}
+				return reconcile(filePath, options);
+			});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("installation_pending_activation");
+			expect(warnSpy).toHaveBeenCalledWith(
+				"Activation staging path changed during reconciliation; leaving it untouched",
+				{ changedStagingPath: recordedStage, retryCandidatePath: retryStage },
+			);
+		} finally {
+			reconcileSpy.mockRestore();
+			warnSpy.mockRestore();
+		}
+
+		const pending = await readActivationRecord(targetPath);
+		expect(pending.status).toBe("valid");
+		if (pending.status === "valid") {
+			expect(pending.record.phase).toBe("pending_activation");
+			expect(pending.record.stagingPath).toBe(retryStage);
+		}
+		expect(await Bun.file(recordedStage).text()).toBe("changed binary");
+		expect(await Bun.file(retryStage).text()).toBe("new binary");
+
+		await writeFixtureFile(nextStage, "new binary");
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(retryStage).exists()).toBe(false);
+		expect(await Bun.file(nextStage).exists()).toBe(false);
+		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+
+	it("reports and preserves the retry candidate when candidate-missing reconciliation cannot repoint", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async (filePath, options) => {
+				if (filePath === targetPath) await fs.unlink(recordedStage);
+				return reconcile(filePath, options);
+			});
+		const updateRecord = installActivation.updateActivationRecordFile;
+		const recordSpy = vi
+			.spyOn(installActivation, "updateActivationRecordFile")
+			.mockImplementation(async (record, expectedIdentity) => {
+				if (record.stagingPath === retryStage) throw new Error("activation_record_compare_and_swap_failed");
+				return updateRecord(record, expectedIdentity);
+			});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow(`activation_record_compare_and_swap_failed; retained retry candidate: ${retryStage}`);
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+			const pending = await readActivationRecord(targetPath);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") expect(pending.record.stagingPath).toBe(recordedStage);
+		} finally {
+			recordSpy.mockRestore();
+			reconcileSpy.mockRestore();
+		}
+	});
+
+	it("logs redundant-stage cleanup paths after a reconciliation conflict", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
+		const placeholderPath = path.join(dir, "gjc.new.retry.exe.placeholder");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage)
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath,
+					retainedPlaceholderPath: placeholderPath,
+				};
+			return exactUnlink(filePath, identity);
+		});
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async () => ({ status: "conflict", reason: "backup_collision" }));
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("backup_collision");
+			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed after activation reconciliation failed", {
+				reason: "backup_collision",
+				warning: expect.stringContaining(`detached=${detachedPath}|placeholder=${placeholderPath}`),
+			});
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+		} finally {
+			warnSpy.mockRestore();
+			reconcileSpy.mockRestore();
+			unlinkSpy.mockRestore();
+		}
+	});
+
 	it("consumes the shared verified activation record rather than creating a competing journal", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
@@ -1864,6 +2615,145 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("old binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+	it("logs redundant-stage cleanup paths when verification failure triggers rollback", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
+		const placeholderPath = path.join(dir, "gjc.new.retry.exe.placeholder");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) {
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath,
+					retainedPlaceholderPath: placeholderPath,
+				};
+			}
+			return exactUnlink(filePath, identity);
+		});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: false, path: targetPath }),
+				}),
+			).rejects.toThrow("could not verify updated version");
+
+			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed before activation rollback", {
+				warning: expect.stringContaining(`detached=${detachedPath}|placeholder=${placeholderPath}`),
+			});
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+			expect(await Bun.file(recordedStage).exists()).toBe(false);
+			expect(await Bun.file(backupPath).exists()).toBe(false);
+		} finally {
+			warnSpy.mockRestore();
+			unlinkSpy.mockRestore();
+		}
+	});
+	it("keeps the first cleanup recovery paths when the activation-record write fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
+		const placeholderPath = path.join(dir, "gjc.new.retry.exe.placeholder");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		let retryCleanupAttempts = 0;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) {
+				retryCleanupAttempts++;
+				return retryCleanupAttempts === 1
+					? {
+							ok: false,
+							code: "cleanup_pending",
+							detachedPath,
+							retainedPlaceholderPath: placeholderPath,
+						}
+					: { ok: false, code: "sharing_violation" };
+			}
+			return exactUnlink(filePath, identity);
+		});
+		const updateActivationRecord = installActivation.updateActivationRecordFile;
+		const recordSpy = vi
+			.spyOn(installActivation, "updateActivationRecordFile")
+			.mockImplementation(async (record, expectedIdentity) => {
+				if (record.phase === "verified") throw new Error("activation_record_compare_and_swap_failed");
+				return updateActivationRecord(record, expectedIdentity);
+			});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("activation_record_compare_and_swap_failed");
+
+			const cleanupWarning = warnSpy.mock.calls.find(
+				([message]) => message === "Update staging cleanup failed before activation rollback",
+			)?.[1]?.warning;
+			expect(cleanupWarning).toContain(`detached=${detachedPath}`);
+			expect(cleanupWarning).toContain(`placeholder=${placeholderPath}`);
+			expect(cleanupWarning).toContain("sharing_violation");
+			expect(retryCleanupAttempts).toBe(2);
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+		} finally {
+			warnSpy.mockRestore();
+			recordSpy.mockRestore();
+			unlinkSpy.mockRestore();
+		}
 	});
 	it("installs a fresh binary when the migration target does not exist yet", async () => {
 		const dir = await makeTempDir();
@@ -2018,7 +2908,66 @@ describe("update-cli download durability", () => {
 	});
 });
 
+describe("update artifact filename recognition", () => {
+	it("recognizes generated names only for their target and exact extension", () => {
+		const targetPath = path.join("/install", "gjc");
+		const extendedTargetPath = path.join("/install", "gjc.exe");
+		const random = seededRandom(0x6866cafe);
+
+		for (let index = 0; index < 64; index++) {
+			const id = generatedUpdateId(random);
+			const version = `${1 + Math.floor(random() * 9)}.${Math.floor(random() * 100)}.${Math.floor(random() * 100)}-rc.${index}+build.${generatedHex(random, 4)}`;
+			const timestamp = `${generatedHex(random, 8)}_${index}Z`;
+
+			expect(isUpdateStagingNameForTest(targetPath, `gjc.new.${id}`)).toBe(true);
+			expect(isUpdateStagingNameForTest(targetPath, `other.new.${id}`)).toBe(false);
+			expect(isUpdateStagingNameForTest(targetPath, `gjc.new.${id}.exe`)).toBe(false);
+			expect(isUpdateStagingNameForTest(extendedTargetPath, `gjc.new.${id}.exe`)).toBe(true);
+			expect(isUpdateStagingNameForTest(extendedTargetPath, `gjc.new.${id}`)).toBe(false);
+			expect(isUpdateStagingNameForTest(extendedTargetPath, `other.new.${id}.exe`)).toBe(false);
+
+			expect(isUpdateBackupNameForTest(targetPath, `gjc.bak.${id}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `gjc.exe.bak.${id}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(targetPath, `other.bak.${id}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `other.exe.bak.${id}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc.bak.${id}.exe`)).toBe(false);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `gjc.bak.${id}`)).toBe(false);
+
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-${version}.bak.${timestamp}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `gjc.exe-${version}.bak.${timestamp}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(targetPath, `other-${version}.bak.${timestamp}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-${version}.old.${timestamp}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc.backup.${id}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-not-a-version.bak.${timestamp}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-${version}.bak.${timestamp}!`)).toBe(false);
+
+			const malformedIds = [id.slice(1), id.replaceAll("-", ""), `${id.slice(0, -1)}g`, id.toUpperCase()];
+			for (const malformedId of malformedIds) {
+				expect(isUpdateStagingNameForTest(targetPath, `gjc.new.${malformedId}`)).toBe(false);
+				expect(isUpdateBackupNameForTest(targetPath, `gjc.bak.${malformedId}`)).toBe(false);
+			}
+		}
+	});
+});
+
 describe("update-cli binary update flow", () => {
+	it("keeps the executable extension on a Windows staging path", async () => {
+		const targetPath = path.join(await makeTempDir(), "gjc.exe");
+		let downloadedPath: string | undefined;
+		const flow: BinaryUpdateFlow = {
+			download: async (_url, tempPath) => {
+				downloadedPath = tempPath;
+			},
+			fsync: async () => {},
+			replace: async options => options.verifyInstalledVersion(options.expectedVersion),
+			verifyInstalledVersion: async expected => ({ ok: true, actual: expected, path: targetPath }),
+		};
+
+		await runBinaryUpdateFlow(targetPath, "https://example.test/gjc.exe", "1.2.3", flow);
+
+		expect(downloadedPath).toMatch(/gjc\.new\.[0-9a-f-]+\.exe$/u);
+	});
+
 	it("downloads, fsyncs, then replaces and verifies in that order", async () => {
 		const calls: string[] = [];
 		const targetPath = path.join(await makeTempDir(), "gjc");
@@ -2053,12 +3002,159 @@ describe("update-cli binary update flow", () => {
 		expect(calls.some(call => call.startsWith("removeTemp "))).toBe(false);
 	});
 
+	it("reclaims staging and exact-replace placeholders while retaining only the verified rollback baseline", async () => {
+		const home = await makeTempDir();
+		const bin = path.join(home, ".local", "bin");
+		await fs.mkdir(bin, { recursive: true });
+		const targetPath = path.join(bin, "gjc");
+		const fixture = (version: string) =>
+			`#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'gjc/${version}\\n'; exit 0; fi\nexit 0\n`;
+		await writeFixtureFile(targetPath, fixture("1.0.0"));
+		const oldStagingPath = path.join(bin, "gjc.new.00000000-0000-4000-8000-000000000001");
+		const oldBackupPath = path.join(bin, "gjc.bak.00000000-0000-4000-8000-000000000002");
+		const oldVersionedBackupPath = path.join(bin, "gjc-0.17.1.bak.20260929T123456Z");
+		await writeFixtureFile(oldStagingPath, "partial stage");
+		await writeFixtureFile(oldBackupPath, "unreferenced backup");
+		await writeFixtureFile(oldVersionedBackupPath, "legacy unreferenced backup");
+		const placeholderSeed = path.join(bin, "placeholder-seed");
+		await writeFixtureFile(placeholderSeed, "", 0o600);
+		const placeholderInode = (await fs.stat(placeholderSeed, { bigint: true })).ino.toString(16);
+		const oldPlaceholderPath = path.join(bin, `.gjc-exact-replace-destination-${placeholderInode}-0`);
+		await fs.rename(placeholderSeed, oldPlaceholderPath);
+		const oldTime = new Date(Date.now() - 60 * 60 * 1000);
+		await fs.utimes(oldPlaceholderPath, oldTime, oldTime);
+
+		for (const version of ["1.0.1", "1.0.2"]) {
+			await runBinaryUpdateFlow(targetPath, "unused", version, {
+				download: async (_url, tempPath) => writeFixtureFile(tempPath, fixture(version)),
+				fsync: fsyncFileForTest,
+				replace: replaceBinaryForUpdate,
+				verifyInstalledVersion: async expected => {
+					await smokeTestPinnedCandidate({ version: expected }, targetPath);
+					return { ok: true, actual: expected, path: targetPath };
+				},
+			});
+
+			const activation = await readActivationRecord(targetPath);
+			expect(activation.status).toBe("valid");
+			if (activation.status !== "valid") throw new Error("expected verified activation record");
+			expect(activation.record.phase).toBe("verified");
+			const names = await fs.readdir(bin);
+			expect(names.filter(name => name.startsWith("gjc.new."))).toEqual([]);
+			expect(names.filter(name => name.startsWith(".gjc-exact-replace-destination-"))).toEqual([]);
+			expect(names).not.toContain(path.basename(oldBackupPath));
+			expect(names).not.toContain(path.basename(oldVersionedBackupPath));
+			const backups = names.filter(name => /^gjc\.bak\./u.test(name));
+			expect(backups).toEqual([activation.record.backupName]);
+			expect(await Bun.file(path.join(bin, activation.record.backupName)).exists()).toBe(true);
+		}
+	});
+
+	it("preserves a journal-owned stage when a denied promotion remains pending", async () => {
+		const home = await makeTempDir();
+		const bin = path.join(home, ".local", "bin");
+		await fs.mkdir(bin, { recursive: true });
+		const targetPath = path.join(bin, "gjc.exe");
+		const fixture = (version: string) =>
+			`#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'gjc/${version}\\n'; exit 0; fi\nexit 0\n`;
+		await writeFixtureFile(targetPath, fixture("1.0.0"));
+		await writeFixtureFile(path.join(bin, "gjc.exe.bak.00000000-0000-4000-8000-000000000003"), "old backup");
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation(() => {
+			return { ok: false, code: "access_denied", windowsErrorCode: "0xC0000022" };
+		});
+		try {
+			await expect(
+				runBinaryUpdateFlow(targetPath, "unused", "1.0.1", {
+					download: async (_url, tempPath) => writeFixtureFile(tempPath, fixture("1.0.1")),
+					fsync: fsyncFileForTest,
+					replace: replaceBinaryForUpdate,
+					verifyInstalledVersion: async expected => ({ ok: true, actual: expected, path: targetPath }),
+				}),
+			).rejects.toThrow("access_denied");
+
+			const activation = await readActivationRecord(targetPath);
+			expect(activation.status).toBe("valid");
+			if (activation.status !== "valid") throw new Error("expected pending activation record");
+			expect(activation.record.phase).toBe("pending_activation");
+			expect(await Bun.file(activation.record.stagingPath).exists()).toBe(true);
+			expect((await fs.readdir(bin)).filter(name => name.startsWith("gjc.exe.bak."))).toEqual([]);
+			expect(replaceSpy).toHaveBeenCalled();
+		} finally {
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it("preserves a retry candidate when activation-record repointing fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+		await fs.unlink(recordedStage);
+
+		const recordSpy = vi.spyOn(installActivation, "updateActivationRecordFile").mockImplementation(async () => {
+			throw new Error("activation_record_compare_and_swap_failed");
+		});
+		try {
+			let failure: unknown;
+			let downloadedStage: string | undefined;
+			try {
+				await runBinaryUpdateFlow(targetPath, "unused", "15.1.8", {
+					download: async (_url, tempPath) => {
+						downloadedStage = tempPath;
+						await writeFixtureFile(tempPath, "new binary");
+					},
+					fsync: fsyncFileForTest,
+					replace: options => replaceBinaryForUpdate({ ...options, verifyStagedVersion: async () => {} }),
+					verifyInstalledVersion: async expected => ({ ok: true, actual: expected, path: targetPath }),
+				});
+			} catch (error) {
+				failure = error;
+			}
+
+			expect(failure).toBeInstanceOf(ActivationRetryCandidateRepointError);
+			if (!(failure instanceof ActivationRetryCandidateRepointError)) {
+				throw new Error("expected activation retry candidate repoint error");
+			}
+			if (!downloadedStage) throw new Error("expected a downloaded retry candidate");
+			expect(failure.candidatePath).toBe(downloadedStage);
+			expect(await Bun.file(failure.candidatePath).text()).toBe("new binary");
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			const pending = await readActivationRecord(targetPath);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") {
+				expect(pending.record.phase).toBe("pending_activation");
+				expect(pending.record.stagingPath).toBe(recordedStage);
+			}
+		} finally {
+			recordSpy.mockRestore();
+		}
+	});
+
 	it("aborts before replacement/verification when fsync fails", async () => {
 		const calls: string[] = [];
 		const targetPath = path.join(await makeTempDir(), "gjc");
+		let stagingPath: string | undefined;
 		const flow: BinaryUpdateFlow = {
 			download: async (_url, tempPath) => {
+				stagingPath = tempPath;
 				calls.push(`download ${tempPath}`);
+				await writeFixtureFile(tempPath, "partial candidate");
 			},
 			fsync: async () => {
 				calls.push("fsync");
@@ -2083,6 +3179,8 @@ describe("update-cli binary update flow", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls).not.toContain("replace");
 		expect(calls).not.toContain("verify");
+		expect(stagingPath).toBeDefined();
+		expect(await Bun.file(stagingPath!).exists()).toBe(false);
 	});
 });
 

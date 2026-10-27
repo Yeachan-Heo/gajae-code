@@ -58,6 +58,7 @@ function makeToolSession(tempDir: string, settings: Settings): ToolSession {
 		getArtifactsDir: () => artifacts.dir,
 		getArtifactManager: () => artifacts,
 		allocateOutputArtifact: (toolType: string) => artifacts.allocatePath(toolType),
+		captureArtifactPublication: () => (content: string, toolType: string) => artifacts.save(content, toolType),
 	} as unknown as ToolSession;
 }
 
@@ -105,7 +106,7 @@ describe("bash resource lifecycle red-team", () => {
 			expect(manager.getJob(monitor.jobId)?.status).toBe("completed");
 			expect(getShellSessionCount()).toBe(baseline);
 		}
-	});
+	}, 30_000);
 
 	// U6 owns the JS-layer lifecycle contract: cancelled persistent shell sessions
 	// remain reachable to disposeAllShellSessions during bounded native cleanup,

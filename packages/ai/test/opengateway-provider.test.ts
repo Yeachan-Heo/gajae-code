@@ -74,6 +74,43 @@ describe("opengateway provider support", () => {
 		expect(gpt?.provider).toBe("opengateway");
 	});
 
+	test("takes capabilities from the upstream model, including -ultrafast deployments", async () => {
+		global.fetch = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({
+						object: "list",
+						data: [
+							{ id: "deepseek/deepseek-v4.1-flash-ultrafast", object: "model", context_window: 1_000_000 },
+							{ id: "deepseek/deepseek-v4.1-flash", object: "model" },
+							{ id: "z-ai/glm-5.3-ultrafast", object: "model", max_output_tokens: 131_072 },
+							{ id: "acme/unknown-model-ultrafast", object: "model" },
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		const models = await opengatewayModelManagerOptions({ apiKey: "opengateway-test-key" }).fetchDynamicModels?.();
+		const byId = new Map(models?.map(model => [model.id, model]));
+
+		const ultrafast = byId.get("deepseek/deepseek-v4.1-flash-ultrafast");
+		expect(ultrafast?.reasoning).toBe(true);
+		expect(ultrafast?.thinking).toBeDefined();
+		expect(ultrafast?.contextWindow).toBe(1_000_000);
+		expect(ultrafast?.provider).toBe("opengateway");
+		expect(ultrafast?.baseUrl).toBe("https://apis.opengateway.ai/v1");
+		expect(byId.get("deepseek/deepseek-v4.1-flash")?.reasoning).toBe(true);
+
+		const glm = byId.get("z-ai/glm-5.3-ultrafast");
+		expect(glm?.reasoning).toBe(true);
+		expect(glm?.maxTokens).toBe(131_072);
+		expect(glm?.provider).toBe("opengateway");
+
+		// No bundled upstream: stays conservative instead of guessing a capability.
+		expect(byId.get("acme/unknown-model-ultrafast")?.reasoning).toBe(false);
+	});
+
 	test("skips dynamic discovery without an API key", () => {
 		const options = opengatewayModelManagerOptions();
 		expect(options.providerId).toBe("opengateway");

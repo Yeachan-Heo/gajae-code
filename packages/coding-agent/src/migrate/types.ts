@@ -1,8 +1,8 @@
 /**
  * Shared types for `gjc migrate`.
  *
- * Imports MCP servers and skills from other coding agents (Claude Code, Codex,
- * OpenCode) into native GJC config. See the consensus plan under
+ * Imports MCP servers, skills, slash commands, and instruction files from other coding agents
+ * (Claude Code, Codex, OpenCode) into native GJC config. See the consensus plan under
  * `.gjc/plans/ralplan/` for the full taxonomy and force/collision semantics.
  */
 import type { MCPServerConfig } from "../runtime-mcp/types";
@@ -16,7 +16,7 @@ export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex"
 export const CANONICAL_SOURCE_ORDER: readonly MigrateSource[] = MIGRATE_SOURCES;
 
 /** What kind of thing an action/coverage row is about. */
-export type MigrateItemType = "mcp" | "skill" | "source";
+export type MigrateItemType = "mcp" | "skill" | "command" | "agent" | "hook" | "instruction" | "source";
 
 /**
  * Per-item outcome taxonomy.
@@ -77,6 +77,31 @@ export interface SkillCandidate {
 	warnings: string[];
 }
 
+/** An instructions file imported as the active GJC AGENTS.md for its scope. */
+export interface InstructionCandidate {
+	source: MigrateSource;
+	name: string;
+	content: string;
+}
+
+/** A Markdown subagent collected from a foreign coding-agent setup. */
+export interface AgentCandidate {
+	source: MigrateSource;
+	/** Agent name exactly as it will be loaded from `<agentsDir>/<name>.md`. */
+	name: string;
+	/** Full Markdown content with normalized GJC frontmatter. */
+	content: string;
+	warnings: string[];
+}
+
+/** A Markdown slash command collected from a foreign coding-agent setup. */
+export interface SlashCommandCandidate {
+	source: MigrateSource;
+	/** Name without the leading slash; nested path components use `:`. */
+	name: string;
+	content: string;
+}
+
 /**
  * Source-level diagnostic for a single source/type pair (e.g. "codex mcp config
  * was malformed"). Distinct from per-item actions so absent/unreadable sources
@@ -89,11 +114,48 @@ export interface SourceDiagnostic {
 	message: string;
 }
 
+/**
+ * A foreign hook command that maps onto a gjc hook event.
+ *
+ * Claude Code hooks are shell commands that receive a JSON payload on stdin and
+ * signal a block with exit code 2; gjc hooks are TypeScript modules. The
+ * importer generates a module that reproduces that contract for the events whose
+ * semantics are unambiguous.
+ */
+export interface HookCandidate {
+	source: MigrateSource;
+	/** Foreign event name, e.g. `PreToolUse`. */
+	event: string;
+	/** Tool-name matcher; empty or absent means every tool. */
+	matcher?: string;
+	/** Shell command exactly as the source declared it. */
+	command: string;
+}
+
+/**
+ * A source setting the migration cannot express in gjc. Reported instead of
+ * guessed at: silently translating an approval or hook policy would change what
+ * the agent is allowed to do. Secret values are never read, so detail may name
+ * keys but never their contents.
+ */
+export interface ManualAction {
+	source: MigrateSource;
+	/** Setting area, e.g. `hooks`, `settings.model`, `env`. */
+	area: string;
+	/** One-line instruction naming the concrete follow-up. */
+	detail: string;
+}
+
 /** Normalized candidates + diagnostics returned by an adapter. */
 export interface AdapterResult {
 	mcpCandidates: McpCandidate[];
 	skillCandidates: SkillCandidate[];
+	slashCommandCandidates: SlashCommandCandidate[];
+	agentCandidates: AgentCandidate[];
+	hookCandidates: HookCandidate[];
+	instructionCandidates: InstructionCandidate[];
 	diagnostics: SourceDiagnostic[];
+	manualActions: ManualAction[];
 }
 
 /** A single planned action consumed identically by dry-run and live execution. */
@@ -112,6 +174,10 @@ export interface MigrateAction {
 	/** Resolved payload the executor needs; never serialized to the report. */
 	mcp?: { config: MCPServerConfig; force: boolean };
 	skill?: { content: string };
+	command?: { content: string };
+	agent?: { content: string };
+	hook?: { content: string };
+	instruction?: { content: string };
 }
 
 export interface MigrateWarning {
@@ -126,6 +192,11 @@ export type StatusCounts = Record<MigrationStatus, number>;
 export interface MigrateDestinations {
 	mcpConfigPath: string;
 	skillsDir: string;
+	commandsDir: string;
+	agentsDir: string;
+	/** Directory that receives generated hook modules. */
+	hooksDir: string;
+	instructionsPath: string;
 }
 
 /** The full machine-readable report emitted with `--json`. */
@@ -138,7 +209,15 @@ export interface MigrateReport {
 	destinations: MigrateDestinations;
 	summary: {
 		total: StatusCounts;
-		byType: { mcp: StatusCounts; skill: StatusCounts; source: StatusCounts };
+		byType: {
+			mcp: StatusCounts;
+			skill: StatusCounts;
+			command: StatusCounts;
+			agent: StatusCounts;
+			hook: StatusCounts;
+			instruction: StatusCounts;
+			source: StatusCounts;
+		};
 		bySource: Record<MigrateSource, StatusCounts>;
 	};
 	actions: Array<{
@@ -153,6 +232,7 @@ export interface MigrateReport {
 		warnings?: string[];
 	}>;
 	warnings: MigrateWarning[];
+	manualActions: ManualAction[];
 }
 
 /** Create a zeroed status-count record. */

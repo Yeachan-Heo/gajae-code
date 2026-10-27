@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SdkClient } from "../client/client";
+import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
 import { SessionSdkSessionRuntime, type SessionSdkTransport } from "./session-runtime";
 import { createSdkWebSocketTransport, type SdkWebSocketTransportDependencies } from "./websocket-transport";
 
@@ -26,6 +27,28 @@ async function probeWebSocketEndpoint(url: string, token: string): Promise<void>
 		});
 	} finally {
 		socket.close();
+	}
+}
+
+async function waitForFrame(
+	frames: readonly Record<string, unknown>[],
+	predicate: (frame: Record<string, unknown>) => boolean,
+	label: string,
+): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + 5_000;
+	while (true) {
+		const frame = frames.find(predicate);
+		if (frame) return frame;
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(5);
+	}
+}
+
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(5);
 	}
 }
 
@@ -193,7 +216,72 @@ describe("SDK WebSocket transport lifecycle", () => {
 			await fs.rm(stateRoot, { recursive: true, force: true });
 		}
 	});
-	test("event replay capability claims cannot authorize gated replay", async () => {
+	test("loopback replay preserves replay-first, split, and subset capability negotiation", async () => {
+		const stateRoot = await tempStateRoot();
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "loopback-split-capabilities",
+			stateRoot,
+			token: "token",
+		});
+		const runtime = new SessionSdkSessionRuntime({ transport });
+		const frames: Record<string, unknown>[] = [];
+		let socket: WebSocket | undefined;
+		const required = [TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY];
+		try {
+			const endpoint = await runtime.start();
+			socket = new WebSocket(`${endpoint.url}?token=token`);
+			socket.addEventListener("message", event => {
+				frames.push(JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>);
+			});
+			await waitForFrame(frames, frame => frame.type === "hello", "server hello");
+			socket.send(
+				JSON.stringify({
+					type: "event_replay",
+					id: "replay-before-hello",
+					sinceSeq: 0,
+					capabilities: [],
+				}),
+			);
+			await waitForFrame(
+				frames,
+				frame => frame.type === "event_replay_result" && frame.id === "replay-before-hello",
+				"replay before hello",
+			);
+			socket.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [TURN_STREAM_CAPABILITY] }));
+			await waitFor(
+				() => runtime.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]).length === 1,
+				"hello after replay",
+			);
+
+			const replayIds = ["observer-addition", "observer-subset", "observer-empty"];
+			for (const [index, capabilities] of [
+				[SESSION_HOST_OBSERVER_CAPABILITY],
+				[SESSION_HOST_OBSERVER_CAPABILITY],
+				[],
+			].entries()) {
+				const id = replayIds[index]!;
+				socket.send(JSON.stringify({ type: "event_replay", id, sinceSeq: 0, capabilities }));
+				await waitForFrame(frames, frame => frame.type === "event_replay_result" && frame.id === id, id);
+				expect(runtime.connectionIdsWithCapabilities(required)).toHaveLength(1);
+			}
+
+			runtime.sendFrameToCapabilities(required, {
+				type: "event",
+				kind: "tool_activity",
+				payload: { phase: "started" },
+			});
+			await waitForFrame(
+				frames,
+				frame => frame.type === "event" && frame.kind === "tool_activity",
+				"live observer event",
+			);
+		} finally {
+			socket?.close();
+			await runtime.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+	test("event replay keeps tool activity gated without tool_activity_v2", async () => {
 		const stateRoot = await tempStateRoot();
 		const transport = await createSdkWebSocketTransport({
 			sessionId: "replay-capability-claim",
@@ -223,7 +311,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 					id: "forged-capability-claim",
 					sinceGeneration: 1,
 					sinceSeq: 0,
-					capabilities: ["tool_activity_v2"],
+					capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
 				}),
 			);
 			const frame = await replay;

@@ -128,9 +128,20 @@ describe("web search CLI settings", () => {
 			overrides: { "web_search.provider": "insane" },
 		});
 
-		vi.spyOn(globalThis, "fetch").mockImplementation((async input => {
+		// Mock fetch to handle wire requests: IP-based URLs with Host header.
+		// guardedPublicFetch resolves www.reddit.com to an IP, sets Host header to www.reddit.com,
+		// then calls fetch(wireUrl, {headers: {Host: "www.reddit.com", ...}}).
+		// The test isolates DNS by mocking fetch to match wire URL + Host header pattern.
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input, init) => {
 			const url = input.toString();
-			if (url === "https://www.reddit.com/r/test/.rss") {
+			const headers =
+				init?.headers instanceof Headers
+					? Object.fromEntries(init.headers)
+					: (init?.headers as Record<string, string>) || {};
+			const hostHeader = (headers as Record<string, string>).Host || (headers as Record<string, string>).host || "";
+
+			// Match wire request: www.reddit.com Host header + /r/test path
+			if (hostHeader === "www.reddit.com" && url.includes("/r/test")) {
 				return new Response(
 					`<?xml version="1.0"?><feed><entry><title>Alias Provider</title><link href="https://www.reddit.com/r/test/comments/1"/><content>via alias</content></entry></feed>`,
 					{ status: 200 },
@@ -138,6 +149,7 @@ describe("web search CLI settings", () => {
 			}
 			return new Response("", { status: 404 });
 		}) as typeof fetch);
+
 		let output = "";
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			output += String(chunk);
@@ -149,4 +161,31 @@ describe("web search CLI settings", () => {
 		expect(Bun.stripANSI(output)).toContain("Provider: Insane");
 		expect(Bun.stripANSI(output)).toContain("Alias Provider");
 	});
+});
+
+describe("web search CLI --limit", () => {
+	it("leaves non-digit --limit values as NaN instead of keeping the leading digits", () => {
+		expect(parseSearchArgs(["q", "--limit=5x"])?.limit).toBeNaN();
+		expect(parseSearchArgs(["q", "-l", "2.5"])?.limit).toBeNaN();
+		expect(parseSearchArgs(["q", "--limit", "5"])?.limit).toBe(5);
+	});
+
+	for (const limit of [0, -3, 2.5, Number.NaN]) {
+		it(`rejects --limit ${limit} before searching`, async () => {
+			const fetchSpy = vi.spyOn(globalThis, "fetch");
+			let stderr = "";
+			vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+				stderr += String(chunk);
+				return true;
+			});
+			vi.spyOn(process, "exit").mockImplementation(code => {
+				throw new Error(`exit ${code}`);
+			});
+
+			await expect(runSearchCommand({ query: "q", limit, expanded: false })).rejects.toThrow("exit 1");
+
+			expect(Bun.stripANSI(stderr)).toContain("--limit must be a positive integer");
+			expect(fetchSpy).not.toHaveBeenCalled();
+		});
+	}
 });

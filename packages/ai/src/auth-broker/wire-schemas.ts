@@ -45,6 +45,8 @@ export const oauthCredentialSchema = z
 		projectId: z.string().optional(),
 		email: z.string().optional(),
 		accountId: z.string().optional(),
+		organizationId: z.string().optional(),
+		organizationName: z.string().optional(),
 		mcpBinding: mcpOAuthBindingSchema.optional(),
 	})
 	.strict();
@@ -203,6 +205,7 @@ export const credentialRefreshRequestSchema = z
 	.object({
 		clientId: z.string().optional(),
 		clientSecret: z.string().optional(),
+		expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 	})
 	.strict();
 

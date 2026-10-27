@@ -19,14 +19,14 @@ describe("openai-codex user agent", () => {
 	it("removes non-ASCII kernel release characters before constructing the header", () => {
 		const userAgent = formatCodexUserAgent("linux", "4.4.302-Minimal™-EAS-QTI_Haptic-R26", "arm64");
 
-		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(userAgent).toMatch(/^codex_cli_rs\/[^ ]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
 		expect(() => new Headers({ "User-Agent": userAgent })).not.toThrow();
 	});
 
 	it("removes control characters from dynamic platform values", () => {
 		const userAgent = formatCodexUserAgent("linux\n", "6.8.0\t-generic", "arm64\r");
 
-		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
+		expect(userAgent).toMatch(/^codex_cli_rs\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
 	});
 });
 
@@ -58,6 +58,7 @@ describe("openai-codex tool schemas", () => {
 			name: "list_outgoing_messages",
 			description: "List outgoing messages",
 			parameters: { type: "object", properties: {} },
+			strict: false,
 		});
 	});
 });
@@ -134,8 +135,13 @@ describe("openai-codex request transformer", () => {
 		expect(first?.role).toBe("developer");
 		expect(first?.content).toEqual([{ type: "input_text", text: `${DEFAULT_PROMPT_PREFIX}...` }]);
 
-		const orphaned = input.find(item => item.type === "message" && item.role === "assistant");
-		expect(orphaned?.content).toMatch(/Previous tool result/);
+		const orphaned = input.find(
+			item =>
+				item.type === "message" && typeof item.content === "string" && item.content.includes("<untrusted-content"),
+		);
+		expect(orphaned?.role).toBe("user");
+		expect(String(orphaned?.content)).toContain("\nresult\n");
+		expect(String(orphaned?.content)).toContain('tool="tool"');
 	});
 
 	it("normalizes object-valued text parts before provider send", async () => {

@@ -121,6 +121,25 @@ describe("splitInternalUrlSel", () => {
 		});
 	});
 
+	it("splits selectors from skill relative paths", () => {
+		expect(splitInternalUrlSel("skill://foo/docs/reference.md:10-20")).toEqual({
+			path: "skill://foo/docs/reference.md",
+			sel: "10-20",
+		});
+		expect(splitInternalUrlSel("skill://foo/docs/reference.md:10-20?view=full#examples")).toEqual({
+			path: "skill://foo/docs/reference.md?view=full#examples",
+			sel: "10-20",
+		});
+		expect(
+			splitInternalUrlSel("skill://namespace:foo/docs/reference.md:10-20", {
+				activeSkillNames: ["namespace:foo"],
+			}),
+		).toEqual({
+			path: "skill://namespace:foo/docs/reference.md",
+			sel: "10-20",
+		});
+	});
+
 	it("leaves non-URL and unknown-scheme strings alone", () => {
 		expect(splitInternalUrlSel("/abs/path:1-50")).toEqual({ path: "/abs/path:1-50" });
 		expect(splitInternalUrlSel("agent://1-50")).toEqual({ path: "agent://1-50" });

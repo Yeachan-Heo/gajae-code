@@ -3,6 +3,7 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	ffi::{OsStr, OsString},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
@@ -21,6 +22,174 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::task;
+
+#[cfg(any(windows, test))]
+#[repr(align(4))]
+struct WindowsSid([u8; 16]);
+
+#[cfg(any(windows, test))]
+const WINDOWS_BUILTIN_ADMINISTRATORS_SID: WindowsSid = WindowsSid([
+	0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+]);
+
+/// Windows may create a managed root while elevated, leaving it owned by the
+/// built-in Administrators group. The DACL is validated separately before use.
+#[cfg(any(windows, test))]
+fn is_trusted_windows_owner_sid(
+	mut owner_matches_sid: impl FnMut(&[u8]) -> bool,
+	current_user_sid: &[u8],
+) -> bool {
+	owner_matches_sid(current_user_sid)
+		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice())
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_LOCAL_SYSTEM_SID: WindowsSid = WindowsSid([
+	0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+/// Access bits that let a principal change an executable's bytes, metadata, or
+/// security. `SYNCHRONIZE`, `READ_CONTROL`, and the read/execute bits are
+/// deliberately absent: deriving this mask from `FILE_ALL_ACCESS` (which
+/// carries `SYNCHRONIZE`) made every ordinary `(RX)` ACE look write-capable
+/// (#6096). Generic bits are listed explicitly because an ACE may store them
+/// unmapped.
+#[cfg(any(windows, test))]
+const EXECUTABLE_WRITE_CAPABLE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA
+	| 0x0000_0004 // FILE_APPEND_DATA
+	| 0x0000_0010 // FILE_WRITE_EA
+	| 0x0000_0040 // FILE_DELETE_CHILD
+	| 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+	| 0x0001_0000 // DELETE
+	| 0x0004_0000 // WRITE_DAC
+	| 0x0008_0000 // WRITE_OWNER
+	| 0x0200_0000 // MAXIMUM_ALLOWED
+	| 0x1000_0000 // GENERIC_ALL
+	| 0x4000_0000; // GENERIC_WRITE
+
+/// Whether an ACCESS_ALLOWED ACE for `ace_sid` is acceptable on an executable
+/// the updater will publish or retire. Read/execute grants are acceptable for
+/// any principal. Write-capable grants are acceptable only for principals that
+/// already hold full authority over the user's profile: the current user, the
+/// built-in Administrators group, and LocalSystem — exactly what a default
+/// `%LOCALAPPDATA%` DACL inherits. Any other write grant (Users, Authenticated
+/// Users, Everyone, a sandbox capability SID, …) is a shared-write exposure.
+#[cfg(any(windows, test))]
+fn executable_ace_is_safe(
+	mask: u32,
+	mut ace_matches_sid: impl FnMut(&[u8]) -> bool,
+	current_user_sid: &[u8],
+) -> bool {
+	mask & EXECUTABLE_WRITE_CAPABLE_MASK == 0
+		|| is_trusted_windows_owner_sid(&mut ace_matches_sid, current_user_sid)
+		|| ace_matches_sid(WINDOWS_LOCAL_SYSTEM_SID.0.as_slice())
+}
+
+#[cfg(test)]
+mod windows_executable_ace_tests {
+	use super::{
+		WINDOWS_BUILTIN_ADMINISTRATORS_SID, WINDOWS_LOCAL_SYSTEM_SID, executable_ace_is_safe,
+	};
+
+	const CURRENT_USER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00];
+	// S-1-5-32-545 BUILTIN\Users and S-1-1-0 Everyone.
+	const USERS_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x21, 0x02, 0x00,
+		0x00,
+	];
+	const EVERYONE_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+
+	const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+	// What icacls prints as (RX): FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
+	const READ_EXECUTE: u32 = 0x0012_00a9;
+	const MODIFY: u32 = 0x0013_01bf;
+	const GENERIC_READ_EXECUTE: u32 = 0x8000_0000 | 0x2000_0000;
+	const GENERIC_WRITE: u32 = 0x4000_0000;
+	const GENERIC_ALL: u32 = 0x1000_0000;
+
+	fn safe_for(mask: u32, ace_sid: &[u8]) -> bool {
+		executable_ace_is_safe(mask, |trusted| trusted == ace_sid, &CURRENT_USER_SID)
+	}
+
+	#[test]
+	fn read_execute_grants_are_safe_for_any_principal() {
+		// #6096: SYNCHRONIZE inside (RX) must not make a read-only ACE write-capable.
+		for sid in [USERS_SID.as_slice(), EVERYONE_SID.as_slice()] {
+			assert!(safe_for(READ_EXECUTE, sid));
+			assert!(safe_for(GENERIC_READ_EXECUTE, sid));
+			assert!(safe_for(0x0010_0000, sid), "SYNCHRONIZE alone is not a write grant");
+			assert!(safe_for(0x0002_0000, sid), "READ_CONTROL alone is not a write grant");
+		}
+	}
+
+	#[test]
+	fn default_profile_full_control_principals_are_trusted() {
+		// A default %LOCALAPPDATA% DACL inherits SYSTEM:(F) and Administrators:(F).
+		for sid in [
+			CURRENT_USER_SID.as_slice(),
+			WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice(),
+			WINDOWS_LOCAL_SYSTEM_SID.0.as_slice(),
+		] {
+			assert!(safe_for(FILE_ALL_ACCESS, sid));
+			assert!(safe_for(GENERIC_ALL, sid));
+		}
+	}
+
+	#[test]
+	fn write_grants_to_other_principals_stay_refused() {
+		for mask in [
+			FILE_ALL_ACCESS,
+			MODIFY,
+			GENERIC_WRITE,
+			GENERIC_ALL,
+			0x0000_0002, // FILE_WRITE_DATA
+			0x0000_0004, // FILE_APPEND_DATA
+			0x0000_0010, // FILE_WRITE_EA
+			0x0000_0100, // FILE_WRITE_ATTRIBUTES
+			0x0001_0000, // DELETE
+			0x0004_0000, // WRITE_DAC
+			0x0008_0000, // WRITE_OWNER
+			READ_EXECUTE | 0x0000_0002,
+		] {
+			assert!(!safe_for(mask, &USERS_SID), "0x{mask:08X} for Users must be refused");
+			assert!(!safe_for(mask, &EVERYONE_SID), "0x{mask:08X} for Everyone must be refused");
+		}
+	}
+}
+
+#[cfg(test)]
+mod windows_owner_sid_tests {
+	use super::{WINDOWS_BUILTIN_ADMINISTRATORS_SID, is_trusted_windows_owner_sid};
+
+	const CURRENT_USER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00];
+	const UNTRUSTED_OWNER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x16, 0x00, 0x00, 0x00];
+	const BUILTIN_ADMINISTRATORS_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00,
+		0x00,
+	];
+	const NEARBY_UNTRUSTED_GROUP_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x30, 0x02, 0x00,
+		0x00,
+	];
+
+	fn is_trusted_owner(owner_sid: &[u8]) -> bool {
+		is_trusted_windows_owner_sid(|trusted_sid| trusted_sid == owner_sid, &CURRENT_USER_SID)
+	}
+
+	#[test]
+	fn accepts_current_user_and_builtin_administrators_but_rejects_other_owners() {
+		assert_eq!(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0, BUILTIN_ADMINISTRATORS_SID,);
+		assert!(is_trusted_owner(&CURRENT_USER_SID));
+		assert!(is_trusted_owner(&BUILTIN_ADMINISTRATORS_SID));
+		assert!(!is_trusted_owner(&UNTRUSTED_OWNER_SID));
+		assert!(!is_trusted_owner(&NEARBY_UNTRUSTED_GROUP_SID));
+	}
+}
+
 /// Classification of a read-only retained-publication observation.
 #[napi(object)]
 pub struct NativeBrokerPublicationObservation {
@@ -425,45 +594,50 @@ pub struct NativePermissionRepairResult {
 
 #[napi(object)]
 pub struct NativeExactFileIdentity {
-	pub dev:             BigInt,
-	pub ino:             BigInt,
-	pub nlink:           Option<BigInt>,
-	pub parent_dev:      Option<BigInt>,
-	pub parent_ino:      Option<BigInt>,
-	pub size:            BigInt,
-	pub mtime_ns:        BigInt,
+	pub dev:               BigInt,
+	pub ino:               BigInt,
+	pub nlink:             Option<BigInt>,
+	pub parent_dev:        Option<BigInt>,
+	pub parent_ino:        Option<BigInt>,
+	pub size:              BigInt,
+	pub mtime_ns:          BigInt,
 	/// When true, atomically detach a directory rather than deleting a regular
 	/// file.
-	pub directory:       Option<bool>,
+	pub directory:         Option<bool>,
 	/// Keep a regular file in quarantine after its identity has been verified
 	/// instead of unlinking it. This makes cross-device retirement recoverable.
-	pub detach_only:     Option<bool>,
+	pub detach_only:       Option<bool>,
 	/// A caller-persisted, single-component no-replace quarantine destination.
 	/// Required for every exact deletion so authority survives a post-detach
 	/// crash.
-	pub quarantine_name: Option<String>,
+	pub quarantine_name:   Option<String>,
 	/// SHA-256 of regular-file bytes. Required for regular-file deletion and
 	/// verified from the detached object before unlinking it.
-	pub sha256:          Option<String>,
+	pub sha256:            Option<String>,
 	/// Permit removing exactly this authorized pathname when the inode has other
 	/// hard links. Remaining links are retained after exact quarantine cleanup.
-	pub allow_hard_link: Option<bool>,
+	pub allow_hard_link:   Option<bool>,
+	/// Require the authorized regular file to retain at least two hard links at
+	/// every identity check. This is used by cleanup paths that remove only a
+	/// surplus alias while preserving the live transcript link.
+	pub require_hard_link: Option<bool>,
 }
 
 #[derive(Clone)]
 struct ExactFileIdentity {
-	dev:             u64,
-	ino:             u64,
-	nlink:           Option<u64>,
-	parent_dev:      Option<u64>,
-	parent_ino:      Option<u64>,
-	size:            u64,
-	mtime_ns:        i64,
-	directory:       bool,
-	detach_only:     bool,
-	quarantine_name: Option<String>,
-	sha256:          Option<[u8; 32]>,
-	allow_hard_link: bool,
+	dev:               u64,
+	ino:               u64,
+	nlink:             Option<u64>,
+	parent_dev:        Option<u64>,
+	parent_ino:        Option<u64>,
+	size:              u64,
+	mtime_ns:          i64,
+	directory:         bool,
+	detach_only:       bool,
+	quarantine_name:   Option<String>,
+	sha256:            Option<[u8; 32]>,
+	allow_hard_link:   bool,
+	require_hard_link: bool,
 }
 /// Typed result of an identity-bound regular-file deletion or directory detach.
 #[napi(object)]
@@ -540,6 +714,9 @@ impl NativeNoReplaceResult {
 				Some("atomic_unavailable") => ("not_committed", "not_attempted", "atomic_unavailable"),
 				Some("cross_device") => ("not_committed", "not_attempted", "cross_device"),
 				Some("permission_denied") => ("not_committed", "not_attempted", "permission_denied"),
+				// Windows can reject NtSetInformationFile before any rename occurs
+				// because an open child handle does not permit delete sharing.
+				Some("access_denied") => ("not_committed", "not_attempted", "access_denied"),
 				Some("not_found" | "invalid_request") => {
 					("not_committed", "not_attempted", "invalid_request")
 				},
@@ -554,6 +731,10 @@ impl NativeNoReplaceResult {
 				// filesystem: rename()/renameat2()/renameatx_np() are not partially
 				// observable on EINTR for local filesystems, unlike e.g. close().
 				Some("interrupted") => ("not_committed", "not_attempted", "interrupted"),
+				// Windows reports STATUS_SHARING_VIOLATION before a no-replace
+				// rename commits its namespace change. The caller may safely retry
+				// the same staged source while the conflicting handle drains.
+				Some("sharing_violation") => ("not_committed", "not_attempted", "sharing_violation"),
 				// Unclassified failures leave the syscall's namespace effect
 				// ambiguous. Never authorize staging cleanup from them.
 				_ => ("unknown", "not_provable", "unknown"),
@@ -597,6 +778,23 @@ impl NativeNoReplaceResult {
 				sync_failures:    None,
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod no_replace_access_denied_tests {
+	use super::{NativeExactUnlinkResult, NativeNoReplaceResult};
+
+	#[test]
+	fn access_denied_rename_is_reported_as_pre_mutation() {
+		let result =
+			NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure("access_denied"));
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("access_denied"));
+		assert_eq!(result.mutation_state, "not_committed");
+		assert_eq!(result.durability_state, "not_attempted");
+		assert_eq!(result.reason, "access_denied");
+		assert_eq!(result.phase, "rename");
 	}
 }
 
@@ -869,7 +1067,7 @@ impl NativeExactUnlinkResult {
 }
 
 #[cfg(any(windows, test))]
-/// STATUS_SHARING_VIOLATION: a concurrent handle denies the share mode this
+/// `STATUS_SHARING_VIOLATION`: a concurrent handle denies the share mode this
 /// open requested. This is the Windows transient conflict issue #4330 exists
 /// for: another holder without delete sharing makes the exact-replace
 /// destination `NtCreateFile` fail before any namespace mutation, and the
@@ -878,50 +1076,143 @@ impl NativeExactUnlinkResult {
 const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 
 #[cfg(any(windows, test))]
+/// `STATUS_ACCESS_DENIED`, kept distinct from owner-identity failures because
+/// Windows replacement opens and renames can fail before mutation while a
+/// handle denies the requested sharing or delete access.
+const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
+
+#[cfg(any(windows, test))]
+const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_PATH_NOT_FOUND: u32 = 3;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_ACCESS_DENIED: u32 = 5;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_SHARING_VIOLATION: u32 = 32;
+
+#[cfg(any(windows, test))]
+fn windows_error_code(error: u32) -> &'static str {
+	match error {
+		WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND => "not_found",
+		WIN32_ERROR_ACCESS_DENIED => "access_denied",
+		WIN32_ERROR_SHARING_VIOLATION => "sharing_violation",
+		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
+fn ntstatus_code(status: i32) -> &'static str {
+	match status as u32 {
+		0xc000_0034 | 0xc000_003a => "not_found",
+		0xc000_0035 => "quarantine_collision",
+		0xc000_0043 => "sharing_violation",
+		0xc000_0022 => "owner_mismatch",
+		0xc000_050b => "reparse_point",
+		0xc000_00d4 => "atomic_unavailable",
+		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
+fn publication_rename_error_code(code: &'static str) -> &'static str {
+	match code {
+		// Preserve the existing owner-only security contract everywhere else. A
+		// denied Windows publication syscall is not an owner-identity failure.
+		"owner_mismatch" => "access_denied",
+		other => other,
+	}
+}
+
+#[cfg(any(windows, test))]
+fn retained_replace_error_code(status: i32) -> &'static str {
+	publication_rename_error_code(ntstatus_code(status))
+}
+
+#[cfg(any(windows, test))]
+/// Publication code for a held-path open that already mapped its NTSTATUS
+/// through [`ntstatus_code`]. Exact-replace and no-replace publication open the
+/// staged source and the destination (or its parent) before any rename, so a
+/// denied open is a pre-mutation publication failure, not an owner-identity
+/// one (#6760). Left as `owner_mismatch`, a no-replace file-lock publication
+/// was reported as an unclassified, possibly committed outcome.
+fn exact_replace_open_error_code(code: Option<&str>) -> &str {
+	match code {
+		Some("owner_mismatch") => "access_denied",
+		Some(code) => code,
+		None => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
 /// True only for pre-mutation Windows failures that are transient and safe to
-/// retry at the exact-replace destination open. Sharing violations happen
-/// before anything was renamed or unlinked, so retrying cannot publish twice;
-/// permission, path, disk-full, and identity failures are never retried.
+/// retry at the exact-replace destination open. Sharing violations and access
+/// denials are raised by the open itself, before anything was renamed or
+/// unlinked, so a bounded retry cannot publish twice; path, disk-full, and
+/// identity failures are never retried. A denial during a binary replace is the
+/// status a scanner or a briefly held image lock produces (#6760), and the
+/// budget below already documents it as the denial allowance, so the open now
+/// retries it exactly like the rename does.
 const fn is_retryable_exact_replace_status(status: i32) -> bool {
-	status == STATUS_SHARING_VIOLATION
+	status == STATUS_SHARING_VIOLATION || status == STATUS_ACCESS_DENIED
 }
 
 #[cfg(windows)]
 /// STATUS_INVALID_PARAMETER: the synthetic NTSTATUS used for early,
-/// pre-syscall name validation rejections in the status-returning open path
-/// (e.g. an embedded NUL or an oversized name), which never reach
-/// `NtCreateFile` and so have no real NTSTATUS to report. Distinct from
-/// `STATUS_SHARING_VIOLATION` and never retried.
+/// pre-syscall name validation rejections in the status-returning open/rename
+/// paths (e.g. an embedded NUL or an oversized name), which never reach the
+/// underlying syscall and so have no real NTSTATUS to report. Distinct from
+/// transient publication statuses and never retried.
 const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
 
-/// Bound on transient retries for the exact-replace destination open on
-/// Windows, matching the reporter's controlled 30 x 100 ms reproduction window
-/// (~1.2 s of contention) with margin. The delay keeps the retry hot loop from
-/// busy-spinning the persistence fence; the bound keeps a persistent holder
-/// from freezing a session for more than ~3 s.
+/// Bound on transient retries for pre-mutation exact-replace operations on
+/// Windows. Thirty attempts with 100 ms between them bounds a persistent
+/// denial to about three seconds without busy-spinning.
 #[cfg(any(windows, test))]
-const EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT: u32 = 30;
+const EXACT_REPLACE_RETRY_LIMIT: u32 = 30;
 #[cfg(any(windows, test))]
-const EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS: u64 = 100;
+const EXACT_REPLACE_RETRY_DELAY_MS: u64 = 100;
 
 #[cfg(any(windows, test))]
-/// Open a Windows handle with bounded transient retry on sharing violations.
+/// Open a Windows handle with bounded retry on sharing violations.
 /// `open` returns the raw NTSTATUS on failure; only
 /// [`is_retryable_exact_replace_status`] failures are retried, and only up to
-/// [`EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT`] attempts with a bounded delay
+/// [`EXACT_REPLACE_RETRY_LIMIT`] attempts with a bounded delay
 /// between them. This is the narrow pre-mutation syscall boundary: the caller
 /// must ensure nothing has been renamed or unlinked before the open.
 fn open_with_transient_retry<T>(mut open: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
-	for attempt in 0..EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT {
+	for attempt in 0..EXACT_REPLACE_RETRY_LIMIT {
 		match open() {
 			Ok(handle) => return Ok(handle),
 			Err(status)
 				if is_retryable_exact_replace_status(status)
-					&& attempt + 1 < EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT =>
+					&& attempt + 1 < EXACT_REPLACE_RETRY_LIMIT =>
 			{
-				std::thread::sleep(std::time::Duration::from_millis(
-					EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS,
-				));
+				std::thread::sleep(std::time::Duration::from_millis(EXACT_REPLACE_RETRY_DELAY_MS));
+			},
+			Err(status) => return Err(status),
+		}
+	}
+	unreachable!("the retry bound guarantees at least one attempt")
+}
+
+#[cfg(any(windows, test))]
+const fn is_retryable_exact_replace_rename_status(status: i32) -> bool {
+	status == STATUS_ACCESS_DENIED || status == STATUS_SHARING_VIOLATION
+}
+
+#[cfg(any(windows, test))]
+/// Retry exact-replace rename failures only for bounded transient statuses.
+/// Both statuses are returned before the requested rename takes effect, so
+/// the caller can safely retry this one operation without publishing twice.
+fn rename_with_transient_retry<T>(mut rename: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
+	for attempt in 0..EXACT_REPLACE_RETRY_LIMIT {
+		match rename() {
+			Ok(result) => return Ok(result),
+			Err(status)
+				if is_retryable_exact_replace_rename_status(status)
+					&& attempt + 1 < EXACT_REPLACE_RETRY_LIMIT =>
+			{
+				std::thread::sleep(std::time::Duration::from_millis(EXACT_REPLACE_RETRY_DELAY_MS));
 			},
 			Err(status) => return Err(status),
 		}
@@ -931,7 +1222,7 @@ fn open_with_transient_retry<T>(mut open: impl FnMut() -> Result<T, i32>) -> Res
 
 #[cfg(any(windows, test))]
 /// Path-free, hex-formatted Windows NTSTATUS evidence for a pre-mutation
-/// failure, e.g. `0xC0000043` for STATUS_SHARING_VIOLATION.
+/// failure, e.g. `0xC0000043` for `STATUS_SHARING_VIOLATION`.
 fn native_windows_error_code(status: i32) -> String {
 	format!("0x{status:08X}")
 }
@@ -939,18 +1230,24 @@ fn native_windows_error_code(status: i32) -> String {
 #[cfg(test)]
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		open_with_transient_retry,
+		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, NativeExactUnlinkResult,
+		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, exact_replace_open_error_code,
+		is_retryable_exact_replace_rename_status, is_retryable_exact_replace_status,
+		native_windows_error_code, ntstatus_code, open_with_transient_retry,
+		publication_rename_error_code, rename_with_transient_retry, retained_replace_error_code,
+		windows_error_code,
 	};
 
 	#[test]
-	fn retry_policy_accepts_only_sharing_violations() {
+	fn retry_policy_accepts_only_pre_mutation_transient_statuses() {
 		assert!(is_retryable_exact_replace_status(STATUS_SHARING_VIOLATION));
-		// Permission, path-not-found, disk-full, and identity failures are never
-		// retried: none of them is a transient holder release.
+		// A denied open happens before any rename, so it retries inside the same
+		// bounded budget the rename path already grants it (#6760).
+		assert!(is_retryable_exact_replace_status(STATUS_ACCESS_DENIED));
+		assert!(is_retryable_exact_replace_rename_status(STATUS_ACCESS_DENIED));
+		// Path-not-found, disk-full, and identity failures are never retried: none
+		// of them is a transient holder release.
 		for status in [
-			0xc000_0022u32 as i32,
 			0xc000_0034u32 as i32,
 			0xc000_003au32 as i32,
 			0xc000_007fu32 as i32,
@@ -963,14 +1260,94 @@ mod exact_replace_windows_retry_policy_tests {
 
 	#[test]
 	fn retry_budget_and_delay_are_bounded() {
-		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT, 30);
-		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, 100);
+		assert_eq!(EXACT_REPLACE_RETRY_LIMIT, 30);
+		assert_eq!(EXACT_REPLACE_RETRY_DELAY_MS, 100);
+	}
+
+	#[test]
+	fn exact_replace_rename_retries_access_denied_and_sharing_violations_only() {
+		assert!(is_retryable_exact_replace_rename_status(STATUS_ACCESS_DENIED));
+		assert!(is_retryable_exact_replace_rename_status(STATUS_SHARING_VIOLATION));
+		for status in [0xc000_0034u32 as i32, 0xc000_007fu32 as i32, 0xc000_000du32 as i32] {
+			assert!(
+				!is_retryable_exact_replace_rename_status(status),
+				"0x{status:08X} must not retry",
+			);
+		}
 	}
 
 	#[test]
 	fn windows_error_code_is_hex_and_path_free() {
 		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
-		assert_eq!(native_windows_error_code(0xc000_0022u32 as i32), "0xC0000022");
+		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED as i32), "0xC0000022");
+	}
+
+	#[test]
+	fn win32_access_denied_stays_distinct_for_exact_cleanup() {
+		assert_eq!(windows_error_code(5), "access_denied");
+		assert_eq!(windows_error_code(32), "sharing_violation");
+		assert_eq!(windows_error_code(2), "not_found");
+		assert_eq!(windows_error_code(5_000), "io_error");
+	}
+
+	#[test]
+	fn status_access_denied_is_distinct_from_owner_mismatch() {
+		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED), "0xC0000022");
+		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "owner_mismatch");
+		assert_eq!(
+			publication_rename_error_code(ntstatus_code(STATUS_ACCESS_DENIED)),
+			"access_denied"
+		);
+		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
+	}
+
+	#[test]
+	fn exact_replace_denied_open_is_access_denied_not_owner_mismatch() {
+		// #6760: a denied open of the staged source or the live destination
+		// surfaced as `owner_mismatch` and aborted `gjc update` on Windows.
+		assert_eq!(
+			exact_replace_open_error_code(Some(ntstatus_code(STATUS_ACCESS_DENIED))),
+			"access_denied"
+		);
+		assert_eq!(
+			exact_replace_open_error_code(Some(ntstatus_code(STATUS_SHARING_VIOLATION))),
+			"sharing_violation"
+		);
+		assert_eq!(exact_replace_open_error_code(Some("reparse_point")), "reparse_point");
+		assert_eq!(exact_replace_open_error_code(None), "io_error");
+	}
+
+	#[test]
+	fn retained_replace_access_denied_is_not_an_owner_mismatch() {
+		assert_eq!(retained_replace_error_code(STATUS_ACCESS_DENIED), "access_denied");
+	}
+
+	#[test]
+	fn rename_retry_succeeds_after_transient_access_denied() {
+		let mut failures = 2;
+		let attempts = std::cell::Cell::new(0);
+		let renamed = rename_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			if failures > 0 {
+				failures -= 1;
+				Err(STATUS_ACCESS_DENIED)
+			} else {
+				Ok(())
+			}
+		});
+		assert_eq!(renamed, Ok(()));
+		assert_eq!(attempts.get(), 3, "2 transient failures then success");
+	}
+
+	#[test]
+	fn rename_retry_exhausts_the_budget_and_preserves_access_denied() {
+		let attempts = std::cell::Cell::new(0);
+		let renamed: Result<(), i32> = rename_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			Err(STATUS_ACCESS_DENIED)
+		});
+		assert_eq!(renamed, Err(STATUS_ACCESS_DENIED));
+		assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
 	}
 
 	#[test]
@@ -991,14 +1368,34 @@ mod exact_replace_windows_retry_policy_tests {
 	}
 
 	#[test]
-	fn transient_retry_exhausts_the_budget_and_reports_the_status() {
-		let attempts = std::cell::Cell::new(0);
-		let opened: Result<u8, i32> = open_with_transient_retry(|| {
-			attempts.set(attempts.get() + 1);
-			Err(STATUS_SHARING_VIOLATION)
-		});
-		assert_eq!(opened, Err(STATUS_SHARING_VIOLATION));
-		assert_eq!(attempts.get(), EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT);
+	fn exhausted_opens_preserve_distinct_failure_codes_and_raw_statuses() {
+		for (status, code, raw_status) in [
+			(STATUS_ACCESS_DENIED, "access_denied", "0xC0000022"),
+			(STATUS_SHARING_VIOLATION, "sharing_violation", "0xC0000043"),
+		] {
+			let attempts = std::cell::Cell::new(0);
+			let opened: Result<u8, i32> = open_with_transient_retry(|| {
+				attempts.set(attempts.get() + 1);
+				Err(status)
+			});
+			assert_eq!(opened, Err(status));
+			assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
+			// Retry eligibility must not determine the terminal publication category.
+			let result = opened
+				.map_err(|status| {
+					NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+						.with_windows_error_code(native_windows_error_code(status))
+				})
+				.unwrap_err();
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some(code));
+			assert_eq!(result.windows_error_code.as_deref(), Some(raw_status));
+			assert_eq!(result.payload_durable, None);
+			assert_eq!(result.detached_path, None);
+			assert_eq!(result.retained_successor_path, None);
+			assert_eq!(result.retained_placeholder_path, None);
+			assert_eq!(result.retained_unknown_path, None);
+		}
 	}
 
 	#[test]
@@ -1006,10 +1403,10 @@ mod exact_replace_windows_retry_policy_tests {
 		let attempts = std::cell::Cell::new(0);
 		let opened: Result<u8, i32> = open_with_transient_retry(|| {
 			attempts.set(attempts.get() + 1);
-			Err(0xc000_0022u32 as i32)
+			Err(0xc000_007fu32 as i32)
 		});
-		assert_eq!(opened, Err(0xc000_0022u32 as i32));
-		assert_eq!(attempts.get(), 1, "non-sharing failures are never retried");
+		assert_eq!(opened, Err(0xc000_007fu32 as i32));
+		assert_eq!(attempts.get(), 1, "disk-full and other non-transient failures are never retried");
 	}
 }
 
@@ -1030,6 +1427,113 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	let mut hasher = Sha256::new();
 	hasher.update(bytes);
 	hasher.finalize().into()
+}
+
+const DIRECTORY_TREE_TRANSITION_SUFFIX: &str = ".removing";
+const MAX_DIRECTORY_TREE_COMPONENT_BYTES: usize = 255;
+
+fn directory_tree_transition_name(original_basename: &OsStr) -> Option<OsString> {
+	let original_basename_bytes = original_basename.as_encoded_bytes();
+	if original_basename_bytes.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX.as_bytes()) {
+		return Some(original_basename.to_os_string());
+	}
+	let derived_length = original_basename_bytes
+		.len()
+		.checked_add(DIRECTORY_TREE_TRANSITION_SUFFIX.len())?;
+	if derived_length <= MAX_DIRECTORY_TREE_COMPONENT_BYTES {
+		let mut transition_name = original_basename.to_os_string();
+		transition_name.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		return Some(transition_name);
+	}
+
+	let mut hashed_name = String::with_capacity(10 + 64 + DIRECTORY_TREE_TRANSITION_SUFFIX.len());
+	hashed_name.push_str(".gjc-lock-");
+	for byte in sha256(original_basename_bytes) {
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+	}
+	hashed_name.push_str(DIRECTORY_TREE_TRANSITION_SUFFIX);
+	Some(OsString::from(hashed_name))
+}
+
+#[cfg(test)]
+mod directory_tree_transition_name_tests {
+	use std::ffi::{OsStr, OsString};
+
+	use super::{
+		DIRECTORY_TREE_TRANSITION_SUFFIX, MAX_DIRECTORY_TREE_COMPONENT_BYTES,
+		directory_tree_transition_name, sha256,
+	};
+
+	#[test]
+	fn transition_name_preserves_short_names_and_uses_utf8_byte_lengths() {
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new("lock")),
+			Some(OsString::from("lock.removing")),
+		);
+
+		let unicode_at_limit = "é".repeat(123);
+		assert_eq!(unicode_at_limit.len() + DIRECTORY_TREE_TRANSITION_SUFFIX.len(), 255);
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new(&unicode_at_limit)),
+			Some(OsString::from(format!("{unicode_at_limit}{DIRECTORY_TREE_TRANSITION_SUFFIX}"))),
+		);
+
+		let unicode_over_limit = "é".repeat(124);
+		assert_eq!(unicode_over_limit.len(), 248);
+		let hashed = directory_tree_transition_name(OsStr::new(&unicode_over_limit))
+			.expect("long UTF-8 basename should hash");
+		let hashed = hashed.to_str().expect("hash name is UTF-8");
+		assert!(hashed.starts_with(".gjc-lock-"));
+		assert!(hashed.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX));
+		assert!(hashed.len() <= MAX_DIRECTORY_TREE_COMPONENT_BYTES);
+	}
+
+	#[test]
+	fn basenames_of_255_bytes_get_deterministic_distinct_hashes() {
+		let first = "a".repeat(255);
+		let second = "b".repeat(255);
+		let first_name =
+			directory_tree_transition_name(OsStr::new(&first)).expect("255-byte basename should hash");
+		let repeated_first_name = directory_tree_transition_name(OsStr::new(&first))
+			.expect("same basename should hash deterministically");
+		let second_name = directory_tree_transition_name(OsStr::new(&second))
+			.expect("second 255-byte basename should hash");
+
+		assert_eq!(first_name, repeated_first_name);
+		assert_ne!(first_name, second_name);
+		let digest = sha256(first.as_bytes());
+		let expected_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+		let expected_name = format!(".gjc-lock-{expected_hash}{DIRECTORY_TREE_TRANSITION_SUFFIX}");
+		assert_eq!(first_name.to_str(), Some(expected_name.as_str()));
+		assert!(first_name.to_str().expect("hash name is UTF-8").len() <= 255);
+	}
+
+	#[test]
+	fn transition_name_is_idempotent_for_replay_inputs() {
+		let already_transition = OsStr::new(".gjc-lock-deadbeef.removing");
+		assert_eq!(
+			directory_tree_transition_name(already_transition),
+			Some(OsString::from(already_transition)),
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn transition_name_preserves_short_non_utf8_unix_names() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+		let original = OsString::from_vec(vec![b'l', 0xff, b'k']);
+		let mut expected = original.clone();
+		expected.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		let derived = directory_tree_transition_name(&original).expect("short name should fit");
+		assert_eq!(derived.as_os_str().as_bytes(), b"l\xffk.removing");
+		assert_eq!(derived, expected);
+
+		let mut already_transitioned = original;
+		already_transitioned.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		assert_eq!(directory_tree_transition_name(&already_transitioned), Some(already_transitioned),);
+	}
 }
 
 #[cfg(any(unix, test))]
@@ -1112,6 +1616,7 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 		quarantine_name,
 		sha256,
 		allow_hard_link: identity.allow_hard_link.unwrap_or(false),
+		require_hard_link: identity.require_hard_link.unwrap_or(false),
 	})
 }
 
@@ -1321,6 +1826,64 @@ pub fn canonical_existing_directory_identity(
 	platform::canonical_existing_directory_identity(&path)
 }
 
+#[cfg(any(windows, test))]
+const FILE_CASE_SENSITIVE_SEARCH_FLAG: u32 = 0x0000_0001;
+
+#[cfg(any(windows, test))]
+const fn volume_case_sensitivity_from_flags(file_system_flags: u32) -> Option<bool> {
+	// This is a volume capability, not the current directory's mode. A missing
+	// capability proves case-insensitivity; a present one leaves the mode unknown.
+	if file_system_flags & FILE_CASE_SENSITIVE_SEARCH_FLAG == 0 {
+		Some(false)
+	} else {
+		None
+	}
+}
+
+#[cfg(test)]
+mod volume_case_sensitivity_tests {
+	use super::volume_case_sensitivity_from_flags;
+
+	#[test]
+	fn only_treats_a_volume_as_case_insensitive_when_it_lacks_case_sensitive_search() {
+		assert_eq!(volume_case_sensitivity_from_flags(0), Some(false));
+		assert_eq!(volume_case_sensitivity_from_flags(0x0000_0001), None);
+	}
+}
+
+/// Returns whether the directory's child names are case-sensitive when the
+/// platform can query that property.
+#[napi]
+pub fn directory_case_sensitive(path: String) -> Option<bool> {
+	if path.contains('\0') {
+		return None;
+	}
+	#[cfg(windows)]
+	{
+		platform::directory_case_sensitive(Path::new(&path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = path;
+		None
+	}
+}
+
+/// Fold UTF-16 code units with Windows' ordinal case mapping, without Unicode
+/// expansions.
+#[allow(clippy::missing_const_for_fn, reason = "the Windows implementation calls an OS API")]
+#[napi]
+pub fn windows_ordinal_case_fold(value: String) -> String {
+	#[cfg(windows)]
+	{
+		platform::windows_ordinal_case_fold(&value)
+	}
+	#[cfg(not(windows))]
+	{
+		value
+	}
+}
+
 #[cfg(unix)]
 pub(crate) fn verify_descriptor_acl_absent(
 	file: &std::fs::File,
@@ -1479,6 +2042,25 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	platform::exact_unlink(Path::new(&path), &identity)
 }
 
+/// Delete only the empty regular file opened by the caller's retained
+/// descriptor.
+///
+/// This is used when a newly created staging file cannot be statted through the
+/// host API. Native code derives identity from the open descriptor and verifies
+/// the public entry still names that object before using the platform's exact
+/// unlink protocol.
+#[napi]
+pub fn exact_unlink_open_file(
+	path: String,
+	caller_fd: i32,
+	quarantine_name: String,
+) -> NativeExactUnlinkResult {
+	if path.contains('\0') || quarantine_name.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	platform::exact_unlink_open_file(Path::new(&path), caller_fd, &quarantine_name)
+}
+
 /// Delete only the regular file that still has the supplied platform identity,
 /// without the exchange/quarantine protocol used by [`exact_unlink`].
 ///
@@ -1572,9 +2154,10 @@ pub fn exact_replace_path(
 /// single-link ownership; hard-linked or symlinked source/destination are
 /// rejected) before anything is mutated. On Windows a pre-mutation
 /// `STATUS_SHARING_VIOLATION` on the destination open is reported as a
-/// distinct `sharing_violation` code with `windows_error_code` set -- exactly
-/// as [`exact_replace_path`] already reports it -- and is always surfaced
-/// before any rename, so it is never mistaken for a post-effect failure.
+/// distinct `sharing_violation` code, while `STATUS_ACCESS_DENIED` on a
+/// retained open or rename is reported as `access_denied`. Pre-mutation
+/// failures include the original `windows_error_code`; only known-safe rename
+/// operations retry transient access-denied or sharing-violation statuses.
 #[napi]
 pub fn exact_replace_retained(
 	source_path: String,
@@ -1794,12 +2377,23 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 	platform::snapshot_directory_tree(Path::new(&path))
 }
 
+/// Capture native root metadata only after proving a directory has no entries.
+/// Enumeration stops at the first non-dot child; no child is opened or read.
+#[napi]
+pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
+	if path.contains('\0') {
+		return NativeDirectoryTreeResult::failure("io_error");
+	}
+	platform::snapshot_empty_directory(Path::new(&path))
+}
+
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
-/// exactly equals the persisted snapshot. POSIX first no-replace detaches the
-/// verified root to its deterministic `.removing` sibling; the reopened
-/// detached descriptor remains authoritative throughout payload scrubbing and
-/// replay.
+/// exactly equals the persisted snapshot. POSIX removal no-replace detaches the
+/// verified root to its deterministic `.removing` sibling before scrubbing. On
+/// Windows, callers that need retirement semantics must request a detach-only
+/// pass, then replay exact removal at the returned sibling; ordinary Windows
+/// removal never vacates the caller's path before scrubbing completes.
 #[napi]
 pub fn exact_remove_directory_tree(
 	path: String,
@@ -2322,14 +2916,15 @@ pub(crate) mod platform {
 			fd::{AsRawFd, FromRawFd},
 			unix::ffi::OsStrExt,
 		},
-		path::{Component, Path},
+		path::{Component, Path, PathBuf},
 	};
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
-		security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader,
+		directory_tree_transition_name, io_code, security_io_code, sha256,
+		validate_retained_backup_name,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -2843,6 +3438,23 @@ pub(crate) mod platform {
 		Cow::Borrowed(path)
 	}
 
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) static WRITE_FALLBACK_ATTEMPTS: std::sync::atomic::AtomicUsize =
+		std::sync::atomic::AtomicUsize::new(0);
+
+	/// Whether an acquisition may retry a read denial with write authority.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(super) enum AcquisitionPolicy {
+		/// Ordinary permission repair callers: a hostile ACL may deny reads while
+		/// leaving owner writes available, and those callers exist to fix it.
+		RepairableWrite,
+		/// Read-only observation: never acquire or even attempt write authority.
+		/// The read-denial retry this refuses exists only on macOS, so the
+		/// variant is available exactly where an acquisition can select it.
+		#[cfg(target_os = "macos")]
+		ReadOnly,
+	}
+
 	/// Open each component through retained directory descriptors. Every name is
 	/// lstat'd and then opened no-follow; the two identities must agree. `..`
 	/// is never accepted, so a pathname cannot escape the authority selected at
@@ -2852,6 +3464,18 @@ pub(crate) mod platform {
 		path: &Path,
 		kind: &str,
 	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
+		checked_file_with_policy(path, kind, AcquisitionPolicy::RepairableWrite)
+	}
+
+	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
+	fn checked_file_with_policy(
+		path: &Path,
+		kind: &str,
+		// Consulted only by the macOS read-denial retry below.
+		policy: AcquisitionPolicy,
+	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
+		#[cfg(not(target_os = "macos"))]
+		let _ = policy;
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
 		}
@@ -2945,10 +3569,16 @@ pub(crate) mod platform {
 		#[cfg(target_os = "macos")]
 		let target_fd = if target_fd < 0 && !is_directory {
 			let read_error = std::io::Error::last_os_error();
-			if read_error.raw_os_error() == Some(libc::EACCES) {
+			if read_error.raw_os_error() == Some(libc::EACCES)
+				&& policy == AcquisitionPolicy::RepairableWrite
+			{
 				// A hostile macOS ACL may deny reads while leaving owner writes
 				// available. Retry only that denial with write authority so ACLs can
-				// be inspected and repaired without changing file contents.
+				// be inspected and repaired without changing file contents. A read-only
+				// acquisition must never even attempt this: an observation that failed
+				// to read has no business holding write authority.
+				#[cfg(test)]
+				WRITE_FALLBACK_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 				// SAFETY: this retries the same retained parent and validated final component.
 				unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags | libc::O_WRONLY) }
 			} else {
@@ -5082,6 +5712,62 @@ pub(crate) mod platform {
 		}
 	}
 
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		if caller_fd < 0 || validate_retained_backup_name(quarantine_name).is_none() {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		// SAFETY: zero is valid initialized storage for fstat output; caller_fd is
+		// retained by the host FileHandle for the duration of this synchronous call.
+		let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: caller_fd remains live through this synchronous call and file_stat is
+		// writable.
+		if unsafe { libc::fstat(caller_fd, &mut file_stat) } != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		if file_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| file_stat.st_size != 0
+			|| file_stat.st_nlink != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let (parent_fd, _) = match open_parent_no_follow(path) {
+			Ok(parent) => parent,
+			Err(result) => return *result,
+		};
+		// SAFETY: zero is valid initialized storage for fstat output.
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd is live and parent_stat is writable initialized output.
+		let parent_stat_result = unsafe { libc::fstat(parent_fd, &mut parent_stat) };
+		// SAFETY: open_parent_no_follow returned ownership of this descriptor.
+		unsafe { libc::close(parent_fd) };
+		if parent_stat_result != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		let Ok(mtime_ns) = i64::try_from(stat_mtime_ns(&file_stat)) else {
+			return NativeExactUnlinkResult::failure("identity_unavailable");
+		};
+		let identity = ExactFileIdentity {
+			dev: file_stat.st_dev as u64,
+			ino: file_stat.st_ino as u64,
+			nlink: Some(file_stat.st_nlink as u64),
+			parent_dev: Some(parent_stat.st_dev as u64),
+			parent_ino: Some(parent_stat.st_ino as u64),
+			size: 0,
+			mtime_ns,
+			directory: false,
+			detach_only: false,
+			quarantine_name: Some(quarantine_name.to_owned()),
+			sha256: Some(sha256(&[])),
+			allow_hard_link: false,
+			require_hard_link: false,
+		};
+		exact_unlink_direct(path, &identity)
+	}
+
 	fn exact_unlink_at(
 		parent_fd: libc::c_int,
 		name: CString,
@@ -5123,6 +5809,12 @@ pub(crate) mod platform {
 		if !identity.directory
 			&& !identity.allow_hard_link
 			&& (named.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != 1))
+		{
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if !identity.directory
+			&& identity.require_hard_link
+			&& (named.st_nlink < 2 || identity.nlink.is_some_and(|nlink| nlink < 2))
 		{
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
@@ -5421,26 +6113,9 @@ pub(crate) mod platform {
 				unsafe { libc::close(parent_fd) };
 				return Err(Box::new(NativeExactUnlinkResult::failure("io_error")));
 			};
-			// SAFETY: zero is a valid initialized representation for this output struct.
-			let mut named: libc::stat = unsafe { std::mem::zeroed() };
-			// SAFETY: the descriptor and CString are live; the initialized output struct is
-			// writable.
-			if unsafe {
-				libc::fstatat(parent_fd, segment.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-			} != 0
-			{
-				let error = std::io::Error::last_os_error();
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(parent_fd) };
-				return Err(Box::new(NativeExactUnlinkResult::failure(security_code(&error))));
-			}
-			if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(parent_fd) };
-				return Err(Box::new(NativeExactUnlinkResult::failure("reparse_point")));
-			}
-			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
-			// valid.
+			// Each ancestor is opened no-follow; the kernel enforces the directory and
+			// symlink predicates without a redundant successful-path metadata probe.
+			// SAFETY: the parent descriptor and NUL-terminated component remain live.
 			let next_fd = unsafe {
 				libc::openat(
 					parent_fd,
@@ -5448,13 +6123,30 @@ pub(crate) mod platform {
 					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
 				)
 			};
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			if next_fd < 0 {
-				return Err(Box::new(NativeExactUnlinkResult::failure(security_code(
-					&std::io::Error::last_os_error(),
-				))));
+				// Capture the failed open before a diagnostic syscall or close changes errno.
+				let error = std::io::Error::last_os_error();
+				let mut code = security_code(&error);
+				if error.raw_os_error() == Some(libc::ENOTDIR) {
+					// Darwin can report ENOTDIR for O_DIRECTORY | O_NOFOLLOW on a symlink.
+					// This probe classifies failure only: it never retries or grants authority.
+					// SAFETY: zero is valid initialized storage for this output struct.
+					let mut named: libc::stat = unsafe { std::mem::zeroed() };
+					// SAFETY: the parent descriptor, component, and writable output remain live.
+					if unsafe {
+						libc::fstatat(parent_fd, segment.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+					} == 0 && named.st_mode & libc::S_IFMT == libc::S_IFLNK
+					{
+						code = "reparse_point";
+					}
+				}
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return Err(Box::new(NativeExactUnlinkResult::failure(code)));
 			}
+			// SAFETY: the successful open owns next_fd; release its predecessor exactly
+			// once.
+			unsafe { libc::close(parent_fd) };
 			parent_fd = next_fd;
 		}
 		let Ok(name) = CString::new(name_bytes.as_slice()) else {
@@ -5536,23 +6228,24 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
 		let identity = ExactFileIdentity {
-			dev:             current.st_dev as u64,
-			ino:             current.st_ino as u64,
-			nlink:           Some(current.st_nlink as u64),
-			parent_dev:      Some(parent.st_dev as u64),
-			parent_ino:      Some(parent.st_ino as u64),
-			size:            current.st_size as u64,
-			mtime_ns:        stat_mtime_ns(&current) as i64,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: Some(format!(
+			dev:               current.st_dev as u64,
+			ino:               current.st_ino as u64,
+			nlink:             Some(current.st_nlink as u64),
+			parent_dev:        Some(parent.st_dev as u64),
+			parent_ino:        Some(parent.st_ino as u64),
+			size:              current.st_size as u64,
+			mtime_ns:          stat_mtime_ns(&current) as i64,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(format!(
 				".gjc-substitution-cleanup-{:x}-{:x}-{:x}",
 				current.st_dev,
 				current.st_ino,
 				std::process::id(),
 			)),
-			sha256:          Some(digest),
-			allow_hard_link: true,
+			sha256:            Some(digest),
+			allow_hard_link:   true,
+			require_hard_link: false,
 		};
 		exact_unlink_at(parent_fd, name.clone(), path, &identity)
 	}
@@ -5922,7 +6615,11 @@ pub(crate) mod platform {
 		if fd < 0 {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
-		let result = (|| {
+		// SAFETY: this function exclusively owns the freshly opened descriptor.
+		// Hash it directly; duplicating it shares the same file offset and adds no
+		// authority.
+		let mut file = unsafe { File::from_raw_fd(fd) };
+		(|| {
 			// SAFETY: zero is a valid initialized representation for fstat output.
 			let mut opened: libc::stat = unsafe { std::mem::zeroed() };
 			// SAFETY: fd is live and opened is writable.
@@ -5932,7 +6629,7 @@ pub(crate) mod platform {
 			if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
 				return Ok(false);
 			}
-			let digest = digest_fd(fd)?;
+			let digest = digest_reader(&mut file).map_err(|_| "io_error")?;
 			// Linearize the pathname observation after descriptor hashing: the live name
 			// must still resolve no-follow to the descriptor whose metadata and bytes were
 			// checked above.
@@ -5949,20 +6646,17 @@ pub(crate) mod platform {
 				&& opened.st_ino as u64 == identity.ino
 				&& opened.st_size as u64 == identity.size
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
-				&& (identity.allow_hard_link
-					|| (opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)))
-				&& (identity.allow_hard_link
-					|| identity
-						.nlink
-						.is_none_or(|nlink| nlink == opened.st_nlink as u64))
-				&& identity.sha256.as_ref() == Some(&digest)
+				&& if identity.require_hard_link {
+					opened.st_nlink >= 2 && identity.nlink.is_none_or(|nlink| nlink >= 2)
+				} else if identity.allow_hard_link {
+					true
+				} else {
+					opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)
+				} && identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
 				&& named.st_ino == opened.st_ino)
-		})();
-		// SAFETY: this function owns fd exactly once.
-		unsafe { libc::close(fd) };
-		result
+		})()
 	}
 
 	#[expect(
@@ -6754,6 +7448,187 @@ pub(crate) mod platform {
 		}
 	}
 
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_is_empty(fd: libc::c_int) -> Result<bool, &'static str> {
+		let current = c".";
+		// SAFETY: `fd` is live and `.` resolves the same directory with an independent
+		// stream offset for this bounded observation.
+		let duplicate = unsafe {
+			libc::openat(
+				fd,
+				current.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if duplicate < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		// SAFETY: ownership of the live duplicate transfers to DIR on success.
+		let directory = unsafe { libc::fdopendir(duplicate) };
+		if directory.is_null() {
+			let error = std::io::Error::last_os_error();
+			// SAFETY: fdopendir failed, so this branch still owns the descriptor.
+			unsafe { libc::close(duplicate) };
+			return Err(security_code(&error));
+		}
+		loop {
+			clear_errno();
+			// SAFETY: the DIR pointer is live until its matching closedir call.
+			let entry = unsafe { libc::readdir(directory) };
+			if entry.is_null() {
+				let errno = current_errno();
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::closedir(directory) };
+				return if errno == 0 {
+					Ok(true)
+				} else {
+					Err(security_code(&std::io::Error::from_raw_os_error(errno)))
+				};
+			}
+			// SAFETY: readdir returned a live dirent with a NUL-terminated name.
+			let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+			if name != b"." && name != b".." {
+				// Stop immediately: do not retain, stat, open, or descend into this child.
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::closedir(directory) };
+				return Ok(false);
+			}
+		}
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_entry_from_fd(fd: libc::c_int) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		// SAFETY: zero initializes this output-only C stat structure before fstat fills
+		// it.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the descriptor is live and the initialized output struct is writable.
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+			return Err("not_directory");
+		}
+		Ok(entry_from_stat(String::new(), &stat, "directory", None))
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_entry_at(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		// SAFETY: zero initializes this output-only C stat structure before fstatat
+		// fills it.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the parent descriptor and name are live, and the output struct is
+		// writable.
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		match stat.st_mode & libc::S_IFMT {
+			libc::S_IFLNK => return Err("reparse_point"),
+			libc::S_IFDIR => {},
+			_ => return Err("not_directory"),
+		}
+		Ok(entry_from_stat(String::new(), &stat, "directory", None))
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	pub(super) fn snapshot_empty_directory(path: &Path) -> NativeDirectoryTreeResult {
+		let (parent_fd, name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let parent = unsafe { File::from_raw_fd(parent_fd) };
+		let parent_entry = match directory_entry_from_fd(parent.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		// SAFETY: the live descriptor, where used, and NUL-terminated path remain
+		// valid.
+		let root_fd = unsafe {
+			libc::openat(
+				parent.as_raw_fd(),
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if root_fd < 0 {
+			return NativeDirectoryTreeResult::failure(
+				security_code(&std::io::Error::last_os_error()),
+			);
+		}
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let root = unsafe { File::from_raw_fd(root_fd) };
+		let root_entry = match directory_entry_from_fd(root.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		match directory_is_empty(root.as_raw_fd()) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+
+		let (final_parent_fd, final_name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let final_parent = unsafe { File::from_raw_fd(final_parent_fd) };
+		let final_parent_entry = match directory_entry_from_fd(final_parent.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if final_name != name
+			|| final_parent_entry.dev != parent_entry.dev
+			|| final_parent_entry.ino != parent_entry.ino
+		{
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		match directory_is_empty(root.as_raw_fd()) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		let current_root = match directory_entry_from_fd(root.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		let named_root = match directory_entry_at(final_parent.as_raw_fd(), &final_name) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if current_root != root_entry || named_root != root_entry {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		NativeDirectoryTreeResult::success(NativeDirectoryTreeSnapshot {
+			root_dev: root_entry.dev.clone(),
+			root_ino: root_entry.ino.clone(),
+			entries:  vec![root_entry],
+		})
+	}
+
+	#[cfg(not(any(
+		target_os = "linux",
+		target_os = "android",
+		target_os = "macos",
+		target_os = "ios"
+	)))]
+	pub(super) fn snapshot_empty_directory(_: &Path) -> NativeDirectoryTreeResult {
+		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+
 	fn snapshot_fd(
 		fd: libc::c_int,
 		relative: &str,
@@ -7124,7 +7999,7 @@ pub(crate) mod platform {
 									== expected_child.size.parse().ok().unwrap_or(u64::MAX)
 								&& stat_mtime_ns(&commit_stat)
 									== expected_child.mtime_ns.parse().ok().unwrap_or(i128::MIN)
-								&& digest_fd(writable).ok().is_some_and(|digest| {
+								&& digest_fd(writable).is_ok_and(|digest| {
 									expected_child
 										.sha256
 										.as_deref()
@@ -7236,7 +8111,6 @@ pub(crate) mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
 		let (parent, name) = match open_parent_no_follow(path) {
 			Ok(value) => value,
 			Err(result) => return *result,
@@ -7254,9 +8128,18 @@ pub(crate) mod platform {
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
 		}
-		let mut final_bytes = name.as_bytes().to_vec();
-		final_bytes.extend_from_slice(b".removing");
-		let Ok(final_name) = CString::new(final_bytes) else {
+		let input_is_final = name.as_bytes().ends_with(b".removing");
+		let Some(final_component) =
+			directory_tree_transition_name(std::ffi::OsStr::from_bytes(name.as_bytes()))
+		else {
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent) };
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let mut final_candidate = PathBuf::from(path);
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
+		let Ok(final_name) = CString::new(final_component.as_os_str().as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent) };
 			return NativeExactUnlinkResult::failure("io_error");
@@ -7264,7 +8147,6 @@ pub(crate) mod platform {
 		// A crash after the final no-replace rename is replayed from the single,
 		// caller-derivable sibling. This is not a search fallback: it is the only
 		// alternate retained authority for this exact planned root.
-		let input_is_final = name.as_bytes().ends_with(b".removing");
 		let (fd, root_name, retained_path, already_final) = {
 			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 			// valid.
@@ -7563,6 +8445,2838 @@ pub(crate) mod platform {
 			detached_retained_path,
 		)
 	}
+
+	// ================= read-only broker diagnostic snapshot (DESIGN §B3)
+	// =================
+	//
+	// A narrow read-only view over the retained `checked_file` descriptor chain:
+	// no write method, no exposed descriptor, no publication authority token. The
+	// first supported runtime is Darwin on a local ownership-enforcing APFS mount;
+	// every other platform, filesystem or permission model is `unsupported` before
+	// any byte is read.
+
+	/// Copy budget for one publication read, plus a sentinel byte used to detect
+	/// an oversized or growing file without reading to EOF.
+	#[cfg(target_os = "macos")]
+	pub(super) const DIAGNOSTIC_SNAPSHOT_MAX_BYTES: usize = 65536;
+	#[cfg(target_os = "macos")]
+	const DIAGNOSTIC_SNAPSHOT_ACL_TEXT_MAX: usize = 4096;
+	#[cfg(target_os = "macos")]
+	const DIAGNOSTIC_SNAPSHOT_MAX_PATH_BYTES: usize = 4096;
+	#[cfg(target_os = "macos")]
+	const DIAGNOSTIC_SNAPSHOT_MAX_COMPONENTS: usize = 128;
+	#[cfg(target_os = "macos")]
+	const DIAGNOSTIC_SNAPSHOT_MAX_BUDGET_MS: u32 = 10_000;
+
+	// Every producer and consumer of this classification is the Darwin diagnostic
+	// path; other targets answer with the fixed unsupported string instead.
+	#[cfg(target_os = "macos")]
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(super) enum DiagnosticFailure {
+		Absent,
+		Unsupported,
+		UnsafeDiscovery,
+		Timeout,
+	}
+
+	#[cfg(target_os = "macos")]
+	impl DiagnosticFailure {
+		pub(super) const fn reason(self) -> &'static str {
+			match self {
+				Self::Absent => "absent",
+				Self::Unsupported => "unsupported",
+				Self::UnsafeDiscovery => "unsafe_discovery",
+				Self::Timeout => "timeout",
+			}
+		}
+	}
+
+	/// The one publication this adapter may resolve. The peer never supplies a
+	/// leaf name, operation or path segment.
+	#[cfg(target_os = "macos")]
+	fn diagnostic_publication_path(
+		agent_dir: &str,
+	) -> Result<std::path::PathBuf, DiagnosticFailure> {
+		if agent_dir.is_empty()
+			|| agent_dir.contains('\0')
+			|| !agent_dir.starts_with('/')
+			|| agent_dir.len() > DIAGNOSTIC_SNAPSHOT_MAX_PATH_BYTES
+		{
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		let mut components = 0usize;
+		for component in Path::new(agent_dir).components() {
+			match component {
+				Component::RootDir => {},
+				Component::Normal(_) => components += 1,
+				Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+					return Err(DiagnosticFailure::Unsupported);
+				},
+			}
+		}
+		if components == 0 || components + 2 > DIAGNOSTIC_SNAPSHOT_MAX_COMPONENTS {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		Ok(Path::new(agent_dir).join("sdk").join("broker.json"))
+	}
+
+	#[cfg(target_os = "macos")]
+	fn diagnostic_open_failure(code: Option<&str>) -> DiagnosticFailure {
+		match code {
+			Some("not_found") => DiagnosticFailure::Absent,
+			Some("reparse_point" | "identity_mismatch" | "not_directory") => {
+				DiagnosticFailure::UnsafeDiscovery
+			},
+			_ => DiagnosticFailure::Unsupported,
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	// SAFETY: these declarations match the platform C ABI.
+	unsafe extern "C" {
+		fn acl_to_text(acl: *mut libc::c_void, len: *mut libc::ssize_t) -> *mut libc::c_char;
+		fn acl_valid(acl: *mut libc::c_void) -> libc::c_int;
+		fn acl_get_permset_mask_np(entry: *mut libc::c_void, mask: *mut u64) -> libc::c_int;
+		fn acl_size(acl: *mut libc::c_void) -> libc::ssize_t;
+		fn acl_copy_ext_native(
+			buf: *mut libc::c_void,
+			acl: *mut libc::c_void,
+			size: libc::ssize_t,
+		) -> libc::ssize_t;
+	}
+
+	/// Selector for the last entry.
+	#[cfg(target_os = "macos")]
+	const ACL_LAST_ENTRY: libc::c_int = -2;
+
+	/// `errno` the platform reports when entry iteration has reached the end.
+	#[cfg(target_os = "macos")]
+	const ACL_ERRNO_END_OF_ITERATION: i32 = libc::EINVAL;
+
+	/// Bounded external ACL representation (`kauth_filesec`, magic
+	/// `0x012cc16d`).
+	///
+	/// Layout from the platform SDK (`sys/kauth.h`): `u32 magic`, `guid_t
+	/// owner`, `guid_t group`, then `struct kauth_acl { u32 entrycount; u32
+	/// flags; kauth_ace ace[] }` with `struct kauth_ace { guid_t applicable;
+	/// u32 flags; u32 rights }`. A one-entry ACL is exactly 68 bytes, confirmed
+	/// against a real ACL on this runtime before this parser was relied on.
+	#[cfg(target_os = "macos")]
+	const KAUTH_FILESEC_MAGIC: u32 = 0x012c_c16d;
+
+	#[cfg(target_os = "macos")]
+	const KAUTH_FILESEC_HEADER_BYTES: usize = 44;
+
+	#[cfg(target_os = "macos")]
+	const KAUTH_ACE_BYTES: usize = 24;
+
+	#[cfg(target_os = "macos")]
+	const KAUTH_ACL_MAX_ENTRIES: u32 = 128;
+
+	/// The only entry-flag value the approved exception may carry: the deny tag
+	/// alone.
+	#[cfg(target_os = "macos")]
+	const KAUTH_ACE_DENY_ONLY: u32 = 2;
+
+	/// The only rights value the approved exception may carry: DELETE alone.
+	#[cfg(target_os = "macos")]
+	const KAUTH_VNODE_DELETE_ONLY: u32 = 1 << 4;
+
+	/// One parsed entry of the bounded external representation.
+	#[cfg(target_os = "macos")]
+	pub(super) struct ParsedAclEntry {
+		guid:   [u8; 16],
+		flags:  u32,
+		rights: u32,
+	}
+
+	/// A structurally validated external ACL representation.
+	#[cfg(target_os = "macos")]
+	pub(super) struct ParsedAclRepresentation {
+		count:        u32,
+		header_flags: u32,
+		entries:      Vec<ParsedAclEntry>,
+	}
+
+	/// Parse and structurally validate the bounded external representation.
+	/// Total length, magic and the entry count are all checked against each
+	/// other; nothing is reinterpreted beyond the documented layout.
+	#[cfg(target_os = "macos")]
+	pub(super) fn parse_acl_representation(bytes: &[u8]) -> Option<ParsedAclRepresentation> {
+		if bytes.len() < KAUTH_FILESEC_HEADER_BYTES {
+			return None;
+		}
+		let payload = bytes.len() - KAUTH_FILESEC_HEADER_BYTES;
+		if !payload.is_multiple_of(KAUTH_ACE_BYTES) {
+			return None;
+		}
+		let read_u32 = |offset: usize| -> u32 {
+			u32::from_le_bytes([
+				bytes[offset],
+				bytes[offset + 1],
+				bytes[offset + 2],
+				bytes[offset + 3],
+			])
+		};
+		if read_u32(0) != KAUTH_FILESEC_MAGIC {
+			return None;
+		}
+		let count = read_u32(36);
+		if u64::from(count) != (payload / KAUTH_ACE_BYTES) as u64 || count > KAUTH_ACL_MAX_ENTRIES {
+			return None;
+		}
+		let mut entries = Vec::with_capacity(count as usize);
+		for index in 0..count as usize {
+			let base = KAUTH_FILESEC_HEADER_BYTES + index * KAUTH_ACE_BYTES;
+			let mut guid = [0u8; 16];
+			guid.copy_from_slice(&bytes[base..base + 16]);
+			entries.push(ParsedAclEntry {
+				guid,
+				flags: read_u32(base + 16),
+				rights: read_u32(base + 20),
+			});
+		}
+		Some(ParsedAclRepresentation { count, header_flags: read_u32(40), entries })
+	}
+
+	/// Decide a parsed representation by full-field equality: exactly one entry,
+	/// ACL header flags entirely zero, entry flags exactly the deny tag, rights
+	/// exactly DELETE and the everyone GUID. A missing or malformed
+	/// representation proves nothing.
+	#[cfg(target_os = "macos")]
+	pub(super) fn classify_acl_representation(
+		parsed: Option<&ParsedAclRepresentation>,
+	) -> AncestorAclDecision {
+		let Some(representation) = parsed else {
+			return AncestorAclDecision::InspectionFailed;
+		};
+		if representation.count as usize != representation.entries.len() {
+			return AncestorAclDecision::InspectionFailed;
+		}
+		if representation.count != 1 || representation.header_flags != 0 {
+			return AncestorAclDecision::NotAllowlisted;
+		}
+		let entry = &representation.entries[0];
+		if entry.flags != KAUTH_ACE_DENY_ONLY || entry.rights != KAUTH_VNODE_DELETE_ONLY {
+			return AncestorAclDecision::NotAllowlisted;
+		}
+		if entry.guid != EVERYONE_GUID {
+			return AncestorAclDecision::NotAllowlisted;
+		}
+		AncestorAclDecision::SingleEveryoneDenyDelete
+	}
+
+	/// Clear `errno` immediately before a failable call.
+	#[cfg(target_os = "macos")]
+	fn reset_errno() {
+		#[cfg(test)]
+		note_acl_trace_for_test("reset");
+		// SAFETY: __error returns this thread's errno location.
+		unsafe { *libc::__error() = 0 };
+	}
+
+	/// Capture `errno` immediately after a failable call, before any other FFI
+	/// call.
+	#[cfg(target_os = "macos")]
+	fn capture_errno() -> i32 {
+		#[cfg(test)]
+		note_acl_trace_for_test("capture");
+		// SAFETY: __error returns this thread's errno location.
+		unsafe { *libc::__error() }
+	}
+
+	/// Selector for the entry after the first one.
+	#[cfg(target_os = "macos")]
+	const ACL_NEXT_ENTRY: libc::c_int = -1;
+
+	/// Raw well-known everyone GUID (`ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C`).
+	#[cfg(target_os = "macos")]
+	const EVERYONE_GUID: [u8; 16] = [
+		0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0x00, 0x00, 0x00,
+		0x0c,
+	];
+
+	#[cfg(target_os = "macos")]
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(super) enum StrictAclInspection {
+		Absent,
+		Present,
+		InspectionFailed,
+	}
+
+	#[cfg(target_os = "macos")]
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(super) enum AclFirstEntry {
+		Present,
+		EmptyCandidate,
+		InspectionFailed,
+	}
+
+	/// Classify `acl_get_fd` returning NULL. Only a stable descriptor whose file
+	/// genuinely has no ACL storage reports ENOENT.
+	#[cfg(target_os = "macos")]
+	pub(super) fn classify_acl_handle(errno: Option<i32>) -> StrictAclInspection {
+		if errno == Some(libc::ENOENT) {
+			StrictAclInspection::Absent
+		} else {
+			StrictAclInspection::InspectionFailed
+		}
+	}
+
+	/// Classify `acl_get_entry(acl, ACL_FIRST_ENTRY, …)`.
+	///
+	/// Apple documents 0 as "an entry was returned" and -1 as either end-of-ACL
+	/// (EINVAL) or a genuine error, so -1 alone proves nothing: every non-EINVAL
+	/// errno is an inspection failure, not emptiness.
+	#[cfg(target_os = "macos")]
+	pub(super) fn classify_acl_first_entry(result: i32, errno: Option<i32>) -> AclFirstEntry {
+		if result == 0 {
+			return AclFirstEntry::Present;
+		}
+		if result == -1 && errno == Some(libc::EINVAL) {
+			return AclFirstEntry::EmptyCandidate;
+		}
+		AclFirstEntry::InspectionFailed
+	}
+
+	/// Classify an empty-ACL candidate against this runtime's `acl_init(0)`
+	/// reference text.
+	#[cfg(target_os = "macos")]
+	pub(super) fn classify_empty_acl_candidate(
+		valid: bool,
+		observed: Option<&[u8]>,
+		reference: Option<&[u8]>,
+	) -> StrictAclInspection {
+		if !valid {
+			return StrictAclInspection::InspectionFailed;
+		}
+		match (observed, reference) {
+			(Some(observed), Some(reference)) if observed == reference => StrictAclInspection::Absent,
+			(Some(_), Some(_)) => StrictAclInspection::Present,
+			_ => StrictAclInspection::InspectionFailed,
+		}
+	}
+
+	/// Strict ACL classification for diagnostics.
+	///
+	/// Unlike `has_extended_acl`, a bare `acl_get_entry == -1` is NOT accepted
+	/// as proof of emptiness: only a genuinely empty ACL, proven by `acl_valid`
+	/// plus a bounded byte-equal `acl_to_text` comparison against `acl_init(0)`
+	/// on this same runtime, classifies as absent. Every other errno (ENOTSUP,
+	/// EBADF, EACCES, ENOMEM, EIO, unknown) is an inspection failure, never
+	/// emptiness.
+	#[cfg(target_os = "macos")]
+	pub(super) fn strict_acl_inspection(fd: libc::c_int) -> StrictAclInspection {
+		// SAFETY: fd is a live caller-retained descriptor; the returned ACL is freed
+		// exactly once on every branch below.
+		let acl = unsafe { acl_get_fd(fd) };
+		if acl.is_null() {
+			return classify_acl_handle(std::io::Error::last_os_error().raw_os_error());
+		}
+		let mut entry: *mut libc::c_void = std::ptr::null_mut();
+		// SAFETY: the ACL allocation is live and `entry` is a writable output pointer.
+		let entry_result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+		let entry_errno = if entry_result == 0 {
+			None
+		} else {
+			std::io::Error::last_os_error().raw_os_error()
+		};
+		match classify_acl_first_entry(entry_result, entry_errno) {
+			AclFirstEntry::Present => {
+				// SAFETY: owns the allocation from acl_get_fd and frees it once.
+				unsafe { acl_free(acl) };
+				return StrictAclInspection::Present;
+			},
+			AclFirstEntry::InspectionFailed => {
+				// SAFETY: owns the allocation from acl_get_fd and frees it once.
+				unsafe { acl_free(acl) };
+				return StrictAclInspection::InspectionFailed;
+			},
+			AclFirstEntry::EmptyCandidate => {},
+		}
+		// SAFETY: the ACL allocation is live for this validity check.
+		let valid = unsafe { acl_valid(acl) } == 0;
+		let observed = if valid { acl_text_bytes(acl) } else { None };
+		// SAFETY: owns the allocation from acl_get_fd and frees it once.
+		unsafe { acl_free(acl) };
+		// SAFETY: builds the reference empty ACL for this runtime; freed once below.
+		let reference_acl = unsafe { acl_init(0) };
+		if reference_acl.is_null() {
+			return StrictAclInspection::InspectionFailed;
+		}
+		let reference = acl_text_bytes(reference_acl);
+		// SAFETY: owns the allocation from acl_init and frees it once.
+		unsafe { acl_free(reference_acl) };
+		classify_empty_acl_candidate(valid, observed.as_deref(), reference.as_deref())
+	}
+
+	#[cfg(target_os = "macos")]
+	fn acl_text_bytes(acl: *mut libc::c_void) -> Option<Vec<u8>> {
+		let mut len: libc::ssize_t = 0;
+		// SAFETY: acl is a live ACL allocation and len is writable storage.
+		let text = unsafe { acl_to_text(acl, &mut len) };
+		if text.is_null() {
+			return None;
+		}
+		let mut bytes = Vec::new();
+		let mut index = 0usize;
+		let collected = loop {
+			if index > DIAGNOSTIC_SNAPSHOT_ACL_TEXT_MAX {
+				break None;
+			}
+			// SAFETY: text is a NUL-terminated C string shorter than the bound above.
+			let byte = unsafe { *text.add(index) };
+			if byte == 0 {
+				break Some(bytes);
+			}
+			bytes.push(byte as u8);
+			index += 1;
+		};
+		// SAFETY: owns the string allocation returned by acl_to_text and frees it once.
+		unsafe { acl_free(text.cast()) };
+		collected
+	}
+
+	/// What a trusted ancestor's ACL is allowed to be.
+	#[cfg(target_os = "macos")]
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(super) enum AncestorAclDecision {
+		/// No extended ACL at all.
+		Absent,
+		/// Exactly one non-inheriting everyone DENY DELETE entry, fully
+		/// validated.
+		SingleEveryoneDenyDelete,
+		/// Understood, but outside the approved allowlist.
+		NotAllowlisted,
+		/// The platform could not answer; never treated as either of the above.
+		InspectionFailed,
+	}
+
+	/// Classify a trusted ancestor's ACL: absent, the single approved
+	/// deny-delete ACE, or fail closed.
+	#[cfg(target_os = "macos")]
+	pub(super) fn ancestor_acl_decision(fd: libc::c_int) -> AncestorAclDecision {
+		match strict_acl_inspection(fd) {
+			StrictAclInspection::Absent => return AncestorAclDecision::Absent,
+			StrictAclInspection::InspectionFailed => return AncestorAclDecision::InspectionFailed,
+			StrictAclInspection::Present => {},
+		}
+		reset_errno();
+		// SAFETY: fd is a live retained descriptor; the ACL is freed once below.
+		let acl = unsafe { acl_get_fd(fd) };
+		let acl_errno = capture_errno();
+		#[cfg(test)]
+		let acl = if acl_fault_for_test().handle_null {
+			if !acl.is_null() {
+				// SAFETY: releases the real allocation before the injected NULL is used.
+				unsafe { acl_free(acl) };
+				note_acl_free_for_test();
+			}
+			std::ptr::null_mut()
+		} else {
+			acl
+		};
+		if acl.is_null() {
+			let _ = acl_errno;
+			return AncestorAclDecision::InspectionFailed;
+		}
+		let decision = ancestor_acl_decision_for_acl(acl);
+		// SAFETY: frees the allocation from acl_get_fd exactly once, after every
+		// capture.
+		unsafe { acl_free(acl) };
+		#[cfg(test)]
+		{
+			note_acl_free_for_test();
+			// The cleanup step is allowed to clobber errno; every decision above was
+			// already captured, so this must not be able to change the outcome.
+			if let Some(errno) = acl_fault_for_test().errno_after_free {
+				// SAFETY: __error returns this thread's errno location.
+				unsafe { *libc::__error() = errno };
+			}
+		}
+		decision
+	}
+
+	/// Decide a live ACL. Completeness comes from the bounded external
+	/// representation, and the cardinality is cross-checked on the live object
+	/// with strict errno discipline: reset immediately before each failable
+	/// call, capture immediately after and before any other FFI call or free.
+	/// `-1` alone never proves a single entry.
+	#[cfg(target_os = "macos")]
+	fn ancestor_acl_decision_for_acl(acl: *mut libc::c_void) -> AncestorAclDecision {
+		// SAFETY: acl is a live allocation owned by the caller.
+		let valid = unsafe { acl_valid(acl) };
+		#[cfg(test)]
+		let valid = if acl_fault_for_test().invalid_acl {
+			1
+		} else {
+			valid
+		};
+		if valid != 0 {
+			return AncestorAclDecision::InspectionFailed;
+		}
+
+		reset_errno();
+		// SAFETY: acl is live.
+		let size = unsafe { acl_size(acl) };
+		let size_errno = capture_errno();
+		#[cfg(test)]
+		let size = acl_fault_for_test().size.unwrap_or(size);
+		if size <= 0 || size > (1 << 20) {
+			let _ = size_errno;
+			return AncestorAclDecision::InspectionFailed;
+		}
+		let mut buffer = vec![0u8; size as usize];
+		reset_errno();
+		// SAFETY: buffer is writable with exactly `size` bytes and acl is live.
+		let copied = unsafe { acl_copy_ext_native(buffer.as_mut_ptr().cast(), acl, size) };
+		let copy_errno = capture_errno();
+		#[cfg(test)]
+		let copied = acl_fault_for_test().copied.unwrap_or(copied);
+		if copied != size {
+			let _ = copy_errno;
+			return AncestorAclDecision::InspectionFailed;
+		}
+		let representation_decision =
+			classify_acl_representation(parse_acl_representation(&buffer).as_ref());
+		if representation_decision != AncestorAclDecision::SingleEveryoneDenyDelete {
+			return representation_decision;
+		}
+
+		let mut first_entry: *mut libc::c_void = std::ptr::null_mut();
+		reset_errno();
+		// SAFETY: acl is live and the output pointer is writable.
+		let first = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut first_entry) };
+		#[cfg(test)]
+		note_acl_trace_for_test("call:first");
+		let first_errno = capture_errno();
+		#[cfg(test)]
+		let (first, first_errno) = acl_fault_for_test().first.unwrap_or((first, first_errno));
+		#[cfg(test)]
+		let first_entry = if acl_fault_for_test().first_entry_null {
+			std::ptr::null_mut()
+		} else {
+			first_entry
+		};
+		if first != 0 || first_entry.is_null() {
+			let _ = first_errno;
+			return AncestorAclDecision::InspectionFailed;
+		}
+
+		let mut last_entry: *mut libc::c_void = std::ptr::null_mut();
+		reset_errno();
+		// SAFETY: acl is live and the output pointer is writable.
+		let last = unsafe { acl_get_entry(acl, ACL_LAST_ENTRY, &mut last_entry) };
+		#[cfg(test)]
+		note_acl_trace_for_test("call:last");
+		let last_errno = capture_errno();
+		#[cfg(test)]
+		let (last, last_errno) = acl_fault_for_test().last.unwrap_or((last, last_errno));
+		#[cfg(test)]
+		let last_entry = {
+			let fault = acl_fault_for_test();
+			if fault.last_entry_null {
+				std::ptr::null_mut()
+			} else if fault.last_entry_mismatch {
+				// A different, non-null address: LAST must name the very same entry.
+				(first_entry as usize + 24) as *mut libc::c_void
+			} else {
+				last_entry
+			}
+		};
+		if last != 0 || last_entry.is_null() || last_entry != first_entry {
+			let _ = last_errno;
+			return AncestorAclDecision::InspectionFailed;
+		}
+
+		let mut next_entry: *mut libc::c_void = std::ptr::null_mut();
+		reset_errno();
+		// SAFETY: acl is live and the output pointer is writable.
+		let next = unsafe { acl_get_entry(acl, ACL_NEXT_ENTRY, &mut next_entry) };
+		#[cfg(test)]
+		note_acl_trace_for_test("call:next");
+		// Test-only mis-order control: record a cleanup and clobber errno BEFORE the
+		// capture, which is exactly the ordering the contract forbids.
+		#[cfg(test)]
+		if acl_fault_for_test().clobber_errno_before_capture {
+			note_acl_trace_for_test("free");
+			// SAFETY: __error returns this thread's errno location.
+			unsafe { *libc::__error() = libc::EIO };
+		}
+		let next_errno = capture_errno();
+		#[cfg(test)]
+		let (next, next_errno) = acl_fault_for_test().next.unwrap_or((next, next_errno));
+		if next == 0 {
+			// A second entry exists: outside the approved single-ACE exception.
+			return AncestorAclDecision::NotAllowlisted;
+		}
+		if next != -1 || next_errno != ACL_ERRNO_END_OF_ITERATION {
+			// An iteration failure is never proof that there is no second entry.
+			return AncestorAclDecision::InspectionFailed;
+		}
+
+		let mut mask: u64 = 0;
+		reset_errno();
+		// SAFETY: first_entry belongs to the live ACL and mask is writable.
+		let mask_result = unsafe { acl_get_permset_mask_np(first_entry, &mut mask) };
+		let mask_errno = capture_errno();
+		#[cfg(test)]
+		let mask_result = acl_fault_for_test().mask_result.unwrap_or(mask_result);
+		#[cfg(test)]
+		let mask = acl_fault_for_test().mask.unwrap_or(mask);
+		if mask_result != 0 {
+			let _ = mask_errno;
+			return AncestorAclDecision::InspectionFailed;
+		}
+		if mask != u64::from(KAUTH_VNODE_DELETE_ONLY) {
+			return AncestorAclDecision::NotAllowlisted;
+		}
+
+		AncestorAclDecision::SingleEveryoneDenyDelete
+	}
+
+	/// Test-only fault record for the call boundaries of the ACL decision above,
+	/// so the errno discipline and every failure branch can be observed on the
+	/// production path. Release builds contain none of this.
+	#[cfg(all(test, target_os = "macos"))]
+	#[derive(Clone, Copy, Default)]
+	pub(super) struct AclFaultForTest {
+		/// Force `acl_get_fd` to look like it returned NULL.
+		pub handle_null: bool,
+		/// Force `acl_valid` to report a non-zero (invalid) result.
+		pub invalid_acl: bool,
+		/// Replace the `acl_size` return value.
+		pub size: Option<libc::ssize_t>,
+		/// Replace the `acl_copy_ext_native` return value.
+		pub copied: Option<libc::ssize_t>,
+		/// Replace the FIRST iteration result and its captured errno.
+		pub first: Option<(libc::c_int, i32)>,
+		/// Make the FIRST entry pointer look NULL even though the call succeeded.
+		pub first_entry_null: bool,
+		/// Replace the LAST iteration result and its captured errno.
+		pub last: Option<(libc::c_int, i32)>,
+		/// Make the LAST entry pointer look NULL even though the call succeeded.
+		pub last_entry_null: bool,
+		/// Make LAST report a different entry than FIRST.
+		pub last_entry_mismatch: bool,
+		/// Replace the NEXT iteration result and its captured errno.
+		pub next: Option<(libc::c_int, i32)>,
+		/// Replace the permission mask getter result.
+		pub mask_result: Option<libc::c_int>,
+		/// Replace the reported permission mask.
+		pub mask: Option<u64>,
+		/// Have the free step change errno, to prove capture happens before
+		/// cleanup.
+		pub errno_after_free: Option<i32>,
+		/// Simulate cleanup-before-capture at the iterator boundary (negative
+		/// control).
+		pub clobber_errno_before_capture: bool,
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	static ACL_FAULT_FOR_TEST: std::sync::Mutex<Option<AclFaultForTest>> =
+		std::sync::Mutex::new(None);
+
+	#[cfg(all(test, target_os = "macos"))]
+	static ACL_FREE_CALLS_FOR_TEST: std::sync::atomic::AtomicUsize =
+		std::sync::atomic::AtomicUsize::new(0);
+
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn inject_acl_fault_for_test(value: Option<AclFaultForTest>) {
+		*ACL_FAULT_FOR_TEST
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+		ACL_FREE_CALLS_FOR_TEST.store(0, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn observed_errno_for_test() -> i32 {
+		capture_errno()
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn acl_free_calls_for_test() -> usize {
+		ACL_FREE_CALLS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	fn acl_fault_for_test() -> AclFaultForTest {
+		ACL_FAULT_FOR_TEST
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.unwrap_or_default()
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	fn note_acl_free_for_test() {
+		ACL_FREE_CALLS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		note_acl_trace_for_test("free");
+	}
+
+	/// Ordered record of the ACL call-boundary events, so the reset -> call ->
+	/// capture order can be asserted instead of argued. Test builds only.
+	#[cfg(all(test, target_os = "macos"))]
+	static ACL_TRACE_FOR_TEST: std::sync::Mutex<Vec<&'static str>> =
+		std::sync::Mutex::new(Vec::new());
+
+	#[cfg(all(test, target_os = "macos"))]
+	fn note_acl_trace_for_test(event: &'static str) {
+		if !ACL_TRACE_ENABLED_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
+			return;
+		}
+		ACL_TRACE_FOR_TEST
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.push(event);
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	static ACL_TRACE_ENABLED_FOR_TEST: std::sync::atomic::AtomicBool =
+		std::sync::atomic::AtomicBool::new(false);
+
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn start_acl_trace_for_test() {
+		ACL_TRACE_FOR_TEST
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.clear();
+		ACL_TRACE_ENABLED_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn take_acl_trace_for_test() -> Vec<&'static str> {
+		ACL_TRACE_ENABLED_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
+		std::mem::take(
+			&mut *ACL_TRACE_FOR_TEST
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner()),
+		)
+	}
+
+	#[cfg(target_os = "macos")]
+	fn strict_acl_absent(fd: libc::c_int) -> Result<(), DiagnosticFailure> {
+		match strict_acl_inspection(fd) {
+			StrictAclInspection::Absent => Ok(()),
+			StrictAclInspection::Present => Err(DiagnosticFailure::UnsafeDiscovery),
+			StrictAclInspection::InspectionFailed => Err(DiagnosticFailure::Unsupported),
+		}
+	}
+
+	/// Every descriptor must sit on a local, ownership-enforcing APFS mount. The
+	/// numeric filesystem type alone is never accepted as proof.
+	#[cfg(target_os = "macos")]
+	pub(super) fn local_ownership_filesystem(fd: libc::c_int) -> Result<(), DiagnosticFailure> {
+		// SAFETY: libc::statfs is a plain C structure fstatfs fully initializes.
+		let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+		// SAFETY: fd is live and info is writable storage.
+		if unsafe { libc::fstatfs(fd, &mut info) } != 0 {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		let mut name = Vec::new();
+		for byte in info.f_fstypename {
+			if byte == 0 {
+				break;
+			}
+			name.push(byte as u8);
+		}
+		if name != b"apfs" {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		let flags = u64::from(info.f_flags);
+		if flags & (libc::MNT_LOCAL as u64) == 0 || flags & (libc::MNT_IGNORE_OWNERSHIP as u64) != 0 {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		Ok(())
+	}
+
+	/// Ancestor admission: owned by root or the current user, never group/other
+	/// writable, never sticky (the first release has no sticky exception), on a
+	/// supported mount and with no extended ACL.
+	/// Strict-policy convenience used by the retained-ancestor regression rows.
+	#[cfg(all(test, target_os = "macos"))]
+	pub(in crate::path_identity::platform) fn diagnostic_ancestor_admitted(
+		directory: &File,
+		initial: &libc::stat,
+	) -> Result<(), DiagnosticFailure> {
+		diagnostic_ancestor_admitted_with_policy(directory, initial, AncestorAclPolicy::Strict)
+	}
+
+	/// Which ACL states a retained directory may have.
+	#[cfg(target_os = "macos")]
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(super) enum AncestorAclPolicy {
+		/// agentDir, sdk and the publication leaf: no extended ACL at all.
+		Strict,
+		/// Trusted ancestors STRICTLY ABOVE agentDir: absent, or exactly one
+		/// validated non-inheriting everyone DENY DELETE entry (user-approved
+		/// exception).
+		TrustedAboveAgentDir,
+	}
+
+	#[cfg(target_os = "macos")]
+	pub(super) fn diagnostic_ancestor_admitted_with_policy(
+		directory: &File,
+		initial: &libc::stat,
+		policy: AncestorAclPolicy,
+	) -> Result<(), DiagnosticFailure> {
+		local_ownership_filesystem(directory.as_raw_fd())?;
+		// SAFETY: geteuid only reads the process effective user identity.
+		let euid = unsafe { libc::geteuid() };
+		if initial.st_uid != 0 && initial.st_uid != euid {
+			return Err(DiagnosticFailure::UnsafeDiscovery);
+		}
+		let mode = u32::from(initial.st_mode);
+		if mode & 0o022 != 0 || mode & u32::from(libc::S_ISVTX) != 0 {
+			return Err(DiagnosticFailure::UnsafeDiscovery);
+		}
+		match policy {
+			AncestorAclPolicy::Strict => strict_acl_absent(directory.as_raw_fd()),
+			AncestorAclPolicy::TrustedAboveAgentDir => {
+				match ancestor_acl_decision(directory.as_raw_fd()) {
+					AncestorAclDecision::Absent | AncestorAclDecision::SingleEveryoneDenyDelete => {
+						Ok(())
+					},
+					AncestorAclDecision::NotAllowlisted => Err(DiagnosticFailure::UnsafeDiscovery),
+					AncestorAclDecision::InspectionFailed => Err(DiagnosticFailure::Unsupported),
+				}
+			},
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	pub(super) fn diagnostic_leaf_admitted(initial: &libc::stat) -> Result<(), DiagnosticFailure> {
+		// SAFETY: geteuid only reads the process effective user identity.
+		let euid = unsafe { libc::geteuid() };
+		let mode = u32::from(initial.st_mode);
+		if mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
+			|| initial.st_uid != euid
+			|| mode & 0o777 != 0o600
+			|| initial.st_nlink != 1
+			|| initial.st_size < 0
+			|| initial.st_size as u64 > DIAGNOSTIC_SNAPSHOT_MAX_BYTES as u64
+		{
+			return Err(DiagnosticFailure::UnsafeDiscovery);
+		}
+		Ok(())
+	}
+
+	/// Bounded positioned read. Never reads to EOF: a file that grows past the
+	/// budget between reads is rejected instead of truncated into a plausible
+	/// document.
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn diagnostic_bounded_read(fd: libc::c_int) -> Result<Vec<u8>, DiagnosticFailure> {
+		let mut buffer = vec![0u8; DIAGNOSTIC_SNAPSHOT_MAX_BYTES + 1];
+		let mut filled = 0usize;
+		loop {
+			let remaining = buffer.len() - filled;
+			if remaining == 0 {
+				return Err(DiagnosticFailure::UnsafeDiscovery);
+			}
+			// SAFETY: fd is live, the destination slice is writable, `remaining` bounds
+			// the write, and pread does not move the shared file offset.
+			let read = unsafe {
+				libc::pread(fd, buffer[filled..].as_mut_ptr().cast(), remaining, filled as libc::off_t)
+			};
+			if read < 0 {
+				let error = std::io::Error::last_os_error();
+				if error.raw_os_error() == Some(libc::EINTR) {
+					continue;
+				}
+				return Err(DiagnosticFailure::Unsupported);
+			}
+			if read == 0 {
+				break;
+			}
+			filled += read as usize;
+			if filled > DIAGNOSTIC_SNAPSHOT_MAX_BYTES {
+				return Err(DiagnosticFailure::UnsafeDiscovery);
+			}
+		}
+		buffer.truncate(filled);
+		Ok(buffer)
+	}
+
+	/// Exclusive read-only ownership of one validated publication descriptor
+	/// chain.
+	#[cfg(target_os = "macos")]
+	pub(super) struct DiagnosticSnapshotLease {
+		authority: CheckedPathAuthority,
+		deadline:  std::time::Instant,
+	}
+
+	/// The unsupported counterpart. It is inhabited so `&self` methods are sound
+	/// and lint-clean, and its private field keeps every caller outside this
+	/// module from constructing one: the only way to obtain a lease stays
+	/// `open_diagnostic_snapshot`, which refuses without touching the
+	/// filesystem.
+	#[cfg(not(target_os = "macos"))]
+	pub(super) struct DiagnosticSnapshotLease(());
+
+	/// Whether this build admits the diagnostic snapshot capability at all. The
+	/// observation contract was established for Darwin on arm64 only; a Darwin
+	/// x64 build reports unsupported before any path is opened.
+	#[cfg(target_os = "macos")]
+	pub(super) const fn diagnostic_runtime_supported() -> bool {
+		cfg!(all(target_os = "macos", target_arch = "aarch64"))
+	}
+
+	/// The retained directory chain of an authority: the walk root followed by
+	/// every opened component, ending at the directory holding the publication.
+	#[cfg(target_os = "macos")]
+	pub(in crate::path_identity::platform) fn retained_directories(
+		authority: &CheckedPathAuthority,
+	) -> Vec<&File> {
+		let mut directories: Vec<&File> = Vec::new();
+		if let Some(first) = authority.edges.first() {
+			directories.push(&first.parent);
+		}
+		for edge in &authority.edges {
+			directories.push(&edge.child);
+		}
+		directories
+	}
+
+	/// Prove the retained directory chain against its CURRENT metadata:
+	/// ownership, permission bits, sticky bit, mount semantics and absence of
+	/// an extended ACL for every ancestor, plus exact current-uid 0700 for
+	/// agentDir and sdk.
+	///
+	/// This runs on every use of a lease, not only at open: a directory that
+	/// becomes group-writable or gains an ACL after the descriptors were
+	/// retained keeps its dev/ino identity, so the identity-only revalidation
+	/// cannot see it.
+	#[cfg(target_os = "macos")]
+	pub(in crate::path_identity::platform) fn diagnostic_chain_admitted(
+		authority: &CheckedPathAuthority,
+	) -> Result<(), DiagnosticFailure> {
+		let directories = retained_directories(authority);
+		// root + agentDir + sdk is the shortest admissible chain.
+		if directories.len() < 3 {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		let mut current_stats = Vec::with_capacity(directories.len());
+		// The last two retained directories are agentDir and sdk; they stay strict.
+		// Only the trusted ancestors strictly above agentDir may carry the approved
+		// single everyone DENY DELETE entry.
+		let strict_from = directories.len() - 2;
+		for (index, directory) in directories.iter().enumerate() {
+			let current =
+				fstat(directory.as_raw_fd()).map_err(|_| DiagnosticFailure::UnsafeDiscovery)?;
+			let policy = if index >= strict_from {
+				AncestorAclPolicy::Strict
+			} else {
+				AncestorAclPolicy::TrustedAboveAgentDir
+			};
+			diagnostic_ancestor_admitted_with_policy(directory, &current, policy)?;
+			current_stats.push(current);
+		}
+		// SAFETY: geteuid only reads the process effective user identity.
+		let euid = unsafe { libc::geteuid() };
+		for current in current_stats.iter().rev().take(2) {
+			if current.st_uid != euid || u32::from(current.st_mode) & 0o777 != 0o700 {
+				return Err(DiagnosticFailure::UnsafeDiscovery);
+			}
+		}
+		Ok(())
+	}
+
+	/// Re-prove every retained ancestor plus the leaf on each use of a lease.
+	#[cfg(target_os = "macos")]
+	pub(in crate::path_identity::platform) fn diagnostic_reverify_authority(
+		authority: &CheckedPathAuthority,
+	) -> Result<(), DiagnosticFailure> {
+		let current =
+			revalidate_authority(authority).map_err(|_| DiagnosticFailure::UnsafeDiscovery)?;
+		diagnostic_chain_admitted(authority)?;
+		diagnostic_leaf_admitted(&current)?;
+		local_ownership_filesystem(authority.file.as_raw_fd())?;
+		strict_acl_absent(authority.file.as_raw_fd())
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	type DiagnosticReadHook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+	#[cfg(all(test, target_os = "macos"))]
+	static AFTER_DIAGNOSTIC_READ_HOOK: std::sync::Mutex<Option<DiagnosticReadHook>> =
+		std::sync::Mutex::new(None);
+
+	/// Install a barrier that pauses a diagnostic read after its bytes are
+	/// copied and before the post-read metadata comparison, so a test can
+	/// mutate the same inode.
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn set_after_diagnostic_read_hook_for_test(hook: Option<DiagnosticReadHook>) {
+		*AFTER_DIAGNOSTIC_READ_HOOK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	fn pause_after_diagnostic_read_for_test() {
+		let hook = AFTER_DIAGNOSTIC_READ_HOOK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take();
+		if let Some((entered, resume)) = hook {
+			entered.send(()).expect("diagnostic read hook receiver");
+			resume.recv().expect("diagnostic read hook resume");
+		}
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	static INJECTED_READ_INTERRUPTS: std::sync::atomic::AtomicU32 =
+		std::sync::atomic::AtomicU32::new(0);
+
+	#[cfg(all(test, target_os = "macos"))]
+	static INJECTED_SHORT_READ: std::sync::atomic::AtomicBool =
+		std::sync::atomic::AtomicBool::new(false);
+
+	/// Queue `count` interrupted `pread` results for the next diagnostic reads.
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn inject_diagnostic_read_interrupts_for_test(count: u32) {
+		INJECTED_READ_INTERRUPTS.store(count, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// How many injected interrupts are still queued.
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn pending_diagnostic_read_interrupts_for_test() -> u32 {
+		INJECTED_READ_INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	/// Force the next diagnostic read to copy fewer bytes than the file holds.
+	#[cfg(all(test, target_os = "macos"))]
+	pub(super) fn inject_diagnostic_short_read_for_test(enabled: bool) {
+		INJECTED_SHORT_READ.store(enabled, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// How many interrupted reads one snapshot may absorb. The byte budget alone
+	/// is not a work budget: without this an EINTR storm would spin forever.
+	#[cfg(target_os = "macos")]
+	const DIAGNOSTIC_READ_RETRY_BUDGET: u32 = 16;
+
+	#[cfg(target_os = "macos")]
+	pub(super) const fn diagnostic_retry_budget_exhausted(attempts: u32) -> bool {
+		attempts > DIAGNOSTIC_READ_RETRY_BUDGET
+	}
+
+	/// Whether two observations of the same descriptor describe the same
+	/// unchanged file, and whether the copied length is exactly that file's
+	/// size.
+	#[cfg(target_os = "macos")]
+	pub(super) fn diagnostic_snapshot_is_stable(
+		before: &libc::stat,
+		after: &libc::stat,
+		filled: usize,
+	) -> bool {
+		if !stat_same_object(before, after) {
+			return false;
+		}
+		if before.st_size != after.st_size
+			|| before.st_nlink != after.st_nlink
+			|| stat_mtime_ns(before) != stat_mtime_ns(after)
+			|| stat_ctime_ns(before) != stat_ctime_ns(after)
+		{
+			return false;
+		}
+		before.st_size >= 0 && u64::try_from(filled).is_ok_and(|read| read == before.st_size as u64)
+	}
+
+	/// One bounded, stability-checked read of the retained publication
+	/// descriptor.
+	///
+	/// A publication that is truncated, grown or rewritten in place while it is
+	/// being copied is NOT a snapshot: the same inode can hold a mixture of two
+	/// documents well below the byte cap, and a later semantic generation
+	/// comparison cannot repair token/endpoint bytes that were spliced together
+	/// here.
+	#[cfg(target_os = "macos")]
+	pub(super) fn diagnostic_read_stable(
+		fd: libc::c_int,
+		deadline: std::time::Instant,
+	) -> Result<Vec<u8>, DiagnosticFailure> {
+		if std::time::Instant::now() >= deadline {
+			return Err(DiagnosticFailure::Timeout);
+		}
+		let before = fstat(fd).map_err(|_| DiagnosticFailure::UnsafeDiscovery)?;
+		if u32::from(before.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG) {
+			return Err(DiagnosticFailure::UnsafeDiscovery);
+		}
+		if before.st_size < 0 || before.st_size as u64 > DIAGNOSTIC_SNAPSHOT_MAX_BYTES as u64 {
+			return Err(DiagnosticFailure::UnsafeDiscovery);
+		}
+		let mut buffer = vec![0u8; DIAGNOSTIC_SNAPSHOT_MAX_BYTES + 1];
+		let mut filled = 0usize;
+		let mut interrupted = 0u32;
+		loop {
+			if std::time::Instant::now() >= deadline {
+				return Err(DiagnosticFailure::Timeout);
+			}
+			#[allow(unused_mut, reason = "only the cfg(test) fault seam shortens the request")]
+			let mut remaining = buffer.len() - filled;
+			if remaining == 0 {
+				return Err(DiagnosticFailure::UnsafeDiscovery);
+			}
+			#[cfg(all(test, target_os = "macos"))]
+			{
+				// Fault injection for the retry-budget and short-read paths. Release
+				// builds contain none of this; the loop below is the production one.
+				if INJECTED_READ_INTERRUPTS
+					.fetch_update(
+						std::sync::atomic::Ordering::SeqCst,
+						std::sync::atomic::Ordering::SeqCst,
+						|pending| pending.checked_sub(1),
+					)
+					.is_ok()
+				{
+					interrupted += 1;
+					if diagnostic_retry_budget_exhausted(interrupted) {
+						return Err(DiagnosticFailure::Timeout);
+					}
+					continue;
+				}
+				if INJECTED_SHORT_READ.swap(false, std::sync::atomic::Ordering::SeqCst) {
+					// Simulate a premature end of data: one byte arrives and the copy
+					// stops, so the snapshot holds fewer bytes than the file does.
+					// SAFETY: fd is live and the single-byte destination is writable.
+					let short = unsafe {
+						libc::pread(fd, buffer[filled..].as_mut_ptr().cast(), 1, filled as libc::off_t)
+					};
+					if short > 0 {
+						filled += short as usize;
+					}
+					break;
+				}
+			}
+			// SAFETY: fd is live, the destination slice is writable, `remaining` bounds
+			// the write, and pread does not move the shared file offset.
+			let read = unsafe {
+				libc::pread(fd, buffer[filled..].as_mut_ptr().cast(), remaining, filled as libc::off_t)
+			};
+			if read < 0 {
+				let error = std::io::Error::last_os_error();
+				if error.raw_os_error() == Some(libc::EINTR) {
+					interrupted += 1;
+					if diagnostic_retry_budget_exhausted(interrupted) {
+						return Err(DiagnosticFailure::Timeout);
+					}
+					continue;
+				}
+				return Err(DiagnosticFailure::Unsupported);
+			}
+			if read == 0 {
+				break;
+			}
+			filled += read as usize;
+			if filled > DIAGNOSTIC_SNAPSHOT_MAX_BYTES {
+				return Err(DiagnosticFailure::UnsafeDiscovery);
+			}
+		}
+		#[cfg(test)]
+		pause_after_diagnostic_read_for_test();
+		let after = fstat(fd).map_err(|_| DiagnosticFailure::UnsafeDiscovery)?;
+		if !diagnostic_snapshot_is_stable(&before, &after, filled) {
+			return Err(DiagnosticFailure::UnsafeDiscovery);
+		}
+		if std::time::Instant::now() >= deadline {
+			return Err(DiagnosticFailure::Timeout);
+		}
+		buffer.truncate(filled);
+		Ok(buffer)
+	}
+
+	#[cfg(target_os = "macos")]
+	impl DiagnosticSnapshotLease {
+		fn deadline_remaining(&self) -> Result<(), DiagnosticFailure> {
+			if std::time::Instant::now() >= self.deadline {
+				return Err(DiagnosticFailure::Timeout);
+			}
+			Ok(())
+		}
+
+		fn admitted(&self) -> Result<(), DiagnosticFailure> {
+			diagnostic_reverify_authority(&self.authority)
+		}
+
+		fn read_snapshot(&self) -> Result<Vec<u8>, DiagnosticFailure> {
+			self.deadline_remaining()?;
+			self.admitted()?;
+			let bytes = diagnostic_read_stable(self.authority.file.as_raw_fd(), self.deadline)?;
+			self.admitted()?;
+			Ok(bytes)
+		}
+
+		pub(super) fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			self.read_snapshot().map_err(DiagnosticFailure::reason)
+		}
+
+		pub(super) fn revalidate_edges(&self) -> Result<(), &'static str> {
+			self
+				.deadline_remaining()
+				.and_then(|()| self.admitted())
+				.map_err(DiagnosticFailure::reason)
+		}
+	}
+
+	#[cfg(not(target_os = "macos"))]
+	impl DiagnosticSnapshotLease {
+		// The receiver is the contract, not an unused parameter: callers hold a
+		// retained lease and invoke `lease.read_bytes()`, which the macOS
+		// implementation answers from that lease's own descriptors. An associated
+		// function would change the API of a type whose whole purpose is to be held.
+		#[allow(clippy::unused_self, reason = "keeps the lease method API identical on every target")]
+		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			Err("unsupported")
+		}
+
+		#[allow(clippy::unused_self, reason = "keeps the lease method API identical on every target")]
+		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
+			Err("unsupported")
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	fn open_diagnostic_lease(
+		agent_dir: &str,
+		budget_ms: u32,
+	) -> Result<DiagnosticSnapshotLease, DiagnosticFailure> {
+		if !diagnostic_runtime_supported() {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		if budget_ms == 0 || budget_ms > DIAGNOSTIC_SNAPSHOT_MAX_BUDGET_MS {
+			return Err(DiagnosticFailure::Unsupported);
+		}
+		let publication = diagnostic_publication_path(agent_dir)?;
+		let deadline =
+			std::time::Instant::now() + std::time::Duration::from_millis(u64::from(budget_ms));
+		let authority = checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly)
+			.map_err(|result| diagnostic_open_failure(result.code.as_deref()))?;
+		diagnostic_chain_admitted(&authority)?;
+		diagnostic_leaf_admitted(&authority.initial)?;
+		local_ownership_filesystem(authority.file.as_raw_fd())?;
+		strict_acl_absent(authority.file.as_raw_fd())?;
+		let lease = DiagnosticSnapshotLease { authority, deadline };
+		lease.deadline_remaining()?;
+		lease.admitted()?;
+		Ok(lease)
+	}
+
+	#[cfg(target_os = "macos")]
+	pub(super) fn open_diagnostic_snapshot(
+		agent_dir: &str,
+		budget_ms: u32,
+	) -> Result<DiagnosticSnapshotLease, &'static str> {
+		open_diagnostic_lease(agent_dir, budget_ms).map_err(DiagnosticFailure::reason)
+	}
+
+	#[cfg(not(target_os = "macos"))]
+	// The fixed unsupported answer: no selector is parsed and no path is opened.
+	pub(super) const fn open_diagnostic_snapshot(
+		_agent_dir: &str,
+		_budget_ms: u32,
+	) -> Result<DiagnosticSnapshotLease, &'static str> {
+		Err("unsupported")
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	mod diagnostic_snapshot_tests {
+		use std::{
+			fs,
+			os::{
+				fd::AsRawFd,
+				unix::fs::{MetadataExt, PermissionsExt},
+			},
+			path::PathBuf,
+			process::Command,
+			sync::{
+				atomic::{AtomicU64, Ordering},
+				mpsc,
+			},
+		};
+
+		use super::{
+			AclFirstEntry, AcquisitionPolicy, DIAGNOSTIC_SNAPSHOT_MAX_BYTES, DiagnosticFailure,
+			StrictAclInspection, WRITE_FALLBACK_ATTEMPTS, checked_file_with_policy,
+			classify_acl_first_entry, classify_acl_handle, classify_empty_acl_candidate,
+			diagnostic_bounded_read, diagnostic_publication_path, diagnostic_read_stable,
+			diagnostic_reverify_authority, diagnostic_runtime_supported, local_ownership_filesystem,
+			open_diagnostic_lease, strict_acl_inspection,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-diagnostic-snapshot-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
+				));
+				fs::create_dir(&path).expect("create temp directory");
+				fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+					.expect("restrict temp directory");
+				Self(path)
+			}
+
+			fn agent_dir(&self) -> PathBuf {
+				let agent = self.0.join("agent");
+				let sdk = agent.join("sdk");
+				fs::create_dir_all(&sdk).expect("create publication directories");
+				for directory in [&agent, &sdk] {
+					fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+						.expect("restrict publication directory");
+				}
+				agent
+			}
+
+			fn publish(&self, bytes: &[u8]) -> PathBuf {
+				let agent = self.agent_dir();
+				let publication = agent.join("sdk").join("broker.json");
+				fs::write(&publication, bytes).expect("write publication");
+				fs::set_permissions(&publication, fs::Permissions::from_mode(0o600))
+					.expect("restrict publication");
+				agent
+			}
+		}
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+
+		fn agent_dir_string(path: &std::path::Path) -> String {
+			path.to_str().expect("utf8 fixture path").to_owned()
+		}
+
+		/// Whether this build admits the capability at all.
+		///
+		/// The whole test module compiles for every macOS architecture, but the
+		/// product refuses before opening anything unless the build is arm64.
+		/// Shape and positive expectations below are therefore arm64-only, and
+		/// every other architecture is asserted to fail closed with
+		/// `Unsupported` before a path is touched.
+		const ARCH_ADMITTED: bool = cfg!(target_arch = "aarch64");
+
+		/// The failure an unsupported architecture must produce for any selector.
+		fn unsupported_before_open(selector: &str) {
+			assert_eq!(
+				open_diagnostic_lease(selector, 2000).err(),
+				Some(DiagnosticFailure::Unsupported),
+				"an unsupported architecture must refuse before opening anything",
+			);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_rejects_unsafe_selectors_before_touching_the_filesystem() {
+			for selector in ["", "relative/agent", "/agent\0dir", "/agent/../escape", "/"] {
+				assert_eq!(
+					diagnostic_publication_path(selector),
+					Err(DiagnosticFailure::Unsupported),
+					"selector {selector:?}",
+				);
+			}
+			assert_eq!(
+				diagnostic_publication_path("/task/agent"),
+				Ok(PathBuf::from("/task/agent/sdk/broker.json")),
+			);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_rejects_budgets_outside_the_supported_window() {
+			let root = TempDir::new();
+			let agent = agent_dir_string(&root.publish(b"{}"));
+			// Both an out-of-range budget and an unsupported architecture are Unsupported,
+			// so this row holds on every macOS build.
+			for budget in [0, 10_001] {
+				assert_eq!(
+					open_diagnostic_lease(&agent, budget).err(),
+					Some(DiagnosticFailure::Unsupported),
+					"budget {budget}",
+				);
+			}
+		}
+
+		#[test]
+		fn diagnostic_snapshot_reports_absent_publication_without_guessing() {
+			let root = TempDir::new();
+			let agent = agent_dir_string(&root.agent_dir());
+			if !ARCH_ADMITTED {
+				unsupported_before_open(&agent);
+				return;
+			}
+			assert_eq!(open_diagnostic_lease(&agent, 2000).err(), Some(DiagnosticFailure::Absent),);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_strictly_classifies_acl_inspection_outcomes() {
+			let root = TempDir::new();
+			let plain = root.0.join("plain");
+			fs::write(&plain, b"plain").expect("write plain file");
+			fs::set_permissions(&plain, fs::Permissions::from_mode(0o600)).expect("restrict plain");
+			let plain_file = fs::File::open(&plain).expect("open plain file");
+			assert_eq!(strict_acl_inspection(plain_file.as_raw_fd()), StrictAclInspection::Absent,);
+
+			let guarded = root.0.join("guarded");
+			fs::write(&guarded, b"guarded").expect("write guarded file");
+			fs::set_permissions(&guarded, fs::Permissions::from_mode(0o600))
+				.expect("restrict guarded");
+			let applied = Command::new("/bin/chmod")
+				.args(["+a", "everyone allow read", guarded.to_str().expect("utf8 path")])
+				.status()
+				.expect("fixture chmod runs");
+			assert!(applied.success(), "fixture ACL must be installed");
+			let guarded_file = fs::File::open(&guarded).expect("open guarded file");
+			assert_eq!(strict_acl_inspection(guarded_file.as_raw_fd()), StrictAclInspection::Present,);
+
+			// A closed descriptor cannot prove emptiness: EBADF is an inspection
+			// failure, never "no ACL".
+			let closed = guarded_file.as_raw_fd();
+			drop(guarded_file);
+			assert_eq!(strict_acl_inspection(closed), StrictAclInspection::InspectionFailed);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_acl_handle_errnos_never_mean_absent_except_enoent() {
+			assert_eq!(classify_acl_handle(Some(libc::ENOENT)), StrictAclInspection::Absent);
+			for errno in [
+				libc::ENOTSUP,
+				libc::EOPNOTSUPP,
+				libc::EBADF,
+				libc::EACCES,
+				libc::ENOMEM,
+				libc::EIO,
+				libc::EINVAL,
+			] {
+				assert_eq!(
+					classify_acl_handle(Some(errno)),
+					StrictAclInspection::InspectionFailed,
+					"errno {errno}",
+				);
+			}
+			assert_eq!(classify_acl_handle(None), StrictAclInspection::InspectionFailed);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_first_entry_minus_one_is_empty_only_for_einval() {
+			assert_eq!(classify_acl_first_entry(0, None), AclFirstEntry::Present);
+			assert_eq!(
+				classify_acl_first_entry(-1, Some(libc::EINVAL)),
+				AclFirstEntry::EmptyCandidate,
+			);
+			// A malformed ACL, an unsupported filesystem, a stale descriptor or a
+			// stale errno must never be read as "this file has no ACL".
+			for errno in [
+				Some(libc::ENOTSUP),
+				Some(libc::EBADF),
+				Some(libc::EACCES),
+				Some(libc::ENOMEM),
+				Some(libc::EIO),
+				Some(libc::ENOENT),
+				None,
+			] {
+				assert_eq!(
+					classify_acl_first_entry(-1, errno),
+					AclFirstEntry::InspectionFailed,
+					"errno {errno:?}",
+				);
+			}
+			// An out-of-contract return value is never emptiness either.
+			assert_eq!(
+				classify_acl_first_entry(-2, Some(libc::EINVAL)),
+				AclFirstEntry::InspectionFailed,
+			);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_empty_candidate_requires_byte_equal_reference_text() {
+			assert_eq!(
+				classify_empty_acl_candidate(true, Some(b"!#acl 1\n"), Some(b"!#acl 1\n")),
+				StrictAclInspection::Absent,
+			);
+			assert_eq!(
+				classify_empty_acl_candidate(
+					true,
+					Some(b"!#acl 1\ngroup:everyone:allow:read\n"),
+					Some(b"!#acl 1\n"),
+				),
+				StrictAclInspection::Present,
+			);
+			assert_eq!(
+				classify_empty_acl_candidate(false, Some(b"!#acl 1\n"), Some(b"!#acl 1\n")),
+				StrictAclInspection::InspectionFailed,
+			);
+			assert_eq!(
+				classify_empty_acl_candidate(true, None, Some(b"!#acl 1\n")),
+				StrictAclInspection::InspectionFailed,
+			);
+			assert_eq!(
+				classify_empty_acl_candidate(true, Some(b"!#acl 1\n"), None),
+				StrictAclInspection::InspectionFailed,
+			);
+		}
+
+		fn install_acl(path: &std::path::Path) {
+			let applied = Command::new("/bin/chmod")
+				.args(["+a", "everyone allow read", path.to_str().expect("utf8 path")])
+				.status()
+				.expect("fixture chmod runs");
+			assert!(applied.success(), "fixture ACL must be installed");
+		}
+
+		fn remove_acl(path: &std::path::Path) {
+			let applied = Command::new("/bin/chmod")
+				.args(["-N", path.to_str().expect("utf8 path")])
+				.status()
+				.expect("fixture chmod runs");
+			assert!(applied.success(), "fixture ACL must be removed");
+		}
+
+		/// R2: a read-only acquisition must never retry a read denial with write
+		/// authority. The ordinary repair caller keeps that fallback.
+		#[test]
+		fn diagnostic_snapshot_readonly_acquisition_never_attempts_write_authority() {
+			let root = TempDir::new();
+			let agent = root.agent_dir();
+			let publication = agent.join("sdk").join("broker.json");
+			fs::write(&publication, b"{}").expect("write publication");
+			// Owner write, no owner read: the first O_RDONLY openat returns EACCES.
+			fs::set_permissions(&publication, fs::Permissions::from_mode(0o200))
+				.expect("write-only publication");
+
+			// Control: the ordinary repair policy still uses its fallback.
+			WRITE_FALLBACK_ATTEMPTS.store(0, Ordering::Relaxed);
+			let repairable =
+				checked_file_with_policy(&publication, "file", AcquisitionPolicy::RepairableWrite);
+			assert!(repairable.is_ok(), "ordinary repair acquisition still opens the leaf");
+			assert!(
+				WRITE_FALLBACK_ATTEMPTS.load(Ordering::Relaxed) >= 1,
+				"the ordinary repair caller must keep its write fallback",
+			);
+
+			// Read-only acquisition: zero write-authority attempts.
+			WRITE_FALLBACK_ATTEMPTS.store(0, Ordering::Relaxed);
+			let readonly = checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly);
+			assert!(readonly.is_err(), "read-only acquisition must fail closed on EACCES");
+			assert_eq!(
+				WRITE_FALLBACK_ATTEMPTS.load(Ordering::Relaxed),
+				0,
+				"read-only acquisition attempted write authority",
+			);
+
+			// The diagnostics entry point uses the read-only policy. On an unsupported
+			// architecture it refuses before opening anything, which trivially attempts no
+			// write authority either.
+			WRITE_FALLBACK_ATTEMPTS.store(0, Ordering::Relaxed);
+			let _ = open_diagnostic_lease(&agent_dir_string(&agent), 2000);
+			assert_eq!(
+				WRITE_FALLBACK_ATTEMPTS.load(Ordering::Relaxed),
+				0,
+				"diagnostics acquisition attempted write authority",
+			);
+		}
+
+		fn install_acl_spec(path: &std::path::Path, spec: &str) {
+			let applied = Command::new("/bin/chmod")
+				.args(["+a", spec, path.to_str().expect("utf8 path")])
+				.status()
+				.expect("fixture chmod runs");
+			assert!(applied.success(), "fixture ACL {spec} must be installed");
+		}
+
+		/// A disposable ancestor chain entirely inside the task fixture:
+		/// `<temp>/above/agent/sdk/broker.json`. Only `above` receives ACL
+		/// fixtures, so the approved exception can be exercised without
+		/// touching any existing path.
+		struct AncestorFixture {
+			root:  TempDir,
+			above: PathBuf,
+			agent: PathBuf,
+		}
+
+		impl AncestorFixture {
+			fn new(bytes: &[u8]) -> Self {
+				let root = TempDir::new();
+				let above = root.0.join("above");
+				let agent = above.join("agent");
+				let sdk = agent.join("sdk");
+				fs::create_dir_all(&sdk).expect("create fixture chain");
+				fs::set_permissions(&above, fs::Permissions::from_mode(0o755)).expect("ancestor mode");
+				for directory in [&agent, &sdk] {
+					fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+						.expect("restrict publication directory");
+				}
+				let publication = sdk.join("broker.json");
+				fs::write(&publication, bytes).expect("write publication");
+				fs::set_permissions(&publication, fs::Permissions::from_mode(0o600))
+					.expect("restrict publication");
+				Self { root, above, agent }
+			}
+
+			fn selector(&self) -> String {
+				agent_dir_string(&self.agent)
+			}
+
+			fn publication(&self) -> PathBuf {
+				self.agent.join("sdk").join("broker.json")
+			}
+
+			fn sdk(&self) -> PathBuf {
+				self.agent.join("sdk")
+			}
+		}
+
+		impl Drop for AncestorFixture {
+			fn drop(&mut self) {
+				// Disposable metadata is always released, whatever the assertions did.
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", self.above.to_str().unwrap_or(".")])
+					.status();
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", self.agent.to_str().unwrap_or(".")])
+					.status();
+				let _ = fs::set_permissions(&self.above, fs::Permissions::from_mode(0o755));
+				let _ = fs::set_permissions(&self.agent, fs::Permissions::from_mode(0o700));
+				let _ = &self.root;
+			}
+		}
+
+		/// The exact ACE the approved contract allows on a trusted ancestor above
+		/// agentDir.
+		const APPROVED_ANCESTOR_ACE: &str = "everyone deny delete";
+
+		/// Fixture helper source: writes an extended ACL with chosen header
+		/// flags, entry flags and rights through the platform's own ACL API.
+		/// Test-side only; production never sets an ACL.
+		const CRAFT_SOURCE: &str = r#"#include <errno.h>
+#include <sys/acl.h>
+#include <sys/kauth.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+	if (argc < 5) { return 2; }
+	size_t size = KAUTH_FILESEC_SIZE(1);
+	struct kauth_filesec *fs = calloc(1, size);
+	fs->fsec_magic = KAUTH_FILESEC_MAGIC;
+	fs->fsec_acl.acl_entrycount = 1;
+	fs->fsec_acl.acl_flags = (u_int32_t)strtoul(argv[2], NULL, 0);
+	struct kauth_ace *ace = &fs->fsec_acl.acl_ace[0];
+	static const unsigned char everyone[16] = {0xab,0xcd,0xef,0xab,0xcd,0xef,0xab,0xcd,0xef,0xab,0xcd,0xef,0x00,0x00,0x00,0x0c};
+	memcpy(&ace->ace_applicable, everyone, 16);
+	ace->ace_flags = (u_int32_t)strtoul(argv[3], NULL, 0);
+	ace->ace_rights = (u_int32_t)strtoul(argv[4], NULL, 0);
+	acl_t acl = acl_copy_int_native(fs);
+	free(fs);
+	if (!acl) { return 1; }
+	int rc = acl_set_file(argv[1], ACL_TYPE_EXTENDED, acl);
+	acl_free(acl);
+	return rc == 0 ? 0 : 1;
+}
+"#;
+
+		fn build_craft_tool(root: &std::path::Path) -> PathBuf {
+			let source = root.join("craft.c");
+			let binary = root.join("craft");
+			fs::write(&source, CRAFT_SOURCE).expect("write craft source");
+			let built = Command::new("/usr/bin/cc")
+				.args(["-o", binary.to_str().expect("utf8"), source.to_str().expect("utf8")])
+				.status()
+				.expect("cc runs");
+			assert!(built.success(), "craft helper must build");
+			binary
+		}
+
+		fn craft_acl(
+			tool: &std::path::Path,
+			target: &std::path::Path,
+			header: u32,
+			flags: u32,
+			rights: u32,
+		) {
+			let applied = Command::new(tool)
+				.args([
+					target.to_str().expect("utf8"),
+					&format!("0x{header:x}"),
+					&format!("0x{flags:x}"),
+					&format!("0x{rights:x}"),
+				])
+				.status()
+				.expect("craft runs");
+			assert!(applied.success(), "crafted ACL must be installed");
+		}
+
+		fn acl_decision_for(directory: &std::path::Path) -> super::AncestorAclDecision {
+			let handle = fs::File::open(directory).expect("open fixture directory");
+			super::ancestor_acl_decision(handle.as_raw_fd())
+		}
+
+		/// ACL-FULL-MASK: completeness is proven over the whole fields, not a
+		/// walk over the bits this code happens to enumerate.
+		#[test]
+		fn diagnostic_snapshot_acl_completeness_is_full_field() {
+			if !ARCH_ADMITTED {
+				return;
+			}
+			let root = TempDir::new();
+			let tool = build_craft_tool(&root.0);
+			let deny: u32 = 2;
+			let delete: u32 = 1 << 4;
+			let cases: [(&str, u32, u32, u32, super::AncestorAclDecision); 4] = [
+				("approved", 0, deny, delete, super::AncestorAclDecision::SingleEveryoneDenyDelete),
+				// The ACL header flag field was never inspected at all.
+				(
+					"header-no-inherit",
+					1 << 17,
+					deny,
+					delete,
+					super::AncestorAclDecision::NotAllowlisted,
+				),
+				// An entry flag outside the enumerated set.
+				(
+					"unknown-entry-flag",
+					0,
+					deny | (1 << 28),
+					delete,
+					super::AncestorAclDecision::NotAllowlisted,
+				),
+				// A right outside the enumerated set.
+				(
+					"unknown-right",
+					0,
+					deny,
+					delete | (1 << 30),
+					super::AncestorAclDecision::NotAllowlisted,
+				),
+			];
+			for (label, header, flags, rights, expected) in cases {
+				let directory = root.0.join(format!("case-{label}"));
+				fs::create_dir(&directory).expect("create case directory");
+				fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).expect("case mode");
+				craft_acl(&tool, &directory, header, flags, rights);
+				assert_eq!(acl_decision_for(&directory), expected, "case {label}");
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", directory.to_str().unwrap_or(".")])
+					.status();
+			}
+		}
+
+		/// ACL-COUNT-ERROR / ACL-FULL-MASK pure layer: the representation
+		/// decides, and every malformed or out-of-contract shape fails closed.
+		#[test]
+		fn diagnostic_snapshot_acl_representation_rows() {
+			fn build(
+				count: u32,
+				entries: usize,
+				header: u32,
+				flags: u32,
+				rights: u32,
+				magic: u32,
+				guid_byte: u8,
+				trailing: usize,
+			) -> Vec<u8> {
+				let mut bytes = vec![0u8; 44 + 24 * entries + trailing];
+				bytes[0..4].copy_from_slice(&magic.to_le_bytes());
+				bytes[36..40].copy_from_slice(&count.to_le_bytes());
+				bytes[40..44].copy_from_slice(&header.to_le_bytes());
+				for index in 0..entries {
+					let base = 44 + index * 24;
+					let guid: [u8; 16] = if guid_byte == 0 {
+						super::EVERYONE_GUID
+					} else {
+						[guid_byte; 16]
+					};
+					bytes[base..base + 16].copy_from_slice(&guid);
+					bytes[base + 16..base + 20].copy_from_slice(&flags.to_le_bytes());
+					bytes[base + 20..base + 24].copy_from_slice(&rights.to_le_bytes());
+				}
+				bytes
+			}
+			let magic = 0x012c_c16d_u32;
+			let approved = build(1, 1, 0, 2, 16, magic, 0, 0);
+			assert_eq!(
+				super::classify_acl_representation(super::parse_acl_representation(&approved).as_ref()),
+				super::AncestorAclDecision::SingleEveryoneDenyDelete,
+			);
+			for (label, bytes) in [
+				("zero-entries", build(0, 0, 0, 2, 16, magic, 0, 0)),
+				("two-entries", build(2, 2, 0, 2, 16, magic, 0, 0)),
+				("many-entries", build(5, 5, 0, 2, 16, magic, 0, 0)),
+				("header-flag", build(1, 1, 1 << 17, 2, 16, magic, 0, 0)),
+				("unknown-entry-flag", build(1, 1, 0, 2 | (1 << 28), 16, magic, 0, 0)),
+				("permit-tag", build(1, 1, 0, 1, 16, magic, 0, 0)),
+				("unknown-right", build(1, 1, 0, 2, 16 | (1 << 30), magic, 0, 0)),
+				("no-right", build(1, 1, 0, 2, 0, magic, 0, 0)),
+				("wrong-principal", build(1, 1, 0, 2, 16, magic, 7, 0)),
+			] {
+				assert_eq!(
+					super::classify_acl_representation(super::parse_acl_representation(&bytes).as_ref()),
+					super::AncestorAclDecision::NotAllowlisted,
+					"case {label}",
+				);
+			}
+			for (label, bytes) in [
+				("wrong-magic", build(1, 1, 0, 2, 16, 0xdead_beef, 0, 0)),
+				("trailing-bytes", build(1, 1, 0, 2, 16, magic, 0, 3)),
+				("count-mismatch", build(7, 1, 0, 2, 16, magic, 0, 0)),
+				("too-short", vec![0u8; 10]),
+				("empty", Vec::new()),
+			] {
+				assert_eq!(
+					super::classify_acl_representation(super::parse_acl_representation(&bytes).as_ref()),
+					super::AncestorAclDecision::InspectionFailed,
+					"case {label}",
+				);
+			}
+		}
+
+		/// The terminator errno the production iterator expects.
+		const ACL_ERRNO_END_OF_ITERATION_FOR_TEST: i32 = libc::EINVAL;
+
+		/// A crafted, disposable directory carrying exactly the approved ACE.
+		fn approved_fixture(root: &TempDir, name: &str, tool: &std::path::Path) -> PathBuf {
+			let directory = root.0.join(name);
+			fs::create_dir(&directory).expect("create fixture directory");
+			fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).expect("fixture mode");
+			craft_acl(tool, &directory, 0, 2, 1 << 4);
+			directory
+		}
+
+		/// Clears the injected fault even if the body panics.
+		struct FaultGuard;
+
+		impl Drop for FaultGuard {
+			fn drop(&mut self) {
+				super::inject_acl_fault_for_test(None);
+			}
+		}
+
+		fn with_fault<T>(fault: super::AclFaultForTest, body: impl FnOnce() -> T) -> T {
+			super::inject_acl_fault_for_test(Some(fault));
+			let _guard = FaultGuard;
+			body()
+		}
+
+		/// Removes a fixture ACL even if the assertions panic.
+		struct FixtureAclGuard(PathBuf);
+
+		impl Drop for FixtureAclGuard {
+			fn drop(&mut self) {
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", self.0.to_str().unwrap_or(".")])
+					.status();
+			}
+		}
+
+		/// ACL-REGRESSION-MATRIX bundle 1: the COUNT call boundary on the
+		/// production path.
+		///
+		/// Every row runs the real decision function with one injected fault at
+		/// the exact call site, with an unchanged control before and after.
+		/// These are call-boundary injections, not kernel faults and not an
+		/// exploit.
+		#[test]
+		fn diagnostic_snapshot_acl_count_call_boundary_matrix() {
+			if !ARCH_ADMITTED {
+				return;
+			}
+			let root = TempDir::new();
+			let tool = build_craft_tool(&root.0);
+			let directory = approved_fixture(&root, "count-matrix", &tool);
+			let approved = super::AncestorAclDecision::SingleEveryoneDenyDelete;
+			let unproven = super::AncestorAclDecision::InspectionFailed;
+			let refused = super::AncestorAclDecision::NotAllowlisted;
+			assert_eq!(acl_decision_for(&directory), approved, "control before the matrix");
+
+			let einval = ACL_ERRNO_END_OF_ITERATION_FOR_TEST;
+			let mut rows: Vec<(String, super::AclFaultForTest, super::AncestorAclDecision)> =
+				Vec::new();
+			for (label, errno) in
+				[("einval", einval), ("eio", libc::EIO), ("ebadf", libc::EBADF), ("unknown", 1234)]
+			{
+				// FIRST and LAST failures can never be read as a successful enumeration,
+				// whatever errno accompanies them -- including the iteration terminator.
+				rows.push((
+					format!("first-minus-one-{label}"),
+					super::AclFaultForTest { first: Some((-1, errno)), ..Default::default() },
+					unproven,
+				));
+				rows.push((
+					format!("last-minus-one-{label}"),
+					super::AclFaultForTest { last: Some((-1, errno)), ..Default::default() },
+					unproven,
+				));
+			}
+			rows.push((
+				"first-unexpected-return".to_owned(),
+				super::AclFaultForTest { first: Some((7, 0)), ..Default::default() },
+				unproven,
+			));
+			rows.push((
+				"last-unexpected-return".to_owned(),
+				super::AclFaultForTest { last: Some((7, 0)), ..Default::default() },
+				unproven,
+			));
+			rows.push((
+				"first-success-null-entry".to_owned(),
+				super::AclFaultForTest { first_entry_null: true, ..Default::default() },
+				unproven,
+			));
+			rows.push((
+				"last-success-null-entry".to_owned(),
+				super::AclFaultForTest { last_entry_null: true, ..Default::default() },
+				unproven,
+			));
+			rows.push((
+				"first-last-pointer-mismatch".to_owned(),
+				super::AclFaultForTest { last_entry_mismatch: true, ..Default::default() },
+				unproven,
+			));
+			// NEXT rows: a failure, a zero errno, an unexpected return and a real second
+			// entry are all distinguished from the valid terminator.
+			for (label, errno) in
+				[("eio", libc::EIO), ("ebadf", libc::EBADF), ("unknown", 1234), ("zero", 0)]
+			{
+				rows.push((
+					format!("next-minus-one-{label}"),
+					super::AclFaultForTest { next: Some((-1, errno)), ..Default::default() },
+					unproven,
+				));
+			}
+			rows.push((
+				"next-unexpected-return".to_owned(),
+				super::AclFaultForTest { next: Some((7, 0)), ..Default::default() },
+				unproven,
+			));
+			rows.push((
+				"next-second-entry".to_owned(),
+				super::AclFaultForTest { next: Some((0, 0)), ..Default::default() },
+				refused,
+			));
+			rows.push((
+				"next-valid-terminator".to_owned(),
+				super::AclFaultForTest { next: Some((-1, einval)), ..Default::default() },
+				approved,
+			));
+			// Cleanup must not be able to rewrite a captured errno: the free step changes
+			// errno here and the valid terminator still stands.
+
+			assert_eq!(rows.len(), 20, "pinned row count");
+			for (label, fault, expected) in rows {
+				let observed = with_fault(fault, || acl_decision_for(&directory));
+				assert_eq!(observed, expected, "count row {label}");
+				assert_eq!(acl_decision_for(&directory), approved, "control after {label}");
+			}
+
+			// Order regression: the cleanup step clobbers errno after the decision was
+			// captured. The outcome must be unchanged AND the clobber must be observable,
+			// so moving any capture after the free would flip this row.
+			super::inject_acl_fault_for_test(Some(super::AclFaultForTest {
+				errno_after_free: Some(libc::EIO),
+				..Default::default()
+			}));
+			let ordered = acl_decision_for(&directory);
+			let errno_after = super::observed_errno_for_test();
+			super::inject_acl_fault_for_test(None);
+			assert_eq!(
+				ordered, approved,
+				"a clobbered errno after cleanup must not change the decision"
+			);
+			assert_eq!(errno_after, libc::EIO, "the cleanup clobber must really have happened");
+			let _ = Command::new("/bin/chmod")
+				.args(["-N", directory.to_str().unwrap_or(".")])
+				.status();
+		}
+
+		/// ACL-REGRESSION-MATRIX bundle 3: every FFI failure on the production
+		/// path closes as unproven, releases no decision and frees the handle
+		/// exactly once.
+		#[test]
+		fn diagnostic_snapshot_acl_ffi_failure_matrix() {
+			if !ARCH_ADMITTED {
+				return;
+			}
+			let root = TempDir::new();
+			let tool = build_craft_tool(&root.0);
+			let directory = approved_fixture(&root, "ffi-matrix", &tool);
+			let approved = super::AncestorAclDecision::SingleEveryoneDenyDelete;
+			let unproven = super::AncestorAclDecision::InspectionFailed;
+			let refused = super::AncestorAclDecision::NotAllowlisted;
+			assert_eq!(acl_decision_for(&directory), approved, "control before the matrix");
+
+			let rows: [(&str, super::AclFaultForTest, super::AncestorAclDecision, usize); 10] = [
+				(
+					"handle-null",
+					super::AclFaultForTest { handle_null: true, ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"acl-invalid",
+					super::AclFaultForTest { invalid_acl: true, ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"size-negative",
+					super::AclFaultForTest { size: Some(-1), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"size-zero",
+					super::AclFaultForTest { size: Some(0), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"size-oversize",
+					super::AclFaultForTest { size: Some((1 << 20) + 1), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"copy-negative",
+					super::AclFaultForTest { copied: Some(-1), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"copy-short",
+					super::AclFaultForTest { copied: Some(24), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"copy-oversize",
+					super::AclFaultForTest { copied: Some(1 << 21), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"mask-getter-error",
+					super::AclFaultForTest { mask_result: Some(-1), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					// The u64 getter must match DELETE exactly, high bits included.
+					"mask-high-bit",
+					super::AclFaultForTest { mask: Some((1u64 << 32) | 16), ..Default::default() },
+					refused,
+					1,
+				),
+			];
+
+			for (label, fault, expected, expected_frees) in rows {
+				super::inject_acl_fault_for_test(Some(fault));
+				let observed = acl_decision_for(&directory);
+				let frees = super::acl_free_calls_for_test();
+				super::inject_acl_fault_for_test(None);
+				assert_eq!(observed, expected, "ffi row {label}");
+				assert_eq!(frees, expected_frees, "ffi row {label} must free the handle exactly once");
+				assert_eq!(acl_decision_for(&directory), approved, "control after {label}");
+			}
+			let _ = Command::new("/bin/chmod")
+				.args(["-N", directory.to_str().unwrap_or(".")])
+				.status();
+		}
+
+		/// Raw-trace predicate: the nine ancestor boundary events must appear in
+		/// order with NO cleanup interleaved, and a cleanup must follow the
+		/// window's final capture. Nothing is filtered out of the trace before
+		/// checking.
+		fn raw_order_verdict(trace: &[&str]) -> Result<(), &'static str> {
+			const EXPECTED: [&str; 9] = [
+				"reset",
+				"call:first",
+				"capture",
+				"reset",
+				"call:last",
+				"capture",
+				"reset",
+				"call:next",
+				"capture",
+			];
+			let ancestor_first = trace
+				.iter()
+				.rposition(|event| *event == "call:first")
+				.ok_or("no ancestor FIRST call")?;
+			if ancestor_first < 1 {
+				return Err("no reset before the ancestor FIRST call");
+			}
+			let start = ancestor_first - 1;
+			let window = trace
+				.get(start..start + EXPECTED.len())
+				.ok_or("window truncated")?;
+			if window.iter().any(|event| *event == "free") {
+				return Err("cleanup inside the ancestor window");
+			}
+			if window != EXPECTED {
+				return Err("window order differs");
+			}
+			let final_capture = start + EXPECTED.len() - 1;
+			if trace[start..final_capture]
+				.iter()
+				.any(|event| *event == "free")
+			{
+				return Err("cleanup inside the ancestor window");
+			}
+			if !trace[final_capture + 1..]
+				.iter()
+				.any(|event| *event == "free")
+			{
+				return Err("no cleanup after the final capture");
+			}
+			Ok(())
+		}
+
+		/// ACL-REGRESSION-MATRIX order: the recorded boundary events show reset
+		/// -> call -> capture at each iterator step, with every cleanup after
+		/// those captures. The negative control injects the forbidden order and
+		/// must fail closed.
+		#[test]
+		fn diagnostic_snapshot_acl_boundary_order_trace() {
+			if !ARCH_ADMITTED {
+				return;
+			}
+			let root = TempDir::new();
+			let tool = build_craft_tool(&root.0);
+			let directory = approved_fixture(&root, "order-trace", &tool);
+			let _acl_guard = FixtureAclGuard(directory.clone());
+
+			super::start_acl_trace_for_test();
+			let decision = acl_decision_for(&directory);
+			let trace = super::take_acl_trace_for_test();
+			assert_eq!(decision, super::AncestorAclDecision::SingleEveryoneDenyDelete);
+
+			// The raw trace is checked, so an interleaved cleanup cannot hide. The strict
+			// classification pass's own cleanup sits before the ancestor window.
+			assert_eq!(raw_order_verdict(&trace), Ok(()), "raw ancestor boundary order: {trace:?}");
+
+			// Negative sensitivity control: cleanup recorded and errno clobbered BEFORE the
+			// iterator capture. The trace shows the forbidden order and the decision
+			// closes. This is a sensitivity check on the instrumentation, not a restored
+			// history.
+			super::inject_acl_fault_for_test(Some(super::AclFaultForTest {
+				clobber_errno_before_capture: true,
+				..Default::default()
+			}));
+			let _fault_guard = FaultGuard;
+			super::start_acl_trace_for_test();
+			let misordered = acl_decision_for(&directory);
+			let misordered_trace = super::take_acl_trace_for_test();
+			assert_eq!(
+				misordered,
+				super::AncestorAclDecision::InspectionFailed,
+				"a capture taken after cleanup must not admit the fixture",
+			);
+			// The same raw predicate must reject the mis-ordered control for exactly the
+			// forbidden reason.
+			assert_eq!(
+				raw_order_verdict(&misordered_trace),
+				Err("cleanup inside the ancestor window"),
+				"the control must be rejected by the raw predicate: {misordered_trace:?}",
+			);
+		}
+
+		/// ACL-REGRESSION-MATRIX bundle 2: a finite bit walk over every field,
+		/// plus the structural rows. Pure, so JS and native can assert the same
+		/// expectations.
+		#[test]
+		fn diagnostic_snapshot_acl_full_field_bit_walk() {
+			fn representation(
+				count: u32,
+				entries: usize,
+				header: u32,
+				flags: u32,
+				rights: u32,
+			) -> Vec<u8> {
+				let mut bytes = vec![0u8; 44 + 24 * entries];
+				bytes[0..4].copy_from_slice(&0x012c_c16d_u32.to_le_bytes());
+				bytes[36..40].copy_from_slice(&count.to_le_bytes());
+				bytes[40..44].copy_from_slice(&header.to_le_bytes());
+				for index in 0..entries {
+					let base = 44 + index * 24;
+					bytes[base..base + 16].copy_from_slice(&super::EVERYONE_GUID);
+					bytes[base + 16..base + 20].copy_from_slice(&flags.to_le_bytes());
+					bytes[base + 20..base + 24].copy_from_slice(&rights.to_le_bytes());
+				}
+				bytes
+			}
+			fn decide(bytes: &[u8]) -> super::AncestorAclDecision {
+				super::classify_acl_representation(super::parse_acl_representation(bytes).as_ref())
+			}
+			let approved = super::AncestorAclDecision::SingleEveryoneDenyDelete;
+			let refused = super::AncestorAclDecision::NotAllowlisted;
+			let unproven = super::AncestorAclDecision::InspectionFailed;
+
+			assert_eq!(decide(&representation(1, 1, 0, 2, 1 << 4)), approved, "exact approved shape");
+
+			// 32-bit header walk: any header flag at all is outside the contract.
+			for bit in 0..32u32 {
+				assert_eq!(
+					decide(&representation(1, 1, 1u32 << bit, 2, 1 << 4)),
+					refused,
+					"header bit {bit}",
+				);
+			}
+			// Entry flags: every single-bit value other than the deny tag, and the deny tag
+			// with any extra bit, including the low kind bits.
+			for bit in 0..32u32 {
+				let solo = 1u32 << bit;
+				if solo != 2 {
+					assert_eq!(
+						decide(&representation(1, 1, 0, solo, 1 << 4)),
+						refused,
+						"entry solo bit {bit}"
+					);
+				}
+				let combined = 2u32 | solo;
+				if combined != 2 {
+					assert_eq!(
+						decide(&representation(1, 1, 0, combined, 1 << 4)),
+						refused,
+						"entry deny plus bit {bit}",
+					);
+				}
+			}
+			assert_eq!(decide(&representation(1, 1, 0, 0, 1 << 4)), refused, "entry flags zero");
+			// Rights: every single-bit value other than DELETE, and DELETE with any extra.
+			for bit in 0..32u32 {
+				let solo = 1u32 << bit;
+				if solo != 1 << 4 {
+					assert_eq!(
+						decide(&representation(1, 1, 0, 2, solo)),
+						refused,
+						"rights solo bit {bit}"
+					);
+				}
+				let combined = (1u32 << 4) | solo;
+				if combined != 1 << 4 {
+					assert_eq!(
+						decide(&representation(1, 1, 0, 2, combined)),
+						refused,
+						"rights delete plus bit {bit}",
+					);
+				}
+			}
+			assert_eq!(decide(&representation(1, 1, 0, 2, 0)), refused, "rights zero");
+
+			// Cardinality: an entry count other than one is refused, and a count the bytes
+			// do not support is unproven.
+			for count in [0u32, 2, 5, 128] {
+				let expected = if count == 1 { approved } else { refused };
+				assert_eq!(
+					decide(&representation(count, count as usize, 0, 2, 1 << 4)),
+					expected,
+					"count {count}"
+				);
+			}
+			assert_eq!(
+				decide(&representation(129, 129, 0, 2, 1 << 4)),
+				unproven,
+				"count 129 exceeds the maximum"
+			);
+			assert_eq!(
+				decide(&representation(0xffff_ffff, 1, 0, 2, 1 << 4)),
+				unproven,
+				"NOACL sentinel count"
+			);
+			assert_eq!(
+				decide(&representation(2, 1, 0, 2, 1 << 4)),
+				unproven,
+				"count exceeds the byte length"
+			);
+			assert_eq!(
+				decide(&representation(1, 2, 0, 2, 1 << 4)),
+				unproven,
+				"byte length exceeds the count"
+			);
+
+			// Magic and framing.
+			let mut swapped = representation(1, 1, 0, 2, 1 << 4);
+			swapped[0..4].copy_from_slice(&0x012c_c16d_u32.to_be_bytes());
+			assert_eq!(decide(&swapped), unproven, "byte-swapped magic");
+			let mut wrong_magic = representation(1, 1, 0, 2, 1 << 4);
+			wrong_magic[0..4].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+			assert_eq!(decide(&wrong_magic), unproven, "wrong magic");
+
+			let full = representation(1, 1, 0, 2, 1 << 4);
+			assert_eq!(decide(&full[..43]), unproven, "header truncated");
+			assert_eq!(decide(&full[..full.len() - 1]), unproven, "entry truncated");
+			let mut plus_one = full.clone();
+			plus_one.push(0);
+			assert_eq!(decide(&plus_one), unproven, "one trailing byte");
+			let mut plus_entry = full.clone();
+			plus_entry.extend(std::iter::repeat_n(0u8, 24));
+			assert_eq!(decide(&plus_entry), unproven, "one trailing entry without the count");
+			assert_eq!(decide(&[]), unproven, "empty");
+
+			// Wrong principal with an otherwise exact shape.
+			let mut stranger = representation(1, 1, 0, 2, 1 << 4);
+			stranger[44..60].copy_from_slice(&[7u8; 16]);
+			assert_eq!(decide(&stranger), refused, "wrong principal");
+		}
+
+		/// ACL-CONTRACT: exactly one non-inheriting everyone DENY DELETE ACE on a
+		/// trusted ancestor strictly above agentDir is admitted; absence stays
+		/// admitted too.
+		#[test]
+		fn diagnostic_snapshot_admits_single_everyone_deny_delete_ancestor() {
+			if !ARCH_ADMITTED {
+				let fixture = AncestorFixture::new(b"{}");
+				unsupported_before_open(&fixture.selector());
+				return;
+			}
+			let fixture = AncestorFixture::new(b"{\"generation\":\"fixture\"}");
+			// Control: an ACL-free ancestor chain is admitted.
+			let clean = open_diagnostic_lease(&fixture.selector(), 2000);
+			assert!(clean.is_ok(), "ACL-free ancestor chain must be admitted: {:?}", clean.err());
+			drop(clean);
+
+			install_acl_spec(&fixture.above, APPROVED_ANCESTOR_ACE);
+			let admitted = open_diagnostic_lease(&fixture.selector(), 2000);
+			assert!(
+				admitted.is_ok(),
+				"a single non-inheriting everyone deny delete ACE above agentDir must be admitted: \
+				 {:?}",
+				admitted.err(),
+			);
+		}
+
+		/// ACL-CONTRACT: a real positive lease returns the published bytes,
+		/// revalidates and closes, with the fixture unchanged by the
+		/// observation.
+		#[test]
+		fn diagnostic_snapshot_positive_lease_reads_and_revalidates() {
+			if !ARCH_ADMITTED {
+				let fixture = AncestorFixture::new(b"{}");
+				unsupported_before_open(&fixture.selector());
+				return;
+			}
+			let payload = b"{\"generation\":\"0123456789abcdef\",\"protocol\":1}";
+			let fixture = AncestorFixture::new(payload);
+			install_acl_spec(&fixture.above, APPROVED_ANCESTOR_ACE);
+			let before = fs::metadata(fixture.publication()).expect("publication metadata");
+
+			let lease = match open_diagnostic_lease(&fixture.selector(), 2000) {
+				Ok(lease) => lease,
+				Err(failure) => panic!("positive lease must open: {failure:?}"),
+			};
+			assert_eq!(lease.read_bytes(), Ok(payload.to_vec()));
+			assert_eq!(lease.revalidate_edges(), Ok(()));
+			// A second read of an unchanged publication is still the same snapshot.
+			assert_eq!(lease.read_bytes(), Ok(payload.to_vec()));
+
+			let after = fs::metadata(fixture.publication()).expect("publication metadata");
+			assert_eq!(before.mode(), after.mode(), "observation must not change modes");
+			assert_eq!(before.len(), after.len(), "observation must not change bytes");
+			assert_eq!(fs::read(fixture.publication()).expect("read publication"), payload.to_vec(),);
+		}
+
+		/// ACL-CONTRACT: after a successful lease, mutating the task fixture's
+		/// own metadata makes the next read and revalidate refuse and withhold
+		/// bytes.
+		#[test]
+		fn diagnostic_snapshot_refuses_after_fixture_mutation() {
+			if !ARCH_ADMITTED {
+				let fixture = AncestorFixture::new(b"{}");
+				unsupported_before_open(&fixture.selector());
+				return;
+			}
+			let payload = b"{\"generation\":\"mutation\"}";
+			for mutation in [
+				"agent-mode-0755",
+				"sdk-mode-0770",
+				"agent-acl",
+				"sdk-acl",
+				"above-allow-acl",
+				"above-mode",
+			] {
+				let fixture = AncestorFixture::new(payload);
+				install_acl_spec(&fixture.above, APPROVED_ANCESTOR_ACE);
+				let lease = match open_diagnostic_lease(&fixture.selector(), 2000) {
+					Ok(lease) => lease,
+					Err(failure) => panic!("positive lease must open for {mutation}: {failure:?}"),
+				};
+				// Unchanged control first.
+				assert_eq!(lease.read_bytes(), Ok(payload.to_vec()), "{mutation} baseline");
+
+				match mutation {
+					"agent-mode-0755" => {
+						fs::set_permissions(&fixture.agent, fs::Permissions::from_mode(0o755))
+							.expect("loosen agent mode");
+					},
+					"sdk-mode-0770" => {
+						fs::set_permissions(&fixture.sdk(), fs::Permissions::from_mode(0o770))
+							.expect("loosen sdk mode");
+					},
+					"agent-acl" => install_acl_spec(&fixture.agent, APPROVED_ANCESTOR_ACE),
+					"sdk-acl" => install_acl_spec(&fixture.sdk(), APPROVED_ANCESTOR_ACE),
+					"above-allow-acl" => install_acl_spec(&fixture.above, "everyone allow write"),
+					"above-mode" => {
+						fs::set_permissions(&fixture.above, fs::Permissions::from_mode(0o777))
+							.expect("loosen ancestor mode");
+					},
+					other => panic!("unhandled mutation {other}"),
+				}
+
+				let read = lease.read_bytes();
+				assert!(read.is_err(), "{mutation}: read must refuse, got {read:?}");
+				assert!(lease.revalidate_edges().is_err(), "{mutation}: revalidate must refuse");
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", fixture.sdk().to_str().unwrap_or(".")])
+					.status();
+			}
+		}
+
+		/// ACL-CONTRACT: every ancestor ACL shape outside the exact allowlist
+		/// fails closed.
+		#[test]
+		fn diagnostic_snapshot_rejects_non_allowlisted_ancestor_acls() {
+			if !ARCH_ADMITTED {
+				let fixture = AncestorFixture::new(b"{}");
+				unsupported_before_open(&fixture.selector());
+				return;
+			}
+			let cases: [(&str, &[&str]); 6] = [
+				("allow", &["everyone allow read"]),
+				("mixed", &["everyone deny delete", "everyone allow read"]),
+				("inherited", &["everyone deny delete,file_inherit"]),
+				("extra-rights", &["everyone deny delete,write"]),
+				("wrong-principal", &["staff deny delete"]),
+				("multiple-deny", &["everyone deny delete", "staff deny delete"]),
+			];
+			for (label, specs) in cases {
+				let fixture = AncestorFixture::new(b"{}");
+				for spec in specs {
+					install_acl_spec(&fixture.above, spec);
+				}
+				let outcome = open_diagnostic_lease(&fixture.selector(), 2000);
+				assert!(outcome.is_err(), "ancestor ACL case {label} must fail closed, got a lease",);
+			}
+		}
+
+		/// ACL-CONTRACT: the exception stops at agentDir. agentDir, sdk and the
+		/// leaf keep strict ACL absence even for the otherwise approved ACE.
+		#[test]
+		fn diagnostic_snapshot_keeps_agent_boundary_strict() {
+			if !ARCH_ADMITTED {
+				let fixture = AncestorFixture::new(b"{}");
+				unsupported_before_open(&fixture.selector());
+				return;
+			}
+			for target in ["agent", "sdk", "leaf"] {
+				let fixture = AncestorFixture::new(b"{}");
+				install_acl_spec(&fixture.above, APPROVED_ANCESTOR_ACE);
+				let path = match target {
+					"agent" => fixture.agent.clone(),
+					"sdk" => fixture.sdk(),
+					_ => fixture.publication(),
+				};
+				install_acl_spec(&path, APPROVED_ANCESTOR_ACE);
+				let outcome = open_diagnostic_lease(&fixture.selector(), 2000);
+				assert!(outcome.is_err(), "the approved ACE must NOT be accepted on {target}",);
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", path.to_str().unwrap_or(".")])
+					.status();
+			}
+		}
+
+		/// R3: retained-ancestor policy is re-proved against CURRENT metadata.
+		///
+		/// The end-to-end lease form of this proof needs a whole-chain positive
+		/// lease, which the stock home `everyone deny delete` ACL still refuses
+		/// (that ACL is deliberately unchanged and the relaxation is not
+		/// approved), so the two halves are proved separately here: the
+		/// identity-only revalidation accepts a loosened or newly ACL-bearing
+		/// directory, while the diagnostics ancestor policy applied
+		/// to the current metadata refuses it.
+		#[test]
+		fn diagnostic_snapshot_reverifies_every_retained_ancestor() {
+			let root = TempDir::new();
+			let agent = root.publish(b"{}");
+			let sdk = agent.join("sdk");
+			let publication = sdk.join("broker.json");
+			let authority =
+				match checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly) {
+					Ok(authority) => authority,
+					Err(_) => panic!("retain the fixture publication chain"),
+				};
+
+			for directory in [&sdk, &agent] {
+				let handle = fs::File::open(directory).expect("open retained directory");
+				let baseline = super::fstat(handle.as_raw_fd())
+					.ok()
+					.expect("fstat directory");
+				assert_eq!(
+					super::diagnostic_ancestor_admitted(&handle, &baseline),
+					Ok(()),
+					"unchanged control: {directory:?}",
+				);
+
+				// Group-writable: the ancestor policy rejects ambient write on any
+				// retained directory. (Exact 0700 for agentDir/sdk is the chain policy.)
+				fs::set_permissions(directory, fs::Permissions::from_mode(0o770))
+					.expect("loosen retained directory");
+				let loosened = super::fstat(handle.as_raw_fd())
+					.ok()
+					.expect("fstat directory");
+				// Identity-only revalidation cannot see this: dev/ino/uid/type are intact.
+				assert!(
+					super::revalidate_authority(&authority).is_ok(),
+					"identity-only revalidation must still accept the loosened chain",
+				);
+				assert_eq!(
+					super::diagnostic_ancestor_admitted(&handle, &loosened),
+					Err(DiagnosticFailure::UnsafeDiscovery),
+					"a loosened retained directory must fail closed: {directory:?}",
+				);
+				fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+					.expect("restore retained directory");
+
+				install_acl(directory);
+				let with_acl = super::fstat(handle.as_raw_fd())
+					.ok()
+					.expect("fstat directory");
+				assert!(
+					super::revalidate_authority(&authority).is_ok(),
+					"identity-only revalidation must still accept the ACL-bearing chain",
+				);
+				assert_eq!(
+					super::diagnostic_ancestor_admitted(&handle, &with_acl),
+					Err(DiagnosticFailure::UnsafeDiscovery),
+					"an ACL added to a retained directory must fail closed: {directory:?}",
+				);
+				remove_acl(directory);
+				assert_eq!(
+					super::diagnostic_ancestor_admitted(&handle, &with_acl),
+					Ok(()),
+					"restored control: {directory:?}",
+				);
+			}
+
+			// The lease-level outcome is asserted against an EXPLICITLY DETECTED fixture
+			// condition instead of the ambient environment: the chain is admissible only
+			// when no retained directory carries an extended ACL. Both branches are
+			// deterministic, so this test is correct on an ACL-free root as well.
+			// `Present` and `InspectionFailed` are NOT the same outcome: an ACE that exists
+			// is unsafe_discovery, while an ACL the platform could not answer for is
+			// unsupported. Collapsing them would assert a failure mode the product does not
+			// produce.
+			// Follows the approved contract: trusted ancestors strictly above agentDir may
+			// carry exactly one validated everyone DENY DELETE entry, while agentDir and
+			// sdk stay strict. The expectation is derived from the same decision the
+			// product makes, position by position.
+			let mut chain_acl_present = false;
+			let mut chain_acl_unproven = false;
+			let retained = super::retained_directories(&authority);
+			let strict_from = retained.len() - 2;
+			for (index, directory) in retained.iter().enumerate() {
+				if index >= strict_from {
+					match super::strict_acl_inspection(directory.as_raw_fd()) {
+						StrictAclInspection::Present => chain_acl_present = true,
+						StrictAclInspection::InspectionFailed => chain_acl_unproven = true,
+						StrictAclInspection::Absent => {},
+					}
+					continue;
+				}
+				match super::ancestor_acl_decision(directory.as_raw_fd()) {
+					super::AncestorAclDecision::NotAllowlisted => chain_acl_present = true,
+					super::AncestorAclDecision::InspectionFailed => chain_acl_unproven = true,
+					super::AncestorAclDecision::Absent
+					| super::AncestorAclDecision::SingleEveryoneDenyDelete => {},
+				}
+			}
+			let chain_has_acl = chain_acl_present || chain_acl_unproven;
+			let expected = if chain_acl_unproven {
+				Err(DiagnosticFailure::Unsupported)
+			} else if chain_acl_present {
+				Err(DiagnosticFailure::UnsafeDiscovery)
+			} else {
+				Ok(())
+			};
+			assert_eq!(
+				super::diagnostic_chain_admitted(&authority),
+				expected,
+				"chain_has_acl={chain_has_acl}"
+			);
+			assert_eq!(
+				diagnostic_reverify_authority(&authority),
+				expected,
+				"chain_has_acl={chain_has_acl}"
+			);
+
+			// An ACL installed on a retained directory by this test is always refused,
+			// whatever the surrounding environment looks like.
+			install_acl(&sdk);
+			assert_eq!(
+				super::diagnostic_chain_admitted(&authority),
+				Err(DiagnosticFailure::UnsafeDiscovery),
+			);
+			remove_acl(&sdk);
+			assert_eq!(super::diagnostic_chain_admitted(&authority), expected);
+		}
+
+		/// R4: interrupted reads are retried within a bounded budget, and a short
+		/// read is never reported as a stable snapshot. The faults are injected
+		/// into the real production read loop, not into a helper copy of it.
+		#[test]
+		fn diagnostic_snapshot_read_bounds_interrupts_and_short_reads() {
+			let root = TempDir::new();
+			let target = root.0.join("payload");
+			fs::write(&target, b"payload-bytes").expect("write payload");
+			fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("restrict payload");
+			let handle = fs::File::open(&target).expect("open payload");
+			let far = || std::time::Instant::now() + std::time::Duration::from_millis(5000);
+
+			// Interrupts inside the budget are absorbed and the snapshot still succeeds.
+			super::inject_diagnostic_read_interrupts_for_test(super::DIAGNOSTIC_READ_RETRY_BUDGET);
+			assert_eq!(
+				diagnostic_read_stable(handle.as_raw_fd(), far()),
+				Ok(b"payload-bytes".to_vec()),
+			);
+			assert_eq!(super::pending_diagnostic_read_interrupts_for_test(), 0);
+
+			// One interrupt past the budget stops the read instead of spinning.
+			super::inject_diagnostic_read_interrupts_for_test(super::DIAGNOSTIC_READ_RETRY_BUDGET + 1);
+			assert_eq!(
+				diagnostic_read_stable(handle.as_raw_fd(), far()),
+				Err(DiagnosticFailure::Timeout),
+			);
+			super::inject_diagnostic_read_interrupts_for_test(0);
+
+			// A short read leaves fewer bytes than the file holds: not a snapshot.
+			super::inject_diagnostic_short_read_for_test(true);
+			assert_eq!(
+				diagnostic_read_stable(handle.as_raw_fd(), far()),
+				Err(DiagnosticFailure::UnsafeDiscovery),
+			);
+			super::inject_diagnostic_short_read_for_test(false);
+
+			// Control: with no injected fault the same descriptor still succeeds.
+			assert_eq!(
+				diagnostic_read_stable(handle.as_raw_fd(), far()),
+				Ok(b"payload-bytes".to_vec()),
+			);
+		}
+
+		/// R4: one read is a stable snapshot or it is a failure.
+		#[test]
+		fn diagnostic_snapshot_read_requires_a_stable_snapshot() {
+			let root = TempDir::new();
+			let stable = root.0.join("stable");
+			fs::write(&stable, b"stable-bytes").expect("write stable payload");
+			fs::set_permissions(&stable, fs::Permissions::from_mode(0o600)).expect("restrict");
+			let file = fs::File::open(&stable).expect("open stable payload");
+			let far = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+			assert_eq!(diagnostic_read_stable(file.as_raw_fd(), far), Ok(b"stable-bytes".to_vec()),);
+
+			// An already expired deadline forbids the read outright.
+			assert_eq!(
+				diagnostic_read_stable(file.as_raw_fd(), std::time::Instant::now()),
+				Err(DiagnosticFailure::Timeout),
+			);
+
+			// Same-inode truncate between the read and the post-read metadata check.
+			for mutation in ["truncate", "same-size-overwrite"] {
+				let target = root.0.join(format!("mutated-{mutation}"));
+				fs::write(&target, b"0123456789").expect("write payload");
+				fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("restrict");
+				let handle = fs::File::open(&target).expect("open payload");
+				let (entered_tx, entered_rx) = mpsc::channel();
+				let (resume_tx, resume_rx) = mpsc::channel();
+				super::set_after_diagnostic_read_hook_for_test(Some((entered_tx, resume_rx)));
+				let fd = handle.as_raw_fd();
+				let reader = std::thread::spawn(move || {
+					diagnostic_read_stable(
+						fd,
+						std::time::Instant::now() + std::time::Duration::from_millis(5000),
+					)
+				});
+				entered_rx
+					.recv()
+					.expect("reader reached the post-read barrier");
+				if mutation == "truncate" {
+					fs::write(&target, b"012").expect("truncate payload");
+				} else {
+					fs::write(&target, b"abcdefghij").expect("same-size overwrite");
+				}
+				resume_tx.send(()).expect("resume reader");
+				let outcome = reader.join().expect("reader thread");
+				assert_eq!(
+					outcome,
+					Err(DiagnosticFailure::UnsafeDiscovery),
+					"mid-read {mutation} must not be reported as a stable snapshot",
+				);
+				super::set_after_diagnostic_read_hook_for_test(None);
+			}
+		}
+
+		/// R6: the native capability is gated on the supported runtime tuple, and
+		/// the assertion follows the build's own architecture instead of
+		/// hard-coding arm64.
+		#[test]
+		fn diagnostic_snapshot_runtime_tuple_is_gated() {
+			assert_eq!(
+				diagnostic_runtime_supported(),
+				cfg!(all(target_os = "macos", target_arch = "aarch64")),
+			);
+			// The test module's own admission constant must follow the product gate, so the
+			// arch-conditional expectations below cannot drift from what the product does.
+			assert_eq!(ARCH_ADMITTED, diagnostic_runtime_supported());
+			#[cfg(target_arch = "aarch64")]
+			{
+				// Supported architecture: a real fixture is admitted up to its own policy.
+				let root = TempDir::new();
+				let agent = root.agent_dir();
+				assert_eq!(
+					open_diagnostic_lease(&agent_dir_string(&agent), 2000).err(),
+					Some(DiagnosticFailure::Absent),
+					"an admissible arm64 fixture reaches publication resolution",
+				);
+			}
+			#[cfg(not(target_arch = "aarch64"))]
+			{
+				// Unsupported architecture: refused before any path is opened, so even a
+				// syntactically fine selector cannot reach publication resolution.
+				assert_eq!(
+					open_diagnostic_lease("/nonexistent-agent-dir", 2000).err(),
+					Some(DiagnosticFailure::Unsupported),
+				);
+			}
+		}
+
+		#[test]
+		fn diagnostic_snapshot_requires_local_ownership_enforcing_apfs() {
+			let root = TempDir::new();
+			let directory = fs::File::open(&root.0).expect("open fixture directory");
+			assert_eq!(local_ownership_filesystem(directory.as_raw_fd()), Ok(()));
+			let closed = directory.as_raw_fd();
+			drop(directory);
+			assert_eq!(local_ownership_filesystem(closed), Err(DiagnosticFailure::Unsupported),);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_read_is_bounded_and_rejects_oversize() {
+			let root = TempDir::new();
+			let exact = root.0.join("exact");
+			let payload = vec![b'x'; DIAGNOSTIC_SNAPSHOT_MAX_BYTES];
+			fs::write(&exact, &payload).expect("write exact-size payload");
+			let exact_file = fs::File::open(&exact).expect("open exact payload");
+			assert_eq!(diagnostic_bounded_read(exact_file.as_raw_fd()), Ok(payload));
+
+			let oversize = root.0.join("oversize");
+			fs::write(&oversize, vec![b'x'; DIAGNOSTIC_SNAPSHOT_MAX_BYTES + 1])
+				.expect("write oversize payload");
+			let oversize_file = fs::File::open(&oversize).expect("open oversize payload");
+			assert_eq!(
+				diagnostic_bounded_read(oversize_file.as_raw_fd()),
+				Err(DiagnosticFailure::UnsafeDiscovery),
+			);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_rejects_unsafe_publication_shapes() {
+			let root = TempDir::new();
+			let agent = root.agent_dir();
+			let publication = agent.join("sdk").join("broker.json");
+			let selector = agent_dir_string(&agent);
+			if !ARCH_ADMITTED {
+				fs::write(&publication, b"{}").expect("write publication");
+				unsupported_before_open(&selector);
+				return;
+			}
+
+			fs::write(&publication, b"{}").expect("write publication");
+			fs::set_permissions(&publication, fs::Permissions::from_mode(0o640))
+				.expect("loosen publication mode");
+			assert_eq!(
+				open_diagnostic_lease(&selector, 2000).err(),
+				Some(DiagnosticFailure::UnsafeDiscovery),
+				"group-readable publication",
+			);
+
+			fs::set_permissions(&publication, fs::Permissions::from_mode(0o600))
+				.expect("restore publication mode");
+			fs::hard_link(&publication, agent.join("sdk").join("extra-link"))
+				.expect("create extra hard link");
+			assert_eq!(
+				open_diagnostic_lease(&selector, 2000).err(),
+				Some(DiagnosticFailure::UnsafeDiscovery),
+				"multiply linked publication",
+			);
+			fs::remove_file(agent.join("sdk").join("extra-link")).expect("drop extra link");
+
+			fs::remove_file(&publication).expect("drop publication");
+			std::os::unix::fs::symlink(root.0.join("elsewhere"), &publication)
+				.expect("publish a symlink");
+			assert_eq!(
+				open_diagnostic_lease(&selector, 2000).err(),
+				Some(DiagnosticFailure::UnsafeDiscovery),
+				"symlinked publication",
+			);
+			fs::remove_file(&publication).expect("drop symlink");
+
+			let fifo =
+				std::ffi::CString::new(publication.to_str().expect("utf8 path")).expect("fifo path");
+			// SAFETY: the path is NUL-terminated and mkfifo only creates the node.
+			assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "create fifo");
+			assert_eq!(
+				open_diagnostic_lease(&selector, 2000).err(),
+				Some(DiagnosticFailure::UnsafeDiscovery),
+				"fifo publication",
+			);
+		}
+
+		#[test]
+		fn diagnostic_snapshot_rejects_group_writable_and_sticky_ancestors() {
+			for mode in [0o770, 0o1700] {
+				let root = TempDir::new();
+				let agent = root.publish(b"{}");
+				fs::set_permissions(&agent, fs::Permissions::from_mode(mode))
+					.expect("loosen ancestor mode");
+				let selector = agent_dir_string(&agent);
+				if !ARCH_ADMITTED {
+					unsupported_before_open(&selector);
+					continue;
+				}
+				assert_eq!(
+					open_diagnostic_lease(&selector, 2000).err(),
+					Some(DiagnosticFailure::UnsafeDiscovery),
+					"ancestor mode {mode:o}",
+				);
+			}
+		}
+
+		/// The stock macOS home directory carries a `group:everyone deny delete`
+		/// ACL, so the strict no-ACL ancestor policy refuses a publication below
+		/// it instead of downgrading to an inspection failure. A positive
+		/// whole-chain fixture needs an ACL-free root outside the user's home,
+		/// which is an unapproved path in this task.
+		#[test]
+		fn diagnostic_snapshot_rejects_ancestor_with_extended_acl() {
+			let root = TempDir::new();
+			let agent = root.publish(b"{\"generation\":\"x\"}");
+			let selector = agent_dir_string(&agent);
+			if !ARCH_ADMITTED {
+				unsupported_before_open(&selector);
+				return;
+			}
+			let outcome = open_diagnostic_lease(&selector, 2000);
+			match outcome {
+				Ok(lease) => {
+					assert_eq!(lease.read_bytes(), Ok(b"{\"generation\":\"x\"}".to_vec()));
+					assert_eq!(lease.revalidate_edges(), Ok(()));
+				},
+				Err(failure) => assert_eq!(
+					failure,
+					DiagnosticFailure::UnsafeDiscovery,
+					"an ACL-bearing ancestor must fail closed as unsafe_discovery",
+				),
+			}
+		}
+	}
 }
 
 #[cfg(windows)]
@@ -7579,8 +11293,7 @@ mod platform {
 	use windows_sys::Win32::{
 		Foundation::{
 			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
-			ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_ALL, GetLastError, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -7596,20 +11309,22 @@ mod platform {
 			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
 			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
 			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
-			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
-			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
-			WRITE_DAC, WRITE_OWNER,
+			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+			GetVolumeInformationByHandleW, OPEN_EXISTING, READ_CONTROL, ReadFile,
+			SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
 
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		open_with_transient_retry, sha256,
+		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, ExactFileIdentity,
+		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
+		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
+		directory_tree_transition_name, exact_replace_open_error_code, native_windows_error_code,
+		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
+		rename_with_transient_retry, retained_replace_error_code, sha256,
+		volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -7618,6 +11333,12 @@ mod platform {
 	unsafe extern "system" {
 		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
 		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+		fn GetFileInformationByHandleEx(
+			file: HANDLE,
+			file_information_class: i32,
+			file_information: *mut c_void,
+			buffer_size: u32,
+		) -> i32;
 	}
 
 	// Test-only fault injection for the exact-replace destination open retry:
@@ -7630,10 +11351,19 @@ mod platform {
 		static EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT: std::cell::Cell<u32> =
 			const { std::cell::Cell::new(0) };
 	}
+	#[cfg(test)]
+	thread_local! {
+		static EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT: std::cell::Cell<Option<i32>> =
+			const { std::cell::Cell::new(None) };
+	}
 
 	#[cfg(test)]
 	pub(super) fn inject_exact_replace_destination_open_sharing_violations(count: u32) {
 		EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT.with(|target| target.set(count));
+	}
+	#[cfg(test)]
+	pub(super) fn inject_exact_replace_retained_publish_status(status: Option<i32>) {
+		EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT.with(|target| target.set(status));
 	}
 
 	#[cfg(test)]
@@ -7646,6 +11376,10 @@ mod platform {
 			target.set(current - 1);
 			true
 		})
+	}
+	#[cfg(test)]
+	fn take_injected_exact_replace_retained_publish_status() -> Option<i32> {
+		EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT.with(|target| target.replace(None))
 	}
 
 	#[cfg(not(test))]
@@ -7660,6 +11394,13 @@ mod platform {
 		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+	const FILE_CASE_SENSITIVE_INFO_CLASS: i32 = 23;
+	const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+	#[repr(C)]
+	struct FileCaseSensitiveInfo {
+		flags: u32,
+	}
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -7685,11 +11426,7 @@ mod platform {
 	}
 
 	fn last_error_code() -> &'static str {
-		match unsafe { GetLastError() } {
-			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
-			ERROR_SHARING_VIOLATION => "sharing_violation",
-			_ => "io_error",
-		}
+		super::windows_error_code(unsafe { GetLastError() })
 	}
 
 	fn open_path(path: &Path, reparse: bool, desired_access: u32) -> Result<HANDLE, &'static str> {
@@ -7791,6 +11528,75 @@ mod platform {
 		result
 	}
 
+	fn volume_case_sensitivity(handle: HANDLE) -> Option<bool> {
+		let mut file_system_flags = 0;
+		let succeeded = unsafe {
+			GetVolumeInformationByHandleW(
+				handle,
+				null_mut(),
+				0,
+				null_mut(),
+				null_mut(),
+				&mut file_system_flags,
+				null_mut(),
+				0,
+			)
+		};
+		if succeeded == 0 {
+			return None;
+		}
+		volume_case_sensitivity_from_flags(file_system_flags)
+	}
+
+	pub(super) fn directory_case_sensitive(path: &Path) -> Option<bool> {
+		let path_wide = wide(path);
+		let handle = unsafe {
+			CreateFileW(
+				path_wide.as_ptr(),
+				FILE_READ_ATTRIBUTES,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				null(),
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+				null_mut(),
+			)
+		};
+		if handle == INVALID_HANDLE_VALUE {
+			return None;
+		}
+		let result = (|| {
+			let attributes = handle_attributes(handle).ok()?;
+			if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+				return None;
+			}
+
+			let mut information = FileCaseSensitiveInfo { flags: 0 };
+			let succeeded = unsafe {
+				GetFileInformationByHandleEx(
+					handle,
+					FILE_CASE_SENSITIVE_INFO_CLASS,
+					(&mut information as *mut FileCaseSensitiveInfo).cast(),
+					size_of::<FileCaseSensitiveInfo>() as u32,
+				)
+			};
+			if succeeded == 0 {
+				// Fall back only when volume metadata proves case-insensitive lookup.
+				return volume_case_sensitivity(handle);
+			}
+			Some(information.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+		})();
+		let closed = unsafe { CloseHandle(handle) } != 0;
+		if closed { result } else { None }
+	}
+
+	pub(super) fn windows_ordinal_case_fold(value: &str) -> String {
+		let folded: Vec<u16> = value
+			.encode_utf16()
+			.map(|unit| unsafe { rtl_upcase_unicode_char(unit) })
+			.collect();
+		String::from_utf16(&folded).unwrap_or_else(|_| value.to_owned())
+	}
+
 	#[repr(C)]
 	struct UnicodeString {
 		length:         u16,
@@ -7816,6 +11622,9 @@ mod platform {
 
 	#[link(name = "ntdll")]
 	unsafe extern "system" {
+		#[link_name = "RtlUpcaseUnicodeChar"]
+		fn rtl_upcase_unicode_char(source_character: u16) -> u16;
+
 		fn NtCreateFile(
 			file_handle: *mut HANDLE,
 			desired_access: u32,
@@ -7942,18 +11751,6 @@ mod platform {
 			return Err("not_directory");
 		}
 		Ok((root, names))
-	}
-
-	fn ntstatus_code(status: i32) -> &'static str {
-		match status as u32 {
-			0xc000_0034 | 0xc000_003a => "not_found",
-			0xc000_0035 => "quarantine_collision",
-			0xc000_0043 => "sharing_violation",
-			0xc000_0022 => "owner_mismatch",
-			0xc000_050b => "reparse_point",
-			0xc000_00d4 => "atomic_unavailable",
-			_ => "io_error",
-		}
 	}
 
 	fn open_relative_with_share(
@@ -8212,25 +12009,29 @@ mod platform {
 		handles_same_object_checked(left, right).unwrap_or(false)
 	}
 
-	fn rename_handle(
+	fn rename_handle_status(
 		handle: HANDLE,
 		parent_handle: HANDLE,
 		name: &[u16],
 		replace_if_exists: bool,
-	) -> Result<(), &'static str> {
-		let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or("io_error")?;
+	) -> Result<(), i32> {
+		let name_bytes = name
+			.len()
+			.checked_mul(size_of::<u16>())
+			.ok_or(STATUS_INVALID_PARAMETER)?;
 		let file_name_offset = std::mem::offset_of!(HandleRenameInformation, file_name);
 		let allocation_size = file_name_offset
 			.checked_add(name_bytes)
-			.ok_or("io_error")?
+			.ok_or(STATUS_INVALID_PARAMETER)?
 			.max(size_of::<HandleRenameInformation>());
-		let allocation_size_u32 = u32::try_from(allocation_size).map_err(|_| "io_error")?;
+		let allocation_size_u32 =
+			u32::try_from(allocation_size).map_err(|_| STATUS_INVALID_PARAMETER)?;
 		if file_name_offset % align_of::<u16>() != 0 {
-			return Err("io_error");
+			return Err(STATUS_INVALID_PARAMETER);
 		}
 		let words = allocation_size
 			.checked_add(size_of::<usize>() - 1)
-			.ok_or("io_error")?
+			.ok_or(STATUS_INVALID_PARAMETER)?
 			/ size_of::<usize>();
 		let mut storage = vec![0usize; words];
 		let rename = storage.as_mut_ptr().cast::<HandleRenameInformation>();
@@ -8241,7 +12042,8 @@ mod platform {
 		unsafe {
 			(*rename).replace_if_exists = u8::from(replace_if_exists);
 			(*rename).root_directory = parent_handle;
-			(*rename).file_name_length = u32::try_from(name_bytes).map_err(|_| "io_error")?;
+			(*rename).file_name_length =
+				u32::try_from(name_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
 			let file_name = storage
 				.as_mut_ptr()
 				.cast::<u8>()
@@ -8267,8 +12069,48 @@ mod platform {
 		if rename_status >= 0 {
 			Ok(())
 		} else {
-			Err(ntstatus_code(rename_status))
+			Err(rename_status)
 		}
+	}
+
+	fn rename_handle(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+		replace_if_exists: bool,
+	) -> Result<(), &'static str> {
+		rename_handle_status(handle, parent_handle, name, replace_if_exists).map_err(ntstatus_code)
+	}
+
+	fn rename_pre_retirement_with_transient_retry(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+		replace_if_exists: bool,
+	) -> Result<(), i32> {
+		// This bounded wait is safe only while the live destination still exists.
+		// Never use it for publication after retiring the predecessor: restore the
+		// predecessor before any retry delay in that state.
+		rename_with_transient_retry(|| {
+			rename_handle_status(handle, parent_handle, name, replace_if_exists)
+		})
+	}
+
+	fn publish_retained_source_once(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+	) -> Result<(), i32> {
+		#[cfg(test)]
+		if let Some(status) = take_injected_exact_replace_retained_publish_status() {
+			return Err(status);
+		}
+		rename_handle_status(handle, parent_handle, name, false)
+	}
+
+	fn retained_replace_rename_failure(status: i32) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+			.with_windows_error_code(native_windows_error_code(status))
 	}
 
 	fn detach_directory(
@@ -8389,7 +12231,9 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -8450,17 +12294,8 @@ mod platform {
 		}) {
 			Ok(handle) => handle,
 			Err(status) => {
-				return NativeExactUnlinkResult::failure(
-					if is_retryable_exact_replace_status(status) {
-						// Retry budget exhausted: the holder never released. Surface the
-						// specific category instead of a bare io_error so the session crash
-						// log and operator diagnostics can identify a sharing conflict.
-						"sharing_violation"
-					} else {
-						ntstatus_code(status)
-					},
-				)
-				.with_windows_error_code(native_windows_error_code(status));
+				return NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+					.with_windows_error_code(native_windows_error_code(status));
 			},
 		};
 		let destination = HeldExact { target: destination_handle, ancestors: Vec::new() };
@@ -8593,21 +12428,6 @@ mod platform {
 	/// a principal other than the verified owner. Read/execute-only ACEs for
 	/// other principals are accepted.
 	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), &'static str> {
-		const FILE_WRITE_DATA: u32 = 0x0000_0002;
-		const FILE_APPEND_DATA: u32 = 0x0000_0004;
-		const FILE_WRITE_EA: u32 = 0x0000_0010;
-		const DELETE: u32 = 0x0001_0000;
-		const GENERIC_WRITE: u32 = 0x4000_0000;
-		const WRITE_CAPABLE_MASK: u32 = FILE_WRITE_DATA
-			| FILE_APPEND_DATA
-			| FILE_WRITE_EA
-			| FILE_WRITE_ATTRIBUTES
-			| WRITE_DAC
-			| WRITE_OWNER
-			| DELETE
-			| GENERIC_WRITE
-			| GENERIC_ALL
-			| FILE_ALL_ACCESS;
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
 			Err(()) => return Err("acl_unavailable"),
@@ -8641,9 +12461,18 @@ mod platform {
 			if owner.is_null() {
 				return Err("acl_unavailable");
 			}
-			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor; sid is a validated current-user SID.
-			if unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
+			// An elevated token's default owner is BUILTIN\Administrators, so an
+			// elevated install and every candidate it downloads are Administrators-owned
+			// (#6916); accept the same trusted owners as managed roots (#6420).
+			let owner_trusted = super::is_trusted_windows_owner_sid(
+				|trusted_sid| {
+					// SAFETY: `owner` is inside the live descriptor; `trusted_sid` is the
+					// validated current-user SID or the fixed Administrators SID.
+					unsafe { EqualSid(owner, trusted_sid.as_ptr().cast_mut().cast()) != 0 }
+				},
+				&sid,
+			);
+			if !owner_trusted {
 				return Err("owner_mismatch");
 			}
 			if dacl.is_null() {
@@ -8699,9 +12528,6 @@ mod platform {
 				// live ACE.
 				let mask =
 					unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(mask_offset).cast::<u32>()) };
-				if mask & WRITE_CAPABLE_MASK == 0 {
-					continue;
-				}
 				// SAFETY: structural validation proved the SID range lies inside the
 				// live ACE.
 				let ace_sid = unsafe {
@@ -8710,12 +12536,21 @@ mod platform {
 				if valid_sid(ace_sid).is_none() {
 					return Err("acl_malformed");
 				}
-				// SAFETY: both pointers identify complete validated SIDs that remain live
-				// through comparison.
-				let grants_owner = unsafe {
-					EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
-				} != 0;
-				if !grants_owner {
+				let safe = super::executable_ace_is_safe(
+					mask,
+					|trusted_sid| {
+						// SAFETY: both pointers identify complete validated SIDs that remain
+						// live through comparison.
+						unsafe {
+							EqualSid(
+								ace_sid.as_ptr().cast_mut().cast(),
+								trusted_sid.as_ptr().cast_mut().cast(),
+							) != 0
+						}
+					},
+					&sid,
+				);
+				if !safe {
 					return Err("acl_present");
 				}
 			}
@@ -8739,9 +12574,13 @@ mod platform {
 	/// exact no-replace rename whenever that name is still vacant; if it is not
 	/// (an external successor claimed it), the predecessor remains durably
 	/// recoverable at exactly its caller-recorded `backup_name`.
-	/// `STATUS_SHARING_VIOLATION` on the destination open is detected and
-	/// reported before any rename, exactly as in `exact_replace_path`, so it is
-	/// never confused with a post-effect failure.
+	/// `STATUS_SHARING_VIOLATION` on the destination open and transient
+	/// `STATUS_ACCESS_DENIED`/`STATUS_SHARING_VIOLATION` failures retiring the
+	/// predecessor are retried only while the live destination still exists. The
+	/// source publication is attempted once after retirement; a failure restores
+	/// the predecessor immediately before returning, so the public path is never
+	/// vacant during a retry delay. Pre-mutation results retain the native
+	/// status; failures after retirement preserve the recovery paths.
 	pub(super) fn exact_replace_retained(
 		source_path: &Path,
 		destination_path: &Path,
@@ -8787,12 +12626,14 @@ mod platform {
 		let source = match open_exact_with_share(
 			&source_path,
 			"file",
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | READ_CONTROL | 0x0001_0000,
 			FILE_SHARE_READ,
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -8835,8 +12676,8 @@ mod platform {
 			return NativeExactUnlinkResult::failure("io_error");
 		};
 		// Pre-mutation, retryable-sharing-violation destination open -- identical
-		// boundary to exact_replace_path. A sharing violation here always fires
-		// before any rename, so it is never mistaken for a post-effect failure.
+		// boundary to exact_replace_path. Any access-denied status is still
+		// classified as a publication failure, not an ownership mismatch.
 		let destination_handle = match open_with_transient_retry(|| {
 			if take_injected_exact_replace_destination_open_sharing_violation() {
 				return Err(STATUS_SHARING_VIOLATION);
@@ -8844,21 +12685,19 @@ mod platform {
 			open_relative_with_share_status(
 				parent_handle,
 				destination_name,
-				FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+				FILE_READ_ATTRIBUTES
+					| 0x0001_0000
+					| FILE_WRITE_ATTRIBUTES
+					| FILE_READ_DATA
+					| READ_CONTROL,
 				false,
 				FILE_SHARE_READ | FILE_SHARE_DELETE,
 			)
 		}) {
 			Ok(handle) => handle,
 			Err(status) => {
-				return NativeExactUnlinkResult::failure(
-					if is_retryable_exact_replace_status(status) {
-						"sharing_violation"
-					} else {
-						ntstatus_code(status)
-					},
-				)
-				.with_windows_error_code(native_windows_error_code(status));
+				return NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+					.with_windows_error_code(native_windows_error_code(status));
 			},
 		};
 		let destination = HeldExact { target: destination_handle, ancestors: Vec::new() };
@@ -8909,9 +12748,13 @@ mod platform {
 		// crash after it commits leaves the predecessor durably at the exact
 		// caller-recorded `backup_name` with `destination_name` vacant -- both
 		// states are fully described by evidence the caller already holds.
-		if let Err(code) = rename_handle(destination.target, parent_handle, &backup_name_wide, false)
-		{
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(status) = rename_pre_retirement_with_transient_retry(
+			destination.target,
+			parent_handle,
+			&backup_name_wide,
+			false,
+		) {
+			return retained_replace_rename_failure(status);
 		}
 		let mut retired_destination: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(destination.target, &mut retired_destination) } == 0
@@ -8950,13 +12793,14 @@ mod platform {
 				NativeExactUnlinkResult::detached_failure(code, backup_path_string)
 			};
 		}
-		match rename_handle(source.target, parent_handle, &destination_name_wide, false) {
+		match publish_retained_source_once(source.target, parent_handle, &destination_name_wide) {
 			Ok(()) => NativeExactUnlinkResult::detached(backup_path_string),
-			Err(code) => {
-				// The publish itself failed: restore the predecessor to its original
-				// name (exact no-replace rename, never overwriting a name that is no
-				// longer vacant) whenever that name is still vacant, exactly as
-				// exact_replace_path does on this failure path.
+			Err(status) => {
+				let code = retained_replace_error_code(status);
+				// The source publish is attempted once after retirement: waiting here
+				// would leave the public name vacant. Restore the predecessor
+				// immediately with an exact no-replace rename, never overwriting a
+				// name that is no longer vacant.
 				let restored_destination =
 					rename_handle(destination.target, parent_handle, &destination_name_wide, false)
 						.is_ok();
@@ -8978,6 +12822,129 @@ mod platform {
 					}
 				}
 			},
+		}
+	}
+
+	#[cfg(test)]
+	mod exact_replace_retained_retry_tests {
+		use std::{
+			fs,
+			os::windows::io::AsRawHandle,
+			path::{Path, PathBuf},
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			super::{ExactFileIdentity, STATUS_ACCESS_DENIED, apply_owner_only_path_security, sha256},
+			BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, HANDLE, exact_replace_retained,
+			inject_exact_replace_retained_publish_status, open_directory_exact,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-exact-replace-retained-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				fs::create_dir(&path).expect("create retained replace temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+
+		fn file_information(handle: HANDLE) -> BY_HANDLE_FILE_INFORMATION {
+			let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			assert_ne!(
+				unsafe { GetFileInformationByHandle(handle, &mut information) },
+				0,
+				"read file identity",
+			);
+			information
+		}
+
+		fn identity(path: &Path, parent: &Path, bytes: &[u8]) -> ExactFileIdentity {
+			let file = fs::File::open(path).expect("open retained replace file");
+			let information = file_information(file.as_raw_handle() as HANDLE);
+			let parent = open_directory_exact(parent).expect("open retained replace parent");
+			let parent_information = file_information(parent.target);
+			let filetime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+				| u64::from(information.ftLastWriteTime.dwLowDateTime);
+			let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
+			ExactFileIdentity {
+				dev:               u64::from(information.dwVolumeSerialNumber),
+				ino:               (u64::from(information.nFileIndexHigh) << 32)
+					| u64::from(information.nFileIndexLow),
+				nlink:             Some(u64::from(information.nNumberOfLinks)),
+				parent_dev:        Some(u64::from(parent_information.dwVolumeSerialNumber)),
+				parent_ino:        Some(
+					(u64::from(parent_information.nFileIndexHigh) << 32)
+						| u64::from(parent_information.nFileIndexLow),
+				),
+				size:              (u64::from(information.nFileSizeHigh) << 32)
+					| u64::from(information.nFileSizeLow),
+				mtime_ns:          i64::try_from(mtime_ns).expect("mtime fits i64"),
+				directory:         false,
+				detach_only:       false,
+				quarantine_name:   None,
+				sha256:            Some(sha256(bytes)),
+				allow_hard_link:   false,
+				require_hard_link: false,
+			}
+		}
+
+		struct ResetPublishFailureInjection;
+
+		impl Drop for ResetPublishFailureInjection {
+			fn drop(&mut self) {
+				inject_exact_replace_retained_publish_status(None);
+			}
+		}
+
+		#[test]
+		fn denied_source_publish_restores_live_predecessor_without_retrying_vacancy() {
+			let temporary = TempDir::new();
+			let source = temporary.0.join("staging.exe");
+			let destination = temporary.0.join("gjc.exe");
+			let backup_name = "gjc.exe.backup";
+			let backup = temporary.0.join(backup_name);
+			fs::write(&source, b"new binary").expect("write staged executable");
+			fs::write(&destination, b"old binary").expect("write installed executable");
+			for path in [&source, &destination] {
+				let secured = apply_owner_only_path_security(
+					path.to_string_lossy().into_owned(),
+					"file".to_owned(),
+				);
+				assert!(secured.ok, "owner-only security failed: {:?}", secured.code);
+			}
+			let source_identity = identity(&source, &temporary.0, b"new binary");
+			let destination_identity = identity(&destination, &temporary.0, b"old binary");
+			let _reset_injection = ResetPublishFailureInjection;
+			inject_exact_replace_retained_publish_status(Some(STATUS_ACCESS_DENIED));
+
+			let result = exact_replace_retained(
+				&source,
+				&destination,
+				backup_name,
+				&source_identity,
+				&destination_identity,
+			);
+
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("access_denied"));
+			assert_eq!(result.detached_path, None);
+			assert_eq!(fs::read(&destination).expect("read restored executable"), b"old binary");
+			assert_eq!(fs::read(&source).expect("read retained staged executable"), b"new binary");
+			assert!(!backup.exists(), "the predecessor must be restored before returning");
 		}
 	}
 
@@ -9018,7 +12985,9 @@ mod platform {
 		let source = match open_exact(&source_path, source_kind, FILE_READ_ATTRIBUTES | 0x0001_0000) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let Some(destination_parent_path) = destination_path.parent() else {
@@ -9029,12 +12998,14 @@ mod platform {
 		};
 		let destination_parent = match open_directory_exact(destination_parent_path) {
 			Ok(handle) => handle,
-			Err(code) => return NativeExactUnlinkResult::failure(&code),
+			Err(code) => {
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(Some(&code)));
+			},
 		};
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
 		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
 			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::failure(code),
+			Err(code) => NativeExactUnlinkResult::failure(publication_rename_error_code(code)),
 		}
 	}
 	pub(super) fn exact_unlink(
@@ -9086,6 +13057,12 @@ mod platform {
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		if !identity.directory && !identity.allow_hard_link && information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if !identity.directory
+			&& identity.require_hard_link
+			&& (information.nNumberOfLinks < 2 || identity.nlink.is_some_and(|nlink| nlink < 2))
+		{
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
 		if !identity.directory
@@ -9150,6 +13127,18 @@ mod platform {
 				identity,
 			);
 		}
+		if !identity.directory && identity.require_hard_link {
+			let mut revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(handle.target, &mut revalidated) } == 0 {
+				return NativeExactUnlinkResult::failure(last_error_code());
+			}
+			if !handle_identity_matches(&revalidated, identity) {
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+			if revalidated.nNumberOfLinks < 2 || identity.nlink.is_some_and(|nlink| nlink < 2) {
+				return NativeExactUnlinkResult::failure("hard_link_unsupported");
+			}
+		}
 		match delete_handle(handle.target) {
 			Ok(()) => NativeExactUnlinkResult::success(),
 			Err(code) => NativeExactUnlinkResult::failure(code),
@@ -9167,6 +13156,78 @@ mod platform {
 			return NativeExactUnlinkResult::failure("invalid_request");
 		}
 		exact_unlink(path, identity)
+	}
+
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		_quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		let caller = match retained_caller_handle(caller_fd) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		let attributes = match handle_attributes(caller.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(caller.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| size != 0
+			|| information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let path_handle = match open_exact_with_share(
+			path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		match same_file_identity(path_handle.target, caller.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		}
+		let attributes = match handle_attributes(path_handle.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut path_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(path_handle.target, &mut path_information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let path_size = (u64::from(path_information.nFileSizeHigh) << 32)
+			| u64::from(path_information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| path_size != 0
+			|| path_information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		match delete_handle(path_handle.target) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		}
 	}
 
 	pub(super) fn exact_restore(
@@ -9481,9 +13542,15 @@ mod platform {
 		let result = if owner.is_null() {
 			Err("acl_unavailable")
 		} else {
-			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor; `sid` is a validated current-user SID.
-			let owner_matches = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
+			let owner_matches = super::is_trusted_windows_owner_sid(
+				|trusted_sid| {
+					// SAFETY: `owner` is returned by GetSecurityInfo within the live
+					// descriptor. `trusted_sid` is either the validated current-user SID or
+					// the fixed, well-formed BUILTIN Administrators SID.
+					unsafe { EqualSid(owner, trusted_sid.as_ptr().cast_mut().cast()) != 0 }
+				},
+				sid,
+			);
 			if !owner_matches {
 				Ok(OwnerOnlyAclState::OwnerMismatch)
 			} else {
@@ -9997,7 +14064,37 @@ mod platform {
 	}
 	#[cfg(test)]
 	mod tests {
-		use super::{FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, owner_only_ace_mask_is_safe};
+		use std::{
+			path::PathBuf,
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, exact_remove_directory_tree_with_mode,
+			owner_only_ace_mask_is_safe, snapshot_directory_tree,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-lock-retirement-collision-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				std::fs::create_dir(&path).expect("create lock-retirement temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = std::fs::remove_dir_all(&self.0);
+			}
+		}
 
 		#[test]
 		fn owner_only_ace_mask_accepts_legacy_and_current_full_access_masks() {
@@ -10009,6 +14106,57 @@ mod platform {
 		fn owner_only_ace_mask_rejects_partial_and_combined_masks() {
 			assert!(!owner_only_ace_mask_is_safe(FILE_ALL_ACCESS & !FILE_READ_DATA));
 			assert!(!owner_only_ace_mask_is_safe(GENERIC_ALL | FILE_READ_DATA));
+		}
+
+		#[test]
+		fn retirement_collision_preserves_canonical_owner_metadata() {
+			let root = TempDir::new();
+			let canonical = root.0.join("index.jsonl.lock");
+			let retired = root.0.join("index.jsonl.lock.removing");
+			std::fs::create_dir(&canonical).expect("create canonical lock");
+			std::fs::write(canonical.join("info"), b"canonical-owner").expect("write canonical owner");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("info"), b"predecessor-owner")
+				.expect("write predecessor owner");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot canonical lock");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, true);
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("quarantine_collision"));
+			assert_eq!(
+				std::fs::read(canonical.join("info")).expect("canonical owner remains"),
+				b"canonical-owner"
+			);
+			assert_eq!(
+				std::fs::read(retired.join("info")).expect("predecessor owner remains"),
+				b"predecessor-owner"
+			);
+		}
+
+		#[test]
+		fn generic_removal_does_not_reserve_the_lock_retirement_name() {
+			let root = TempDir::new();
+			let canonical = root.0.join("plugin");
+			let retired = root.0.join("plugin.removing");
+			std::fs::create_dir(&canonical).expect("create generic tree");
+			std::fs::write(canonical.join("payload"), b"generic payload")
+				.expect("write generic payload");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("payload"), b"unrelated retirement")
+				.expect("write unrelated payload");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot generic tree");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, false);
+			assert!(result.ok);
+			assert!(!canonical.exists());
+			assert_eq!(
+				std::fs::read(retired.join("payload")).expect("unrelated payload remains"),
+				b"unrelated retirement"
+			);
 		}
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {
@@ -10197,6 +14345,70 @@ mod platform {
 			result?;
 		}
 		Ok(())
+	}
+
+	fn directory_handle_is_empty(handle: HANDLE) -> Result<bool, &'static str> {
+		let mut restart_scan = 1u8;
+		loop {
+			let mut buffer = vec![0u8; 1024];
+			// SAFETY: zero is a valid initial NT I/O status block and the kernel writes it
+			// only through this exclusive, properly aligned mutable reference.
+			let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+			// SAFETY: `handle` remains open, `buffer` is writable for its checked u32
+			// length, and `status` outlives the synchronous NT call. Requesting a single
+			// record bounds enumeration without accumulating directory names.
+			let result = unsafe {
+				NtQueryDirectoryFile(
+					handle,
+					null_mut(),
+					null_mut(),
+					null_mut(),
+					&mut status,
+					buffer.as_mut_ptr().cast(),
+					buffer.len() as u32,
+					FILE_ID_BOTH_DIRECTORY_INFORMATION,
+					1,
+					null_mut(),
+					restart_scan,
+				)
+			};
+			restart_scan = 0;
+			if result == STATUS_NO_MORE_FILES {
+				return Ok(true);
+			}
+			if result < 0 || status.information > buffer.len() {
+				return Err("io_error");
+			}
+			let used = status.information;
+			if used == 0 {
+				return Err("io_error");
+			}
+			let minimum = std::mem::offset_of!(FileIdBothDirectoryInformation, file_name);
+			let name_length_offset =
+				std::mem::offset_of!(FileIdBothDirectoryInformation, file_name_length);
+			if used < minimum {
+				return Err("io_error");
+			}
+			let length_end = name_length_offset
+				.checked_add(size_of::<u32>())
+				.ok_or("io_error")?;
+			let name_length = u32::from_le_bytes(
+				buffer
+					.get(name_length_offset..length_end)
+					.ok_or("io_error")?
+					.try_into()
+					.map_err(|_| "io_error")?,
+			) as usize;
+			if name_length % size_of::<u16>() != 0 || name_length > used - minimum {
+				return Err("io_error");
+			}
+			let name_end = minimum.checked_add(name_length).ok_or("io_error")?;
+			let name = buffer.get(minimum..name_end).ok_or("io_error")?;
+			if name == [b'.', 0] || name == [b'.', 0, b'.', 0] {
+				continue;
+			}
+			return Ok(false);
+		}
 	}
 
 	fn tree_entry_matches(
@@ -10417,6 +14629,69 @@ mod platform {
 		Ok(())
 	}
 
+	pub(super) fn snapshot_empty_directory(path: &Path) -> NativeDirectoryTreeResult {
+		let root = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+			Ok(root) => root,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let initial_entry = match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		match directory_handle_is_empty(root.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+
+		let reopened = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+			Ok(reopened) => reopened,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let (Some(parent), Some(reopened_parent)) = (root.parent(), reopened.parent()) else {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		};
+		match handles_same_object_checked(parent, reopened_parent) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("identity_mismatch"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		match handles_same_object_checked(root.target, reopened.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("identity_mismatch"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		match directory_handle_is_empty(root.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		let current_entry = match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		let named_entry = match tree_entry(reopened.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if current_entry != initial_entry || named_entry != initial_entry {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		NativeDirectoryTreeResult::success(NativeDirectoryTreeSnapshot {
+			root_dev: initial_entry.dev.clone(),
+			root_ino: initial_entry.ino.clone(),
+			entries:  vec![initial_entry],
+		})
+	}
+
 	pub(super) fn snapshot_directory_tree(path: &Path) -> NativeDirectoryTreeResult {
 		let root = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
 			Ok(root) => root,
@@ -10447,17 +14722,14 @@ mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
-		let final_name: Vec<u16> = match path.file_name() {
-			Some(name) => {
-				let mut value: Vec<u16> = name.encode_wide().collect();
-				value.extend(".removing".encode_utf16());
-				value
-			},
+		let final_component = match path.file_name().and_then(directory_tree_transition_name) {
+			Some(name) => name,
 			None => return NativeExactUnlinkResult::failure("io_error"),
 		};
+		let final_name: Vec<u16> = final_component.encode_wide().collect();
 		let mut final_candidate = PathBuf::from(path);
-		final_candidate.set_file_name(OsString::from_wide(&final_name));
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
 		let input_is_final = planned_path.ends_with(".removing");
 		let (root, retained_path, already_final) = match open_exact(
 			path,
@@ -10531,18 +14803,19 @@ mod platform {
 			// non-zero mtime (and zeroing the size would too), which would turn
 			// every filter-hosted detach into a spurious identity mismatch.
 			let identity = ExactFileIdentity {
-				dev:             root_entry.dev.parse().unwrap_or_default(),
-				ino:             root_entry.ino.parse().unwrap_or_default(),
-				nlink:           None,
-				parent_dev:      expected_parent.map(|value| value.0),
-				parent_ino:      expected_parent.map(|value| value.1),
-				size:            root_entry.size.parse().unwrap_or_default(),
-				mtime_ns:        root_entry.mtime_ns.parse().unwrap_or_default(),
-				directory:       true,
-				detach_only:     true,
-				quarantine_name: Some(quarantine_name.clone()),
-				sha256:          None,
-				allow_hard_link: false,
+				dev:               root_entry.dev.parse().unwrap_or_default(),
+				ino:               root_entry.ino.parse().unwrap_or_default(),
+				nlink:             None,
+				parent_dev:        expected_parent.map(|value| value.0),
+				parent_ino:        expected_parent.map(|value| value.1),
+				size:              root_entry.size.parse().unwrap_or_default(),
+				mtime_ns:          root_entry.mtime_ns.parse().unwrap_or_default(),
+				directory:         true,
+				detach_only:       true,
+				quarantine_name:   Some(quarantine_name.clone()),
+				sha256:            None,
+				allow_hard_link:   false,
+				require_hard_link: false,
 			};
 			return detach_directory(
 				root.target,
@@ -10553,26 +14826,52 @@ mod platform {
 				&identity,
 			);
 		}
-		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
-				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
-					Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
-						match delete_handle(root.target) {
-							Ok(()) => NativeExactUnlinkResult::success(),
-							Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-						}
-					},
-					Ok(_) => NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path),
-					Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-				},
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
+		// Keep generic Windows removal at its caller-visible name if payload
+		// scrubbing fails. File-lock retirement requests detach_only first and
+		// replays this exact removal at `.removing` after the canonical name is
+		// safely vacant.
+		let retained_path = if already_final {
+			retained_path
+		} else {
+			planned_path
+		};
+		match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},
+			Ok(_) => {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 			},
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+		match remove_tree_handle(root.target, "", &expected.entries) {
 			Ok(()) => match delete_handle(root.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 			},
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 		}
+	}
+
+	// Read-only broker diagnostic snapshot is a Darwin-first capability; every
+	// other platform reports the fixed unsupported outcome without opening a path.
+	// Inhabited but not constructible from outside this module: no caller can mint
+	// a lease, and the fixed unsupported answers need no filesystem access.
+	pub(super) struct DiagnosticSnapshotLease(());
+
+	impl DiagnosticSnapshotLease {
+		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			Err("unsupported")
+		}
+
+		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
+			Err("unsupported")
+		}
+	}
+
+	pub(super) const fn open_diagnostic_snapshot(
+		_agent_dir: &str,
+		_budget_ms: u32,
+	) -> Result<DiagnosticSnapshotLease, &'static str> {
+		Err("unsupported")
 	}
 }
 
@@ -10606,6 +14905,9 @@ mod platform {
 	pub(super) fn exact_unlink_direct(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
+	pub(super) fn exact_unlink_open_file(_: &Path, _: i32, _: &str) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
 	pub(super) fn exact_restore(
 		_: &Path,
 		_: &Path,
@@ -10614,6 +14916,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn snapshot_directory_tree(_: &Path) -> NativeDirectoryTreeResult {
+		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+	pub(super) fn snapshot_empty_directory(_: &Path) -> NativeDirectoryTreeResult {
 		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
 	}
 	pub(super) fn exact_remove_directory_tree_with_mode(
@@ -10674,6 +14979,29 @@ mod platform {
 		_: i32,
 	) -> NativeOwnerOnlySecurityResult {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+
+	// Read-only broker diagnostic snapshot is a Darwin-first capability; every
+	// other platform reports the fixed unsupported outcome without opening a path.
+	// Inhabited but not constructible from outside this module: no caller can mint
+	// a lease, and the fixed unsupported answers need no filesystem access.
+	pub(super) struct DiagnosticSnapshotLease(());
+
+	impl DiagnosticSnapshotLease {
+		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			Err("unsupported")
+		}
+
+		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
+			Err("unsupported")
+		}
+	}
+
+	pub(super) const fn open_diagnostic_snapshot(
+		_agent_dir: &str,
+		_budget_ms: u32,
+	) -> Result<DiagnosticSnapshotLease, &'static str> {
+		Err("unsupported")
 	}
 }
 #[cfg(all(test, windows))]
@@ -11143,18 +15471,19 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&successor, b"live successor").expect("write successor");
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          Some(sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            Some(sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11213,18 +15542,19 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       target_is_directory,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         target_is_directory,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11290,18 +15620,19 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       target_is_directory,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         target_is_directory,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11371,18 +15702,19 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       target_is_directory,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         target_is_directory,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11463,6 +15795,7 @@ mod exact_unlink_placeholder_tests {
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256: Some(sha256(b"stale")),
 			allow_hard_link: false,
+			require_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -11551,18 +15884,19 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&target, b"stale").expect("write stale target");
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          Some(sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            Some(sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -12457,18 +16791,19 @@ mod exact_replace_path_tests {
 		let metadata = fs::metadata(path).expect("stat exact replace file");
 		let parent = fs::metadata(parent).expect("stat exact replace parent");
 		ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      Some(parent.dev()),
-			parent_ino:      Some(parent.ino()),
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: None,
-			sha256:          Some(sha256(bytes)),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        Some(parent.dev()),
+			parent_ino:        Some(parent.ino()),
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   None,
+			sha256:            Some(sha256(bytes)),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		}
 	}
 
@@ -12894,6 +17229,253 @@ mod exact_replace_path_tests {
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
 	}
 }
+
+#[cfg(all(test, unix))]
+mod sdk_readiness_lifecycle_tests {
+	use std::{
+		fs,
+		os::unix::fs::{MetadataExt, symlink},
+		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{ExactFileIdentity, PATH_IDENTITY_HOOK_TEST_LOCK, platform, sha256};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(base: &Path) -> Self {
+			loop {
+				let path = base.join(format!(
+					"gjc-sdk-readiness-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				match fs::create_dir(&path) {
+					Ok(()) => return Self(path),
+					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+					Err(error) => panic!("create readiness temp directory: {error}"),
+				}
+			}
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn identity(path: &Path) -> ExactFileIdentity {
+		let metadata = fs::metadata(path).expect("stat readiness file");
+		let parent =
+			fs::metadata(path.parent().expect("readiness parent")).expect("stat readiness parent");
+		ExactFileIdentity {
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        Some(parent.dev()),
+			parent_ino:        Some(parent.ino()),
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".readiness-cleanup".to_owned()),
+			sha256:            Some(sha256(&fs::read(path).expect("read readiness identity bytes"))),
+			allow_hard_link:   false,
+			require_hard_link: false,
+		}
+	}
+
+	fn seed(root: &Path) -> (PathBuf, PathBuf) {
+		let sdk = root.join("agent").join("sdk");
+		fs::create_dir_all(&sdk).expect("create nested SDK directory");
+		let staged = sdk.join("ready.staged");
+		let ready = sdk.join("ready.json");
+		fs::write(&staged, b"new readiness").expect("seed staged readiness");
+		fs::write(&ready, b"old readiness").expect("seed existing readiness");
+		(staged, ready)
+	}
+
+	fn assert_entries(parent: &Path, expected: &[&str]) {
+		let mut actual = fs::read_dir(parent)
+			.expect("list readiness namespace")
+			.map(|entry| entry.expect("read readiness entry").file_name())
+			.collect::<Vec<_>>();
+		actual.sort();
+		let mut expected = expected
+			.iter()
+			.map(|name| std::ffi::OsString::from(*name))
+			.collect::<Vec<_>>();
+		expected.sort();
+		assert_eq!(actual, expected, "unexpected readiness namespace debris");
+	}
+
+	fn replace_and_cleanup(real_root: &Path, operation_root: &Path) {
+		let (real_staged, real_ready) = seed(real_root);
+		let staged = operation_root.join("agent/sdk/ready.staged");
+		let ready = operation_root.join("agent/sdk/ready.json");
+		let expected_source = identity(&real_staged);
+		let expected_destination = identity(&real_ready);
+		let result =
+			platform::exact_replace_path(&staged, &ready, &expected_source, &expected_destination);
+		assert!(result.ok, "replace readiness: {:?}", result.code);
+		assert_eq!(fs::read(&real_ready).expect("read published readiness"), b"new readiness");
+		assert!(!real_staged.exists(), "staged readiness must disappear");
+		let parent = real_ready.parent().expect("SDK directory");
+		// Exact replacement deliberately retains the descriptor-scrubbed predecessor.
+		let scrubbed_name = format!(
+			".gjc-exact-replace-destination-{:x}-{:x}",
+			expected_destination.ino,
+			std::process::id()
+		);
+		assert_entries(parent, &["ready.json", &scrubbed_name]);
+		let scrubbed = parent.join(&scrubbed_name);
+		assert!(
+			fs::symlink_metadata(&scrubbed)
+				.expect("stat scrubbed predecessor")
+				.is_file()
+		);
+		assert_eq!(fs::read(&scrubbed).expect("read scrubbed predecessor"), b"");
+
+		let published = identity(&real_ready);
+		assert_eq!((published.dev, published.ino), (expected_source.dev, expected_source.ino));
+		let result = platform::exact_unlink_direct(&ready, &published);
+		assert!(result.ok, "clean readiness: {:?}", result.code);
+		assert!(!real_ready.exists(), "published readiness must disappear");
+		assert_entries(parent, &[&scrubbed_name]);
+		assert_eq!(fs::read(scrubbed).expect("read retained scrubbed predecessor"), b"");
+	}
+
+	#[test]
+	fn readiness_replace_then_direct_cleanup_under_temp_dir() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let temporary = TempDir::new(&std::env::temp_dir());
+		// Keep the lexical temp path: macOS alias translation must run in the native
+		// walk.
+		replace_and_cleanup(&temporary.0, &temporary.0);
+	}
+
+	#[test]
+	fn readiness_replace_and_direct_cleanup_refuse_symlinks() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		for case in ["ancestor", "source_leaf", "destination_leaf"] {
+			let temporary = TempDir::new(&std::env::temp_dir());
+			let (staged, ready) = seed(&temporary.0);
+			let expected_source = identity(&staged);
+			let expected_destination = identity(&ready);
+			let parent = ready.parent().expect("SDK directory");
+			let alias = if case == "ancestor" {
+				temporary.0.join("alias")
+			} else {
+				parent.join("alias")
+			};
+			let (operation_staged, operation_ready, cleanup_path, cleanup_identity) = match case {
+				"ancestor" => {
+					symlink(temporary.0.join("agent"), &alias).expect("create symlink ancestor");
+					(
+						alias.join("sdk/ready.staged"),
+						alias.join("sdk/ready.json"),
+						alias.join("sdk/ready.json"),
+						&expected_destination,
+					)
+				},
+				"source_leaf" => {
+					symlink(&staged, &alias).expect("create source symlink leaf");
+					(alias.clone(), ready.clone(), alias.clone(), &expected_source)
+				},
+				_ => {
+					symlink(&ready, &alias).expect("create destination symlink leaf");
+					(staged.clone(), alias.clone(), alias.clone(), &expected_destination)
+				},
+			};
+			let replaced = platform::exact_replace_path(
+				&operation_staged,
+				&operation_ready,
+				&expected_source,
+				&expected_destination,
+			);
+			assert!(!replaced.ok, "replace must refuse {case}");
+			assert_eq!(
+				replaced.code.as_deref(),
+				Some(if case == "ancestor" {
+					"reparse_point"
+				} else {
+					"identity_mismatch"
+				})
+			);
+			let cleaned = platform::exact_unlink_direct(&cleanup_path, cleanup_identity);
+			assert!(!cleaned.ok, "cleanup must refuse {case}");
+			assert_eq!(cleaned.code.as_deref(), Some("reparse_point"));
+			assert_eq!(fs::read(&staged).expect("read untouched staged readiness"), b"new readiness");
+			assert_eq!(fs::read(&ready).expect("read untouched old readiness"), b"old readiness");
+			assert!(
+				fs::symlink_metadata(alias)
+					.expect("stat refused symlink")
+					.file_type()
+					.is_symlink()
+			);
+			let mut expected_entries = vec!["ready.staged", "ready.json"];
+			if case != "ancestor" {
+				expected_entries.push("alias");
+			}
+			assert_entries(parent, &expected_entries);
+		}
+	}
+
+	#[test]
+	fn readiness_replace_and_direct_cleanup_refuse_wrong_parent_or_identity() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		for wrong_parent in [true, false] {
+			let temporary = TempDir::new(&std::env::temp_dir());
+			let (staged, ready) = seed(&temporary.0);
+			let mut expected_source = identity(&staged);
+			let mut expected_destination = identity(&ready);
+			let expected_code = if wrong_parent {
+				let other_parent = fs::metadata(&temporary.0).expect("stat unrelated parent");
+				for identity in [&mut expected_source, &mut expected_destination] {
+					identity.parent_dev = Some(other_parent.dev());
+					identity.parent_ino = Some(other_parent.ino());
+				}
+				"parent_mismatch"
+			} else {
+				expected_destination.ino = expected_destination.ino.wrapping_add(1);
+				"identity_mismatch"
+			};
+			let replaced =
+				platform::exact_replace_path(&staged, &ready, &expected_source, &expected_destination);
+			assert!(!replaced.ok);
+			assert_eq!(replaced.code.as_deref(), Some(expected_code));
+			let cleaned = platform::exact_unlink_direct(&ready, &expected_destination);
+			assert!(!cleaned.ok);
+			assert_eq!(cleaned.code.as_deref(), Some(expected_code));
+			assert_eq!(fs::read(&staged).expect("read untouched staged readiness"), b"new readiness");
+			assert_eq!(fs::read(&ready).expect("read untouched old readiness"), b"old readiness");
+			assert_entries(ready.parent().expect("SDK directory"), &["ready.staged", "ready.json"]);
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn readiness_replace_then_direct_cleanup_through_tmp_lexical_alias() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let temporary = TempDir::new(Path::new("/private/tmp"));
+		let lexical = Path::new("/tmp").join(temporary.0.file_name().expect("temp directory name"));
+		// Identities come from /private/tmp; only native operations receive /tmp.
+		replace_and_cleanup(&temporary.0, &lexical);
+	}
+}
+
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};
@@ -12945,5 +17527,118 @@ mod sha256_tests {
 		let digest = digest_reader(&mut reader).unwrap();
 		assert_eq!(reader.offset, reader.bytes.len());
 		assert_eq!(digest, sha256(&reader.bytes));
+	}
+}
+
+/// Bytes copied out of one read-only broker publication observation.
+#[napi(object)]
+pub struct NativeDiagnosticSnapshotRead {
+	pub ok:     bool,
+	pub reason: Option<String>,
+	pub bytes:  Option<Uint8Array>,
+}
+
+/// Outcome of a read-only publication revalidation.
+#[napi(object)]
+pub struct NativeDiagnosticSnapshotStatus {
+	pub ok:     bool,
+	pub reason: Option<String>,
+}
+
+/// Exclusive read-only lease over one already published broker document.
+///
+/// The lease exposes no descriptor, no path, no write method and no publication
+/// authority: it can only copy bounded bytes, re-prove the retained descriptor
+/// and name edges, and close. `close` is idempotent and never throws; every use
+/// after close reports `unsafe_discovery`.
+#[napi]
+pub struct NativeDiagnosticSnapshot {
+	lease:  Mutex<Option<platform::DiagnosticSnapshotLease>>,
+	reason: Option<String>,
+}
+
+#[napi]
+impl NativeDiagnosticSnapshot {
+	#[napi(getter)]
+	pub const fn ok(&self) -> bool {
+		self.reason.is_none()
+	}
+
+	#[napi(getter)]
+	pub fn reason(&self) -> Option<String> {
+		self.reason.clone()
+	}
+
+	#[napi]
+	pub fn read(&self) -> NativeDiagnosticSnapshotRead {
+		let guard = self.lease.lock();
+		let Some(lease) = guard.as_ref() else {
+			return NativeDiagnosticSnapshotRead {
+				ok:     false,
+				reason: Some(
+					self
+						.reason
+						.clone()
+						.unwrap_or_else(|| "unsafe_discovery".to_owned()),
+				),
+				bytes:  None,
+			};
+		};
+		match lease.read_bytes() {
+			Ok(bytes) => NativeDiagnosticSnapshotRead {
+				ok:     true,
+				reason: None,
+				bytes:  Some(Uint8Array::new(bytes)),
+			},
+			Err(reason) => NativeDiagnosticSnapshotRead {
+				ok:     false,
+				reason: Some(reason.to_owned()),
+				bytes:  None,
+			},
+		}
+	}
+
+	#[napi]
+	pub fn revalidate(&self) -> NativeDiagnosticSnapshotStatus {
+		let guard = self.lease.lock();
+		let Some(lease) = guard.as_ref() else {
+			return NativeDiagnosticSnapshotStatus {
+				ok:     false,
+				reason: Some(
+					self
+						.reason
+						.clone()
+						.unwrap_or_else(|| "unsafe_discovery".to_owned()),
+				),
+			};
+		};
+		match lease.revalidate_edges() {
+			Ok(()) => NativeDiagnosticSnapshotStatus { ok: true, reason: None },
+			Err(reason) => {
+				NativeDiagnosticSnapshotStatus { ok: false, reason: Some(reason.to_owned()) }
+			},
+		}
+	}
+
+	#[napi]
+	pub fn close(&self) {
+		// Taking the lease releases the retained descriptors; a second close observes
+		// `None`, so close stays idempotent without an explicit drop of a non-Drop
+		// value.
+		let _released = self.lease.lock().take();
+	}
+}
+
+/// Open a read-only lease over the fixed broker publication under `agentDir`.
+///
+/// The caller supplies only the agent directory: the publication name, the
+/// ancestor policy and the read budget are fixed by this adapter.
+#[napi]
+pub fn diagnostic_snapshot_open(agent_dir: String, budget_ms: u32) -> NativeDiagnosticSnapshot {
+	match platform::open_diagnostic_snapshot(&agent_dir, budget_ms) {
+		Ok(lease) => NativeDiagnosticSnapshot { lease: Mutex::new(Some(lease)), reason: None },
+		Err(reason) => {
+			NativeDiagnosticSnapshot { lease: Mutex::new(None), reason: Some(reason.to_owned()) }
+		},
 	}
 }

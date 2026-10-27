@@ -9,10 +9,10 @@ name: Spoofed version drift
 #
 # Detection only, deliberately. The job holds no write scope: the repository
 # runs a default-deny token policy (scripts/check-workflow-permissions.ts) with
-# exactly three narrowly-justified exceptions, and dev requires the signed
-# exact-head PR contract — so a bot-opened PR would still need a human verdict.
+# exactly three narrowly-justified exceptions, and the dev ruleset requires
+# an approving GitHub review — so a bot-opened PR would still need a maintainer.
 # Buying `contents: write` + `pull-requests: write` for a daily cron would not
-# remove that human step, it would only widen the token surface. A red
+# remove that review, it would only widen the token surface. A red
 # scheduled run is the signal; remediation is one command:
 #
 #   bun scripts/check-spoofed-versions.ts --update

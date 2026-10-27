@@ -97,8 +97,13 @@ export class PromptActivity {
 	#awaitingModel = false;
 
 	/** Folds one inbound frame's lifecycle event into the in-flight tool and model state. */
-	observe(eventType: string | undefined, toolCallId: string | undefined, messageRole: string | undefined): void {
-		this.#observeInference(eventType, messageRole);
+	observe(
+		eventType: string | undefined,
+		toolCallId: string | undefined,
+		messageRole: string | undefined,
+		messageHasToolCall = false,
+	): void {
+		this.#observeInference(eventType, messageRole, messageHasToolCall);
 		if (toolCallId === undefined) return;
 		if (eventType === "tool_execution_start" || eventType === "tool_execution_update") this.#running.add(toolCallId);
 		else if (eventType === "tool_execution_end") this.#running.delete(toolCallId);
@@ -110,7 +115,11 @@ export class PromptActivity {
 	 * re-invocation that carries a tool result back — until the first frame of that
 	 * response proves the model answered.
 	 */
-	#observeInference(eventType: string | undefined, messageRole: string | undefined): void {
+	#observeInference(
+		eventType: string | undefined,
+		messageRole: string | undefined,
+		messageHasToolCall: boolean,
+	): void {
 		if (eventType === "agent_start" || eventType === "tool_execution_end") {
 			this.#awaitingModel = true;
 			return;
@@ -132,7 +141,11 @@ export class PromptActivity {
 		// Providers that do not stream emit no `message_update`, so the assistant message
 		// itself is the first proof. `message_start`/`message_end` also carry the user and
 		// tool-result messages the host echoes back, which prove nothing about the model.
-		if ((eventType === "message_start" || eventType === "message_end") && messageRole === "assistant")
+		if (
+			(eventType === "message_start" || eventType === "message_end") &&
+			messageRole === "assistant" &&
+			!messageHasToolCall
+		)
 			this.#awaitingModel = false;
 	}
 

@@ -81,6 +81,58 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("does not restart queued work when an owner lease is released after manager disposal", async () => {
+		const manager = makeManager(1);
+		const blockerStarted = Promise.withResolvers<void>();
+		const blockerGate = Promise.withResolvers<void>();
+		const blockerId = manager.register(
+			"task",
+			"foreign blocker",
+			async () => {
+				blockerStarted.resolve();
+				await blockerGate.promise;
+				return "finished";
+			},
+			{ ownerId: "owner-b" },
+		);
+		await blockerStarted.promise;
+		const blockerJob = manager.getJob(blockerId);
+		manager.registerSubagentRecord({
+			subagentId: "disposed-queued",
+			ownerId: "owner-a",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/disposed-queued.jsonl",
+			resumable: true,
+		});
+		let resumeStarts = 0;
+		manager.setResumeRunner(subagentId => {
+			resumeStarts++;
+			return manager.register("task", `resume ${subagentId}`, async () => "resumed", {
+				ownerId: "owner-a",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(manager.resumeSubagent("disposed-queued", { ownerId: "owner-a" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+
+		try {
+			await manager.dispose({ timeoutMs: 0 });
+			manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: true });
+			expect(resumeStarts).toBe(0);
+		} finally {
+			blockerGate.resolve();
+			await blockerJob?.promise;
+			await manager.waitForAll();
+		}
+	});
+
 	test("proves a captured running record by stable id and commit purges only its owner", async () => {
 		const manager = makeManager();
 		registerCooperativeSubagent(manager, "running", "owner-a");
@@ -373,6 +425,315 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("waits for a queued record's failed prior execution to settle without cancelling the queue", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1, retentionMs: 0 });
+		const priorRunGate = Promise.withResolvers<void>();
+		const blockerStarted = Promise.withResolvers<void>();
+		const blockerGate = Promise.withResolvers<void>();
+		const subagentId = "queued-after-failure";
+		const priorJobId = manager.register(
+			"task",
+			"failed prior run",
+			async () => {
+				await priorRunGate.promise;
+				return "late completion";
+			},
+			{
+				ownerId: "owner-a",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		const priorJob = manager.getJob(priorJobId);
+		if (!priorJob) throw new Error("Prior job was not registered");
+		manager.registerSubagentRecord({
+			subagentId,
+			ownerId: "owner-a",
+			currentJobId: priorJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: `/tmp/${subagentId}.jsonl`,
+			resumable: true,
+		});
+		expect(manager.failNow(priorJobId, priorJob.generation, "logical failure")).toBe(true);
+		await manager.drainDeliveries({ timeoutMs: 100 });
+
+		manager.register(
+			"task",
+			"foreign blocker",
+			async () => {
+				blockerStarted.resolve();
+				await blockerGate.promise;
+				return "blocker done";
+			},
+			{ ownerId: "owner-b" },
+		);
+		await blockerStarted.promise;
+		manager.setResumeRunner(id =>
+			manager.register("task", `resume ${id}`, async () => "resumed", {
+				id: `${id}-resume`,
+				ownerId: "owner-a",
+				metadata: { subagent: { id, agent: "executor", agentSource: "bundled" } },
+			}),
+		);
+		expect(manager.resumeSubagent(subagentId, { ownerId: "owner-a" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+		try {
+			expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 })).toMatchObject({
+				confirmed: false,
+				reason: "deadline_exceeded",
+				unresolvedIds: [subagentId],
+			});
+			expect(manager.getSubagentRecord(subagentId)?.status).toBe("queued");
+
+			priorRunGate.resolve();
+			await priorJob.promise;
+			expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 100 })).toMatchObject({
+				confirmed: true,
+				terminalIds: [subagentId],
+				unresolvedIds: [],
+			});
+			expect(manager.getSubagentRecord(subagentId)?.status).toBe("queued");
+			manager.finishOwnerSubagentShutdown(lease, "commit");
+			expect(manager.getSubagentRecord(subagentId)).toBeUndefined();
+		} finally {
+			priorRunGate.resolve();
+			blockerGate.resolve();
+			manager.finishOwnerSubagentShutdown(lease, "release");
+			await manager.waitForAll();
+			await manager.dispose();
+		}
+	});
+
+	test("does not resume a queued subagent until its failed prior execution settles", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1, retentionMs: 0 });
+		const priorRunGate = Promise.withResolvers<void>();
+		const priorStarted = Promise.withResolvers<void>();
+		const blockerStarted = Promise.withResolvers<void>();
+		const blockerGate = Promise.withResolvers<void>();
+		const subagentId = "queued-after-failed-run";
+		let priorRunnerDone = false;
+		let resumeStarts = 0;
+		let resumedBeforePriorRunnerDone = false;
+		const priorJobId = manager.register(
+			"task",
+			"failed prior run",
+			async () => {
+				priorStarted.resolve();
+				try {
+					await priorRunGate.promise;
+					return "late completion";
+				} finally {
+					priorRunnerDone = true;
+				}
+			},
+			{
+				ownerId: "owner-a",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		const priorJob = manager.getJob(priorJobId);
+		if (!priorJob) throw new Error("Prior job was not registered");
+		manager.registerSubagentRecord({
+			subagentId,
+			ownerId: "owner-a",
+			currentJobId: priorJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: `/tmp/${subagentId}.jsonl`,
+			resumable: true,
+		});
+		await priorStarted.promise;
+		expect(manager.failNow(priorJobId, priorJob.generation, "logical failure")).toBe(true);
+		await manager.drainDeliveries({ timeoutMs: 100 });
+		const blockerJobId = manager.register(
+			"task",
+			"foreign blocker",
+			async () => {
+				blockerStarted.resolve();
+				await blockerGate.promise;
+				return "blocker done";
+			},
+			{ ownerId: "owner-b" },
+		);
+		await blockerStarted.promise;
+		manager.setResumeRunner(id => {
+			resumeStarts++;
+			resumedBeforePriorRunnerDone = !priorRunnerDone;
+			return manager.register("task", `resume ${id}`, async () => "resumed", {
+				id: `${id}-resume`,
+				ownerId: "owner-a",
+				metadata: { subagent: { id, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(manager.resumeSubagent(subagentId, { ownerId: "owner-a" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+
+		try {
+			expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 })).toMatchObject({
+				confirmed: false,
+				reason: "deadline_exceeded",
+				unresolvedIds: [subagentId],
+			});
+			blockerGate.resolve();
+			await manager.getJob(blockerJobId)?.promise;
+			manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: true });
+			expect(resumeStarts).toBe(0);
+			expect(manager.getSubagentRecord(subagentId)?.status).toBe("queued");
+
+			priorRunGate.resolve();
+			await priorJob.promise;
+			const resumedJobId = manager.getSubagentRecord(subagentId)?.currentJobId;
+			if (!resumedJobId) throw new Error("Queued child did not resume after its prior execution settled");
+			expect(resumeStarts).toBe(1);
+			expect(resumedBeforePriorRunnerDone).toBe(false);
+			await manager.getJob(resumedJobId)?.promise;
+			expect(manager.getSubagentRecord(subagentId)?.status).toBe("completed");
+		} finally {
+			priorRunGate.resolve();
+			blockerGate.resolve();
+			manager.finishOwnerSubagentShutdown(lease, "release");
+			await manager.waitForAll();
+			await manager.dispose();
+		}
+	});
+
+	test("publishes terminal evidence when shutdown commit purges a queued resume", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1 });
+		const blockerStarted = Promise.withResolvers<void>();
+		const blockerGate = Promise.withResolvers<void>();
+		const subagentId = "queued-wait-on-commit";
+		const blockerJobId = manager.register(
+			"task",
+			"foreign blocker",
+			async () => {
+				blockerStarted.resolve();
+				await blockerGate.promise;
+				return "blocker done";
+			},
+			{ ownerId: "owner-b" },
+		);
+		await blockerStarted.promise;
+		manager.registerSubagentRecord({
+			subagentId,
+			ownerId: "owner-a",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: `/tmp/${subagentId}.jsonl`,
+			resumable: true,
+		});
+		manager.setResumeRunner(id =>
+			manager.register("task", `resume ${id}`, async () => "resumed", {
+				ownerId: "owner-a",
+				metadata: { subagent: { id, agent: "executor", agentSource: "bundled" } },
+			}),
+		);
+		expect(manager.resumeSubagent(subagentId, { ownerId: "owner-a" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+		const target = manager.resolveSubagentWaitTarget(subagentId, { ownerId: "owner-a" });
+		if (!target) throw new Error("Expected a terminal-wait target for the queued resume");
+		const wait = manager.subscribeTerminalWait([target], "all_terminal");
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+		try {
+			expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 100 })).toMatchObject({
+				confirmed: true,
+				terminalIds: [subagentId],
+			});
+			manager.finishOwnerSubagentShutdown(lease, "commit");
+			expect(manager.getSubagentRecord(subagentId)).toBeUndefined();
+			await expect(wait.result).resolves.toMatchObject({
+				outcome: "completed",
+				condition: "all_terminal",
+				terminalJobIds: [subagentId],
+				pendingJobIds: [],
+			});
+		} finally {
+			wait.close();
+			blockerGate.resolve();
+			await manager.getJob(blockerJobId)?.promise;
+			manager.finishOwnerSubagentShutdown(lease, "release");
+			await manager.dispose();
+		}
+	});
+
+	for (const invalidation of ["record identity", "current job id", "current job generation"] as const) {
+		test(`cancels the captured queued execution when its ${invalidation} changes`, async () => {
+			const manager = makeManager();
+			const executionGate = Promise.withResolvers<void>();
+			const executionStarted = Promise.withResolvers<void>();
+			let executionSignal: AbortSignal | undefined;
+			const backingJobId = manager.register(
+				"task",
+				"queued backing execution",
+				async ({ signal }) => {
+					executionSignal = signal;
+					executionStarted.resolve();
+					await executionGate.promise;
+					return "settled";
+				},
+				{
+					ownerId: "owner-a",
+					metadata: { subagent: { id: "invalidated-queued", agent: "executor", agentSource: "bundled" } },
+				},
+			);
+			await executionStarted.promise;
+			const backingJob = manager.getJob(backingJobId);
+			if (!backingJob) throw new Error("Queued backing job was not registered");
+			const captured = {
+				subagentId: "invalidated-queued",
+				ownerId: "owner-a",
+				currentJobId: backingJobId,
+				currentJobGeneration: backingJob.generation,
+				historicalJobIds: [],
+				status: "queued" as const,
+				sessionFile: "/tmp/original.jsonl",
+				resumable: true,
+			};
+			manager.registerSubagentRecord(captured);
+			const lease = manager.beginOwnerSubagentShutdown("owner-a");
+			if (!lease) throw new Error("Owner shutdown lease was not created");
+			let canonicalRecord = captured;
+			if (invalidation === "record identity") {
+				canonicalRecord = { ...captured, sessionFile: "/tmp/replacement.jsonl" };
+				manager.registerSubagentRecord(canonicalRecord);
+			} else if (invalidation === "current job id") {
+				captured.currentJobId = "replacement-job";
+			} else {
+				captured.currentJobGeneration = "replacement-generation";
+			}
+
+			try {
+				expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 })).toMatchObject({
+					confirmed: false,
+					reason: "deadline_exceeded",
+					unresolvedIds: [captured.subagentId],
+				});
+				expect(executionSignal?.aborted).toBe(true);
+				expect(manager.getSubagentRecord(captured.subagentId)).toBe(canonicalRecord);
+			} finally {
+				manager.finishOwnerSubagentShutdown(lease, "release");
+				executionGate.resolve();
+				await manager.waitForAll();
+				await manager.dispose();
+			}
+		});
+	}
+
 	test("queues a watched completion and delivers it after unwatch", async () => {
 		const delivered: string[] = [];
 		const manager = new AsyncJobManager({
@@ -561,6 +922,159 @@ describe("owner subagent shutdown leases", () => {
 		expect(proof).toMatchObject({ confirmed: false, unresolvedIds: ["cancelling"] });
 		manager.finishOwnerSubagentShutdown(lease, "release");
 		gate.resolve();
+		await manager.waitForAll();
+		await manager.dispose();
+	});
+
+	test("a shutdown lease waits for its evicted execution and never cancels an id replacement", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+		const originalGate = Promise.withResolvers<void>();
+		const replacementGate = Promise.withResolvers<void>();
+		const originalEvictions: string[] = [];
+		let replacementSignal: AbortSignal | undefined;
+		const jobId = manager.register(
+			"task",
+			"original",
+			async () => {
+				await originalGate.promise;
+				return "late original";
+			},
+			{
+				id: "reused-physical-job",
+				ownerId: "owner-a",
+				metadata: { subagent: { id: "original-subagent", agent: "executor", agentSource: "bundled" } },
+				lifecycle: { onEvict: job => originalEvictions.push(job.generation) },
+			},
+		);
+		const originalJob = manager.getJob(jobId);
+		if (!originalJob) throw new Error("Original job was not registered");
+		manager.registerSubagentRecord({
+			subagentId: "original-subagent",
+			ownerId: "owner-a",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: true,
+		});
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+		manager.cancelAll({ ownerId: "owner-a" });
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(originalEvictions).toEqual([]);
+		expect(await manager.cancelAndSettleOwnerJobs("owner-a", { timeoutMs: 10 })).toBe(false);
+
+		const replacementId = manager.register(
+			"task",
+			"replacement",
+			async ({ signal }) => {
+				replacementSignal = signal;
+				await replacementGate.promise;
+				return "replacement done";
+			},
+			{ id: jobId, ownerId: "owner-b" },
+		);
+		expect(replacementId).toBe(jobId);
+		const replacementJob = manager.getJob(replacementId);
+		if (!replacementJob) throw new Error("Replacement job was not registered");
+
+		const deadlineProof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 10 });
+		expect(deadlineProof).toMatchObject({
+			confirmed: false,
+			reason: "deadline_exceeded",
+			unresolvedIds: ["original-subagent"],
+		});
+		expect(replacementSignal?.aborted).toBe(false);
+		expect(replacementJob.status).toBe("running");
+
+		originalGate.resolve();
+		await originalJob.promise;
+		const settledProof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 100 });
+		expect(settledProof).toMatchObject({ confirmed: true, terminalIds: ["original-subagent"], unresolvedIds: [] });
+		expect(originalEvictions).toEqual([originalJob.generation]);
+		expect(replacementSignal?.aborted).toBe(false);
+		expect(replacementJob.status).toBe("running");
+
+		manager.finishOwnerSubagentShutdown(lease, "release");
+		replacementGate.resolve();
+		await manager.waitForAll();
+		await manager.dispose();
+	});
+
+	test("shutdown captures a failed evicted subagent while its original runner is still active", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+		const originalGate = Promise.withResolvers<void>();
+		const replacementGate = Promise.withResolvers<void>();
+		let replacementSignal: AbortSignal | undefined;
+		const jobId = manager.register(
+			"task",
+			"failed original",
+			async () => {
+				await originalGate.promise;
+				return "late original";
+			},
+			{
+				id: "failed-physical-job",
+				ownerId: "owner-a",
+				metadata: { subagent: { id: "failed-subagent", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		const originalJob = manager.getJob(jobId);
+		if (!originalJob) throw new Error("Original job was not registered");
+		manager.registerSubagentRecord({
+			subagentId: "failed-subagent",
+			ownerId: "owner-a",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: true,
+		});
+		expect(manager.failNow(jobId, originalJob.generation, "owner failed job")).toBe(true);
+		expect(manager.getJob(jobId)).toBeUndefined();
+		// Consume A's published failure receipt before reusing its address; its
+		// runner remains held, independently of delivery reservation lifetime.
+		await manager.drainDeliveries({ timeoutMs: 100 });
+
+		const replacementId = manager.register(
+			"task",
+			"replacement B",
+			async ({ signal }) => {
+				replacementSignal = signal;
+				await replacementGate.promise;
+				return "replacement done";
+			},
+			{ id: jobId, ownerId: "owner-b" },
+		);
+		expect(replacementId).toBe(jobId);
+		const replacementJob = manager.getJob(replacementId);
+		if (!replacementJob) throw new Error("Replacement job was not registered");
+
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+		expect(lease.targets).toEqual([{ subagentId: "failed-subagent", jobId, source: "record" }]);
+		const deadlineProof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 10 });
+		expect(deadlineProof).toMatchObject({
+			confirmed: false,
+			reason: "deadline_exceeded",
+			unresolvedIds: ["failed-subagent"],
+		});
+		expect(replacementSignal?.aborted).toBe(false);
+		expect(replacementJob.status).toBe("running");
+
+		originalGate.resolve();
+		await originalJob.promise;
+		const settledProof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 100 });
+		expect(settledProof).toMatchObject({
+			confirmed: true,
+			terminalIds: ["failed-subagent"],
+			unresolvedIds: [],
+		});
+		expect(replacementSignal?.aborted).toBe(false);
+		expect(replacementJob.status).toBe("running");
+
+		manager.finishOwnerSubagentShutdown(lease, "release");
+		replacementGate.resolve();
 		await manager.waitForAll();
 		await manager.dispose();
 	});

@@ -1089,6 +1089,22 @@ describe("ACP deep-interview wire path", () => {
 								question: "Which ACP direction should the interview use?",
 								options: [{ label: "Keep protocol choices" }, { label: "Use plain text" }],
 								recommended: 0,
+								deepInterview: {
+									round: 0,
+									component: "review-topology",
+									dimension: "topology",
+									ambiguity: 1,
+									intent_contract: {
+										items: [
+											{
+												id: "integration:acp",
+												category: "integration",
+												statement: "Preserve ACP protocol choices",
+											},
+										],
+										confirmation_options: ["Keep protocol choices"],
+									},
+								},
 							},
 						],
 					});

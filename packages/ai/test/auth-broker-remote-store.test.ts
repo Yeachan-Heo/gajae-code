@@ -7,11 +7,14 @@ import {
 	AuthBrokerError,
 	type AuthBrokerServerHandle,
 	AuthStorage,
+	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
 	RemoteAuthCredentialStore,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
+import type { UsageReport } from "../src/usage";
+import { claudeUsageProvider } from "../src/usage/claude";
 import * as oauthUtils from "../src/utils/oauth";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
@@ -246,6 +249,63 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		});
 	});
 
+	test("adopts a fresh peer rotation already present in the broker snapshot", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const initialEntry = remote.snapshot.credentials[0]!;
+		expect(initialEntry.credential.type).toBe("oauth");
+		if (initialEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		store!.updateAuthCredential(initialEntry.id, mintOAuthCredential("peer", Date.now() + 60 * 60_000));
+		await storage!.reload();
+		await remote.refreshSnapshot();
+		const refreshRequest = vi.spyOn(client, "refreshCredential");
+
+		const refreshed = await remote.refreshOAuthCredential("anthropic", initialEntry.id, initialEntry.credential);
+
+		expect(refreshRequest).not.toHaveBeenCalled();
+		expect(refreshed).toMatchObject({ access: "access-peer", refresh: REMOTE_REFRESH_SENTINEL });
+		expect(remote.snapshot.credentials[0]?.credential).toMatchObject({ type: "oauth", access: "access-peer" });
+	});
+
+	test("adopts a peer rotation that races the broker refresh request", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const initialEntry = remote.snapshot.credentials[0]!;
+		expect(initialEntry.credential.type).toBe("oauth");
+		if (initialEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		const expectedRevision = initialEntry.revision;
+		expect(typeof expectedRevision).toBe("number");
+		const refreshCredential = client.refreshCredential.bind(client);
+		const refreshRequest = vi.spyOn(client, "refreshCredential").mockImplementation(async (id, signal, revision) => {
+			expect(revision).toBe(expectedRevision);
+			const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+			try {
+				peerStore.updateAuthCredential(id, mintOAuthCredential("peer", Date.now() + 60 * 60_000));
+			} finally {
+				peerStore.close();
+			}
+			return refreshCredential(id, signal, revision);
+		});
+		const refresh = vi.spyOn(oauthUtils, "refreshOAuthToken");
+
+		const refreshed = await remote.refreshOAuthCredential("anthropic", initialEntry.id, initialEntry.credential);
+
+		expect(refreshRequest).toHaveBeenCalledTimes(1);
+		expect(refresh).not.toHaveBeenCalled();
+		expect(refreshed).toMatchObject({ access: "access-peer", refresh: REMOTE_REFRESH_SENTINEL });
+		expect(remote.snapshot.credentials[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-peer",
+		});
+		expect(store!.listAuthCredentials("anthropic")[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-peer",
+			refresh: "refresh-peer",
+		});
+	});
+
 	test("preserves a broker refresh error when reconciliation reload fails, then recovers on a later reload", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
@@ -381,6 +441,166 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
 	});
 
+	test("does not assign a lone usage report to another Anthropic organization", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		const teamCredential = {
+			...mintOAuthCredential("shared", Date.now() + 60_000),
+			accountId: "shared-account",
+			email: "shared@example.com",
+			organizationId: "org-team",
+			organizationName: "Acme Team",
+		};
+		const personalCredential = {
+			...teamCredential,
+			access: "access-shared-personal",
+			refresh: "refresh-shared-personal",
+			organizationId: "org-personal",
+			organizationName: "Personal Max",
+		};
+		storage!.upsertCredential("anthropic", teamCredential);
+		storage!.upsertCredential("anthropic", personalCredential);
+		await remote.refreshSnapshot();
+
+		const teamEntry = remote.snapshot.credentials.find(
+			entry => entry.credential.type === "oauth" && entry.credential.organizationId === "org-team",
+		);
+		const personalEntry = remote.snapshot.credentials.find(
+			entry => entry.credential.type === "oauth" && entry.credential.organizationId === "org-personal",
+		);
+		if (teamEntry?.credential.type !== "oauth" || personalEntry?.credential.type !== "oauth") {
+			throw new Error("expected broker snapshot to contain both Anthropic organizations");
+		}
+
+		const now = Date.now();
+		const teamReport = {
+			provider: "anthropic" as const,
+			fetchedAt: now,
+			limits: [],
+			metadata: { accountId: "shared-account", email: "shared@example.com", orgId: "org-team" },
+		};
+		const fetchUsage = vi.spyOn(client, "fetchUsage").mockResolvedValue({
+			generatedAt: now,
+			reports: [teamReport],
+		});
+
+		await expect(remote.getUsageReport("anthropic", teamEntry.credential)).resolves.toEqual(teamReport);
+		await expect(remote.getUsageReport("anthropic", personalEntry.credential)).resolves.toBeNull();
+		expect(fetchUsage).toHaveBeenCalledTimes(1);
+	});
+
+	describe("a credential stored without an organization", () => {
+		const legacyCredential = {
+			...mintOAuthCredential("shared", Date.now() + 60_000),
+			accountId: "shared-account",
+			email: "shared@example.com",
+		};
+		const teamCredential = {
+			...legacyCredential,
+			access: "access-shared-team",
+			refresh: "refresh-shared-team",
+			organizationId: "org-team",
+			organizationName: "Acme Team",
+		};
+		const identity = { accountId: "shared-account", email: "shared@example.com" };
+
+		async function seed(): Promise<{
+			client: AuthBrokerClient;
+			legacy: OAuthCredential;
+			team: OAuthCredential;
+			legacyId: number;
+			teamId: number;
+		}> {
+			const client = new AuthBrokerClient({ url: handle!.url, token });
+			remote = new RemoteAuthCredentialStore({
+				client,
+				streamSnapshots: false,
+				presentationPath: path.join(tempDir, "presentations.json"),
+			});
+			// Two rows of one account coexist: the org-less row predates organization tracking.
+			storage!.upsertCredential("anthropic", legacyCredential);
+			storage!.upsertCredential("anthropic", teamCredential);
+			await remote.refreshSnapshot();
+			const shared = remote.snapshot.credentials.filter(
+				entry => entry.credential.type === "oauth" && entry.credential.accountId === "shared-account",
+			);
+			const legacy = shared.find(entry => entry.credential.type === "oauth" && !entry.credential.organizationId);
+			const team = shared.find(entry => entry.credential.type === "oauth" && !!entry.credential.organizationId);
+			if (legacy?.credential.type !== "oauth" || team?.credential.type !== "oauth") {
+				throw new Error("expected broker snapshot to hold the legacy row and the Team row");
+			}
+			return { client, legacy: legacy.credential, team: team.credential, legacyId: legacy.id, teamId: team.id };
+		}
+
+		test("does not take the lone report of an organization another row is scoped to", async () => {
+			const { client, legacy, team, legacyId, teamId } = await seed();
+			const now = Date.now();
+			// The legacy row's usage fetch failed, so the broker returns only the Team row's report.
+			const teamReport = {
+				provider: "anthropic" as const,
+				fetchedAt: now,
+				limits: [],
+				metadata: { ...identity, orgId: "org-team" },
+			};
+			vi.spyOn(client, "fetchUsage").mockResolvedValue({ generatedAt: now, reports: [teamReport] });
+
+			await expect(remote!.getUsageReport("anthropic", legacy)).resolves.toBeNull();
+			await expect(remote!.getUsageReport("anthropic", team)).resolves.toEqual(teamReport);
+
+			await remote!.fetchUsageReports();
+			await remote!.flushPresentationPersistence();
+			expect(remote!.peekCachedUsagePresentation("anthropic", legacyId)).toBeUndefined();
+			expect(remote!.peekCachedUsagePresentation("anthropic", teamId)).toEqual(
+				expect.objectContaining({ credentialId: teamId }),
+			);
+		});
+
+		test("does not take another account's report when the only unclaimed report is left after filtering", async () => {
+			const { client, legacy, legacyId } = await seed();
+			const now = Date.now();
+			// The legacy row's fetch failed. The Team report is claimed by the Team row; the remaining report belongs
+			// to the unrelated account seeded by beforeEach and carries no organization.
+			const teamReport = {
+				provider: "anthropic" as const,
+				fetchedAt: now,
+				limits: [],
+				metadata: { ...identity, orgId: "org-team" },
+			};
+			const otherAccountReport = {
+				provider: "anthropic" as const,
+				fetchedAt: now,
+				limits: [],
+				metadata: { accountId: "account-a", email: "a@example.com" },
+			};
+			vi.spyOn(client, "fetchUsage").mockResolvedValue({
+				generatedAt: now,
+				reports: [teamReport, otherAccountReport],
+			});
+
+			await expect(remote!.getUsageReport("anthropic", legacy)).resolves.toBeNull();
+			await remote!.fetchUsageReports();
+			await remote!.flushPresentationPersistence();
+			expect(remote!.peekCachedUsagePresentation("anthropic", legacyId)).toBeUndefined();
+		});
+
+		test("still takes its own report, including one naming an organization no row claims", async () => {
+			const { client, legacy, team } = await seed();
+			const now = Date.now();
+			// The Team row's fetch failed; the legacy row's report names its real, still-unrecorded organization.
+			const legacyReport = {
+				provider: "anthropic" as const,
+				fetchedAt: now,
+				limits: [],
+				metadata: { ...identity, orgId: "org-personal" },
+			};
+			vi.spyOn(client, "fetchUsage").mockResolvedValue({ generatedAt: now, reports: [legacyReport] });
+
+			await expect(remote!.getUsageReport("anthropic", legacy)).resolves.toEqual(legacyReport);
+			await expect(remote!.getUsageReport("anthropic", team)).resolves.toBeNull();
+			await remote!.flushPresentationPersistence();
+		});
+	});
+
 	test("does not let an obsolete scoped usage flight delete its replacement", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
@@ -459,5 +679,108 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toEqual(
 			expect.objectContaining({ credentialId: entry.id }),
 		);
+	});
+});
+
+describe("RemoteAuthCredentialStore usage attribution through a live broker", () => {
+	let tempDir = "";
+	let store: SqliteAuthCredentialStore | undefined;
+	let storage: AuthStorage | undefined;
+	let handle: AuthBrokerServerHandle | undefined;
+	let remote: RemoteAuthCredentialStore | undefined;
+	const token = "usage-attribution-bearer";
+	// Anthropic usage by access token; a token missing here gets a non-retryable failure, like a revoked grant.
+	const utilizationByToken: Record<string, number> = { "Bearer access-team": 80, "Bearer access-other": 30 };
+
+	beforeEach(async () => {
+		for (const key of ANTHROPIC_ENV) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-usage-attribution-"));
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const expires = Date.now() + 3_600_000;
+		const shared = { accountId: "shared-account", email: "shared@example.com" };
+		// Same account: a row stored before organizations were tracked, and the Team organization's row.
+		store.saveOAuth("anthropic", {
+			access: "access-legacy",
+			refresh: "refresh-legacy",
+			expires,
+			...shared,
+		});
+		store.saveOAuth("anthropic", {
+			access: "access-team",
+			refresh: "refresh-team",
+			expires,
+			...shared,
+			organizationId: "org-team",
+			organizationName: "Acme Team",
+		});
+		// An unrelated account whose report carries no organization.
+		store.saveOAuth("anthropic", {
+			access: "access-other",
+			refresh: "refresh-other",
+			expires,
+			accountId: "other-account",
+			email: "other@example.com",
+		});
+		storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsageProvider : undefined),
+			usageFetch: (async (_input: string | URL | Request, init?: RequestInit) => {
+				const utilization = utilizationByToken[new Headers(init?.headers).get("authorization") ?? ""];
+				if (utilization === undefined) return new Response("forbidden", { status: 403 });
+				return new Response(
+					JSON.stringify({
+						five_hour: { utilization, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+						seven_day: { utilization: 1, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch,
+		});
+		await storage.reload();
+		handle = startAuthBroker({ storage, bind: "127.0.0.1:0", bearerTokens: [token], disableRefresher: true });
+	});
+
+	afterEach(async () => {
+		remote?.close();
+		await handle?.close();
+		storage?.close();
+		store?.close();
+		await fs.rm(tempDir, { recursive: true, force: true });
+		for (const key of ANTHROPIC_ENV) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+	});
+
+	test("leaves a legacy row without usage when its fetch fails instead of borrowing another row's report", async () => {
+		remote = new RemoteAuthCredentialStore({
+			client: new AuthBrokerClient({ url: handle!.url, token }),
+			streamSnapshots: false,
+			presentationPath: path.join(tempDir, "presentations.json"),
+		});
+		await remote.refreshSnapshot();
+		const byAccess = new Map(
+			remote.snapshot.credentials.flatMap(entry =>
+				entry.credential.type === "oauth" ? [[entry.credential.access, entry] as const] : [],
+			),
+		);
+		const fiveHourUsed = (report: UsageReport | null) =>
+			report?.limits.find(limit => limit.id === "anthropic:5h")?.amount.used;
+		const usageOf = async (access: string) => {
+			const entry = byAccess.get(access);
+			if (entry?.credential.type !== "oauth") throw new Error(`missing broker row for ${access}`);
+			return remote!.getUsageReport("anthropic", entry.credential);
+		};
+
+		// The broker returns the Team and unrelated-account reports; the legacy row's own fetch failed.
+		expect(fiveHourUsed(await usageOf("access-team"))).toBe(80);
+		expect(fiveHourUsed(await usageOf("access-other"))).toBe(30);
+		await expect(usageOf("access-legacy")).resolves.toBeNull();
+
+		await remote.fetchUsageReports();
+		await remote.flushPresentationPersistence();
+		expect(remote.peekCachedUsagePresentation("anthropic", byAccess.get("access-legacy")!.id)).toBeUndefined();
 	});
 });

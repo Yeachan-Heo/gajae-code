@@ -267,6 +267,36 @@ describe("windows native addon loading", () => {
 		}
 	});
 
+	it("loads libunwind.dll from the installed addon directory after staging", async () => {
+		if (process.platform !== "win32") return;
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-unwind-"));
+		const filename = "pi_natives.win32-arm64.node";
+		try {
+			const context = await makeInstalledContext(root, [filename], "arm64-addon");
+			const installedDll = path.join(context.nativeDir, "libunwind.dll");
+			const execDir = path.join(root, "bin");
+			await fs.mkdir(execDir, { recursive: true });
+			await fs.writeFile(installedDll, "installed-runtime");
+			const loaded: string[] = [];
+			const bindings = loadNative({
+				context,
+				loadNativeLibrary: runtime => {
+					loaded.push(runtime);
+					return 1n;
+				},
+				requireCandidate: candidate => ({ selected: candidate }),
+				validateCandidate: () => undefined,
+			});
+			expect(await fs.readdir(execDir)).toEqual([]);
+			expect(path.dirname(loaded[0] ?? "")).not.toBe(path.dirname(process.execPath));
+			expect(loaded).toEqual([installedDll]);
+			expect(bindings.selected).toBe(contentPath(context.versionedDir, filename, "arm64-addon"));
+			expect(await fs.readdir(context.versionedDir)).not.toContain("libunwind.dll");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("does not fall through to execDir when installed addon staging fails", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-fallback-"));
 		const filename = "pi_natives.win32-x64.node";

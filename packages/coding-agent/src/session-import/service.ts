@@ -55,6 +55,7 @@ export type SessionImportErrorCode =
 	| "destination_conflict"
 	| "publish_uncertain"
 	| "atomic_unavailable"
+	| "permission_denied"
 	| "durability_not_provable"
 	| "durability_failed"
 	| "identity_mismatch"

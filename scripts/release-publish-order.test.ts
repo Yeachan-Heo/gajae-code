@@ -8,6 +8,7 @@ import {
 	packages as publishPackages,
 	parseReleasePublishCli,
 	planExpectedEvidencePublication,
+	planExpectedEvidencePublicationWaves,
 	publishExpectedEvidencePackages,
 	validateNpmRegistryUrl,
 } from "./ci-release-publish";
@@ -196,22 +197,57 @@ describe("unscoped gajae-code package publication", () => {
 		}
 	});
 
-	test("seals the dependency-ordered plan into evidence and the fixed publish boundary consumes it", async () => {
-		// The OIDC publish job must publish in planExpectedEvidencePublication
-		// order, not evidence-array (name-sorted) order. The order is computed in
+	test("groups the plan into dependency waves that publish every dependency in an earlier wave", () => {
+		const records = canonicalEvidenceRecords();
+		const waves = planExpectedEvidencePublicationWaves(records);
+		const waveOf = new Map(waves.flatMap((wave, index) => wave.map(name => [name, index] as const)));
+
+		expect(waves.flat().sort()).toEqual(records.map(record => record.name).sort());
+		expect(new Set(waves.flat()).size).toBe(records.length);
+		for (const record of records) {
+			for (const dependencyName of Object.keys(record.internal_dependencies)) {
+				expect(waveOf.get(dependencyName)!).toBeLessThan(waveOf.get(record.name)!);
+			}
+		}
+		// Every wave after the first is necessary: each member depends on the wave right before it.
+		for (const [index, wave] of waves.entries()) {
+			if (index === 0) continue;
+			for (const name of wave) {
+				const record = records.find(candidate => candidate.name === name)!;
+				expect(Object.keys(record.internal_dependencies).some(dependency => waveOf.get(dependency) === index - 1)).toBe(true);
+			}
+		}
+		// The five platform binaries have no internal dependencies and share the first wave.
+		expect(waves[0]).toEqual(expect.arrayContaining([
+			"@gajae-code/natives-darwin-arm64",
+			"@gajae-code/natives-darwin-x64",
+			"@gajae-code/natives-linux-arm64",
+			"@gajae-code/natives-linux-x64",
+			"@gajae-code/natives-win32-x64",
+		]));
+		expect(waves.length).toBeLessThan(records.length);
+	});
+
+	test("seals the dependency wave plan into evidence and the fixed publish boundary consumes it", async () => {
+		// The OIDC publish job must publish in planExpectedEvidencePublicationWaves
+		// order, not evidence-array (name-sorted) order. The plan is computed in
 		// the credential-free prepare job and sealed as an artifact.
 		const script = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
-		expect(script).toContain('PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json"');
-		expect(script).toContain("planExpectedEvidencePublication(expected.packages)");
+		expect(script).toContain('PUBLISH_ORDER_FILE = "gajae-release-publish-order-v2.json"');
+		expect(script).toContain("planExpectedEvidencePublicationWaves(expected.packages)");
 
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 		const publish = workflowJob(workflow, "publish");
-		expect(publish).toContain("gajae-release-publish-order-v1.json");
-		expect(publish).toContain("for name in $(jq -r '.order[]'");
+		expect(publish).toContain("gajae-release-publish-order-v2.json");
+		expect(publish).toContain("'.waves[$wave][]'");
+		// A wave starts only after every package of the previous wave succeeded.
+		expect(publish).toContain('wait "$pid" || failed=1');
+		expect(publish).toContain("later waves were not started");
 		// No direct evidence-array iteration may remain in the boundary.
 		expect(publish).not.toContain(".packages[$index]");
-		// The boundary rejects a plan that does not cover exactly the expected set.
+		// The boundary rejects a plan or receipt that does not cover exactly the expected set.
 		expect(publish).toContain("does not cover exactly the expected package set");
+		expect(publish).toContain("Publish receipt records do not cover exactly the expected package set");
 	});
 
 	test("rejects duplicate, missing, and extra evidence records before publication", async () => {
@@ -238,6 +274,13 @@ describe("unscoped gajae-code package publication", () => {
 			"native/index.d.ts",
 			"native/loader-state.js",
 			"native/loader-state.d.ts",
+			// Read-only diagnostic loader plus its trusted artifact digest record. These are
+			// package data, not binaries: the loader activates only an already verified
+			// cached artifact, so the delegation assertion below still holds.
+			"native/diagnostic-loader.d.ts",
+			"native/diagnostic-loader.js",
+			"native/diagnostic-artifact.json",
+			"native/diagnostic-artifact-embedded.json",
 			"native/embedded-addon.js",
 			"README.md",
 		]);
@@ -392,6 +435,13 @@ describe("immutable stable release contracts", () => {
 		expect(releaseScript).not.toContain('git(["add", "."])');
 
 	});
+	test("rebuilds release native addons with the distribution provenance profile", async () => {
+		const releaseScript = await Bun.file(path.join(repoRoot, "scripts/release.ts")).text();
+
+		expect(releaseScript).toContain(
+			'await $`bun --cwd=packages/natives run build`.env({ ...process.env, PI_NATIVE_PROFILE: "dist" });',
+		);
+	});
 	test("release entrypoints accept only their declared mode-specific arguments", () => {
 		expect(parseReleasePublishCli(["--dry-run"])).toEqual({ mode: "dry-run" });
 		expect(parseReleasePublishCli(["--prepare-evidence", "--evidence-dir", "release-evidence"])).toEqual({
@@ -426,6 +476,12 @@ describe("immutable stable release contracts", () => {
 
 		expect(parseReleaseCli(["watch"])).toEqual({ mode: "watch" });
 		expect(parseReleaseCli(["1.2.3"])).toEqual({ mode: "release", version: "1.2.3" });
+		expect(parseReleaseCli(["backmerge", "1.2.3"])).toEqual({ mode: "backmerge", version: "1.2.3" });
+		expect(() => parseReleaseCli(["backmerge"])).toThrow("exactly one exact stable X.Y.Z version");
+		expect(() => parseReleaseCli(["backmerge", "v1.2.3"])).toThrow("exactly one exact stable X.Y.Z version");
+		expect(() => parseReleaseCli(["backmerge", "1.2.3", "--dry-run"])).toThrow(
+			"exactly one exact stable X.Y.Z version",
+		);
 		expect(() => parseReleaseCli(["watch", "--verbose"])).toThrow("exactly one argument");
 		expect(() => parseReleaseCli(["1.2.3", "--dry-run"])).toThrow("exactly one argument");
 	});
@@ -456,6 +512,8 @@ describe("immutable stable release contracts", () => {
 		expect(releaseScript).toContain("Cannot parse CI run query");
 		expect(releaseScript).toContain("headSha");
 		expect(releaseScript).toContain("await watchCI(`v${version}`)");
+		expect(releaseScript).toContain("git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}");
+		expect(releaseScript).not.toContain("git -C /tmp/gjc-backmerge merge origin/main");
 		expect(assertionIndex).toBeGreaterThan(-1);
 		expect(assertionIndex).toBeLessThan(commitIndex);
 	});
@@ -484,7 +542,11 @@ describe("native release binary coverage", () => {
 		const prepare = workflowJob(workflow, "release_prepare");
 		const publish = workflowJob(workflow, "publish");
 		const finalize = workflowJob(workflow, "release_finalize");
+		const patterns = await Bun.file(path.join(repoRoot, "scripts/agpl-removal-patterns.json")).json();
 
+		for (const token of patterns.tokens as Array<{ value: string }>) {
+			expect(workflow.toLowerCase()).not.toContain(token.value.toLowerCase());
+		}
 		for (const job of [native, binaries]) {
 			expect(job).toContain("startsWith(github.ref, 'refs/tags/v')");
 			expect(job).toContain("inputs.rehearsal == 'tag-build-verify'");
@@ -497,6 +559,9 @@ describe("native release binary coverage", () => {
 
 		expect(native).toContain("needs: [release_metadata]");
 		expect(binaries).toContain("needs: [native, release_metadata]");
+		expect(binaries).toContain("bun scripts/verify-agpl-removal.ts --active-refs");
+		expect(binaries).toContain("--payload --tarball");
+		expect(binaries).toContain("--prose-root .");
 		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
 		expect(finalize).toContain("needs: [publish, release_metadata]");

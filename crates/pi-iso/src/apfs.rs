@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/apfs.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retained the
+// local APFS backend and added selective tree cloning.
 //! macOS APFS clonefile-based isolation.
 //!
 //! `clonefile(2)` recursively reflinks an entire directory tree in a single
@@ -50,6 +53,18 @@ impl IsolationBackend for ApfsBackend {
 		}
 	}
 
+	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+		#[cfg(target_os = "macos")]
+		{
+			imp::clone_tree(lower, merged, skip)
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			let _ = (lower, merged, skip);
+			Err(IsoError::unavailable("APFS clonefile isolation is only available on macOS"))
+		}
+	}
+
 	fn stop(&self, merged: &Path) -> IsoResult<()> {
 		#[cfg(target_os = "macos")]
 		{
@@ -73,6 +88,9 @@ mod imp {
 	};
 
 	use crate::{IsoError, IsoResult};
+
+	// Darwin's clonefile.h defines this, but libc does not currently expose it.
+	const CLONE_NOFOLLOW: u32 = 0x0001;
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
 		let lower = canonical_existing_dir(lower)?;
@@ -112,6 +130,78 @@ mod imp {
 		Err(IsoError::other(format!("clonefile {} -> {}: {err}", lower.display(), merged.display())))
 	}
 
+	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+		let lower = canonical_existing_dir(lower)?;
+		if let Some(parent) = merged.parent() {
+			fs::create_dir_all(parent).map_err(|err| {
+				IsoError::other(format!("unable to create parent of {}: {err}", merged.display()))
+			})?;
+		}
+		if merged.exists() {
+			if fs::read_dir(merged)
+				.map_err(|err| IsoError::other(format!("read_dir {}: {err}", merged.display())))?
+				.next()
+				.is_some()
+			{
+				return Err(IsoError::other(format!(
+					"clone destination {} is not empty",
+					merged.display()
+				)));
+			}
+		} else {
+			fs::create_dir(merged)
+				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
+		}
+
+		let result = (|| {
+			for entry in fs::read_dir(&lower)
+				.map_err(|err| IsoError::other(format!("read_dir {}: {err}", lower.display())))?
+			{
+				let entry = entry.map_err(|err| {
+					IsoError::other(format!("dir entry in {}: {err}", lower.display()))
+				})?;
+				if skip.contains(&entry.file_name().as_os_str()) {
+					continue;
+				}
+				let file_type = entry.file_type().map_err(|err| {
+					IsoError::other(format!("file_type {}: {err}", entry.path().display()))
+				})?;
+				if !(file_type.is_file() || file_type.is_dir() || file_type.is_symlink()) {
+					continue;
+				}
+				let src = entry.path();
+				let dst = merged.join(entry.file_name());
+				let src_c = to_cstring(src.as_os_str().as_bytes(), "source")?;
+				let dst_c = to_cstring(dst.as_os_str().as_bytes(), "destination")?;
+				// SAFETY: both C strings remain alive for the call. CLONE_NOFOLLOW
+				// clones a symlink itself rather than its target.
+				let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), CLONE_NOFOLLOW) };
+				if rc != 0 {
+					let err = std::io::Error::last_os_error();
+					if let Some(code) = err.raw_os_error()
+						&& matches!(code, libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV)
+					{
+						return Err(IsoError::unavailable(format!(
+							"APFS clonefile unsupported on this volume ({err}); {} -> {}",
+							src.display(),
+							dst.display()
+						)));
+					}
+					return Err(IsoError::other(format!(
+						"clonefile {} -> {}: {err}",
+						src.display(),
+						dst.display()
+					)));
+				}
+			}
+			Ok(())
+		})();
+		if result.is_err() {
+			let _ = fs::remove_dir_all(merged);
+		}
+		result
+	}
+
 	pub fn stop(merged: &Path) -> IsoResult<()> {
 		match fs::remove_dir_all(merged) {
 			Ok(()) => Ok(()),
@@ -144,5 +234,72 @@ mod imp {
 	fn to_cstring(bytes: &[u8], label: &str) -> IsoResult<CString> {
 		CString::new(bytes)
 			.map_err(|err| IsoError::other(format!("{label} path contains NUL byte: {err}")))
+	}
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+	use std::{
+		ffi::OsStr,
+		fs,
+		os::unix::{ffi::OsStrExt, fs::symlink},
+		path::{Path, PathBuf},
+		time::{SystemTime, UNIX_EPOCH},
+	};
+
+	use super::*;
+
+	struct Fixture(PathBuf);
+
+	impl Fixture {
+		fn new() -> Self {
+			let nanos = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time should be after epoch")
+				.as_nanos();
+			let root =
+				std::env::temp_dir().join(format!("pi-iso-clone-tree-{}-{nanos}", std::process::id()));
+			fs::create_dir_all(&root).expect("create clone-tree fixture");
+			Self(root)
+		}
+	}
+
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn clone_tree_skips_top_level_entry_and_preserves_symlink() {
+		let fixture = Fixture::new();
+		let lower = fixture.0.join("lower");
+		let merged = fixture.0.join("merged");
+		fs::create_dir_all(lower.join("nested")).unwrap();
+		fs::create_dir_all(lower.join(".git")).unwrap();
+		fs::write(lower.join("file"), "file").unwrap();
+		fs::write(lower.join("nested/child"), "child").unwrap();
+		fs::write(lower.join(".git/config"), "skip").unwrap();
+		symlink("file", lower.join("link")).unwrap();
+		let fifo = std::ffi::CString::new(lower.join("debug.fifo").as_os_str().as_bytes()).unwrap();
+		// SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+		assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+		let result = backend().clone_tree(&lower, &merged, &[OsStr::new(".git")]);
+		if matches!(result, Err(crate::IsoError::Unavailable(_))) {
+			return;
+		}
+		result.unwrap();
+		assert!(!merged.join(".git").exists());
+		assert!(fs::symlink_metadata(merged.join("debug.fifo")).is_err());
+		assert_eq!(fs::read_to_string(merged.join("file")).unwrap(), "file");
+		assert_eq!(fs::read_to_string(merged.join("nested/child")).unwrap(), "child");
+		assert_eq!(fs::read_link(merged.join("link")).unwrap(), Path::new("file"));
+		assert!(
+			fs::symlink_metadata(merged.join("link"))
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
 	}
 }

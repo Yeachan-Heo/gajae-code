@@ -228,16 +228,18 @@ export function buildTopNByModelSeries<T extends ModelKeyedPoint, B>(
 	const hasOther = points.some(p => !topKeys.has(`${p.model}::${p.provider}`));
 	if (hasOther) seriesNames.push("Other");
 
-	const dayMap = new Map<number, Record<string, B>>();
-	for (const day of allDays) dayMap.set(day, {});
+	// Model labels are attacker-controlled strings. A plain object would treat
+	// "__proto__" as the inherited prototype and mutate Object.prototype.
+	const dayMap = new Map<number, Map<string, B>>();
+	for (const day of allDays) dayMap.set(day, new Map());
 	for (const point of points) {
 		const key = `${point.model}::${point.provider}`;
 		const label = topKeys.has(key) ? (labelByKey.get(key) ?? point.model) : "Other";
 		const row = dayMap.get(point.timestamp);
 		if (!row) continue;
-		const bucket = row[label] ?? initBucket();
+		const bucket = row.get(label) ?? initBucket();
 		accumulate(bucket, point);
-		row[label] = bucket;
+		row.set(label, bucket);
 	}
 
 	return {
@@ -245,7 +247,7 @@ export function buildTopNByModelSeries<T extends ModelKeyedPoint, B>(
 		datasets: seriesNames.map(name => ({
 			label: name,
 			data: allDays.map(day => {
-				const bucket = dayMap.get(day)?.[name];
+				const bucket = dayMap.get(day)?.get(name);
 				return bucket ? bucketToValue(bucket) : 0;
 			}),
 		})),

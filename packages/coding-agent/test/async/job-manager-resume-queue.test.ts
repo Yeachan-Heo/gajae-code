@@ -1,5 +1,30 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
+import {
+	bindToolLineage,
+	isOwnedAttemptRegistrationIncomplete,
+	type LineageBinding,
+	lookupOwnedRegistration,
+	registerOwnedIfLineaged,
+	registerOwnedRegistration,
+	retireOwnedRegistrationsForEndpoint,
+	type TurnRegistrationKey,
+	unbindToolLineage,
+	unregisterOwnedRegistration,
+} from "@gajae-code/coding-agent/session/terminal-abort";
+
+const testToolLineages: Array<{ toolCallId: string; endpointId?: string }> = [];
+const testOwnedRegistrations: TurnRegistrationKey[] = [];
+
+afterEach(() => {
+	for (const { toolCallId, endpointId } of testToolLineages.splice(0)) unbindToolLineage(toolCallId, endpointId);
+	for (const registration of testOwnedRegistrations.splice(0)) unregisterOwnedRegistration(registration);
+});
+
+function bindTestToolLineage(toolCallId: string, binding: LineageBinding): void {
+	bindToolLineage(toolCallId, binding);
+	testToolLineages.push({ toolCallId, endpointId: binding.endpointId });
+}
 
 /** Build a manager that records every delivered completion. */
 function makeManager(opts?: { maxRunningJobs?: number; retentionMs?: number }) {
@@ -52,22 +77,33 @@ function spawnControllable(manager: AsyncJobManager, subagentId: string, ownerId
 
 /** A resume runner that re-spawns a subagent which completes immediately. */
 function installResumeRunner(manager: AsyncJobManager) {
-	manager.setResumeRunner((subagentId, message) => {
-		const rec = manager.getSubagentRecord(subagentId);
-		return manager.register(
-			"task",
-			subagentId,
-			async (): Promise<SubagentRunOutcome> => ({
-				kind: "completed",
-				text: message ? `resumed:${message}` : `resumed:${subagentId}`,
-			}),
-			{
-				id: `${subagentId}-r`,
-				ownerId: rec?.ownerId,
-				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
-			},
-		);
-	});
+	manager.setResumeRunner(
+		(subagentId, message, _descriptor, resumeToolCallId, admissionEndpointId, ownedRegistrationEndpointId) => {
+			const rec = manager.getSubagentRecord(subagentId);
+			const jobId = manager.register(
+				"task",
+				subagentId,
+				async (): Promise<SubagentRunOutcome> => ({
+					kind: "completed",
+					text: message ? `resumed:${message}` : `resumed:${subagentId}`,
+				}),
+				{
+					id: `${subagentId}-r`,
+					ownerId: rec?.ownerId,
+					metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+				},
+			);
+			// Resolve lineage at admission while storing ownership under the manager's current endpoint.
+			registerOwnedIfLineaged(manager, resumeToolCallId, jobId, admissionEndpointId, ownedRegistrationEndpointId);
+			const generation = manager.getJob(jobId)?.generation;
+			const registrationEndpoint = ownedRegistrationEndpointId ?? admissionEndpointId;
+			if (generation) {
+				const registration = lookupOwnedRegistration(jobId, generation, registrationEndpoint);
+				if (registration) testOwnedRegistrations.push(registration);
+			}
+			return jobId;
+		},
+	);
 }
 
 describe("AsyncJobManager subagent pause/resume/queue", () => {
@@ -428,7 +464,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
-	test("a fenced queued owner remains queued while a later foreign owner resumes", async () => {
+	test("a live rollback drains a fenced queued owner after foreign progress", async () => {
 		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
 		installResumeRunner(manager);
 		const a = spawnControllable(manager, "A", "owner-a");
@@ -451,7 +487,109 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(completions.map(completion => completion.text)).toContain("resumed:C");
 		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 });
 		expect(proof).toMatchObject({ confirmed: true, terminalIds: ["A"], unresolvedIds: [] });
-		manager.finishOwnerSubagentShutdown(lease, "release");
+		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
+		manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: true });
+		expect(manager.getSubagentRecord("A")?.status).not.toBe("queued");
+		await manager.waitForAll();
+		expect(manager.getSubagentRecord("A")?.status).toBe("completed");
+		expect(completions.map(completion => completion.text)).toContain("resumed:A");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("a stale queued generation cannot resume a replacement owner's entry", async () => {
+		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale").queued).toBe(true);
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current").queued).toBe(true);
+
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(completions.map(completion => completion.text)).toContain("resumed:current");
+		expect(completions.map(completion => completion.text)).not.toContain("resumed:stale");
+		expect(manager.getSubagentRecord("A", { ownerId: "owner-b" })?.status).toBe("completed");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("stale queued generation's owned registration is retired on replacement (endpoint-transition regression)", async () => {
+		// Tests that when a subagent is resumed with a tool call ID, and later
+		// a replacement owner/generation is registered, the stale registration is
+		// properly retired using its original endpoint identity, not the manager's
+		// current endpoint (which may have been rekeyed).
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Set up a tool lineage for the stale resume
+		const staleToolCallId = "tool-call-stale-123";
+		const managerEndpointId = "endpoint-v1";
+		bindTestToolLineage(staleToolCallId, {
+			lineageIdHash: "hash-stale",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: managerEndpointId,
+		});
+
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+		// Queue the stale resume WITH a tool call ID to exercise registration
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale", staleToolCallId).queued).toBe(true);
+		// Verify the stale queued generation has an owned registration
+		const staleGen = `queued:A:1`;
+		const staleReg = lookupOwnedRegistration(staleGen, staleGen, managerEndpointId);
+		expect(staleReg).toBeDefined();
+
+		// Replace with a new owner/record
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+		// Queue the new resume (also with tool call ID)
+		const currentToolCallId = "tool-call-current-456";
+		bindTestToolLineage(currentToolCallId, {
+			lineageIdHash: "hash-current",
+			promptAttemptEpoch: 2,
+			endpointGeneration: 1,
+			endpointId: managerEndpointId,
+		});
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current", currentToolCallId).queued).toBe(true);
+		// The current generation should have its own registration
+		const currentGen = `queued:A:2`;
+		const currentReg = lookupOwnedRegistration(currentGen, currentGen, managerEndpointId);
+		expect(currentReg).toBeDefined();
+
+		// Drain and complete; this will clean up the stale queued entry
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// After drain, the stale registration should have been retired
+		const staleRegAfter = lookupOwnedRegistration(staleGen, staleGen, managerEndpointId);
+		expect(staleRegAfter).toBeUndefined();
+
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
@@ -547,5 +685,287 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(manager.getSubagentRecord("A")).toBeUndefined();
 		expect(manager.getLiveHandle("A")).toBeUndefined();
 		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("stale queued registrations are retired when manager is rekeyed (endpoint-transition regression)", async () => {
+		// Tests that when a subagent is resumed with a tool call ID at endpoint E1,
+		// queued, and then the manager is rekeyed to E2 before the queue is drained,
+		// the stale queued registration is properly retired using the saved admission
+		// endpoint (E1), not the manager's current endpoint (E2).
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// Start with A paused, then add a blocker to fill capacity
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Now start a blocker to fill the max capacity slot
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+
+		// Set up a tool lineage at endpoint E1
+		const staleToolCallId = "tool-call-stale-endpoint-123";
+		const endpointE1 = "endpoint-e1";
+		bindTestToolLineage(staleToolCallId, {
+			lineageIdHash: "hash-stale",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: endpointE1,
+		});
+
+		// Queue the resume with the tool call ID; this saves endpointE1 as the admission endpoint
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale", staleToolCallId).queued).toBe(true);
+		const staleGen = `queued:A:1`;
+		const staleRegBefore = lookupOwnedRegistration(staleGen, staleGen, endpointE1);
+		expect(staleRegBefore).toBeDefined();
+
+		// Replace with a new owner/record
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+		// Queue the new resume (also with tool call ID at E2)
+		const endpointE2 = "endpoint-e2";
+		const currentToolCallId = "tool-call-current-456";
+		bindTestToolLineage(currentToolCallId, {
+			lineageIdHash: "hash-current",
+			promptAttemptEpoch: 2,
+			endpointGeneration: 1,
+			endpointId: endpointE2,
+		});
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current", currentToolCallId).queued).toBe(true);
+
+		// Drain the queue by releasing the blocker; the stale entry should be cleaned up using the saved E1 endpoint
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// The stale registration should have been retired (using the saved E1 endpoint)
+		const staleRegAfter = lookupOwnedRegistration(staleGen, staleGen, endpointE1);
+		expect(staleRegAfter).toBeUndefined();
+
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("saturated pool: stale queued entries are retired even when all slots are full", async () => {
+		// When a queued resume is replaced by a record for a different owner while
+		// the pool is at max capacity, the stale entry must be retired immediately,
+		// not deferred until a slot becomes free. This prevents owned aborts from
+		// returning unsettled for generations that can never execute.
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// First, spawn A, pause it to create a paused record, then set up blocker
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Spawn a blocker to fill the single capacity slot
+		const blocker = spawnControllable(manager, "BLOCKER", "owner-blocker");
+		expect(manager.getRunningJobs().length).toBe(1);
+
+		// Queue a resume for A (owner-a); this saves the admission endpoint
+		const toolCallIdA = "tool-call-a-123";
+		const endpointA = "endpoint-a";
+		bindTestToolLineage(toolCallIdA, {
+			lineageIdHash: "hash-a",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: endpointA,
+		});
+		const resumeA = manager.resumeSubagent("A", { ownerId: "owner-a" }, "A message", toolCallIdA);
+		expect(resumeA.ok).toBe(true);
+		expect(resumeA.queued).toBe(true);
+		const staleGenA = `queued:A:1`;
+		const staleRegABefore = lookupOwnedRegistration(staleGenA, staleGenA, endpointA);
+		expect(staleRegABefore).toBeDefined();
+
+		// Replace A's record with B's record (same subagent ID, different owner)
+		// This makes the queued entry stale
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+
+		// Queue the new resume for B
+		const toolCallIdB = "tool-call-b-456";
+		const endpointB = "endpoint-b";
+		bindTestToolLineage(toolCallIdB, {
+			lineageIdHash: "hash-b",
+			promptAttemptEpoch: 2,
+			endpointGeneration: 1,
+			endpointId: endpointB,
+		});
+		const resumeB = manager.resumeSubagent("A", { ownerId: "owner-b" }, "B message", toolCallIdB);
+		expect(resumeB.queued).toBe(true);
+		const validGenB = `queued:A:2`;
+		const validRegB = lookupOwnedRegistration(validGenB, validGenB, endpointB);
+		expect(validRegB).toBeDefined();
+
+		// Critically: A's stale entry must be retired NOW, even though the pool is
+		// still saturated. The stale registration should be unregistered and marked
+		// terminal immediately when the replacement was queued.
+		const staleRegAAfter = lookupOwnedRegistration(staleGenA, staleGenA, endpointA);
+		expect(staleRegAAfter).toBeUndefined();
+
+		// The stale generation should be marked as terminal in the manager.
+		const staleJobA = manager.getJob(staleGenA);
+		expect(staleJobA?.status).toBe("cancelled");
+
+		// Release the blocker and verify B's resume can start
+		blocker.release();
+		await manager.waitForAll();
+
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("valid queued resume ownership is preserved across manager rekey", async () => {
+		// Tests that when a subagent is resumed with a tool call ID at endpoint E1,
+		// queued, and then the manager is rekeyed to E2 while the entry remains VALID
+		// (not stale, still in the queue), the valid entry uses its saved admission
+		// endpoint to unregister the owned tuple when the queue is drained.
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// Start with A paused, then add a blocker to fill capacity
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Start a blocker to fill the single capacity slot
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+
+		// Set up a tool lineage at endpoint E1
+		const validToolCallId = "tool-call-valid-e1-123";
+		const endpointE1 = "endpoint-e1-valid";
+		bindTestToolLineage(validToolCallId, {
+			lineageIdHash: "hash-valid-e1",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: endpointE1,
+		});
+
+		// Register the manager at endpoint E1
+		const registeredAtE1 = AsyncJobManager.registerForEndpoint(endpointE1, manager);
+		expect(registeredAtE1).toBe(true);
+
+		// Queue the resume with the tool call ID at E1; both lineage admission
+		// and queued ownership initially use endpoint E1.
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "valid", validToolCallId).queued).toBe(true);
+		const validGen = `queued:A:1`;
+		const validRegBefore = lookupOwnedRegistration(validGen, validGen, endpointE1);
+		expect(validRegBefore).toBeDefined();
+
+		// Rekey the manager from E1 to E2: the valid queue entry is now at a different endpoint
+		const endpointE2 = "endpoint-e2-valid";
+		const rekeySuccess = AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager);
+		expect(rekeySuccess).toBe(true);
+		// Verify the manager has been moved to E2
+		expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE2);
+		expect(manager.getSubagentRecord("A")?.queued).toMatchObject({
+			admissionEndpointId: endpointE1,
+			ownedRegistrationEndpointId: endpointE2,
+		});
+		expect(lookupOwnedRegistration(validGen, validGen, endpointE1)).toBeUndefined();
+		expect(lookupOwnedRegistration(validGen, validGen, endpointE2)).toMatchObject({
+			lineageIdHash: "hash-valid-e1",
+			endpointId: endpointE2,
+		});
+
+		// Drain the queue by releasing the blocker; the queued tuple is retired
+		// at E2 while its original E1 lineage is used for the resumed job.
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// The queued ownership tuple moves with the manager to E2 and is retired there.
+		const validRegAfter = lookupOwnedRegistration(validGen, validGen, endpointE2);
+		expect(validRegAfter).toBeUndefined();
+
+		// The resumed job should have transitioned from queued to running/completed
+		const rec = manager.getSubagentRecord("A");
+		expect(rec?.status).not.toBe("queued");
+
+		// The original E1 lineage is retained, but the resumed job's ownership tuple
+		// follows the manager to its current E2 endpoint.
+		if (rec?.currentJobId && rec?.currentJobGeneration) {
+			const runningRegE1 = lookupOwnedRegistration(rec.currentJobId, rec.currentJobGeneration, endpointE1);
+			expect(runningRegE1).toBeUndefined();
+			const runningRegE2 = lookupOwnedRegistration(rec.currentJobId, rec.currentJobGeneration, endpointE2);
+			expect(runningRegE2).toMatchObject({ lineageIdHash: "hash-valid-e1", endpointId: endpointE2 });
+			if (runningRegE2) unregisterOwnedRegistration(runningRegE2);
+		}
+
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("queued rekey retains saturation evidence until successor endpoint teardown", async () => {
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+		const endpointE1 = "endpoint-e1-saturated";
+		const endpointE2 = "endpoint-e2-saturated";
+		const lineageIdHash = "hash-saturated-queued-rekey";
+		const attemptEpoch = 71;
+		try {
+			expect(AsyncJobManager.registerForEndpoint(endpointE1, manager)).toBe(true);
+
+			// Fill the process-global registration registry with non-evictable work.
+			for (let i = 0; i < 8192; i++) {
+				const generation = `saturation-filler:${i}`;
+				const registration: TurnRegistrationKey = {
+					endpointId: endpointE1,
+					lineageIdHash: "hash-saturation-filler",
+					promptAttemptEpoch: 1,
+					endpointGeneration: 1,
+					jobId: generation,
+					jobGeneration: generation,
+				};
+				registerOwnedRegistration(registration);
+				testOwnedRegistrations.push(registration);
+			}
+
+			const toolCallId = "tool-call-saturated-queued-rekey";
+			bindTestToolLineage(toolCallId, {
+				lineageIdHash,
+				promptAttemptEpoch: attemptEpoch,
+				endpointGeneration: 1,
+				endpointId: endpointE1,
+			});
+			expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "resume", toolCallId).queued).toBe(true);
+			const queuedGeneration = "queued:A:1";
+			expect(lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE1)).toBeUndefined();
+			expect(isOwnedAttemptRegistrationIncomplete(lineageIdHash, attemptEpoch)).toBe(true);
+
+			expect(AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager)).toBe(true);
+			retireOwnedRegistrationsForEndpoint(endpointE1);
+			expect(isOwnedAttemptRegistrationIncomplete(lineageIdHash, attemptEpoch)).toBe(true);
+		} finally {
+			manager.cancelSubagent("A", { ownerId: "owner-a" });
+			blocker.release();
+			await manager.waitForAll();
+			await manager.drainDeliveries({ timeoutMs: 500 });
+			await manager.dispose({ timeoutMs: 500 });
+			retireOwnedRegistrationsForEndpoint(endpointE1);
+			retireOwnedRegistrationsForEndpoint(endpointE2);
+		}
+		expect(isOwnedAttemptRegistrationIncomplete(lineageIdHash, attemptEpoch)).toBe(false);
 	});
 });

@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/btrfs.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain local
+// btrfs fallback and cleanup behavior.
 //! Linux btrfs subvolume snapshot isolation.
 //!
 //! When `lower` is a btrfs subvolume, `btrfs subvolume snapshot` creates an

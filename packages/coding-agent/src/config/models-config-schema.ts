@@ -26,6 +26,7 @@ export const ModelCompatSchema = z.object({
 	sendSessionHeaders: z.boolean().optional(),
 	supportsResponsesSessionAffinity: z.boolean().optional(),
 	supportsServiceTier: z.boolean().optional(),
+	supportsUltrafastTier: z.boolean().optional(),
 	supportsMultipleSystemMessages: z.boolean().optional(),
 	supportsReasoningEffort: z.boolean().optional(),
 	reasoningEffortMap: ReasoningEffortMapSchema.optional(),
@@ -68,6 +69,8 @@ export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = [
 ] as const;
 export const EffortSchema = z.enum(GJC_MODEL_EFFORT_IDS);
 const CacheRetentionSchema = z.enum(["none", "short", "long"]);
+const MAX_STREAM_IDLE_TIMEOUT_MS = 2 ** 31 - 1;
+const StreamIdleTimeoutMsSchema = z.number().int().finite().nonnegative().max(MAX_STREAM_IDLE_TIMEOUT_MS);
 
 const ThinkingControlModeSchema = z.enum([
 	"effort",
@@ -166,6 +169,7 @@ const ModelDefinitionSchema = z
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
 		cacheRetention: CacheRetentionSchema.optional(),
+		streamIdleTimeoutMs: StreamIdleTimeoutMsSchema.optional(),
 	})
 	.strict();
 
@@ -193,6 +197,7 @@ export const ModelOverrideSchema = z
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
 		cacheRetention: CacheRetentionSchema.optional(),
+		streamIdleTimeoutMs: StreamIdleTimeoutMsSchema.optional(),
 	})
 	.strict();
 
@@ -257,6 +262,7 @@ const ProviderConfigSchema = z
 		 */
 		transport: z.literal("pi-native").optional(),
 		cacheRetention: CacheRetentionSchema.optional(),
+		streamIdleTimeoutMs: StreamIdleTimeoutMsSchema.optional(),
 		openaiCompat: LocalOpenAICompatSchema.optional(),
 	})
 	.strict();

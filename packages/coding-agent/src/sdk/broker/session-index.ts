@@ -2,10 +2,20 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { withFileLock } from "../../config/file-lock";
+import {
+	describeRetainedLockTransition,
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+	type FileLockOptions,
+	isFileLockAcquireTimeout,
+	withFileLock,
+} from "../../config/file-lock";
 import { repo } from "../../utils/git";
+import { endpointIncarnation } from "./endpoint-authority";
+import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
+import { publishableRuntimeAbortCapability } from "./runtime-abort-capability";
 import {
 	assertSupportedSessionIndexEventVersion,
 	assertSupportedSnapshotVersion,
@@ -143,6 +153,12 @@ export interface SessionIndexEvent {
 	/** Immutable endpoint file identity captured by the broker at registration. */
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
+	/**
+	 * Operator-abort marker a host without a lifecycle request publishes in its own
+	 * endpoint registration (`runtime-abort-capability.ts`). Broker-private: never
+	 * returned by session list or any SDK response.
+	 */
+	abortCapability?: string;
 	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/**
@@ -173,6 +189,8 @@ export interface IndexedSession {
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
+	/** Broker-private operator-abort marker of a host without a lifecycle request. */
+	abortCapability?: string;
 	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
@@ -349,6 +367,8 @@ function sameIndexChangeStamp(a: SessionIndexChangeStamp, b: SessionIndexChangeS
 const ROTATE_BYTES = 4 * 1024 * 1024;
 /** Coalesced heartbeat checkpoint rate cap (C2): at most one per session per minute. */
 export const SESSION_HEARTBEAT_INTERVAL_MS = 60_000;
+/** A stale-host retirement requires silence well beyond the broker freshness window. */
+export const DEAD_HOST_HEARTBEAT_SILENCE_MS = 10 * SESSION_HEARTBEAT_INTERVAL_MS;
 export const DEFAULT_SESSION_RETENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_SESSION_RETENTION_MAX_ROWS = 25_000;
 
@@ -571,6 +591,7 @@ function projectIdentity(
 	ambiguous: boolean,
 	now: number,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+	skipOsProcessProbes = false,
 ): IndexedSession {
 	const { latest, heartbeat } = state;
 	const terminal = isTerminalEvent(latest);
@@ -579,7 +600,7 @@ function projectIdentity(
 		latest.hostUnregisteredReason === "process_exited" || latest.hostUnregisteredReason === "detached_idle"
 			? latest.hostUnregisteredReason
 			: undefined;
-	const pidAlive = alive(latest.pid);
+	const pidAlive = !skipOsProcessProbes && alive(latest.pid);
 	// Liveness evidence is host-written: a checkpointed heartbeat, or the
 	// `host_registered` event the host appended itself. Counting registration
 	// closes the up-to-one-interval window where a just-registered session
@@ -599,7 +620,7 @@ function projectIdentity(
 	// costing a powershell.exe spawn per stale registration on Windows.
 	const probeKey = `${latest.sessionId}\u0000${latest.endpointGeneration}\u0000${latest.pid}`;
 	const currentIncarnation =
-		recordedIncarnation === undefined || !pidAlive
+		skipOsProcessProbes || recordedIncarnation === undefined || !pidAlive
 			? undefined
 			: probedIncarnations !== undefined
 				? probedIncarnations.get(probeKey)
@@ -614,6 +635,7 @@ function projectIdentity(
 		endpointMtimeMs: latest.endpointMtimeMs,
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
+		...(latest.abortCapability === undefined ? {} : { abortCapability: latest.abortCapability }),
 		...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
 		terminalUncertain,
 		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
@@ -650,7 +672,10 @@ function reduceEvents(
 	now: number,
 	agentDir: string,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+	sessionIds?: ReadonlySet<string>,
+	options: { readonly skipOsProcessProbes?: boolean } = {},
 ): SessionIndexProjection {
+	const skipOsProcessProbes = options.skipOsProcessProbes === true;
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
 	const agentDirIdentity = resolveEquivalentPath(agentDir);
@@ -666,7 +691,12 @@ function reduceEvents(
 		}
 		return identity;
 	};
-	const { admitted } = admitEvents(events);
+	// Admission and projection are keyed by sessionId (tuple, tombstone, identity),
+	// so a scoped read reduces only the requested sessions' events and skips the
+	// other sessions' pid/incarnation probes without changing their rows.
+	const { admitted } = admitEvents(
+		sessionIds === undefined ? events : events.filter(event => sessionIds.has(event.sessionId)),
+	);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
 	for (const event of admitted) {
@@ -732,7 +762,8 @@ function reduceEvents(
 		const fencing = fencingRoots.get(sessionId);
 		const unresolved = unresolvedRoots.get(sessionId);
 		const ambiguous = (fencing?.size ?? 0) > 1;
-		for (const state of states) identities.push(projectIdentity(state, ambiguous, now, probedIncarnations));
+		for (const state of states)
+			identities.push(projectIdentity(state, ambiguous, now, probedIncarnations, skipOsProcessProbes));
 		const defaultAuthority = preferredIdentity(states);
 		if (defaultAuthority === undefined || defaultAuthority.latest.type === "session_deleted") continue;
 		let authority = defaultAuthority;
@@ -745,14 +776,42 @@ function reduceEvents(
 			const survivingAuthority = onlyRoot ? preferredIdentity(onlyRoot) : undefined;
 			if (survivingAuthority !== undefined) authority = survivingAuthority;
 		}
-		sessions.push(projectIdentity(authority, ambiguous, now, probedIncarnations));
+		sessions.push(projectIdentity(authority, ambiguous, now, probedIncarnations, skipOsProcessProbes));
 	}
 	return { identities, sessions };
 }
 
 // Global launch bursts may queue behind legitimate long index transactions. Keep
 // this bounded at one minute while the shared lock's exact dead-owner recovery runs.
-const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
+const SESSION_INDEX_LOCK_OPTIONS = {
+	retries: 600,
+	retryDelayMs: 100,
+	orphanTransitionAgeMs: FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+} as const;
+// Leave one retry interval beyond the transition's safe-adoption age so a fresh
+// ownerless transition can be reclaimed during ordinary startup.
+const SESSION_INDEX_STARTUP_LOCK_WAIT_MS =
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS + SESSION_INDEX_LOCK_OPTIONS.retryDelayMs * 2;
+
+/** Bound ordinary bootstrap waits; authorized doctor successors may use the full prepared window. */
+export function sessionIndexStartupLockOptions(
+	deadline: number,
+	signal?: AbortSignal,
+	policy: "ordinary" | "authorized-successor" = "ordinary",
+): FileLockOptions {
+	const boundedDeadline =
+		policy === "authorized-successor"
+			? deadline
+			: Math.min(deadline, performance.now() + SESSION_INDEX_STARTUP_LOCK_WAIT_MS);
+	return {
+		...SESSION_INDEX_LOCK_OPTIONS,
+		retries: Math.min(
+			SESSION_INDEX_LOCK_OPTIONS.retries,
+			Math.max(1, Math.ceil((boundedDeadline - performance.now()) / SESSION_INDEX_LOCK_OPTIONS.retryDelayMs)),
+		),
+		...(signal === undefined ? {} : { signal }),
+	};
+}
 
 /**
  * Observation window for one locked index transaction (#4544). This never times
@@ -794,6 +853,17 @@ const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
  * and the next pass re-probes from scratch.
  */
 const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
+/**
+ * Fresh re-probe attempts one heartbeat checkpoint pass makes when its
+ * observation batch goes stale under lock contention. Each attempt is fully
+ * fail-closed; the bound only prevents a contended machine from writing no
+ * heartbeat for long enough that live hosts project as dead.
+ */
+const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+const SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS = 60_000;
+/** One elapsed budget for queueing, probing and every reacquisition in a pass. */
+export const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
+const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
 /** Maximum distinct live identity probes admitted by one public status query. */
 const SESSION_GENERATION_PROBE_LIMIT = 32;
 
@@ -803,11 +873,30 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * is named in a slow-operation warning when it holds the lock beyond the
  * observation window and (b) the lock budget cannot silently drift per call
  * site.
+ *
+ * Every acquisition also carries this installation's host identity.
+ * `staleLockSnapshot` treats a host-qualified owner as foreign when the acquirer
+ * omits `ownerHostId`, so a same-host process that died holding the lock is never
+ * reclaimed and broker startup burns its whole retry budget. Identity is applied
+ * under the options a caller passed for budget and cancellation, so startup,
+ * heartbeat, and ordinary index transactions share one reclaim rule: a proven-dead
+ * same-host owner can be recovered, and a live or cross-host owner cannot.
  */
-function withSessionIndexLock<T>(operation: string, agentDir: string, callback: () => Promise<T>): Promise<T> {
+async function sessionIndexLockOptions(agentDir: string, options: FileLockOptions): Promise<FileLockOptions> {
+	return { ...options, ...(await brokerLockHostIdentity(agentDir)) };
+}
+
+async function withSessionIndexLock<T>(
+	operation: string,
+	agentDir: string,
+	callback: () => Promise<T>,
+	options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS,
+): Promise<T> {
+	const lockOptions = await sessionIndexLockOptions(agentDir, options);
 	return withFileLock(
 		logFor(agentDir),
 		async () => {
+			options.signal?.throwIfAborted();
 			// Armed only once the lock is actually held: queueing time behind another
 			// legitimate holder must not be attributed to this operation.
 			const note = setTimeout(
@@ -823,7 +912,7 @@ function withSessionIndexLock<T>(operation: string, agentDir: string, callback: 
 				clearTimeout(note);
 			}
 		},
-		SESSION_INDEX_LOCK_OPTIONS,
+		lockOptions,
 	);
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
@@ -1013,6 +1102,83 @@ async function replaceAtomically(file: string, contents: Buffer | string): Promi
 	if (cleanupError) throw cleanupError;
 }
 
+const EVENT_GENERATION_RECORD_VERSION = 1;
+const eventGenerationFor = (agentDir: string, sessionId: string) =>
+	path.join(agentDir, "sdk", "event-generations", `${createHash("sha256").update(sessionId).digest("hex")}.json`);
+
+/**
+ * Allocate the event generation for one SDK host start of `sessionId`.
+ *
+ * Every host start opens a fresh event stream, and this index orders a session's
+ * identities by endpoint generation before registration order. A generation
+ * taken from wall time alone falls behind a retained identity once the clock
+ * steps backward — the resumed host then loses authority to the retained row and
+ * disappears from Router consumers — and repeats for two starts in one
+ * millisecond. Allocation therefore reads and advances a durable per-session
+ * high-water mark under a cross-process file lock, so every result is strictly
+ * above every generation previously allocated for the session in this agent
+ * dir. The result is at least `floor`: a host start passes its wall time, which
+ * keeps a session without a high-water mark ahead of hosts that predate it, and
+ * a host reserving a generation it already serves passes that generation, which
+ * comes back unchanged only while no host has been issued it or anything above.
+ */
+export async function allocateSessionEventGeneration(
+	agentDir: string,
+	sessionId: string,
+	floor: number,
+): Promise<number> {
+	if (sessionId.length === 0) throw new Error("SDK event generation allocation requires a session id.");
+	if (!Number.isSafeInteger(floor) || floor < 0)
+		throw new Error("SDK event generation floor must be a non-negative safe integer.");
+	const file = eventGenerationFor(agentDir, sessionId);
+	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	return await withFileLock(
+		file,
+		async () => {
+			// Generation 0 is reserved for the direct-session GC fence row.
+			const next = Math.max((await readEventGenerationHighWater(file, sessionId)) + 1, floor, 1);
+			if (!Number.isSafeInteger(next)) throw new Error("SDK event generation is exhausted.");
+			await replaceAtomically(
+				file,
+				`${JSON.stringify({ version: EVENT_GENERATION_RECORD_VERSION, sessionId, generation: next })}\n`,
+			);
+			return next;
+		},
+		await sessionIndexLockOptions(agentDir, SESSION_INDEX_LOCK_OPTIONS),
+	);
+}
+
+/**
+ * A missing record is the only bootstrap state. A record that cannot be read
+ * back exactly is never treated as empty: restarting from the wall-clock floor
+ * would reopen the regression the high-water mark exists to close.
+ */
+async function readEventGenerationHighWater(file: string, sessionId: string): Promise<number> {
+	let source: string;
+	try {
+		source = await fs.readFile(file, "utf8");
+	} catch (error) {
+		if (isEnoent(error)) return 0;
+		throw error;
+	}
+	let record: unknown;
+	try {
+		record = JSON.parse(source);
+	} catch {
+		record = undefined;
+	}
+	const { version, sessionId: recordedSessionId, generation } = (record ?? {}) as Record<string, unknown>;
+	if (
+		version !== EVENT_GENERATION_RECORD_VERSION ||
+		recordedSessionId !== sessionId ||
+		typeof generation !== "number" ||
+		!Number.isSafeInteger(generation) ||
+		generation < 1
+	)
+		throw new Error(`SDK event generation record is unreadable: ${file}`);
+	return generation;
+}
+
 function alive(pid: number): boolean {
 	if (process.platform === "win32") {
 		try {
@@ -1131,6 +1297,7 @@ export class SessionIndex {
 	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
+	#lastHeartbeatStaleWarningAt = Number.NEGATIVE_INFINITY;
 	#logOffset = 0;
 	#corruptSuffix = false;
 	/**
@@ -1158,7 +1325,7 @@ export class SessionIndex {
 		});
 		return promise;
 	}
-	async open(): Promise<this> {
+	async open(options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS): Promise<this> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		let group = SessionIndex.#openGroups.get(indexPath);
 		if (!group || group.closed) {
@@ -1168,7 +1335,7 @@ export class SessionIndex {
 		}
 		await group.promise;
 		await SessionIndex.#enqueue(indexPath, () =>
-			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock()),
+			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock(), options),
 		);
 		return this;
 	}
@@ -1192,32 +1359,39 @@ export class SessionIndex {
 	 * stamp of the last completed locked pass, the in-memory projection is
 	 * already current and the locked rescan is skipped entirely — this is what
 	 * keeps an idle SessionRouter reconcile (2s cadence) from re-parsing and
-	 * re-checksumming the whole index forever. An append committed before the
-	 * stat always changes the stamp, so a miss is impossible; a change landing
-	 * after the stat is seen on the next poll, the same TOCTOU envelope a
-	 * locked read has. A corrupt suffix never takes the fast path: re-scanning
+	 * re-checksumming the whole index forever. The unchanged check runs before
+	 * the local queue so unrelated heartbeat work cannot delay ordinary creates.
+	 * Admission that requires serialized authority must use refresh() instead.
+	 * An append committed before the stat always changes
+	 * the stamp; a change landing after the stat is seen on the next poll, the
+	 * same TOCTOU envelope a locked read has. A corrupt suffix never takes the fast path: re-scanning
 	 * preserves the existing re-diagnosis behavior. Returns true when state was
 	 * reloaded. Authority revalidation that needs the strongest available
 	 * snapshot inside an already-locked write (append, unregister) keeps using
 	 * the exact locked paths.
 	 */
 	async refreshIfChanged(): Promise<boolean> {
-		if (this.#changeStamp !== undefined && !this.#corruptSuffix) {
+		if (this.#changeStamp === undefined || this.#corruptSuffix) {
+			await this.open();
+			await this.refresh();
+			return true;
+		}
+		const stamp = await readIndexChangeStamp(this.#agentDir);
+		if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			if (this.#changeStamp === undefined || this.#corruptSuffix) {
+				await withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshUnderLock());
+				return true;
+			}
 			const stamp = await readIndexChangeStamp(this.#agentDir);
 			if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
 			// A possible change is re-classified UNDER the lock (#4689 review):
 			// writers mutate these files only while holding it, so the locked
-			// observation is atomic with the tail/replay it selects. The
-			// unlocked stamp above is only the cheap "definitely unchanged" cut.
-			const indexPath = path.resolve(logFor(this.#agentDir));
-			await SessionIndex.#enqueue(indexPath, () =>
-				withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock()),
-			);
+			// observation is atomic with the tail/replay it selects.
+			await withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock());
 			return true;
-		}
-		await this.open();
-		await this.refresh();
-		return true;
+		});
 	}
 	/**
 	 * Locked change classification (#4689). Append-only log growth with an
@@ -1324,6 +1498,10 @@ export class SessionIndex {
 	}
 	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
 	async #writeAuditUnderLock(): Promise<void> {
+		const candidates = auditRecords(this.#events, this.#policy.clock());
+		// The audit log only dedupes rejections, so a reader with none never pays
+		// for loading it.
+		if (candidates.length === 0) return;
 		if (this.#auditedSeq === null) {
 			this.#auditedSeq = new Set();
 			try {
@@ -1341,9 +1519,7 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
 		}
-		const pending = auditRecords(this.#events, this.#policy.clock()).filter(
-			record => !this.#auditedSeq!.has(record.indexSeq),
-		);
+		const pending = candidates.filter(record => !this.#auditedSeq!.has(record.indexSeq));
 		if (pending.length === 0) return;
 		await appendSync(auditFor(this.#agentDir), pending.map(record => JSON.stringify(record)).join("\n"));
 		for (const record of pending) this.#auditedSeq.add(record.indexSeq);
@@ -1680,6 +1856,21 @@ export class SessionIndex {
 				// persisted binding instead.
 				if (ownIncarnation !== undefined && unsigned.hostIncarnation === undefined)
 					unsigned.hostIncarnation = ownIncarnation;
+				// A host registering its own endpoint without a lifecycle request publishes
+				// its operator-abort marker, so the Broker can route an operator terminal
+				// abort to a TUI or direct CLI session (a lifecycle host proves the same
+				// routing with its lifecycle request id). Generation 0 is the transcript-only
+				// direct registration, which has no endpoint to route to.
+				if (
+					unsigned.type === "host_registered" &&
+					unsigned.pid === process.pid &&
+					unsigned.endpointGeneration > 0 &&
+					unsigned.lifecycleRequestId === undefined &&
+					unsigned.abortCapability === undefined
+				) {
+					const abortCapability = publishableRuntimeAbortCapability();
+					if (abortCapability !== undefined) unsigned.abortCapability = abortCapability;
+				}
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				const serialized = JSON.stringify(event);
 				// Publish to memory only after the complete append and fsync succeed.
@@ -1696,6 +1887,82 @@ export class SessionIndex {
 			});
 		});
 	}
+
+	/**
+	 * Atomically fence an exact, long-silent dead-host authority before a caller
+	 * removes state outside the broker index. The comparison and terminal event
+	 * append share the machine-global index lock, so a heartbeat, successor
+	 * registration, or unresolved-authority update that wins the lock prevents
+	 * destructive coordinator cleanup.
+	 */
+	async retireStaleIfCurrent(expected: {
+		sessionId: string;
+		workspace: string;
+		endpointGeneration: number;
+		endpointIncarnation: string;
+	}): Promise<"retired" | "already_retired" | "not_found" | "stale"> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		// Process-incarnation observations are gathered before the lock. The locked
+		// projection then uses this fixed batch, avoiding an unbounded OS probe while
+		// holding the machine-global index lock.
+		const probed = new Map<string, string | undefined>();
+		for (const row of reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities) {
+			const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+			if (recordedIncarnation === undefined || !alive(row.pid)) continue;
+			probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
+		}
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			try {
+				await fs.stat(dirFor(this.#agentDir));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return "not_found";
+				throw error;
+			}
+			return await withSessionIndexLock("stale session retirement", this.#agentDir, async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) throw new Error("Cannot retire a session from a corrupt session index");
+				const current = this.listSessions(probed).sessions.find(
+					session => session.sessionId === expected.sessionId,
+				);
+				if (!current) return "not_found";
+				if (
+					resolveEquivalentPath(current.locator.cwd) !== resolveEquivalentPath(expected.workspace) ||
+					current.endpointGeneration !== expected.endpointGeneration ||
+					endpointIncarnation(current, expected.sessionId) !== expected.endpointIncarnation
+				)
+					return "stale";
+				if (current.ambiguous || current.terminalUncertain) return "stale";
+				if (current.terminal) return "already_retired";
+				if (
+					current.live !== false ||
+					current.lastHeartbeatAt === undefined ||
+					this.#policy.clock() - current.lastHeartbeatAt < DEAD_HOST_HEARTBEAT_SILENCE_MS
+				)
+					return "stale";
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					version: SESSION_INDEX_EVENT_VERSION,
+					indexSeq: this.indexSeq + 1,
+					ts: Date.now(),
+					type: "session_closed",
+					sessionId: current.sessionId,
+					locator: current.locator,
+					endpointGeneration: current.endpointGeneration,
+					pid: current.pid,
+					...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+					...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+					...(current.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: current.endpointMtimeMs }),
+					...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
+					...(current.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: current.lifecycleRequestId }),
+				};
+				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.#refreshUnderLock();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return "retired";
+			});
+		});
+	}
+
 	async unregisterIfCurrent(
 		expected: Pick<
 			SessionIndexEvent,
@@ -1877,10 +2144,18 @@ export class SessionIndex {
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 
-	listSessions(): SessionList {
+	/**
+	 * Public session rows. `sessionIds` scopes the projection to those sessions:
+	 * rows for them are identical to the unscoped read, other sessions are absent.
+	 */
+	listSessions(
+		probedIncarnations?: ReadonlyMap<string, string | undefined>,
+		sessionIds?: ReadonlySet<string>,
+	): SessionList {
 		return {
 			indexSeq: this.indexSeq,
-			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
+			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations, sessionIds)
+				.sessions,
 			warnings: this.#warnings,
 		};
 	}
@@ -2255,9 +2530,87 @@ export class SessionIndex {
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
 	 */
-	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
+	async checkpointLiveHeartbeats(
+		now = Date.now(),
+		abortSignal?: AbortSignal,
+		deadlineAt = performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS,
+	): Promise<number> {
+		// A stale observation batch fails closed (no heartbeat), but on a busy
+		// machine a single contended lock acquisition is enough to discard the
+		// whole cycle. With the broker's 5s cadence repeatedly losing that race,
+		// every live host's heartbeat aged past the 2-interval freshness window
+		// and the router retired attached sessions as "removed" mid-prompt.
+		// Re-probe from scratch a bounded number of times inside this pass: each
+		// attempt keeps the exact fail-closed contract (fresh probes, freshness
+		// bounds re-checked under the lock); only the starvation is removed.
+		const deadline = Math.min(deadlineAt, performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS);
+		if (abortSignal?.aborted || performance.now() >= deadline) return 0;
+		const budget = new AbortController();
+		const signal = abortSignal ? AbortSignal.any([abortSignal, budget.signal]) : budget.signal;
+		const timer = setTimeout(() => budget.abort(), deadline - performance.now());
+		timer.unref?.();
+		const checkpoint = async (): Promise<number> => {
+			for (let attempt = 0; ; attempt++) {
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				const result = await this.#checkpointLiveHeartbeatsOnce(now, signal, deadline);
+				if (result === STALE_OBSERVATION) {
+					if (attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS) {
+						const warningAt = performance.now();
+						if (warningAt - this.#lastHeartbeatStaleWarningAt >= SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS) {
+							this.#lastHeartbeatStaleWarningAt = warningAt;
+							logger.warn("sdk broker: skipped session heartbeat checkpoint after repeated stale observations", {
+								indexPath: path.resolve(logFor(this.#agentDir)),
+								attempts: attempt + 1,
+							});
+						}
+						return 0;
+					}
+					now = Date.now();
+					continue;
+				}
+				return result;
+			}
+		};
+		try {
+			// The deadline aborts queued work and prevents a late callback from
+			// entering its write section, but it cannot cancel an append/fsync that
+			// has already started. Keep the caller tied to the lock-owning operation
+			// so startup readiness never overtakes lock release.
+			return await checkpoint();
+		} catch (error) {
+			if (signal.aborted && error === signal.reason) {
+				// The budget abort can beat the lock layer's own exhaustion. Asking
+				// directly keeps a retained removal transition from being reported as
+				// an idle cycle: the blocked-renewal caller needs the reason and path.
+				const blocked = await describeRetainedLockTransition(
+					path.resolve(logFor(this.#agentDir)),
+					await sessionIndexLockOptions(this.#agentDir, SESSION_INDEX_LOCK_OPTIONS),
+				);
+				if (blocked) throw blocked;
+				return 0;
+			}
+			if (
+				performance.now() >= deadline &&
+				isFileLockAcquireTimeout(error) &&
+				!error.orphanPath &&
+				!error.removalFailure
+			)
+				return 0;
+			throw error;
+		} finally {
+			clearTimeout(timer);
+			budget.abort();
+		}
+	}
+
+	async #checkpointLiveHeartbeatsOnce(
+		now: number,
+		signal: AbortSignal,
+		deadline: number,
+	): Promise<number | typeof STALE_OBSERVATION> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
+			if (signal.aborted || performance.now() >= deadline) return 0;
 			// An absent index holds no registration to checkpoint, so this pass must read
 			// it as "nothing to do" instead of creating one. Recreating the directory
 			// resurrects a state root its owner already retired: the broker's 5s
@@ -2282,72 +2635,101 @@ export class SessionIndex {
 			// revalidation that never probes the OS under the lock: the next pass
 			// re-probes from scratch.
 			const probed = new Map<string, string | undefined>();
-			for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
+			// This projection is only used to select structurally eligible rows; its
+			// `live` field is not consumed here. Skip OS probes during projection so
+			// the deadline-aware loop below performs only the required observations.
+			const candidates = reduceEvents(this.#events, now, this.#agentDir, undefined, undefined, {
+				skipOsProcessProbes: true,
+			}).sessions;
+			if (signal.aborted || performance.now() >= deadline) return 0;
+			for (const row of candidates) {
+				if (signal.aborted || performance.now() >= deadline) return 0;
 				if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 				if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
 					continue;
-				if (!alive(row.pid)) continue;
 				const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
 				if (recordedIncarnation === undefined) continue;
-				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
+				if (!alive(row.pid)) continue;
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				const currentIncarnation = processIncarnation(row.pid);
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, currentIncarnation);
 			}
 			const probedAt = performance.now();
-			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
-				// Contended or delayed acquisition invalidates the observation set:
-				// never trust identity evidence gathered meaningfully before the
-				// lock was held. The checkpoint is skipped this cycle (fail-closed);
-				// the OS is never probed while the machine-global lock is held. The
-				// bound tolerates scheduler jitter on an uncontended acquisition —
-				// which is the only path where the evidence is trustworthy.
-				if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return 0;
-				await this.#replayUnderLock();
-				// Recheck AFTER the awaited replay too (#4544 review round 4): the
-				// replay re-reads the whole log (up to the 4 MiB rotation bound) and
-				// fsyncs pending audit rows, so the probe→write interval can stretch
-				// well past the acquisition bound above while the lock is held. The
-				// same pid-reuse window exists across that awaited replay; consuming
-				// the cached observation then would checkpoint the replacement
-				// process as the dead row. The replay bound covers the full locked
-				// replay cost envelope of a healthy machine; anything slower fails
-				// closed (no heartbeat this cycle) and the next pass re-probes.
-				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return 0;
-				if (this.#corruptSuffix) return 0;
-				const events: SessionIndexEvent[] = [];
-				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
-				for (const row of rows) {
-					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
-					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
-						continue;
-					if (!alive(row.pid)) continue;
-					const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
-					if (recordedIncarnation === undefined) continue;
-					const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
-					if (current === undefined || current !== recordedIncarnation) continue;
-					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-						version: SESSION_INDEX_EVENT_VERSION,
-						indexSeq: this.indexSeq + events.length + 1,
-						type: "host_heartbeat",
-						sessionId: row.sessionId,
-						locator: row.locator,
-						endpointGeneration: row.endpointGeneration,
-						pid: row.pid,
-						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
-						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
-						...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
-						// Preserve the host's last observed activity state while this
-						// broker-owned heartbeat only renews liveness. A live idle host
-						// must not be rewritten as active merely because its pid is alive.
-						activity: row.activity ?? { state: "active", at: now },
-						ts: now,
-					};
-					events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
-				}
-				if (events.length === 0) return 0;
-				for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
-				await this.#refreshUnderLock();
-				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
-				return events.length;
-			});
+			if (signal.aborted || probedAt >= deadline) return 0;
+			return await withSessionIndexLock(
+				"heartbeat checkpoint",
+				this.#agentDir,
+				async () => {
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					// Contended or delayed acquisition invalidates the observation set:
+					// never trust identity evidence gathered meaningfully before the
+					// lock was held. The checkpoint is skipped this cycle (fail-closed);
+					// the OS is never probed while the machine-global lock is held. The
+					// bound tolerates scheduler jitter on an uncontended acquisition —
+					// which is the only path where the evidence is trustworthy.
+					if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return STALE_OBSERVATION;
+					await this.#replayUnderLock();
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					// Recheck AFTER the awaited replay too (#4544 review round 4): the
+					// replay re-reads the whole log (up to the 4 MiB rotation bound) and
+					// fsyncs pending audit rows, so the probe→write interval can stretch
+					// well past the acquisition bound above while the lock is held. The
+					// same pid-reuse window exists across that awaited replay; consuming
+					// the cached observation then would checkpoint the replacement
+					// process as the dead row. The replay bound covers the full locked
+					// replay cost envelope of a healthy machine; anything slower fails
+					// closed (no heartbeat this cycle) and the next pass re-probes.
+					if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
+					if (this.#corruptSuffix) return 0;
+					const events: SessionIndexEvent[] = [];
+					const rows = reduceEvents(this.#events, now, this.#agentDir, probed, undefined, {
+						skipOsProcessProbes: true,
+					}).sessions;
+					for (const row of rows) {
+						if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
+						if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
+							continue;
+						if (!alive(row.pid)) continue;
+						const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+						if (recordedIncarnation === undefined) continue;
+						const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
+						if (current === undefined || current !== recordedIncarnation) continue;
+						const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+							version: SESSION_INDEX_EVENT_VERSION,
+							indexSeq: this.indexSeq + events.length + 1,
+							type: "host_heartbeat",
+							sessionId: row.sessionId,
+							locator: row.locator,
+							endpointGeneration: row.endpointGeneration,
+							pid: row.pid,
+							...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
+							...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
+							...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
+							// Preserve the host's last observed activity state while this
+							// broker-owned heartbeat only renews liveness. A live idle host
+							// must not be rewritten as active merely because its pid is alive.
+							activity: row.activity ?? { state: "active", at: now },
+							ts: now,
+						};
+						events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
+					}
+					if (events.length === 0) return 0;
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+					await this.#refreshUnderLock();
+					if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+					return events.length;
+				},
+				{
+					...SESSION_INDEX_LOCK_OPTIONS,
+					retries: Math.min(
+						SESSION_INDEX_LOCK_OPTIONS.retries,
+						Math.max(1, Math.ceil((deadline - performance.now()) / SESSION_INDEX_LOCK_OPTIONS.retryDelayMs)),
+					),
+					signal,
+				},
+			);
 		});
 	}
 

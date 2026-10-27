@@ -129,7 +129,9 @@ describe("Responses tools remain visible during uninterrupted reasoning", () => 
 			} as unknown as AssistantMessageEventStream;
 			async function deliver() {
 				for (const event of pending.splice(0)) {
-					if (!("partial" in event)) throw new Error(`Unexpected terminal provider event: ${event.type}`);
+					if (event.type === "error" || !("partial" in event) || event.partial === undefined) {
+						throw new Error(`Unexpected terminal provider event: ${event.type}`);
+					}
 					await controller.handleEvent({
 						type: "message_update",
 						message: event.partial,

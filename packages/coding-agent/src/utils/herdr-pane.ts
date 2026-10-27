@@ -22,9 +22,8 @@
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { getTrustedAgentFile, getTrustedHomeDir, logger } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
@@ -56,7 +55,9 @@ const HERDR_RELEASE_TIMEOUT_MS = 1000;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 /** Herdr truncates to the pane width anyway; this only bounds the argv. */
 const MAX_PANE_TITLE_CHARS = 120;
-const HERDR_SEQUENCE_STATE_PATH = path.join(os.tmpdir(), "gjc-herdr-sequence-v1");
+/** Short decimal watermark. A longer file is not a sequence this process should adopt. */
+const HERDR_SEQUENCE_TEXT_LIMIT = 32;
+const HERDR_SEQUENCE_FILE_NAME = "gjc-herdr-sequence-v1";
 
 /**
  * The environment is inherited, not authoritative. The token prevents a
@@ -88,24 +89,83 @@ interface HerdrPaneOwnerMarker {
  */
 let sequenceFloor = 0;
 
-function readSequenceFloor(): number {
+/**
+ * The watermark has to survive process replacement, so the name stays stable.
+ * It lives under the trusted agent directory: a fixed name in the shared temp
+ * directory can be planted by another user before this module loads.
+ */
+function herdrSequenceStatePath(): string | undefined {
 	try {
-		const value = Number.parseInt(fs.readFileSync(HERDR_SEQUENCE_STATE_PATH, "utf8"), 10);
+		const target = path.resolve(getTrustedAgentFile(HERDR_SEQUENCE_FILE_NAME));
+		const directory = path.resolve(path.dirname(target));
+		const root = path.parse(directory).root;
+		if (directory === root || directory === path.resolve(getTrustedHomeDir())) return undefined;
+		return target;
+	} catch {
+		return undefined;
+	}
+}
+
+function readSequenceFloor(): number {
+	let fd: number | undefined;
+	try {
+		const target = herdrSequenceStatePath();
+		if (!target) return 0;
+		const info = fs.lstatSync(target);
+		if (!info.isFile()) return 0;
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		fd = fs.openSync(target, fs.constants.O_RDONLY | noFollow);
+		const opened = fs.fstatSync(fd);
+		if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino) return 0;
+		const buffer = Buffer.alloc(HERDR_SEQUENCE_TEXT_LIMIT);
+		const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
+		const value = Number.parseInt(buffer.subarray(0, count).toString("utf8"), 10);
 		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 	} catch {
 		return 0;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// The descriptor is already closed.
+			}
+		}
 	}
 }
 
 function persistSequenceFloor(value: number): void {
+	let fd: number | undefined;
+	let temporary: string | undefined;
 	try {
-		const directory = path.dirname(HERDR_SEQUENCE_STATE_PATH);
+		const target = herdrSequenceStatePath();
+		if (!target) return;
+		const directory = path.dirname(target);
 		fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-		const temporary = `${HERDR_SEQUENCE_STATE_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-		fs.writeFileSync(temporary, String(value), { encoding: "utf8", mode: 0o600 });
-		fs.renameSync(temporary, HERDR_SEQUENCE_STATE_PATH);
+		temporary = path.join(directory, `.${HERDR_SEQUENCE_FILE_NAME}.${process.pid}.${crypto.randomUUID()}.tmp`);
+		fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+		fs.writeSync(fd, String(value));
+		fs.closeSync(fd);
+		fd = undefined;
+		fs.renameSync(temporary, target);
+		temporary = undefined;
 	} catch (error) {
 		logger.debug("herdr sequence watermark persistence failed", { error: String(error) });
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// The descriptor is already closed.
+			}
+		}
+		if (temporary !== undefined) {
+			try {
+				fs.rmSync(temporary, { force: true });
+			} catch {
+				// The exclusive temp file is already gone.
+			}
+		}
 	}
 }
 
@@ -127,10 +187,17 @@ function nextSequence(current: number): number {
  * Module scope because the title is a property of the process, not of one
  * reporter instance: `setSessionTerminalTitle` is called from controllers that
  * never see the reporter.
+ *
+ * Lazy-initialized on first use to avoid writing the herdr sequence watermark
+ * during module load (which would violate the read-only contract of commands
+ * like `gjc doctor` that import this module but never use the herdr reporter).
  */
-let metadataSeq = initialSeq();
+let metadataSeq: number | undefined;
 
 function nextMetadataSeq(): number {
+	if (metadataSeq === undefined) {
+		metadataSeq = initialSeq();
+	}
 	metadataSeq = nextSequence(metadataSeq);
 	return metadataSeq;
 }

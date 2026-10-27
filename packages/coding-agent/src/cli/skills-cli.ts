@@ -2,7 +2,9 @@
  * Handles `gjc skills` for inspecting bundled workflow skills and
  * filesystem-discovered custom skills.
  */
+import { sanitizeDisplayLine } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
+import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import {
 	DEFAULT_GJC_DEFINITION_NAMES,
 	type EmbeddedDefaultGjcSkill,
@@ -58,9 +60,17 @@ function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function formatCandidate(candidate: RuntimeSkillDiscoveryCandidate): string {
-	const useWhen = candidate.useWhen && candidate.useWhen.length > 0 ? ` [when: ${candidate.useWhen.join(", ")}]` : "";
-	return `${candidate.name}\t${candidate.source}\t${candidate.description}\t${candidate.path}${useWhen}`;
+/**
+ * One discover text row. Repository name, description, path, and use conditions
+ * are flattened to a single line and stripped of terminal controls here, at the
+ * last step before stdout, so a skill file cannot inject a control sequence.
+ */
+export function formatCandidate(candidate: RuntimeSkillDiscoveryCandidate): string {
+	const useWhen =
+		candidate.useWhen && candidate.useWhen.length > 0
+			? ` [when: ${candidate.useWhen.map(sanitizeDisplayLine).join(", ")}]`
+			: "";
+	return `${sanitizeDisplayLine(candidate.name)}\t${sanitizeDisplayLine(candidate.source)}\t${sanitizeDisplayLine(candidate.description)}\t${sanitizeDisplayLine(candidate.path)}${useWhen}`;
 }
 
 /** Shell-quote only when needed, so a single-word query stays copy-pasteable as typed. */
@@ -111,6 +121,10 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 					...settings.getGroup("skills"),
 					disabledExtensions: settings.get("disabledExtensions"),
 				},
+				allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+					trustUserSkills: settings.getGlobal("skills.trustUserSkills"),
+					enablePiUser: settings.getGlobal("skills.enablePiUser"),
+				}),
 			});
 			if (cmd.flags?.json) {
 				writeJson({
@@ -133,7 +147,7 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 			if (result.diagnostics.messages.length > 0) {
 				process.stdout.write("\nDiagnostics:\n");
 				for (const message of result.diagnostics.messages) {
-					process.stdout.write(`- ${message}\n`);
+					process.stdout.write(`- ${sanitizeDisplayLine(message)}\n`);
 				}
 			}
 		} finally {

@@ -1,28 +1,93 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { canonicalEnvKey, getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
+import { canonicalEnvKey, getAgentDir, getConfigRootDir, getTrustedHomeDir, pathIdentityKey } from "./dirs";
 import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
+import {
+	decodeEscapedProjectLiteral,
+	parseEnvFile,
+	parseEnvFileContent,
+	parseShellEnvFile,
+	projectDeclarationIsDynamic,
+	projectEnvLayerFiles,
+	projectEnvSnapshot,
+} from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 
-function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
+function findClosingBrace(value: string, open: number): number {
+	let depth = 1;
+	for (let index = open + 2; index < value.length; index++) {
+		if (value[index] === "\\") {
+			index++;
+			continue;
+		}
+		if (value[index] === "$" && value[index + 1] === "{") {
+			depth++;
+			index++;
+		} else if (value[index] === "}" && --depth === 0) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function expandProjectEnvValue(value: string, resolve: (name: string) => string | undefined): string {
+	let result = "";
+	for (let index = 0; index < value.length; index++) {
+		const char = value[index];
+		if (char === "\\" && value[index + 1] === "$") {
+			result += "$";
+			index++;
+			continue;
+		}
+		if (char !== "$") {
+			result += char;
+			continue;
+		}
+
+		let name: string | undefined;
+		let end = index;
+		let fallback: string | undefined;
+		if (value[index + 1] === "{") {
+			const close = findClosingBrace(value, index);
+			const expression = close < 0 ? undefined : value.slice(index + 2, close);
+			const match = expression && /^([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?$/.exec(expression);
+			if (match) {
+				name = match[1];
+				fallback = match[2];
+				end = close;
+			}
+		} else {
+			const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(value.slice(index + 1));
+			if (match) {
+				name = match[0];
+				end = index + name.length;
+			}
+		}
+		if (!name) {
+			result += "$";
+			continue;
+		}
+		result += resolve(name) ?? (fallback === undefined ? "" : expandProjectEnvValue(fallback, resolve));
+		index = end;
+	}
+	return result;
+}
+
+function loadProjectEnv(): {
+	values: Record<string, string>;
+	loadedValues: Record<string, string>;
+	dynamic: Set<string>;
+} {
 	const cwd = process.cwd();
 	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
-	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
-	// NODE_ENV cannot introduce separators or `..` path segments.
-	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
-		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
-	];
+	// Same file list as projectEnvSnapshot, so a loaded value stays project-controlled.
+	const files = projectEnvLayerFiles(nodeEnv);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
 	for (const file of files) {
@@ -33,11 +98,45 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 			const key = canonicalEnvKey(rawKey);
 			values[key] = value;
 			// Track dynamic provenance only for the winning declaration.
-			if (/[$`]/.test(value)) dynamic.add(key);
+			// Escaped dollars are literals, matching projectEnvSnapshot.
+			if (projectDeclarationIsDynamic(value)) dynamic.add(key);
 			else dynamic.delete(key);
 		}
 	}
-	return { values, dynamic };
+	// Quoted escapes are not `$` or backticks, but Bun autoload decodes `\n`
+	// and `\r` inside double quotes. `projectEnvSnapshot` already refuses that
+	// shape. Union those keys. Do not copy its values: an unparsed declaration
+	// is stored there as "" and must not overlay this layer. File selection
+	// stays above, so a higher static layer still clears a lower dynamic one.
+	for (const key of projectEnvSnapshot(cwd).dynamic) dynamic.add(key);
+
+	const resolved = new Map<string, string>();
+	const resolving = new Set<string>();
+	const resolveProjectValue = (key: string): string | undefined => {
+		const inherited = Bun.env[key];
+		if (inherited !== undefined) return inherited;
+		const cached = resolved.get(key);
+		if (cached !== undefined) return cached;
+		if (!Object.hasOwn(values, key) || resolving.has(key)) return undefined;
+
+		resolving.add(key);
+		const value = expandProjectEnvValue(values[key] ?? "", name => resolveProjectValue(canonicalEnvKey(name)));
+		resolving.delete(key);
+		resolved.set(key, value);
+		return value;
+	};
+	for (const [key, value] of Object.entries(values)) {
+		resolved.set(
+			key,
+			expandProjectEnvValue(value, name => resolveProjectValue(canonicalEnvKey(name))),
+		);
+	}
+	// Expansion already read the raw text. Equality then uses Bun's decoded literal
+	// for a declaration that is not dynamic, including an escaped dollar.
+	for (const key of Object.keys(values)) {
+		if (!dynamic.has(key)) values[key] = decodeEscapedProjectLiteral(values[key] ?? "");
+	}
+	return { values, loadedValues: Object.fromEntries(resolved), dynamic };
 }
 
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
@@ -103,6 +202,11 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // files for the credential-only snapshot.
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
+
+/** Project dotenv as it was when this module loaded, before a later `chdir` or file delete. */
+export function startupProjectEnvSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
+	return { values: projectSnapshot.values, dynamic: projectSnapshot.dynamic };
+}
 const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
 const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
 const declaredHome = projectEnv[declaredHomeKey];
@@ -119,20 +223,41 @@ try {
 	trustedEnvHome = undefined;
 }
 
-// Eagerly parse the trusted user's env files and the project .env (from cwd)
-const homeShellEnv = trustedEnvHome
-	? {
-			...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+// `path.resolve` does not follow symlinks, so macOS `/tmp` vs `/private/tmp`,
+// a symlink home, or a bind mount compares unequal and would load the checkout
+// as the trusted home. Keep the lexical check, then compare device/inode, then
+// `pathIdentityKey` when the filesystem has no usable inode.
+function credentialHomeMatchesCwd(home: string): boolean {
+	const cwd = process.cwd();
+	if (path.resolve(home) === path.resolve(cwd)) return true;
+	try {
+		const left = fs.statSync(home, { bigint: true });
+		const right = fs.statSync(cwd, { bigint: true });
+		if (left.isDirectory() && right.isDirectory() && left.ino !== 0n && right.ino !== 0n) {
+			return left.dev === right.dev && left.ino === right.ino;
 		}
-	: {};
-const homeEnv =
-	trustedEnvHome && path.resolve(trustedEnvHome) !== path.resolve(process.cwd())
-		? parseEnvFile(path.join(trustedEnvHome, ".env"))
+	} catch {
+		// Missing or unreadable: do not treat this directory as a credential home.
+		return true;
+	}
+	return pathIdentityKey(home) === pathIdentityKey(cwd);
+}
+
+// Eagerly parse the trusted user's env files and the project .env (from cwd).
+// When cwd is that home, both the dotenv and the shell startup files are the
+// checkout, so neither is a credential source.
+const credentialHomeIsCwd = trustedEnvHome !== undefined && credentialHomeMatchesCwd(trustedEnvHome);
+const homeShellEnv =
+	trustedEnvHome && !credentialHomeIsCwd
+		? {
+				...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+			}
 		: {};
+const homeEnv = trustedEnvHome && !credentialHomeIsCwd ? parseEnvFile(path.join(trustedEnvHome, ".env")) : {};
 let piEnv: Record<string, string> = {};
 let agentEnv: Record<string, string> = {};
 try {
@@ -183,8 +308,57 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	return trimmed;
 }
 
-for (const file of [projectEnv, agentEnv, piEnv, homeEnv, homeShellEnv]) {
+/**
+ * Names a repository `.env` must not install into the process environment.
+ * `NODE_TLS_REJECT_UNAUTHORIZED=0` disables certificate verification for every
+ * fetch in the process, so a project `.env` pairing it with a proxy would expose
+ * provider credentials to whoever answers the proxy.
+ * `GJC_HARNESS_SOCKET_DIR` and `GJC_HARNESS_ROOT_REGISTRY_DIR` select the harness
+ * control socket directory and the session-root registry. The harness reads both
+ * from the process environment after this module loads, so a project `.env` must
+ * not point either at a path the repository controls.
+ * `PI_COMPILED` is the build script's `--define` marker for a standalone binary.
+ * It is not a project setting: foreground `gjc sdk broker run` loads dotenv
+ * in-process, and a repository-controlled true value must not be treated as
+ * evidence that this process is that binary.
+ * `GJC_SDK_DISABLE=1` is the operator opt-out for SDK hosting. Session startup
+ * and the harness owner read it from the process environment after this module
+ * loads, and they copy a value that is still set into the child environment.
+ * A repository `.env` must not install it. A shell export is kept unless it is
+ * the same string the project declares, or the project declaration is dynamic.
+ * A dynamic declaration is ambiguous, so a different shell value is dropped too.
+ * An escaped dollar is a literal, not a dynamic declaration.
+ */
+const PROJECT_DENIED_ENV_NAMES = [
+	"NODE_TLS_REJECT_UNAUTHORIZED",
+	"GJC_HARNESS_SOCKET_DIR",
+	"GJC_HARNESS_ROOT_REGISTRY_DIR",
+	"PI_COMPILED",
+	"GJC_SDK_DISABLE",
+] as const;
+
+// Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
+// (same provenance rule as the credential snapshot) and never copy it below.
+// Removing `NODE_TLS_REJECT_UNAUTHORIZED` restores verification: Bun reads that
+// switch per TLS connection. The same drop covers the harness directory names.
+// A quoted escape is dynamic even when the line parser did not store a value.
+for (const name of PROJECT_DENIED_ENV_NAMES) {
+	const key = canonicalEnvKey(name);
+	const declared = projectEnv[key];
+	if (declared === undefined && !projectSnapshot.dynamic.has(key)) continue;
+	const runtime = Bun.env[name];
+	if (
+		runtime !== undefined &&
+		(projectSnapshot.dynamic.has(key) || runtime === declared || runtime.trim() === declared)
+	) {
+		delete Bun.env[name];
+	}
+}
+const projectDeniedKeys = new Set<string>(PROJECT_DENIED_ENV_NAMES.map(canonicalEnvKey));
+
+for (const file of [projectSnapshot.loadedValues, agentEnv, piEnv, homeEnv, homeShellEnv]) {
 	for (const key in file) {
+		if (file === projectSnapshot.loadedValues && projectDeniedKeys.has(key)) continue;
 		if (!Bun.env[key]) {
 			Bun.env[key] = file[key];
 		}
@@ -290,17 +464,26 @@ export function isBunTestRuntime(): boolean {
 }
 
 /**
+ * True when `moduleUrl` is a Bun standalone-binary module.
+ * Bun rewrites `import.meta.url` for every module bundled into the executable
+ * to an embedded virtual-filesystem path (`$bunfs`, `~BUN`, or `%7EBUN`).
+ * This does not read the environment. `PI_COMPILED` is not evidence: a project
+ * `.env` can declare it, and the launching shell can export it.
+ */
+export function isEmbeddedCompiledModule(moduleUrl: string = import.meta.url): boolean {
+	return moduleUrl.includes("$bunfs") || moduleUrl.includes("~BUN") || moduleUrl.includes("%7EBUN");
+}
+
+/**
  * True when this code is running inside a `bun build --compile` standalone
- * binary. Detects via the embedded virtual-filesystem path markers
- * (`$bunfs`, `~BUN`, or its URL-encoded form `%7EBUN`) in `import.meta.url`,
- * which Bun rewrites for every module bundled into the executable. The
- * `PI_COMPILED` env var (set by the build script's `--define`) is checked
- * first for cheap fast-path detection.
+ * binary. Prefers `PI_COMPILED` when the launching process already has it,
+ * then {@link isEmbeddedCompiledModule}. Project dotenv cannot install
+ * `PI_COMPILED`; callers that load a repository file must use
+ * {@link isEmbeddedCompiledModule} so a shell export cannot redirect them.
  */
 export function isCompiledBinary(): boolean {
 	if (Bun.env.PI_COMPILED) return true;
-	const url = import.meta.url;
-	return url.includes("$bunfs") || url.includes("~BUN") || url.includes("%7EBUN");
+	return isEmbeddedCompiledModule();
 }
 
 const TRUTHY: Dict<boolean> = { "1": true, Y: true, TRUE: true, YES: true, ON: true };

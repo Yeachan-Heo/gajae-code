@@ -20,13 +20,14 @@ import {
 	formatMiddleElisionMarker,
 	type OutputSummary,
 	type ReadWindow,
+	runWithOutputRedaction,
 	type TruncationResult,
 	truncateMiddle,
 	truncateTail,
 } from "../session/streaming-output";
 
 import { formatBytes, wrapBrackets } from "./render-utils";
-import { renderError } from "./tool-errors";
+import { renderError, ToolError, throwIfAborted } from "./tool-errors";
 
 /**
  * Truncation metadata for the output notice.
@@ -632,6 +633,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		} else {
 			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; ${formatBytes(elidedBytes)} middle bytes elided`;
 		}
+		if (truncation.nextOffset != null) {
+			notice += `. Use :${truncation.nextOffset} to continue`;
+		}
 		if (hasArtifactNotice(truncation)) {
 			notice += `. ${formatTruncationArtifactNotice(truncation)}`;
 		}
@@ -793,6 +797,128 @@ function appendOutputNotice(
 
 const kUnwrappedExecute = Symbol("OutputMeta.UnwrappedExecute");
 
+const UNTRUSTED_FENCE_OPEN = "<untrusted-content>\n";
+const UNTRUSTED_FENCE_CLOSE = "\n</untrusted-content>";
+
+function hasOuterUntrustedFence(text: string): boolean {
+	return (
+		text.startsWith(UNTRUSTED_FENCE_OPEN) &&
+		text.endsWith(UNTRUSTED_FENCE_CLOSE) &&
+		text.length > UNTRUSTED_FENCE_OPEN.length + UNTRUSTED_FENCE_CLOSE.length
+	);
+}
+
+function fenceLineCount(text: string): number {
+	let lines = 1;
+	for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lines++;
+	return lines;
+}
+
+function hideFenceCloser(value: string): string {
+	return value.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
+}
+
+/** Fence whose opener the tail cut removed. Null when every opener is still in the tail. */
+function splitFenceAt(text: string, cut: number): { bodyStart: number; bodyEnd: number; closeEnd: number } | null {
+	let search = 0;
+	while (search <= cut && search < text.length) {
+		const openStart = text.indexOf(UNTRUSTED_FENCE_OPEN, search);
+		if (openStart < 0 || openStart >= cut) return null;
+		const bodyStart = openStart + UNTRUSTED_FENCE_OPEN.length;
+		const bodyEnd = text.indexOf(UNTRUSTED_FENCE_CLOSE, bodyStart);
+		if (bodyEnd < 0) return null;
+		const closeEnd = bodyEnd + UNTRUSTED_FENCE_CLOSE.length;
+		if (cut < closeEnd) return { bodyStart, bodyEnd, closeEnd };
+		search = closeEnd;
+	}
+	return null;
+}
+
+/**
+ * Put the opener back when the line budget and the byte budget both have
+ * room for the tags, the trusted suffix, and one body line. Lines before
+ * the cut stay dropped. If either budget is short, the unfenced plain tail
+ * is returned instead of an empty fence.
+ */
+function repairSplitFenceTail(
+	fullText: string,
+	truncated: TruncationResult,
+	options: { maxBytes: number; maxLines: number },
+): TruncationResult {
+	if (!truncated.truncated || !fullText.endsWith(truncated.content)) return truncated;
+	const cut = fullText.length - truncated.content.length;
+	const split = splitFenceAt(fullText, cut);
+	if (!split) return truncated;
+	const retained = cut < split.bodyEnd ? fullText.slice(Math.max(cut, split.bodyStart), split.bodyEnd) : "";
+	const suffix = fullText.slice(Math.max(cut, split.closeEnd));
+	const escaped = hideFenceCloser(retained);
+	if (escaped.length === 0) return truncated;
+	const shellLines = fenceLineCount(`${UNTRUSTED_FENCE_OPEN}.${UNTRUSTED_FENCE_CLOSE}${suffix}`) - 1;
+	let bodyLines = options.maxLines - shellLines;
+	const tagBytes =
+		Buffer.byteLength(UNTRUSTED_FENCE_OPEN, "utf-8") + Buffer.byteLength(UNTRUSTED_FENCE_CLOSE, "utf-8");
+	const innerBytes = options.maxBytes - tagBytes - Buffer.byteLength(suffix, "utf-8");
+	if (bodyLines < 1 || innerBytes < 1) return truncated;
+	let fitted: string | undefined;
+	while (bodyLines >= 1) {
+		const body = truncateTail(escaped, { maxBytes: innerBytes, maxLines: bodyLines }).content;
+		if (body.length === 0) break;
+		const content = `${UNTRUSTED_FENCE_OPEN}${body}${UNTRUSTED_FENCE_CLOSE}${suffix}`;
+		const over = fenceLineCount(content) - options.maxLines;
+		if (over <= 0 && Buffer.byteLength(content, "utf-8") <= options.maxBytes) {
+			fitted = content;
+			break;
+		}
+		if (over <= 0) break;
+		bodyLines -= over;
+	}
+	if (!fitted) return truncated;
+	return {
+		...truncated,
+		content: fitted,
+		truncated: true,
+		outputLines: fenceLineCount(fitted),
+		outputBytes: Buffer.byteLength(fitted, "utf-8"),
+	};
+}
+
+/**
+ * Tail truncation keeps a suffix, so an outer untrusted-content fence loses its
+ * opening tag. Reapply that fence around the retained body. Embedded closing
+ * tags stay escaped. The fenced excerpt stays within `maxBytes`.
+ */
+function truncateTailKeepingUntrustedFence(
+	fullText: string,
+	options: { maxBytes: number; maxLines: number },
+): TruncationResult {
+	const truncated = truncateTail(fullText, options);
+	if (!hasOuterUntrustedFence(fullText)) return repairSplitFenceTail(fullText, truncated, options);
+	if (truncated.content.startsWith(UNTRUSTED_FENCE_OPEN) && truncated.content.endsWith(UNTRUSTED_FENCE_CLOSE)) {
+		return truncated;
+	}
+	const overhead =
+		Buffer.byteLength(UNTRUSTED_FENCE_OPEN, "utf-8") + Buffer.byteLength(UNTRUSTED_FENCE_CLOSE, "utf-8");
+	const body = fullText.slice(UNTRUSTED_FENCE_OPEN.length, fullText.length - UNTRUSTED_FENCE_CLOSE.length);
+	const innerBudget = Math.max(0, options.maxBytes - overhead);
+	const inner = truncateTail(body, { maxBytes: innerBudget, maxLines: options.maxLines });
+	let escaped = inner.content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
+	let content = `${UNTRUSTED_FENCE_OPEN}${escaped}${UNTRUSTED_FENCE_CLOSE}`;
+	if (Buffer.byteLength(content, "utf-8") > options.maxBytes) {
+		const fitted = truncateTail(escaped, { maxBytes: innerBudget, maxLines: options.maxLines });
+		escaped = fitted.content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
+		content = `${UNTRUSTED_FENCE_OPEN}${escaped}${UNTRUSTED_FENCE_CLOSE}`;
+	}
+	if (Buffer.byteLength(content, "utf-8") > options.maxBytes) return truncated;
+	return {
+		...truncated,
+		content,
+		truncated: true,
+		truncatedBy: inner.truncatedBy ?? truncated.truncatedBy,
+		outputLines: content.split("\n").length,
+		outputBytes: Buffer.byteLength(content, "utf-8"),
+	};
+}
+
 // =============================================================================
 // Centralized artifact spill for large tool results
 // =============================================================================
@@ -921,19 +1047,29 @@ async function spillLargeResultToArtifact(
 				maxHeadBytes: headBytes,
 				maxHeadLines: tailLines,
 			})
-		: truncateTail(fullText, {
+		: truncateTailKeepingUntrustedFence(fullText, {
 				maxBytes: tailBytes,
 				maxLines: tailLines,
 			});
 
-	// Replace text blocks with single truncated block, keep images
+	// Rebuild content preserving original block order while replacing text content.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let textReplaced = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			// Replace the first text block with truncated content, keep subsequent blocks in order.
+			if (!textReplaced) {
+				newContent.push({ type: "text", text: truncated.content });
+				textReplaced = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	// If there was no text block (edge case), add the truncated text at the end.
+	if (!textReplaced) {
+		newContent.push({ type: "text", text: truncated.content });
+	}
 
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
@@ -1003,8 +1139,9 @@ function stripBodyOwnedTruncationFooter(text: string, details: unknown): string 
  * closes those gaps: when `tools.maxInlineResultBytes` is configured (> 0), any
  * final result whose inline text exceeds the cap is force-saved to an artifact
  * (reusing an existing artifactId to avoid double-artifacting) and truncated to a
- * head+tail view that fits the cap. Disabled by default (opt-in pending
- * measurement); a 0 cap returns the result untouched.
+ * head+tail view that fits the cap. Defaults to 12 KB, chosen by the live
+ * tool-result A/B in #5945; a 0 cap, or a context that cannot store an
+ * artifact, returns the result untouched.
  */
 async function enforceInlineResultBackstop(
 	result: AgentToolResult,
@@ -1035,6 +1172,9 @@ async function enforceInlineResultBackstop(
 	if (!artifactId && artifactCapability) {
 		artifactId = (await artifactCapability.saveArtifact(fullText, toolName)) ?? undefined;
 	}
+	// Without an artifact the elided text would be unrecoverable (e.g. standalone
+	// `gjc read` has no session store), so an uncapped result beats silent loss.
+	if (!artifactId) return result;
 
 	// Budget head+tail below the cap, reserving room for the elision marker so the
 	// composed `<head>\n<marker>\n<tail>` view never exceeds the configured cap.
@@ -1048,47 +1188,85 @@ async function enforceInlineResultBackstop(
 				maxHeadBytes: Math.min(headBytes, Math.floor(budget / 2)),
 				maxHeadLines: tailLines,
 			})
-		: truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+		: truncateTailKeepingUntrustedFence(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
 
 	// Defensive clamp: guarantee the contract even for pathological marker sizes.
 	if (Buffer.byteLength(truncated.content, "utf-8") > maxInlineBytes) {
-		truncated = truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+		truncated = truncateTailKeepingUntrustedFence(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
 	}
 
+	// Rebuild content preserving original block order while replacing text content.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let textReplaced = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			// Replace the first text block with truncated content, keep subsequent blocks in order.
+			if (!textReplaced) {
+				newContent.push({ type: "text", text: truncated.content });
+				textReplaced = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	// If there was no text block (edge case), add the truncated text at the end.
+	if (!textReplaced) {
+		newContent.push({ type: "text", text: truncated.content });
+	}
 
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
 	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
+
+	// If a prior truncation exists from spillLargeResultToArtifact (not from tool-owned window
+	// metadata like read with explicit ranges), preserve its totals instead of using the
+	// intermediate truncated view's totals. The intermediate view was already truncated by the
+	// spill step, so its totalLines/totalBytes do not reflect the original full output.
+	// Tool-owned windows have different semantics: totalLines is file-relative but totalBytes
+	// are window-relative, and they include a nextOffset for pagination. We must keep them as-is
+	// and only update outputLines/outputBytes to reflect the new backstop truncation level.
+	const priorTruncation = existingMeta?.truncation;
+	// Detect tool-owned window metadata by checking for nextOffset (present in read windows).
+	// The read tool produces nextOffset for pagination, which must survive the backstop.
+	const isToolOwnedWindow = priorTruncation?.nextOffset !== undefined;
+	// Preserve prior totals when they exist (either from spill or tool-owned window).
+	// The backstop's truncated view has reduced totalLines/totalBytes that don't reflect
+	// the original full output or window.
+	const realTotalLines = priorTruncation?.totalLines ?? truncated.totalLines;
+	const realTotalBytes = priorTruncation?.totalBytes ?? truncated.totalBytes;
+	const elidedLines = Math.max(0, realTotalLines - outputLines);
+	const elidedBytes = Math.max(0, realTotalBytes - outputBytes);
+
+	const nextOffsetProp =
+		isToolOwnedWindow && priorTruncation?.nextOffset !== undefined ? { nextOffset: priorTruncation.nextOffset } : {};
+
 	const truncationMeta: TruncationMeta =
 		truncated.truncatedBy === "middle"
 			? {
 					direction: "middle",
 					truncatedBy: "middle",
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
+					totalLines: realTotalLines,
+					totalBytes: realTotalBytes,
 					outputLines,
 					outputBytes,
 					maxBytes: maxInlineBytes,
-					elidedLines: truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines),
-					elidedBytes: truncated.elidedBytes ?? Math.max(0, truncated.totalBytes - outputBytes),
+					headRange: undefined,
+					tailRange: undefined,
+					elidedLines,
+					elidedBytes,
 					artifactId,
+					...nextOffsetProp,
 				}
 			: {
 					direction: "tail",
 					truncatedBy: truncated.truncatedBy ?? "bytes",
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
+					totalLines: realTotalLines,
+					totalBytes: realTotalBytes,
 					outputLines,
 					outputBytes,
 					maxBytes: maxInlineBytes,
-					shownRange: { start: truncated.totalLines - outputLines + 1, end: truncated.totalLines },
+					shownRange: { start: realTotalLines - outputLines + 1, end: realTotalLines },
 					artifactId,
+					...nextOffsetProp,
 				};
 
 	const newMeta: OutputMeta = { ...(existingMeta ?? {}), truncation: truncationMeta };
@@ -1099,6 +1277,19 @@ async function enforceInlineResultBackstop(
 // =============================================================================
 // Tool wrapper
 // =============================================================================
+
+async function outputRedactionFor(settings: Settings): Promise<readonly string[] | undefined> {
+	const { collectEnvSecrets, loadSecrets } = await import("../secrets");
+	const entries = [...(await loadSecrets(settings.getCwd(), settings.getAgentDir())), ...collectEnvSecrets()];
+	const plain: string[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type !== "plain" || entry.content.length === 0 || seen.has(entry.content)) continue;
+		seen.add(entry.content);
+		plain.push(entry.content);
+	}
+	return plain.length > 0 ? plain : undefined;
+}
 
 async function wrappedExecute(
 	this: AgentTool & { [kUnwrappedExecute]: AgentToolExecFn },
@@ -1111,7 +1302,14 @@ async function wrappedExecute(
 	const originalExecute = this[kUnwrappedExecute];
 
 	try {
-		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		const settings = context?.settings;
+		let plainSecrets: readonly string[] | undefined;
+		if (settings?.get("secrets.enabled") === true) {
+			plainSecrets = await outputRedactionFor(settings);
+			throwIfAborted(signal);
+		}
+		const run = () => originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		let result = plainSecrets ? await runWithOutputRedaction(plainSecrets, run) : await run();
 
 		// Spill large results to artifact, truncate to tail
 		result = await spillLargeResultToArtifact(result, this.name, context);
@@ -1130,7 +1328,20 @@ async function wrappedExecute(
 		}
 		return result;
 	} catch (e) {
-		// Re-throw with formatted message so agent-loop sets isError flag
+		// Preserve the original Error class and stack so designed tool outcomes can
+		// be classified by the agent telemetry path and genuine failures retain the
+		// frame where they actually occurred. Non-Error throws still need a stable
+		// Error envelope for the agent loop.
+		if (e instanceof ToolError) {
+			const rendered = renderError(e);
+			if (rendered !== e.message) {
+				const renderedError = new ToolError(rendered, e.context);
+				if (e.stack) renderedError.stack = e.stack;
+				throw renderedError;
+			}
+			throw e;
+		}
+		if (e instanceof Error) throw e;
 		throw new Error(renderError(e));
 	}
 }

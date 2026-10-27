@@ -117,7 +117,7 @@ async function newSession(
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: registry,
 		builtinToolIdentities,
 		...(options.reloadSshTool ? { reloadSshTool: options.reloadSshTool } : {}),
@@ -239,7 +239,7 @@ async function newDispatchSession(options: {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map(options.activeTools.map(tool => [tool.name, tool])),
 		builtinToolIdentities: new Set<object>(options.builtins),
 	});
@@ -375,7 +375,9 @@ describe("AgentSession coordinator activity labels", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			toolRegistry: new Map([[bashTool.name, bashTool]]),
 		});
 		sessions.push(session);

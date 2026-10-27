@@ -85,7 +85,10 @@ function createHarness(sessions: AgentSession[]): Harness {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key" } as never,
+		modelRegistry: {
+			getApiKey: async () => "test-key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 	});
 	sessions.push(session);
 

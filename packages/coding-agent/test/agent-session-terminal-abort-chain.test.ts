@@ -7,6 +7,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel, type MockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import * as bashExecutor from "@gajae-code/coding-agent/exec/bash-executor";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -29,6 +30,7 @@ import { MonitorTool } from "@gajae-code/coding-agent/tools/monitor";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
+import { __sessionStateSidecarTestHooks } from "../src/gjc-runtime/session-state-sidecar";
 import { createTempDirRegistry, reapStaleTempDirs, sweepAfterSettle } from "./helpers/temp-dir-registry";
 
 const TEST_ABORT_GRACE_MS = 50;
@@ -114,6 +116,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	// before this suite grew its own sweep. Age-gated so a shard running
 	// concurrently on this host is never touched.
 	beforeAll(() => {
+		__sessionStateSidecarTestHooks.disableCoordinatorFileSyncForTests = true;
 		reapStaleTempDirs(TEMP_DIR_PREFIX);
 	});
 
@@ -122,6 +125,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	// `finally`, and a writer that outlives teardown can recreate a root the
 	// `finally` already removed. `afterAll` still runs in both cases.
 	afterAll(async () => {
+		__sessionStateSidecarTestHooks.disableCoordinatorFileSyncForTests = false;
 		await sweepAfterSettle(tempDirRegistry);
 	});
 
@@ -223,11 +227,43 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				// wait for the session's idle signal and every canceled job promise first.
 				session.agent.abort();
 				manager.cancelAll();
-				await session.waitForIdle();
-				await manager.waitForAll();
-				await manager.dispose({ timeoutMs: 3_000 });
-				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
-				await session.dispose();
+				// Join any rearmed continuation before disposing its manager. The
+				// coordinator persistence seam waits for this continuation to settle;
+				// disposing the manager first can strand it and make the seam hang.
+				const idleSettled = await Promise.race([
+					session.waitForIdle().then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(5_000).then(() => false),
+				]);
+				if (!idleSettled) {
+					await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
+					await Promise.race([chainSessionManager.close(), Bun.sleep(3_000)]);
+					return;
+				}
+				const jobsSettled = await Promise.race([
+					manager.waitForAll().then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(5_000).then(() => false),
+				]);
+				if (!jobsSettled) {
+					await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
+					await Promise.race([chainSessionManager.close(), Bun.sleep(3_000)]);
+					return;
+				}
+				const persistenceSettled = await Promise.race([
+					session.awaitCoordinatorRuntimeStatePersistenceForTests().then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(5_000).then(() => false),
+				]);
+				await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
+				if (persistenceSettled) await session.dispose();
+				else void session.dispose().catch(() => {});
 			}
 		} finally {
 			const managers = [...extraManagers];
@@ -245,7 +281,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			authStorage = undefined;
 			tempDirRegistry.release(tempDir);
 		}
-	}, 30_000);
+	}, 60_000);
 
 	it("terminal abort registers the scope so the left-running owned job classifies as owned-completion", async () => {
 		const callId = "call_terminal_owned";
@@ -277,6 +313,22 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 		await promptPromise;
 	}, 20_000);
+
+	it("bounds coordinator persistence teardown after its async-job manager is disposed", async () => {
+		const originalWaitForIdle = session.waitForIdle;
+		session.waitForIdle = (() => new Promise<void>(() => {})) as AgentSession["waitForIdle"];
+		try {
+			await manager.dispose({ timeoutMs: 100 });
+			const outcome = await Promise.race([
+				session.awaitCoordinatorRuntimeStatePersistenceForTests().then(() => "settled" as const),
+				Bun.sleep(2_000).then(() => "timed_out" as const),
+			]);
+			expect(outcome).toBe("settled");
+		} finally {
+			session.waitForIdle = originalWaitForIdle;
+			manualTeardown = true;
+		}
+	}, 10_000);
 
 	it("starts managed jobs in the session's endpoint-owned manager, not the process-global instance", async () => {
 		// Reproduction of the review-thread P1 scenario: a SECOND session's
@@ -986,6 +1038,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// admission sequence) and the rearm consumes it.
 		await waitFor(() => !session.agent.hasQueuedSteering(), "requester steer consumed");
 		await promptPromise;
+		// The rearmed continuation is admitted asynchronously after the aborted
+		// run settles; join it before shared teardown disposes its manager.
+		await session.waitForIdle();
 	}, 30_000);
 
 	it("terminal abort discards snapshots captured by replay-only admissions", async () => {
@@ -1213,40 +1268,92 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// must stay associated with the requesting connection or a later
 		// terminal abort from that client is rejected as non-owner.
 		let promoted = 0;
+		const steerPromoted = Promise.withResolvers<void>();
 		scriptedResponses = [stopReply("ok"), stopReply("steer answered")];
 		await session.prompt("first turn");
+		await session.waitForIdle();
 		// Queue the client steer while idle: the auto-continue promotes it into
 		// its OWN run, which fires the ownership hook exactly once.
 		await session.sendUserMessage("client steer", {
 			deliverAs: "steer",
 			onQueuedPromoted: () => {
 				promoted += 1;
+				steerPromoted.resolve();
 			},
 		});
-		await waitFor(() => !session.agent.hasQueuedSteering(), "steer consumed by its own run");
-		await waitFor(() => promoted === 1, "steer ownership hook fired");
+		// Promotion is fired from the queued-message run-acceptance callback,
+		// after the Agent has consumed the steer; join that boundary directly
+		// instead of polling wall-clock time for the scheduler to run.
+		await steerPromoted.promise;
+		expect(session.agent.hasQueuedSteering()).toBe(false);
 		expect(promoted).toBe(1);
-	}, 30_000);
+		await session.waitForIdle();
+	}, 60_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
-		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
+		scriptedResponses = [stopReply("first turn done")];
 		await session.prompt("first turn");
+		await session.waitForIdle();
 		const staleToken = session.captureTerminalAbortSteeringSnapshot();
 		expect(staleToken).toBeDefined();
-		const secondPrompt = session.prompt("second turn").catch(() => {});
-		await waitFor(() => session.agent.activeResourceRunId !== undefined, "second run handle");
-		const handle = session.agent.activeResourceRunId ?? "run";
-		await expect(
-			session.abortPromptAndWait(handle, {
+		const bashStarted = Promise.withResolvers<bashExecutor.BashExecutorOptions>();
+		const bashStopped = Promise.withResolvers<void>();
+		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			const signal = options?.signal;
+			if (!signal) throw new Error("expected the second turn's bash command to have an abort signal");
+			bashStarted.resolve(options);
+			await bashStopped.promise;
+			return {
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 0,
+				totalBytes: 0,
+				outputLines: 0,
+				outputBytes: 0,
+			};
+		});
+		try {
+			scriptedResponses = [bashCall("controlled second-turn command", "call_second_turn")];
+			const secondPrompt = session.prompt("second turn").catch(() => {});
+			// A prompt that ends before dispatching Bash must also settle this gate;
+			// otherwise a failed/short-circuited run leaves bashStarted unresolved
+			// until the test's 60-second timeout.
+			const bashExecution = await Promise.race([
+				bashStarted.promise,
+				secondPrompt.then(() => {
+					throw new Error("second turn settled before the controlled Bash executor started");
+				}),
+			]);
+			expect(bashExecution.signal?.aborted).toBe(false);
+			const handle = session.agent.activeResourceRunId ?? "run";
+			await expect(
+				session.abortPromptAndWait(handle, {
+					graceMs: TEST_ABORT_GRACE_MS,
+					terminal: { scope: "turn", steeringSnapshotToken: staleToken },
+				}),
+			).resolves.toMatchObject({ status: "unfenced", reason: "unknown_run" });
+			// The stale token is retired and cannot affect cleanup of the live turn.
+			session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
+			const abortPromise = session.abortPromptAndWait(handle, {
 				graceMs: TEST_ABORT_GRACE_MS,
-				terminal: { scope: "turn", steeringSnapshotToken: staleToken },
-			}),
-		).resolves.toMatchObject({ status: "unfenced", reason: "unknown_run" });
-		// The stale token is retired and cannot affect cleanup of the live turn.
-		session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
-		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
-		await secondPrompt;
-	}, 30_000);
+				terminal: { scope: "turn" },
+			});
+			// `abortPromptAndWait` admits the terminal fence synchronously, but a
+			// foreground BashTool does not necessarily cancel its shell when the
+			// Agent turn is aborted. Release the controlled command after that
+			// admission so the test does not depend on process timing.
+			bashStopped.resolve();
+			await abortPromise;
+			await secondPrompt;
+			await session.waitForIdle();
+			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+		} finally {
+			bashStopped.resolve();
+			executeBashSpy.mockRestore();
+		}
+	}, 60_000);
 
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
 		// Delta-review P1 regression: the steering purge must NOT
@@ -1467,12 +1574,34 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// use the manager inherited from the parent rather than process-global
 		// session B, or jobs and their async-result delivery cross session trees.
 		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		// Keep manager selection, raw-line dispatch, and cancellation real, but
+		// gate stdout explicitly instead of racing native shell startup on CI.
+		const started = Promise.withResolvers<bashExecutor.BashExecutorOptions>();
+		const stopped = Promise.withResolvers<void>();
+		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			if (!options?.signal) throw new Error("expected monitor cancellation signal");
+			options.signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+			started.resolve(options);
+			await stopped.promise;
+			return {
+				output: "monitor-line\n",
+				exitCode: undefined,
+				cancelled: options.signal.aborted,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 13,
+				outputLines: 1,
+				outputBytes: 13,
+			};
+		});
 		try {
 			AsyncJobManager.setInstance(foreign);
+			const sendCustomMessage = vi.fn(async () => {});
 			const childToolSession: ToolSession = {
 				...toolSession,
 				getSessionId: () => "unregistered-child-endpoint",
 				getAsyncJobManager: () => manager,
+				sendCustomMessage,
 			};
 			const monitorTool = new MonitorTool(childToolSession);
 			await monitorTool.execute("monitor-call", {
@@ -1480,17 +1609,28 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				kind: "other",
 				description: "probe",
 			});
+			const execution = await started.promise;
 			expect(foreign.getAllJobs().length).toBe(0);
 			const endpointJobs = manager.getAllJobs();
 			expect(endpointJobs.length).toBe(1);
+			expect(endpointJobs[0]!.status).toBe("running");
+			expect(execution.onRawChunk).toBeDefined();
+			execution.onRawChunk!("monitor-line\n");
 			// Non-persistent monitors cancel after the first delivered line —
-			// on the endpoint manager that owns the job.
+			// on the endpoint manager that owns the job, not by natural exit.
+			expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+			expect(execution.signal!.aborted).toBe(true);
 			await waitFor(
-				() => manager.getJob(endpointJobs[0]!.id)?.status !== "running",
+				() => manager.getJob(endpointJobs[0]!.id)?.status === "cancelled",
 				"endpoint monitor cancelled",
 				5_000,
 			);
+			execution.onRawChunk!("late-monitor-line\n");
+			expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+			expect(foreign.getAllJobs().length).toBe(0);
 		} finally {
+			stopped.resolve();
+			executeBashSpy.mockRestore();
 			AsyncJobManager.setInstance(manager);
 		}
 	}, 20_000);

@@ -84,6 +84,7 @@ const EXTENSION_CONTEXT_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"clearContext",
 	"cycleModel",
 	"setModelProfile",
+	"setDefaultModelProfile",
 	"cycleThinkingLevel",
 	"setQueueMode",
 	"invokeSkill",
@@ -91,6 +92,14 @@ const EXTENSION_CONTEXT_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"operateGoal",
 	"setSdkPermissionProvider",
 	"setSdkClientBridge",
+	"sdkControl",
+]);
+const MODEL_CHANGE_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
+	"setModel",
+	"setModelTemporaryForControl",
+	"cycleModel",
+	"setModelProfile",
+	"setDefaultModelProfile",
 	"sdkControl",
 ]);
 const EXTENSION_COMMAND_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
@@ -250,7 +259,11 @@ export class ExtensionUiController {
 				const slashIndex = selector.indexOf("/");
 				const model =
 					slashIndex > 0
-						? session.modelRegistry.find(selector.slice(0, slashIndex), selector.slice(slashIndex + 1))
+						? session.modelRegistry.find(
+								selector.slice(0, slashIndex),
+								selector.slice(slashIndex + 1),
+								session.credentialSessionId,
+							)
 						: undefined;
 				if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
 					throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
@@ -442,6 +455,14 @@ export class ExtensionUiController {
 		return this.ctx.isStopped?.() === true;
 	}
 
+	async #withModelChangeRefresh<T>(changeModel: () => Promise<T>): Promise<T> {
+		try {
+			return await changeModel();
+		} finally {
+			if (!this.#isStopped()) this.ctx.updateEditorChrome();
+		}
+	}
+
 	#assertActive(): void {
 		if (this.#isStopped()) throw Object.assign(new Error("Interactive mode stopped"), { code: "cancelled" });
 	}
@@ -453,6 +474,9 @@ export class ExtensionUiController {
 				if (!mutationNames.has(property) || typeof member !== "function") return member;
 				return (...args: unknown[]) => {
 					this.#assertActive();
+					if (MODEL_CHANGE_MUTATIONS.has(property)) {
+						return this.#withModelChangeRefresh(async () => Reflect.apply(member, current, args));
+					}
 					return Reflect.apply(member, current, args);
 				};
 			},
@@ -575,6 +599,7 @@ export class ExtensionUiController {
 			getCredentialSessionId: () => this.ctx.session.credentialSessionId,
 			isIdle: () => !this.ctx.session.isStreaming,
 			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
+			getSessionWorkLease: () => this.ctx.session.sessionWorkLease,
 			abort: () => this.ctx.session.abort(),
 			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
@@ -625,11 +650,21 @@ export class ExtensionUiController {
 			invokeSkill: (name, args, options) => this.ctx.session.invokeSkill(name, args, options),
 			setPlanMode: on => this.ctx.session.setSdkPlanMode(on),
 			operateGoal: (op, objective) => this.ctx.session.operateGoal(op, objective),
+			// Read the CURRENT session on every call: interactive contexts outlive a
+			// session rebind, and the snapshot must stay session-owned (owner-filtered)
+			// instead of reaching for the process-global manager (issue: jobs Q25).
+			getJobs: () => this.ctx.session.getAsyncJobSnapshot(),
 			getSkillState: () =>
 				this.ctx.session.skills.map(skill => ({ name: skill.name, description: skill.description })),
 			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
+			// The SDK session runtime streams turn content (message/tool events) and `bash_folded`
+			// to the connection that submitted the turn through these two bindings. Without them a
+			// terminal-hosted session accepts a remote prompt and settles it, but streams no answer.
+			onJobFold: listener => this.ctx.session.onJobFold(listener),
+			// Live observers must not consume the startup fallback notice before the TUI subscribes.
+			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
@@ -641,12 +676,15 @@ export class ExtensionUiController {
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				if (!result.cancelled) await this.ctx.session.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
+				if (this.#isStopped()) return;
+				await this.ctx.session.notifySessionIdentityChanged();
 				if (this.#isStopped()) return;
 				const sessionIdentityChanged = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (sessionIdentityChanged) this.ctx.resetIrcSidebarSession();
@@ -805,6 +843,7 @@ export class ExtensionUiController {
 			getCredentialSessionId: () => this.ctx.session.credentialSessionId,
 			isIdle: () => !this.ctx.session.isStreaming,
 			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
+			getSessionWorkLease: () => this.ctx.session.sessionWorkLease,
 			abort: () => this.ctx.session.abort(),
 			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
@@ -852,11 +891,19 @@ export class ExtensionUiController {
 				}
 				return false;
 			},
+			// Same session-owned binding as the hooks/custom-tools context above.
+			getJobs: () => this.ctx.session.getAsyncJobSnapshot(),
 			getSkillState: () =>
 				this.ctx.session.skills.map(skill => ({ name: skill.name, description: skill.description })),
 			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
+			// The SDK session runtime streams turn content (message/tool events) and `bash_folded`
+			// to the connection that submitted the turn through these two bindings. Without them a
+			// terminal-hosted session accepts a remote prompt and settles it, but streams no answer.
+			onJobFold: listener => this.ctx.session.onJobFold(listener),
+			// Live observers must not consume the startup fallback notice before the TUI subscribes.
+			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
@@ -868,6 +915,7 @@ export class ExtensionUiController {
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				if (!result.cancelled) await this.ctx.session.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
@@ -877,6 +925,8 @@ export class ExtensionUiController {
 				}
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
+				if (this.#isStopped()) return;
+				await this.ctx.session.notifySessionIdentityChanged();
 				if (this.#isStopped()) return;
 				const sessionIdentityChanged = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (sessionIdentityChanged) this.ctx.resetIrcSidebarSession();

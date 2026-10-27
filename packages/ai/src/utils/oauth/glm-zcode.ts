@@ -4,8 +4,9 @@
  * Replicates how the ZCode desktop app turns a Z.AI login into usable GLM model
  * access. This is NOT an official Z.AI OAuth client: it reuses ZCode's authorize
  * page, broker, and a custom-protocol redirect. It may break at any time and may
- * violate ZCode/Z.AI Terms of Service. Endpoints/client id are overridable via
- * `ZCODE_OAUTH_*` environment variables.
+ * violate ZCode/Z.AI Terms of Service. Endpoints and the client id are
+ * overridable via `ZCODE_OAUTH_*` from the launching shell or user-owned env
+ * files. A project `.env` is not a trusted source for those values.
  *
  * Verified end-to-end against the ZCode host bundle (`resolveZaiApiKey` /
  * `resolveBizApiKey`) and live traffic:
@@ -28,6 +29,7 @@
  * This provider must NEVER force `isOAuth=true`: the key is a plain Z.AI API key, and
  * api.z.ai is not api.anthropic.com, so the Anthropic path already emits a plain bearer.
  */
+import { $credentialEnv } from "@gajae-code/utils";
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions, parseCallbackInput } from "./callback-server";
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -52,9 +54,18 @@ export const GLM_ZCODE_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
 
 type FetchImpl = typeof globalThis.fetch;
 
+/**
+ * Trusted override for one `ZCODE_OAUTH_*` name.
+ *
+ * These values choose where the authorization code and upstream token are sent.
+ * `$credentialEnv` keeps the launching shell and user-owned env files and skips
+ * a project `.env`. A shell value is also skipped when it repeats that file
+ * or the project declaration is dynamic, and when no other trusted source
+ * sets the name an empty value still uses the built-in endpoint.
+ */
 function envOr(name: string, fallback: string): string {
-	const value = process.env[name];
-	return value && value.trim().length > 0 ? value.trim() : fallback;
+	const value = $credentialEnv(name)?.trim();
+	return value ? value : fallback;
 }
 
 function resolveAuthorizeUrl(): string {
@@ -387,7 +398,7 @@ export class GlmZcodeOAuthFlow extends OAuthCallbackFlow {
 		return {
 			url: `${authorizeUrl}?${params.toString()}`,
 			instructions:
-				"Complete Z.AI login in your browser. This is an UNOFFICIAL ZCode-based login — use at your own risk; it may stop working or violate ZCode/Z.AI Terms of Service. Because this CLI cannot receive the zcode:// redirect, paste the final redirect URL or authorization code when prompted. If the ZCode desktop app is installed, cancel the browser's prompt to open it: the app exchanges the single-use code itself and the pasted code is then rejected (broker error 2007).",
+				"Complete Z.AI login in your browser. This is an UNOFFICIAL ZCode-based login — use at your own risk; it may stop working or violate ZCode/Z.AI Terms of Service. If the ZCode desktop app is installed, cancel the browser's prompt to open it: the app exchanges the single-use code itself and the pasted code is then rejected (broker error 2007). After login the browser redirects to a zcode:// address, which never appears in the address bar — copy it from DevTools instead: open the browser DevTools Network tab (filter: zcode), select the zcode://oauth/callback?code=…&state=… request, and paste that full URL (or just the code) at the prompt.",
 		};
 	}
 
@@ -395,6 +406,13 @@ export class GlmZcodeOAuthFlow extends OAuthCallbackFlow {
 		return exchangeGlmZcodeCode(this.#fetch, { code, state, redirectUri }, this.ctrl.signal);
 	}
 }
+
+/**
+ * Manual-input prompt for the paste fallback. Repeats the redirect-URL shape and
+ * the DevTools pointer so a re-prompt after a rejected paste stays self-contained.
+ */
+export const GLM_ZCODE_MANUAL_INPUT_PROMPT =
+	"Paste the full zcode://oauth/callback?code=…&state=… URL (copy it from browser DevTools → Network tab; the address bar never shows it) or the authorization code:";
 
 export async function loginGlmZcode(
 	ctrl: OAuthController,

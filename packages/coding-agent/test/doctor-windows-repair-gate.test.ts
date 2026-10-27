@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { DoctorAction } from "../src/cli/doctor/args";
 import { journalRepairSupported } from "../src/cli/doctor/repairs";
 
@@ -45,9 +48,48 @@ describe("journal-backed repair platform gate", () => {
 
 describe("doctor --help documents the Windows limitation", () => {
 	test("names the unsupported repair set and the working diagnose path", async () => {
-		const source = await Bun.file(new URL("../src/cli/doctor-cli.ts", import.meta.url)).text();
-		for (const action of JOURNAL_BACKED) expect(source).toContain(action);
-		expect(source).toContain("unsupported on Windows");
-		expect(source).toContain("--dry-run work");
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-doctor-help-"));
+		try {
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					"--no-env-file",
+					`--config=${path.resolve(import.meta.dir, "../src/sdk/broker/internal-source.bunfig.toml")}`,
+					path.resolve(import.meta.dir, "../src/cli.ts"),
+					"doctor",
+					"--help",
+				],
+				{
+					cwd: home,
+					env: {
+						PATH: process.env.PATH ?? "",
+						HOME: home,
+						GJC_CODING_AGENT_DIR: path.join(home, ".gjc"),
+						BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+					},
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+			try {
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect(exitCode).toBe(0);
+				expect(stderr).toBe("");
+				expect(stdout).toContain("Usage: gjc doctor");
+				for (const action of JOURNAL_BACKED) expect(stdout).toContain(action);
+				expect(stdout).toContain("unsupported on Windows");
+				expect(stdout).toContain("--dry-run work");
+			} finally {
+				clearTimeout(timer);
+			}
+		} finally {
+			await fs.rm(home, { recursive: true, force: true });
+		}
 	});
 });

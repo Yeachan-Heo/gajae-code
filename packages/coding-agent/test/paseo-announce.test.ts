@@ -138,6 +138,16 @@ describe("parseDaemonListen", () => {
 		expect(parseDaemonListen("65536")).toBeUndefined();
 		expect(parseDaemonListen("999999999999999999999999")).toBeUndefined();
 	});
+
+	test("rejects host:port spellings whose port is not plain decimal digits", () => {
+		expect(parseDaemonListen("localhost:0x1A0B")).toBeUndefined();
+		expect(parseDaemonListen("localhost:1e3")).toBeUndefined();
+		expect(parseDaemonListen("localhost:6767.0")).toBeUndefined();
+		expect(parseDaemonListen("localhost: 6767")).toBeUndefined();
+		expect(parseDaemonListen("localhost:+6767")).toBeUndefined();
+		expect(parseDaemonListen("tcp://10.0.0.2:0b1011?ssl=true")).toBeUndefined();
+		expect(parseDaemonListen("localhost:06767")).toEqual({ kind: "tcp", host: "localhost", port: 6767 });
+	});
 });
 
 describe("resolveDaemonTarget", () => {

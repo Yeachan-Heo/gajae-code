@@ -19,6 +19,7 @@ import {
 import {
 	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	type PreparedNewSession,
 	SessionManager,
 	SessionManagerTestHooks,
 } from "../../src/session/session-manager";
@@ -26,6 +27,8 @@ import {
 	FileSessionStorage,
 	MemorySessionStorage,
 	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+	SessionStorageWriterRetryableCloseError,
 	type StagedStreamingWriter,
 } from "../../src/session/session-storage";
 
@@ -3663,23 +3666,16 @@ describe("whole-session persistence freshness", () => {
 			destinationFile,
 			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-destination", timestamp: "0", cwd: "/cwd" })}\n`,
 		);
-		const destinationManager = await SessionManager.open(
+		const manager = await SessionManager.open(
 			destinationFile,
 			SessionManager.explicitDestination("/sessions"),
 			storage,
 			"copy-retain",
 			"off",
 		);
-		const destinationSnapshot = destinationManager.captureState();
-		await destinationManager.close();
-		const manager = await SessionManager.open(
-			sourceFile,
-			SessionManager.explicitDestination("/sessions"),
-			storage,
-			"copy-retain",
-			"off",
-		);
+		const destinationSnapshot = manager.captureState();
 		try {
+			await manager.setSessionFile(sourceFile);
 			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
 			await manager.flush();
 			const sourceBeforeRewrite = storage.readTextSync(sourceFile);
@@ -3696,6 +3692,324 @@ describe("whole-session persistence freshness", () => {
 		} finally {
 			storage.releaseFlush.resolve();
 			await expect(manager.close()).rejects.toThrow("session_persistence_lifecycle_changed");
+		}
+	});
+	it.each([1, 2])("clears the original certified writer-close error after %i failed attempts", async failures => {
+		class RetryableCloseStorage extends MemorySessionStorage {
+			closeFailures = failures;
+			closeDispatches = 0;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.closeDispatches++;
+							if (this.closeFailures > 0) {
+								this.closeFailures--;
+								throw new SessionStorageWriterRetryableCloseError(
+									`injected_retryable_close_${this.closeDispatches}`,
+								);
+							}
+						},
+					},
+				});
+			}
+		}
+		const storage = new RetryableCloseStorage();
+		const sessionFile = "/sessions/retryable-close.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "retryable-close", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const entryId = manager.appendCustomEntry("retryable-close", { value: 1 });
+		await manager.flush();
+		for (let attempt = 1; attempt <= failures; attempt++) {
+			await expect(manager.close()).rejects.toThrow(`injected_retryable_close_${attempt}`);
+		}
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.closeDispatches).toBe(failures + 1);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(storage.readTextSync(sessionFile)).toContain(`"id":"${entryId}"`);
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.closeDispatches).toBe(failures + 1);
+	});
+	it("retires a close-origin error after rewrite debt resolves", async () => {
+		class CloseSequenceStorage extends MemorySessionStorage {
+			readonly events: string[] = [];
+			#sessionCloseFailures = 1;
+			#rewriteCloseFailures = 1;
+			sessionCloseDispatches = 0;
+			rewriteCloseDispatches = 0;
+
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							if (filePath.includes(".tmp")) {
+								this.rewriteCloseDispatches++;
+								this.events.push(`rewrite-close-${this.rewriteCloseDispatches}`);
+								if (this.#rewriteCloseFailures > 0) {
+									this.#rewriteCloseFailures--;
+									throw new Error("rewrite_debt_error_y");
+								}
+								return;
+							}
+							this.sessionCloseDispatches++;
+							this.events.push(`session-close-${this.sessionCloseDispatches}`);
+							if (this.#sessionCloseFailures > 0) {
+								this.#sessionCloseFailures--;
+								throw new SessionStorageWriterRetryableCloseError("writer_close_error_x");
+							}
+						},
+					},
+				});
+			}
+		}
+
+		const storage = new CloseSequenceStorage();
+		const sessionFile = "/sessions/retryable-close-rewrite-debt.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${[
+				{ type: "session", version: 5, id: "retryable-close-rewrite-debt", timestamp: "0", cwd: "/cwd" },
+				{
+					type: "message",
+					id: "existing",
+					parentId: null,
+					timestamp: "0",
+					message: { role: "user", content: "existing", timestamp: 0 },
+				},
+			]
+				.map(entry => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+
+		const initialId = manager.appendCustomEntry("initial", { value: 1 });
+		await manager.flush();
+		const beforeRewrite = storage.readTextSync(sessionFile);
+		const existing = manager.getEntry("existing");
+		if (existing?.type !== "message") throw new Error("test fixture message missing");
+		existing.message = { role: "user", content: "rewritten after close retry", timestamp: 0 };
+		manager.applyEntryMessageUpdates([existing]);
+		const expectedRecords = [manager.getHeader(), ...manager.getEntries()];
+		expect(manager.hotRetainedMessageCharsForTests()).toBeGreaterThan(0);
+
+		await expect(manager.close()).rejects.toThrow("writer_close_error_x");
+		expect(storage.readTextSync(sessionFile)).toBe(beforeRewrite);
+		expect(manager.getEntry("existing")).toEqual(existing);
+		expect(manager.getEntries()).toHaveLength(2);
+		await expect(manager.close()).rejects.toThrow("rewrite_debt_error_y");
+		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1"]);
+		expect(storage.readTextSync(sessionFile)).toBe(beforeRewrite);
+		expect(manager.getEntry("existing")).toEqual(existing);
+		expect(manager.getEntries()).toHaveLength(2);
+
+		// The real close body must finish the rewrite and release resident state,
+		// even though the second attempt already closed and released its writer.
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1", "rewrite-close-2"]);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(manager.getHeader()).toBeNull();
+		expect(manager.hasHistoryEntries()).toBe(false);
+		expect(manager.getCanonicalEntryForTests("existing")).toBeUndefined();
+		expect(manager.getEntry(initialId)).toBeUndefined();
+		expect(manager.getLeafEntry()).toBeUndefined();
+		expect(manager.getBranch()).toHaveLength(0);
+		expect(manager.hotRetainedMessageCharsForTests()).toBe(0);
+		const afterRewrite = storage.readTextSync(sessionFile);
+		const persistedRecords = afterRewrite
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(persistedRecords).toEqual(expectedRecords);
+		const closeDispatchesAfterRecovery = storage.sessionCloseDispatches + storage.rewriteCloseDispatches;
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.sessionCloseDispatches + storage.rewriteCloseDispatches).toBe(closeDispatchesAfterRecovery);
+		expect(storage.readTextSync(sessionFile)).toBe(afterRewrite);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(manager.hotRetainedMessageCharsForTests()).toBe(0);
+	});
+	it("resets a stale close origin across session replacement", async () => {
+		class ReplacementCloseStorage extends MemorySessionStorage {
+			readonly closeDispatches = new Map<string, number>();
+			#failures = new Map<string, number>();
+			#missingEmptyFiles = new Set<string>();
+
+			failNextClose(filePath: string): void {
+				this.#failures.set(filePath, 1);
+			}
+
+			treatMissingAsEmpty(filePath: string): void {
+				this.#missingEmptyFiles.add(filePath);
+			}
+
+			override readText(filePath: string): Promise<string> {
+				if (this.#missingEmptyFiles.has(filePath) && !this.existsSync(filePath)) return Promise.resolve("");
+				return super.readText(filePath);
+			}
+
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							const dispatches = (this.closeDispatches.get(filePath) ?? 0) + 1;
+							this.closeDispatches.set(filePath, dispatches);
+							const failures = this.#failures.get(filePath) ?? 0;
+							if (failures > 0) {
+								this.#failures.set(filePath, failures - 1);
+								throw new SessionStorageWriterRetryableCloseError(
+									filePath.includes("source") ? "writer_close_error_x" : "writer_close_error_y",
+								);
+							}
+						},
+					},
+				});
+			}
+		}
+
+		const storage = new ReplacementCloseStorage();
+		const sourceFile = "/sessions/replacement-source.jsonl";
+		const targetFile = "/sessions/replacement-target.jsonl";
+		for (const [file, id] of [
+			[sourceFile, "replacement-source"],
+			[targetFile, "replacement-target"],
+		] as const) {
+			storage.writeTextSync(
+				file,
+				`${JSON.stringify({ type: "session", version: 5, id, timestamp: "0", cwd: "/cwd" })}\n`,
+			);
+		}
+		storage.failNextClose(sourceFile);
+		storage.failNextClose(targetFile);
+		const manager = await SessionManager.open(
+			sourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			manager.appendCustomEntry("source-entry", { value: 1 });
+			await manager.flush();
+			await expect(manager.setSessionFile(targetFile)).rejects.toThrow("writer_close_error_x");
+			await expect(manager.setSessionFile(targetFile)).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(sourceFile)).toBe(2);
+			manager.appendCustomEntry("target-entry", { value: 2 });
+			await manager.flush();
+
+			await expect(manager.close()).rejects.toThrow("writer_close_error_y");
+			await expect(manager.close()).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(targetFile)).toBe(2);
+			expect(manager.getEntries()).toHaveLength(0);
+			expect(manager.getHeader()).toBeNull();
+		} finally {
+			await manager.close().catch(() => {});
+		}
+
+		const freshSourceFile = "/sessions/fresh-replacement-source.jsonl";
+		const freshTargetFile = "/sessions/fresh-replacement-target.jsonl";
+		storage.writeTextSync(
+			freshSourceFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "fresh-replacement-source", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		storage.treatMissingAsEmpty(freshTargetFile);
+		storage.failNextClose(freshSourceFile);
+		storage.failNextClose(freshTargetFile);
+		const freshManager = await SessionManager.open(
+			freshSourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			freshManager.appendCustomEntry("fresh-source-entry", { value: 1 });
+			await freshManager.flush();
+			await expect(freshManager.setSessionFile(freshTargetFile)).rejects.toThrow("writer_close_error_x");
+			await expect(freshManager.setSessionFile(freshTargetFile)).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(freshSourceFile)).toBe(2);
+			freshManager.appendCustomEntry("fresh-target-entry", { value: 2 });
+			await freshManager.flush();
+
+			await expect(freshManager.close()).rejects.toThrow("writer_close_error_y");
+			await expect(freshManager.close()).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(freshTargetFile)).toBe(2);
+		} finally {
+			await freshManager.close().catch(() => {});
+		}
+	});
+	it("resets a stale close origin when rollback replaces the writer", async () => {
+		class RollbackCloseStorage extends MemorySessionStorage {
+			closeDispatches = 0;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.closeDispatches++;
+							if (this.closeDispatches === 1)
+								throw new SessionStorageWriterRetryableCloseError("writer_close_error_x");
+							if (this.closeDispatches === 3)
+								throw new SessionStorageWriterRetryableCloseError("writer_close_error_y");
+						},
+					},
+				});
+			}
+		}
+
+		const storage = new RollbackCloseStorage();
+		const sessionFile = "/sessions/rollback-close-origin.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "rollback-close-origin", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		storage.writeTextSync(
+			"/sessions/rollback-close-origin-successor.jsonl",
+			`${JSON.stringify({ type: "session", version: 5, id: "rollback-close-origin-successor", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			manager.appendCustomEntry("before-close-retry", { value: 1 });
+			await manager.flush();
+			const rollback = await manager.captureRollbackState();
+			await expect(manager.setSessionFile("/sessions/rollback-close-origin-successor.jsonl")).rejects.toThrow(
+				"writer_close_error_x",
+			);
+			await manager.restoreRollbackState(rollback);
+			manager.appendCustomEntry("after-rollback", { value: 2 });
+			await manager.flush();
+			await expect(manager.close()).rejects.toThrow("writer_close_error_y");
+			await expect(manager.close()).resolves.toBeUndefined();
+			expect(storage.closeDispatches).toBe(4);
+			expect(storage.readTextSync(sessionFile)).toContain('"value":2');
+		} finally {
+			await manager.close().catch(() => {});
 		}
 	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
@@ -5924,5 +6238,151 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		);
 		const truncated = SessionManager.captureTranscriptStrict("/sessions/truncated.jsonl", storage);
 		expect(truncated).toMatchObject({ kind: "error", reason: "malformed" });
+	});
+
+	it("binds captured artifact publication to the actual session across readiness, commit, and close", async () => {
+		const tempDir = TempDir.createSync("@pi-artifact-publication-lifecycle-");
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "artifact-source", timestamp: "0", cwd: tempDir.path() })}\n`,
+		);
+		let manager: SessionManager | undefined;
+		let prepared: PreparedNewSession | undefined;
+		let restoreAllocationSpy: (() => void) | undefined;
+		const allocationStarted = Promise.withResolvers<void>();
+		const releaseAllocation = Promise.withResolvers<void>();
+		try {
+			manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(tempDir.path()),
+				new FileSessionStorage(),
+			);
+			const retainedPublication = manager.captureArtifactPublication();
+			const sourceSessionId = manager.getSessionId();
+			const sourceSessionFile = manager.getSessionFile();
+			expect(sourceSessionFile).toBe(sessionFile);
+
+			prepared = await manager.prepareFork();
+			if (!prepared?.sessionFile) throw new Error("Expected an uncommitted successor session");
+			expect(manager.getSessionId()).toBe(sourceSessionId);
+			expect(manager.getSessionFile()).toBe(sourceSessionFile);
+
+			const readyContent = "source remains writable while successor is ready: 雪🧪\n";
+			const readyId = await retainedPublication(readyContent, "bash-original");
+			expect(readyId).toBeDefined();
+			if (!readyId) throw new Error("Expected source-session artifact publication");
+			const readyPath = path.join(sourceSessionFile!.slice(0, -6), `${readyId}.bash-original.log`);
+			expect(await manager.getArtifactPath(readyId)).toBe(readyPath);
+			expect(await Bun.file(readyPath).bytes()).toEqual(Buffer.from(readyContent, "utf8"));
+			expect(await Bun.file(readyPath).text()).toBe(readyContent);
+
+			await manager.discardPreparedNewSession(prepared);
+			prepared = undefined;
+			const releasedContent = "source remains writable after candidate release\n";
+			const releasedId = await retainedPublication(releasedContent, "bash-original");
+			expect(releasedId).toBeDefined();
+			if (!releasedId) throw new Error("Expected publication after candidate release");
+			expect(
+				await Bun.file(path.join(sourceSessionFile!.slice(0, -6), `${releasedId}.bash-original.log`)).text(),
+			).toBe(releasedContent);
+
+			prepared = await manager.prepareFork();
+			if (!prepared?.sessionFile) throw new Error("Expected a successor session for commit");
+			const successorSessionFile = prepared.sessionFile;
+			const successorArtifactsDir = successorSessionFile.slice(0, -6);
+			const readCandidateInventory = async (): Promise<Map<string, Uint8Array>> => {
+				const names = fs.existsSync(successorArtifactsDir) ? fs.readdirSync(successorArtifactsDir).sort() : [];
+				const inventory = new Map<string, Uint8Array>();
+				for (const name of names) {
+					inventory.set(name, await Bun.file(path.join(successorArtifactsDir, name)).bytes());
+				}
+				return inventory;
+			};
+			const candidateInventoryBefore = await readCandidateInventory();
+			expect([...candidateInventoryBefore.keys()].sort()).toEqual(
+				[
+					`.artifact-id-${readyId}`,
+					`.artifact-id-${releasedId}`,
+					`${readyId}.bash-original.log`,
+					`${releasedId}.bash-original.log`,
+				].sort(),
+			);
+			expect(candidateInventoryBefore.get(`${readyId}.bash-original.log`)).toEqual(
+				Buffer.from(readyContent, "utf8"),
+			);
+			expect(candidateInventoryBefore.get(`${releasedId}.bash-original.log`)).toEqual(
+				Buffer.from(releasedContent, "utf8"),
+			);
+			const sourceArtifacts = manager.getArtifactManager();
+			if (!sourceArtifacts) throw new Error("Expected the actual source artifact manager");
+			const allocatePath = sourceArtifacts.allocatePath.bind(sourceArtifacts);
+			let heldAllocation = true;
+			const allocationSpy = vi.spyOn(sourceArtifacts, "allocatePath").mockImplementation(async toolType => {
+				const allocation = await allocatePath(toolType);
+				if (heldAllocation && toolType === "bash-original") {
+					heldAllocation = false;
+					allocationStarted.resolve();
+					await releaseAllocation.promise;
+				}
+				return allocation;
+			});
+			restoreAllocationSpy = () => allocationSpy.mockRestore();
+			const pendingPublication = retainedPublication("must not cross the commit boundary", "bash-original");
+			await allocationStarted.promise;
+
+			manager.commitPreparedNewSession(prepared);
+			prepared = undefined;
+			expect(manager.getSessionFile()).toBe(successorSessionFile);
+			expect(manager.getSessionId()).not.toBe(sourceSessionId);
+			releaseAllocation.resolve();
+			await expect(pendingPublication).rejects.toThrow(/no longer authorized|changed before/);
+			restoreAllocationSpy();
+			restoreAllocationSpy = undefined;
+
+			const candidateInventoryAfterRejectedPublication = await readCandidateInventory();
+			expect(candidateInventoryAfterRejectedPublication).toEqual(candidateInventoryBefore);
+			for (const name of candidateInventoryBefore.keys()) {
+				expect(await Bun.file(path.join(successorArtifactsDir, name)).text()).not.toContain(
+					"must not cross the commit boundary",
+				);
+			}
+			await expect(retainedPublication("stale retained publisher", "bash-original")).rejects.toThrow(
+				/no longer authorized|changed before/,
+			);
+			expect(await readCandidateInventory()).toEqual(candidateInventoryBefore);
+
+			const successorPublication = manager.captureArtifactPublication();
+			const successorContent = "successor control: 你好🧪\n";
+			const successorId = await successorPublication(successorContent, "bash");
+			expect(successorId).toBeDefined();
+			if (!successorId) throw new Error("Expected successor-session control publication");
+			const successorArtifactPath = path.join(successorArtifactsDir, `${successorId}.bash.log`);
+			expect(await manager.getArtifactPath(successorId)).toBe(successorArtifactPath);
+			expect(await Bun.file(successorArtifactPath).bytes()).toEqual(Buffer.from(successorContent, "utf8"));
+			expect(await Bun.file(successorArtifactPath).text()).toBe(successorContent);
+			const candidateInventoryAfterControl = await readCandidateInventory();
+			expect([...candidateInventoryAfterControl.keys()].sort()).toEqual(
+				[
+					...new Set([
+						...candidateInventoryBefore.keys(),
+						`.artifact-id-${successorId}`,
+						`${successorId}.bash.log`,
+					]),
+				].sort(),
+			);
+
+			const closePublisher = manager.captureArtifactPublication();
+			await manager.close();
+			manager = undefined;
+			await expect(closePublisher("publication after close", "bash")).rejects.toThrow(/closing/);
+			expect(await readCandidateInventory()).toEqual(candidateInventoryAfterControl);
+		} finally {
+			releaseAllocation.resolve();
+			restoreAllocationSpy?.();
+			if (manager && prepared) await manager.discardPreparedNewSession(prepared);
+			await manager?.close();
+			tempDir.removeSync();
+		}
 	});
 });

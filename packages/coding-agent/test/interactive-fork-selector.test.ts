@@ -19,6 +19,7 @@ import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-comma
 import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { type Component, Container, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { attachExactMcpControls } from "../src/runtime-mcp/redaction";
 
 class TestEditor extends Container {
 	#text = "";
@@ -169,6 +170,7 @@ async function createHarness(
 			cancelContinuation: cancelGoalContinuation,
 			scheduleContinuation: scheduleGoalContinuation,
 		},
+		refreshSlashCommandState: vi.fn(async () => {}),
 	} as unknown as InteractiveModeContext;
 	const selectorController = new SelectorController(ctx);
 	ctx.showUserMessageSelector = () => selectorController.showUserMessageSelector(committedUiCleanup);
@@ -473,6 +475,16 @@ describe("interactive /fork prompt selector", () => {
 		"tool cleanup",
 	] as const)("reconciles the durable child when real branch lifecycle fails during %s", async failurePoint => {
 		const harness = await createHarness({ mcpDiscoveryEnabled: failurePoint === "MCP restoration" });
+		attachExactMcpControls(harness.session, {
+			grantSource: "root-interactive-exact-config",
+			configPath: path.join(harness.tempDir, "mcp.json"),
+		});
+		let mcpMetadataVisible = true;
+		const refreshSlashCommandState = vi
+			.spyOn(harness.ctx, "refreshSlashCommandState")
+			.mockImplementation(async () => {
+				mcpMetadataVisible = harness.session.hasExactMcpControls;
+			});
 		const parentFile = harness.session.sessionFile!;
 		const parentId = harness.sessionManager.getSessionId();
 		const parentBytes = fs.readFileSync(parentFile);
@@ -535,6 +547,9 @@ describe("interactive /fork prompt selector", () => {
 					? "MCP selection restore failed"
 					: "Tool session transition cleanup failed",
 			);
+			expect(harness.session.hasExactMcpControls).toBe(false);
+			expect(mcpMetadataVisible).toBe(false);
+			expect(refreshSlashCommandState).toHaveBeenCalledTimes(1);
 			const resumed = await SessionManager.open(childFile, harness.tempDir);
 			try {
 				expect(resumed.buildSessionContext().messages).toHaveLength(4);

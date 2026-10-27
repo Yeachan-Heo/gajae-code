@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import type { ShellRunOptions } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import {
 	BASH_SHELL_WORKER_ARG,
 	type BashShellWorkerRequest,
@@ -84,7 +85,10 @@ export class IsolatedShell {
 		this.#child = childProcess.spawn(command!, args, {
 			cwd: process.cwd(),
 			detached: process.platform !== "win32",
-			env: process.env,
+			// The worker chain (guardian -> supervisor -> runtime) inherits this env and
+			// the native shell imports it wholesale, so project hook variables must be
+			// gone here, not only from the per-session overlay.
+			env: projectSafeSpawnEnv(),
 			stdio: ["pipe", "pipe", "pipe"],
 			windowsHide: true,
 		});

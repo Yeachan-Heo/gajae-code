@@ -314,7 +314,7 @@ describe("interactive startup input ordering", () => {
 				showNewVersionNotification: () => {},
 				renderInitialMessages: () => events.push("render"),
 				showStatus: (message: string) => events.push(`status:${message}`),
-				showError: () => {},
+				showError: (message: string) => events.push(`error:${message}`),
 				getUserInput: async () => {
 					throw stop;
 				},
@@ -343,18 +343,18 @@ describe("interactive startup input ordering", () => {
 				undefined,
 				async () => {
 					events.push("profile:start");
-					return { recoverableErrors: [] };
+					return { recoverableErrors: ["Configured modelProfile.default is stale"] };
 				},
 			),
 		).rejects.toBe(stop);
 
-		expect(events.slice(0, 5)).toEqual([
-			"init",
-			"render",
-			"status:Loading model profile…",
-			"profile:start",
-			"continue",
-		]);
+		expect(events.slice(0, 4)).toEqual(["init", "render", "status:Loading model profile…", "profile:start"]);
+		expect(events).toContain("continue");
+		expect(events).toContain("error:Configured modelProfile.default is stale");
+		expect(events).toContain("status:Model profile ready");
+		expect(events.indexOf("error:Configured modelProfile.default is stale")).toBeGreaterThan(
+			events.indexOf("render"),
+		);
 	});
 	it("propagates deferred model profile failures after the first render", async () => {
 		const events: string[] = [];

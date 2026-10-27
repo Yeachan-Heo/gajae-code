@@ -80,17 +80,38 @@ function writeOwnershipReceipt(target: string, root: string, alias: string, sour
 	try { fs.writeFileSync(fd, JSON.stringify({ ...body, auth }) + "\n"); } finally { fs.closeSync(fd); }
 }
 
-function hasTrustedOwnershipReceipt(target: string, root: string, alias: string): boolean {
+function readOwnershipReceipt(target: string, root: string, alias: string): { identity?: { dev?: string; ino?: string } } | null {
 	try {
 		const raw = JSON.parse(fs.readFileSync(`${target}.gjc-managed.json`, "utf8"));
 		const body = { version: RECEIPT_VERSION, alias, target, root, source: raw.source, parent: raw.parent, identity: raw.identity };
+		const matches = raw.version === RECEIPT_VERSION && raw.alias === alias && raw.target === target && raw.root === root &&
+			raw.parent === path.dirname(target) && raw.auth === createHash("sha256").update(JSON.stringify(body)).digest("hex");
+		return matches ? raw : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The receipt binds the link by inode. Its recorded st_dev is not compared: macOS APFS hands the same
+ * volume a different st_dev after a reboot, which made every existing receipt look foreign (#5990).
+ * The volume is re-derived instead: the link must sit on the same device as its parent directory now.
+ */
+function hasTrustedOwnershipReceipt(target: string, root: string, alias: string): boolean {
+	const receipt = readOwnershipReceipt(target, root, alias);
+	if (receipt === null) return false;
+	try {
 		const current = fs.lstatSync(target);
-		return raw.version === RECEIPT_VERSION && raw.alias === alias && raw.target === target && raw.root === root &&
-			raw.parent === path.dirname(target) && raw.identity?.dev === String(current.dev) && raw.identity?.ino === String(current.ino) &&
-			raw.auth === createHash("sha256").update(JSON.stringify(body)).digest("hex");
+		const parent = fs.lstatSync(path.dirname(target));
+		return receipt.identity?.ino === String(current.ino) && current.dev === parent.dev;
 	} catch {
 		return false;
 	}
+}
+
+/** A receipt left after its link was removed by hand is ours when it names this checkout, alias and path. */
+function isOwnOrphanReceipt(target: string, root: string, alias: string): boolean {
+	return !lexists(target) && readOwnershipReceipt(target, root, alias) !== null;
 }
 
 export function commandExtensions(platform = process.platform, pathext = process.env.PATHEXT): string[] {
@@ -442,7 +463,11 @@ function link(binary: boolean): never {
 	// after the primary `gjc` link was already replaced, a failing alias would
 	// leave the installation half-updated.
 	const assertReplaceable = (linkPath: string, name: string): void => {
-		if (!lexists(linkPath)) return;
+		if (!lexists(linkPath)) {
+			if (!lexists(`${linkPath}.gjc-managed.json`) || isOwnOrphanReceipt(linkPath, repoRoot, name)) return;
+			console.error(`✗ Refusing to replace foreign ownership receipt ${linkPath}.gjc-managed.json`);
+			process.exit(1);
+		}
 		const existing = realpath(linkPath);
 		if (!hasTrustedOwnershipReceipt(linkPath, repoRoot, name) || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
 			console.error(`✗ Refusing to replace foreign or unknown ${linkPath}`);
@@ -453,10 +478,9 @@ function link(binary: boolean): never {
 	assertReplaceable(aliasTarget, "가재씨");
 
 	const installLink = (linkPath: string, name: string): void => {
-		if (lexists(linkPath)) {
-			fs.rmSync(linkPath, { force: true });
-			if (lexists(`${linkPath}.gjc-managed.json`)) fs.rmSync(`${linkPath}.gjc-managed.json`, { force: true });
-		}
+		// Preflight vouched for both the link and its receipt, or for an orphan receipt of ours.
+		if (lexists(linkPath)) fs.rmSync(linkPath, { force: true });
+		if (lexists(`${linkPath}.gjc-managed.json`)) fs.rmSync(`${linkPath}.gjc-managed.json`, { force: true });
 		fs.symlinkSync(linkSource, linkPath);
 		writeOwnershipReceipt(linkPath, repoRoot, name, linkSourceReal);
 		console.log(`✓ Linked ${linkPath} -> ${linkSource}`);

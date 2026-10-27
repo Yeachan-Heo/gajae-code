@@ -1,5 +1,5 @@
 /**
- * Crash fingerprinting, algorithm v1.
+ * Crash fingerprinting, algorithms v1 and v2.
  *
  * A fingerprint is a stable, versioned identity for a crash *class*, computed
  * at `recordFatalCrash` time from the already-captured diagnostic text (error
@@ -16,7 +16,7 @@
  * `redactCrashSecrets` rewrites are replaced with placeholders before hashing —
  * so a fingerprint never encodes a secret or a raw filesystem path.
  *
- * ## Canonical serialization (v1)
+ * ## Canonical serialization
  *
  * Fields are length-prefixed UTF-8 (`<byteLength>:<bytes>`) so no delimiter
  * ambiguity exists between an empty field and a missing one:
@@ -26,15 +26,18 @@
  * Up to three normalized in-app frames participate; absent frames are omitted
  * (the length prefix of the preceding fields keeps the encoding unambiguous).
  * The digest is sha256 truncated to its first 16 bytes, published as 32
- * lowercase hex characters (128 bits).
+ * lowercase hex characters (128 bits). Version 2 extends credential redaction
+ * while retaining this domain string so unaffected crash classes keep their
+ * existing identity; records carry the normalizer version in their marker.
  */
 import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
-import { redactCrashSecrets } from "./crash-redaction";
+import { redactCrashSecrets, redactCrashSecretsV1 } from "./crash-redaction";
 
 /** Algorithm version recorded beside every emitted fingerprint. */
-export const CRASH_FINGERPRINT_VERSION = 1;
+export const CRASH_FINGERPRINT_VERSION = 2;
+const CRASH_FINGERPRINT_VERSION_V1 = 1;
 /** Hex length of a published fingerprint (128 bits). */
 export const CRASH_FINGERPRINT_HEX_LENGTH = 32;
 /** Matches exactly a published fingerprint. */
@@ -134,8 +137,20 @@ export function replaceAbsolutePaths(text: string, homeDir: string = os.homedir(
  * distinct from `500`). Only high-entropy identifiers are collapsed.
  */
 export function normalizeCrashMessage(message: string, options: CrashFingerprintOptions = {}): string {
+	return normalizeCrashMessageWithRedactor(message, options, redactCrashSecrets);
+}
+
+function normalizeCrashMessageV1(message: string, options: CrashFingerprintOptions = {}): string {
+	return normalizeCrashMessageWithRedactor(message, options, redactCrashSecretsV1);
+}
+
+function normalizeCrashMessageWithRedactor(
+	message: string,
+	options: CrashFingerprintOptions,
+	redact: (text: string) => string,
+): string {
 	const homeDir = options.homeDir ?? os.homedir();
-	let normalized = redactCrashSecrets(message);
+	let normalized = redact(message);
 	normalized = replaceAbsolutePaths(normalized, homeDir);
 	normalized = normalized.replace(UUID_PATTERN, "<uuid>");
 	normalized = normalized.replace(HEX_RUN_PATTERN, match => (/[a-fA-F]/.test(match) ? "<hex>" : "<num>"));
@@ -224,24 +239,77 @@ function canonicalSerialization(fields: readonly string[]): Buffer {
 	return Buffer.concat(parts);
 }
 
-/** Compute the v1 fingerprint of an already-captured fatal diagnostic. */
-export function computeCrashFingerprint(
+function computeFingerprint(
 	input: CrashFingerprintInput,
-	options: CrashFingerprintOptions = {},
+	options: CrashFingerprintOptions,
+	includeMessage: boolean,
+	version: number,
 ): CrashFingerprint {
-	const errorName = truncateUtf8(normalizeCrashMessage(input.name, options) || "Error", 128);
-	const messageClass = normalizeCrashMessage(input.message, options);
+	const normalizeMessage = version === CRASH_FINGERPRINT_VERSION_V1 ? normalizeCrashMessageV1 : normalizeCrashMessage;
+	const fingerprintErrorName = truncateUtf8(normalizeMessage(input.name, options) || "Error", 128);
+	const fingerprintMessageClass = normalizeMessage(input.message, options);
+	const errorName =
+		version === CRASH_FINGERPRINT_VERSION_V1
+			? truncateUtf8(normalizeCrashMessage(input.name, options) || "Error", 128)
+			: fingerprintErrorName;
+	const messageClass =
+		version === CRASH_FINGERPRINT_VERSION_V1
+			? normalizeCrashMessage(input.message, options)
+			: fingerprintMessageClass;
 	const frames = normalizeCrashFrames(input.stack, options);
-	const digest = createHash("sha256")
-		.update(canonicalSerialization(["gjc-crash-fp.v1", errorName, messageClass, ...frames]))
-		.digest();
+	const identity = includeMessage
+		? ["gjc-crash-fp.v1", fingerprintErrorName, fingerprintMessageClass, ...frames]
+		: ["gjc-crash-fp.v1", "handled", fingerprintErrorName, frames[0] ?? NO_APP_FRAME];
+	const digest = createHash("sha256").update(canonicalSerialization(identity)).digest();
 	return {
 		fingerprint: digest.subarray(0, CRASH_FINGERPRINT_HEX_LENGTH / 2).toString("hex"),
-		version: CRASH_FINGERPRINT_VERSION,
+		version,
 		errorName,
 		messageClass,
 		frames,
 	};
+}
+
+/** Compute the current-version fingerprint of an already-captured fatal diagnostic. */
+export function computeCrashFingerprint(
+	input: CrashFingerprintInput,
+	options: CrashFingerprintOptions = {},
+): CrashFingerprint {
+	return computeFingerprint(input, options, true, CRASH_FINGERPRINT_VERSION);
+}
+
+/**
+ * Compute a historical v1 fingerprint when validating a persisted v1 marker.
+ * Returned message fields use current redaction and remain safe to display.
+ */
+export function computeCrashFingerprintV1(
+	input: CrashFingerprintInput,
+	options: CrashFingerprintOptions = {},
+): CrashFingerprint {
+	return computeFingerprint(input, options, true, CRASH_FINGERPRINT_VERSION_V1);
+}
+
+/**
+ * Compute the stable identity used for a handled tool error.
+ *
+ * Tool failures often carry command output or other per-occurrence detail in
+ * their message. That text is useful in the record body but is not the failure
+ * identity: handled errors group by error class and the first in-app frame
+ * where the failure originated, rather than the full wrapper stack.
+ */
+export function computeHandledErrorFingerprint(
+	input: CrashFingerprintInput,
+	options: CrashFingerprintOptions = {},
+): CrashFingerprint {
+	return computeFingerprint(input, options, false, CRASH_FINGERPRINT_VERSION);
+}
+
+/** Compute a historical v1 handled-error fingerprint when validating a persisted v1 marker. */
+export function computeHandledErrorFingerprintV1(
+	input: CrashFingerprintInput,
+	options: CrashFingerprintOptions = {},
+): CrashFingerprint {
+	return computeFingerprint(input, options, false, CRASH_FINGERPRINT_VERSION_V1);
 }
 
 /** The machine-readable identity line appended to every new crash record. */

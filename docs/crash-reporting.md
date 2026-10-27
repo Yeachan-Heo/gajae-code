@@ -9,12 +9,12 @@ per-invocation, digest-confirmed confirmation. Fully automatic issue creation is
 explicit non-goal. The separate Sentry upstream is default-off and config-gated; it
 transmits only fields approved by `sanitizeExternalCrashV1`.**
 
-## 1. Fingerprinting (algorithm v1)
+## 1. Fingerprinting (algorithms v1 and v2)
 
 Every new fatal record gains one machine-readable identity line:
 
 ```
-gjc-crash-record.v1 fp:<32 hex> fpv:1 id:<random>
+gjc-crash-record.v1 fp:<32 hex> fpv:2 id:<random>
 ```
 
 The fingerprint is computed at `recordFatalCrash` time from the already-captured
@@ -23,12 +23,18 @@ diagnostic text (error name, message, stack) — the throwable is never read aga
 - **Canonical serialization** is length-prefixed UTF-8 (`<byteLength>:<bytes>`) over
   `"gjc-crash-fp.v1"`, `errorName`, `normalizedMessageClass`, and up to three normalized
   in-app frames. The digest is sha256 truncated to 128 bits, published as 32 lowercase
-  hex characters. The algorithm version is recorded as `fpv` beside every value.
+  hex characters. New records use `fpv:2`; the v2 normalizer recognizes additional `pw`
+  credential aliases but retains the v1 domain string so unaffected crash classes keep
+  their existing identity.
 - **Message normalization is typed, not "strip all digits".** Absolute POSIX/Windows/UNC
   /BunFS paths become `<path>`, home-rooted paths become `<home>`, UUIDs become `<uuid>`,
   hex runs become `<hex>`, digit runs of four or more become `<num>`, and everything
   `redactCrashSecrets` rewrites keeps its marker. Runs of three or fewer digits and errno
   names survive verbatim, so `404` and `500` stay distinct crash classes.
+- **Historical records remain verifiable.** Recovery dispatches on the marker's `fpv`:
+  v1 records use the original normalizer, while new v2 records use the expanded redactor.
+  A complete base-era v1 record can therefore still recover an index entry if its journal
+  append was lost; markerless pre-feature records remain unmatchable.
 - **Frame normalization** keeps the install-root-relative file path and the function name
   and drops line/column numbers, which churn on every release. Source-tree, compiled
   BunFS (`/$bunfs/root/…`, `B:\~BUN\root\…`) and Windows stacks normalize identically.
@@ -235,9 +241,11 @@ invisible to both `gjc crash list` and the relay.
 
 Handled tool errors are captured at `finishExecuteToolSpan`, which already holds the live
 `Error` with an intact stack. Capture is deliberately narrow: only `status === "error"`
-with an `Error` carrying a non-empty stack is recorded. Aborted calls, blocked calls, and
-non-`Error` throws are not, because without a stack the v1 fingerprint degrades to
-`<no-app-frame>` and every unrelated failure would collapse into one meaningless group.
+with an unexpected `Error` carrying a non-empty stack is recorded. Designed tool outcomes
+(`ToolError`/`ToolAbortError`, including permission refusals, policy denials, command
+failures, and rejected edit anchors) are marked before they cross into the generic agent
+runtime and never enter the crash recorder. Aborted calls, blocked calls, and non-`Error`
+throws are also not recorded.
 
 The same reasoning rules out hooking `logger.error`: of its call sites, nearly all pass
 `String(error)` or `error.message`, so the stack is already gone by the time the logger
@@ -246,9 +254,11 @@ sees it.
 Handled errors get their own files -- `gjc-error.log`, `gjc-error-events.jsonl`,
 `gjc-error-index.json` -- rather than sharing the fatal store. They are high-volume and
 fatal crashes are rare and precious; under a shared cap the noisy class would evict the
-signal and break `gjc crash report`. Everything else is reused verbatim: the same record
-format, the same `redactCrashSecrets` scrubbing, the same v1 fingerprint, the same
-`sanitizeExternalCrashV1` egress contract.
+signal and break `gjc crash report`. Their fingerprint uses the error class and first
+normalized in-app frame, not the full wrapper stack, so recurring failures group together
+even when call-site frames or command output change. Everything else is reused verbatim:
+the same record format, the same `redactCrashSecrets` scrubbing, the same v1 fingerprint,
+the same `sanitizeExternalCrashV1` egress contract.
 
 Two bounds keep the capture path cheap enough to run inside a live turn. A fingerprint is
 recorded at most once while it stays hot, so a tool failing in a loop writes one record rather

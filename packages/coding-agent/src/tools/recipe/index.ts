@@ -7,6 +7,7 @@ import type { Theme } from "../../modes/theme/theme";
 import recipeDescription from "../../prompts/tools/recipe.md" with { type: "text" };
 import type { ToolSession } from "..";
 import { type BashRenderContext, BashTool, type BashToolDetails } from "../bash";
+import { assertRecipeCommandAllowed } from "./recipe-guard";
 import { createRecipeToolRenderer, type RecipeRenderArgs } from "./render";
 import { buildPromptModel, type DetectedRunner, resolveCommand } from "./runner";
 import { RUNNERS } from "./runners";
@@ -48,8 +49,10 @@ export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetail
 
 	readonly #bash: BashTool;
 	readonly #runners: DetectedRunner[];
+	readonly #session: ToolSession;
 
 	constructor(session: ToolSession, runners: DetectedRunner[]) {
+		this.#session = session;
 		this.#runners = runners;
 		this.#bash = new BashTool(session);
 		this.description = prompt.render(recipeDescription, buildPromptModel(runners));
@@ -75,6 +78,12 @@ export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetail
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const { command, cwd } = resolveCommand(op, this.#runners);
+		await assertRecipeCommandAllowed({
+			cwd: this.#session.cwd,
+			sessionId: this.#session.getSessionId?.() ?? undefined,
+			command,
+			commandCwd: cwd,
+		});
 		return await this.#bash.execute(toolCallId, { command, cwd }, signal, onUpdate, ctx);
 	}
 }

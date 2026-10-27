@@ -4,6 +4,7 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
@@ -12,6 +13,7 @@ import {
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
 	MANAGED_SESSION_BINDING_FILE,
+	type ManagedScopeResolution,
 	ManagedSessionScopeTestHooks,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
@@ -21,6 +23,7 @@ import {
 } from "../../src/session/internal/managed-session-scope";
 import * as managedSessionStorage from "../../src/session/internal/managed-session-storage";
 import {
+	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	MANAGED_ARTIFACT_MAX_FILES,
 	publishManagedFileNoReplace,
 	validateManagedArtifactTree,
@@ -455,6 +458,11 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		);
 	});
 
+	it("accepts Windows access-denied owner-only security results", () => {
+		const failure = { ok: false, code: "access_denied" } as const;
+		expect(validateNativeSecurityResult(failure, "verify", "directory")).toEqual(failure);
+	});
+
 	it("does not re-adopt a replaced managed leaf or write into its external replacement", async () => {
 		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
 		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
@@ -474,6 +482,242 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 });
 
 describe("managed session write protocol", () => {
+	it("reports the identity failure that stopped a managed startup instead of a blanket binding_invalid", async () => {
+		const { scope } = await fixture();
+		expect(prepareManagedSessionScopeForWriteSync(scope).kind).toBe("resolved");
+
+		// The managed storage identity guards only run under the Windows
+		// verify-first policy, so a Windows identity failure is invisible to every
+		// other platform's CI. Reproduce that failure and assert the operator is
+		// told which invariant broke instead of a blanket `binding_invalid`.
+		const real = syncFs.lstatSync;
+		const lstat = vi.spyOn(syncFs, "lstatSync");
+		lstat.mockImplementation(((target: string, options?: { bigint?: boolean }) => {
+			if (target === scope.directoryPath) throw new Error("identity_mismatch");
+			return (real as (...args: unknown[]) => unknown)(target, options);
+		}) as typeof syncFs.lstatSync);
+
+		let prepared: ManagedScopeResolution;
+		try {
+			prepared = prepareManagedSessionScopeForWriteSync(scope, "windows-existing-verify-first");
+		} finally {
+			lstat.mockRestore();
+		}
+
+		expect(prepared.kind).toBe("error");
+		if (prepared.kind !== "error") throw new Error("Expected a prepare failure");
+		expect(prepared.cause?.classification).toBe("identity_mismatch");
+		expect(prepared.cause?.diagnostic).toMatch(/^prepare:/);
+		expect(JSON.stringify(prepared.cause)).not.toContain(scope.directoryPath);
+		expect(prepared.message).not.toContain(scope.directoryPath);
+	});
+
+	it("separates an external holder's errno from a corrupted binding without leaking the path", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+
+		// An external holder (AV scanner, indexer, cloud-sync agent) denying the
+		// managed scope is operationally distinct from a corrupted binding, and
+		// only the errno separates them.
+		const denied = Object.assign(new Error(`EPERM: operation not permitted, open '${scope.directoryPath}'`), {
+			code: "EPERM",
+			path: scope.directoryPath,
+		});
+		// Both retained-native and pathname-backed stores enter this publication
+		// boundary. A staging-file open is not part of every platform's path.
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw denied;
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			publish.mockRestore();
+		}
+
+		expect(injected).toBe(1);
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({ classification: "EPERM", diagnostic: "prepare:binding_publish" });
+		expect(startupError.message).toBe("Could not prepare managed session scope (EPERM: prepare:binding_publish).");
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(JSON.stringify(startupError.cause)).not.toContain(scope.directoryPath);
+		// The injected failure must not damage the existing binding or leak the spy.
+		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
+	});
+
+	it("names a refused cleanup receipt instead of reporting a corrupted binding (#6820)", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+
+		// The receipt preflight inside the binding publish refuses a stale
+		// receipt (e.g. a device number that changed across a reboot). The binding
+		// itself is healthy, so the operator must be pointed at the receipt.
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw new Error("managed_replace_cleanup_receipt_invalid");
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			publish.mockRestore();
+		}
+
+		expect(injected).toBe(1);
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({
+			classification: "managed_replace_cleanup_receipt_invalid",
+			diagnostic: "prepare:binding_publish",
+		});
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (managed_replace_cleanup_receipt_invalid: prepare:binding_publish).",
+		);
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
+	});
+
+	it("preserves managed publication permission errors in the scope result", async () => {
+		const { scope } = await fixture();
+		const outcome = classifyNativePublishOutcome({
+			ok: false,
+			code: "access_denied",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "access_denied",
+			primitive: "windows_rename_noreplace",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		});
+		const denied = new managedSessionStorage.ManagedPublishError("permission_denied", outcome);
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw denied;
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		let prepared: ManagedScopeResolution;
+		try {
+			prepared = prepareManagedSessionScopeForWriteSync(scope, "windows-existing-verify-first");
+		} finally {
+			publish.mockRestore();
+		}
+
+		expect(injected).toBe(1);
+		expect(prepared.kind).toBe("error");
+		if (prepared.kind !== "error") throw new Error("Expected a prepare failure");
+		expect(prepared.code).toBe("permission_denied");
+		expect(prepared.cause?.classification).toBe("permission_denied");
+		expect(JSON.stringify(prepared.cause)).not.toContain(scope.directoryPath);
+	});
+
+	it.each(["open", "delete"] as const)("preserves permission failures through managed %s", async operation => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(path.join(legacy, "2026-01-01_permission-denied.jsonl"), transcript("permission-denied", cwd));
+		await expect(prepareManagedSessionScopeForWrite(scope)).resolves.toMatchObject({ kind: "resolved" });
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("Candidate listing was incomplete");
+		const candidate = listed.owned.find(entry => entry.provenance === "legacy");
+		if (!candidate) throw new Error("Missing legacy candidate");
+
+		const result: NativeNoReplaceResult = {
+			ok: false,
+			code: "access_denied",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "access_denied",
+			primitive: "windows_rename_noreplace",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		};
+		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+		const realRename = native.renameNoReplacePathAsync;
+		let injected = 0;
+		const rename = vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async (_source, target) => {
+			if (target === bindingPath) {
+				injected += 1;
+				return result;
+			}
+			return realRename(_source, target);
+		});
+		try {
+			await fs.rm(bindingPath);
+			const result =
+				operation === "open"
+					? await openManagedCandidateForWrite(scope, candidate)
+					: await deleteManagedSessionCandidate(scope, candidate);
+			expect(injected).toBe(1);
+			expect(result).toMatchObject({ kind: "error", code: "permission_denied" });
+		} finally {
+			rename.mockRestore();
+		}
+	});
+
+	it("still redacts an unclassified startup failure that embeds its pathname", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+		const locks = path.join(scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		await fs.rm(locks, { recursive: true, force: true });
+		await fs.writeFile(locks, "not-a-directory\n", { mode: 0o600 });
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({
+			classification: "binding_invalid",
+			diagnostic: "prepare:locks_directory",
+		});
+		expect(startupError.message).not.toContain(locks);
+	});
+
 	it("accepts partial scrubbed replay trees but rejects moved or rootless entries", () => {
 		const expected = {
 			rootDev: "1",
@@ -631,6 +875,42 @@ describe("managed session write protocol", () => {
 		const interruptedReplay = await openManagedCandidateForWrite(scope, legacyCandidate);
 		expect(interruptedReplay).toMatchObject({ kind: "opened", path: first.path, migrated: true });
 		expect(await committedReceiptNames(receipts)).toHaveLength(1);
+	});
+	it("coalesces a migrated legacy transcript without full-reading unrelated v2 transcripts", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		const source = path.join(legacy, "2026-01-01_session-a.jsonl");
+		await fs.writeFile(source, transcript("session-a", cwd));
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const unrelated = ["session-b", "session-c", "session-d"].map(id =>
+			path.join(scope.directoryPath, `2026-01-02_${id}.jsonl`),
+		);
+		for (const [index, file] of unrelated.entries())
+			await fs.writeFile(file, transcript(["session-b", "session-c", "session-d"][index]!, cwd), { mode: 0o600 });
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("listing incomplete");
+		const legacyCandidate = listed.owned.find(candidate => candidate.provenance === "legacy");
+		if (!legacyCandidate) throw new Error("legacy candidate missing");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error("migration failed");
+
+		const capture = vi.spyOn(managedSessionStorage, "captureManagedFileNoFollow");
+		const coalesced = listManagedCandidates(scope);
+		const fullyRead = capture.mock.calls.map(([pathname]) => pathname);
+		capture.mockRestore();
+
+		if (coalesced.kind !== "complete") throw new Error("listing incomplete");
+		expect(coalesced.owned.map(candidate => [candidate.sessionId, candidate.migrationState]).sort()).toEqual([
+			["session-a", "migrated_v2"],
+			["session-b", "native_v2"],
+			["session-c", "native_v2"],
+			["session-d", "native_v2"],
+		]);
+		// Only the matching (source, destination) pair is verified byte-for-byte.
+		for (const file of unrelated) expect(fullyRead).not.toContain(file);
+		expect(fullyRead).toContain(opened.path);
+		expect(fullyRead).toContain(source);
 	});
 	it("publishes a committed managed inode with exactly one link", async () => {
 		const { scope } = await fixture();
@@ -3015,6 +3295,351 @@ describe("scrubbed write-protocol remnant reaping", () => {
 	];
 	const aged = new Date(Date.now() - 60 * 60 * 1000);
 
+	async function seedAgedRemnants(directory: string, names: readonly string[]): Promise<void> {
+		for (const name of names) {
+			const pathname = path.join(directory, name);
+			await Bun.write(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+	}
+
+	async function reap(asyncMode: boolean, directory: string) {
+		return asyncMode
+			? managedSessionStorage.reapScrubbedProtocolRemnants(directory)
+			: managedSessionStorage.reapScrubbedProtocolRemnantsSync(directory);
+	}
+
+	for (const asyncMode of [false, true]) {
+		const mode = asyncMode ? "async" : "sync";
+
+		it(`${mode} reaping captures and reuses one fresh stable parent identity per invocation`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const candidateNames = remnantNames.slice(0, 2);
+			await seedAgedRemnants(scope.directoryPath, candidateNames);
+			const firstParentIdentity = physicalIdentity(scope.directoryPath);
+			let parentCaptures = 0;
+			let restoreParentLstat = () => {};
+			if (asyncMode) {
+				const originalLstat = fs.lstat;
+				const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof fs.lstat);
+				restoreParentLstat = () => lstat.mockRestore();
+			} else {
+				const originalLstat = syncFs.lstatSync;
+				const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof syncFs.lstatSync);
+				restoreParentLstat = () => lstat.mockRestore();
+			}
+			const actualUnlink = native.exactUnlinkDirect;
+			const observedParentIdentities: Array<{ dev: bigint | undefined; ino: bigint | undefined }> = [];
+			const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((pathname, identity) => {
+				observedParentIdentities.push({ dev: identity.parentDev, ino: identity.parentIno });
+				return actualUnlink(pathname, identity);
+			});
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 2, failures: 0 });
+				expect(parentCaptures).toBe(1);
+				expect(observedParentIdentities).toEqual(
+					candidateNames.map(() => ({ dev: firstParentIdentity.dev, ino: firstParentIdentity.ino })),
+				);
+				const originalDirectory = `${scope.directoryPath}.original`;
+				await fs.rename(scope.directoryPath, originalDirectory);
+				await fs.mkdir(scope.directoryPath, { mode: 0o700 });
+				await seedAgedRemnants(scope.directoryPath, candidateNames);
+				const secondParentStat = syncFs.statSync(scope.directoryPath, { bigint: true });
+				const secondParentIdentity = { dev: secondParentStat.dev, ino: secondParentStat.ino };
+				expect(secondParentIdentity).not.toEqual(firstParentIdentity);
+
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 2, failures: 0 });
+				expect(parentCaptures).toBe(2);
+				expect(observedParentIdentities).toEqual([
+					...candidateNames.map(() => ({ dev: firstParentIdentity.dev, ino: firstParentIdentity.ino })),
+					...candidateNames.map(() => ({ dev: secondParentIdentity.dev, ino: secondParentIdentity.ino })),
+				]);
+				expect((await fs.readdir(scope.directoryPath)).filter(name => candidateNames.includes(name))).toEqual([]);
+			} finally {
+				restoreParentLstat();
+				unlink.mockRestore();
+			}
+		});
+
+		it(`${mode} reaping does not capture a parent when every candidate is protected`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const young = path.join(scope.directoryPath, ".gjc-exact-unlink-placeholder-young");
+			const evidence = path.join(scope.directoryPath, ".gjc-exact-unlink-placeholder-evidence");
+			const unrelated = path.join(scope.directoryPath, "unrelated.jsonl");
+			await fs.writeFile(young, "", { mode: 0o600 });
+			await fs.writeFile(evidence, "retained evidence", { mode: 0o600 });
+			await fs.utimes(evidence, aged, aged);
+			await fs.writeFile(unrelated, "", { mode: 0o600 });
+			await fs.utimes(unrelated, aged, aged);
+			let parentCaptures = 0;
+			let restoreParentLstat = () => {};
+			if (asyncMode) {
+				const originalLstat = fs.lstat;
+				const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof fs.lstat);
+				restoreParentLstat = () => lstat.mockRestore();
+			} else {
+				const originalLstat = syncFs.lstatSync;
+				const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof syncFs.lstatSync);
+				restoreParentLstat = () => lstat.mockRestore();
+			}
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 0, failures: 0 });
+				expect(parentCaptures).toBe(0);
+				expect(await fs.readFile(evidence, "utf8")).toBe("retained evidence");
+				await expect(fs.access(young)).resolves.toBeNull();
+				await expect(fs.access(unrelated)).resolves.toBeNull();
+			} finally {
+				restoreParentLstat();
+			}
+		});
+
+		for (const behavior of ["EACCES", "ENOENT", "invalid-type"] as const) {
+			it(`${mode} reaping retries per-file after pre-capture ${behavior}`, async () => {
+				const { scope } = await fixture();
+				await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+				const candidateNames = remnantNames.slice(0, 2);
+				await seedAgedRemnants(scope.directoryPath, candidateNames);
+				const nonDirectory = path.join(scope.directoryPath, "not-a-directory");
+				await fs.writeFile(nonDirectory, "protected", { mode: 0o600 });
+				let parentAttempts = 0;
+				let restoreParentLstat = () => {};
+				if (asyncMode) {
+					const originalLstat = fs.lstat;
+					const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+						if (file === scope.directoryPath) {
+							parentAttempts += 1;
+							if (parentAttempts === 1 && behavior === "EACCES")
+								throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
+							if (parentAttempts === 1 && behavior === "ENOENT")
+								throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
+							if (parentAttempts === 1) return originalLstat(nonDirectory, options as never);
+						}
+						return originalLstat(file, options as never);
+					}) as typeof fs.lstat);
+					restoreParentLstat = () => lstat.mockRestore();
+				} else {
+					const originalLstat = syncFs.lstatSync;
+					const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+						if (file === scope.directoryPath) {
+							parentAttempts += 1;
+							if (parentAttempts === 1 && behavior === "EACCES")
+								throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
+							if (parentAttempts === 1 && behavior === "ENOENT")
+								throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
+							if (parentAttempts === 1) return originalLstat(nonDirectory, options as never);
+						}
+						return originalLstat(file, options as never);
+					}) as typeof syncFs.lstatSync);
+					restoreParentLstat = () => lstat.mockRestore();
+				}
+				const actualUnlink = native.exactUnlinkDirect;
+				const unlink = vi
+					.spyOn(native, "exactUnlinkDirect")
+					.mockImplementation((pathname, identity) => actualUnlink(pathname, identity));
+				const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+				try {
+					const expectedFailures = behavior === "ENOENT" ? 0 : 1;
+					expect(await reap(asyncMode, scope.directoryPath)).toEqual({
+						reaped: 1,
+						failures: expectedFailures,
+					});
+					expect(parentAttempts).toBe(2);
+					expect(unlink).toHaveBeenCalledTimes(1);
+					expect(warning).toHaveBeenCalledTimes(expectedFailures);
+					if (expectedFailures > 0)
+						expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+							failureCount: expectedFailures,
+							reapedCount: 1,
+						});
+					expect(
+						(await fs.readdir(scope.directoryPath)).filter(name => candidateNames.includes(name)),
+					).toHaveLength(1);
+					expect(await fs.readFile(nonDirectory, "utf8")).toBe("protected");
+				} finally {
+					restoreParentLstat();
+					unlink.mockRestore();
+					warning.mockRestore();
+				}
+			});
+		}
+
+		it(`${mode} reaping pins the original parent across a real directory replacement`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const candidateNames = remnantNames.slice(0, 2);
+			await seedAgedRemnants(scope.directoryPath, candidateNames);
+			const originalIdentities = new Map(
+				candidateNames.map(name => [name, physicalIdentity(path.join(scope.directoryPath, name))]),
+			);
+			const movedOriginalDirectory = `${scope.directoryPath}.original`;
+			const replacementDirectory = `${scope.directoryPath}.replacement`;
+			await fs.mkdir(replacementDirectory, { mode: 0o700 });
+			await seedAgedRemnants(replacementDirectory, candidateNames);
+			const replacementIdentities = new Map(
+				candidateNames.map(name => [name, physicalIdentity(path.join(replacementDirectory, name))]),
+			);
+			const nativeResults: native.NativeExactUnlinkResult[] = [];
+			let replaced = false;
+			const actualUnlink = native.exactUnlinkDirect;
+			const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((pathname, identity) => {
+				const result = actualUnlink(pathname, identity);
+				nativeResults.push(result);
+				if (result.ok && !replaced) {
+					replaced = true;
+					syncFs.renameSync(scope.directoryPath, movedOriginalDirectory);
+					syncFs.renameSync(replacementDirectory, scope.directoryPath);
+				}
+				return result;
+			});
+			const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 1, failures: 1 });
+				expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+					failureCount: 1,
+					reapedCount: 1,
+				});
+				expect(replaced).toBe(true);
+				expect(nativeResults).toHaveLength(2);
+				expect(nativeResults[0]?.ok).toBe(true);
+				expect(nativeResults[1]).toMatchObject({ ok: false, code: "parent_mismatch" });
+				const removedName = candidateNames.find(
+					name => !syncFs.existsSync(path.join(movedOriginalDirectory, name)),
+				);
+				expect(removedName).toBeDefined();
+				const remainingName = candidateNames.find(name => name !== removedName)!;
+				const originalRemainingPath = path.join(movedOriginalDirectory, remainingName);
+				const replacementRemainingPath = path.join(scope.directoryPath, remainingName);
+				const originalExpected = originalIdentities.get(remainingName);
+				const replacementExpected = replacementIdentities.get(remainingName);
+				if (!originalExpected || !replacementExpected) throw new Error("Missing replacement fixture identity");
+				expect(physicalIdentity(originalRemainingPath)).toEqual(originalExpected);
+				expect(physicalIdentity(replacementRemainingPath)).toEqual(replacementExpected);
+				expect(physicalIdentity(replacementRemainingPath)).not.toEqual(physicalIdentity(originalRemainingPath));
+				expect(await fs.readFile(originalRemainingPath)).toEqual(Buffer.alloc(0));
+				expect(await fs.readFile(replacementRemainingPath)).toEqual(Buffer.alloc(0));
+			} finally {
+				unlink.mockRestore();
+				warning.mockRestore();
+			}
+		});
+
+		it(`${mode} reaping counts a real parent symlink substitution without unlinking`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const name = remnantNames[0]!;
+			const pathname = path.join(scope.directoryPath, name);
+			await seedAgedRemnants(scope.directoryPath, [name]);
+			const originalIdentity = physicalIdentity(pathname);
+			const originalDirectory = `${scope.directoryPath}.original`;
+			const symlinkTarget = path.join(path.dirname(scope.directoryPath), "symlink-target");
+			await fs.mkdir(symlinkTarget, { mode: 0o700 });
+			let moved = false;
+			let nativeFailure: native.NativeExactUnlinkResult | undefined;
+			const actualUnlink = native.exactUnlinkDirect;
+			const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
+				syncFs.renameSync(scope.directoryPath, originalDirectory);
+				moved = true;
+				syncFs.symlinkSync(symlinkTarget, scope.directoryPath, process.platform === "win32" ? "junction" : "dir");
+				const result = actualUnlink(file, identity);
+				nativeFailure = result;
+				return result;
+			});
+			const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 0, failures: 1 });
+				expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+					failureCount: 1,
+					reapedCount: 0,
+				});
+				expect(nativeFailure).toMatchObject({ ok: false, code: "reparse_point" });
+				expect(syncFs.lstatSync(scope.directoryPath).isSymbolicLink()).toBe(true);
+				expect(physicalIdentity(path.join(originalDirectory, name))).toEqual(originalIdentity);
+				expect(await fs.readFile(path.join(originalDirectory, name))).toEqual(Buffer.alloc(0));
+			} finally {
+				unlink.mockRestore();
+				warning.mockRestore();
+				if (moved) {
+					if (
+						syncFs.existsSync(scope.directoryPath) ||
+						syncFs.lstatSync(scope.directoryPath, { throwIfNoEntry: false })
+					)
+						syncFs.unlinkSync(scope.directoryPath);
+					syncFs.renameSync(originalDirectory, scope.directoryPath);
+				}
+			}
+		});
+		for (const code of ["EACCES", "ENOENT"] as const) {
+			it(`${mode} reaping preserves post-failure diagnostic ${code} accounting`, async () => {
+				const { scope } = await fixture();
+				await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+				const name = remnantNames[0]!;
+				await seedAgedRemnants(scope.directoryPath, [name]);
+				const originalIdentity = physicalIdentity(path.join(scope.directoryPath, name));
+				const originalDirectory = `${scope.directoryPath}.original`;
+				const target = path.join(path.dirname(scope.directoryPath), "diagnostic-target");
+				await fs.mkdir(target, { mode: 0o700 });
+				let moved = false;
+				let restoreLstat = () => {};
+				if (asyncMode) {
+					const actualLstat = fs.lstat;
+					const observer = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+						if (file === scope.directoryPath && moved)
+							throw Object.assign(new Error(`injected diagnostic ${code}`), { code });
+						return actualLstat(file, options as never);
+					}) as typeof fs.lstat);
+					restoreLstat = () => observer.mockRestore();
+				} else {
+					const actualLstat = syncFs.lstatSync;
+					const observer = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+						if (file === scope.directoryPath && moved)
+							throw Object.assign(new Error(`injected diagnostic ${code}`), { code });
+						return actualLstat(file, options as never);
+					}) as typeof syncFs.lstatSync);
+					restoreLstat = () => observer.mockRestore();
+				}
+				const actualUnlink = native.exactUnlinkDirect;
+				const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
+					syncFs.renameSync(scope.directoryPath, originalDirectory);
+					syncFs.symlinkSync(target, scope.directoryPath, process.platform === "win32" ? "junction" : "dir");
+					moved = true;
+					return actualUnlink(file, identity);
+				});
+				const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+				try {
+					const failures = code === "EACCES" ? 1 : 0;
+					expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 0, failures });
+					expect(unlink).toHaveBeenCalledTimes(1);
+					expect(warning).toHaveBeenCalledTimes(failures);
+					expect(physicalIdentity(path.join(originalDirectory, name))).toEqual(originalIdentity);
+					expect(await fs.readFile(path.join(originalDirectory, name))).toEqual(Buffer.alloc(0));
+					expect(await fs.readdir(target)).toEqual([]);
+				} finally {
+					unlink.mockRestore();
+					warning.mockRestore();
+					restoreLstat();
+					if (moved) {
+						syncFs.unlinkSync(scope.directoryPath);
+						syncFs.renameSync(originalDirectory, scope.directoryPath);
+					}
+				}
+			});
+		}
+	}
+
 	it("reaps only aged zero-length remnants and preserves evidence", async () => {
 		const { scope } = await fixture();
 		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
@@ -3062,11 +3687,20 @@ describe("scrubbed write-protocol remnant reaping", () => {
 	it("reaps an over-limit poisoned scope before binding publication and preserves protected entries", async () => {
 		const { scope } = await fixture();
 		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
-		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index += 1) {
-			const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${index}`);
-			await fs.writeFile(pathname, "", { mode: 0o600 });
-			await fs.utimes(pathname, aged, aged);
+		// Keep every over-limit entry real and aged without serializing 100,002 setup operations.
+		for (let start = 0; start <= MANAGED_ARTIFACT_MAX_FILES; start += MANAGED_ARTIFACT_COPY_BATCH_SIZE) {
+			const count = Math.min(MANAGED_ARTIFACT_COPY_BATCH_SIZE, MANAGED_ARTIFACT_MAX_FILES + 1 - start);
+			await Promise.all(
+				Array.from({ length: count }, async (_, offset) => {
+					const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${start + offset}`);
+					await Bun.write(pathname, "", { mode: 0o600, createPath: false });
+					syncFs.utimesSync(pathname, aged, aged);
+				}),
+			);
 		}
+		expect(
+			(await fs.readdir(scope.directoryPath)).filter(name => name.startsWith(".gjc-receipt-remove-poison-")),
+		).toHaveLength(MANAGED_ARTIFACT_MAX_FILES + 1);
 		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-evidence");
 		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
 		await fs.utimes(evidence, aged, aged);
@@ -3083,6 +3717,9 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		if (process.platform !== "win32") await fs.symlink(unrelated, symlink);
 
 		expect(prepareManagedSessionScopeForWriteSync(scope)).toMatchObject({ kind: "resolved" });
+		expect(
+			(await fs.readdir(scope.directoryPath)).filter(name => name.startsWith(".gjc-receipt-remove-poison-")),
+		).toHaveLength(0);
 
 		expect(await fs.readFile(evidence, "utf8")).toBe("retained receipt payload");
 		await expect(fs.access(young)).resolves.toBeNull();
@@ -3130,11 +3767,11 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
 		await fs.writeFile(pathname, "", { mode: 0o600 });
 		await fs.utimes(pathname, aged, aged);
-		const unlinkSync = syncFs.unlinkSync;
-		const unlink = vi.spyOn(syncFs, "unlinkSync").mockImplementation(((file: syncFs.PathLike) => {
+		const exactUnlinkDirect = native.exactUnlinkDirect;
+		const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
 			if (file === pathname) throw Object.assign(new Error("injected unlink failure"), { code: "EACCES" });
-			return unlinkSync(file);
-		}) as typeof syncFs.unlinkSync);
+			return exactUnlinkDirect(file, identity);
+		});
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({

@@ -32,6 +32,18 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+async function writeActivity(cwd: string, sessionId: string, updatedAt: string, mtimeMs: number): Promise<void> {
+	const marker = sessionActivityPath(cwd, sessionId);
+	await fs.mkdir(path.dirname(marker), { recursive: true });
+	await fs.writeFile(
+		marker,
+		`${JSON.stringify({ session_id: sessionId, updated_at: updatedAt, writer: "test" }, null, 2)}\n`,
+		"utf-8",
+	);
+	const when = new Date(mtimeMs);
+	await fs.utimes(marker, when, when);
+}
+
 afterAll(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -128,11 +140,106 @@ describe("session-resolution (boundary)", () => {
 		await expect(detectLatestSession(cwd)).rejects.toThrow(/ambiguous latest session/);
 	});
 
+	it("ignores a planted future activity timestamp during read auto-detect", async () => {
+		const now = Date.now();
+		const cwd = await tempDir();
+		await writeActivity(cwd, "legit", new Date(now - 10 * 60_000).toISOString(), now - 10 * 60_000);
+		await writeActivity(cwd, "attacker", "2099-01-01T00:00:00.000Z", now);
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("legit");
+		expect(ctx.source).toBe("latest");
+
+		const ahead = await tempDir();
+		await writeActivity(ahead, "legit", new Date(now - 10 * 60_000).toISOString(), now - 10 * 60_000);
+		await writeActivity(ahead, "attacker", new Date(now + 3 * 60_000).toISOString(), now - 60 * 60_000);
+		const steered = await resolveGjcSessionForRead(ahead, {});
+		expect(steered.gjcSessionId).toBe("legit");
+
+		const only = await tempDir();
+		await writeActivity(only, "attacker", "2099-01-01T00:00:00.000Z", now);
+		await expect(resolveGjcSessionForRead(only, {})).rejects.toThrow(/no active GJC session/);
+	});
+
+	it("still allows an updated_at inside the clock skew", async () => {
+		const cwd = await tempDir();
+		const now = Date.now();
+		await writeActivity(cwd, "older", new Date(now - 30 * 60_000).toISOString(), now);
+		await writeActivity(cwd, "recent", new Date(now + 30_000).toISOString(), now - 60 * 60_000);
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("recent");
+		expect(ctx.source).toBe("latest");
+	});
+
+	it("keeps mtime ordering when updated_at does not parse", async () => {
+		const cwd = await tempDir();
+		const now = Date.now();
+		await writeActivity(cwd, "older", new Date(now - 60 * 60_000).toISOString(), now - 60 * 60_000);
+		const marker = sessionActivityPath(cwd, "touched");
+		await fs.mkdir(path.dirname(marker), { recursive: true });
+		await fs.writeFile(marker, "{not-json\n", "utf-8");
+		const when = new Date(now);
+		await fs.utimes(marker, when, when);
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("touched");
+		expect(ctx.source).toBe("latest");
+	});
+
 	it("ignores session dirs without an activity marker", async () => {
 		const cwd = await tempDir();
 		await fs.mkdir(sessionStateDir(cwd, "no-marker"), { recursive: true });
 		await writeSessionActivityMarker(cwd, "marked", { writer: "test" });
 		const ctx = await detectLatestSession(cwd);
 		expect(ctx.gjcSessionId).toBe("marked");
+	});
+
+	it("still auto-detects a normal session directory", async () => {
+		const cwd = await tempDir();
+		await writeSessionActivityMarker(cwd, "kept", { writer: "test" });
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("kept");
+		expect(ctx.source).toBe("latest");
+		expect(ctx.sessionRoot).toBe(sessionRoot(cwd, "kept"));
+	});
+
+	it("still auto-detects a session directory whose name encodes a dot", async () => {
+		const cwd = await tempDir();
+		await writeSessionActivityMarker(cwd, "a.b", { writer: "test" });
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("a.b");
+		expect(ctx.source).toBe("latest");
+		expect(ctx.sessionRoot).toBe(sessionRoot(cwd, "a.b"));
+	});
+
+	it("still rejects an explicit session id that is not one path component", () => {
+		expect(() => resolveSessionIdFromSources({ flagValue: ".." })).toThrow(SessionResolutionError);
+		expect(() => resolveSessionIdFromSources({ flagValue: "a/b" })).toThrow(SessionResolutionError);
+		expect(resolveSessionIdFromSources({ flagValue: "kept" })?.gjcSessionId).toBe("kept");
+	});
+
+	it("auto-detects a normal session when a crafted session directory is present", async () => {
+		for (const crafted of ["_session-%2F", "_session-%2E%2E"]) {
+			const cwd = await tempDir();
+			await writeSessionActivityMarker(cwd, "kept", { writer: "test" });
+			await fs.mkdir(path.join(cwd, ".gjc", crafted));
+			const ctx = await resolveGjcSessionForRead(cwd, {});
+			expect(ctx.gjcSessionId).toBe("kept");
+			expect(ctx.source).toBe("latest");
+			expect(ctx.sessionRoot).toBe(sessionRoot(cwd, "kept"));
+		}
+	});
+
+	it("still rejects auto-detect when every session directory decodes unsafe", async () => {
+		for (const crafted of ["_session-%2F", "_session-%2E%2E"]) {
+			const cwd = await tempDir();
+			await fs.mkdir(path.join(cwd, ".gjc", crafted), { recursive: true });
+			let caught: unknown;
+			try {
+				await resolveGjcSessionForRead(cwd, {});
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(SessionResolutionError);
+			expect((caught as SessionResolutionError).code).toBe("unsafe_session");
+		}
 	});
 });

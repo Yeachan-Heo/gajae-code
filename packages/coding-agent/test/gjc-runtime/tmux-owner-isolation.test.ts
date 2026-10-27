@@ -176,6 +176,7 @@ describe("tmux owner isolation", () => {
 		["malformed columns", "42\towned\textra\n"],
 		["inconsistent pids", "42\tfirst\n43\tsecond\n"],
 		["mixed valid and invalid rows", "42\tfirst\nbroken\tsecond\n"],
+		["a tab rewritten by a non-UTF-8 tmux client", "42_owned\n"],
 	])("fails closed on non-empty list-sessions output with %s", async (_case, stdout) => {
 		const proof = await tmuxServerProof("socket", ["psmux"], {
 			platform: "win32",
@@ -806,7 +807,9 @@ describe("tmux owner isolation", () => {
 			state_dir: state,
 			socket_key: "socket",
 			expected_scope: "gjc-owner-token.scope",
-			tmux_argv: ["tmux", "new-session", "-s", "owned", "a b"],
+			// Managed native tmux creation passes the UTF-8 client flag before the subcommand;
+			// the server proof must reuse it so its tab-separated reply stays parseable.
+			tmux_argv: ["tmux", "-u", "new-session", "-s", "owned", "a b"],
 			attempt,
 		};
 		const calls: string[][] = [];
@@ -832,9 +835,9 @@ describe("tmux owner isolation", () => {
 		expect(JSON.parse(await fs.readFile(path.join(attemptDir, "generation.json"), "utf8"))).toMatchObject({
 			generation: "prior-generation",
 		});
-		expect(calls).toEqual([["tmux", "new-session", "-s", "owned", "a b"]]);
+		expect(calls).toEqual([["tmux", "-u", "new-session", "-s", "owned", "a b"]]);
 
-		expect(proofPrefixes).toEqual([["tmux"]]);
+		expect(proofPrefixes).toEqual([["tmux", "-u"]]);
 		const explicitAttempt: AttemptCapability = {
 			token: "explicit-token",
 			session_name: "owned-explicit",
@@ -887,6 +890,8 @@ describe("tmux owner isolation", () => {
 		for (const tmux_argv of [
 			request.tmux_argv,
 			["tmux", "-L", "explicit", "new-session", "-d", "-s", "owned-session", "literal value"],
+			["tmux", "-u", "new-session", "-d", "-s", "owned-session", "literal value"],
+			["tmux", "-u", "-L", "explicit", "new-session", "-d", "-s", "owned-session", "literal value"],
 		]) {
 			await planTmuxOwnerIsolation(
 				{ ...request, tmux_argv },
@@ -904,7 +909,12 @@ describe("tmux owner isolation", () => {
 				},
 			);
 		}
-		expect(planPrefixes).toEqual([["tmux"], ["tmux", "-L", "explicit"]]);
+		expect(planPrefixes).toEqual([
+			["tmux"],
+			["tmux", "-L", "explicit"],
+			["tmux", "-u"],
+			["tmux", "-u", "-L", "explicit"],
+		]);
 		const denied = await bootstrapTmuxOwnerIsolation(bootstrap, {
 			readSelfCgroup: async () => "0::/bad.service",
 			spawn: () => {

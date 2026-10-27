@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/projfs.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain the
+// local Windows ARM64 emulation guard.
 //! Windows Projected File System backend.
 //!
 //! Ported from the original `pi_natives::projfs_overlay`; the napi-derived

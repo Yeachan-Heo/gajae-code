@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
+import embeddedDiagnosticArtifacts from "./diagnostic-artifact-embedded.json" with { type: "json" };
 import packageJson from "../package.json" with { type: "json" };
 import { embeddedAddon } from "./embedded-addon.js";
 
@@ -32,13 +33,14 @@ import { embeddedAddon } from "./embedded-addon.js";
  * post-build `--reset` stub) is the authoritative compiled-mode signal.
  */
 
-const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
+const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"];
 const OPTIONAL_PACKAGE_BY_PLATFORM_TAG = {
 	"darwin-arm64": "@gajae-code/natives-darwin-arm64",
 	"darwin-x64": "@gajae-code/natives-darwin-x64",
 	"linux-arm64": "@gajae-code/natives-linux-arm64",
 	"linux-x64": "@gajae-code/natives-linux-x64",
 	"win32-x64": "@gajae-code/natives-win32-x64",
+	"win32-arm64": "@gajae-code/natives-win32-arm64",
 };
 const WINDOWS_GENERIC_READ = 0x80000000;
 const WINDOWS_FILE_SHARE_READ = 0x00000001;
@@ -138,6 +140,32 @@ function validateStagedCandidate(ctx, candidate) {
 	}
 }
 
+function preloadSiblingNativeRuntime(ctx, candidate, loadLibrary) {
+	if (process.platform !== "win32") return;
+	// Staging copies only the .node into the versioned cache and drops the
+	// package directory from the candidate list. The DLL stays beside the
+	// recorded source addon, not beside that cache copy or bun.exe.
+	const sourcePath = ctx.stagedSourceSnapshots?.get(candidate)?.sourcePath;
+	const runtimes = [
+		typeof sourcePath === "string" ? path.join(path.dirname(sourcePath), "libunwind.dll") : null,
+		path.join(path.dirname(candidate), "libunwind.dll"),
+		path.join(path.dirname(process.execPath), "libunwind.dll"),
+	];
+	const seen = new Set();
+	for (const runtime of runtimes) {
+		if (!runtime || seen.has(runtime) || !fs.existsSync(runtime)) continue;
+		seen.add(runtime);
+		const handle = loadLibrary(runtime);
+		if (handle !== 0 && handle !== 0n && handle != null) return;
+	}
+}
+
+function loadSiblingNativeLibrary(runtime) {
+	const widePath = new Uint16Array(runtime.length + 1);
+	for (let index = 0; index < runtime.length; index++) widePath[index] = runtime.charCodeAt(index);
+	return windowsKernel32Bindings().symbols.LoadLibraryW(ptr(widePath));
+}
+
 function windowsKernel32Bindings() {
 	if (windowsKernel32) return windowsKernel32;
 	windowsKernel32 = dlopen("kernel32.dll", {
@@ -147,6 +175,7 @@ function windowsKernel32Bindings() {
 		},
 		CloseHandle: { args: ["i64"], returns: "u32" },
 		GetLastError: { args: [], returns: "u32" },
+		LoadLibraryW: { args: ["ptr"], returns: "ptr" },
 	});
 	return windowsKernel32;
 }
@@ -368,18 +397,60 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
 /**
  * Decide whether a previously extracted embedded addon may be reused. A cached
  * extraction from an earlier build of the same version carries the same version
- * sentinel yet can expose a different native surface, so it is fresh only when
- * its byte size matches the embedded payload. `sizeOf` returns the byte size of
- * a path, or `null` when it cannot be inspected.
- * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null }} input
+ * sentinel and may have the same byte size, so freshness also requires its digest
+ * to match the package-owned embedded build record. `sizeOf` returns a path's
+ * byte size; `digestOf` returns a SHA-256 hex digest. Both return `null` when the
+ * path cannot be inspected.
+ * @param {{ targetPath: string; embeddedPath: string; expectedDigest: string | null | undefined; sizeOf: (path: string) => number | null; digestOf: (path: string) => string | null }} input
  * @returns {boolean}
  */
-export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf }) {
+export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, expectedDigest, sizeOf, digestOf }) {
+	if (typeof expectedDigest !== "string" || !/^[0-9a-f]{64}$/.test(expectedDigest)) return false;
 	const cachedSize = sizeOf(targetPath);
 	if (cachedSize === null) return false;
 	const embeddedSize = sizeOf(embeddedPath);
 	if (embeddedSize === null) return false;
-	return cachedSize === embeddedSize;
+	if (cachedSize !== embeddedSize) return false;
+	return digestOf(targetPath) === expectedDigest;
+}
+
+function sha256File(file) {
+	let fd = -1;
+	try {
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+		const before = fs.fstatSync(fd);
+		if (!before.isFile()) return null;
+		const hash = createHash("sha256");
+		const buffer = Buffer.allocUnsafe(1 << 20);
+		let offset = 0;
+		while (offset < before.size) {
+			const read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, before.size - offset), offset);
+			if (read === 0) return null;
+			hash.update(buffer.subarray(0, read));
+			offset += read;
+		}
+		const after = fs.fstatSync(fd);
+		if (
+			after.dev !== before.dev ||
+			after.ino !== before.ino ||
+			after.size !== before.size ||
+			after.mtimeMs !== before.mtimeMs
+		) {
+			return null;
+		}
+		return hash.digest("hex");
+	} catch {
+		return null;
+	} finally {
+		if (fd >= 0) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// A failed close cannot make an unverified digest admissible.
+			}
+		}
+	}
 }
 
 // =========================================================================
@@ -549,12 +620,16 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 	const extracted = [];
 	for (const embeddedFile of embeddedAddonCandidates(ctx.selectedVariant)) {
 		const targetPath = path.join(ctx.versionedDir, embeddedFile.filename);
+		const expectedDigest =
+			embeddedDiagnosticArtifacts?.schema === "gjc.diagnostic-artifact" &&
+			embeddedDiagnosticArtifacts?.version === embeddedAddon.version
+				? embeddedDiagnosticArtifacts?.artifacts?.[embeddedFile.filename]
+				: undefined;
 		if (fs.existsSync(targetPath)) {
 			// Guard against intra-version drift: a cached extraction written by an earlier
-			// build of the same version carries the same version sentinel but can expose a
-			// different native surface (e.g. a symbol added mid-cycle). The embedded addon
-			// is the source of truth, so reuse the cached file only when it matches the
-			// embedded payload size and re-extract otherwise.
+			// build of the same version carries the same version sentinel and may even have
+			// the same byte size. The embedded digest is the source of truth, so reuse the
+			// cached file only when its bytes match that exact build.
 			const sizeOf = candidate => {
 				try {
 					return fs.statSync(candidate).size;
@@ -562,7 +637,15 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 					return null;
 				}
 			};
-			if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: embeddedFile.filePath, sizeOf })) {
+			if (
+				cachedEmbeddedExtractionIsFresh({
+					targetPath,
+					embeddedPath: embeddedFile.filePath,
+					expectedDigest,
+					sizeOf,
+					digestOf: sha256File,
+				})
+			) {
 				extracted.push(targetPath);
 				continue;
 			}
@@ -748,6 +831,11 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
 		);
 	}
+	if (typeof bindings.__gjcInstallTokioRuntime !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required runtime installation capability '__gjcInstallTokioRuntime'.`,
+		);
+	}
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}
@@ -905,7 +993,11 @@ export function loadNative(options = {}) {
 			}
 			try {
 				validateStagedCandidate(ctx, candidate);
+				preloadSiblingNativeRuntime(ctx, candidate, options.loadNativeLibrary ?? loadSiblingNativeLibrary);
 				const bindings = options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
+				if (typeof bindings.__gjcInstallTokioRuntime === "function") {
+					bindings.__gjcInstallTokioRuntime();
+				}
 				return releaseLease ? { [STAGED_CANDIDATE_ATTEMPT]: true, bindings, release: releaseLease } : bindings;
 			} catch (error) {
 				releaseLease?.();

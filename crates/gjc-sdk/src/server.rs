@@ -125,22 +125,76 @@ const CONNECTION_JOIN_GRACE: Duration = Duration::from_secs(1);
 /// replay report the authoritative sequence gap instead of buffering forever.
 const MAX_QUEUED_DIRECTED_FRAMES: usize = 256;
 
+/// Diagnostic frame kind used when the response ceiling rejects input before
+/// parsing can safely inspect its envelope.
+const OVERSIZED_DIRECTED_FRAME_KIND: &str = "oversized";
+
 /// Commands serialized through the owning connection task.
 #[derive(Debug)]
 enum DirectCommand {
 	Deliver(Box<ServerMessage>, Option<oneshot::Sender<bool>>),
 	DirectedFrame {
-		json:                   String,
-		connection_generation:  String,
-		requires_tool_activity: bool,
+		json:                  String,
+		connection_generation: String,
+		required_capabilities: RequiredCapabilities,
 	},
 	/// A prerequisite and its dependent frames reserved and enqueued as one
 	/// connection-generation-bound writer command.
 	DirectedFrameBatch {
-		frames:                Vec<(String, bool)>,
+		frames:                Vec<(String, RequiredCapabilities)>,
 		connection_generation: String,
 	},
 	ReevaluateAsk,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RequiredCapabilities {
+	tool_activity:  bool,
+	awaiting_input: bool,
+}
+
+impl RequiredCapabilities {
+	const fn is_empty(self) -> bool {
+		!self.tool_activity && !self.awaiting_input
+	}
+
+	fn from_kind(kind: &str) -> Self {
+		Self {
+			tool_activity:  matches!(kind, "tool_activity" | "reasoning_summary"),
+			awaiting_input: kind == "awaiting_input",
+		}
+	}
+
+	fn allows(self, advertised: &[String]) -> bool {
+		(!self.tool_activity
+			|| advertised
+				.iter()
+				.any(|cap| cap == capabilities::TOOL_ACTIVITY_V1))
+			&& (!self.awaiting_input
+				|| advertised
+					.iter()
+					.any(|cap| cap == capabilities::AWAITING_INPUT_V1))
+	}
+}
+
+fn required_capabilities_for_message(message: &ServerMessage) -> RequiredCapabilities {
+	match message {
+		ServerMessage::ToolActivity(_) | ServerMessage::ReasoningSummary(_) => {
+			RequiredCapabilities::from_kind("tool_activity")
+		},
+		ServerMessage::AwaitingInput(_) => RequiredCapabilities::from_kind("awaiting_input"),
+		_ => RequiredCapabilities::default(),
+	}
+}
+
+fn may_deliver_message(state: &ServerState, connection_id: &str, message: &ServerMessage) -> bool {
+	let required = required_capabilities_for_message(message);
+	required.is_empty()
+		|| state
+			.connections
+			.lock()
+			.get(connection_id)
+			.is_some_and(|connection| required.allows(&connection.capabilities))
 }
 
 fn reserve_directed_frame(counter: &AtomicUsize) -> bool {
@@ -149,7 +203,7 @@ fn reserve_directed_frame(counter: &AtomicUsize) -> bool {
 
 fn reserve_directed_frames(counter: &AtomicUsize, count: usize) -> bool {
 	counter
-		.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+		.try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
 			queued
 				.checked_add(count)
 				.filter(|next| *next <= MAX_QUEUED_DIRECTED_FRAMES)
@@ -203,10 +257,33 @@ fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
 	state.acks.lock().begin_dispatch(request.request_id())
 }
 
+/// Extract a safe protocol kind for diagnostics without retaining payload data.
+fn directed_frame_kind(json: &str) -> String {
+	let Some(value) = serde_json::from_str::<serde_json::Value>(json).ok() else {
+		return "invalid".to_owned();
+	};
+	let Some(kind) = value
+		.as_object()
+		.and_then(|object| object.get("type"))
+		.and_then(serde_json::Value::as_str)
+	else {
+		return "unknown".to_owned();
+	};
+	if kind.is_empty()
+		|| kind.len() > 64
+		|| !kind
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+	{
+		return "invalid".to_owned();
+	}
+	kind.to_owned()
+}
+
 /// Validate the host-to-client directed envelope before it enters a connection
 /// writer. The host can only direct typed v3 envelopes; raw WebSocket text is
 /// deliberately not an escape hatch around transport policy.
-fn validate_directed_frame(json: String) -> Option<(String, bool)> {
+fn validate_directed_frame(json: String) -> Option<(String, RequiredCapabilities)> {
 	if json.len() > RESPONSE_CEILING_BYTES {
 		return None;
 	}
@@ -214,9 +291,12 @@ fn validate_directed_frame(json: String) -> Option<(String, bool)> {
 	let object = frame.as_object()?;
 	let frame_type = object.get("type").and_then(serde_json::Value::as_str);
 	if frame_type != Some("event_replay_result") {
-		let requires_tool_activity =
-			frame_type.is_some_and(|kind| matches!(kind, "tool_activity" | "reasoning_summary"));
-		return Some((json, requires_tool_activity));
+		return Some((
+			json,
+			frame_type
+				.map(RequiredCapabilities::from_kind)
+				.unwrap_or_default(),
+		));
 	}
 	if !object.get("id").is_some_and(serde_json::Value::is_string)
 		|| !object.get("ok").is_some_and(serde_json::Value::is_boolean)
@@ -246,32 +326,37 @@ fn validate_directed_frame(json: String) -> Option<(String, bool)> {
 	}) {
 		return None;
 	}
-	let requires_tool_activity = events.iter().any(|event| {
-		let event = event.as_object();
-		let kind = event
-			.and_then(|event| event.get("kind"))
-			.and_then(serde_json::Value::as_str);
-		let name = event
-			.and_then(|event| event.get("name"))
-			.and_then(serde_json::Value::as_str);
-		let payload_type = event
-			.and_then(|event| event.get("payload"))
-			.and_then(serde_json::Value::as_object)
-			.and_then(|payload| payload.get("type"))
-			.and_then(serde_json::Value::as_str);
-		[kind, name, payload_type]
-			.into_iter()
-			.flatten()
-			.any(|kind| matches!(kind, "tool_activity" | "reasoning_summary"))
-	});
-	Some((json, requires_tool_activity))
+	let required_capabilities =
+		events
+			.iter()
+			.fold(RequiredCapabilities::default(), |mut required, event| {
+				let event = event.as_object();
+				let kind = event
+					.and_then(|event| event.get("kind"))
+					.and_then(serde_json::Value::as_str);
+				let name = event
+					.and_then(|event| event.get("name"))
+					.and_then(serde_json::Value::as_str);
+				let payload_type = event
+					.and_then(|event| event.get("payload"))
+					.and_then(serde_json::Value::as_object)
+					.and_then(|payload| payload.get("type"))
+					.and_then(serde_json::Value::as_str);
+				for kind in [kind, name, payload_type].into_iter().flatten() {
+					let frame = RequiredCapabilities::from_kind(kind);
+					required.tool_activity |= frame.tool_activity;
+					required.awaiting_input |= frame.awaiting_input;
+				}
+				required
+			});
+	Some((json, required_capabilities))
 }
 
 fn may_deliver_directed_frame(
 	state: &ServerState,
 	connection_id: &str,
 	connection_generation: &str,
-	requires_tool_activity: bool,
+	required_capabilities: RequiredCapabilities,
 ) -> bool {
 	state
 		.connections
@@ -279,11 +364,7 @@ fn may_deliver_directed_frame(
 		.get(connection_id)
 		.is_some_and(|connection| {
 			connection.generation == connection_generation
-				&& (!requires_tool_activity
-					|| connection
-						.capabilities
-						.iter()
-						.any(|capability| capability == capabilities::TOOL_ACTIVITY_V1))
+				&& required_capabilities.allows(&connection.capabilities)
 		})
 }
 
@@ -503,6 +584,69 @@ impl std::fmt::Display for PushFrameError {
 }
 
 impl std::error::Error for PushFrameError {}
+
+/// Cause of a rejected directed frame delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectedDeliveryErrorKind {
+	/// The connection id is not currently registered, or its writer is closed.
+	ConnectionUnavailable,
+	/// The JSON envelope does not satisfy the directed-frame protocol shape.
+	InvalidFrame,
+	/// The serialized envelope exceeds the response frame ceiling.
+	OversizedFrame,
+	/// The connection has not negotiated the capability required by the frame.
+	Unauthorized,
+	/// The connection's bounded writer queue has reached its capacity.
+	WriterBacklogFull,
+}
+
+impl std::fmt::Display for DirectedDeliveryErrorKind {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let name = match self {
+			Self::ConnectionUnavailable => "connection_unavailable",
+			Self::InvalidFrame => "invalid_frame",
+			Self::OversizedFrame => "oversized_frame",
+			Self::Unauthorized => "unauthorized",
+			Self::WriterBacklogFull => "writer_backlog_full",
+		};
+		formatter.write_str(name)
+	}
+}
+
+/// Context-rich rejection of a directed frame before it reaches a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectedDeliveryError {
+	/// The session whose endpoint rejected the frame.
+	pub session_id:    String,
+	/// The requested destination connection id.
+	pub connection_id: String,
+	/// Safe protocol kind extracted from the envelope, or a bounded sentinel
+	/// when the response ceiling rejects input before envelope parsing.
+	pub frame_kind:    String,
+	/// Serialized frame size in bytes.
+	pub frame_bytes:   usize,
+	/// Queue depth when the writer backlog was full.
+	pub backlog_depth: Option<usize>,
+	/// Why the frame was rejected.
+	pub kind:          DirectedDeliveryErrorKind,
+}
+
+impl std::fmt::Display for DirectedDeliveryError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"sdk directed delivery rejected: cause={} sessionId={} connectionId={} frameKind={} \
+			 frameBytes={}",
+			self.kind, self.session_id, self.connection_id, self.frame_kind, self.frame_bytes,
+		)?;
+		if let Some(depth) = self.backlog_depth {
+			write!(formatter, " backlogDepth={depth} backlogLimit={MAX_QUEUED_DIRECTED_FRAMES}")?;
+		}
+		Ok(())
+	}
+}
+
+impl std::error::Error for DirectedDeliveryError {}
 
 type AckOrigin = (String, String);
 type FinishedAck = (String, Option<AckOrigin>, bool);
@@ -911,18 +1055,23 @@ impl ServerHandle {
 			.iter()
 			.map(String::as_str)
 			.collect::<HashSet<_>>();
+		let required_capabilities = required_capabilities_for_message(&msg);
 		let recipients = self
 			.state
 			.connections
 			.lock()
-			.keys()
-			.filter(|connection_id| !excluded.contains(connection_id.as_str()))
+			.iter()
+			.filter(|(connection_id, connection)| {
+				!excluded.contains(connection_id.as_str())
+					&& required_capabilities.allows(&connection.capabilities)
+			})
+			.map(|(connection_id, _)| connection_id)
 			.cloned()
 			.collect::<Vec<_>>();
 		let json = serde_json::to_string(&msg).expect("ServerMessage serialization cannot fail");
 		let mut accepted = false;
 		for connection_id in recipients {
-			accepted |= self.send_to(&connection_id, json.clone());
+			accepted |= self.send_to(&connection_id, json.clone()).is_ok();
 		}
 		Ok(accepted)
 	}
@@ -943,6 +1092,9 @@ impl ServerHandle {
 			.connections
 			.lock()
 			.values()
+			.filter(|connection| {
+				required_capabilities_for_message(&msg).allows(&connection.capabilities)
+			})
 			.map(|connection| connection.tx.clone())
 			.collect::<Vec<_>>();
 		if senders.is_empty() {
@@ -1035,22 +1187,46 @@ impl ServerHandle {
 		self.capability_rx.lock().take()
 	}
 
-	/// Send a validated JSON envelope to one connected v3 SDK client. Returns
-	/// false when the destination is no longer current, the envelope is invalid,
-	/// it exceeds the transport frame bound, or the connection's bounded writer
-	/// backlog is full.
-	pub fn send_to(&self, connection_id: &str, json: String) -> bool {
-		self.enqueue_directed_frame(connection_id, json).is_some()
+	/// Send a validated JSON envelope to one connected v3 SDK client.
+	///
+	/// The error preserves the destination and frame metadata without retaining
+	/// or formatting the payload, so a caller can identify the dropped delivery
+	/// without exposing secrets.
+	pub fn send_to(&self, connection_id: &str, json: String) -> Result<(), DirectedDeliveryError> {
+		self.enqueue_directed_frame(connection_id, json).map(|_| ())
 	}
 
 	/// Send one directed frame and return an opaque, server-authenticated
 	/// receipt for the exact connection generation that accepted it. The
 	/// receipt carries no authority outside this server and must be passed to
 	/// [`Self::queue_idle_after_directed`].
-	pub fn send_to_with_receipt(&self, connection_id: &str, json: String) -> Option<String> {
-		let prerequisite_digest = directed_prerequisite_digest(&json)?;
+	pub fn send_to_with_receipt(
+		&self,
+		connection_id: &str,
+		json: String,
+	) -> Result<String, DirectedDeliveryError> {
+		let frame_bytes = json.len();
+		if frame_bytes > RESPONSE_CEILING_BYTES {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::OversizedFrame,
+				connection_id,
+				OVERSIZED_DIRECTED_FRAME_KIND.to_owned(),
+				frame_bytes,
+				None,
+			));
+		}
+		let frame_kind = directed_frame_kind(&json);
+		let prerequisite_digest = directed_prerequisite_digest(&json).ok_or_else(|| {
+			self.directed_delivery_error(
+				DirectedDeliveryErrorKind::InvalidFrame,
+				connection_id,
+				frame_kind.clone(),
+				frame_bytes,
+				None,
+			)
+		})?;
 		let generation = self.enqueue_directed_frame(connection_id, json)?;
-		Some(sign_directed_delivery_receipt(
+		Ok(sign_directed_delivery_receipt(
 			connection_id.to_owned(),
 			generation,
 			prerequisite_digest,
@@ -1058,36 +1234,98 @@ impl ServerHandle {
 		))
 	}
 
-	fn enqueue_directed_frame(&self, connection_id: &str, json: String) -> Option<String> {
-		let (json, requires_tool_activity) = validate_directed_frame(json)?;
-		let sender = self
-			.state
-			.connections
-			.lock()
-			.get(connection_id)
-			.map(|connection| {
-				(
-					connection.tx.clone(),
-					connection.generation.clone(),
-					Arc::clone(&connection.queued_directed_frames),
-				)
-			});
-		sender.and_then(|(sender, connection_generation, queued_directed_frames)| {
-			if !reserve_directed_frame(&queued_directed_frames) {
-				return None;
-			}
-			let sent = sender
-				.send(DirectCommand::DirectedFrame {
-					json,
-					connection_generation: connection_generation.clone(),
-					requires_tool_activity,
-				})
-				.is_ok();
-			if !sent {
-				release_directed_frame(&queued_directed_frames);
-			}
-			sent.then_some(connection_generation)
-		})
+	fn directed_delivery_error(
+		&self,
+		kind: DirectedDeliveryErrorKind,
+		connection_id: &str,
+		frame_kind: String,
+		frame_bytes: usize,
+		backlog_depth: Option<usize>,
+	) -> DirectedDeliveryError {
+		DirectedDeliveryError {
+			session_id: self.session_id.clone(),
+			connection_id: connection_id.to_owned(),
+			frame_kind,
+			frame_bytes,
+			backlog_depth,
+			kind,
+		}
+	}
+
+	fn enqueue_directed_frame(
+		&self,
+		connection_id: &str,
+		json: String,
+	) -> Result<String, DirectedDeliveryError> {
+		let frame_bytes = json.len();
+		if frame_bytes > RESPONSE_CEILING_BYTES {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::OversizedFrame,
+				connection_id,
+				OVERSIZED_DIRECTED_FRAME_KIND.to_owned(),
+				frame_bytes,
+				None,
+			));
+		}
+		let frame_kind = directed_frame_kind(&json);
+		let (json, required_capabilities) = validate_directed_frame(json).ok_or_else(|| {
+			self.directed_delivery_error(
+				DirectedDeliveryErrorKind::InvalidFrame,
+				connection_id,
+				frame_kind.clone(),
+				frame_bytes,
+				None,
+			)
+		})?;
+		let connections = self.state.connections.lock();
+		let Some(connection) = connections.get(connection_id) else {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::ConnectionUnavailable,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		};
+		if !required_capabilities.allows(&connection.capabilities) {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::Unauthorized,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		}
+		let sender = connection.tx.clone();
+		let connection_generation = connection.generation.clone();
+		let queued_directed_frames = Arc::clone(&connection.queued_directed_frames);
+		if !reserve_directed_frame(&queued_directed_frames) {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::WriterBacklogFull,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				Some(queued_directed_frames.load(Ordering::Relaxed)),
+			));
+		}
+		let sent = sender
+			.send(DirectCommand::DirectedFrame {
+				json,
+				connection_generation: connection_generation.clone(),
+				required_capabilities,
+			})
+			.is_ok();
+		if !sent {
+			release_directed_frame(&queued_directed_frames);
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::ConnectionUnavailable,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		}
+		Ok(connection_generation)
 	}
 
 	/// Queue an idle action behind an identity prerequisite for one exact
@@ -1134,7 +1372,7 @@ impl ServerHandle {
 			return Err(PushFrameError::DependentSessionMismatch);
 		}
 
-		let Some((prerequisite_json, prerequisite_requires_tool_activity)) =
+		let Some((prerequisite_json, prerequisite_required_capabilities)) =
 			validate_directed_frame(prerequisite_json)
 		else {
 			return Err(PushFrameError::DependentPrerequisiteInvalid);
@@ -1159,8 +1397,7 @@ impl ServerHandle {
 		let needed = self.state.registry.lock().note_idle(needed);
 		let idle_json = serde_json::to_string(&ServerMessage::ActionNeeded(needed))
 			.expect("ServerMessage serialization cannot fail");
-		let Some((idle_json, idle_requires_tool_activity)) = validate_directed_frame(idle_json)
-		else {
+		let Some((idle_json, idle_required_capabilities)) = validate_directed_frame(idle_json) else {
 			return Err(PushFrameError::DependentIdleInvalid);
 		};
 
@@ -1169,14 +1406,14 @@ impl ServerHandle {
 		for (connection_id, connection) in connections.iter() {
 			let frames = match positioned.get(connection_id) {
 				Some(generation) if generation == &connection.generation => {
-					vec![(idle_json.clone(), idle_requires_tool_activity)]
+					vec![(idle_json.clone(), idle_required_capabilities)]
 				},
 				// A same-id replacement generation is intentionally excluded: an
 				// older receipt cannot grant it the dependent raw fallback.
 				Some(_) => continue,
 				None => vec![
-					(prerequisite_json.clone(), prerequisite_requires_tool_activity),
-					(idle_json.clone(), idle_requires_tool_activity),
+					(prerequisite_json.clone(), prerequisite_required_capabilities),
+					(idle_json.clone(), idle_required_capabilities),
 				],
 			};
 			targets.push((
@@ -1900,6 +2137,7 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 			capabilities::THREADED.into(),
 			capabilities::CONTEXT.into(),
 			capabilities::TURN_STREAM.into(),
+			capabilities::SESSION_HOST_OBSERVER_V1.into(),
 			capabilities::IMAGES.into(),
 			capabilities::CONFIG.into(),
 			capabilities::CLIENT_PING_PONG.into(),
@@ -1907,6 +2145,7 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 			capabilities::ASK_CONTROLS_V1.into(),
 			capabilities::ASK_SELECTED_ACK_V1.into(),
 			capabilities::TOOL_ACTIVITY_V1.into(),
+			capabilities::AWAITING_INPUT_V1.into(),
 			capabilities::EPHEMERAL_TURN_V1.into(),
 		],
 		connection_id:    Some(connection_id.clone()),
@@ -1951,7 +2190,9 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 				while let Ok(direct) = direct_rx.try_recv() {
 					let sent = match direct {
 						DirectCommand::Deliver(message, dispatched) => {
-							if !prepare_direct_ack(&state, &message) {
+							if !may_deliver_message(&state, &connection_id, &message)
+								|| !prepare_direct_ack(&state, &message)
+							{
 								if let Some(dispatched) = dispatched {
 									let _ = dispatched.send(false);
 								}
@@ -1966,14 +2207,14 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 						DirectCommand::DirectedFrame {
 							json,
 							connection_generation,
-							requires_tool_activity,
+							required_capabilities,
 						} => {
 							release_directed_frame(&queued_directed_frames);
 							may_deliver_directed_frame(
 								&state,
 								&connection_id,
 								&connection_generation,
-								requires_tool_activity,
+								required_capabilities,
 							) && write.send(Message::Text(json)).await.is_ok()
 						},
 						DirectCommand::DirectedFrameBatch {
@@ -1981,14 +2222,14 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 							connection_generation,
 						} => {
 							let mut sent = true;
-							for (json, requires_tool_activity) in frames {
+							for (json, required_capabilities) in frames {
 								release_directed_frame(&queued_directed_frames);
 								if sent
 									&& may_deliver_directed_frame(
 										&state,
 										&connection_id,
 										&connection_generation,
-										requires_tool_activity,
+										required_capabilities,
 									)
 								{
 									sent = write.send(Message::Text(json)).await.is_ok();
@@ -2053,7 +2294,9 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 				};
 				match direct {
 					DirectCommand::Deliver(message, dispatched) => {
-						if !prepare_direct_ack(&state, &message) {
+						if !may_deliver_message(&state, &connection_id, &message)
+							|| !prepare_direct_ack(&state, &message)
+						{
 							if let Some(dispatched) = dispatched {
 								let _ = dispatched.send(false);
 							}
@@ -2070,14 +2313,14 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 					DirectCommand::DirectedFrame {
 						json,
 						connection_generation,
-						requires_tool_activity,
+						required_capabilities,
 					} => {
 						release_directed_frame(&queued_directed_frames);
 						if may_deliver_directed_frame(
 							&state,
 							&connection_id,
 							&connection_generation,
-							requires_tool_activity,
+							required_capabilities,
 						) && write.send(Message::Text(json)).await.is_err() {
 							break;
 						}
@@ -2087,14 +2330,14 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 						connection_generation,
 					} => {
 						let mut failed = false;
-						for (json, requires_tool_activity) in frames {
+						for (json, required_capabilities) in frames {
 							release_directed_frame(&queued_directed_frames);
 							if !failed
 								&& may_deliver_directed_frame(
 									&state,
 									&connection_id,
 									&connection_generation,
-									requires_tool_activity,
+									required_capabilities,
 								)
 								&& write.send(Message::Text(json)).await.is_err()
 							{
@@ -2120,14 +2363,7 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 							ServerMessage::ActionNeeded(needed)
 								if needed.kind != ActionKind::Idle || !needed.controls.is_empty()
 						)
-							&& (!matches!(
-								&msg,
-								ServerMessage::ToolActivity(_) | ServerMessage::ReasoningSummary(_)
-							) || state.connections.lock().get(&connection_id).is_some_and(|connection| {
-								connection.capabilities.iter().any(|capability| {
-									capability == capabilities::TOOL_ACTIVITY_V1
-								})
-							}));
+							&& may_deliver_message(&state, &connection_id, &msg);
 						if allowed && send_msg(&mut write, &msg).await.is_err() {
 							break;
 						}
@@ -2239,6 +2475,38 @@ where
 	S: SinkExt<Message> + Unpin,
 {
 	if is_v3_frame(text) {
+		// event_replay can negotiate capabilities on the same authenticated socket
+		// as hello. Publish the merged native snapshot before forwarding the request.
+		if let Ok(frame) = serde_json::from_str::<serde_json::Value>(text)
+			&& frame.get("type").and_then(serde_json::Value::as_str) == Some("event_replay")
+			&& let Some(requested) = frame
+				.get("capabilities")
+				.and_then(serde_json::Value::as_array)
+			&& requested.iter().all(serde_json::Value::is_string)
+		{
+			let _ = state
+				.connections
+				.lock()
+				.get_mut(connection_id)
+				.map(|connection| {
+					for capability in requested.iter().filter_map(serde_json::Value::as_str) {
+						if !connection
+							.capabilities
+							.iter()
+							.any(|existing| existing == capability)
+						{
+							connection.capabilities.push(capability.to_owned());
+						}
+					}
+					connection.negotiation = Negotiation::Negotiated;
+					*awaiting = false;
+					let _ = state.cap_tx.send(CapabilityUpdate {
+						connection_id: connection_id.to_owned(),
+						capabilities:  connection.capabilities.clone(),
+					});
+				});
+			let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
+		}
 		return state
 			.frame_tx
 			.send((
@@ -2423,7 +2691,7 @@ where
 }
 
 /// Attaches the authoritative, locally negotiated capability set to forwarded
-/// `event_replay` frames. Hello is handled before later frames on a connection,
+/// `event_replay` frames. Negotiation is handled before forwarding the request,
 /// so this does not depend on an asynchronously mirrored host cache.
 fn attach_event_replay_capabilities(
 	text: &str,
@@ -2712,10 +2980,13 @@ mod tests {
 			assert!(
 				handle
 					.send_to("slow", format!(r#"{{"type":"query_response","id":"q{id}","ok":true}}"#),)
+					.is_ok()
 			);
 		}
 		assert!(
-			!handle.send_to("slow", r#"{"type":"query_response","id":"overflow","ok":true}"#.into(),)
+			handle
+				.send_to("slow", r#"{"type":"query_response","id":"overflow","ok":true}"#.into(),)
+				.is_err()
 		);
 		assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES);
 
@@ -2725,8 +2996,143 @@ mod tests {
 		};
 		release_directed_frame(&queued);
 		assert!(
-			handle.send_to("slow", r#"{"type":"query_response","id":"recovered","ok":true}"#.into(),)
+			handle
+				.send_to("slow", r#"{"type":"query_response","id":"recovered","ok":true}"#.into(),)
+				.is_ok()
 		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_delivery_diagnostics_identify_each_rejection_cause() {
+		fn assert_context(
+			error: &DirectedDeliveryError,
+			cause: DirectedDeliveryErrorKind,
+			connection_id: &str,
+			frame_kind: &str,
+			frame_bytes: usize,
+		) {
+			let diagnostic = error.to_string();
+			assert!(diagnostic.contains(&format!("cause={cause}")));
+			assert!(diagnostic.contains("sessionId=session-5758"));
+			assert!(diagnostic.contains(&format!("connectionId={connection_id}")));
+			assert!(diagnostic.contains(&format!("frameKind={frame_kind}")));
+			assert!(diagnostic.contains(&format!("frameBytes={frame_bytes}")));
+		}
+
+		let handle = start(ServerConfig::new("session-5758", "secret"))
+			.await
+			.unwrap();
+		let invalid_json = "{";
+		let invalid = handle
+			.send_to("missing", invalid_json.into())
+			.expect_err("malformed JSON must be rejected");
+		assert_context(
+			&invalid,
+			DirectedDeliveryErrorKind::InvalidFrame,
+			"missing",
+			"invalid",
+			invalid_json.len(),
+		);
+
+		let oversized_json = format!(
+			r#"{{"type":"query_response","id":"oversized","ok":true,"result":"{}"}}"#,
+			"x".repeat(RESPONSE_CEILING_BYTES),
+		);
+		let oversized_bytes = oversized_json.len();
+		let oversized_with_receipt_json = oversized_json.clone();
+		let oversized = handle
+			.send_to("missing", oversized_json)
+			.expect_err("oversized JSON must be rejected");
+		assert_context(
+			&oversized,
+			DirectedDeliveryErrorKind::OversizedFrame,
+			"missing",
+			OVERSIZED_DIRECTED_FRAME_KIND,
+			oversized_bytes,
+		);
+		let oversized_with_receipt = handle
+			.send_to_with_receipt("missing", oversized_with_receipt_json)
+			.expect_err("oversized JSON must be rejected before receipt parsing");
+		assert_context(
+			&oversized_with_receipt,
+			DirectedDeliveryErrorKind::OversizedFrame,
+			"missing",
+			OVERSIZED_DIRECTED_FRAME_KIND,
+			oversized_bytes,
+		);
+
+		let (unauthorized_tx, _unauthorized_rx) = mpsc::unbounded_channel();
+		let unauthorized_queue = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("unauthorized".into(), Connection {
+				generation:             "generation".into(),
+				capabilities:           Vec::new(),
+				negotiation:            Negotiation::Negotiated,
+				delivered:              None,
+				queued_directed_frames: Arc::clone(&unauthorized_queue),
+				tx:                     unauthorized_tx,
+			});
+		let unauthorized_json =
+			r#"{"type":"tool_activity","toolCallId":"call-1","toolName":"read","phase":"started"}"#;
+		let unauthorized = handle
+			.send_to("unauthorized", unauthorized_json.into())
+			.expect_err("capability-gated JSON must be rejected");
+		assert_context(
+			&unauthorized,
+			DirectedDeliveryErrorKind::Unauthorized,
+			"unauthorized",
+			"tool_activity",
+			unauthorized_json.len(),
+		);
+
+		let (backlog_tx, _backlog_rx) = mpsc::unbounded_channel();
+		let backlog_queue = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("backlog".into(), Connection {
+				generation:             "generation".into(),
+				capabilities:           vec![capabilities::TOOL_ACTIVITY_V1.into()],
+				negotiation:            Negotiation::Negotiated,
+				delivered:              None,
+				queued_directed_frames: Arc::clone(&backlog_queue),
+				tx:                     backlog_tx,
+			});
+		let backlog_json = r#"{"type":"query_response","id":"backlog","ok":true}"#;
+		for _ in 0..MAX_QUEUED_DIRECTED_FRAMES {
+			handle
+				.send_to("backlog", backlog_json.into())
+				.expect("backlog fixture should accept its bounded capacity");
+		}
+		let backlog = handle
+			.send_to("backlog", backlog_json.into())
+			.expect_err("full writer backlog must be rejected");
+		assert_context(
+			&backlog,
+			DirectedDeliveryErrorKind::WriterBacklogFull,
+			"backlog",
+			"query_response",
+			backlog_json.len(),
+		);
+		assert!(backlog.to_string().contains("backlogDepth=256"));
+
+		let unavailable_json = r#"{"type":"query_response","id":"unavailable","ok":true}"#;
+		let unavailable = handle
+			.send_to("unavailable", unavailable_json.into())
+			.expect_err("missing connection must be rejected");
+		assert_context(
+			&unavailable,
+			DirectedDeliveryErrorKind::ConnectionUnavailable,
+			"unavailable",
+			"query_response",
+			unavailable_json.len(),
+		);
+
 		handle.stop();
 	}
 
@@ -2944,6 +3350,7 @@ mod tests {
 			assert!(
 				handle
 					.send_to("slow", format!(r#"{{"type":"query_response","id":"q{id}","ok":true}}"#),)
+					.is_ok()
 			);
 		}
 		let identity = ServerMessage::IdentityHeader(IdentityHeader {
@@ -2970,7 +3377,7 @@ mod tests {
 					"slow",
 					serde_json::to_string(&identity).expect("identity serialization"),
 				)
-				.is_none()
+				.is_err()
 		);
 
 		for sequence in 0..8 {
@@ -3244,7 +3651,37 @@ mod tests {
 		handle.stop();
 	}
 	#[tokio::test]
-	async fn event_replay_forwards_authoritative_capabilities_after_repeated_hello() {
+	async fn event_replay_negotiates_observation_without_client_hello() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut frames = handle.take_frame_receiver().expect("frame receiver");
+		let mut updates = handle
+			.take_capability_receiver()
+			.expect("capability receiver");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		ws.send(Message::Text(
+			r#"{"type":"event_replay","id":"observe","capabilities":["turn_stream","session_host_observer_v1"]}"#.into(),
+		)).await.unwrap();
+		let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(update.capabilities, vec![
+			capabilities::TURN_STREAM,
+			capabilities::SESSION_HOST_OBSERVER_V1
+		]);
+		let (connection_id, frame) = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(connection_id, update.connection_id);
+		let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+		assert_eq!(frame["capabilities"], serde_json::json!(update.capabilities));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn event_replay_merges_capabilities_after_repeated_hello() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut frames = handle.take_frame_receiver().expect("frame receiver");
 		let mut ws = connect(&handle, "secret").await;
@@ -3252,7 +3689,7 @@ mod tests {
 		send_hello(&mut ws, vec![]).await;
 		send_hello(&mut ws, vec![capabilities::TOOL_ACTIVITY_V1.into()]).await;
 		ws.send(Message::Text(
-			r#"{"type":"event_replay","id":"replay-forged","capabilities":["forged"]}"#.into(),
+			r#"{"type":"event_replay","id":"replay-observer","capabilities":["session_host_observer_v1"]}"#.into(),
 		))
 		.await
 		.unwrap();
@@ -3262,7 +3699,13 @@ mod tests {
 			.expect("timed out waiting for replay frame")
 			.expect("frame receiver closed");
 		let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
-		assert_eq!(frame["capabilities"], serde_json::json!([capabilities::TOOL_ACTIVITY_V1]));
+		assert_eq!(
+			frame["capabilities"],
+			serde_json::json!([
+				capabilities::TOOL_ACTIVITY_V1,
+				capabilities::SESSION_HOST_OBSERVER_V1
+			])
+		);
 		handle.stop();
 	}
 
@@ -3304,6 +3747,91 @@ mod tests {
 		));
 		assert!(
 			tokio::time::timeout(Duration::from_millis(100), non_capable.next())
+				.await
+				.is_err()
+		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn awaiting_input_is_delivered_only_to_advertising_clients() {
+		use crate::protocol::{AwaitingInput, AwaitingInputKind};
+
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut updates = handle
+			.take_capability_receiver()
+			.expect("capability receiver");
+		let mut capable = connect(&handle, "secret").await;
+		let capable_id = next_server_hello(&mut capable).await.connection_id.unwrap();
+		send_hello(&mut capable, vec![capabilities::AWAITING_INPUT_V1.into()]).await;
+		let mut legacy = connect(&handle, "secret").await;
+		next_server_hello(&mut legacy).await;
+		send_hello(&mut legacy, vec![]).await;
+		let mut tool_only = connect(&handle, "secret").await;
+		next_server_hello(&mut tool_only).await;
+		send_hello(&mut tool_only, vec![capabilities::TOOL_ACTIVITY_V2.into()]).await;
+		for _ in 0..3 {
+			timeout(Duration::from_secs(2), updates.recv())
+				.await
+				.unwrap()
+				.unwrap();
+		}
+
+		let frame = ServerMessage::AwaitingInput(AwaitingInput {
+			session_id:   "s".into(),
+			tool_call_id: "c".into(),
+			tool_name:    "bash".into(),
+			kind:         AwaitingInputKind::DeviceCode,
+		});
+		handle.push_frame(frame.clone()).unwrap();
+		assert_eq!(next_server_msg(&mut capable).await, frame);
+		assert!(
+			timeout(Duration::from_millis(100), legacy.next())
+				.await
+				.is_err()
+		);
+		assert!(
+			timeout(Duration::from_millis(100), tool_only.next())
+				.await
+				.is_err()
+		);
+
+		// The excluded-recipient raw fan-out must enforce the same capability.
+		assert!(
+			!handle
+				.push_frame_excluding(frame.clone(), &[capable_id])
+				.unwrap()
+		);
+		assert!(
+			timeout(Duration::from_millis(100), legacy.next())
+				.await
+				.is_err()
+		);
+		assert!(
+			timeout(Duration::from_millis(100), tool_only.next())
+				.await
+				.is_err()
+		);
+		assert!(
+			handle
+				.push_frame_excluding(frame.clone(), &["nonexistent".into()])
+				.unwrap()
+		);
+		assert_eq!(next_server_msg(&mut capable).await, frame);
+		assert!(
+			handle
+				.push_frame_and_wait(frame.clone(), Duration::from_secs(2))
+				.await
+				.unwrap()
+		);
+		assert_eq!(next_server_msg(&mut capable).await, frame);
+		assert!(
+			timeout(Duration::from_millis(100), legacy.next())
+				.await
+				.is_err()
+		);
+		assert!(
+			timeout(Duration::from_millis(100), tool_only.next())
 				.await
 				.is_err()
 		);
@@ -3978,6 +4506,7 @@ mod tests {
 			capabilities::THREADED,
 			capabilities::CONTEXT,
 			capabilities::TURN_STREAM,
+			capabilities::SESSION_HOST_OBSERVER_V1,
 			capabilities::IMAGES,
 			capabilities::CONFIG,
 			capabilities::CLIENT_PING_PONG,
@@ -3985,6 +4514,7 @@ mod tests {
 			capabilities::ASK_CONTROLS_V1,
 			capabilities::ASK_SELECTED_ACK_V1,
 			capabilities::TOOL_ACTIVITY_V1,
+			capabilities::AWAITING_INPUT_V1,
 			capabilities::EPHEMERAL_TURN_V1,
 		]);
 
@@ -3993,6 +4523,63 @@ mod tests {
 			other => panic!("expected replayed action_needed, got {other:?}"),
 		}
 		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn exact_request_frame_ceiling_is_accepted_and_one_byte_over_closes_only_its_socket() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut bounded = connect(&handle, "secret").await;
+		next_server_hello(&mut bounded).await;
+		let mut healthy = connect(&handle, "secret").await;
+		next_server_hello(&mut healthy).await;
+		wait_for_clients(&handle, 2).await;
+
+		let envelope_bytes =
+			serde_json::to_string(&ClientMessage::Ping(Ping { nonce: String::new() }))
+				.unwrap()
+				.len();
+		let nonce = "x".repeat(REQUEST_FRAME_BYTES - envelope_bytes);
+		let exact =
+			serde_json::to_string(&ClientMessage::Ping(Ping { nonce: nonce.clone() })).unwrap();
+		assert_eq!(exact.len(), 256 * 1024);
+		bounded
+			.send(Message::Text(exact))
+			.await
+			.expect("send exact private request ceiling");
+		match timeout(Duration::from_secs(2), next_server_msg(&mut bounded))
+			.await
+			.expect("exact private request must receive its real pong")
+		{
+			ServerMessage::Pong(pong) => assert_eq!(pong.nonce, nonce),
+			other => panic!("expected exact-frame pong, got {other:?}"),
+		}
+
+		let over =
+			serde_json::to_string(&ClientMessage::Ping(Ping { nonce: format!("{nonce}x") })).unwrap();
+		assert_eq!(over.len(), 256 * 1024 + 1);
+		bounded
+			.send(Message::Text(over))
+			.await
+			.expect("send one-byte-over private request");
+		match timeout(Duration::from_secs(2), bounded.next())
+			.await
+			.expect("one-byte-over private request must close its socket")
+		{
+			Some(Ok(Message::Close(Some(frame)))) => assert_eq!(frame.code, CloseCode::Size),
+			Some(Err(_)) | None => {},
+			Some(Ok(message)) => panic!("one-byte-over private request was not rejected: {message:?}"),
+		}
+		wait_for_clients(&handle, 1).await;
+		healthy
+			.send(Message::Text(
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
+			))
+			.await
+			.expect("unrelated authenticated socket remains writable");
+		assert!(
+			matches!(next_server_msg(&mut healthy).await, ServerMessage::Pong(Pong { nonce }) if nonce == "healthy")
+		);
+		handle.stop_and_wait().await;
 	}
 
 	#[tokio::test]
@@ -4467,8 +5054,7 @@ mod tests {
 				thread_id:  Some("topic-1".into()),
 				images:     vec![],
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -4510,8 +5096,7 @@ mod tests {
 				"threadId": "11",
 				"question": "What changed?",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4564,9 +5149,7 @@ mod tests {
 				"question": "wrong token",
 			}),
 		] {
-			ws.send(Message::Text(frame.to_string().into()))
-				.await
-				.unwrap();
+			ws.send(Message::Text(frame.to_string())).await.unwrap();
 		}
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(300), inbound.recv())
@@ -4601,8 +5184,7 @@ mod tests {
 				"threadId": "11",
 				"reason": "daemon_shutdown",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4637,8 +5219,7 @@ mod tests {
 				"question": "strict",
 				"unexpected": true,
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4653,8 +5234,7 @@ mod tests {
 				"threadId": "11",
 				"question": "strict",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4684,8 +5264,7 @@ mod tests {
 				thread_id:  Some("topic-1".into()),
 				command:    serde_json::json!({ "name": "context" }),
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -4721,8 +5300,7 @@ mod tests {
 				thread_id:  None,
 				images:     vec![],
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -4794,7 +5372,9 @@ mod tests {
 		assert_eq!(source, a_id);
 		assert_eq!(raw, r#"{"type":"register_provider","id":"r1"}"#);
 		assert!(
-			handle.send_to(&a_id, r#"{"type":"register_provider_result","leaseId":"l1"}"#.into())
+			handle
+				.send_to(&a_id, r#"{"type":"register_provider_result","leaseId":"l1"}"#.into())
+				.is_ok()
 		);
 		let directed = tokio::time::timeout(std::time::Duration::from_secs(2), a.next())
 			.await
@@ -4828,13 +5408,13 @@ mod tests {
 
 		let frame =
 			r#"{"type":"tool_activity","toolCallId":"c1","toolName":"read","phase":"started"}"#;
-		assert!(handle.send_to(&legacy_id, frame.into()));
+		assert!(handle.send_to(&legacy_id, frame.into()).is_err());
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(300), legacy.next())
 				.await
 				.is_err()
 		);
-		assert!(handle.send_to(&capable_id, frame.into()));
+		assert!(handle.send_to(&capable_id, frame.into()).is_ok());
 		let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), capable.next())
 			.await
 			.expect("directed send timeout")
@@ -4844,6 +5424,37 @@ mod tests {
 		handle.stop();
 	}
 	#[tokio::test]
+	async fn directed_awaiting_input_requires_its_own_capability() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut updates = handle.take_capability_receiver().unwrap();
+		let mut tool_only = connect(&handle, "secret").await;
+		let tool_id = next_server_hello(&mut tool_only)
+			.await
+			.connection_id
+			.unwrap();
+		send_hello(&mut tool_only, vec![capabilities::TOOL_ACTIVITY_V2.into()]).await;
+		let mut capable = connect(&handle, "secret").await;
+		let capable_id = next_server_hello(&mut capable).await.connection_id.unwrap();
+		send_hello(&mut capable, vec![capabilities::AWAITING_INPUT_V1.into()]).await;
+		for _ in 0..2 {
+			timeout(Duration::from_secs(2), updates.recv())
+				.await
+				.unwrap()
+				.unwrap();
+		}
+		let frame = r#"{"type":"awaiting_input","sessionId":"s","toolCallId":"c","toolName":"bash","kind":"browser_auth"}"#;
+		assert!(handle.send_to(&tool_id, frame.into()).is_err());
+		assert!(
+			timeout(Duration::from_millis(100), tool_only.next())
+				.await
+				.is_err()
+		);
+		assert!(handle.send_to(&capable_id, frame.into()).is_ok());
+		assert!(matches!(next_server_msg(&mut capable).await, ServerMessage::AwaitingInput(_)));
+		handle.stop();
+	}
+
+	#[tokio::test]
 	async fn oversized_text_frame_closes_only_the_offending_client() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut oversized = connect(&handle, "secret").await;
@@ -4852,10 +5463,22 @@ mod tests {
 		next_server_hello(&mut healthy).await;
 		wait_for_clients(&handle, 2).await;
 
-		oversized
-			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1).into()))
+		// The server rejects the frame from its length header and closes while
+		// the client may still be writing the payload, so the send itself can
+		// observe the close as a reset or broken pipe. Either way the offending
+		// client is disconnected, which is what this test asserts.
+		match oversized
+			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
 			.await
-			.expect("send oversized text frame");
+		{
+			Ok(()) => {},
+			Err(tokio_tungstenite::tungstenite::Error::Io(error))
+				if matches!(
+					error.kind(),
+					std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+				) => {},
+			Err(error) => panic!("send oversized text frame: {error:?}"),
+		}
 		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
 			.await
 			.expect("oversized client was not closed")
@@ -4869,9 +5492,7 @@ mod tests {
 
 		healthy
 			.send(Message::Text(
-				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() }))
-					.unwrap()
-					.into(),
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
 			))
 			.await
 			.expect("send healthy request");
@@ -4888,7 +5509,7 @@ mod tests {
 		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 
-		ws.send(Message::Binary(br#"{"type":"ping"}"#.to_vec().into()))
+		ws.send(Message::Binary(br#"{"type":"ping"}"#.to_vec()))
 			.await
 			.expect("send binary protocol frame");
 		let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())

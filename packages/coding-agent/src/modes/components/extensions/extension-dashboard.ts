@@ -59,7 +59,7 @@ export class ExtensionDashboard extends Container {
 	async #init(): Promise<void> {
 		const sm = this.settings ?? (await Settings.init());
 		const disabledIds = sm ? ((sm.get("disabledExtensions") as string[]) ?? []) : [];
-		this.#state = await createInitialState(this.cwd, disabledIds);
+		this.#state = await createInitialState(this.cwd, disabledIds, sm);
 
 		// Calculate max visible items based on terminal height
 		// Reserve ~10 lines for header, tabs, help text, borders
@@ -193,7 +193,7 @@ export class ExtensionDashboard extends Container {
 
 		const sm = this.settings ?? Settings.instance;
 		const disabledIds = sm ? ((sm.get("disabledExtensions") as string[]) ?? []) : [];
-		const nextState = await refreshState(this.#state, this.cwd, disabledIds);
+		const nextState = await refreshState(this.#state, this.cwd, disabledIds, sm);
 		if (refreshToken !== this.#refreshToken) return;
 		this.#state = nextState;
 

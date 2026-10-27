@@ -10,6 +10,7 @@ import {
 	type ChatEffectLease,
 	type ChatEffectReceipt,
 } from "./chat-effect-journal";
+import { loadNotificationConfigFile } from "./config";
 import { ConversationStore } from "./conversation-store";
 
 import {
@@ -19,8 +20,51 @@ import {
 	normalizeDiscordConversation,
 } from "./discord-conversation";
 import type { DiscordInboundEvent, DiscordMessageComponent, DiscordProvider, DiscordThread } from "./discord-provider";
+import { scrubReplayedProviderText } from "./engine";
 
 const FAILURE = "This conversation is no longer available.";
+
+function actorRecord(value: unknown): Record<string, unknown> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as Record<string, unknown>;
+}
+
+function trimmedActorId(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Ids named by the global Discord notification config. An absent or malformed list is empty. */
+export function discordActorIdsFromConfig(value: unknown): ReadonlySet<string> {
+	const ids = new Set<string>();
+	const discord = actorRecord(actorRecord(actorRecord(value)?.notifications)?.discord);
+	if (!discord) return ids;
+	const single = trimmedActorId(discord.authorizedUserId);
+	if (single) ids.add(single);
+	if (Array.isArray(discord.authorizedUserIds)) {
+		for (const item of discord.authorizedUserIds) {
+			const id = trimmedActorId(item);
+			if (id) ids.add(id);
+		}
+	}
+	return ids;
+}
+
+/** True only when the author is a non-blank id present in the allowlist. */
+export function discordInboundActorAllowed(authorId: string, allowed: ReadonlySet<string>): boolean {
+	const author = authorId.trim();
+	return author.length > 0 && allowed.has(author);
+}
+
+function explicitActorAllowlist(ids: readonly string[]): ReadonlySet<string> {
+	const allowed = new Set<string>();
+	for (const id of ids) {
+		const trimmed = trimmedActorId(id);
+		if (trimmed) allowed.add(trimmed);
+	}
+	return allowed;
+}
 
 export class DiscordAttachmentBindingError extends Error {
 	constructor(message = "Discord session attachment changed before outbound publication.") {
@@ -95,6 +139,8 @@ export interface DiscordNotificationDaemonOptions {
 		attachment: SessionAttachment,
 		idempotencyKey: string,
 	) => Promise<boolean>;
+	/** When set, this is the only inbound allowlist. When omitted, the global config file is read. Empty fails closed. */
+	authorizedActorIds?: readonly string[];
 }
 
 export interface DiscordNotificationInput {
@@ -106,6 +152,8 @@ export interface DiscordNotificationInput {
 	actionId?: string;
 	options?: string[];
 	publicationId?: string;
+	/** Present only for an explicit presentation redact opt-out. Absent keeps the safe scrub. */
+	literal?: true;
 }
 
 type DiscordInboundEffectPayload =
@@ -133,6 +181,8 @@ type DiscordInboundRouting = {
 	kind: "command" | "action";
 	actionId?: string;
 	actionNonce?: string;
+	/** Present only after an allowlisted live claim. Older durable claims omit it. */
+	authorId?: string;
 };
 
 function backfilledEffectIncarnationId(record: DiscordConversation): string {
@@ -466,7 +516,16 @@ export class DiscordNotificationDaemon {
 		const effectId = pendingActionId
 			? authoritative.pendingActionEffectId!
 			: `notification:${authoritative.threadId}:${input.publicationId ?? randomUUID()}`;
-		await this.#postEffect(effectId, authoritative, input.content, components, pendingActionId !== undefined);
+		await this.#postEffect(
+			effectId,
+			authoritative,
+			input.content,
+			components,
+			pendingActionId !== undefined,
+			false,
+			false,
+			input.literal === true,
+		);
 
 		return authoritative;
 	}
@@ -658,6 +717,7 @@ export class DiscordNotificationDaemon {
 
 	async handleInbound(event: DiscordInboundEvent): Promise<void> {
 		if (event.bot || event.authorId === this.options.provider.botUserId) return;
+		if (!discordInboundActorAllowed(event.authorId, await this.#allowedActorIds())) return;
 		await this.#reconcileTerminalInboundReceipts();
 		const record = await this.#byThread(event.guildId, event.parentId, event.threadId);
 		if (!record?.sessionId) {
@@ -693,6 +753,22 @@ export class DiscordNotificationDaemon {
 		return work.finally(() => this.#activeWork.delete(work));
 	}
 
+	async #reauthorizeInboundActor(effect: ChatEffect<DiscordInboundEffectPayload>): Promise<boolean> {
+		const authorId = effect.payload?.routing?.authorId;
+		return discordInboundActorAllowed(typeof authorId === "string" ? authorId : "", await this.#allowedActorIds());
+	}
+
+	async #allowedActorIds(): Promise<ReadonlySet<string>> {
+		if (this.options.authorizedActorIds) return explicitActorAllowlist(this.options.authorizedActorIds);
+		try {
+			const loaded = loadNotificationConfigFile(this.options.agentDir);
+			if (loaded.status !== "ok") return new Set();
+			return discordActorIdsFromConfig(loaded.value);
+		} catch {
+			return new Set();
+		}
+	}
+
 	async #claimInbound(
 		record: DiscordConversation,
 		event: DiscordInboundEvent,
@@ -712,6 +788,7 @@ export class DiscordNotificationDaemon {
 		let valid = false;
 		const effectId = `discord:${record.appId}:${record.guildId}:${record.parentChannelId}:${record.threadId}:${event.id}`;
 		const idempotencyKey = effectId;
+		const authorId = trimmedActorId(event.authorId);
 		const routing: DiscordInboundRouting = {
 			guildId: event.guildId,
 			parentId: event.parentId,
@@ -721,6 +798,7 @@ export class DiscordNotificationDaemon {
 			...(event.interaction ? { interactionId: event.interaction.id } : {}),
 			kind: command ? "command" : "action",
 			...(!command ? { actionId: route!.actionId, actionNonce: route!.actionNonce } : {}),
+			...(authorId === undefined ? {} : { authorId }),
 		};
 		const payload: DiscordInboundEffectPayload = command
 			? { type: "command", content: event.content!, idempotencyKey, routing }
@@ -863,6 +941,13 @@ export class DiscordNotificationDaemon {
 			return;
 		}
 		record = current;
+		// Startup and lease recovery claim durable effects directly. Re-check the
+		// author stored on that effect against the current allowlist before any
+		// callback or SDK delivery. A missing or unlisted author fails closed.
+		if (!(await this.#reauthorizeInboundActor(effect))) {
+			await this.#terminalizeInbound(record, receipt, "actor_unauthorized", lease);
+			return;
+		}
 		if (receipt.kind === "action" && !this.#hasDurableDeferIntent(effect)) {
 			// Callback tokens cannot survive a restart. Persist the intent before remote
 			// I/O so recovery can safely resume SDK delivery whether defer reached Discord
@@ -2187,6 +2272,7 @@ export class DiscordNotificationDaemon {
 		actionPublication = false,
 		closing = false,
 		allowInactive = false,
+		keepLiteral = false,
 	): Promise<void> {
 		const nonce = discordEffectNonce(id);
 		const existingEffect = await this.#effects.read<{
@@ -2195,6 +2281,7 @@ export class DiscordNotificationDaemon {
 			nonce: string;
 			components?: DiscordMessageComponent[];
 			attachmentAuthorityId?: string;
+			literal?: true;
 		}>(id);
 		const payload = existingEffect?.payload ?? {
 			threadId: record.threadId!,
@@ -2202,6 +2289,7 @@ export class DiscordNotificationDaemon {
 			nonce,
 			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			...(components ? { components } : {}),
+			...(keepLiteral ? { literal: true as const } : {}),
 		};
 		if (payload.attachmentAuthorityId !== record.attachmentAuthorityId)
 			throw new DiscordAttachmentBindingError("Discord provider effect belongs to another attachment.");
@@ -2225,9 +2313,14 @@ export class DiscordNotificationDaemon {
 						status: "reconciled",
 					};
 				await ensure();
+				if (id.startsWith("notification:") && typeof payload.content !== "string")
+					throw new Error(`Discord effect ${id} has no replayable frame body`);
+				const content = id.startsWith("notification:")
+					? scrubReplayedProviderText(id, payload.content, payload.literal === true)
+					: payload.content;
 				const posted = await this.options.provider.postMessage({
 					threadId: payload.threadId,
-					content: payload.content,
+					content,
 					nonce: payload.nonce,
 					...(payload.components ? { components: payload.components } : {}),
 				});

@@ -193,18 +193,41 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 				typeof parsed === "object" && parsed !== null && "choices" in parsed
 					? (parsed as { choices?: unknown }).choices
 					: undefined;
-			const firstChoice = Array.isArray(choices) ? choices[0] : undefined;
-			const message =
-				typeof firstChoice === "object" &&
-				firstChoice !== null &&
-				"message" in firstChoice &&
-				typeof (firstChoice as { message?: unknown }).message === "object" &&
-				!Array.isArray((firstChoice as { message?: unknown }).message)
-					? (firstChoice as { message: Record<string, unknown> }).message
-					: undefined;
-			const content = message?.content;
-			if (!(typeof content === "string" && content.trim().length > 0)) {
+			if (!Array.isArray(choices) || choices.length === 0) {
 				throw validationFailure(options.provider, options.apiKey, "the inference probe returned no choices");
+			}
+			const firstChoice: unknown = choices[0];
+			if (
+				typeof firstChoice !== "object" ||
+				firstChoice === null ||
+				Array.isArray(firstChoice) ||
+				!("message" in firstChoice)
+			) {
+				throw validationFailure(
+					options.provider,
+					options.apiKey,
+					"the inference probe returned choices without a valid message",
+				);
+			}
+			const choice = firstChoice as Record<string, unknown>;
+			const rawMessage = choice.message;
+			if (typeof rawMessage !== "object" || rawMessage === null || Array.isArray(rawMessage)) {
+				throw validationFailure(
+					options.provider,
+					options.apiKey,
+					"the inference probe returned choices without a valid message",
+				);
+			}
+			const message = rawMessage as Record<string, unknown>;
+			const hasContent = typeof message.content === "string" && message.content.trim().length > 0;
+			const hasReasoningContent =
+				typeof message.reasoning_content === "string" && message.reasoning_content.trim().length > 0;
+			if (!hasContent && !hasReasoningContent && choice.finish_reason !== "length") {
+				throw validationFailure(
+					options.provider,
+					options.apiKey,
+					"the inference probe returned choices with empty content",
+				);
 			}
 		}
 		return;

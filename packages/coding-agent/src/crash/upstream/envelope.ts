@@ -17,6 +17,7 @@ export interface CrashEventFrame {
 export interface BuildCrashEnvelopeInput {
 	readonly eventId: string;
 	readonly fingerprint: string;
+	readonly fpv: number;
 	readonly errorName: string;
 	readonly messageClass: string;
 	readonly frames: readonly CrashEventFrame[];
@@ -90,6 +91,8 @@ export function sentryAuthHeader(dsn: SentryDsn, clientVersion: string): string 
 export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEnvelopeResult {
 	if (!EVENT_ID.test(input.eventId)) return reject("invalid event id");
 	if (!EVENT_ID.test(input.fingerprint)) return reject("invalid fingerprint");
+	if (!Number.isSafeInteger(input.fpv) || input.fpv < 1 || input.fpv > 999)
+		return reject("invalid fingerprint version");
 	if (!Number.isFinite(input.lifetimeCount) || input.lifetimeCount < 0) return reject("invalid lifetime count");
 	const firstSeen = coarseDate(input.firstSeen);
 	const lastSeen = coarseDate(input.lastSeen);
@@ -133,7 +136,7 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 		},
 		tags: {
 			"gjc.fingerprint": input.fingerprint,
-			"gjc.fpv": "1",
+			"gjc.fpv": String(input.fpv),
 			"gjc.platform": input.platform,
 			bun: input.bunVersion,
 		},

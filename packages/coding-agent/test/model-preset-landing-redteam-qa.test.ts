@@ -28,7 +28,7 @@ const model = (provider: string, id: string, minLevel = Effort.Low): Model =>
 	}) as Model;
 
 const codexModel = model("openai-codex", "gpt-5.5", Effort.Low);
-const anthropicModel = model("anthropic", "claude-opus-5");
+const anthropicModel = model("anthropic", "claude-opus-5-5");
 const minimaxModel = model("minimax-code", "minimax-v3");
 const noSuffixModel = model("provider-a", "default");
 
@@ -38,7 +38,7 @@ const builtinCodexModels = [
 	model("openai-codex", "gpt-5.6-sol", Effort.Low),
 ];
 const builtinComboModels = [
-	model("anthropic", "claude-opus-5", Effort.Low),
+	model("anthropic", "claude-opus-5-5", Effort.Low),
 	model("anthropic", "claude-fable-5", Effort.Low),
 	model("anthropic", "claude-sonnet-5"),
 	model("opencode-go", "deepseek-v4-pro"),
@@ -64,7 +64,7 @@ const codexEco: ModelProfileDefinition = {
 const combo: ModelProfileDefinition = {
 	name: "opus-codex",
 	requiredProviders: ["anthropic", "openai-codex"],
-	modelMapping: { default: "anthropic/claude-opus-5:xhigh", executor: "openai-codex/gpt-5.5:low" },
+	modelMapping: { default: "anthropic/claude-opus-5-5:medium", executor: "openai-codex/gpt-5.5:low" },
 	source: "builtin",
 };
 const comboOpencode: ModelProfileDefinition = {
@@ -141,6 +141,7 @@ function createRegistry(
 		getAvailableModelProfileNames: () => [...profileMap.keys()],
 		getApiKeyForProvider: async (provider: string) => (authenticatedProviders.includes(provider) ? "key" : undefined),
 		getApiKey: async () => "key",
+		isSelectorCircuitOpen: (_selector: string) => false,
 	};
 }
 
@@ -189,9 +190,7 @@ function cursorRowLabel(selector: ModelSelectorComponent): string | undefined {
 
 describe("preset landing adversarial QA", () => {
 	test("defers browser catalog materialization until model browsing starts", async () => {
-		const registry = Object.assign(createRegistry(["openai-codex"]), {
-			getAvailableForProfileActivation: vi.fn(() => [codexModel, ...builtinCodexModels]),
-		});
+		const registry = createRegistry(["openai-codex"]);
 		const ui = { requestRender: vi.fn() } as unknown as TUI;
 		const selector = new ModelSelectorComponent(
 			ui,
@@ -206,14 +205,12 @@ describe("preset landing adversarial QA", () => {
 		await rendered(selector);
 		expect(registry.refreshStatic).toHaveBeenCalledTimes(1);
 		expect(registry.refresh).not.toHaveBeenCalled();
-		expect(registry.getAvailable).not.toHaveBeenCalled();
 		expect(registry.getCanonicalModelSelections).not.toHaveBeenCalled();
-		expect(registry.getAvailableForProfileActivation).toHaveBeenCalled();
+		expect(registry.getAvailable).toHaveBeenCalled();
 
 		selector.handleInput("g");
 		const text = await rendered(selector);
 		expect(registry.refresh).toHaveBeenCalledTimes(1);
-		expect(registry.getAvailable).toHaveBeenCalledTimes(1);
 		expect(registry.getCanonicalModelSelections).toHaveBeenCalledTimes(1);
 		expect(text).toContain("gpt-5.5");
 	});
@@ -524,18 +521,18 @@ describe("preset landing adversarial QA", () => {
 		expect(text).not.toContain("DEFAULT: provider-a/default:");
 	});
 
-	test("built-in Codex Eco preview preserves the Terra and Luna role models", async () => {
+	test("built-in Codex Eco preview uses Luna for every role", async () => {
 		const selector = createSelector({ profiles: [builtinProfile("codex-eco")] });
 		await rendered(selector);
 		selector.refreshPresetProfiles("codex-eco");
 
 		const text = await rendered(selector);
-		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-terra");
-		expect(text).toContain("EXECUTOR: openai-codex/gpt-5.6-luna");
-		expect(text).toContain("PLANNER: openai-codex/gpt-5.6-luna");
-		expect(text).toContain("CRITIC: openai-codex/gpt-5.6-terra");
-		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-terra");
-		expect(text).not.toContain("gpt-5.6-sol");
+		expect(text).toContain("DEFAULT: openai-codex/gpt-6-luna");
+		expect(text).toContain("EXECUTOR: openai-codex/gpt-6-luna");
+		expect(text).toContain("PLANNER: openai-codex/gpt-6-luna");
+		expect(text).toContain("CRITIC: openai-codex/gpt-6-luna");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-6-luna");
+		expect(text).not.toMatch(/gpt-6(\.1)?-sol/);
 	});
 
 	test("built-in Codex + OpenCodeGo preview preserves provider role models", async () => {
@@ -547,11 +544,11 @@ describe("preset landing adversarial QA", () => {
 		selector.refreshPresetProfiles("codex-opencodego");
 
 		const text = await rendered(selector);
-		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-sol");
+		expect(text).toContain("DEFAULT: openai-codex/gpt-6.1-sol");
 		expect(text).toContain("EXECUTOR: opencode-go/deepseek-v4-pro");
 		expect(text).toContain("PLANNER: opencode-go/kimi-k3");
 		expect(text).toContain("CRITIC: opencode-go/mimo-v2.5-pro");
-		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-sol");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-6.1-sol");
 	});
 
 	test("#688 Down crossing a group boundary lands on the destination group header", async () => {

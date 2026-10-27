@@ -76,7 +76,7 @@ describe("malformed tool-call circuit breaker", () => {
 				return { content: [{ type: "toolCall" as const, id: `tool-${calls}`, name: "echo", arguments: {} }] };
 			},
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
 		const events: AgentEvent[] = [];
@@ -117,7 +117,7 @@ describe("malformed tool-call circuit breaker", () => {
 				};
 			},
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
 		for await (const _event of stream) {
@@ -143,7 +143,7 @@ describe("malformed tool-call circuit breaker", () => {
 				return { content: [{ type: "toolCall" as const, id: `tool-${calls}`, name: "echo", arguments: {} }] };
 			},
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
 		for await (const _event of stream) {
@@ -173,7 +173,7 @@ describe("malformed tool-call circuit breaker", () => {
 				{ content: ["recovered with a real answer"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
 		for await (const _event of stream) {
@@ -213,7 +213,7 @@ describe("malformed tool-call circuit breaker", () => {
 			content: [{ type: "toolCall" as const, id: `tool-${i}`, name: "echo", arguments: { value: `v${i}` } }],
 		}));
 		const mock = createMockModel({ responses: [...responses, { content: ["all good"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
 		for await (const _event of stream) {

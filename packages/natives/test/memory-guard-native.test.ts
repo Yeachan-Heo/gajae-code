@@ -49,6 +49,7 @@ describe("probeWindowsJobMemory", () => {
 	it("rejects stale same-version bindings without the memory probe capability", () => {
 		const bindings = {
 			__piNativesVCurrent: () => undefined,
+			__gjcInstallTokioRuntime: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 		};
@@ -64,6 +65,7 @@ describe("probeWindowsJobMemory", () => {
 	it("rejects stale same-version bindings without executable identity capability", () => {
 		const bindings = {
 			__piNativesVCurrent: () => undefined,
+			__gjcInstallTokioRuntime: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,

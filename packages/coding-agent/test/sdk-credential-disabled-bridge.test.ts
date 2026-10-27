@@ -413,13 +413,103 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(storage.close).toHaveBeenCalledTimes(1);
 	});
 
-	it("cleans an abandoned credential listener without closing caller-owned storage", async () => {
+	it("retains auth storage close failure after initial reload failure", async () => {
+		const dirs = makeDirs("reload-close-failure");
+		const reloadError = new Error("initial reload failed");
+		const closeError = new Error("owned auth storage close failed");
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(() => {
+				throw closeError;
+			}),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		const thrown = await discoverAuthStorage(dirs.agentDir).then(
+			() => undefined,
+			error => error,
+		);
+		expect(thrown).toBe(reloadError);
+		if (!thrown || (typeof thrown !== "object" && typeof thrown !== "function"))
+			throw new Error("Expected the startup cleanup diagnostic on the reload error.");
+		expect("startupCleanupDiagnostic" in thrown).toBe(true);
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("wraps cleanup diagnostics when a proxy silently rejects property definition", async () => {
+		const dirs = makeDirs("reload-silent-proxy");
+		const cleanupError = new Error("owned auth storage close failed");
+		const reloadError = new Proxy(new Error("initial reload failed"), {
+			defineProperty() {
+				return true;
+			},
+		});
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(() => {
+				throw cleanupError;
+			}),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		const thrown = await discoverAuthStorage(dirs.agentDir).then(
+			() => undefined,
+			error => error,
+		);
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) return;
+		expect(thrown.errors).toEqual([reloadError, cleanupError]);
+		expect(thrown.message).toContain("initial reload failed");
+		expect("startupCleanupDiagnostic" in thrown).toBe(true);
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves cleanup diagnostics when the startup error is a hostile proxy", async () => {
+		const dirs = makeDirs("reload-hostile-error");
+		const cleanupError = new Error("owned auth storage close failed");
+		const reloadError = new Proxy(new Error("initial reload failed"), {
+			defineProperty() {
+				throw new Error("hostile defineProperty trap");
+			},
+			getPrototypeOf() {
+				throw new Error("hostile getPrototypeOf trap");
+			},
+		});
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(() => {
+				throw cleanupError;
+			}),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		const thrown = await discoverAuthStorage(dirs.agentDir).then(
+			() => undefined,
+			error => error,
+		);
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) return;
+		expect(thrown.errors).toEqual([reloadError, cleanupError]);
+		expect(thrown.message).toContain("initial reload failed");
+		expect("startupCleanupDiagnostic" in thrown).toBe(true);
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("releases its caller-owned storage subscription when scoped settings fail", async () => {
 		const dirs = makeDirs("settings-failure");
 		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const close = vi.spyOn(authStorage, "close");
 		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let subscriptions = 0;
 		let unsubscriptions = 0;
 		vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			subscriptions++;
 			const unsubscribe = originalSubscribe(listener);
 			return () => {
 				unsubscriptions++;
@@ -434,9 +524,43 @@ describe("createAgentSession credential_disabled subscription", () => {
 
 		await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
 
+		// The SDK listener is registered before scoped settings load so a shared-storage
+		// credential_disabled emitted while settings are pending is not lost (#5893
+		// review). A settings failure must then release exactly that one subscription
+		// and leave the caller-owned storage open.
+		expect(subscriptions).toBe(1);
 		expect(unsubscriptions).toBe(1);
 		expect(close).not.toHaveBeenCalled();
 	});
+
+	it(
+		"replays buffered credential-disabled events after scoped settings failure",
+		async () => {
+			const dirs = makeDirs("settings-failure-buffered-event");
+			const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
+			await authStorage.set("anthropic", [expiredOAuth()]);
+			failOAuthRefresh();
+			await authStorage.getApiKey("anthropic", "buffered-settings-failure");
+			vi.spyOn(Settings, "loadForScope").mockRejectedValueOnce(new Error("settings initialization failed"));
+			const { settings: _settings, ...startupOptions } = baseOptions(dirs, authStorage);
+
+			await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
+
+			const ext = makeRecordingExtension();
+			const { session } = await createAgentSession(baseOptions(dirs, authStorage, [ext.factory]));
+			try {
+				const observed = ext.next();
+				initializeRunnerForTest(session.extensionRunner);
+				const event = await observed;
+				expect(event.provider).toBe("anthropic");
+				expect(event.disabledCause).toContain("invalid_grant");
+				expect(ext.events).toHaveLength(1);
+			} finally {
+				await session.dispose();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 
 	it("closes internally owned storage when startup fails before AgentSession construction", async () => {
 		const dirs = makeDirs("owned-settings-failure");
@@ -459,6 +583,17 @@ describe("createAgentSession credential_disabled subscription", () => {
 				embedderEvents.push(event);
 			},
 		});
+		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let subscriptions = 0;
+		let unsubscriptions = 0;
+		vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			subscriptions++;
+			const unsubscribe = originalSubscribe(listener);
+			return () => {
+				unsubscriptions++;
+				unsubscribe();
+			};
+		});
 
 		const throwingFactory: ExtensionFactory = () => {
 			throw new Error("simulated mid-startup failure");
@@ -473,6 +608,8 @@ describe("createAgentSession credential_disabled subscription", () => {
 		await expect(createAgentSession(baseOptions(dirs, authStorage, [throwingFactory]))).rejects.toThrow(
 			/simulated mid-startup failure/,
 		);
+		expect(subscriptions).toBe(2);
+		expect(unsubscriptions).toBe(2);
 
 		// Now fire a real disable. Only the embedder must observe it — no leftover listener
 		// from either failed startup attempt.
@@ -652,4 +789,49 @@ describe("createAgentSession credential_disabled subscription", () => {
 			authStorage.close();
 		}
 	});
+
+	it(
+		"receives credential_disabled events during early startup when embedder subscriber exists",
+		async () => {
+			// Regression test for issue #5886: The SDK credential listener must be
+			// registered BEFORE awaiting scoped settings. When a caller-owned AuthStorage
+			// already has an embedder subscriber, the listener set is non-empty from
+			// construction, so the no-listener buffer is disabled. The SDK listener must
+			// subscribe immediately at the top of createAgentSession so credential_disabled
+			// events during startup (e.g., during model catalog probes) reach the extension.
+			const dirs = makeDirs("embedder-startup-event");
+			const embedderEvents: CredentialDisabledEvent[] = [];
+			const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
+				onCredentialDisabled: event => {
+					embedderEvents.push(event);
+				},
+			});
+			const ext = makeRecordingExtension();
+
+			// Pre-populate an expired credential to trigger disable during catalog probes
+			await authStorage.set("anthropic", [expiredOAuth()]);
+			failOAuthRefresh();
+
+			const { session } = await createAgentSession(baseOptions(dirs, authStorage, [ext.factory]));
+
+			try {
+				// The event was emitted during session startup. Initialize the runner to
+				// flush the buffered event through the extension.
+				const observed = ext.next();
+				initializeRunnerForTest(session.extensionRunner);
+				const extEvent = await observed;
+
+				// The extension MUST have received the event.
+				expect(extEvent.provider).toBe("anthropic");
+				expect(extEvent.disabledCause).toContain("invalid_grant");
+				// Both embedder and extension received the event.
+				expect(embedderEvents).toHaveLength(1);
+				expect(ext.events).toHaveLength(1);
+			} finally {
+				await session.dispose();
+				await drainCredentialDisabledDispatch();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 });

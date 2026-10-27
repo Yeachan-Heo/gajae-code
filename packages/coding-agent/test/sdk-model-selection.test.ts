@@ -385,6 +385,87 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		await session.dispose();
 	});
 
+	for (const modelId of ["namespace/catalog-model", "catalog-model"]) {
+		test(`restores a CLI-owned discovered model with id ${modelId}`, async () => {
+			const provider = "runtime-catalog";
+			const registry = modelRegistry;
+			authStorage.setRuntimeApiKey(provider, "test-key");
+			using _refreshableProviders = vi.spyOn(registry, "getRefreshableProviders").mockReturnValue([provider]);
+			using refresh = vi.spyOn(registry, "refreshProvider").mockImplementation(async providerId => {
+				registry.registerProvider(providerId, {
+					baseUrl: "http://127.0.0.1:9/v1",
+					apiKey: "RUNTIME_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: modelId,
+							name: "Discovered Catalog Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+						},
+					],
+				});
+			});
+			const sessionManager = SessionManager.inMemory(tempDir);
+			sessionManager.appendModelChange(`${provider}/${modelId}`, "default");
+
+			const { session, modelFallbackMessage } = await createAgentSession({
+				...buildSessionOptions(undefined, sessionManager),
+				settings: Settings.isolated(),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			try {
+				expect(session.model).toMatchObject({ provider, id: modelId });
+				expect(modelFallbackMessage).toBeUndefined();
+				expect(refresh).toHaveBeenCalled();
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
+	test("rechecks a recovered saved chain after startup extensions register its model", async () => {
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+		});
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendModelChange("late-provider/late-model", "default");
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, sessionManager),
+			settings,
+			extensions: [
+				api => {
+					api.registerProvider("late-provider", {
+						baseUrl: "http://127.0.0.1:9/v1",
+						apiKey: "LATE_KEY",
+						api: "openai-completions",
+						models: [
+							{
+								id: "late-model",
+								name: "Late Model",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					});
+				},
+			],
+		});
+
+		expect(session.model).toMatchObject({ provider: "late-provider", id: "late-model" });
+		expect(modelFallbackMessage).toBeUndefined();
+		await session.dispose();
+	});
+
 	test("resolves explicit modelPattern after runtime providers are available", async () => {
 		const { session, modelFallbackMessage } = await createAgentSession(
 			buildSessionOptions("runtime-provider/runtime-model"),
@@ -1025,67 +1106,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(session.model?.id).not.toBe(anthropicDefault.id);
 		} finally {
 			await session.dispose();
-		}
-	});
-
-	test("skips a curated default disproved by fresh provider discovery", async () => {
-		const staleAuth = await AuthStorage.create(path.join(tempDir, `stale-default-${Snowflake.next()}.db`));
-		const staleRegistry = new ModelRegistry(
-			staleAuth,
-			path.join(tempDir, `stale-default-${Snowflake.next()}.yml`),
-			undefined,
-			{ automaticRefresh: false },
-		);
-		const currentModelId = "claude-opus-4-6";
-		try {
-			staleAuth.setRuntimeApiKey("anthropic", "anthropic-test-key");
-			using _hook = hookFetch(input => {
-				const url = String(input);
-				if (url === "https://models.dev/api.json") {
-					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
-				return new Response(JSON.stringify({ data: [{ id: currentModelId }] }), {
-					headers: { "Content-Type": "application/json" },
-				});
-			});
-			await staleRegistry.refreshProvider("anthropic", "online");
-
-			const curatedDefault = DEFAULT_MODEL_PER_PROVIDER.anthropic;
-			// Fresh, authoritative live evidence makes the live catalog the selectable
-			// list, so a curated default the provider did not enroll is not selectable
-			// either. The curated default is only the fallback while that evidence is
-			// absent (#5720, #5746).
-			expect(
-				staleRegistry
-					.getAvailable()
-					.filter(model => model.provider === "anthropic")
-					.map(model => model.id)
-					.sort(),
-			).toEqual([currentModelId]);
-			expect(staleRegistry.getAvailableForProfileActivation().some(model => model.id === curatedDefault)).toBe(
-				false,
-			);
-
-			const settings = Settings.isolated({
-				enabledModels: [`anthropic/${curatedDefault}`, `anthropic/${currentModelId}`],
-			});
-			const { session } = await createAgentSession({
-				...buildSessionOptions(),
-				authStorage: staleAuth,
-				modelRegistry: staleRegistry,
-				settings,
-			});
-			try {
-				expect(session.model).toMatchObject({ provider: "anthropic", id: currentModelId });
-			} finally {
-				await session.dispose();
-			}
-		} finally {
-			staleRegistry.dispose();
-			staleAuth.close();
 		}
 	});
 

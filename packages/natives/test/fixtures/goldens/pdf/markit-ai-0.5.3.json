@@ -1,0 +1,15 @@
+{
+	"schemaVersion": 1,
+	"cases": [
+		{
+			"id": "pdf-one-page-title",
+			"inputSha256": "3ad76ba7d0a11f66028fd50573b8126ddfe7505f3b09d1bff3077d9d46b087fe",
+			"markdown": "Golden paragraph one\n\nMore one page text"
+		},
+		{
+			"id": "pdf-two-pages",
+			"inputSha256": "5df4b5ce818704828e93946014a3a1e8d0d85653124c92297bc9508ba800bac7",
+			"markdown": "First page content\n\nSecond line\n\nSecond page content\n\nFinal line"
+		}
+	]
+}

@@ -119,6 +119,7 @@ export function sourceConfigDir(
 
 export type InventoryStatus =
 	| "enabled"
+	| "stored-only"
 	| "disabled"
 	| "invalid"
 	| "shadowed"

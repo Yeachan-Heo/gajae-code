@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import type * as nodeFs from "node:fs";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -36,6 +36,46 @@ async function withLocalRoot<T>(sessionId: string, fn: (root: string) => Promise
 
 function localOptions(sessionId: string, artifactsDir: string) {
 	return { getArtifactsDir: () => artifactsDir, isManagedDestination: () => true, getSessionId: () => sessionId };
+}
+
+function withForeignOwner(real: nodeFs.Stats): nodeFs.Stats {
+	const uid = (process.getuid?.() ?? 0) + 1;
+	const mode = (real.mode & ~0o777) | 0o755;
+	return new Proxy(real, {
+		get(target, prop, receiver) {
+			if (prop === "uid") return uid;
+			if (prop === "mode") return mode;
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+async function withForeignOwnerStat<T>(foreignPath: string, fn: () => Promise<T>): Promise<T> {
+	const wanted = path.resolve(foreignPath);
+	const lstat = fs.lstat.bind(fs);
+	const lstatSync = nodeFs.lstatSync.bind(nodeFs);
+	const matches = (target: nodeFs.PathLike) => path.resolve(String(target)) === wanted;
+	const asyncSpy = vi.spyOn(fs, "lstat").mockImplementation((async (
+		target: nodeFs.PathLike,
+		options?: nodeFs.StatOptions,
+	) => {
+		const stat = await lstat(target, options);
+		return matches(target) && !options?.bigint ? withForeignOwner(stat as nodeFs.Stats) : stat;
+	}) as unknown as typeof fs.lstat);
+	const syncSpy = vi.spyOn(nodeFs, "lstatSync").mockImplementation(((
+		target: nodeFs.PathLike,
+		options?: nodeFs.StatOptions,
+	) => {
+		const stat = lstatSync(target, options);
+		return matches(target) && !options?.bigint ? withForeignOwner(stat as nodeFs.Stats) : stat;
+	}) as unknown as typeof nodeFs.lstatSync);
+	try {
+		return await fn();
+	} finally {
+		asyncSpy.mockRestore();
+		syncSpy.mockRestore();
+	}
 }
 
 it("keeps explicit local roots under artifacts while managed roots stay external", async () => {
@@ -652,4 +692,273 @@ describe("LocalProtocolHandler", () => {
 			});
 		});
 	});
+
+	const posixOnly = process.platform === "win32";
+
+	it.skipIf(posixOnly)("refuses a pre-created group-writable managed local root", async () => {
+		const sessionId = `group-writable-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o720);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow("Unsafe local:// root");
+			await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+			await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+		});
+	});
+
+	it.skipIf(posixOnly)("refuses a managed local root whose inode changes after init", async () => {
+		const sessionId = `inode-swap-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			const before = await fs.stat(localRoot);
+			const parked = `${localRoot}-parked`;
+			await fs.rename(localRoot, parked);
+			try {
+				await fs.mkdir(localRoot, { mode: 0o700 });
+				await fs.chmod(localRoot, 0o700);
+				expect((await fs.stat(localRoot)).ino).not.toBe(before.ino);
+				await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+				expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow("Unsafe local:// root");
+				await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			} finally {
+				await fs.rm(parked, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it.skipIf(posixOnly)("adopts a managed root another initializer recreated with a settled marker", async () => {
+		const sessionId = `recreated-${crypto.randomUUID()}`;
+		const noteUrl = ["local", "//note.txt"].join(":");
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			// The temp sweeper removes the root; a sibling gjc process for the same
+			// session recreates it and settles the migration marker.
+			await fs.rm(localRoot, { recursive: true, force: true });
+			await fs.mkdir(localRoot, { mode: 0o700 });
+			await fs.writeFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "absent\n", { mode: 0o600 });
+			expect(resolveLocalUrlToPath(noteUrl, options)).toBe(path.join(localRoot, "note.txt"));
+			expect(await initializeLocalRoot(options)).toBe(await fs.realpath(localRoot));
+		});
+	});
+
+	it("refuses a recreated managed root on Windows without ACL validation", async () => {
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!originalPlatform?.configurable) throw new Error("process.platform descriptor is not configurable");
+		const sessionId = `recreated-windows-${crypto.randomUUID()}`;
+		const noteUrl = ["local", "//note.txt"].join(":");
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			const parked = `${localRoot}-parked`;
+			const originalIdentity = await fs.lstat(localRoot);
+			await fs.rename(localRoot, parked);
+			try {
+				await fs.mkdir(localRoot, { mode: 0o700 });
+				expect((await fs.lstat(localRoot)).ino).not.toBe(originalIdentity.ino);
+				const marker = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+				await fs.writeFile(marker, "absent\n", { mode: 0o600 });
+				Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+				try {
+					expect(() => resolveLocalUrlToPath(noteUrl, options)).toThrow("Unsafe local:// root");
+					await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+					expect(await fs.readFile(marker, "utf8")).toBe("absent\n");
+				} finally {
+					Object.defineProperty(process, "platform", originalPlatform);
+				}
+			} finally {
+				await fs.rm(parked, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it.skipIf(posixOnly)("still allows a managed root after its marker-only directory is removed", async () => {
+		const sessionId = `marker-pruned-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			expect(await fs.readdir(localRoot)).toEqual([".gjc-local-legacy-migrated-v1"]);
+			const marker = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+			await fs.rm(localRoot, { recursive: true });
+			expect(await initializeLocalRoot(options)).toBe(await fs.realpath(localRoot));
+			expect(await fs.readFile(marker, "utf8")).toBe("absent\n");
+			expect(resolveLocalUrlToPath("local://note.txt", options)).toBe(path.join(localRoot, "note.txt"));
+			LocalProtocolHandler.setOverride(options);
+			const listed = await InternalUrlRouter.instance().resolve("local://");
+			expect(listed.sourcePath).toBe(await fs.realpath(localRoot));
+			await fs.rm(localRoot, { recursive: true });
+			expect(resolveLocalUrlToPath("local://note.txt", options)).toBe(path.join(localRoot, "note.txt"));
+		});
+	});
+
+	it.skipIf(posixOnly)("retries initialization after a marker write fails on a recreated root", async () => {
+		const sessionId = `marker-retry-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			await fs.rm(localRoot, { recursive: true });
+			const markerPath = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+			const originalWrite = fs.writeFile;
+			let failedOnce = false;
+			const writeSpy = vi.spyOn(fs, "writeFile").mockImplementation((async (file, data, writeOptions) => {
+				if (!failedOnce && String(file) === markerPath) {
+					failedOnce = true;
+					throw Object.assign(new Error("marker write failed"), { code: "EIO" });
+				}
+				return originalWrite(file, data as string, writeOptions);
+			}) as typeof fs.writeFile);
+			try {
+				await expect(initializeLocalRoot(options)).rejects.toThrow("marker write failed");
+			} finally {
+				writeSpy.mockRestore();
+			}
+			expect(await initializeLocalRoot(options)).toBe(await fs.realpath(localRoot));
+			expect(await fs.readFile(markerPath, "utf8")).toBe("absent\n");
+			expect(resolveLocalUrlToPath("local://note.txt", options)).toBe(path.join(localRoot, "note.txt"));
+		});
+	});
+
+	it.skipIf(posixOnly)("refuses a managed local root swapped for a symlink after init", async () => {
+		const sessionId = `symlink-swap-${crypto.randomUUID()}`;
+		const localRoot = resolveLocalRoot({ getSessionId: () => sessionId, isManagedDestination: () => true });
+		const parked = `${localRoot}-parked`;
+		const landing = `${localRoot}-landing`;
+		await fs.rm(localRoot, { recursive: true, force: true });
+		await fs.rm(parked, { recursive: true, force: true });
+		await fs.rm(landing, { recursive: true, force: true });
+		await fs.mkdir(landing, { recursive: true });
+		try {
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			await fs.rename(localRoot, parked);
+			await fs.symlink(landing, localRoot);
+			expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow("Unsafe local:// root");
+			await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+			await expect(fs.lstat(path.join(landing, "note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.lstat(path.join(landing, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+		} finally {
+			await fs.rm(localRoot, { recursive: true, force: true });
+			await fs.rm(parked, { recursive: true, force: true });
+			await fs.rm(landing, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(posixOnly)("refuses a world-writable managed local parent", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "local-parent-"));
+		const packageRoot = path.resolve(import.meta.dir, "../..");
+		try {
+			const proc = Bun.spawn(["bun", "-e", PARENT_WRITABLE_SCRIPT], {
+				cwd: packageRoot,
+				env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			if (code !== 0) throw new Error(`parent check exited ${code}\n${stdout}\n${stderr}`);
+		} finally {
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(posixOnly)("refuses a managed local parent owned by another user", async () => {
+		const sessionId = `foreign-parent-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o755);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await withForeignOwnerStat(path.dirname(localRoot), async () => {
+				expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow("Unsafe local:// root");
+				await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+			});
+			await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+		});
+	});
+
+	it.skipIf(posixOnly)("refuses a managed session directory owned by another user", async () => {
+		const sessionId = `foreign-root-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o755);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await withForeignOwnerStat(localRoot, async () => {
+				expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow("Unsafe local:// root");
+				await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+			});
+			await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+		});
+	});
+
+	it.skipIf(posixOnly)("still allows a private 0700 managed local root", async () => {
+		const sessionId = `owner-0700-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			expect(resolveLocalUrlToPath("local://ok.txt", options)).toBe(path.join(localRoot, "ok.txt"));
+			expect(resolveLocalUrlToPath("local://ok.txt", options)).toBe(path.join(localRoot, "ok.txt"));
+			const stat = await fs.lstat(localRoot);
+			const uid = process.getuid?.();
+			if (uid === undefined) throw new Error("posix uid is required");
+			expect(stat.uid).toBe(uid);
+			expect(stat.mode & 0o777).toBe(0o700);
+			expect(await initializeLocalRoot(options)).toBe(await fs.realpath(localRoot));
+			await fs.chmod(localRoot, 0o755);
+			expect(resolveLocalUrlToPath("local://ok.txt", options)).toBe(path.join(localRoot, "ok.txt"));
+		});
+	});
+
+	it.skipIf(posixOnly)("still allows a mode 0755 managed session directory", async () => {
+		const sessionId = `owner-0755-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o755);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			expect(resolveLocalUrlToPath("local://plain.txt", options)).toBe(path.join(localRoot, "plain.txt"));
+			expect(resolveLocalUrlToPath("local://plain.txt", options)).toBe(path.join(localRoot, "plain.txt"));
+			expect(await initializeLocalRoot(options)).toBe(await fs.realpath(localRoot));
+		});
+	});
 });
+
+const PARENT_WRITABLE_SCRIPT = `
+import { LocalProtocolHandler, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const sessionId = "parent-open";
+const root = path.join(os.tmpdir(), "gjc-local", sessionId);
+const parent = path.dirname(root);
+await fs.mkdir(parent, { recursive: true });
+await fs.chmod(parent, 0o777);
+await fs.mkdir(root, { mode: 0o700 });
+LocalProtocolHandler.resetOverrideForTests();
+try {
+	resolveLocalUrlToPath("local://note.txt", {
+		getSessionId: () => sessionId,
+		isManagedDestination: () => true,
+	});
+	console.log("ACCEPTED");
+	process.exit(2);
+} catch (error) {
+	if (String(error).includes("Unsafe local:// root")) process.exit(0);
+	console.error(error);
+	process.exit(3);
+}
+`;

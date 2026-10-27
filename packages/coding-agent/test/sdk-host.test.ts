@@ -21,6 +21,51 @@ describe("session SDK event stream", () => {
 });
 
 describe("SessionSdkHost", () => {
+	// The notifications bus delivers awaiting_input live-only and never retains it;
+	// this pins the host gate so a retained one could still not leak to clients
+	// that lack the dedicated capability.
+	test("a retained awaiting_input event requires its own capability rather than tool activity or frame claims", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
+		const host = new SessionSdkHost({
+			sessionId: "awaiting-capabilities",
+			stateRoot: "/tmp/awaiting-capabilities",
+			token: "token",
+			connectionCapabilities: connectionId =>
+				connectionId === "awaiting" ? new Set(["awaiting_input_v1"]) : new Set(["tool_activity_v2"]),
+			sendFrame: (connectionId, frame) => {
+				sent.push({ connectionId, frame });
+				return "written";
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+		});
+		await host.start();
+		try {
+			host.emitEvent({ kind: "awaiting_input", payload: { type: "awaiting_input", toolCallId: "call-1" } });
+			host.emitEvent({ kind: "tool_activity", payload: { type: "tool_activity" } });
+			receive("awaiting", { type: "event_replay", id: "awaiting", sinceSeq: 0, capabilities: [] });
+			await Bun.sleep(0);
+			expect((sent.at(-1)!.frame.events as Array<{ kind: string }>).slice(1).map(event => event.kind)).toEqual([
+				"awaiting_input",
+			]);
+			receive("tool-only", {
+				type: "event_replay",
+				id: "tool-only",
+				sinceSeq: 0,
+				capabilities: ["awaiting_input_v1"],
+			});
+			await Bun.sleep(0);
+			expect((sent.at(-1)!.frame.events as Array<{ kind: string }>).slice(1).map(event => event.kind)).toEqual([
+				"tool_activity",
+			]);
+		} finally {
+			await host.stop();
+		}
+	});
+
 	test("replay authorization uses negotiated connection capabilities, not frame claims", async () => {
 		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
@@ -87,6 +132,7 @@ describe("SessionSdkHost", () => {
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
+			allocateEventGeneration: async () => 1_000,
 			sendFrame: () => {
 				return "written";
 			},
@@ -104,12 +150,130 @@ describe("SessionSdkHost", () => {
 		});
 		expect(await host.start()).toBe("started");
 		expect(await host.start()).toBe("already");
-		expect(registered).toEqual([1]);
+		expect(registered).toEqual([1_000]);
 		expect(handler).toBeDefined();
 		expect(await host.stop()).toBe("stopped");
 		expect(await host.stop()).toBe("already");
 		expect(await host.start()).toBe("started");
-		expect(registered).toEqual([1, 2]);
+		// A restart inside one stream advances even when the authority repeats itself.
+		expect(registered).toEqual([1_000, 1_001]);
+	});
+
+	test("a recreated host takes its event namespace from the generation authority", async () => {
+		let issued = 5_000;
+		const createHost = () =>
+			new SessionSdkHost({
+				sessionId: "resumed",
+				stateRoot: "/tmp/resumed",
+				token: "t",
+				allocateEventGeneration: async () => issued++,
+				sendFrame: () => "written",
+				onFrame: () => () => {},
+			});
+		const first = createHost();
+		await first.start();
+		const firstEvent = first.emitEvent({ kind: "notice", payload: { type: "notice", message: "first" } });
+		await first.stop();
+		const resumed = createHost();
+		await resumed.start();
+		const resumedEvent = resumed.emitEvent({ kind: "notice", payload: { type: "notice", message: "resumed" } });
+		// Each process restarts its sequence, so only the generation keeps the
+		// resumed host's (generation, seq) coordinates apart from the closed host's.
+		expect(resumedEvent.seq).toBe(firstEvent.seq);
+		expect(firstEvent.generation).toBe(5_000);
+		expect(resumedEvent.generation).toBe(5_001);
+		await resumed.stop();
+
+		// Without an authority the generation only advances inside the host's own stream.
+		const local = new SessionSdkHost({
+			sessionId: "local",
+			stateRoot: "/tmp/local",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await local.start();
+		expect(local.generation).toBe(1);
+		await local.stop();
+		await local.start();
+		expect(local.generation).toBe(2);
+		await local.stop();
+	});
+
+	test("an unreserved generation serves locally and is published only once the authority reserves it", async () => {
+		const floors: number[] = [];
+		let authority: (floor: number) => number = () => {
+			throw new Error("generation authority unavailable");
+		};
+		const registered: number[] = [];
+		const host = new SessionSdkHost({
+			sessionId: "unreserved",
+			stateRoot: "/tmp/unreserved",
+			token: "t",
+			allocateEventGeneration: async (_sessionId, floor) => {
+				floors.push(floor);
+				return authority(floor);
+			},
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		const before = Date.now();
+		expect(await host.start()).toBe("started");
+		const generation = host.generation;
+		expect(generation).toBeGreaterThanOrEqual(before);
+		expect(host.events.replay(0).events).toMatchObject([{ name: "session_ready", generation }]);
+
+		const writer = {
+			register: ({ endpointGeneration }: { endpointGeneration: number }) => void registered.push(endpointGeneration),
+		};
+		await expect(host.registerWithBroker(writer)).rejects.toThrow("generation authority unavailable");
+		// The authority already issued this generation to another host.
+		authority = floor => floor + 1;
+		await expect(host.registerWithBroker(writer)).rejects.toThrow(
+			`SDK event generation ${generation} was superseded by ${generation + 1}`,
+		);
+		expect(registered).toEqual([]);
+
+		authority = floor => floor;
+		await host.registerWithBroker(writer);
+		await host.registerWithBroker(writer);
+		expect(registered).toEqual([generation, generation]);
+		// Start floors are wall time; reservations ask for exactly the served generation, once.
+		expect(floors.slice(1)).toEqual([generation, generation, generation]);
+		await host.stop();
+	});
+
+	test("concurrent starts share one allocation and a stop during allocation stops that start", async () => {
+		const allocation = Promise.withResolvers<number>();
+		let allocations = 0;
+		const registered: number[] = [];
+		const unregistered: number[] = [];
+		const host = new SessionSdkHost({
+			sessionId: "pending-allocation",
+			stateRoot: "/tmp/pending-allocation",
+			token: "t",
+			allocateEventGeneration: () => {
+				allocations++;
+				return allocation.promise;
+			},
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: ({ endpointGeneration }) => void registered.push(endpointGeneration),
+			unregister: ({ endpointGeneration }) => void unregistered.push(endpointGeneration),
+		});
+		const first = host.start();
+		const second = host.start();
+		const stopped = host.stop();
+		allocation.resolve(7_000);
+		expect(await first).toBe("started");
+		expect(await second).toBe("already");
+		expect(await stopped).toBe("stopped");
+		expect(allocations).toBe(1);
+		expect(registered).toEqual([7_000]);
+		expect(unregistered).toEqual([7_000]);
+		expect(host.started).toBe(false);
 	});
 
 	test("reports the idle host state and only records activity transitions", async () => {
@@ -297,6 +461,67 @@ describe("SessionSdkHost", () => {
 					"held by pid 123 (live)",
 				);
 				error.message = "operator wording can change";
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).resolves.toBe("stopped");
+		expect(host.started).toBe(false);
+	});
+
+	test("does not suppress access-denied publication failures as lock contention", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"publication failed with access_denied",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+		);
+		const host = new SessionSdkHost({
+			sessionId: "access-denied-stop",
+			stateRoot: "/tmp/access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).rejects.toBe(error);
+		expect(host.started).toBe(true);
+	});
+
+	test("allows access-denied lock contention during shutdown when a holder is proven live", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"held by pid 123 (live)",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+			true,
+		);
+		const host = new SessionSdkHost({
+			sessionId: "live-access-denied-stop",
+			stateRoot: "/tmp/live-access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
 				throw error;
 			},
 		});

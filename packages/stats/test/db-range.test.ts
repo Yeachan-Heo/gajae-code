@@ -29,11 +29,12 @@ afterEach(() => {
 	tempDir = null;
 });
 
-function makeMessage(timestamp: number, entryId: string): MessageStats {
+function makeMessage(timestamp: number, entryId: string, agent: MessageStats["agent"] = "default"): MessageStats {
 	return {
 		sessionFile: "/tmp/session.jsonl",
 		entryId,
 		folder: "/tmp/project",
+		agent,
 		model: "gpt-5.4",
 		provider: "openai-codex",
 		api: "openai-codex-responses",
@@ -64,7 +65,10 @@ describe("getDashboardStats time range", () => {
 		await initDb();
 
 		const now = Date.now();
-		insertMessageStats([makeMessage(now, "within-24h"), makeMessage(now - 48 * 60 * 60 * 1000, "outside-24h")]);
+		insertMessageStats([
+			makeMessage(now, "within-24h", "executor"),
+			makeMessage(now - 48 * 60 * 60 * 1000, "outside-24h", "planner"),
+		]);
 
 		const dayStats = await getDashboardStats("24h");
 		expect(dayStats.overall.totalRequests).toBe(1);
@@ -73,10 +77,13 @@ describe("getDashboardStats time range", () => {
 			model: "gpt-5.4",
 			provider: "openai-codex",
 		});
+		expect(dayStats.byAgent).toHaveLength(1);
+		expect(dayStats.byAgent[0]).toMatchObject({ agent: "executor", totalRequests: 1 });
 
 		const weekStats = await getDashboardStats("7d");
 		expect(weekStats.overall.totalRequests).toBe(2);
 		expect(weekStats.byModel[0]).toMatchObject({ totalRequests: 2, model: "gpt-5.4", provider: "openai-codex" });
+		expect(weekStats.byAgent.map(row => row.agent).sort()).toEqual(["executor", "planner"]);
 
 		const allStats = await getDashboardStats("all");
 		expect(allStats.overall.totalRequests).toBe(2);

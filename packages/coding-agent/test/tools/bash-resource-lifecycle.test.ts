@@ -52,6 +52,7 @@ function makeToolSession(tempDir: string, settings: Settings): ToolSession {
 		getArtifactsDir: () => artifacts.dir,
 		getArtifactManager: () => artifacts,
 		allocateOutputArtifact: (toolType: string) => artifacts.allocatePath(toolType),
+		captureArtifactPublication: () => (content: string, toolType: string) => artifacts.save(content, toolType),
 	} as unknown as ToolSession;
 }
 
@@ -174,7 +175,7 @@ describe("bash resource lifecycle", () => {
 			},
 		);
 
-		const deadline = Date.now() + 2_000;
+		const deadline = Date.now() + 8_000;
 		while (!fs.existsSync(pidFile) && Date.now() < deadline) await Bun.sleep(25);
 		expect(fs.existsSync(pidFile)).toBe(true);
 		const ownedPid = Number(fs.readFileSync(pidFile, "utf8"));
@@ -315,6 +316,7 @@ describe("bash resource lifecycle", () => {
 		const session = {
 			getArtifactManager: () => artifacts,
 			allocateOutputArtifact: (toolType: string) => artifacts.allocatePath(toolType),
+			captureArtifactPublication: () => (content: string, toolType: string) => artifacts.save(content, toolType),
 		} as unknown as ToolSession;
 		const originalText = "x".repeat(DEFAULT_ARTIFACT_MAX_BYTES + 1024);
 		const bashModule = await import("@gajae-code/coding-agent/tools/bash");

@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/rcopy.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain
+// dirty-state seeding for live Git working trees.
 //! Cross-platform fallback isolation: git worktree, or plain recursive copy.
 //!
 //! When `lower` is a git working tree, [`start`](IsolationBackend::start)
@@ -15,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use crate::{BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult};
+use crate::{BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed};
 
 pub struct RcopyBackend;
 
@@ -140,11 +143,7 @@ fn git_worktree_add(lower: &Path, merged: &Path) -> IsoResult<()> {
 	if output.status.success() {
 		return Ok(());
 	}
-	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-	Err(IsoError::other(format!(
-		"git worktree add (exit {}): {stderr}",
-		output.status.code().unwrap_or(-1)
-	)))
+	Err(command_failed("git worktree add", output.status.code().unwrap_or(-1), &output.stderr))
 }
 
 fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
@@ -161,11 +160,7 @@ fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
 	if output.status.success() {
 		return Ok(());
 	}
-	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-	Err(IsoError::other(format!(
-		"git worktree remove (exit {}): {stderr}",
-		output.status.code().unwrap_or(-1)
-	)))
+	Err(command_failed("git worktree remove", output.status.code().unwrap_or(-1), &output.stderr))
 }
 
 /// Replicate `lower`'s live working tree on top of a freshly-checked-out
@@ -234,19 +229,27 @@ fn git_capture(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 			}
 		})?;
 	if !output.status.success() {
-		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-		return Err(IsoError::other(format!(
-			"git {} (exit {}): {stderr}",
-			args.join(" "),
-			output.status.code().unwrap_or(-1)
-		)));
+		return Err(command_failed(
+			format_args!("git {}", args.join(" ")),
+			output.status.code().unwrap_or(-1),
+			&output.stderr,
+		));
 	}
 	Ok(output.stdout)
 }
 
 fn git_apply(cwd: &Path, patch: &[u8], extra: &[&str]) -> IsoResult<()> {
-	use std::io::Write as _;
-	let mut child = std::process::Command::new("git")
+	git_apply_with_program(Path::new("git"), cwd, patch, extra)
+}
+
+fn git_apply_with_program(
+	program: &Path,
+	cwd: &Path,
+	patch: &[u8],
+	extra: &[&str],
+) -> IsoResult<()> {
+	use std::io::{Read as _, Write as _};
+	let mut child = std::process::Command::new(program)
 		.arg("-C")
 		.arg(cwd)
 		.args(["apply", "--binary", "--whitespace=nowarn"])
@@ -264,26 +267,38 @@ fn git_apply(cwd: &Path, patch: &[u8], extra: &[&str]) -> IsoResult<()> {
 				IsoError::other(format!("spawn git apply: {err}"))
 			}
 		})?;
-	{
-		let stdin = child
+	let mut stderr = child
+		.stderr
+		.take()
+		.ok_or_else(|| IsoError::other("git apply: child stderr was not piped".to_string()))?;
+	let stderr_reader = std::thread::Builder::new()
+		.name("pi-iso-git-apply-stderr".to_string())
+		.spawn(move || {
+			let mut bytes = Vec::new();
+			stderr.read_to_end(&mut bytes).map(|_| bytes)
+		})
+		.map_err(|err| IsoError::other(format!("spawn git apply stderr reader: {err}")))?;
+	let write_result = {
+		let mut stdin = child
 			.stdin
-			.as_mut()
+			.take()
 			.ok_or_else(|| IsoError::other("git apply: child stdin was not piped".to_string()))?;
-		stdin
-			.write_all(patch)
-			.map_err(|err| IsoError::other(format!("write patch to git apply: {err}")))?;
-	}
-	let output = child
-		.wait_with_output()
+		let result = stdin.write_all(patch);
+		drop(stdin);
+		result
+	};
+	let status = child
+		.wait()
 		.map_err(|err| IsoError::other(format!("wait git apply: {err}")))?;
-	if output.status.success() {
+	let stderr = stderr_reader
+		.join()
+		.map_err(|_| IsoError::other("wait git apply: stderr reader panicked".to_string()))?
+		.map_err(|err| IsoError::other(format!("read git apply stderr: {err}")))?;
+	if status.success() {
+		write_result.map_err(|err| IsoError::other(format!("write patch to git apply: {err}")))?;
 		return Ok(());
 	}
-	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-	Err(IsoError::other(format!(
-		"git apply (exit {}): {stderr}",
-		output.status.code().unwrap_or(-1)
-	)))
+	Err(command_failed("git apply", status.code().unwrap_or(-1), &stderr))
 }
 
 /// Copy a single path (regular file, symlink, or directory) from `src`

@@ -20,7 +20,11 @@ function createSession(): AgentSession {
 		agent: new Agent({ initialState: { model: alpha, systemPrompt: [], tools: [], messages: [] } }),
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated(),
-		modelRegistry: { getAvailable: () => [alpha, beta, gamma], getApiKey: async () => "key" } as never,
+		modelRegistry: {
+			getAvailable: () => [alpha, beta, gamma],
+			getApiKey: async () => "key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 	});
 }
 

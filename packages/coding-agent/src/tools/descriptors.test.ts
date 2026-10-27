@@ -35,6 +35,7 @@ function makeSession(overrides: Record<string, unknown> = {}): any {
 		"astGrep.enabled": true,
 		"astEdit.enabled": true,
 		"renderMermaid.enabled": true,
+		"reportIssue.enabled": true,
 		"web_search.enabled": true,
 		"calc.enabled": true,
 		"skill.enabled": true,
@@ -128,6 +129,7 @@ describe("tool descriptor compatibility gate", () => {
 			"skill",
 			"goal",
 			"move_session",
+			"report_issue",
 		];
 		expect(Object.keys(BUILTIN_TOOLS)).toEqual(expectedBuiltin);
 		expect(Object.keys(BUILTIN_TOOL_DESCRIPTORS)).toEqual(expectedBuiltin);
@@ -291,6 +293,7 @@ describe("tool descriptor compatibility gate", () => {
 			"astGrep.enabled": false,
 			"astEdit.enabled": false,
 			"renderMermaid.enabled": false,
+			"reportIssue.enabled": false,
 			"web_search.enabled": false,
 			"calc.enabled": false,
 			"skill.enabled": false,
@@ -313,6 +316,7 @@ describe("tool descriptor compatibility gate", () => {
 			"ast_grep",
 			"ast_edit",
 			"render_mermaid",
+			"report_issue",
 			"web_search",
 			"calc",
 			"skill",
@@ -736,6 +740,35 @@ describe("tool descriptor compatibility gate", () => {
 			}),
 		).toThrow('Validation failed for tool "ask"');
 	});
+	test("loaded and deferred asks reject missing interview metadata and empty siblings with actionable corrections", async () => {
+		for (const stage of ["topology", "post-topology"] as const) {
+			const session = makeSession({ "tools.discoveryMode": "all" });
+			session.hasUI = true;
+			session.getDeepInterviewAskStage = () => stage;
+			const eager = await BUILTIN_TOOL_DESCRIPTORS.ask.load(session);
+			const lazy = (await createTools(session)).find(tool => tool.name === "ask");
+			if (!eager || !lazy) throw new Error("expected eager and deferred asks");
+			const ordinary = {
+				id: "dot-gjc-topology",
+				question: "Round 0 | Topology confirmation\n\nDoes this scope match?",
+				options: [{ label: "Looks right" }],
+				workflowGate: { stage: "deep-interview", kind: "question" },
+			};
+			for (const [arguments_, correction] of [
+				[{ questions: [ordinary] }, "require structured deepInterview metadata"],
+				[{ questions: [{ ...ordinary, deepInterview: null }] }, "require structured deepInterview metadata"],
+				[{ questions: [ordinary, { id: "metadata", question: "", options: [] }] }, "remove empty extra questions"],
+				[{ questions: [ordinary, ordinary] }, "require exactly one question"],
+			] as const) {
+				for (const tool of [eager, lazy]) {
+					expect(() =>
+						validateToolArguments(tool, { type: "toolCall", id: "incident", name: "ask", arguments: arguments_ }),
+					).toThrow(correction);
+				}
+			}
+		}
+	});
+
 	test("deferred ask validation matches eager AskTool on adversarial contracts", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });
 		session.hasUI = true;
@@ -932,6 +965,46 @@ describe("tool descriptor compatibility gate", () => {
 		expect((normalizedBisect.parameters as any).properties?._i).toBeUndefined();
 		expect((normalizedWrite.parameters as any).properties?._i).toBeDefined();
 	});
+	for (const staleOutcome of ["resolved", "rejected"] as const) {
+		test(`session move invalidation keeps a newer load when the old load ${staleOutcome}`, async () => {
+			const first = Promise.withResolvers<AgentTool>();
+			const second = Promise.withResolvers<AgentTool>();
+			const oldTool = syntheticTool();
+			const newTool = syntheticTool();
+			let loads = 0;
+			const session = makeSession();
+			const descriptor: ToolDescriptor = {
+				metadata: { name: "synthetic" },
+				presentation: { label: "Synthetic" },
+				isAvailable: () => true,
+				load: () => (++loads === 1 ? first.promise : second.promise),
+			};
+			const lazy = new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session);
+			const oldLoad = lazy.materialize().then(
+				tool => ({ tool, error: undefined }),
+				error => ({ tool: undefined, error }),
+			);
+			await Promise.resolve();
+			expect(loads).toBe(1);
+			lazy.invalidateForSessionMove();
+			const newLoad = lazy.materialize();
+			await Promise.resolve();
+			expect(loads).toBe(2);
+			if (staleOutcome === "resolved") first.resolve(oldTool);
+			else first.reject(new Error("old context load failed"));
+			const oldResult = await oldLoad;
+			if (staleOutcome === "resolved") expect(oldResult.tool).toBe(oldTool);
+			else expect(String(oldResult.error)).toContain("old context load failed");
+			const joinedLoad = lazy.materialize();
+			await Promise.resolve();
+			expect(loads).toBe(2);
+			second.resolve(newTool);
+			expect(await newLoad).toBe(newTool);
+			expect(await joinedLoad).toBe(newTool);
+			expect(await lazy.materialize()).toBe(newTool);
+		});
+	}
+
 	test("concurrent lazy first use shares one load and cleanup registration", async () => {
 		let loads = 0;
 		let cleanupRegistrations = 0;

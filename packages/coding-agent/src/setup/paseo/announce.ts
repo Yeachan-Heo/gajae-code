@@ -152,7 +152,12 @@ export function parseDaemonListen(raw: string): PaseoDaemonTarget | undefined {
 	const withoutQuery = authority.split("?")[0] ?? "";
 	const separator = withoutQuery.lastIndexOf(":");
 	if (separator <= 0) return undefined;
-	const port = Number(withoutQuery.slice(separator + 1));
+	// Digits only, like the bare-port branch above: `Number()` also accepts hex
+	// (`0x1A0B`), exponents (`1e3`), decimals and padding, which would probe a
+	// different port than the raw spelling handed to `paseo import`.
+	const portText = withoutQuery.slice(separator + 1);
+	if (!/^\d+$/.test(portText)) return undefined;
+	const port = Number(portText);
 	if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return undefined;
 	const host = withoutQuery.slice(0, separator).replace(/^\[|]$/g, "");
 	return host ? { kind: "tcp", host, port } : undefined;

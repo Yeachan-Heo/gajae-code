@@ -9,7 +9,11 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AuthCredentialSelector, CredentialRankingMode } from "@gajae-code/ai/core";
+import type {
+	AuthCredentialSelector,
+	ConfiguredCredentialPreference,
+	CredentialRankingMode,
+} from "@gajae-code/ai/core";
 import { $credentialEnv, getAgentDbPath, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { readSecureTokenFile } from "./secure-token-file";
@@ -27,6 +31,8 @@ export interface StartupAuthConfigSnapshot {
 	credentialPinStoreIdentity?: string;
 	credentialRankingMode: CredentialRankingMode;
 	credentialPins: Readonly<Record<string, string>>;
+	/** Ordered soft per-provider preferences; only portable email/`account:` selectors are accepted. */
+	credentialPreferences: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 }
 
 export type StartupAuthConfigErrorKind =
@@ -37,7 +43,8 @@ export type StartupAuthConfigErrorKind =
 	| "invalid-broker"
 	| "invalid-gateway"
 	| "invalid-ranking-mode"
-	| "invalid-credential-pins";
+	| "invalid-credential-pins"
+	| "invalid-credential-preferences";
 
 /** A malformed startup-auth config aborts resolution rather than downgrading to local authority. */
 export class StartupAuthConfigError extends Error {
@@ -64,6 +71,7 @@ const LEGACY_LITERAL_AUTH_KEYS = new Set([
 	"auth.broker.token",
 	"auth.credentialRankingMode",
 	"auth.credentialPins",
+	"auth.credentialPreferences",
 ]);
 
 function configPathForAgentDir(agentDir: string): string {
@@ -78,7 +86,7 @@ function shortenConfigPath(configPath: string): string {
 	return absolutePath.startsWith(homePrefix) ? `~${absolutePath.slice(homePath.length)}` : absolutePath;
 }
 
-function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
+export function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
 	return new StartupAuthConfigError(kind, configPathForAgentDir(agentDir));
 }
 
@@ -98,6 +106,69 @@ export function parsePersistedCredentialSelector(value: string): AuthCredentialS
 
 export function isValidPersistedCredentialSelector(value: string): boolean {
 	return parsePersistedCredentialSelector(value) !== undefined;
+}
+
+/** JSON-schema pattern for a preference account; shared with {@link parsePreferenceAccount}. */
+export const PREFERENCE_ACCOUNT_PATTERN = "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$";
+
+/**
+ * Parse one `auth.credentialPreferences` account: a bare email, `email:<address>`, or `account:<id>`. Numeric row ids
+ * are excluded: they are bound to one credential store, and a preference has no store-identity binding to detect a
+ * retargeted row.
+ */
+export function parsePreferenceAccount(value: string): AuthCredentialSelector | undefined {
+	const trimmed = value.trim();
+	const selector = parsePersistedCredentialSelector(trimmed);
+	if (selector) return selector.kind === "id" ? undefined : selector;
+	return /^[^@\s:]+@[^@\s]+$/.test(trimmed) ? { kind: "email", value: trimmed } : undefined;
+}
+
+/** A preference cap accepts (0, 100]; 100 moves past the account only once it is blocked. */
+export function isValidCredentialPreferenceCap(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 100;
+}
+
+/** Canonical config text for one preference entry: the account, or a one-key `{ account: cap }` mapping. */
+export type CredentialPreferenceEntryValue = string | Readonly<Record<string, number>>;
+
+function parseCredentialPreferenceEntry(value: unknown): ConfiguredCredentialPreference | undefined {
+	if (typeof value === "string") {
+		const selector = parsePreferenceAccount(value);
+		return selector ? { selector } : undefined;
+	}
+	const entry = asRecord(value);
+	const fields = entry ? Object.entries(entry) : [];
+	if (fields.length !== 1) return undefined;
+	const [account, cap] = fields[0]!;
+	const selector = parsePreferenceAccount(account);
+	if (!selector || !isValidCredentialPreferenceCap(cap)) return undefined;
+	return cap === 100 ? { selector } : { selector, maxUsedFraction: cap / 100 };
+}
+
+function preferenceSelectorKey(selector: AuthCredentialSelector): string {
+	return `${selector.kind}:${selector.kind === "email" ? selector.value.toLowerCase() : selector.value}`;
+}
+
+/**
+ * Parse one provider's `auth.credentialPreferences` value: a single account, or a non-empty ordered list whose
+ * entries are an account (`me@example.com`) or an account with a usage cap in percent (`me@example.com: 75`).
+ * Returns undefined for any invalid value, including an account listed twice, so a typo fails closed instead of
+ * silently changing the order.
+ */
+export function parseCredentialPreferenceList(value: unknown): ConfiguredCredentialPreference[] | undefined {
+	const rawEntries = Array.isArray(value) ? value : [value];
+	if (rawEntries.length === 0) return undefined;
+	const entries: ConfiguredCredentialPreference[] = [];
+	const seen = new Set<string>();
+	for (const rawEntry of rawEntries) {
+		const entry = parseCredentialPreferenceEntry(rawEntry);
+		if (!entry) return undefined;
+		const key = preferenceSelectorKey(entry.selector);
+		if (seen.has(key)) return undefined;
+		seen.add(key);
+		entries.push(entry);
+	}
+	return entries;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -145,6 +216,10 @@ function throwLegacyLiteralKeyError(keys: string[]): never {
 			"  credentialRankingMode: balanced\n" +
 			"  credentialPins:\n" +
 			"    <provider>: id:<positive-id>\n" +
+			"  credentialPreferences:\n" +
+			"    <provider>:\n" +
+			"      - <email>\n" +
+			"      - <email>: <max used percent, above 0 and at most 100>\n" +
 			"Do not copy secret values into command output; rewrite the file by hand.",
 	);
 }
@@ -172,11 +247,41 @@ function readCredentialPins(
 	return result;
 }
 
+function readCredentialPreferences(
+	auth: Record<string, unknown> | undefined,
+	configPath: string,
+): Readonly<Record<string, readonly ConfiguredCredentialPreference[]>> {
+	const rawPreferences = auth?.credentialPreferences;
+	if (rawPreferences === undefined) return {};
+	const preferences = asRecord(rawPreferences);
+	if (!preferences) throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
+
+	const result: Record<string, readonly ConfiguredCredentialPreference[]> = {};
+	for (const [provider, rawList] of Object.entries(preferences)) {
+		const normalizedProvider = provider.trim();
+		if (normalizedProvider.length === 0 || /[\u0000-\u001f\u007f]/u.test(normalizedProvider)) {
+			throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
+		}
+		const entries = parseCredentialPreferenceList(rawList);
+		if (!entries) throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
+		result[normalizedProvider] = entries;
+	}
+	return result;
+}
+
 interface GlobalStartupAuthYaml {
 	auth: Record<string, unknown> | undefined;
 	credentialPinStoreIdentity: string | undefined;
 	credentialPins: Readonly<Record<string, string>>;
+	credentialPreferences: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 }
+
+const EMPTY_GLOBAL_STARTUP_AUTH: GlobalStartupAuthYaml = {
+	auth: undefined,
+	credentialPinStoreIdentity: undefined,
+	credentialPins: {},
+	credentialPreferences: {},
+};
 
 async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartupAuthYaml> {
 	const configPath = configPathForAgentDir(agentDir);
@@ -184,11 +289,11 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 	try {
 		raw = await Bun.file(configPath).text();
 	} catch (error) {
-		if (isEnoent(error)) return { auth: undefined, credentialPinStoreIdentity: undefined, credentialPins: {} };
+		if (isEnoent(error)) return EMPTY_GLOBAL_STARTUP_AUTH;
 		logger.warn("startup auth config.yml unreadable", { path: shortenConfigPath(configPath), cause: "unreadable" });
 		throw startupAuthConfigError(agentDir, "unreadable");
 	}
-	if (raw.trim() === "") return { auth: undefined, credentialPinStoreIdentity: undefined, credentialPins: {} };
+	if (raw.trim() === "") return EMPTY_GLOBAL_STARTUP_AUTH;
 
 	let parsed: unknown;
 	try {
@@ -211,7 +316,7 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 	const legacyKeys = Object.keys(root).filter(key => LEGACY_LITERAL_AUTH_KEYS.has(key));
 	if (legacyKeys.length > 0) throwLegacyLiteralKeyError(legacyKeys);
 
-	if (root.auth === undefined) return { auth: undefined, credentialPinStoreIdentity: undefined, credentialPins: {} };
+	if (root.auth === undefined) return EMPTY_GLOBAL_STARTUP_AUTH;
 	const auth = asRecord(root.auth);
 	if (!auth) throw startupAuthConfigError(agentDir, "invalid-auth");
 
@@ -234,12 +339,13 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 		throw startupAuthConfigError(agentDir, "invalid-ranking-mode");
 	}
 	const credentialPins = readCredentialPins(auth, configPath);
+	const credentialPreferences = readCredentialPreferences(auth, configPath);
 	const rawCredentialPinStoreIdentity = auth.credentialPinStoreIdentity;
 	const credentialPinStoreIdentity =
 		typeof rawCredentialPinStoreIdentity === "string" && rawCredentialPinStoreIdentity.trim().length > 0
 			? rawCredentialPinStoreIdentity.trim()
 			: undefined;
-	return { auth, credentialPinStoreIdentity, credentialPins };
+	return { auth, credentialPinStoreIdentity, credentialPins, credentialPreferences };
 }
 
 async function readTokenFile(): Promise<string | undefined> {
@@ -253,7 +359,8 @@ async function readTokenFile(): Promise<string | undefined> {
  * cannot influence credential selection.
  */
 export async function resolveStartupAuthConfig(agentDir: string = getAgentDir()): Promise<StartupAuthConfigSnapshot> {
-	const { auth, credentialPinStoreIdentity, credentialPins } = await readGlobalStartupAuthYaml(agentDir);
+	const { auth, credentialPinStoreIdentity, credentialPins, credentialPreferences } =
+		await readGlobalStartupAuthYaml(agentDir);
 	const broker = asRecord(auth?.broker);
 	const envUrl = $credentialEnv("GJC_AUTH_BROKER_URL")?.trim();
 	const envToken = $credentialEnv("GJC_AUTH_BROKER_TOKEN")?.trim();
@@ -293,5 +400,6 @@ export async function resolveStartupAuthConfig(agentDir: string = getAgentDir())
 		...(credentialPinStoreIdentity ? { credentialPinStoreIdentity } : {}),
 		credentialRankingMode: rankingMode,
 		credentialPins,
+		credentialPreferences,
 	};
 }

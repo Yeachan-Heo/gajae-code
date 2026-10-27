@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { isRecord } from "@gajae-code/utils";
-import { hasRootMarkers, resolveCommand } from "../lsp/config";
+import { hasRootMarkers, resolveTrustedCommand } from "../lsp/config";
+import { isProjectControlledPath } from "../lsp/path-trust";
 import DEFAULTS from "./defaults.json" with { type: "json" };
 import type { DapAdapterConfig, DapResolvedAdapter } from "./types";
 
@@ -48,11 +49,20 @@ export function getAdapterConfigs(): Record<string, DapAdapterConfig> {
 	return { ...DEFAULT_ADAPTERS };
 }
 
-export function resolveAdapter(adapterName: string, cwd: string): DapResolvedAdapter | null {
+/**
+ * `trustCwds` are extra trust roots, such as the session workspace when the command
+ * cwd is a different directory. A command controlled by any of them is refused.
+ */
+export function resolveAdapter(
+	adapterName: string,
+	cwd: string,
+	trustCwds?: readonly string[],
+): DapResolvedAdapter | null {
 	const config = DEFAULT_ADAPTERS[adapterName];
 	if (!config) return null;
-	const resolvedCommand = resolveCommand(config.command, cwd);
+	const resolvedCommand = resolveTrustedCommand(config.command, cwd);
 	if (!resolvedCommand) return null;
+	if (trustCwds?.some(root => isProjectControlledPath(resolvedCommand, root))) return null;
 	return {
 		name: adapterName,
 		command: config.command,
@@ -67,15 +77,15 @@ export function resolveAdapter(adapterName: string, cwd: string): DapResolvedAda
 	};
 }
 
-export function getAvailableAdapters(cwd: string): DapResolvedAdapter[] {
+export function getAvailableAdapters(cwd: string, trustCwds?: readonly string[]): DapResolvedAdapter[] {
 	return Object.keys(DEFAULT_ADAPTERS)
-		.map(name => resolveAdapter(name, cwd))
+		.map(name => resolveAdapter(name, cwd, trustCwds))
 		.filter((adapter): adapter is DapResolvedAdapter => adapter !== null);
 }
 
-function getMatchingAdapters(program: string, cwd: string): DapResolvedAdapter[] {
+function getMatchingAdapters(program: string, cwd: string, trustCwds?: readonly string[]): DapResolvedAdapter[] {
 	const extension = path.extname(program).toLowerCase();
-	const available = getAvailableAdapters(cwd);
+	const available = getAvailableAdapters(cwd, trustCwds);
 	if (!extension) {
 		// For extensionless binaries, only consider native debuggers (gdb, lldb-dap)
 		// or adapters that match by root markers. Don't silently fall back to
@@ -124,20 +134,30 @@ function sortAdaptersForLaunch(program: string, cwd: string, adapters: DapResolv
 	return rootAware.map(entry => entry.adapter);
 }
 
-export function selectLaunchAdapter(program: string, cwd: string, adapterName?: string): DapResolvedAdapter | null {
+export function selectLaunchAdapter(
+	program: string,
+	cwd: string,
+	adapterName?: string,
+	trustCwds?: readonly string[],
+): DapResolvedAdapter | null {
 	if (adapterName) {
-		return resolveAdapter(adapterName, cwd);
+		return resolveAdapter(adapterName, cwd, trustCwds);
 	}
-	const matches = getMatchingAdapters(program, cwd);
+	const matches = getMatchingAdapters(program, cwd, trustCwds);
 	const sorted = sortAdaptersForLaunch(program, cwd, matches);
 	return sorted[0] ?? null;
 }
 
-export function selectAttachAdapter(cwd: string, adapterName?: string, port?: number): DapResolvedAdapter | null {
+export function selectAttachAdapter(
+	cwd: string,
+	adapterName?: string,
+	port?: number,
+	trustCwds?: readonly string[],
+): DapResolvedAdapter | null {
 	if (adapterName) {
-		return resolveAdapter(adapterName, cwd);
+		return resolveAdapter(adapterName, cwd, trustCwds);
 	}
-	const available = getAvailableAdapters(cwd);
+	const available = getAvailableAdapters(cwd, trustCwds);
 	if (port !== undefined) {
 		const debugpy = available.find(adapter => adapter.name === "debugpy");
 		if (debugpy) return debugpy;

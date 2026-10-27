@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel, THINKING_CONTROL_MODES } from "@gajae-code/ai";
+import { getBundledModel, getBundledModels, THINKING_CONTROL_MODES } from "@gajae-code/ai";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
@@ -11,19 +11,34 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	modelSupportsReasoningControl,
 	requireSupportedEffort,
+	requiresAnthropicThinkingDisableWhenOff,
+	supportsAnthropicAdaptiveThinkingDisplay,
 } from "@gajae-code/ai/model-thinking";
-import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
+import type { Api, Context, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
+import { hookFetch } from "@gajae-code/utils";
+import { streamSimple } from "../src/stream";
 
 const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
 	"alibaba-token-plan": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+	google: "https://generativelanguage.googleapis.com/v1beta",
+	kilo: "https://api.kilo.ai/api/gateway",
 	"kimi-code": "https://api.kimi.com/coding/v1",
 	"opencode-go": "https://opencode.ai/zen/go/v1",
 	"opencode-zen": "https://opencode.ai/zen/v1",
 	"openai-codex": "https://chatgpt.com/backend-api",
 	openrouter: "https://openrouter.ai/api/v1",
+	"vercel-ai-gateway": "https://ai-gateway.vercel.sh",
 	xai: "https://api.x.ai/v1",
 	zai: "https://api.z.ai/v1",
 };
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -89,6 +104,11 @@ describe("model thinking metadata", () => {
 			api: "openai-completions",
 			provider: "xai",
 		});
+		const grok47 = createModel({
+			id: "grok-4.7",
+			api: "openai-completions",
+			provider: "xai",
+		});
 		const grok45Preview = createModel({
 			id: "grok-4.5-preview",
 			api: "openai-completions",
@@ -115,6 +135,7 @@ describe("model thinking metadata", () => {
 			minLevel: Effort.Low,
 			maxLevel: Effort.XHigh,
 		});
+		expect(grok47.thinking).toEqual(grok46.thinking);
 		expect(grok45Preview.thinking).toEqual(grok45.thinking);
 		expect(grok5.thinking).toEqual(grok45.thinking);
 		expect(grok420.thinking).toEqual({
@@ -127,6 +148,8 @@ describe("model thinking metadata", () => {
 		expect(() => requireSupportedEffort(grok46, Effort.Minimal)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok46, Effort.Max)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok5, Effort.XHigh)).toThrow(/not supported/);
+		expect(requireSupportedEffort(grok47, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(() => requireSupportedEffort(grok47, Effort.Max)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok420, Effort.XHigh)).toThrow(/not supported/);
 	});
 
@@ -174,6 +197,23 @@ describe("model thinking metadata", () => {
 			levels: [Effort.Low, Effort.High, Effort.Max],
 		});
 		expect(requireSupportedEffort(glm, Effort.Max)).toBe(Effort.Max);
+	});
+
+	it("exposes the full budget ladder including max for GLM Coding Plan GLM-5.3 models", () => {
+		for (const id of ["glm-5.3", "glm-5.3-flash"] as const) {
+			const model = createModel({
+				id,
+				api: "anthropic-messages",
+				provider: "glm-zcode",
+			});
+			expect(model.thinking).toEqual({
+				mode: "budget",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.Max,
+			});
+			expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+			expect(clampThinkingLevelForModel(model, Effort.Max)).toBe(Effort.Max);
+		}
 	});
 
 	it("stores supported efforts for Codex mini in model metadata", () => {
@@ -252,6 +292,50 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToGoogleThinkingLevel(flash37, Effort.High)).toBe("HIGH");
 		expect(() => requireSupportedEffort(flash37, Effort.Minimal)).toThrow(/not supported/);
 		expect(requireSupportedEffort(flash36, Effort.Minimal)).toBe(Effort.Minimal);
+	});
+
+	it("sends thinkingLevel for Gemini 4 Argon with low/medium/high only", () => {
+		const argon = createModel({
+			id: "gemini-4-argon",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+
+		expect(argon.thinking).toEqual({
+			mode: "google-level",
+			minLevel: Effort.Low,
+			maxLevel: Effort.High,
+		});
+		expect(mapEffortToGoogleThinkingLevel(argon, Effort.Low)).toBe("LOW");
+		expect(mapEffortToGoogleThinkingLevel(argon, Effort.Medium)).toBe("MEDIUM");
+		expect(mapEffortToGoogleThinkingLevel(argon, Effort.High)).toBe("HIGH");
+		expect(() => requireSupportedEffort(argon, Effort.Minimal)).toThrow(/not supported/);
+	});
+
+	it("sends thinkingLevel through the Google transport for Gemini 4 Argon", async () => {
+		const argon = createModel({
+			id: "gemini-4-argon",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+		const context: Context = {
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		};
+		let requestBody: string | undefined;
+		using _hook = hookFetch((_input, init) => {
+			requestBody = typeof init?.body === "string" ? init.body : undefined;
+			return new Response('{"error":{"message":"captured request"}}', { status: 400 });
+		});
+
+		await streamSimple(argon, context, { apiKey: "test-key", reasoning: Effort.High }).result();
+
+		const request = JSON.parse(requestBody ?? "{}") as {
+			generationConfig?: {
+				thinkingConfig?: { thinkingLevel?: string; thinkingBudget?: number };
+			};
+		};
+		expect(request.generationConfig?.thinkingConfig?.thinkingLevel).toBe("HIGH");
+		expect(request.generationConfig?.thinkingConfig?.thinkingBudget).toBeUndefined();
 	});
 
 	it("encodes anthropic transport mode in metadata", () => {
@@ -368,9 +452,152 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
 	});
+
+	it("resolves Claude Haiku 5.x as adaptive with a medium default while Haiku 4.5 keeps the generic ladder", () => {
+		const haiku55 = createModel({ id: "claude-haiku-5-5", api: "anthropic-messages", provider: "anthropic" });
+		const haiku55Bedrock = createModel({
+			id: "us.anthropic.claude-haiku-5-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
+		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
+
+		expect(haiku55.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		// AWS documents the same effort range and medium default for Converse.
+		expect(haiku55Bedrock.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.Max)).toBe("max");
+		// Haiku 4.5 predates the policy: unchanged budget ladder, no default.
+		expect(haiku45.thinking?.mode).toBe("budget");
+		expect(haiku45.thinking?.defaultLevel).toBeUndefined();
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Medium)).toBe("medium");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
+	});
+
+	it("keeps the bundled Haiku 5.5 rows aligned with the thinking policy", () => {
+		const direct = getBundledModel("anthropic", "claude-haiku-5-5");
+		expect(direct.thinking?.mode).toBe("anthropic-adaptive");
+		expect(direct.thinking?.maxLevel).toBe(Effort.Max);
+		expect(direct.thinking?.defaultLevel).toBe(Effort.Medium);
+		for (const id of [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		]) {
+			const bedrock = getBundledModel("amazon-bedrock", id as never);
+			expect(bedrock.thinking?.mode).toBe("anthropic-adaptive");
+			expect(bedrock.thinking?.maxLevel).toBe(Effort.Max);
+			expect(bedrock.thinking?.defaultLevel).toBe(Effort.Medium);
+		}
+	});
+
+	it("holds seeded Haiku parser and policy properties for catalog IDs (seed 0x5eed5505)", () => {
+		const haikuVersionPattern = /claude-haiku-(\d{1,2})-(\d{1,2})\b/;
+		const directCatalogCases = getBundledModels("anthropic").flatMap(model => {
+			if (model.api !== "anthropic-messages") return [];
+			const match = haikuVersionPattern.exec(model.id);
+			if (!match) return [];
+			return [
+				{
+					id: model.id,
+					api: "anthropic-messages" as const,
+					provider: "anthropic" as const,
+					major: Number(match[1]),
+					minor: Number(match[2]),
+				},
+			];
+		});
+		const catalogCases = directCatalogCases;
+		const versions = Array.from(new Set(catalogCases.map(({ major, minor }) => `${major}.${minor}`))).sort();
+		const random = seededRandom(0x5eed_5505);
+		const randomInt = (max: number): number => Math.floor(random() * max);
+
+		expect(versions).toContain("4.5");
+		expect(versions).toContain("5.5");
+		for (const version of versions) {
+			const [major, minor] = version.split(".").map(Number);
+			if (major === undefined || minor === undefined) throw new Error(`Invalid catalog version ${version}`);
+			const isHaiku55OrLater = major > 5 || (major === 5 && minor >= 5);
+			for (const api of ["anthropic-messages"] as const) {
+				const candidates = catalogCases.filter(
+					model => model.major === major && model.minor === minor && model.api === api,
+				);
+				expect(candidates.length).toBeGreaterThan(0);
+
+				for (let caseIndex = 0; caseIndex < 32; caseIndex++) {
+					const catalogCase = candidates[randomInt(candidates.length)];
+					if (!catalogCase) throw new Error("Expected a generated Haiku catalog case");
+
+					const model = createModel(catalogCase);
+					const isGeneration5OrLater = major >= 5;
+					const expectedMode = isGeneration5OrLater ? "anthropic-adaptive" : "budget";
+					const expectedDefault = isGeneration5OrLater ? Effort.Medium : undefined;
+					const defaultLevel = model.thinking?.defaultLevel;
+					const supportedEfforts = getSupportedEfforts(model);
+
+					expect(model.thinking?.mode).toBe(expectedMode);
+					expect(defaultLevel).toBe(expectedDefault);
+					if (isHaiku55OrLater) {
+						expect(supportedEfforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+					}
+					if (defaultLevel !== undefined) {
+						expect(supportedEfforts).toContain(defaultLevel);
+					}
+					expect(requiresAnthropicThinkingDisableWhenOff(catalogCase.id)).toBe(isGeneration5OrLater);
+					expect(supportsAnthropicAdaptiveThinkingDisplay(catalogCase.id)).toBe(isGeneration5OrLater);
+				}
+			}
+		}
+	});
 });
 
 describe("generated model policies", () => {
+	it("normalizes negative and non-finite catalog prices without changing valid prices", () => {
+		const model = createModel({ id: "pareto-code", api: "openai-completions", provider: "openrouter" });
+		model.cost = { input: -1_000_000, output: 0.5, cacheRead: Number.NaN, cacheWrite: 0 };
+		const models = [model];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.cost).toEqual({ input: 0, output: 0.5, cacheRead: 0, cacheWrite: 0 });
+	});
+
+	it("caps Gemini 4 Argon output across provider aliases", () => {
+		const models = [
+			createModel({ id: "gemini-4-argon", api: "google-generative-ai", provider: "google" }),
+			createModel({ id: "google/gemini-4-argon", api: "openai-completions", provider: "kilo" }),
+			createModel({ id: "google/gemini-4-argon:batch", api: "openai-completions", provider: "openrouter" }),
+			createModel({ id: "google/gemini-4-argon", api: "anthropic-messages", provider: "vercel-ai-gateway" }),
+		];
+		models[0]!.maxTokens = 1_000_000;
+		models[1]!.maxTokens = 65_536;
+		models[2]!.maxTokens = 943_718;
+		models[3]!.maxTokens = 1_000_000;
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models.map(model => model.maxTokens)).toEqual([65_536, 65_536, 65_536, 65_536]);
+	});
+
+	it("bundles the Argon output cap for gateway aliases", () => {
+		expect(getBundledModel("openrouter", "google/gemini-4-argon:batch")?.maxTokens).toBe(65_536);
+		expect(getBundledModel("vercel-ai-gateway", "google/gemini-4-argon")?.maxTokens).toBe(65_536);
+	});
+
 	it("corrects stale direct xAI Grok reasoning metadata before enrichment", () => {
 		const models = [
 			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),
@@ -426,10 +653,11 @@ describe("generated model policies", () => {
 		expect(nonReasoning[0]?.thinking).toBeUndefined();
 	});
 
-	it("derives conservative thinking config for future direct xAI generations with catalog reasoning", () => {
+	it("advertises xhigh for direct grok-4.7, matching the xAI reasoning contract", () => {
 		const model = createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai" });
 
-		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High });
+		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh });
+		expect(getSupportedEfforts(model)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
 	});
 
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {
@@ -1244,5 +1472,24 @@ describe("model thinking runtime helpers", () => {
 		} satisfies Model<"openai-responses">);
 
 		expect(model.thinking).toBeUndefined();
+	});
+});
+
+describe("supportsAnthropicAdaptiveThinkingDisplay for Sonnet 5+", () => {
+	// Sonnet 5+ defaults adaptive `thinking.display` to "omitted": thinking tokens are billed but no
+	// content streams back unless the request opts in with display: "summarized".
+	it.each([
+		"claude-sonnet-5",
+		"claude-sonnet-5-5",
+		"claude-sonnet-5-5-20261001",
+		"anthropic.claude-sonnet-5-5",
+		"us.anthropic.claude-sonnet-5-5-v1:0",
+	])("opts %s in", id => {
+		expect(supportsAnthropicAdaptiveThinkingDisplay(id)).toBe(true);
+	});
+
+	// Sonnet 4.x adaptive models reject the `display` field.
+	it.each(["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-4-6-20260101"])("keeps %s opted out", id => {
+		expect(supportsAnthropicAdaptiveThinkingDisplay(id)).toBe(false);
 	});
 });

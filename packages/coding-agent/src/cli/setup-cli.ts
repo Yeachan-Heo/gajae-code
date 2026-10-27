@@ -30,14 +30,8 @@ import {
 	runHermesSetup,
 } from "../setup/hermes-setup";
 import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from "../setup/host-plugin-setup";
-import {
-	type PaseoSetupFlags,
-	type PaseoSetupOutcome,
-	PaseoSetupUsageError,
-	runPaseoSetup,
-} from "../setup/paseo/paseo-setup";
+import type { PaseoSetupFlags, PaseoSetupOutcome } from "../setup/paseo/paseo-setup";
 import { checkExitCode } from "../setup/paseo/result-types";
-import { createDefaultPaseoSetupDependencies } from "../setup/paseo/setup-deps";
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
@@ -69,6 +63,7 @@ export interface SetupCommandArgs {
 		baseUrl?: string;
 		apiKeyEnv?: string;
 		model?: string[];
+		discover?: boolean;
 		modelsPath?: string;
 		smoke?: boolean;
 		install?: boolean;
@@ -166,6 +161,7 @@ function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 		flags.baseUrl !== undefined ||
 		flags.apiKeyEnv !== undefined ||
 		flags.model !== undefined ||
+		flags.discover !== undefined ||
 		flags.modelsPath !== undefined
 	);
 }
@@ -264,6 +260,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.apiKeyEnv = args[++i];
 		} else if (arg === "--model" || arg === "--models") {
 			flags.model = [...(flags.model ?? []), args[++i] ?? ""];
+		} else if (arg === "--discover") {
+			flags.discover = true;
 		} else if (arg === "--models-path") {
 			flags.modelsPath = args[++i];
 		} else if (arg === "--remove") {
@@ -425,6 +423,7 @@ async function handleProviderSetup(flags: {
 	apiKeyEnv?: string;
 	model?: string[];
 	modelsPath?: string;
+	discover?: boolean;
 }): Promise<void> {
 	try {
 		const missing: string[] = [];
@@ -433,7 +432,7 @@ async function handleProviderSetup(flags: {
 			if (!flags.provider) missing.push("--provider");
 			if (!flags.baseUrl) missing.push("--base-url");
 			if (!flags.apiKeyEnv) missing.push("--api-key-env");
-			if (!flags.model || flags.model.length === 0) missing.push("--model");
+			if ((!flags.model || flags.model.length === 0) && !flags.discover) missing.push("--model or --discover");
 		}
 		if (missing.length > 0) {
 			throw new Error(
@@ -449,6 +448,7 @@ async function handleProviderSetup(flags: {
 			models: flags.model,
 			modelsPath: flags.modelsPath,
 			force: flags.force,
+			discover: flags.discover,
 		});
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -475,6 +475,14 @@ async function handleProviderSetup(flags: {
  * rather than worked around: a refusal here means the user's files were left
  * exactly as they were.
  */
+/**
+ * Paseo setup reaches config/settings -> model-registry/discovery (~0.9s of
+ * module evaluation). Load it only for `setup paseo` so every other setup
+ * component, notably `setup defaults`, starts without that cost (#5949). Same
+ * lazy-loader shape as the `commands` table in cli-main.ts.
+ */
+const loadPaseoSetup = () => Promise.all([import("../setup/paseo/paseo-setup"), import("../setup/paseo/setup-deps")]);
+
 async function handlePaseoSetup(flags: SetupCommandArgs["flags"]): Promise<void> {
 	const paseoFlags: PaseoSetupFlags = {
 		check: flags.check,
@@ -483,6 +491,7 @@ async function handlePaseoSetup(flags: SetupCommandArgs["flags"]): Promise<void>
 		remove: flags.remove,
 		mpreset: flags.mpreset,
 	};
+	const [{ PaseoSetupUsageError, runPaseoSetup }, { createDefaultPaseoSetupDependencies }] = await loadPaseoSetup();
 	try {
 		const outcome = await runPaseoSetup(paseoFlags, createDefaultPaseoSetupDependencies());
 		if (flags.json) {
@@ -757,7 +766,7 @@ async function confirmImport(count: number): Promise<boolean> {
 }
 
 /**
- * Discover existing Claude Code / Codex CLI credentials and import them into the
+ * Discover existing Claude Code / Codex CLI / Kiro CLI credentials and import them into the
  * gjc credential store after a redacted preview + confirmation. Falls back to
  * manual-setup guidance when nothing importable is found.
  */
@@ -825,7 +834,7 @@ export async function handleCredentialsSetup(
 			for (const line of formatDiscoverySummary(filteredResult)) process.stdout.write(`  ${line}\n`);
 			process.stdout.write(
 				chalk.yellow(
-					`\nNo importable Claude/Codex credentials found. Continue with manual setup:\n` +
+					`\nNo importable Claude/Codex/Kiro CLI credentials found. Continue with manual setup:\n` +
 						`  ${APP_NAME} setup provider   (add an API-compatible provider)\n` +
 						`  ${APP_NAME} (then /login)     (interactive OAuth/subscription login)\n`,
 				),
@@ -921,7 +930,7 @@ ${chalk.bold("Components:")}
   provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
-  credentials Optional: import existing Claude Code / Codex CLI credentials
+  credentials Optional: import existing Claude Code / Codex CLI / Kiro CLI credentials
 
 
 ${chalk.bold("Provider example:")}
@@ -929,9 +938,11 @@ ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset glm
   ${APP_NAME} setup provider --preset cline-pass
   ${APP_NAME} setup provider --preset commandcode-goat
+  ${APP_NAME} setup provider --preset ionet
   ${APP_NAME} setup provider --preset litellm --base-url https://litellm.example.com/v1
   ${APP_NAME} setup provider --preset openai-compatible-proxy --base-url https://gateway.example.com/v1
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
+  MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --discover [--model gpt-example]
 
 ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo
@@ -953,6 +964,7 @@ ${chalk.bold("Options:")}
   --base-url        Provider API base URL (required for proxy presets: litellm, openai-compatible-proxy)
   --api-key-env     Read provider API key from this environment variable
   --model, --models Model id to add (repeat or comma-separate)
+  --discover        Discover models from the provider OpenAI /v1/models endpoint (OpenAI-compatible custom providers; makes --model optional, merges with the live catalog)
   --models-path     Override models config path
   --smoke           Run Hermes MCP setup smoke checks
   --install         Install generated Hermes setup files
@@ -986,7 +998,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup stt              Install speech-to-text dependencies
   ${APP_NAME} setup stt --check      Check if STT dependencies are available
   ${APP_NAME} setup python --check   Check if Python execution is available
-  ${APP_NAME} setup credentials      Discover & import existing Claude/Codex credentials
+  ${APP_NAME} setup credentials      Discover & import existing Claude/Codex/Kiro CLI credentials
   ${APP_NAME} setup credentials --dry-run  Preview importable credentials (redacted)
   ${APP_NAME} setup credentials --yes      Import without an interactive prompt
   ${APP_NAME} setup paseo            Register GJC as a Paseo ACP provider

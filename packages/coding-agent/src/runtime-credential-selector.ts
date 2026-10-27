@@ -6,7 +6,7 @@ export interface CliCredentialSelector {
 	raw: string;
 }
 
-const SELECTOR_KINDS = new Set<AuthCredentialSelectorKind>(["id", "email", "account", "project"]);
+const SELECTOR_KINDS = new Set<AuthCredentialSelectorKind>(["id", "email", "account", "project", "org"]);
 
 function parseSelectorBody(body: string): AuthCredentialSelector | undefined {
 	const separator = body.indexOf(":");
@@ -28,7 +28,7 @@ export function parseCliCredentialSelector(raw: string): CliCredentialSelector {
 	const selector = parseSelectorBody(body);
 	if (!selector || provider === "") {
 		throw new Error(
-			`Invalid --credential selector "${raw}". Use email:name@example.com, id:123, account:<id>, project:<id>, or provider/email:name@example.com.`,
+			`Invalid --credential selector "${raw}". Use email:name@example.com, id:123, account:<id>, project:<id>, org:<organization id or name>, or provider/email:name@example.com.`,
 		);
 	}
 	return { ...(provider ? { provider } : {}), selector, raw };

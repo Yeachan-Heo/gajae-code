@@ -53,9 +53,9 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 		thinkingLevel: primaryThinkingLevel,
 	} = await resolvePrimaryModel(args.model, settings, modelRegistry);
 	const {
-		model: smolModel,
-		apiKey: smolApiKey,
-		thinkingLevel: smolThinkingLevel,
+		model: secondaryModel,
+		apiKey: secondaryApiKey,
+		thinkingLevel: secondaryThinkingLevel,
 	} = await resolveSecondaryCommitModel(settings, modelRegistry, primaryModel, primaryApiKey);
 
 	let stagedFiles = await git.diff.changedFiles(cwd, { cached: true });
@@ -102,9 +102,9 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 		primaryModel,
 		primaryApiKey,
 		primaryThinkingLevel,
-		smolModel,
-		smolApiKey,
-		smolThinkingLevel,
+		secondaryModel,
+		secondaryApiKey,
+		secondaryThinkingLevel,
 		commitSettings,
 	});
 
@@ -148,9 +148,9 @@ async function generateAnalysis(input: {
 	primaryModel: Model<Api>;
 	primaryApiKey: string;
 	primaryThinkingLevel?: ThinkingLevel;
-	smolModel: Model<Api>;
-	smolApiKey: string;
-	smolThinkingLevel?: ThinkingLevel;
+	secondaryModel: Model<Api>;
+	secondaryApiKey: string;
+	secondaryThinkingLevel?: ThinkingLevel;
 	commitSettings: {
 		mapReduceEnabled: boolean;
 		mapReduceMinFiles: number;
@@ -172,9 +172,9 @@ async function generateAnalysis(input: {
 			model: input.primaryModel,
 			apiKey: input.primaryApiKey,
 			thinkingLevel: input.primaryThinkingLevel,
-			smolModel: input.smolModel,
-			smolApiKey: input.smolApiKey,
-			smolThinkingLevel: input.smolThinkingLevel,
+			secondaryModel: input.secondaryModel,
+			secondaryApiKey: input.secondaryApiKey,
+			secondaryThinkingLevel: input.secondaryThinkingLevel,
 			diff: input.diff,
 			stat: input.stat,
 			scopeCandidates: input.scopeCandidates,

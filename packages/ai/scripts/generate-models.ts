@@ -37,7 +37,7 @@ import {
 import { getGitLabDuoModels } from "../src/providers/gitlab-duo";
 import { kiroApiStaticModels } from "../src/providers/kiro-api-key";
 import { JWT_CLAIM_PATH } from "../src/providers/openai-codex/constants";
-import type { Model } from "../src/types";
+import type { Model, OpenAICompat } from "../src/types";
 import { fetchAntigravityDiscoveryModels } from "../src/utils/discovery/antigravity";
 import { fetchCodexModels } from "../src/utils/discovery/codex";
 import type { OAuthProvider } from "../src/utils/oauth/types";
@@ -74,27 +74,72 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
 }
 
 /**
- * Keep the reviewed GPT-6 Astra Codex row available without authenticated
- * discovery. The values mirror OpenAI Codex 0.153.4's bundled model catalog;
- * generated policies apply the public API pricing and freeform tool metadata.
+ * Keep the reviewed GPT-6 Codex rows available without authenticated discovery.
+ * Astra mirrors OpenAI Codex 0.153.4's bundled model catalog; Sol and Luna ship
+ * with the same Codex transport and envelope, whose 272K prompt budget is the
+ * short-context boundary OpenAI publishes for the whole GPT-6 family
+ * (https://developers.openai.com/api/docs/pricing). Generated policies apply the
+ * public API pricing and freeform tool metadata.
+ *
+ * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
+ * so the flagship remains the first Codex suggestion.
  */
-export function injectCodexAstraModel(models: Model[]): void {
-	const astra: Model<"openai-codex-responses"> = {
-		id: "gpt-6-astra",
-		name: "GPT-6-Astra",
+const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number }[] = [
+	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
+	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
+	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+	{ id: "gpt-6-luna", name: "GPT-6 Luna" },
+];
+
+/** Codex GPT-6 ids that are re-injected with unknown limits; seed rows for them are reset. */
+export const CODEX_GPT6_IDS: ReadonlySet<string> = new Set(CODEX_GPT6_MODELS.map(model => model.id));
+
+export function injectCodexGpt6Models(models: Model[]): void {
+	const gpt6 = (id: string, name: string, priority?: number): Model<"openai-codex-responses"> => ({
+		id,
+		name,
 		api: "openai-codex-responses",
 		provider: "openai-codex",
 		baseUrl: "https://chatgpt.com/backend-api",
 		reasoning: true,
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 272_000,
-		maxTokens: 128_000,
+		contextWindow: UNK_CONTEXT_WINDOW,
+		maxTokens: UNK_MAX_TOKENS,
 		preferWebsockets: true,
-		priority: 1,
-	};
-	const hasAstra = models.some(model => model.provider === astra.provider && model.id === astra.id);
-	if (!hasAstra) models.push(astra);
+		...(priority === undefined ? {} : { priority }),
+	});
+	for (const { id, name, priority } of CODEX_GPT6_MODELS) {
+		const model = gpt6(id, name, priority);
+		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);
+		if (!exists) models.push(model);
+	}
+}
+
+const ULTRAFAST_TIER_MODEL_KEYS = new Set([
+	"openai/gpt-6-astra",
+	"openai/gpt-6.1-sol",
+	"openai-codex/gpt-6-astra",
+	"openai-codex/gpt-6.1-sol",
+	"github-copilot/gpt-6-astra",
+	"github-copilot/gpt-6.1-sol",
+	"opencode-zen/gpt-6-astra",
+	"opencode-zen/gpt-6.1-sol",
+]);
+
+const ULTRAFAST_ONLY_PROVIDERS = new Set(["github-copilot", "opencode-zen"]);
+
+/** Preserve reviewed GPT-6 tier capabilities across dynamic catalog regeneration. */
+export function applyUltrafastTierModelPolicies(models: Model[]): void {
+	for (const model of models) {
+		if (!ULTRAFAST_TIER_MODEL_KEYS.has(`${model.provider}/${model.id}`)) continue;
+		const compat: OpenAICompat = { ...(model.compat as OpenAICompat | undefined) };
+		if (ULTRAFAST_ONLY_PROVIDERS.has(model.provider)) delete compat.supportsServiceTier;
+		model.compat = {
+			...compat,
+			supportsUltrafastTier: true,
+		};
+	}
 }
 
 /**
@@ -510,6 +555,59 @@ function inheritModelsDevLimit(value: number, referenceValue: number, unspecifie
 	return value === unspecifiedValue ? referenceValue : value;
 }
 
+export interface SeedLimitPreservation {
+	contextWindow: number | undefined;
+	maxTokens: number | undefined;
+}
+
+/**
+ * Preserve known limits from seed models that will be excluded during regeneration.
+ * This ensures that if discovery fails, we can restore known values instead of
+ * persisting UNK markers that cause premature compaction and capacity understatement.
+ */
+function preserveSeedLimits(
+	prevModelsJson: Record<string, Record<string, Model>>,
+	codexGpt6Ids: ReadonlySet<string>,
+): Map<string, SeedLimitPreservation> {
+	const preserved = new Map<string, SeedLimitPreservation>();
+	for (const models of Object.values(prevModelsJson)) {
+		for (const model of Object.values(models)) {
+			if (model.provider === "openai-codex" && codexGpt6Ids.has(model.id)) {
+				const key = `${model.provider}/${model.id}`;
+				preserved.set(key, {
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+				});
+			}
+		}
+	}
+	return preserved;
+}
+
+/**
+ * Restore known seed limits for models that still have UNK markers after discovery.
+ * This protects against transient external failures (unavailable models.dev, network issues)
+ * that would otherwise overwrite resolved limits with unknown markers.
+ */
+export function restoreSeedLimits(models: Model[], seedLimits: Map<string, SeedLimitPreservation>): Model[] {
+	return models.map(model => {
+		const preserved = seedLimits.get(`${model.provider}/${model.id}`);
+		if (!preserved) {
+			return model;
+		}
+		// Each limit is restored independently: discovery can leave either or both unknown.
+		const contextWindow =
+			model.contextWindow === UNK_CONTEXT_WINDOW
+				? (preserved.contextWindow ?? model.contextWindow)
+				: model.contextWindow;
+		const maxTokens = model.maxTokens === UNK_MAX_TOKENS ? (preserved.maxTokens ?? model.maxTokens) : model.maxTokens;
+		if (contextWindow === model.contextWindow && maxTokens === model.maxTokens) {
+			return model;
+		}
+		return { ...model, contextWindow, maxTokens };
+	});
+}
+
 function applyGlobalModelsDevFallback(models: readonly Model[], modelsDevModels: readonly Model[]): Model[] {
 	const providerScopedKeys = new Set(modelsDevModels.map(model => `${model.provider}/${model.id}`));
 	const globalReferences = createGlobalModelsDevReferenceMap(modelsDevModels);
@@ -521,13 +619,23 @@ function applyGlobalModelsDevFallback(models: readonly Model[], modelsDevModels:
 		if (!reference) {
 			return model;
 		}
+		// For Codex models, inherit all metadata from models.dev to ensure consistency.
+		// For provider-specific models (kiro, junie, etc.), only inherit limits to preserve
+		// their own capability definitions and naming.
+		if (model.provider === "openai-codex") {
+			return {
+				...model,
+				name: reference.name,
+				reasoning: reference.reasoning,
+				input: reference.input,
+				// Fill unknown endpoint limits from same-id models.dev references.
+				contextWindow: inheritModelsDevLimit(model.contextWindow, reference.contextWindow, UNK_CONTEXT_WINDOW),
+				maxTokens: inheritModelsDevLimit(model.maxTokens, reference.maxTokens, UNK_MAX_TOKENS),
+			};
+		}
+		// For other providers, only fill unknown limits, preserving provider-specific metadata.
 		return {
 			...model,
-			name: reference.name,
-			reasoning: reference.reasoning,
-			input: reference.input,
-			// Fill unknown endpoint limits from same-id models.dev references, but keep
-			// provider-specific values when discovery returned them explicitly.
 			contextWindow: inheritModelsDevLimit(model.contextWindow, reference.contextWindow, UNK_CONTEXT_WINDOW),
 			maxTokens: inheritModelsDevLimit(model.maxTokens, reference.maxTokens, UNK_MAX_TOKENS),
 		};
@@ -589,7 +697,7 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 // `claude-opus-*` prefix match: a future generation must be reviewed before we
 // assert capabilities for it. `claude-opus-vision.test.ts` imports this list and
 // fails when the catalog bundles a newer Opus generation than any declared here.
-export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5];
+export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5, 5.5];
 
 /**
  * Known separator-less generation aliases. Upstream normally writes
@@ -662,8 +770,8 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
  * Fetch available Antigravity models from the API using the discovery module.
  * Returns empty array if no auth is available (previous models used as fallback).
  */
-async function fetchAntigravityModels(): Promise<Model<"google-gemini-cli">[]> {
-	const access = await getOAuthAccessFromStorage("google-antigravity");
+export async function fetchAntigravityModels(accessOverride?: OAuthAccess): Promise<Model<"google-gemini-cli">[]> {
+	const access = accessOverride ?? (await getOAuthAccessFromStorage("google-antigravity"));
 	if (!access) {
 		console.log("No Antigravity credentials found, will use previous models");
 		return [];
@@ -673,6 +781,7 @@ async function fetchAntigravityModels(): Promise<Model<"google-gemini-cli">[]> {
 		const discovered = await fetchAntigravityDiscoveryModels({
 			token: access.accessToken,
 			endpoint: ANTIGRAVITY_ENDPOINT,
+			project: access.projectId,
 		});
 		if (discovered === null) {
 			console.warn("Antigravity API fetch failed, will use previous models");
@@ -776,15 +885,21 @@ async function generateModels() {
 	// credentials are unavailable, and ad-hoc model additions all persist
 	// through the existing models.json seed.
 	// Discovery-only providers (local inference servers) — never bundle static models.
+	// Skip Codex gpt-6 models: they will be re-injected with UNK limits to inherit from models.dev.
 	const discoveryOnlyProviders = new Set(["ollama", "sglang", "vllm"]);
+	const codexGpt6Ids = CODEX_GPT6_IDS;
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
+
+	// Preserve known limits from seed models that will be excluded, in case discovery fails
+	const seedLimits = preserveSeedLimits(prevModelsJson as Record<string, Record<string, Model>>, codexGpt6Ids);
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
 		for (const model of Object.values(models)) {
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
 				!discoveryOnlyProviders.has(model.provider) &&
-				!isRetiredBundledModel(model)
+				!isRetiredBundledModel(model) &&
+				!(model.provider === "openai-codex" && codexGpt6Ids.has(model.id))
 			) {
 				allModels.push(model.provider === "openai" ? { ...model, baseUrl: "" } : model);
 			}
@@ -796,16 +911,24 @@ async function generateModels() {
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyClaudeOpusVisionCorrections(allModels);
-	injectCodexAstraModel(allModels);
+	injectCodexGpt6Models(allModels);
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);
+	// Re-apply models.dev fallback after injections to inherit context/token limits
+	// from models.dev for injected models that use UNK_CONTEXT_WINDOW and UNK_MAX_TOKENS.
+	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
+	// Restore known seed limits for Codex models that still have UNK markers after discovery.
+	// This protects against transient failures (unavailable models.dev, network issues) that
+	// would otherwise overwrite known limits with unknown markers.
+	allModels = restoreSeedLimits(allModels, seedLimits);
 	applyGeneratedModelPolicies(allModels);
 	// This provider-specific correction must run after generic policy inference,
 	// which otherwise caps unknown OpenAI-compatible models at `high`.
 	injectMuseSparkModels(allModels);
 	linkOpenAIPromotionTargets(allModels);
 	injectImageGenerationModels(allModels);
+	applyUltrafastTierModelPolicies(allModels);
 
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, Model>> = {};

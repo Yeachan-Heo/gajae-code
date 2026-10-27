@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
@@ -18,7 +19,6 @@ import {
 	prompt,
 	ptree,
 	readSseJson,
-	Snowflake,
 	sanitizeHeaderComponent,
 	untilAborted,
 } from "@gajae-code/utils";
@@ -854,7 +854,7 @@ export function resolveImageRoleModel(
 ): Model | undefined {
 	const roleValue = settings.getModelRole("image");
 	if (!roleValue) return undefined;
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(options?.credentialSessionId);
 	const resolved = resolveModelRoleValue(roleValue, availableModels, {
 		settings,
 		modelRegistry,
@@ -1065,10 +1065,24 @@ function getExtensionForMime(mimeType: string): string {
 
 async function saveImageToTemp(image: InlineImageData): Promise<string> {
 	const ext = getExtensionForMime(image.mimeType);
-	const filename = `gjc-image-${Snowflake.next()}.${ext}`;
-	const filepath = path.join(os.tmpdir(), filename);
-	await Bun.write(filepath, Buffer.from(image.data, "base64"));
-	return filepath;
+	// Random directory plus an exclusive create: a preexisting symlink under the
+	// shared temp directory is not opened, and the image is not left world-readable.
+	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-image-"));
+	try {
+		if (process.platform !== "win32") await fs.promises.chmod(tempDir, 0o700);
+		const filepath = path.join(tempDir, `image.${ext}`);
+		const handle = await fs.promises.open(filepath, "wx", 0o600);
+		try {
+			await handle.writeFile(Buffer.from(image.data, "base64"));
+		} finally {
+			await handle.close();
+		}
+		if (process.platform !== "win32") await fs.promises.chmod(filepath, 0o600);
+		return filepath;
+	} catch (error) {
+		await fs.promises.rm(tempDir, { recursive: true, force: true });
+		throw error;
+	}
 }
 
 async function saveImagesToTemp(images: InlineImageData[]): Promise<string[]> {
@@ -1273,7 +1287,7 @@ function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string
 		headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 		headers.set(
 			"User-Agent",
-			`pi/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
+			`${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
 		);
 		if (sessionId) {
 			headers.set(OPENAI_HEADERS.CONVERSATION_ID, sessionId);

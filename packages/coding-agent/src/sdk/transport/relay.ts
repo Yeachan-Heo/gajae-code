@@ -3,6 +3,7 @@ import type { Readable, Writable } from "node:stream";
 export const REQUEST_FRAME_BYTES = 256 * 1024;
 export const DEFAULT_PENDING_CEILING_BYTES = 8 * 1024 * 1024;
 export const MIN_PENDING_CEILING_BYTES = REQUEST_FRAME_BYTES;
+export const DEFAULT_UPSTREAM_HELLO_TIMEOUT_MS = 10_000;
 
 export type RelayDirection = "downstream->ws" | "ws->downstream";
 export type TransportError = {
@@ -33,6 +34,19 @@ export type RelayWebSocket = {
 	addEventListener(type: string, listener: (event: RelayWebSocketEvent) => void, options?: { once?: boolean }): void;
 	removeEventListener(type: string, listener: (event: RelayWebSocketEvent) => void): void;
 };
+
+/** The upstream host's hello marks the point at which downstream frames may be sent. */
+function isServerHello(text: string): boolean {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return false;
+	}
+	return Boolean(
+		parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { type?: unknown }).type === "hello",
+	);
+}
 
 export type RelayOptions = {
 	url: string;
@@ -112,6 +126,14 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	let pendingToDownstream = 0;
 	let writingWs = false;
 	let writingDownstream = false;
+	// Capability authority belongs to the downstream client. Buffer its hello and
+	// requests until the upstream's (possibly minimal) hello has arrived, then
+	// forward the exact bytes unchanged in order.
+	let upstreamHelloReceived = false;
+	let preHelloToWs: Buffer[] = [];
+	let preHelloToWsBytes = 0;
+	let upstreamHelloTimer: ReturnType<typeof setTimeout> | undefined;
+	let openingSettled = false;
 
 	const settle = (error?: Error): void => {
 		if (completed) return;
@@ -121,6 +143,8 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	};
 	void finished.promise.catch(() => undefined);
 	const detach = (): void => {
+		if (upstreamHelloTimer !== undefined) clearTimeout(upstreamHelloTimer);
+		upstreamHelloTimer = undefined;
 		options.downstream.removeListener("data", onData);
 		options.downstream.removeListener("end", onEnd);
 		options.downstream.removeListener("error", onDownstreamError);
@@ -213,7 +237,14 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 			downstreamBytes = 0;
 			if (options.validateDownstreamFrame && !options.validateDownstreamFrame(line.toString("utf8")))
 				return fail({ type: "transport_error", code: "protocol_error", direction: "downstream->ws" });
-			enqueue(toWs, "downstream->ws", line);
+			if (!upstreamHelloReceived) {
+				if (preHelloToWsBytes + line.length > options.pendingCeilingBytes) {
+					fail({ type: "transport_error", code: "pending_overflow", direction: "downstream->ws" });
+					return;
+				}
+				preHelloToWs.push(line);
+				preHelloToWsBytes += line.length;
+			} else enqueue(toWs, "downstream->ws", line);
 			if (closed) return;
 			start = newline + 1;
 			newline = chunk.indexOf(0x0a, start);
@@ -233,20 +264,54 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 			fail({ type: "transport_error", code: "protocol_error", direction: "ws->downstream" });
 			return;
 		}
+		if (!upstreamHelloReceived && isServerHello(event.data)) {
+			upstreamHelloReceived = true;
+			if (upstreamHelloTimer !== undefined) clearTimeout(upstreamHelloTimer);
+			upstreamHelloTimer = undefined;
+			const queued = preHelloToWs;
+			preHelloToWs = [];
+			preHelloToWsBytes = 0;
+			for (const frame of queued) enqueue(toWs, "downstream->ws", frame);
+		}
 		enqueue(toDownstream, "ws->downstream", Buffer.concat([Buffer.from(event.data, "utf8"), Buffer.from("\n")]));
 	};
-	const onClose = (): void => void close();
-	const onWebSocketError = (): void => void close(new Error("upstream_error"));
+	const onClose = (): void => {
+		if (!openingSettled) {
+			openingSettled = true;
+			opened.reject(new Error("upstream_closed"));
+		}
+		void close();
+	};
+	const onWebSocketError = (): void => {
+		if (!openingSettled) {
+			openingSettled = true;
+			opened.reject(new Error("upstream_error"));
+		}
+		void close(new Error("upstream_error"));
+	};
 	const onOpen = (): void => {
+		if (openingSettled) return;
+		openingSettled = true;
 		cleanupOpening();
+		if (!upstreamHelloReceived) {
+			upstreamHelloTimer = setTimeout(() => {
+				if (!upstreamHelloReceived && !closed)
+					fail({ type: "transport_error", code: "protocol_error", direction: "ws->downstream" });
+			}, DEFAULT_UPSTREAM_HELLO_TIMEOUT_MS);
+			upstreamHelloTimer.unref?.();
+		}
 		opened.resolve();
 	};
 	const onOpenError = (): void => {
+		if (openingSettled) return;
+		openingSettled = true;
 		cleanupOpening();
 		opened.reject(new Error("upstream_error"));
 	};
 	const onAbort = (): void => {
 		const error = new RelayOpenAbortedError();
+		if (openingSettled) return;
+		openingSettled = true;
 		cleanupOpening();
 		opened.reject(error);
 		void close(error);
@@ -258,6 +323,9 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	};
 	ws.addEventListener("open", onOpen, { once: true });
 	ws.addEventListener("error", onOpenError, { once: true });
+	ws.addEventListener("message", onMessage);
+	ws.addEventListener("close", onClose);
+	ws.addEventListener("error", onWebSocketError);
 	options.signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		await opened.promise;
@@ -265,9 +333,6 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		await close(error instanceof Error ? error : new Error(String(error)));
 		throw error;
 	}
-	ws.addEventListener("message", onMessage);
-	ws.addEventListener("close", onClose);
-	ws.addEventListener("error", onWebSocketError);
 	options.downstream.on("data", onData);
 	options.downstream.once("end", onEnd);
 	options.downstream.once("error", onDownstreamError);

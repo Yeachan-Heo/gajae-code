@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { classifyStateArgv } from "../../src/gjc-runtime/state-argv";
-import { checkBashAllowedPrefixes } from "../../src/tools/bash-allowed-prefixes";
+import { checkBashAllowedPrefixes, type GjcSessionBinding } from "../../src/tools/bash-allowed-prefixes";
 
 const ROLE_AGENT_PREFIXES = ["gjc ralplan --write", "gjc state"] as const;
 describe("shared state argv classification", () => {
@@ -88,6 +91,15 @@ describe("shared state argv classification", () => {
 });
 
 describe("checkBashAllowedPrefixes", () => {
+	it("blocks git diff options that write or read outside the repository", () => {
+		for (const command of ["git diff --output=/tmp/pwn", "git diff --no-index a b"]) {
+			const result = checkBashAllowedPrefixes(command, ["git diff"]);
+			expect(result.allowed).toBe(false);
+			expect(result.reason).toContain("git --output or --no-index");
+		}
+		expect(checkBashAllowedPrefixes("git diff --stat", ["git diff"])).toEqual({ allowed: true });
+	});
+
 	it("allows ralplan artifact writes for role agents", () => {
 		expect(
 			checkBashAllowedPrefixes(
@@ -432,10 +444,125 @@ describe("checkBashAllowedPrefixes", () => {
 		expect(result.reason).toContain("shell control operator");
 	});
 
+	it("tells the agent how to fix a chained `cd \u2026 &&` command", () => {
+		const result = checkBashAllowedPrefixes("git status && git log", ROLE_AGENT_PREFIXES);
+
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toContain("shell control operator '&'");
+		expect(result.reason).toContain("one simple command per bash call");
+		expect(result.reason).toContain("pass the directory as `cwd`");
+	});
+
 	it("blocks ordinary shell commands for restricted role agents", () => {
 		const result = checkBashAllowedPrefixes("echo verdict", ROLE_AGENT_PREFIXES);
 
 		expect(result.allowed).toBe(false);
 		expect(result.reason).toContain("restricted role-agent bash only allows commands starting with");
+	});
+});
+
+describe("restricted gjc session and worktree binding", () => {
+	function binding(root: string, invocation = root): GjcSessionBinding {
+		return {
+			sessionId: "current-session",
+			credentialSessionId: "owner-session",
+			worktreeRoot: root,
+			invocationCwd: invocation,
+		};
+	}
+
+	it("rejects another session and still allows the current and credential sessions", () => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bind-session-")));
+		try {
+			const options = { gjcSessionBinding: binding(root) };
+			const foreign = [
+				'gjc state ralplan write --session-id victim-session --input \'{"current_phase":"handoff"}\' --json',
+				'gjc state ralplan write --input \'{"session_id":"victim-session","current_phase":"handoff"}\' --json',
+				"gjc ralplan --write --session-id victim-session --stage critic --stage_n 1 --artifact x",
+			];
+			for (const command of foreign) {
+				const result = checkBashAllowedPrefixes(command, ROLE_AGENT_PREFIXES, options);
+				expect(result.allowed).toBe(false);
+				expect(result.reason).toContain("current session");
+			}
+			const allowed = [
+				"gjc state ralplan read --json",
+				'gjc state ralplan write --session-id current-session --input \'{"current_phase":"handoff"}\' --json',
+				'gjc state ralplan write --input \'{"session_id":"owner-session","current_phase":"handoff"}\' --json',
+				"gjc ralplan --write --session-id owner-session --stage critic --stage_n 1 --artifact x",
+			];
+			for (const command of allowed) {
+				expect(checkBashAllowedPrefixes(command, ROLE_AGENT_PREFIXES, options).allowed).toBe(true);
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a foreign worktree root and still allows this directory via a symlink", () => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bind-wt-")));
+		const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bind-other-")));
+		const link = path.join(root, "self-link");
+		try {
+			fs.symlinkSync(root, link);
+			const options = { gjcSessionBinding: binding(root) };
+			const blocked = checkBashAllowedPrefixes(
+				`gjc ralplan --write --worktree-root '${other}' --stage critic --stage_n 1 --artifact x`,
+				ROLE_AGENT_PREFIXES,
+				options,
+			);
+			expect(blocked.allowed).toBe(false);
+			expect(blocked.reason).toContain("current repository");
+			expect(
+				checkBashAllowedPrefixes(
+					`gjc ralplan --write --worktree-root '${link}' --stage critic --stage_n 1 --artifact x`,
+					ROLE_AGENT_PREFIXES,
+					options,
+				).allowed,
+			).toBe(true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(other, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!Bun.which("git"))("still allows a linked worktree of the same repository", () => {
+		const parent = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bind-repo-")));
+		const root = path.join(parent, "main");
+		const linked = path.join(parent, "linked");
+		const foreign = path.join(parent, "foreign");
+		const git = (cwd: string, args: string[]) => {
+			const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		};
+		try {
+			fs.mkdirSync(root);
+			git(root, ["init"]);
+			git(root, ["config", "user.email", "bind@example.com"]);
+			git(root, ["config", "user.name", "bind"]);
+			fs.writeFileSync(path.join(root, "a.txt"), "a\n");
+			git(root, ["add", "a.txt"]);
+			git(root, ["commit", "-m", "init"]);
+			git(root, ["worktree", "add", "--detach", linked]);
+			fs.mkdirSync(foreign);
+			git(foreign, ["init"]);
+			const options = { gjcSessionBinding: binding(linked) };
+			expect(
+				checkBashAllowedPrefixes(
+					`gjc ralplan --write --worktree-root '${root}' --stage critic --stage_n 1 --artifact x`,
+					ROLE_AGENT_PREFIXES,
+					options,
+				).allowed,
+			).toBe(true);
+			const blocked = checkBashAllowedPrefixes(
+				`gjc ralplan --write --worktree-root '${foreign}' --stage critic --stage_n 1 --artifact x`,
+				ROLE_AGENT_PREFIXES,
+				options,
+			);
+			expect(blocked.allowed).toBe(false);
+			expect(blocked.reason).toContain("current repository");
+		} finally {
+			fs.rmSync(parent, { recursive: true, force: true });
+		}
 	});
 });

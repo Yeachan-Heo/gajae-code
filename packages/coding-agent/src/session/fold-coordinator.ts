@@ -38,7 +38,20 @@ import foldReceiptPrompt from "../prompts/tools/fold-receipt.md" with { type: "t
 export const FOLD_WAKE_MERGE_WINDOW_MS = 800;
 
 /** The wait kinds that can be folded. `task`/`subagent` awaits are a non-goal. */
-export type FoldWaitKind = "bash-managed" | "client-terminal" | "bash-pty";
+export type FoldWaitKind = "bash-managed" | "client-terminal" | "bash-pty" | "job-await";
+
+/**
+ * Whether a wait may be picked as the implicit fold target by the chord and
+ * the SDK `bash.background` control. A `job-await` watches jobs that are
+ * already in the background, so "move the foreground bash into a background
+ * job" has nothing to move; it folds only when the `job` tool's own steer
+ * watcher names it explicitly. Keeping it out of implicit targeting also stops
+ * a `job poll` registered after a foreground bash from taking the chord away
+ * from the command the user is actually watching.
+ */
+export function isImplicitFoldTarget(adapter: FoldAdapter): boolean {
+	return adapter.kind !== "job-await";
+}
 
 /** Outcome of settling the foreground caller. Exactly one party may settle it. */
 export type ForegroundSettleOutcome = "resolved" | "already-settled";
@@ -237,15 +250,21 @@ export class FoldCoordinator {
 		};
 	}
 
-	/** Whether any wait is currently foldable, for the key-availability gate. */
+	/** Whether any implicitly targetable wait is currently foldable, for the key-availability gate. */
 	hasFoldableParticipant(): boolean {
-		return this.#participants.size > 0;
+		return this.resolveTarget() !== undefined;
 	}
 
-	/** Deterministic target: newest registration wins, so the chord folds what the user is watching. */
+	/**
+	 * Deterministic implicit target: newest implicitly targetable registration
+	 * wins, so the chord folds what the user is watching. `job-await` waits are
+	 * skipped; they fold only through an explicit adapter.
+	 */
 	resolveTarget(): FoldAdapter | undefined {
 		let target: FoldAdapter | undefined;
-		for (const adapter of this.#participants.values()) target = adapter;
+		for (const adapter of this.#participants.values()) {
+			if (isImplicitFoldTarget(adapter)) target = adapter;
+		}
 		return target;
 	}
 

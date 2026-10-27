@@ -1,3 +1,4 @@
+import { macosOptionForwardingInstruction } from "../modes/utils/macos-option-forwarding";
 import { detectRecordingTools } from "./recorder";
 import { resolvePython } from "./transcriber";
 
@@ -20,11 +21,8 @@ export function formatSTTUsage(
 	];
 	if (platform === "darwin") {
 		lines.push("On macOS, Alt+H is Option+H. Your terminal must forward Option as Meta/Esc.");
-		if (terminalProgram?.toLowerCase().includes("ghostty")) {
-			lines.push(
-				"Ghostty: set macos-option-as-alt = true in its config, then reload the config or restart Ghostty.",
-			);
-		}
+		const instruction = macosOptionForwardingInstruction(terminalProgram);
+		if (instruction) lines.push(instruction);
 	}
 	lines.push("Run /hotkeys inside GJC to confirm the active shortcut.");
 	return lines.join("\n");

@@ -54,10 +54,12 @@ A second checkout created with `git worktree add` starts with no `node_modules/`
 built native addon, so every `bun test` fails with a bare module-resolution error until
 dependencies are installed. Run `bun run setup:worktree` there (equivalent to
 `bun install && bun run build:native`). Do **not** run `bun run install:dev` in a
-worktree: it repoints the global `gjc` on `PATH`, rewrites `core.hooksPath`, and
-overwrites user-level defaults for your primary checkout. `bun run dev:doctor -- --worktree`
-reports whether the current checkout can resolve workspace packages and load the native
-addon, and names the fix when it cannot.
+worktree: it repoints the global `gjc` on `PATH` and overwrites user-level defaults
+for your primary checkout. `bun run dev:doctor -- --worktree` reports whether the
+current checkout can resolve workspace packages and load the native addon, and names
+the fix when it cannot. If an older `install:dev` set `core.hooksPath` to the now-removed
+`.githooks` directory, run `git config --local --unset core.hooksPath` in the primary
+checkout to restore Git's default hook lookup; do not unset a custom hooks path.
 
 Removing build output (never touches sources, `node_modules/`, `.gjc/` state, or `artifacts/` test working space):
 
@@ -70,6 +72,8 @@ bun scripts/clean.ts --dry-run  # list targets without deleting
 `clean` removes `packages/coding-agent/dist/`, so a `--binary`-linked `gjc` (see `dev:doctor`) stops resolving until you run `bun run --cwd=packages/coding-agent build` again. Source-linked setups are unaffected.
 
 `artifacts/` policy (issue #4420): The root `artifacts/` directory is untracked test working space. Red-team and QA tests write evidence there and read it back within the same run (`g011`/`g014`/`g015`/`vb001-gen5`). The directory is gitignored at root and is not committed. Deterministic test fixtures that must be tracked belong in `packages/*/test/fixtures/`. The `clean` command deliberately does not touch `artifacts/`.
+
+The generated `g003`, `g011`, `g014`, and `g015` QA-report JSON files are also ignored under `packages/tui/artifacts/` because package-local test runs write there. This exception does not apply to the intentionally tracked `issue-3798` validation/capture evidence pair. `scripts/artifacts-tracked-policy.test.ts` checks both output locations from the repository root, independent of the test runner's working directory.
 
 Verification (never run `tsc`/`npx tsc` directly at repo root; use these):
 
@@ -118,6 +122,7 @@ GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `
 - Keep source-bundled skills/agents in sync with tests/gates; do not rely on committed `.gjc` copies.
 - Planning workflows (`deep-interview`, `ralplan`) never execute implementation without explicit user approval; artifacts stay `pending approval` until then. `autoresearch` is a research workflow: it produces findings and a verdict, never an implementation.
 - Subagent await timeouts are observation windows, not failure signals; inspect before cancelling.
+- GitHub comment `/re-review` on PRs re-requests reviews from those with pending `CHANGES_REQUESTED` or `COMMENTED` feedback.
 
 ## Code quality
 
@@ -174,7 +179,7 @@ Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicat
 
 - Always commit incrementally; atomic commits are preferred. One logical change per commit — never batch unrelated work.
 - For targeted branch / PR-like work, always open a PR targeting `dev`.
-- Enable the local exact-head PR preflight with `bun run dev:hooks` (also included in `install:dev`). The Git hook passes the destination branch, pushed object SHA, and actual push URL to `scripts/verify-pr-verdict.ts --push-preflight <branch> <pushed-sha> --push-url <destination-url>`. It rejects stale digests, unrebased bases, malformed verdicts, missing risk classifications, unresolved repository/fork authority, and a `merge-self-approved` verdict that its own signed risk-record comment does not back at the exact head. Valid blocking verdicts (`needs-human`, `merge-blocked`) are allowed locally; only the server merge gate authorizes merge. Bypass with `GJC_SKIP_PR_PREFLIGHT=1` or `--no-verify`. The opt-in `gh pr create` preflight (`--preflight-command`) is evaluated before the PR exists, so it can never see a self-review record and rejects a `merge-self-approved` body; create the PR, post the record, then validate at push time.
+- Agent reviews (`architect`/`critic`) are advisory comments on the PR. Merges to `dev` require one approving GitHub review from a write-access maintainer on the exact current head (enforced by native ruleset).
 - Commit messages use the lore format: conventional-commit subject, a short why-focused body, then structured trailers. Include only the trailers that apply.
 
   ```

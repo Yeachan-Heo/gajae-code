@@ -1,4 +1,5 @@
-//! Bounded shared filesystem scans for native discovery tools.
+//! Transitional adapter for native consumers still migrating to pi-walker;
+//! policy is walker-owned.
 //!
 //! Provides complete-or-error directory snapshots with:
 //! - Strict per-scan entry and successful-snapshot retained-capacity budgets
@@ -32,194 +33,31 @@ use std::{
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use parking_lot::Mutex;
-
-use crate::{env_uint, task};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public types (re-exported by glob for backward compatibility)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Resolved filesystem entry kind for glob filters and match metadata.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[napi]
-pub enum FileType {
-	/// Regular file.
-	File    = 1,
-	/// Directory.
-	Dir     = 2,
-	/// Symbolic link.
-	Symlink = 3,
-}
+// The N-API types are shared with the walker-backed glob implementation.
+pub use crate::iofs::{FileType, GlobMatch};
+use crate::{env_uint, task};
 
-/// A single filesystem entry from a directory scan.
-#[derive(Clone)]
-#[napi(object)]
-pub struct GlobMatch {
-	/// Relative path from the search root, using forward slashes.
-	pub path:      String,
-	/// Resolved filesystem type for the match.
-	pub file_type: FileType,
-	/// Modification time in milliseconds since Unix epoch (from
-	/// `symlink_metadata`).
-	pub mtime:     Option<f64>,
-	/// File size in bytes for regular files.
-	pub size:      Option<f64>,
-}
-
-const SCAN_MAX_ENTRIES_DEFAULT: usize = 250_000;
-const SCAN_MAX_ENTRIES_MIN: usize = 1;
-const SCAN_MAX_ENTRIES_MAX: usize = 1_000_000;
-const SCAN_MAX_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
-const SCAN_MAX_BYTES_MIN: usize = 1024 * 1024;
-const SCAN_MAX_BYTES_MAX: usize = 512 * 1024 * 1024;
-const CACHE_MAX_ENTRIES_DEFAULT: usize = 16;
-const CACHE_MAX_ENTRIES_MIN: usize = 1;
-const CACHE_MAX_ENTRIES_MAX: usize = 64;
-const CACHE_MAX_BYTES_DEFAULT: usize = 128 * 1024 * 1024;
-const CACHE_MAX_BYTES_MIN: usize = 1024 * 1024;
-const CACHE_MAX_BYTES_MAX: usize = 2 * 1024 * 1024 * 1024;
-
-#[derive(Clone, Copy)]
-struct ScanPolicy {
-	max_entries:   usize,
-	max_bytes:     usize,
-	cache_entries: usize,
-	cache_bytes:   usize,
-}
-
-fn bounded_value(value: &str) -> String {
-	value.chars().take(128).collect()
-}
-
-fn parse_limit_value(
-	name: &'static str,
-	value: Option<&str>,
-	default: usize,
-	min: usize,
-	max: usize,
-	allow_zero: bool,
-) -> std::result::Result<usize, String> {
-	let Some(value) = value else {
-		return Ok(default);
-	};
-	if value.starts_with(['+', '-']) {
-		return Err(format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=signed value={} min={min} max={max}",
-			bounded_value(value)
-		));
-	}
-	let parsed = value.parse::<u128>().map_err(|error| {
-		let reason = match error.kind() {
-			std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => "overflow",
-			_ => "malformed",
-		};
-		format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason={reason} value={} min={min} max={max}",
-			bounded_value(value)
-		)
-	})?;
-	if parsed > usize::MAX as u128 {
-		return Err(format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=overflow value={} min={min} max={max}",
-			bounded_value(value)
-		));
-	}
-	let parsed = parsed as usize;
-	if parsed == 0 {
-		if allow_zero {
-			return Ok(0);
-		}
-		return Err(format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=zero value={} min={min} max={max}",
-			bounded_value(value)
-		));
-	}
-	if parsed < min {
-		return Err(format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=below_min value={} min={min} max={max}",
-			bounded_value(value)
-		));
-	}
-	if parsed > max {
-		return Err(format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=above_max value={} min={min} max={max}",
-			bounded_value(value)
-		));
-	}
-	Ok(parsed)
-}
-
-fn parse_limit(
-	name: &'static str,
-	default: usize,
-	min: usize,
-	max: usize,
-	allow_zero: bool,
-) -> std::result::Result<usize, String> {
-	match std::env::var(name) {
-		Ok(value) => parse_limit_value(name, Some(&value), default, min, max, allow_zero),
-		Err(std::env::VarError::NotPresent) => Ok(default),
-		Err(std::env::VarError::NotUnicode(_)) => Err(format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=malformed value=<non-unicode> min={min} \
-			 max={max}"
-		)),
-	}
-}
+type ScanPolicy = pi_walker::ScanPolicy;
 
 fn scan_policy() -> Result<ScanPolicy> {
-	static POLICY: LazyLock<std::result::Result<ScanPolicy, String>> = LazyLock::new(|| {
-		Ok(ScanPolicy {
-			max_entries:   parse_limit(
-				"FS_SCAN_MAX_ENTRIES",
-				SCAN_MAX_ENTRIES_DEFAULT,
-				SCAN_MAX_ENTRIES_MIN,
-				SCAN_MAX_ENTRIES_MAX,
-				false,
-			)?,
-			max_bytes:     parse_limit(
-				"FS_SCAN_MAX_BYTES",
-				SCAN_MAX_BYTES_DEFAULT,
-				SCAN_MAX_BYTES_MIN,
-				SCAN_MAX_BYTES_MAX,
-				false,
-			)?,
-			cache_entries: parse_limit(
-				"FS_SCAN_CACHE_MAX_ENTRIES",
-				CACHE_MAX_ENTRIES_DEFAULT,
-				CACHE_MAX_ENTRIES_MIN,
-				CACHE_MAX_ENTRIES_MAX,
-				false,
-			)?,
-			cache_bytes:   parse_limit(
-				"FS_SCAN_CACHE_MAX_BYTES",
-				CACHE_MAX_BYTES_DEFAULT,
-				CACHE_MAX_BYTES_MIN,
-				CACHE_MAX_BYTES_MAX,
-				true,
-			)?,
-		})
-	});
-	POLICY
-		.as_ref()
-		.copied()
-		.map_err(|err| Error::from_reason(err.clone()))
+	pi_walker::scan_policy().map_err(Error::from_reason)
 }
 
-env_uint! {
-	static CACHE_TTL_MS: u64 = "FS_SCAN_CACHE_TTL_MS" or 1_000 => [0, u64::MAX];
-	static EMPTY_RECHECK_MS: u64 = "FS_SCAN_EMPTY_RECHECK_MS" or 200 => [0, u64::MAX];
-}
 env_uint! {
 	static GREP_WORKERS: usize = "PI_GREP_WORKERS" or 4 => [0, usize::MAX];
 }
 
 pub fn cache_ttl_ms() -> u64 {
-	*CACHE_TTL_MS
+	pi_walker::cache_ttl_ms()
 }
 pub fn empty_recheck_ms() -> u64 {
-	*EMPTY_RECHECK_MS
+	pi_walker::empty_recheck_ms()
 }
 pub fn grep_workers() -> usize {
 	*GREP_WORKERS
@@ -1254,7 +1092,7 @@ pub fn get_or_scan(
 		&FS_CACHE,
 		cache_key(root, options),
 		policy,
-		Duration::from_millis(*CACHE_TTL_MS),
+		Duration::from_millis(cache_ttl_ms()),
 		|| collect_entries(root, options, ct),
 	)
 }
@@ -1316,32 +1154,6 @@ pub fn invalidate_all() {
 ///
 /// Intended to be called after agent file mutations (write, edit, rename,
 /// delete).
-#[napi]
-pub fn invalidate_fs_scan_cache(path: Option<String>) {
-	match path {
-		Some(p) => {
-			let candidate = PathBuf::from(&p);
-			let absolute = if candidate.is_absolute() {
-				candidate
-			} else if let Ok(cwd) = std::env::current_dir() {
-				cwd.join(candidate)
-			} else {
-				PathBuf::from(&p)
-			};
-			let target = std::fs::canonicalize(&absolute)
-				.or_else(|_| {
-					absolute
-						.parent()
-						.and_then(|parent| std::fs::canonicalize(parent).ok())
-						.and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
-						.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
-				})
-				.unwrap_or(absolute);
-			invalidate_path(&target);
-		},
-		None => invalidate_all(),
-	}
-}
 
 #[cfg(test)]
 mod tests {
@@ -1643,44 +1455,6 @@ mod tests {
 			charged_capacity_slots: 0,
 			terminal:               None,
 		}
-	}
-
-	#[test]
-	fn strict_limit_parser_covers_boundaries_and_invalid_values() {
-		assert_eq!(super::parse_limit_value("LIMIT", None, 17, 10, 20, false), Ok(17));
-		assert_eq!(super::parse_limit_value("LIMIT", Some("10"), 17, 10, 20, false), Ok(10));
-		assert_eq!(super::parse_limit_value("LIMIT", Some("20"), 17, 10, 20, false), Ok(20));
-		assert_eq!(super::parse_limit_value("LIMIT", Some("0"), 17, 10, 20, true), Ok(0));
-
-		for (value, reason) in [
-			("nope", "malformed"),
-			("-1", "signed"),
-			("+10", "signed"),
-			("0", "zero"),
-			("9", "below_min"),
-			("21", "above_max"),
-		] {
-			let error = super::parse_limit_value("LIMIT", Some(value), 17, 10, 20, false)
-				.expect_err("invalid explicit limit must fail");
-			assert!(error.contains(&format!("reason={reason}")), "{error}");
-			assert!(error.len() < 512, "configuration diagnostics must stay bounded");
-		}
-
-		let overflow = (usize::MAX as u128 + 1).to_string();
-		let error = super::parse_limit_value("LIMIT", Some(&overflow), 17, 10, usize::MAX, false)
-			.expect_err("usize overflow must fail");
-		assert!(error.contains("reason=overflow"), "{error}");
-
-		let beyond_u128 = "9".repeat(128);
-		let error = super::parse_limit_value("LIMIT", Some(&beyond_u128), 17, 10, usize::MAX, false)
-			.expect_err("u128 overflow must fail");
-		assert!(error.contains("reason=overflow"), "{error}");
-
-		let unicode = "가".repeat(256);
-		let error = super::parse_limit_value("LIMIT", Some(&unicode), 17, 10, 20, false)
-			.expect_err("malformed unicode limit must fail");
-		assert!(error.contains("reason=malformed"), "{error}");
-		assert!(error.len() < 512, "unicode diagnostics must truncate on character boundaries");
 	}
 
 	#[test]

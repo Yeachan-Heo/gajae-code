@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -485,28 +486,49 @@ describe("OutputSink", () => {
 		const dir = await createTempDir();
 		const artifactPath = path.join(dir, "partial-write.log");
 		const originalFile = Bun.file;
+		const originalWrite = nodeFs.write;
 		let writes = 0;
 		let failed = false;
+		let insideBunWriter = false;
+		const noteWrite = (text: string) => {
+			if (!text.includes("abcde") && !text.includes("fghij") && !text.includes("klmno")) return;
+			writes++;
+			if (!failed && text.includes("klmno")) {
+				failed = true;
+				throw new Error("simulated write failure");
+			}
+		};
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			if (!insideBunWriter) {
+				const buffer = args[1];
+				const text = typeof buffer === "string" ? buffer : Buffer.from(buffer as Uint8Array).toString("utf8");
+				noteWrite(text);
+			}
+			return Reflect.apply(originalWrite, nodeFs, args);
+		}) as typeof nodeFs.write);
 		try {
 			Bun.file = ((filePath: string | URL, ...args: unknown[]) => {
 				const file = originalFile(filePath, ...(args as []));
-				if (String(filePath) !== artifactPath) return file;
+				const target = String(filePath);
+				if (target !== artifactPath && !target.includes(`${path.basename(artifactPath)}.`)) return file;
 				return new Proxy(file, {
-					get(target, prop, _receiver) {
-						if (prop !== "writer") return Reflect.get(target, prop, target);
+					get(targetObj, prop, _receiver) {
+						if (prop !== "writer") return Reflect.get(targetObj, prop, targetObj);
 						return () => {
-							const sink = target.writer();
+							const sink = targetObj.writer();
 							return new Proxy(sink, {
 								get(sinkTarget, sinkProp, _sinkReceiver) {
 									if (sinkProp === "end") return sinkTarget.end.bind(sinkTarget);
 									if (sinkProp !== "write") return Reflect.get(sinkTarget, sinkProp, sinkTarget);
 									return (chunk: string | Uint8Array) => {
-										writes++;
-										if (!failed && writes === 2) {
-											failed = true;
-											throw new Error("simulated write failure");
+										const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+										noteWrite(text);
+										insideBunWriter = true;
+										try {
+											return sinkTarget.write.call(sinkTarget, chunk as string);
+										} finally {
+											insideBunWriter = false;
 										}
-										return sinkTarget.write.call(sinkTarget, chunk as string);
 									};
 								},
 							});
@@ -520,13 +542,106 @@ describe("OutputSink", () => {
 			for (let offset = 0; offset < input.length; offset += 5) sink.push(input.slice(offset, offset + 5));
 			const summary = await sink.dump();
 
-			Bun.file = originalFile;
-			expect(writes).toBe(2);
+			expect(writes).toBe(1);
 			expect(summary.artifactId).toBeUndefined();
 			expect(summary.output).not.toContain("artifact://partial-write");
 			expect(summary.artifactFailureDiagnostic).toBe("write: simulated write failure");
 		} finally {
+			writeSpy.mockRestore();
 			Bun.file = originalFile;
+		}
+	});
+
+	test("path-backed push does not write before it returns", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "async.log");
+		let writes = 0;
+		const originalWrite = nodeFs.write;
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			writes++;
+			return Reflect.apply(originalWrite, nodeFs, args);
+		}) as typeof nodeFs.write);
+		try {
+			const sink = new OutputSink({ artifactPath, artifactId: "async-push", spillThreshold: 4 });
+			sink.push("hello-async");
+			expect(writes).toBe(0);
+			const dumped = await sink.dump();
+			expect(writes).toBeGreaterThan(0);
+			expect(dumped.artifactId).toBe("async-push");
+			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+			expect(await fs.readFile(artifactPath, "utf8")).toBe("hello-async");
+		} finally {
+			writeSpy.mockRestore();
+		}
+	});
+
+	test("path-backed push waits once queued bytes pass the high water mark", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "pressure.log");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const originalWrite = nodeFs.write;
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			started.resolve();
+			void release.promise.then(() => {
+				Reflect.apply(originalWrite, nodeFs, args);
+			});
+		}) as typeof nodeFs.write);
+		try {
+			const sink = new OutputSink({ artifactPath, artifactId: "pressure", spillThreshold: 4 });
+			const chunk = "x".repeat(64 * 1024 + 1);
+			const pending = sink.push(chunk);
+			expect(pending).toBeInstanceOf(Promise);
+			await started.promise;
+			const winner = await Promise.race([
+				Promise.resolve(pending).then(() => "settled"),
+				Promise.resolve().then(() => "open"),
+			]);
+			expect(winner).toBe("open");
+			release.resolve();
+			await pending;
+			const dumped = await sink.dump();
+			expect(dumped.artifactId).toBe("pressure");
+			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+			expect(await fs.readFile(artifactPath, "utf8")).toBe(chunk);
+		} finally {
+			release.resolve();
+			writeSpy.mockRestore();
+		}
+	});
+
+	test("synchronous one-byte pushes share one queued artifact write", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "coalesce.log");
+		const originalWrite = nodeFs.write;
+		const release = Promise.withResolvers<void>();
+		let started = 0;
+		let firstLength = 0;
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			if (started === 0 && typeof args[3] === "number") firstLength = args[3];
+			started++;
+			void release.promise.then(() => {
+				Reflect.apply(originalWrite, nodeFs, args);
+			});
+		}) as typeof nodeFs.write);
+		try {
+			const sink = new OutputSink({ artifactPath, artifactId: "coalesce-sync", spillThreshold: 4 });
+			const count = 8_192;
+			for (let i = 0; i < count; i++) sink.push("a");
+			expect(started).toBe(0);
+			for (let i = 0; i < 5 && started === 0; i++) await Promise.resolve();
+			expect(started).toBe(1);
+			expect(firstLength).toBe(count);
+			for (let i = 0; i < 100; i++) sink.push("b");
+			expect(started).toBe(1);
+			release.resolve();
+			const dumped = await sink.dump();
+			expect(dumped.artifactId).toBe("coalesce-sync");
+			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+			expect(await fs.readFile(artifactPath, "utf8")).toBe(`${"a".repeat(count)}${"b".repeat(100)}`);
+		} finally {
+			release.resolve();
+			writeSpy.mockRestore();
 		}
 	});
 
@@ -543,6 +658,173 @@ describe("OutputSink", () => {
 		const artifactText = await Bun.file(artifactPath).text();
 		expect(input.startsWith(artifactText)).toBe(true);
 		expect(artifactText).toBe(input.slice(0, 77));
+	});
+
+	test.skipIf(process.platform === "win32")("does not follow a symlink planted at the artifact path", async () => {
+		const dir = await createTempDir();
+		const victim = path.join(dir, "victim");
+		await fs.writeFile(victim, "VICTIM-ORIGINAL", { mode: 0o600 });
+		const artifactPath = path.join(dir, "artifact.log");
+		await fs.symlink(victim, artifactPath);
+		const sink = new OutputSink({ artifactPath, artifactId: "symlink", spillThreshold: 4 });
+		sink.push("SECRET-BYTES");
+		const dumped = await sink.dump();
+
+		expect(await fs.readFile(victim, "utf8")).toBe("VICTIM-ORIGINAL");
+		expect((await fs.lstat(victim)).mode & 0o777).toBe(0o600);
+		expect(dumped.artifactId).toBe("symlink");
+		const published = await fs.lstat(artifactPath);
+		expect(published.isSymbolicLink()).toBe(false);
+		expect(published.isFile()).toBe(true);
+		expect(published.mode & 0o777).toBe(0o600);
+		expect(await fs.readFile(artifactPath, "utf8")).toBe("SECRET-BYTES");
+	});
+
+	test.skipIf(process.platform === "win32")("corrects an existing mode 0644 artifact file to mode 0600", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "exist.log");
+		await fs.writeFile(artifactPath, "OLD", { mode: 0o644 });
+		const sink = new OutputSink({ artifactPath, artifactId: "mode", spillThreshold: 4 });
+		sink.push("NEWCONTENT");
+		const dumped = await sink.dump();
+
+		expect(dumped.artifactId).toBe("mode");
+		expect(await fs.readFile(artifactPath, "utf8")).toBe("NEWCONTENT");
+		expect((await fs.lstat(artifactPath)).isSymbolicLink()).toBe(false);
+		expect((await fs.lstat(artifactPath)).mode & 0o777).toBe(0o600);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"still allows writing an existing mode 0600 artifact when the parent directory is mode 0500",
+		async () => {
+			const dir = await createTempDir();
+			const parent = path.join(dir, "parent-ro");
+			await fs.mkdir(parent, { mode: 0o700 });
+			const artifactPath = path.join(parent, "exist.log");
+			await fs.writeFile(artifactPath, "OLD", { mode: 0o600 });
+			await fs.chmod(artifactPath, 0o600);
+			await fs.chmod(parent, 0o500);
+			try {
+				const sink = new OutputSink({ artifactPath, artifactId: "parent-ro", spillThreshold: 4 });
+				sink.push("NEWCONTENT");
+				const dumped = await sink.dump();
+
+				expect(dumped.artifactId).toBe("parent-ro");
+				expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+				expect(await fs.readFile(artifactPath, "utf8")).toBe("NEWCONTENT");
+				const published = await fs.lstat(artifactPath);
+				expect(published.isSymbolicLink()).toBe(false);
+				expect(published.isFile()).toBe(true);
+				expect(published.mode & 0o777).toBe(0o600);
+				expect(await fs.readdir(parent)).toEqual(["exist.log"]);
+			} finally {
+				await fs.chmod(parent, 0o700);
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"does not truncate an existing artifact when applying mode 0600 fails",
+		async () => {
+			const dir = await createTempDir();
+			const parent = path.join(dir, "parent-chmod");
+			await fs.mkdir(parent, { mode: 0o700 });
+			const artifactPath = path.join(parent, "exist.log");
+			await fs.writeFile(artifactPath, "KEEP-OLD", { mode: 0o644 });
+			await fs.chmod(artifactPath, 0o644);
+			await fs.chmod(parent, 0o500);
+			let truncated = false;
+			const chmodError = Object.assign(new Error("EPERM"), { code: "EPERM" });
+			const originalTruncate = nodeFs.ftruncateSync;
+			const chmodSpy = spyOn(nodeFs, "fchmodSync").mockImplementation(() => {
+				throw chmodError;
+			});
+			const truncateSpy = spyOn(nodeFs, "ftruncateSync").mockImplementation((...args: unknown[]) => {
+				truncated = true;
+				return Reflect.apply(originalTruncate, nodeFs, args) as ReturnType<typeof nodeFs.ftruncateSync>;
+			});
+			try {
+				const sink = new OutputSink({ artifactPath, artifactId: "chmod-eperm", spillThreshold: 4 });
+				sink.push("NEWCONTENT");
+				const dumped = await sink.dump();
+				expect(dumped.artifactId).toBeUndefined();
+				expect(dumped.artifactFailureDiagnostic).toContain("EPERM");
+				expect(truncated).toBe(false);
+				expect(await fs.readFile(artifactPath, "utf8")).toBe("KEEP-OLD");
+				expect((await fs.lstat(artifactPath)).mode & 0o777).toBe(0o644);
+			} finally {
+				chmodSpy.mockRestore();
+				truncateSpy.mockRestore();
+				await fs.chmod(parent, 0o700);
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"does not follow a symlink when the parent directory is mode 0500",
+		async () => {
+			const dir = await createTempDir();
+			const parent = path.join(dir, "parent-ro-link");
+			await fs.mkdir(parent, { mode: 0o700 });
+			const victim = path.join(parent, "victim");
+			await fs.writeFile(victim, "VICTIM-ORIGINAL", { mode: 0o600 });
+			const artifactPath = path.join(parent, "artifact.log");
+			await fs.symlink(victim, artifactPath);
+			await fs.chmod(parent, 0o500);
+			try {
+				const sink = new OutputSink({ artifactPath, artifactId: "symlink-ro", spillThreshold: 4 });
+				sink.push("SECRET-BYTES");
+				const dumped = await sink.dump();
+
+				expect(dumped.artifactId).toBeUndefined();
+				expect(dumped.artifactFailureDiagnostic).toContain("not a regular file");
+				expect(await fs.readFile(victim, "utf8")).toBe("VICTIM-ORIGINAL");
+				expect((await fs.lstat(victim)).mode & 0o777).toBe(0o600);
+				expect((await fs.lstat(artifactPath)).isSymbolicLink()).toBe(true);
+			} finally {
+				await fs.chmod(parent, 0o700);
+			}
+		},
+	);
+
+	test("still allows a long regular artifact basename", async () => {
+		const dir = await createTempDir();
+		const payload = "NEW-CONTENT";
+		const fresh = path.join(dir, "a".repeat(220));
+		const freshSink = new OutputSink({ artifactPath: fresh, artifactId: "long-fresh", spillThreshold: 4 });
+		freshSink.push(payload);
+		const freshDump = await freshSink.dump();
+		expect(freshDump.artifactId).toBe("long-fresh");
+		expect(freshDump.artifactFailureDiagnostic).toBeUndefined();
+		expect(await fs.readFile(fresh, "utf8")).toBe(payload);
+
+		const existing = path.join(dir, "b".repeat(220));
+		await fs.writeFile(existing, "OLD");
+		const existingSink = new OutputSink({
+			artifactPath: existing,
+			artifactId: "long-existing",
+			spillThreshold: 4,
+		});
+		existingSink.push(payload);
+		const existingDump = await existingSink.dump();
+		expect(existingDump.artifactId).toBe("long-existing");
+		expect(existingDump.artifactFailureDiagnostic).toBeUndefined();
+		expect(await fs.readFile(existing, "utf8")).toBe(payload);
+	});
+
+	test("still allows a fresh regular artifact path to receive the full stream", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "fresh.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "fresh", spillThreshold: 4 });
+		sink.push("hello-fresh");
+		const dumped = await sink.dump();
+
+		expect(dumped.artifactId).toBe("fresh");
+		expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+		const published = await fs.lstat(artifactPath);
+		expect(published.isSymbolicLink()).toBe(false);
+		expect(published.isFile()).toBe(true);
+		expect(await fs.readFile(artifactPath, "utf8")).toBe("hello-fresh");
 	});
 
 	test("createInput decodes streamed UTF-8 chunks correctly", async () => {
@@ -911,6 +1193,60 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(lines[0]).toMatch(/^(abcd)?…$|^abcd…$/);
 		expect(lines[1]).toBe("next");
 		expect(dumped.columnTruncatedLines).toBe(1);
+	});
+
+	test("bounds large cap batches without splitting UTF-8 accounting across a surrogate pair", async () => {
+		const input = `${"x".repeat(64 * 1024 - 1)}😀${"y".repeat(4)}\nshort\n`;
+		const sink = new OutputSink({ maxColumns: 64 * 1024 - 1 + 5, headBytes: 100_000 });
+		await sink.push(input);
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe(`${"x".repeat(64 * 1024 - 1)}…\nshort\n`);
+		expect(dumped.columnDroppedBytes).toBe(8);
+		expect(dumped.columnTruncatedLines).toBe(1);
+		expect(dumped.totalBytes).toBe(byteLength(input));
+		expect(dumped.outputBytes).toBe(byteLength(`${"x".repeat(64 * 1024 - 1)}…\nshort\n`));
+	});
+
+	test("keeps later cap batches after head overflow in stream order", async () => {
+		const input = `é${"x".repeat(64 * 1024 - 1)}Z`;
+		const sink = new OutputSink({ headBytes: 1, maxColumns: 70_000, spillThreshold: 200_000 });
+		await sink.push(input);
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe(input);
+		expect(dumped.totalBytes).toBe(byteLength(input));
+		expect(dumped.outputBytes).toBe(byteLength(input));
+		expect(dumped.truncated).toBe(false);
+	});
+
+	test("limits each cap transformation batch for a single large callback", async () => {
+		const input = "x\n".repeat(64 * 1024);
+		const originalSubstring = String.prototype.substring;
+		let largestTransformInputChars = 0;
+		const substringSpy = spyOn(String.prototype, "substring").mockImplementation(function (
+			this: string,
+			start: number,
+			end?: number,
+		) {
+			largestTransformInputChars = Math.max(largestTransformInputChars, this.length);
+			return originalSubstring.call(this, start, end);
+		});
+
+		try {
+			const sink = new OutputSink({ maxColumns: 4, headBytes: 200_000 });
+			await sink.push(input);
+			const dumped = await sink.dump();
+
+			expect(dumped.output).toBe(input);
+			expect(dumped.totalLines).toBe(64 * 1024 + 1);
+			expect(dumped.outputBytes).toBe(byteLength(input));
+		} finally {
+			substringSpy.mockRestore();
+		}
+
+		expect(largestTransformInputChars).toBeGreaterThan(0);
+		expect(largestTransformInputChars).toBeLessThanOrEqual(64 * 1024);
 	});
 
 	test("disabled by default — maxColumns: 0 is a passthrough", async () => {

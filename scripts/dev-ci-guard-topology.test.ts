@@ -10,6 +10,7 @@ import { parse } from "yaml";
 interface WorkflowStep {
 	name?: string;
 	if?: string;
+	shell?: string;
 	uses?: string;
 	run?: string;
 	env?: Record<string, string>;
@@ -18,6 +19,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
 	name: string;
+	"runs-on"?: string | string[];
 	needs?: string[];
 	if?: string;
 	permissions?: Record<string, "read" | "write" | "none">;
@@ -55,6 +57,13 @@ function requiredJob(document: WorkflowDocument, name: string): WorkflowJob {
 	const job = document.jobs[name];
 	if (!job) throw new Error(`Missing workflow job: ${name}`);
 	return job;
+}
+
+function defaultShellForRunner(runsOn: WorkflowJob["runs-on"]): "bash" | "pwsh" | undefined {
+	const labels = typeof runsOn === "string" ? [runsOn] : (runsOn ?? []);
+	if (labels.some(label => label.toLowerCase().includes("windows"))) return "pwsh";
+	if (labels.some(label => /ubuntu|macos/i.test(label))) return "bash";
+	return undefined;
 }
 
 function requiredEnv(value: WorkflowJob | WorkflowStep): Record<string, string> {
@@ -137,16 +146,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 				if (enabled) scheduled.push(name);
 				needs[name] = { result: enabled ? "success" : "skipped", outputs: enabled ? { relevant: "true", has_native: "true", has_tasks: "true" } : {} };
 			}
-			// The contract lane is both bootstrap jobs: the verdict line lives in the body,
-			// so a metadata edit must re-evaluate the contract AND the merge approval it
-			// reports. Neither is code evidence.
-			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap", "merge-approval-bootstrap"] });
+			// Metadata-only edits skip the DAG entirely (no code changes).
+			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: [] });
 			else if (headOnlyDispatch) expect(scheduled).toEqual(["virtual-integration"]);
 			else {
 				expect(scheduled).toContain("affected-plan");
 				expect(scheduled).toContain("affected-shards");
 				expect(scheduled).toContain("gjc-state-gates-matrix");
-				if (scenario.event === "pull_request") expect(scheduled).toContain("pr-contract-bootstrap");
 			}
 		}
 	});
@@ -164,14 +170,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const d = await workflow();
 		const guard = requiredJob(d, "telegram-daemon-generation");
 		const guardCondition = String(guard.if);
-		expect(guardCondition).toContain("telegram-daemon");
-		expect(guardCondition).toContain("chat-daemon");
-		expect(guardCondition).toContain("telegram-daemon-generation-guard.ts");
+		expect(guardCondition).toContain("needs.affected-plan.outputs.has_protected_daemon_decl == 'true'");
+		expect(guardCondition).not.toContain("needs.affected-plan.outputs.changed_paths");
 		const affected = requiredJob(d, "affected");
 		expect(affected.needs).toContain("telegram-daemon-generation");
 		const aggregateStep = namedStep(affected, "Validate live affected aggregate");
 		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
-		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toContain("telegram-daemon-generation-guard.ts");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.has_protected_daemon_decl }}");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
 		expect(requiredEnvValue(aggregateStep, "CI_DEV_AFFECTED_PLAN")).toBe(
 			"${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json",
@@ -323,7 +328,7 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(source).toContain("CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}");
 		expect(source).toContain("No authoritative terminal-green dev base selected");
 		expect(source).toContain("Provision pinned Rust toolchain for canary native build");
-		expect(source).toContain("toolchain: nightly-2026-04-29");
+		expect(source).toContain("toolchain: nightly-2026-08-12");
 		expect(source).toContain("Run risk-selected canaries in the materialized merge");
 	});
 
@@ -354,16 +359,36 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 		expect(offenders).toEqual([]);
 	});
-	test("every workflow bun test invocation is guarded by its own exit-code check", async () => {
-		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
-		const lines = source.split(/\r?\n/).map(line => line.trim());
+	test("workflow bun test failures cannot be masked by later PowerShell commands", async () => {
+		const document = await workflow();
 		const offenders: string[] = [];
-		for (let index = 0; index < lines.length; index++) {
-			if (!lines[index]!.startsWith("bun test ")) continue;
-			const next = lines[index + 1] ?? "";
-			// A `pwsh` run block must check $LASTEXITCODE right after each bun test;
-			// otherwise a failure is masked by the next invocation overwriting it.
-			if (next !== "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") offenders.push(lines[index]!);
+		for (const [jobName, job] of Object.entries(document.jobs)) {
+			const defaultShell = defaultShellForRunner(job["runs-on"]);
+			for (const [stepIndex, step] of job.steps.entries()) {
+				if (!step.run) continue;
+				const shell = step.shell ?? defaultShell;
+				const lines = step.run.split(/\r?\n/).map(line => line.trim());
+				if (shell === "bash") continue; // GitHub's Bash runner starts with `-e -o pipefail`.
+				if (shell !== "pwsh") {
+					if (lines.some(line => line.startsWith("bun test "))) {
+						offenders.push(`${jobName}/${step.name ?? stepIndex}: shell is not statically known`);
+					}
+					continue;
+				}
+				for (let index = 0; index < lines.length; index++) {
+					if (!lines[index]!.startsWith("bun test ")) continue;
+					const hasFollowingCommand = lines
+						.slice(index + 1)
+						.some(line => line !== "" && !line.startsWith("#"));
+					if (!hasFollowingCommand) continue; // The final command's exit code is returned by the runner.
+					const next = lines[index + 1] ?? "";
+					// A `pwsh` run block must check $LASTEXITCODE right after each bun test;
+					// otherwise a failure is masked by the next invocation overwriting it.
+					if (next !== "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") {
+						offenders.push(`${jobName}/${step.name ?? stepIndex}: ${lines[index]}`);
+					}
+				}
+			}
 		}
 		expect(offenders).toEqual([]);
 	});
@@ -410,26 +435,5 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(workflowConcurrency).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
 		expect(workflowConcurrency).not.toContain("'dev-ci-virtual-integration'");
 	});
-	test("the merge-approval bootstrap binds approval freshness to server-observed evidence (#5692)", async () => {
-		// This job reimplements the approval rule instead of invoking
-		// `scripts/verify-pr-verdict.ts`, which is why the original re-bound-approval hole
-		// survived three rounds of fixes to the script alone. Until the duplication is
-		// removed, pin the invariant here so the workflow copy cannot silently regress.
-		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
-		// `commit_id` is re-pointed by a force-push, so it cannot be the only binding.
-		expect(source).toContain("head_ref_force_pushed");
-		// Ties refuse: GitHub serializes both sides to whole seconds.
-		expect(source).toContain("return submitted <= known;");
-		// No force-push on record means no re-binding vector, so the check must not fall
-		// back to the contributor-settable committer date in either direction (#5692).
-		expect(source).toContain('if (appearance.kind === "unconstrained") return false;');
-		expect(source).toContain('return { kind: "unconstrained" };');
-		// A present-but-unparseable force-push time refuses rather than falling back to the
-		// contributor-settable committer date.
-		expect(source).toContain('if (present.some(value => !Number.isFinite(Date.parse(value)))) return { kind: "unreadable" };');
-		// Selection precedes freshness, so an unreadable later withdrawal cannot be filtered
-		// out and let an earlier approval become the reviewer's last word.
-		const decision = source.slice(source.indexOf('} else if (verdict === "merge-approved")'));
-		expect(decision.indexOf(".at(-1);")).toBeLessThan(decision.indexOf("reviewPrecedesHead(latest.submitted_at"));
-	});
+
 });

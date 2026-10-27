@@ -2,7 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { exactUnlink, type NativeExactFileIdentity } from "@gajae-code/natives";
-import { canDeliverSdkEvent } from "./host";
+import {
+	AWAITING_INPUT_CAPABILITY,
+	canDeliverSdkEvent,
+	SESSION_HOST_OBSERVER_CAPABILITY,
+	TOOL_ACTIVITY_CAPABILITY,
+	TURN_STREAM_CAPABILITY,
+} from "./host";
 import type { SessionSdkTransport } from "./session-runtime";
 import type { SdkFrame } from "./types";
 
@@ -162,6 +168,9 @@ export async function createSdkWebSocketTransport(
 			if (!socket) throw new Error("SDK connection is no longer available.");
 			socket.send(JSON.stringify(frame));
 		},
+		isConnectionOpen(connectionId) {
+			return sockets.has(connectionId);
+		},
 		start: async () => {
 			if (stopPromise) await stopPromise;
 			if (startPromise) return await startPromise;
@@ -192,7 +201,19 @@ export async function createSdkWebSocketTransport(
 						websocket: {
 							open(socket) {
 								sockets.set(socket.data.connectionId, socket);
-								socket.send(JSON.stringify({ type: "hello", connectionId: socket.data.connectionId }));
+								socket.send(
+									JSON.stringify({
+										type: "hello",
+										protocolVersion: 3,
+										connectionId: socket.data.connectionId,
+										capabilities: [
+											AWAITING_INPUT_CAPABILITY,
+											TOOL_ACTIVITY_CAPABILITY,
+											TURN_STREAM_CAPABILITY,
+											SESSION_HOST_OBSERVER_CAPABILITY,
+										],
+									}),
+								);
 							},
 							message(socket, message) {
 								if (sockets.get(socket.data.connectionId) !== socket) return;
@@ -210,16 +231,23 @@ export async function createSdkWebSocketTransport(
 										);
 										return;
 									}
-									if (
+									const isInitialHello =
 										frame.type === "hello" &&
 										frame.protocolVersion === 3 &&
-										(frame.capabilities === undefined || Array.isArray(frame.capabilities)) &&
-										!helloReceived.has(socket.data.connectionId)
+										!helloReceived.has(socket.data.connectionId);
+									if (
+										(isInitialHello || frame.type === "event_replay") &&
+										(frame.capabilities === undefined ||
+											(Array.isArray(frame.capabilities) &&
+												frame.capabilities.every((value: unknown) => typeof value === "string")))
 									) {
-										const capabilities = Array.isArray(frame.capabilities)
-											? frame.capabilities.filter((value): value is string => typeof value === "string")
-											: [];
-										helloReceived.add(socket.data.connectionId);
+										const capabilities = [
+											...new Set([
+												...(negotiatedCapabilities.get(socket.data.connectionId) ?? []),
+												...((frame.capabilities as string[] | undefined) ?? []),
+											]),
+										];
+										if (isInitialHello) helloReceived.add(socket.data.connectionId);
 										negotiatedCapabilities.set(socket.data.connectionId, new Set(capabilities));
 										capabilitiesHandler?.(socket.data.connectionId, capabilities);
 									}

@@ -1,11 +1,21 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { deflateSync } from "node:zlib";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
-import { Agent, type AgentTool, type RunSettlementProof } from "@gajae-code/agent-core";
+import {
+	Agent,
+	type AgentTerminalOwnerContext,
+	type AgentTool,
+	createRunResourceLedger,
+	getAgentTerminalOwnerContext,
+	type RunSettlementProof,
+	setAgentTerminalOwnerContext,
+} from "@gajae-code/agent-core";
 import { type AssistantMessage, closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
@@ -13,6 +23,7 @@ import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type {
 	AgentEndEvent,
@@ -68,14 +79,19 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
-import { sessionHostAttachedClients, sessionHostWorkInFlight } from "../src/sdk/broker/lifecycle";
+import { sessionHostAttachedClients, sessionHostWorkLeaseActive } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
-import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
+import { type ReconciliationStoreDocument, reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
-import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
+import {
+	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
+	SESSION_HOST_OBSERVER_CAPABILITY,
+	SessionSdkHost,
+} from "../src/sdk/host";
+import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
@@ -86,7 +102,7 @@ import {
 	SdkStartupRollbackTracker,
 	sanitizeSdkStartupMessage,
 } from "../src/sdk/startup-capability";
-import { AgentSession } from "../src/session/agent-session";
+import { AgentSession, type QueuedRunStartFailure } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import type {
 	ClientBridgePermissionOption,
@@ -96,6 +112,7 @@ import type {
 import * as sessionSdkRunCapability from "../src/session/sdk-run-capability";
 import { readSdkRunCapability } from "../src/session/sdk-run-capability";
 import { SessionManager } from "../src/session/session-manager";
+import { createSessionWorkLease, type SessionWorkLease } from "../src/session/session-work-lease";
 
 type CapturedSendUserMessage = (
 	content: Parameters<ExtensionActions["sendUserMessage"]>[0],
@@ -121,6 +138,7 @@ function captureInternalSend(
 }
 
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
@@ -149,15 +167,16 @@ afterEach(async () => {
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 15_000;
+	const deadline = performance.now() + 15_000;
 	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+		if (performance.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
 	}
 }
 function pauseNextReconciliationCommit(
 	sessionFile: string,
 	sessionId: string,
+	terminalOnly = false,
 ): {
 	started: Promise<void>;
 	release: () => void;
@@ -172,6 +191,14 @@ function pauseNextReconciliationCommit(
 	let paused = false;
 	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
 		if (armed && !paused && String(to) === target) {
+			const document = terminalOnly
+				? ((await Bun.file(String(from)).json()) as ReconciliationStoreDocument)
+				: undefined;
+			if (
+				terminalOnly &&
+				!document?.records.some(record => record.kind === "prompt" && record.terminalAt !== undefined)
+			)
+				return realRename(from, to);
 			paused = true;
 			started.resolve();
 			await release.promise;
@@ -198,6 +225,7 @@ function pauseNextReconciliationCommit(
 function failNextReconciliationCommit(
 	sessionFile: string,
 	sessionId: string,
+	terminalOnly = false,
 ): { failed: Promise<void>; restore: () => void; arm: () => void } {
 	const target = reconciliationStorePath(sessionFile, sessionId);
 	const failed = Promise.withResolvers<void>();
@@ -206,6 +234,14 @@ function failNextReconciliationCommit(
 	let thrown = false;
 	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
 		if (armed && !thrown && String(to) === target) {
+			const document = terminalOnly
+				? ((await Bun.file(String(from)).json()) as ReconciliationStoreDocument)
+				: undefined;
+			if (
+				terminalOnly &&
+				!document?.records.some(record => record.kind === "prompt" && record.terminalAt !== undefined)
+			)
+				return realRename(from, to);
 			thrown = true;
 			failed.resolve();
 			throw Object.assign(new Error("injected reconciliation rename failure"), { code: "EACCES" });
@@ -304,7 +340,9 @@ function start(
 	if (lifecycle) attachLifecycleStartupCapability(api, lifecycle.startupCapability);
 	const effectiveSettings =
 		settings ??
-		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
+		(lifecycle || typeof ctx.waitForRunSettlement === "function"
+			? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings)
+			: undefined);
 	createOrchestrationNotificationsExtension(
 		api,
 		effectiveSettings
@@ -314,6 +352,32 @@ function start(
 					ensureProviderDaemon,
 					controller,
 					terminalAbortSeams: {
+						...(typeof ctx.waitForRunSettlement === "function"
+							? {
+									waitForRunSettlement: (handle: string) =>
+										(ctx.waitForRunSettlement as (handle: string) => Promise<RunSettlementProof>)(handle),
+								}
+							: {}),
+						...(typeof ctx.getTerminalRunOwnerForEvent === "function"
+							? {
+									getTerminalRunOwnerForEvent: (event: object) =>
+										(
+											ctx.getTerminalRunOwnerForEvent as (
+												event: object,
+											) => AgentTerminalOwnerContext | undefined
+										)(event),
+								}
+							: {}),
+						...(typeof ctx.getRunOwnerDomain === "function"
+							? {
+									getRunOwnerDomain: (handle: string) =>
+										(
+											ctx.getRunOwnerDomain as (
+												handle: string,
+											) => AgentTerminalOwnerContext["domain"] | undefined
+										)(handle),
+								}
+							: {}),
 						getTerminalTurnEpoch: () =>
 							(ctx as { getTerminalTurnEpoch?: () => number | undefined }).getTerminalTurnEpoch?.(),
 						cancelPendingPreflightForTerminalAbort: () =>
@@ -535,6 +599,10 @@ test("lifecycle SDK startup capability settles once and sanitizes public failure
 	expect(started.settleStarted()).toEqual({ status: "started" });
 	expect(started.settleFailure(failure)).toEqual({ status: "started" });
 	expect(await started.promise).toEqual({ status: "started" });
+	const cancelled = new SdkStartupCapability();
+	cancelled.cancel(failure);
+	expect(cancelled.cancelled).toBe(true);
+	expect(await cancelled.promise).toEqual({ status: "failed", failure });
 });
 
 test("lifecycle teardown swallows dual owner failures without surfacing an extension error and retains exact retry authority", async () => {
@@ -557,6 +625,13 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		// Every host start allocates a fresh event generation; the rollback proof must
+		// carry the generation this host actually published to the session index.
+		const endpointGeneration = (await new SessionIndex(cwd).open())
+			.listSessions()
+			.sessions.find(session => session.sessionId === sessionId)?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("Lifecycle host was not published to the session index.");
+		expect(endpointGeneration).toBeGreaterThan(1);
 
 		// Drive the production session_shutdown handler through a real ExtensionRunner
 		// so the onError seam proves the retained owner-release failure is NOT surfaced
@@ -592,7 +667,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			),
 		).toBe(true);
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: false,
 			runtimeRemoved: true,
 			hostStopped: false,
@@ -606,7 +681,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: true,
 			runtimeRemoved: true,
 			hostStopped: true,
@@ -790,7 +865,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 
 		await host.session.extensionRunner?.emit({ type: "agent_start" });
-		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
 		await host.session.extensionRunner?.emit({
 			type: "agent_end",
@@ -798,7 +873,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 			messages: [{ role: "assistant", stopReason: "stop" }],
 		} as never);
 		await Bun.sleep(20);
-		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostWorkLeaseActive()).toBe(false);
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 
 		const disconnectedBeforeReplay = new SdkClient(host.endpoint.url, host.endpoint.token, {
@@ -812,6 +887,400 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 	} finally {
 		await observer.close();
 		await host.stop();
+	}
+}, 60_000);
+
+test("accepted prompt keeps the host lease held until active lifecycle settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-admission-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-admission-lease-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "admission-lease",
+			operation: "turn.prompt",
+			input: { text: "hold the host lease" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "admission-lease"),
+		"accepted prompt response",
+	);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(
+		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] },
+		sessionContext,
+	);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "active lifecycle lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("accepted steer failure releases its queued host lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-lease-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-lease-failure-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			throw Object.assign(new Error("steer dispatch failed after acceptance"), { code: "unavailable" });
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "steer-lease-failure",
+			operation: "turn.steer",
+			input: { text: "fail after acceptance" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-lease-failure"),
+		"steer failure response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "steer-lease-failure")).toMatchObject({
+		ok: false,
+		error: { code: "unavailable" },
+	});
+	await waitFor(() => !sessionHostWorkLeaseActive(), "failed steer lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+/**
+ * Bring up a session host whose `sendUserMessage` captures every promotion hook
+ * per dispatched submission, connect one SDK socket, and return the pieces the
+ * lease-ownership tests drive by hand.
+ */
+async function startLeaseHarness(
+	prefix: string,
+	dispatch: (options: InternalCapturedOptions | undefined, index: number) => Promise<void> | void = async options => {
+		await firePreflightAccept(options);
+	},
+	contextOverrides: Record<string, unknown> = {},
+): Promise<{
+	handlers: Map<string, (event: unknown, context: unknown) => unknown>;
+	sessionContext: Record<string, unknown>;
+	sends: InternalCapturedOptions[];
+	frames: Record<string, unknown>[];
+	socket: WebSocket;
+	control(id: string, operation: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
+}> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-${prefix}-`));
+	dirs.push(cwd);
+	const sessionId = `sdk-${prefix}-${Date.now()}`;
+	const sessionContext = { ...context(cwd, sessionId), ...contextOverrides };
+	const sends: InternalCapturedOptions[] = [];
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			const captured = options as InternalCapturedOptions | undefined;
+			if (captured) sends.push(captured);
+			await dispatch(captured, sends.length - 1);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id) as Record<string, unknown>;
+	};
+	return { handlers, sessionContext, sends, frames, socket, control };
+}
+
+test("every submission promoted into one batched run releases its own lease at that run's agent_start", async () => {
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("batched-promotion");
+	await control("steer-a", "turn.steer", { text: "first" });
+	await control("steer-b", "turn.steer", { text: "second" });
+	await control("steer-c", "turn.steer", { text: "third" });
+	expect(sends).toHaveLength(3);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	// agent_end disowned all three steers and rearmed them as ONE follow-up
+	// batch: the session fires every hook with startsOwnRun: true, then one
+	// agent_start follows for the batch.
+	for (const options of sends) options.onQueuedPromoted?.({ startsOwnRun: true });
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(assistantEndEvent("batched"), sessionContext);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "batched promotion lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+/** A session work lease that also reports how many handles are outstanding. */
+function countingSessionWorkLease(): SessionWorkLease & { outstanding(): number } {
+	const lease = createSessionWorkLease();
+	let outstanding = 0;
+	return {
+		acquire: () => {
+			const handle = lease.acquire();
+			outstanding += 1;
+			let released = false;
+			return {
+				release: () => {
+					if (released) return;
+					released = true;
+					outstanding -= 1;
+					handle.release();
+				},
+			};
+		},
+		isHeld: () => lease.isHeld(),
+		outstanding: () => outstanding,
+	};
+}
+
+test("a promoted run releases the promoted submission's own lease, not the oldest admitted one", async () => {
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("promotion-order", undefined, {
+		getSessionWorkLease: () => lease,
+	});
+	await control("follow-up", "turn.follow_up", { text: "queued first" });
+	await control("steer", "turn.steer", { text: "queued second" });
+	expect(sends).toHaveLength(2);
+	// Two queued admissions plus the follow-up's accepted submission record.
+	expect(lease.outstanding()).toBe(3);
+	const [followUp, steer] = sends;
+	// Disowned steering is prepended ahead of the earlier follow-up: the steer
+	// starts the run and the follow-up is consumed inside it.
+	steer?.onQueuedPromoted?.({ startsOwnRun: true });
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	// The run's own handle replaced the steer's; the follow-up's is untouched.
+	expect(lease.outstanding()).toBe(3);
+	followUp?.onQueuedPromoted?.({ startsOwnRun: false });
+	expect(lease.outstanding()).toBe(2);
+	await handlers.get("agent_end")?.(assistantEndEvent("reordered"), sessionContext);
+	// Only the follow-up's submission record remains, bounded by its own
+	// terminal/deadline; no admission handle survives the run.
+	await waitFor(() => lease.outstanding() === 1, "reordered promotion lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("an accepted prompt diverted into steering or removed from the queue releases its admission lease", async () => {
+	// Count outstanding handles directly: the accepted submission's own record
+	// lease stays held until its terminal, so the aggregate cannot distinguish a
+	// released admission handle from a leaked one here.
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness(
+		"prompt-queue-exit",
+		async (options, index) => {
+			await firePreflightAccept(options);
+			// The session began streaming before the first dispatch ran: the prompt
+			// was parked as steering and its submission resolves at queue time.
+			if (index === 0) options?.onDispatchDisposition?.({ startsOwnRun: false });
+		},
+		{ getSessionWorkLease: () => lease },
+	);
+	await control("diverted", "turn.prompt", { text: "raced into steering" });
+	await waitFor(() => sends.length === 1, "diverted prompt dispatch");
+	await Bun.sleep(20);
+	// Submission record + queued admission.
+	expect(lease.outstanding()).toBe(2);
+	sends[0]?.onQueuedPromoted?.({ startsOwnRun: false });
+	expect(lease.outstanding()).toBe(1);
+
+	await control("queued", "turn.follow_up", { text: "cleared from the queue" });
+	await waitFor(() => sends.length === 2, "follow-up dispatch");
+	await Bun.sleep(20);
+	expect(lease.outstanding()).toBe(3);
+	sends[1]?.onQueuedPromoted?.({ startsOwnRun: true, removed: true });
+	expect(lease.outstanding()).toBe(2);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("a steer whose durable settlement fails after dispatch keeps its lease while the message stays queued", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-settle-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-settle-failure-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const sends: InternalCapturedOptions[] = [];
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				if (options) sends.push(options as InternalCapturedOptions);
+				await firePreflightAccept(options);
+				// The reservation write committed; the NEXT commit is the accepted
+				// settlement, which fails at its atomic rename.
+				failedCommit.arm();
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steer-settle-failure",
+				operation: "turn.steer",
+				input: { text: "queued but not durably settled", clientRef: "steer-settle-failure-ref" },
+			}),
+		);
+		await failedCommit.failed;
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-settle-failure"),
+			"steer settlement response",
+		);
+		expect(sends).toHaveLength(1);
+		// The message is still queued in the session, so the host must stay alive
+		// until the session's own promotion or removal hook retires it.
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		sends[0]?.onQueuedPromoted?.({ startsOwnRun: false });
+		await waitFor(() => !sessionHostWorkLeaseActive(), "queued steer lease release");
+		// Teardown reports the injected persistence failure by contract (#4743).
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		warnSpy.mockRestore();
+		failedCommit.restore();
+	}
+}, 60_000);
+
+test("a submission promoted after its runtime stopped releases its lease instead of parking it", async () => {
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("late-promotion", undefined, {
+		getSessionWorkLease: () => lease,
+	});
+	await control("steer", "turn.steer", { text: "promoted after teardown" });
+	expect(lease.outstanding()).toBe(1);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	// The runtime is fenced and its lists drained; a promotion that lands now
+	// has no run to hand its handle to.
+	expect(lease.outstanding()).toBe(1);
+	sends[0]?.onQueuedPromoted?.({ startsOwnRun: true });
+	expect(lease.outstanding()).toBe(0);
+}, 60_000);
+
+test("an accepted prompt that fails closed before its terminal releases its submission lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fail-closed-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fail-closed-lease-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "fail-closed",
+				operation: "turn.prompt",
+				input: { text: "terminal claim will not persist", clientRef: "fail-closed-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "fail-closed"),
+			"accepted prompt response",
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		// The acceptance and agent_start writes committed; the terminal claim is
+		// the next commit and fails, so the prompt fails closed with no later
+		// traffic to expire its record.
+		failedCommit.arm();
+		await handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
+		await failedCommit.failed;
+		await waitFor(
+			() => frames.some(frame => frame.type === "agent_failed" && frame.error !== undefined),
+			"fail-closed terminal frame",
+		);
+		await waitFor(() => !sessionHostWorkLeaseActive(), "fail-closed lease release");
+		await Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext)).catch(
+			() => undefined,
+		);
+	} finally {
+		errorSpy.mockRestore();
+		warnSpy.mockRestore();
+		failedCommit.restore();
 	}
 }, 60_000);
 
@@ -831,9 +1300,11 @@ test("replay capability claims cannot turn a demanding connection into an observ
 	const baseDemand = sessionHostAttachedClients() ?? 0;
 	const demanding = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
 	sockets.push(demanding);
+	const frames: Record<string, unknown>[] = [];
 	let connectionId: string | undefined;
 	demanding.addEventListener("message", event => {
-		const frame = JSON.parse(String((event as MessageEvent).data)) as { type?: unknown; connectionId?: unknown };
+		const frame = JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>;
+		frames.push(frame);
 		if (frame.type === "hello" && typeof frame.connectionId === "string") connectionId = frame.connectionId;
 	});
 	try {
@@ -843,17 +1314,21 @@ test("replay capability claims cannot turn a demanding connection into an observ
 		});
 		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
 		await waitFor(() => sdkFrame !== undefined && connectionId !== undefined, "SDK callback wiring");
+		const replayId = "forged-observer";
 		sdkFrame!(null, {
 			connectionId: connectionId!,
 			json: JSON.stringify({
 				type: "event_replay",
-				id: "forged-observer",
+				id: replayId,
 				sinceGeneration: 1,
 				sinceSeq: 0,
 				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
 			}),
 		});
-		await Bun.sleep(20);
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === replayId),
+			"forged replay result",
+		);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
 	} finally {
 		demanding.close();
@@ -861,6 +1336,75 @@ test("replay capability claims cannot turn a demanding connection into an observ
 		sdkFrameHook.mockRestore();
 	}
 }, 60_000);
+
+for (const confirmNative of [false, true]) {
+	test(`replay observer demand waits for native confirmation: ${confirmNative ? "confirmed" : "forged"}`, async () => {
+		const delayedCallbacks: Array<() => void> = [];
+		const registerCapabilities = NotificationServer.prototype.onNegotiatedCapabilities;
+		const capabilitySpy = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(
+			function (this: NotificationServer, callback) {
+				return registerCapabilities.call(this, (error, connectionId, capabilities) => {
+					delayedCallbacks.push(() => callback(error, connectionId, capabilities));
+				});
+			},
+		);
+		let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+		const registerFrame = NotificationServer.prototype.onSdkFrame;
+		const frameSpy = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+			this: NotificationServer,
+			callback,
+		) {
+			sdkFrame = callback;
+			return registerFrame.call(this, callback);
+		});
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-observer-demand-"));
+		dirs.push(cwd);
+		try {
+			const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+			try {
+				const baseDemand = sessionHostAttachedClients() ?? 0;
+				const frames: Record<string, unknown>[] = [];
+				const socket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+				sockets.push(socket);
+				socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+				await waitFor(() => frames.some(frame => frame.type === "hello"), "client hello");
+				await waitFor(() => sessionHostAttachedClients() === baseDemand + 1, "client demand");
+				const connectionId = frames.find(frame => frame.type === "hello")?.connectionId;
+				if (typeof connectionId !== "string" || !sdkFrame) throw new Error("Missing SDK callback wiring");
+				const replay = {
+					type: "event_replay",
+					id: "native-observer-demand",
+					capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+				};
+				if (confirmNative) {
+					// Exercise real native replay negotiation, but withhold its callback.
+					socket.send(JSON.stringify(replay));
+					await waitFor(() => delayedCallbacks.length > 0, "native replay snapshot");
+				} else {
+					// A forged bus frame never reaches native negotiation.
+					sdkFrame(null, { connectionId, json: JSON.stringify(replay) });
+				}
+				await waitFor(
+					() => frames.some(frame => frame.type === "event_replay_result" && frame.id === replay.id),
+					"replay processed before native confirmation",
+				);
+				expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				expect(delayedCallbacks.length > 0).toBe(confirmNative);
+				for (const deliver of delayedCallbacks.splice(0)) deliver();
+				if (confirmNative) {
+					await waitFor(() => sessionHostAttachedClients() === baseDemand, "native-confirmed observer");
+				} else {
+					expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				}
+			} finally {
+				await host.stop();
+			}
+		} finally {
+			capabilitySpy.mockRestore();
+			frameSpy.mockRestore();
+		}
+	}, 60_000);
+}
 
 test("a default ACP-shaped SessionRouter client remains demanding", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
@@ -880,6 +1424,53 @@ test("a default ACP-shaped SessionRouter client remains demanding", async () => 
 	} finally {
 		await router.stop();
 		await host.stop();
+	}
+}, 60_000);
+
+test("only a positioned-effects SessionRouter negotiates positioned-only notification delivery", async () => {
+	const negotiations: string[][] = [];
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		return negotiatedImpl.call(this, (error, connectionId, capabilities) => {
+			// The threadsafe callback delivers its tuple as the second argument at runtime.
+			const negotiated = Array.isArray(connectionId) ? (connectionId as unknown[])[1] : capabilities;
+			if (Array.isArray(negotiated)) negotiations.push(negotiated.map(String));
+			return callback(error, connectionId, capabilities);
+		});
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-router-positioned-effects-"));
+	dirs.push(cwd);
+	const agentDir = path.join(cwd, ".gjc", "agent");
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
+	try {
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		// A plain observer (e.g. `sdk session tail`) keeps both public surfaces (#4570).
+		const observer = new SessionRouter({ agentDir, observer: true });
+		try {
+			await observer.start();
+			await waitFor(() => negotiations.length === 1, "plain observer hello negotiation");
+		} finally {
+			await observer.stop();
+		}
+		expect(negotiations[0]).toContain(SESSION_HOST_OBSERVER_CAPABILITY);
+		expect(negotiations[0]).not.toContain(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY);
+
+		const publisher = new SessionRouter({ agentDir, observer: true, positionedNotificationEffects: true });
+		try {
+			await publisher.start();
+			await waitFor(() => negotiations.length === 2, "positioned-effects hello negotiation");
+		} finally {
+			await publisher.stop();
+		}
+		expect(negotiations[1]).toEqual(
+			expect.arrayContaining([SESSION_HOST_OBSERVER_CAPABILITY, POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY]),
+		);
+	} finally {
+		await host?.stop();
+		negotiatedHook.mockRestore();
 	}
 }, 60_000);
 
@@ -1007,24 +1598,47 @@ test("lifecycle startup settles failure when native callback registration throws
 	}
 });
 
-test("session_start swallows startup plus owner-release failure without surfacing an extension error", async () => {
+test.each([
+	false,
+	true,
+])("session_start swallows startup plus owner-release failure without surfacing an extension error (peer cleanup=%s)", async peerCleanup => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
 	dirs.push(cwd);
 	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
-	// `mockRejectedValueOnce` on a shared prototype is a one-shot global: a peer
-	// test scheduled concurrently in the same shard can consume the single
-	// rejection, after which this test's own `start`/`stop` resolve, startup
-	// never sets `suppressExtensionError`, and the error surfaces. Scope the
-	// rejection to this test's first call instead so shard composition cannot
-	// steal it.
+	const startupScope = new AsyncLocalStorage<boolean>();
+	const peer = new SessionSdkHost({
+		sessionId: `${sessionId}-peer`,
+		stateRoot: cwd,
+		token: "test-unstarted-peer",
+		sendFrame: () => {
+			throw new Error("Unstarted peer must not send frames.");
+		},
+		onFrame: () => {
+			throw new Error("Unstarted peer must not install a frame handler.");
+		},
+	});
+	let peerStopResult: unknown;
+	// A first-call boolean on a shared prototype is still global. Inject only
+	// inside this startup's async scope and leave unrelated cleanup untouched.
+	let ownedServerStarts = 0;
+	let ownedHostStops = 0;
 	let serverStartRejected = false;
 	const serverStartImpl = NotificationServer.prototype.start;
 	const serverStart = spyOn(NotificationServer.prototype, "start").mockImplementation(async function (
 		this: NotificationServer,
 		...args: Parameters<NotificationServer["start"]>
 	) {
-		if (!serverStartRejected) {
+		const owned = startupScope.getStore() === true;
+		if (owned) ownedServerStarts++;
+		if (owned && !serverStartRejected) {
 			serverStartRejected = true;
+			if (peerCleanup)
+				peerStopResult = await startupScope
+					.exit(() => peer.stop())
+					.then(
+						value => value,
+						error => error,
+					);
 			throw new Error("server start failed");
 		}
 		return await serverStartImpl.apply(this, args);
@@ -1035,7 +1649,9 @@ test("session_start swallows startup plus owner-release failure without surfacin
 		this: SessionSdkHost,
 		...args: Parameters<SessionSdkHost["stop"]>
 	) {
-		if (!hostStopRejected) {
+		const owned = startupScope.getStore() === true;
+		if (owned) ownedHostStops++;
+		if (owned && !hostStopRejected) {
 			hostStopRejected = true;
 			throw new Error("host stop failed");
 		}
@@ -1064,10 +1680,11 @@ test("session_start swallows startup plus owner-release failure without surfacin
 		const surfaced: Array<{ event: string }> = [];
 		runner.onError(error => surfaced.push(error));
 
-		await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+		await expect(startupScope.run(true, () => runner.emit({ type: "session_start" }))).resolves.toBeUndefined();
 		expect(surfaced).toEqual([]);
-		expect(serverStart).toHaveBeenCalledTimes(1);
-		expect(hostStop).toHaveBeenCalledTimes(2);
+		expect(ownedServerStarts).toBe(1);
+		expect(ownedHostStops).toBe(2);
+		if (peerCleanup) expect(peerStopResult).toBe("already");
 		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
 		expect(
 			breadcrumbs.some(
@@ -1206,6 +1823,7 @@ test("interactive extension context advertises typed SDK controls and forwards p
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			setSdkPermissionProvider: (provider: typeof installed) => {
@@ -1265,6 +1883,7 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			modelRegistry: {
@@ -1314,6 +1933,7 @@ test("interactive SDK controls reject Broker-owned session handoff", async () =>
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: { extensionRunner: runner },
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
@@ -1662,14 +2282,17 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 	const sessionContext = context(cwd, sessionId);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceGeneration: 1, sinceSeq: 0 }));
+	// Omitting sinceGeneration replays the host's current generation.
+	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceSeq: 0 }));
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "replay-1"),
 		"event replay response",
 	);
 	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "replay-1");
-	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true, generation: 1 });
+	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true });
+	expect(replay).not.toHaveProperty("gap");
 	const replayEvents = replay?.events as Array<Record<string, unknown>>;
+	expect(replayEvents.every(event => event.generation === replay?.generation)).toBe(true);
 	expect(replayEvents.length).toBeGreaterThanOrEqual(4);
 	expect(replayEvents.map(event => event.seq)).toEqual(replayEvents.map((_event, index) => index + 1));
 	expect(replayEvents.slice(0, 2)).toEqual([
@@ -1952,13 +2575,1852 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onQueuedRunStartFailed: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
 		],
 		[
 			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onQueuedRunStartFailed: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
 		],
 	]);
+});
+
+const STAGED_TEST_PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function stagedTestPngCrc32(bytes: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function stagedTestPngChunk(type: string, data: Uint8Array): Buffer {
+	const typeBytes = Buffer.from(type, "ascii");
+	const payload = Buffer.from(data);
+	const chunk = Buffer.alloc(12 + payload.length);
+	chunk.writeUInt32BE(payload.length, 0);
+	typeBytes.copy(chunk, 4);
+	payload.copy(chunk, 8);
+	chunk.writeUInt32BE(stagedTestPngCrc32(Buffer.concat([typeBytes, payload])), 8 + payload.length);
+	return chunk;
+}
+
+function makeStagedTestPng(): Buffer {
+	const width = 300;
+	const height = 300;
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	const stride = 1 + width * 4;
+	const pixels = Buffer.alloc(stride * height);
+	let state = 0x12345678;
+	for (let y = 0; y < height; y++) {
+		const row = y * stride;
+		for (let x = 0; x < width; x++) {
+			const pixel = row + 1 + x * 4;
+			for (let channel = 0; channel < 3; channel++) {
+				state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+				pixels[pixel + channel] = state >>> 24;
+			}
+			pixels[pixel + 3] = 255;
+		}
+	}
+	return Buffer.concat([
+		STAGED_TEST_PNG_SIGNATURE,
+		stagedTestPngChunk("IHDR", ihdr),
+		stagedTestPngChunk("IDAT", deflateSync(pixels, { level: 0 })),
+		stagedTestPngChunk("IEND", Buffer.alloc(0)),
+	]);
+}
+
+async function stageOverSdkClient(client: SdkClient, bytes: Buffer, finish = true): Promise<string> {
+	const begin = (await client.control("turn.image.begin", {
+		mimeType: "image/png",
+		byteLength: bytes.length,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	})) as { ok?: boolean; result?: { id?: unknown } };
+	expect(begin.ok).toBe(true);
+	const id = begin.result?.id;
+	if (typeof id !== "string") throw new Error("SDK host did not return a staged image ID.");
+	let sequence = 0;
+	for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+		const data = bytes.subarray(offset, offset + 96 * 1024).toString("base64");
+		expect(Buffer.byteLength(JSON.stringify({ id, sequence, data }))).toBeLessThan(256 * 1024);
+		expect(await client.control("turn.image.append", { id, sequence, data })).toMatchObject({ ok: true });
+		sequence++;
+	}
+	if (finish) expect(await client.control("turn.image.finish", { id })).toMatchObject({ ok: true });
+	return id;
+}
+
+test("SDK host privately stages large images with authenticated connection ownership", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-staged-image-wire-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-staged-image-${Date.now()}`;
+	const bytes = makeStagedTestPng();
+	expect(bytes.length).toBeGreaterThan(256 * 1024);
+	const sent: CapturedSendCall[] = [];
+	const ledger = createRunResourceLedger();
+	const domain = ledger.open("image-wire-run");
+	if (!domain) throw new Error("Image wire run could not open.");
+	let activeHandle: string | undefined = "image-wire-run";
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getActivePromptHandle: () => activeHandle,
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => ({ resourceRunId: "image-wire-run", domain }),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
+	};
+	const allowAcceptance = Promise.withResolvers<void>();
+	const producer = Promise.withResolvers<void>();
+	const producerReturned = Promise.withResolvers<void>();
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			captureInternalSend(sent, content, options);
+			await allowAcceptance.promise;
+			await firePreflightAccept(options);
+			await producer.promise;
+			producerReturned.resolve();
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const clients: SdkClient[] = [];
+	const baseAttachedClients = sessionHostAttachedClients() ?? 0;
+	const finishEntered = Promise.withResolvers<void>();
+	const releaseFinish = Promise.withResolvers<void>();
+	const finishHandlerSettled = Promise.withResolvers<void>();
+	const originalFinish = PromptImageUploadStore.prototype.finish;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem");
+	let holdNextFinish = false;
+	let finishStarted = false;
+	const finishSpy = spyOn(PromptImageUploadStore.prototype, "finish").mockImplementation(async function (
+		this: PromptImageUploadStore,
+		owner,
+		input,
+	) {
+		if (!holdNextFinish) return await originalFinish.call(this, owner, input);
+		holdNextFinish = false;
+		finishStarted = true;
+		finishEntered.resolve();
+		try {
+			await releaseFinish.promise;
+			return await originalFinish.call(this, owner, input);
+		} finally {
+			finishHandlerSettled.resolve();
+		}
+	});
+	try {
+		const owner = await SdkClient.connect(endpoint.url, endpoint.token);
+		const observer = await SdkClient.connect(endpoint.url, endpoint.token);
+		clients.push(owner, observer);
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients + 2,
+			"staged image client connections",
+		);
+		if (!owner.connectionId || !observer.connectionId)
+			throw new Error("SDK clients did not receive authenticated IDs.");
+		expect(owner.connectionId).not.toBe(observer.connectionId);
+
+		const id = await stageOverSdkClient(owner, bytes);
+		await expect(
+			observer.control("turn.prompt", {
+				text: "Cross-connection redemption is forbidden.",
+				stagedImages: [{ id }],
+			}),
+		).rejects.toMatchObject({ code: "image_upload_unavailable" });
+		await expect(
+			owner.control("turn.prompt", {
+				text: "Direct and staged image inputs cannot be combined.",
+				images: [{ data: "cG5n", mimeType: "image/png" }],
+				stagedImages: [{ id }],
+			}),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		const input = { text: "Use the staged image once.", clientRef: "image-wire-ref", stagedImages: [{ id }] };
+		const first = owner.control("turn.prompt", input);
+		void first.catch(() => {});
+		await waitFor(() => sent.length === 1, "staged prompt dispatch");
+		const redemptionCount = redeemSpy.mock.calls.length;
+		// Ordered controls share a session-wide dispatch chain, across connections.
+		// Queue a retry during preflight, but release acceptance before awaiting it.
+		const duplicate = observer.control("turn.prompt", input);
+		void duplicate.catch(() => {});
+		allowAcceptance.resolve();
+		expect(await first).toMatchObject({ ok: true, result: { accepted: true, clientRef: "image-wire-ref" } });
+		await expect(duplicate).rejects.toMatchObject({ code: "client_ref_conflict" });
+		expect(redeemSpy.mock.calls).toHaveLength(redemptionCount);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		// A caller missing its acknowledgement must reconcile, not replay a receipt
+		// or consume bytes on another connection while execution is in flight.
+		await expect(owner.control("turn.prompt", input)).rejects.toMatchObject({ code: "client_ref_conflict" });
+		expect(redeemSpy.mock.calls).toHaveLength(redemptionCount);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.[0]).toEqual([
+			{ type: "text", text: "Use the staged image once." },
+			{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" },
+		]);
+		// Production emits agent_end before sealing: sealing an empty ledger
+		// retires its domain, which would make this event look like a foreign run.
+		expect(ledger.lookupDomain("image-wire-run")).toBe(domain);
+		await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "completed" }, sessionContext);
+		ledger.seal("image-wire-run");
+		producer.resolve();
+		await producerReturned.promise;
+		activeHandle = undefined;
+		await expect(
+			owner.control("turn.prompt", { text: "The staged descriptor is one-shot.", stagedImages: [{ id }] }),
+		).rejects.toMatchObject({ code: "image_upload_unavailable" });
+
+		const disconnectedId = await stageOverSdkClient(owner, bytes, false);
+		holdNextFinish = true;
+		const finishing = owner.control("turn.image.finish", { id: disconnectedId }).then(
+			() => undefined,
+			error => error,
+		);
+		await finishEntered.promise;
+		await owner.close();
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients + 1,
+			"staged image owner disconnect",
+		);
+		// The frame reached the host before disconnection. The client must not
+		// report a retryable pre-send failure or replay that ordered operation.
+		expect(await finishing).toMatchObject({ code: "uncertain_after_send" });
+		releaseFinish.resolve();
+		await finishHandlerSettled.promise;
+		await expect(
+			observer.control("turn.prompt", {
+				text: "A disconnected owner cannot transfer an unfinished lease.",
+				stagedImages: [{ id: disconnectedId }],
+			}),
+		).rejects.toMatchObject({ code: "image_upload_unavailable" });
+	} finally {
+		allowAcceptance.resolve();
+		producer.resolve();
+		releaseFinish.resolve();
+		try {
+			if (finishStarted) await finishHandlerSettled.promise;
+			await Promise.all(clients.map(client => client.close()));
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		} finally {
+			finishSpy.mockRestore();
+			redeemSpy.mockRestore();
+		}
+	}
+});
+
+test("bus retains staged-image capacity until a turn-aborted preflight producer settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-preflight-abort-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-preflight-abort-${Date.now()}`;
+	const producerStarted = Promise.withResolvers<void>();
+	const releaseProducer = Promise.withResolvers<void>();
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-preflight-abort")) throw new Error("Image preflight run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	let preflightSignal: AbortSignal | undefined;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (content, options) => {
+			preflightSignal = options?.preflightSignal;
+			producerStarted.resolve();
+			await releaseProducer.promise;
+			expect(content).toContainEqual(
+				expect.objectContaining({ type: "image", data: expect.any(String), mimeType: "image/png" }),
+			);
+			if (options?.preflightSignal?.aborted)
+				throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "image preflight cancellation endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		const prompt = client
+			.control("turn.prompt", {
+				text: "Hold this image producer before preflight acceptance.",
+				stagedImages: [{ id }],
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await producerStarted.promise;
+		expect(await client.control("turn.abort", {})).toMatchObject({
+			ok: true,
+			result: { aborted: true, disposition: "preflight_cancelled" },
+		});
+		expect(await prompt).toMatchObject({ code: "busy" });
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(releases).toBe(0);
+
+		releaseProducer.resolve();
+		await waitFor(() => releases === 1, "cancelled staged-image producer settlement");
+		expect(releases).toBe(1);
+	} finally {
+		releaseProducer.resolve();
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test("bus retains staged-image capacity across aborted late acceptance and shutdown", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-late-acceptance-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-late-acceptance-${Date.now()}`;
+	const producerStarted = Promise.withResolvers<void>();
+	const acceptanceReturned = Promise.withResolvers<void>();
+	const releaseProducer = Promise.withResolvers<void>();
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-late-acceptance")) throw new Error("Image late-acceptance run could not open.");
+	const sessionFile = path.join(cwd, "session.jsonl");
+	await Bun.write(sessionFile, "");
+	const baseContext = context(cwd, sessionId);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	let preflightSignal: AbortSignal | undefined;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (content, options) => {
+			preflightSignal = options?.preflightSignal;
+			producerStarted.resolve();
+			pausedCommit.arm();
+			try {
+				await firePreflightAccept(options);
+			} catch {
+				// The durable acceptance raced the abort. Keep the producer pending so
+				// shutdown cannot mistake its client-facing outcome for settlement.
+			}
+			acceptanceReturned.resolve();
+			await releaseProducer.promise;
+			expect(content).toContainEqual(
+				expect.objectContaining({ type: "image", data: expect.any(String), mimeType: "image/png" }),
+			);
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	let shutdown: Promise<unknown> | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "late-acceptance image endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		void client
+			.control("turn.prompt", {
+				text: "Hold staged-image acceptance while aborting.",
+				stagedImages: [{ id }],
+			})
+			.catch(() => undefined);
+		await producerStarted.promise;
+		await pausedCommit.started;
+		// The acknowledgement is fenced behind the held durable write. Observe
+		// cancellation admission before releasing that write instead of deadlocking.
+		const abort = client.control("turn.abort", {}).catch(error => error);
+		await waitFor(() => preflightSignal?.aborted === true, "late acceptance preflight cancellation");
+		shutdown = Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext));
+		pausedCommit.release();
+		await acceptanceReturned.promise;
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(releases).toBe(0);
+
+		releaseProducer.resolve();
+		await shutdown;
+		await abort;
+		await waitFor(() => releases === 1, "late accepted staged-image shutdown release");
+		expect(releases).toBe(1);
+	} finally {
+		pausedCommit.release();
+		releaseProducer.resolve();
+		await client?.close();
+		await shutdown;
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		pausedCommit.restore();
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test("bus keeps an accepted staged image charged through producer settlement before run adoption", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-unadopted-shutdown-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-unadopted-shutdown-${Date.now()}`;
+	const producerStarted = Promise.withResolvers<void>();
+	const acceptanceReturned = Promise.withResolvers<void>();
+	const releaseProducer = Promise.withResolvers<void>();
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-unadopted-shutdown")) throw new Error("Image unadopted run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (content, options) => {
+			producerStarted.resolve();
+			await firePreflightAccept(options);
+			acceptanceReturned.resolve();
+			await releaseProducer.promise;
+			expect(content).toContainEqual(
+				expect.objectContaining({ type: "image", data: expect.any(String), mimeType: "image/png" }),
+			);
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	let shutdown: Promise<unknown> | undefined;
+	let shutdownSettled = false;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "unadopted image shutdown endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		const baseAttachedClients = sessionHostAttachedClients() ?? 0;
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients + 1, "image shutdown client");
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		expect(
+			await client.control("turn.prompt", {
+				text: "Accept this image before run adoption.",
+				stagedImages: [{ id }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await producerStarted.promise;
+		await acceptanceReturned.promise;
+		// No agent_start was emitted, so no exact run owner exists yet.
+		expect(releases).toBe(0);
+
+		shutdown = Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext)).then(
+			result => {
+				shutdownSettled = true;
+				return result;
+			},
+		);
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients,
+			"shutdown endpoint stop while image producer is held",
+		);
+		await Bun.sleep(0);
+		expect(shutdownSettled).toBe(false);
+		expect(releases).toBe(0);
+		releaseProducer.resolve();
+		await shutdown;
+		expect(releases).toBe(1);
+	} finally {
+		releaseProducer.resolve();
+		await client?.close();
+		await shutdown;
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test.each([
+	"returned",
+	"pending",
+	"failed-before-refusal",
+] as const)("native image refusal uses real queued Core authority (%s)", async mode => {
+	const pendingProducer = mode !== "returned";
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-native-core-image-refusal-"));
+	dirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	const sessionId = manager.getSessionId();
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled model");
+	const auth = await AuthStorage.create(path.join(cwd, "auth.db"));
+	auth.setRuntimeApiKey(model.provider, "test-key");
+	const entered = Promise.withResolvers<void>();
+	const predecessorRelease = Promise.withResolvers<void>();
+	const producerRelease = Promise.withResolvers<void>();
+	const enqueued = Promise.withResolvers<void>();
+	const refused = Promise.withResolvers<QueuedRunStartFailure>();
+	let providerCalls = 0;
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: createMockModel({
+			responses: [
+				async () => {
+					providerCalls++;
+					entered.resolve();
+					await predecessorRelease.promise;
+					return { content: ["predecessor completed"] };
+				},
+				() => {
+					providerCalls++;
+					return { content: ["unrelated completed"] };
+				},
+			],
+		}).stream,
+	});
+	const settings = Settings.isolated({ "compaction.enabled": false });
+	settings.setModelRole("default", `${model.provider}/${model.id}`);
+	const registry = new ModelRegistry(auth, path.join(cwd, "models.yml"));
+	const runner = new ExtensionRunner([], new ExtensionRuntime(), cwd, manager, registry, undefined, settings);
+	const session = new AgentSession({
+		agent,
+		sessionManager: manager,
+		settings,
+		modelRegistry: registry,
+		extensionRunner: runner,
+	});
+	session.setConfiguredModelChain("default", [`${model.provider}/${model.id}`], "test");
+	const sourceBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
+	let releases = 0;
+	const cleanup: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanup.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const ctx = {
+		...context(cwd, sessionId),
+		sessionManager: manager,
+		isIdle: () => !session.isStreaming,
+		getActivePromptHandle: () => session.activePromptHandle,
+		getPendingMessageCounts: () => session.pendingMessageCounts,
+		getRunOwnerDomain: (handle: string) => session.getRunOwnerDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => session.getTerminalRunOwnerForEvent(event),
+		waitForRunSettlement: (handle: string) => agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
+	};
+	let predecessor: Promise<void> | undefined;
+	const predecessorToken = `unrelated-predecessor-${sessionId}`;
+	const queuedRunCapability = createSdkRunCapability(`queued-image-${sessionId}`);
+	let callback: ((failure: QueuedRunStartFailure) => void) | undefined;
+	let latePromotion: (() => void) | undefined;
+	const handlers = start(
+		ctx,
+		undefined,
+		async (content, options) => {
+			// Real preflight race: the predecessor starts after native admission, before dispatch.
+			// Give each real execution its own SDK identity; the adapter deliberately
+			// queues this C01 dispatch instead of claiming a new public queue policy.
+			// Use the authenticated production send adapter: it translates the
+			// capability into the internal prompt token before Core acceptance.
+			predecessor = session.sendUserMessage("predecessor", {
+				sdkRunCapability: createSdkRunCapability(predecessorToken),
+			});
+			await entered.promise;
+			const delivery = options;
+			callback = options?.onQueuedRunStartFailed;
+			latePromotion = () => options?.onQueuedPromoted?.({ startsOwnRun: true });
+			await session.sendUserMessage(content, {
+				...delivery,
+				deliverAs: "followUp",
+				sdkRunCapability: queuedRunCapability,
+				onQueuedRunStartFailed: failure => {
+					// Delay only notification delivery, never fabricate Core's decision.
+					if (mode !== "failed-before-refusal") callback?.(failure);
+					refused.resolve(failure);
+				},
+			});
+			enqueued.resolve();
+			if (pendingProducer) await producerRelease.promise;
+			if (mode === "failed-before-refusal")
+				throw Object.assign(new Error("earlier enqueue producer failed"), { code: "rate_limit" });
+		},
+		true,
+	);
+	const starts: Array<string | undefined> = [];
+	const eventWrites: Promise<unknown>[] = [];
+	// Real Core/Session/native-consumer integration with forced follow-up delivery.
+	// Only the actual extension projection carries private tokens and owner authority.
+	const originalEmit = runner.emit.bind(runner);
+	const emitSpy = spyOn(runner, "emit").mockImplementation(async (event, continueWhile, scope) => {
+		const result = await originalEmit(event, continueWhile, scope);
+		if (event.type === "agent_start") starts.push(event.sdkRunToken);
+		const handler = handlers.get(event.type);
+		if (handler) {
+			const write = Promise.resolve(handler(event, ctx));
+			eventWrites.push(write);
+			await write;
+		}
+		return result;
+	});
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "real refusal endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		const ack = await client.control("turn.prompt", { text: "queued image", stagedImages: [{ id }] });
+		expect(ack).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(ack as Record<string, unknown>);
+		await enqueued.promise;
+		expect(providerCalls).toBe(1);
+		expect(releases).toBe(0);
+		agent.setModel(undefined);
+		predecessorRelease.resolve();
+		const failure = await refused.promise;
+		expect(failure).toMatchObject({ disposition: "not-started", error: { message: "No model configured" } });
+		await predecessor;
+		await session.waitForIdle();
+		await Promise.all(eventWrites);
+		if (pendingProducer) expect(releases).toBe(0);
+		let earlierReceipt: unknown;
+		producerRelease.resolve();
+		if (mode === "failed-before-refusal") {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				earlierReceipt = await client.query("turn.result", { kind: "prompt", ...correlation });
+				if ((earlierReceipt as { result?: { status?: string } }).result?.status === "failed") break;
+				await Bun.sleep(20);
+			}
+			expect(earlierReceipt).toMatchObject({ ok: true, result: { status: "failed" } });
+			expect(releases).toBe(0);
+			expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(sourceBefore);
+		}
+		callback?.(failure);
+		callback?.(failure);
+		latePromotion?.();
+		await waitFor(() => releases === 1, "real no-start image retirement");
+		expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBefore);
+		expect(providerCalls).toBe(1);
+		expect(starts).toEqual([predecessorToken]);
+		let receipt: unknown;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			receipt = await client.query("turn.result", { kind: "prompt", ...correlation });
+			if ((receipt as { result?: { status?: string } }).result?.status === "failed") break;
+			await Bun.sleep(20);
+		}
+		expect(receipt).toMatchObject({
+			ok: true,
+			result: {
+				status: "failed",
+				error: {
+					code: mode === "failed-before-refusal" ? "rate_limit" : "internal",
+					message: "Prompt submission failed.",
+				},
+				outcome: {
+					kind: "failed",
+					phase: "submission",
+					code: "prompt_failed",
+					provenance: "agent_failed",
+				},
+			},
+		});
+		if (mode === "failed-before-refusal")
+			expect((receipt as { result: unknown }).result).toEqual((earlierReceipt as { result: unknown }).result);
+		agent.setModel(model);
+		await session.prompt("later unrelated run");
+		await session.waitForIdle();
+		await Promise.all(eventWrites);
+		callback?.(failure);
+		expect(starts).toEqual([predecessorToken, undefined]);
+		expect(providerCalls).toBe(2);
+		expect(releases).toBe(1);
+		// The same session store can reserve again after the refused adoption.
+		const nextId = await stageOverSdkClient(client, makeStagedTestPng());
+		expect(await client.control("turn.image.discard", { id: nextId })).toMatchObject({ ok: true });
+		expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBefore);
+	} finally {
+		predecessorRelease.resolve();
+		producerRelease.resolve();
+		await predecessor;
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		emitSpy.mockRestore();
+		await session.dispose();
+		auth.close();
+		redeemSpy.mockRestore();
+		for (const release of cleanup) release();
+	}
+});
+
+test.each([
+	"own-run",
+	"aborted-own-run",
+	"removed",
+	"generic-same-text",
+	"post-start",
+	"post-start-unknown",
+] as const)("bus retains a promoted staged image until agent_start adopts its run (%s)", async mode => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-promotion-adoption-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-promotion-adoption-${Date.now()}`;
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-promotion-run")) throw new Error("Image promotion run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getActivePromptHandle: () => (mode === "post-start" ? "image-promotion-run" : undefined),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	const promotionReady = Promise.withResolvers<void>();
+	const genericFailure = Promise.withResolvers<void>();
+	let refuse: ((failure: QueuedRunStartFailure) => void) | undefined;
+	let promote: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	let promotedAfterAbort = false;
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (_content, options) => {
+			options?.onDispatchDisposition?.({ startsOwnRun: false });
+			await firePreflightAccept(options);
+			promote = options?.onQueuedPromoted;
+			refuse = options?.onQueuedRunStartFailed;
+			if (mode === "aborted-own-run") {
+				options?.preflightSignal?.addEventListener(
+					"abort",
+					() => {
+						promotedAfterAbort = options.preflightSignal?.aborted === true;
+						promote?.({ startsOwnRun: true });
+					},
+					{ once: true },
+				);
+			}
+			promotionReady.resolve();
+			if (mode === "generic-same-text") {
+				await genericFailure.promise;
+				throw new Error("No model configured");
+			}
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "queued image promotion endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		expect(
+			await client.control("turn.prompt", {
+				text: "Promote this queued image into its own run.",
+				stagedImages: [{ id }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await promotionReady.promise;
+		await Bun.sleep(0);
+		// The queue-enqueue producer has settled; promotion creates an adoption
+		// interval before the next agent_start supplies the exact run owner.
+		if (mode === "aborted-own-run") {
+			expect(await client.control("turn.abort", {})).toMatchObject({ ok: true });
+			expect(promotedAfterAbort).toBe(true);
+		} else if (mode === "removed") {
+			promote?.({ startsOwnRun: false, removed: true });
+			await waitFor(() => releases === 1, "authoritative queued image removal");
+		} else {
+			promote?.({ startsOwnRun: true });
+			if (mode === "generic-same-text") {
+				genericFailure.resolve();
+				await Bun.sleep(0);
+			} else if (mode.startsWith("post-start")) {
+				await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+				refuse?.({ disposition: "not-started", error: new Error("No model configured") });
+				refuse?.({ disposition: "not-started", error: new Error("duplicate") });
+			}
+		}
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		expect(releases).toBe(mode === "removed" ? 1 : 0);
+	} finally {
+		genericFailure.resolve();
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test.each([
+	"settlement",
+	"domain",
+	"terminal",
+] as const)("bus omits private image controls without ownership authority (%s)", async missing => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-authority-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-authority-${missing}-${Date.now()}`;
+	const ledger = createRunResourceLedger();
+	const domain = ledger.open("image-run");
+	if (!domain) throw new Error("Image authority run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		waitForRunSettlement:
+			missing === "settlement" ? undefined : (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
+		getRunOwnerDomain: missing === "domain" ? undefined : (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: missing === "terminal" ? undefined : () => ({ resourceRunId: "image-run", domain }),
+	};
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(sessionContext, settings);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "image authority endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const capabilities = await client.query("runtime.capabilities", {});
+		const operations = (capabilities as unknown as { page?: { items?: Array<{ operations?: string[] }> } }).page
+			?.items?.[0]?.operations;
+		expect(operations?.some(operation => operation.startsWith("turn.image."))).toBe(false);
+		await expect(client.control("turn.image.begin", {})).rejects.toMatchObject({
+			code: "operation_not_session_owned",
+		});
+	} finally {
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+});
+
+test.each([
+	"settled",
+	"pending",
+	"slow-pending",
+	"shutdown-slow-pending",
+	"quarantined",
+	"missing-handle-pending",
+	"missing-handle-quarantined",
+	"missing-domain-pending",
+	"missing-domain-quarantined",
+] as const)("bus staged-image capacity survives disconnect and an unrelated run terminal (%s)", async mode => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-domain-"));
+	const sourceBytesBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
+	dirs.push(cwd);
+	const sessionId = `sdk-image-domain-${Date.now()}`;
+	const missingOwner = mode.startsWith("missing-");
+	const live = { idle: true, handle: "image-run" };
+	const ledger = createRunResourceLedger();
+	const domain = ledger.open("image-run");
+	const otherDomain = ledger.open("other-run");
+	if (!domain || !otherDomain) throw new Error("Image test domains could not open.");
+	const tool = Promise.withResolvers<void>();
+	if (mode !== "settled") ledger.track("image-run", "tool", "abort-ignoring-tool", tool.promise);
+	const cleanupReservations: Array<() => void> = [];
+	const owners = new WeakMap<object, AgentTerminalOwnerContext>();
+	const proofAttempted = Promise.withResolvers<void>();
+	const proofHandles: string[] = [];
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		getActivePromptHandle: () => (mode.startsWith("missing-handle") ? undefined : live.handle),
+		getTerminalTurnEpoch: () => 1,
+		getRunOwnerDomain: (handle: string) =>
+			mode.startsWith("missing-domain") ? undefined : ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => owners.get(event),
+		waitForRunSettlement: (handle: string) => {
+			proofHandles.push(handle);
+			proofAttempted.resolve();
+			return ledger.waitForSettlement(handle, { graceMs: null });
+		},
+		abortPromptAndWait: async () => {
+			throw new Error("The image producer is held until its exact terminal.");
+		},
+	};
+	let releases = 0;
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const releaseRun = Promise.withResolvers<void>();
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			options?.onQueuedPromoted?.({ startsOwnRun: true });
+			await releaseRun.promise;
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "image domain endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		const accepted = await client.control("turn.prompt", { text: "hold the image owner", stagedImages: [{ id }] });
+		const result = (accepted as { result: { commandId?: unknown; turnId?: unknown } }).result;
+		const correlation = { commandId: result.commandId, turnId: result.turnId };
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(typeof correlation.commandId).toBe("string");
+		expect(typeof correlation.turnId).toBe("string");
+		live.idle = false;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(releases).toBe(0);
+		if (missingOwner) {
+			const failed = Promise.withResolvers<void>();
+			const removeObserver = client.onFrame(frame => {
+				if (
+					frame.type === "agent_failed" &&
+					frame.commandId === correlation.commandId &&
+					frame.turnId === correlation.turnId
+				)
+					failed.resolve();
+			});
+			releaseRun.reject(new Error("Image producer failed after adopting an unbound execution."));
+			await failed.promise;
+			removeObserver();
+			expect(releases).toBe(0);
+		}
+		await client.close();
+		const unrelated = { type: "agent_end" };
+		owners.set(unrelated, { resourceRunId: "other-run", domain: otherDomain });
+		await handlers.get("agent_end")?.(unrelated, sessionContext);
+		expect(releases).toBe(0);
+		const ended = { type: "agent_end", stopReason: mode === "settled" ? "completed" : "cancelled" };
+		owners.set(ended, { resourceRunId: "image-run", domain });
+		ledger.seal("image-run");
+		if (mode.endsWith("quarantined")) ledger.quarantine("image-run");
+		await handlers.get("agent_end")?.(ended, sessionContext);
+		if (mode !== "settled") {
+			if (mode.includes("slow")) {
+				await proofAttempted.promise;
+				const chargedBytes = getPromptImageProcessBudgetSnapshot().sourceBytes;
+				expect(chargedBytes).toBeGreaterThan(sourceBytesBefore);
+				await handlers.get("agent_end")?.(ended, sessionContext);
+				if (mode.startsWith("shutdown")) {
+					releaseRun.resolve();
+					await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+					await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+				}
+				// Exceed the retired helper's entire 100 x 100 ms polling window.
+				await Bun.sleep(10_100);
+				expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(chargedBytes);
+				expect(proofHandles).toEqual(["image-run"]);
+			} else await Bun.sleep(150);
+			expect(releases).toBe(0);
+			tool.resolve();
+		}
+		if (mode.endsWith("quarantined") || missingOwner) {
+			releaseRun.resolve();
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			await Bun.sleep(150);
+			expect(releases).toBe(0);
+			expect(await ledger.waitForSettlement("image-run", { graceMs: 0 })).toMatchObject(
+				mode.endsWith("quarantined") ? { status: "unfenced", reason: "quarantined" } : { status: "settled" },
+			);
+			return;
+		}
+		await waitFor(() => releases === 1, "exact image resource settlement");
+		expect(releases).toBe(1);
+		if (mode.includes("slow")) {
+			expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBytesBefore);
+			expect(proofHandles).toEqual(["image-run"]);
+		}
+		releaseRun.resolve();
+		await handlers.get("agent_end")?.(ended, sessionContext);
+		expect(releases).toBe(1);
+	} finally {
+		tool.resolve();
+		releaseRun.resolve();
+		try {
+			await client?.close();
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		} finally {
+			redeemSpy.mockRestore();
+			for (const release of cleanupReservations) release();
+		}
+	}
+}, 20_000);
+
+test.each([
+	"fatal",
+	"natural",
+	"removed",
+	"ordinary-abort",
+	"terminal-abort",
+	"queued-deadline",
+	"busy-at-dispatch",
+	"joined-progress",
+	"held-terminal",
+	"held-ordinary-abort",
+	"claim-failure",
+	"finalize-failure",
+] as const)("a diverted text-only prompt keeps exact lifecycle ownership (%s)", async mode => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-text-owner-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steered-text-owner-${Date.now()}`;
+	const live = { idle: true, handle: "original-run" };
+	const base = context(cwd, sessionId, "main", live);
+	const ledger = createRunResourceLedger();
+	const originalDomain = ledger.open("original-run");
+	const successorDomain = ledger.open("successor-run");
+	if (!originalDomain || !successorDomain) throw new Error("Test run domains could not open.");
+	const trustedOwners = new WeakMap<object, AgentTerminalOwnerContext>();
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+		getActivePromptHandle: () => live.handle,
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => trustedOwners.get(event),
+		getTerminalTurnEpoch: () => 1,
+		abortPromptAndWait: async () => {
+			throw new Error("consuming text run remains unsettled");
+		},
+	};
+	const accepted = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	let queued = false;
+	let promote: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	let releaseQueueAbort: (() => void) | undefined;
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const heldCommit =
+		mode === "held-terminal" || mode === "held-ordinary-abort"
+			? pauseNextReconciliationCommit(path.join(cwd, "session.jsonl"), sessionId, true)
+			: undefined;
+	const failedCommit =
+		mode === "claim-failure" || mode === "finalize-failure"
+			? failNextReconciliationCommit(path.join(cwd, "session.jsonl"), sessionId, mode === "finalize-failure")
+			: undefined;
+	try {
+		const handlers = start(
+			sessionContext,
+			{
+				get: (key: string) =>
+					mode === "queued-deadline" || mode === "joined-progress"
+						? key === "sdk.promptDeadlineMs"
+							? 100
+							: key === "sdk.promptMaxRuntimeMs"
+								? 1_000
+								: undefined
+						: undefined,
+				getAgentDir: () => cwd,
+			} as unknown as Settings,
+			async (content, options) => {
+				expect(content).toBe("Text diverted during preflight");
+				accepted.resolve();
+				await preflight.promise;
+				await firePreflightAccept(options);
+				queued = true;
+				promote = options?.onQueuedPromoted;
+				const remove = () => {
+					if (!queued) return;
+					queued = false;
+					heldCommit?.arm();
+					failedCommit?.arm();
+					promote?.({ startsOwnRun: false, removed: true });
+				};
+				options?.preflightSignal?.addEventListener("abort", remove, { once: true });
+				releaseQueueAbort = () => options?.preflightSignal?.removeEventListener("abort", remove);
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const control = async (
+			id: string,
+			operation: string,
+			input: Record<string, unknown>,
+			idempotencyKey?: string,
+		) => {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id,
+					operation,
+					input,
+					...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`${id} response`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+		};
+		if (mode === "busy-at-dispatch") {
+			live.idle = false;
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			expect(
+				await control("steered-prompt", "turn.prompt", { text: "Text diverted during preflight" }),
+			).toMatchObject({
+				ok: false,
+				error: { code: "busy" },
+			});
+			expect(queued).toBe(false);
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			return;
+		}
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steered-prompt",
+				operation: "turn.prompt",
+				input: { text: "Text diverted during preflight" },
+			}),
+		);
+		await accepted.promise;
+		// The prompt is admitted under the idle snapshot, then another run becomes
+		// active before the user-message dispatch; this is the implicit text queue.
+		live.idle = false;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		preflight.resolve();
+		await waitFor(() => frames.some(frame => frame.id === "steered-prompt"), "text prompt admission");
+		const ack = frames.find(frame => frame.id === "steered-prompt")!;
+		expect(ack).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(ack);
+		await waitFor(() => promote !== undefined, "exact queued owner");
+		const queryResult = async () => {
+			const id = `result-${frames.length}`;
+			socket.send(
+				JSON.stringify({
+					type: "query_request",
+					id,
+					query: "turn.result",
+					input: { kind: "prompt", ...correlation },
+				}),
+			);
+			await waitFor(() => frames.some(frame => frame.id === id), "durable diverted result");
+			return frames.find(frame => frame.id === id)!;
+		};
+		if (heldCommit || failedCommit) {
+			const terminalCancellation = mode !== "held-ordinary-abort";
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "persist-cancel",
+					operation: "turn.abort",
+					input: terminalCancellation ? { mode: "terminal" } : {},
+					...(terminalCancellation ? { idempotencyKey: "persist-cancel" } : {}),
+				}),
+			);
+			if (heldCommit) {
+				await heldCommit.started;
+				expect(frames.some(frame => frame.id === "persist-cancel" && frame.type === "control_response")).toBe(
+					false,
+				);
+				const before = (await Bun.file(
+					reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId),
+				).json()) as ReconciliationStoreDocument;
+				expect(
+					before.records.find(record => record.commandId === correlation.commandId)?.terminalAt,
+				).toBeUndefined();
+				heldCommit.release();
+				await waitFor(
+					() => frames.some(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+					"joined durable cancellation reply",
+				);
+				expect(
+					frames.find(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+				).toMatchObject({
+					ok: true,
+				});
+				expect(await queryResult()).toMatchObject({
+					ok: true,
+					result: { status: "terminal_ok", outcome: { reason: "cancelled" } },
+				});
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			} else if (failedCommit) {
+				await failedCommit.failed;
+				await waitFor(
+					() => warnSpy.mock.calls.some(args => String(args[0]).includes("persistence failed")),
+					"failed durable removal",
+				);
+				await waitFor(
+					() => frames.some(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+					"uncertain cancellation reply",
+				);
+				const durable = (await Bun.file(
+					reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId),
+				).json()) as ReconciliationStoreDocument;
+				expect(
+					durable.records.find(record => record.commandId === correlation.commandId)?.terminalAt,
+				).toBeUndefined();
+				expect(durable.terminalScopes?.at(-1)?.turnDisposition).toBe("no_effect_reserved");
+				expect(
+					frames.find(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+				).toMatchObject({
+					ok: true,
+					result: { turn: "uncertain", reason: "worker_unsettled" },
+				});
+				expect(frames.some(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId)).toBe(
+					false,
+				);
+				const replayFrames: Record<string, unknown>[] = [];
+				const replaySocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+				sockets.push(replaySocket);
+				replaySocket.addEventListener("message", event => replayFrames.push(JSON.parse(String(event.data))));
+				await waitFor(() => replaySocket.readyState === WebSocket.OPEN, "fresh cancellation replay client");
+				replaySocket.send(
+					JSON.stringify({
+						type: "control_request",
+						id: "persist-cancel-replay",
+						operation: "turn.abort",
+						input: { mode: "terminal" },
+						idempotencyKey: "persist-cancel",
+					}),
+				);
+				await waitFor(
+					() => replayFrames.some(frame => frame.id === "persist-cancel-replay"),
+					"uncertain cancellation replay",
+				);
+				expect(replayFrames.find(frame => frame.id === "persist-cancel-replay")).toMatchObject({
+					ok: true,
+					result: { turn: "uncertain" },
+				});
+				replaySocket.send(
+					JSON.stringify({
+						type: "control_request",
+						id: "persist-cancel-fresh-key",
+						operation: "turn.abort",
+						input: { mode: "terminal" },
+						idempotencyKey: "persist-cancel-fresh-key",
+					}),
+				);
+				await waitFor(
+					() => replayFrames.some(frame => frame.id === "persist-cancel-fresh-key"),
+					"fresh-key uncertain cancellation retry",
+				);
+				// This new key belongs to a different authenticated connection, which
+				// never owned the removed request. It cannot inherit cancellation authority;
+				// only replaying the original durable key preserves the uncertain result.
+				expect(replayFrames.find(frame => frame.id === "persist-cancel-fresh-key")).toMatchObject({
+					ok: true,
+					result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+				});
+				expect(
+					frames.some(
+						frame =>
+							frame.type === "agent_end" &&
+							frame.commandId === correlation.commandId &&
+							frame.turnId === correlation.turnId,
+					),
+				).toBe(false);
+				expect(live.handle).toBe("original-run");
+				const shutdownFailure = await Promise.resolve(
+					handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+				).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+			}
+			expect(queued).toBe(false);
+			return;
+		}
+		if (mode === "queued-deadline") {
+			await Bun.sleep(350);
+			expect(await queryResult()).toMatchObject({ ok: true, result: { status: "accepted" } });
+			expect(queued).toBe(true);
+		}
+		if (mode === "removed" || mode === "ordinary-abort" || mode === "terminal-abort") {
+			if (mode === "removed") {
+				queued = false;
+				promote?.({ startsOwnRun: false, removed: true });
+			} else if (mode === "terminal-abort") {
+				expect(
+					await control(
+						"cancel-before-consumption",
+						"turn.abort",
+						{ mode: "terminal" },
+						"cancel-before-consumption",
+					),
+				).toMatchObject({ ok: true });
+			} else expect(await control("cancel-before-consumption", "turn.abort", {})).toMatchObject({ ok: true });
+			await waitFor(
+				() => frames.some(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId),
+				"removed text terminal",
+			);
+			expect(queued).toBe(false);
+			expect(await queryResult()).toMatchObject({
+				ok: true,
+				result: { status: "terminal_ok", outcome: { kind: "stopped", reason: "cancelled" } },
+			});
+			expect(live.handle).toBe("original-run");
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			return;
+		}
+
+		const originalEnd = { type: "agent_end" as const, messages: [] };
+		trustedOwners.set(originalEnd, { resourceRunId: "original-run", domain: originalDomain });
+		await handlers.get("agent_end")?.(originalEnd, sessionContext);
+		live.handle = "successor-run";
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === correlation.commandId)).toBe(
+			false,
+		);
+		queued = false;
+		releaseQueueAbort?.();
+		promote?.({ startsOwnRun: false });
+		if (mode === "joined-progress") {
+			await handlers.get("tool_execution_start")?.(
+				{ type: "tool_execution_start", toolCallId: "joined-tool", toolName: "read", args: {} },
+				sessionContext,
+			);
+			for (let tick = 0; tick < 5; tick++) {
+				await Bun.sleep(60);
+				await handlers.get("tool_execution_update")?.(
+					{
+						type: "tool_execution_update",
+						toolCallId: "joined-tool",
+						toolName: "read",
+						args: {},
+						partialResult: { content: [{ type: "text", text: "progress" }] },
+					},
+					sessionContext,
+				);
+				expect(await queryResult()).toMatchObject({ ok: true, result: { status: "accepted" } });
+			}
+			await handlers.get("tool_execution_end")?.(
+				{
+					type: "tool_execution_end",
+					toolCallId: "joined-tool",
+					toolName: "read",
+					result: { content: [{ type: "text", text: "done" }] },
+					isError: false,
+				},
+				sessionContext,
+			);
+		}
+		if (mode === "fatal") {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "steered-abort",
+					operation: "turn.abort",
+					input: { mode: "terminal" },
+					idempotencyKey: "steered-abort",
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
+				"steered fatal closure",
+			);
+		}
+		const successorEnd = {
+			type: "agent_end" as const,
+			messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Text completed" }] }],
+		};
+		trustedOwners.set(successorEnd, { resourceRunId: "successor-run", domain: successorDomain });
+		await handlers.get("agent_end")?.(successorEnd, sessionContext);
+		if (mode === "natural" || mode === "queued-deadline" || mode === "joined-progress") {
+			expect(await queryResult()).toMatchObject({
+				ok: true,
+				result: { status: "terminal_ok", outcome: { kind: "stopped", reason: "end_turn" } },
+			});
+			await handlers.get("agent_end")?.(successorEnd, sessionContext);
+			expect(
+				frames.filter(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId),
+			).toHaveLength(1);
+		}
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		preflight.resolve();
+		releaseQueueAbort?.();
+		heldCommit?.release();
+		heldCommit?.restore();
+		failedCommit?.restore();
+		warnSpy.mockRestore();
+	}
+}, 60_000);
+
+test("SDK host text-only stop/restart isolates late predecessor progress and terminal ownership", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-text-owner-restart-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-text-owner-restart-${Date.now()}`;
+	const live: { idle?: boolean; handle: string } = { idle: true, handle: "predecessor-run" };
+	const base = context(cwd, sessionId, "main", live);
+	const ledger = createRunResourceLedger();
+	const predecessorDomain = ledger.open("predecessor-run");
+	const deadlineSuccessorDomain = ledger.open("successor-deadline-run");
+	const naturalSuccessorDomain = ledger.open("successor-natural-run");
+	if (!predecessorDomain || !deadlineSuccessorDomain || !naturalSuccessorDomain)
+		throw new Error("Test run domains could not open.");
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+		getActivePromptHandle: () => live.handle,
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: getAgentTerminalOwnerContext,
+		getTerminalTurnEpoch: () => 41,
+		abortPromptAndWait: async (handle: string) => {
+			const domain = ledger.lookupDomain(handle);
+			abortAttempts.push({ handle, activeHandle: live.handle, hasLiveDomain: domain !== undefined });
+			if (domain) {
+				abortHandles.push(handle);
+				ledger.seal(handle);
+			}
+			return await ledger.waitForSettlement(handle, { graceMs: 0 });
+		},
+	};
+	const deadlineMs = 500;
+	const settings = {
+		get: (key: string) =>
+			key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 5_000 : undefined,
+	} as unknown as Settings;
+	const abortHandles: string[] = [];
+	const abortAttempts: Array<{ handle: string; activeHandle: string; hasLiveDomain: boolean }> = [];
+	let joinedPromotion: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	const predecessorDispatchStarted = Promise.withResolvers<void>();
+	const predecessorDispatchReady = Promise.withResolvers<void>();
+	const pendingSubmissions = new Set<() => void>();
+	const settleSubmissions = () => {
+		for (const resolve of pendingSubmissions) resolve();
+		pendingSubmissions.clear();
+	};
+	const sendText: CapturedSendUserMessage = async (content, options) => {
+		if (typeof content !== "string") throw new Error("The teardown regression must stay text-only.");
+		if (content === "predecessor joined text") {
+			predecessorDispatchStarted.resolve();
+			await predecessorDispatchReady.promise;
+			await firePreflightAccept(options);
+			joinedPromotion = options?.onQueuedPromoted;
+			options?.onDispatchDisposition?.({ startsOwnRun: false });
+			return;
+		}
+		await firePreflightAccept(options);
+		const completion = Promise.withResolvers<void>();
+		pendingSubmissions.add(completion.resolve);
+		await completion.promise;
+		pendingSubmissions.delete(completion.resolve);
+	};
+	let handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+	let clockNow = Date.now();
+	const leaseClock = spyOn(Date, "now").mockImplementation(() => clockNow);
+	const openClient = async (): Promise<{
+		socket: WebSocket;
+		frames: Record<string, unknown>[];
+		control: (
+			id: string,
+			operation: string,
+			input: Record<string, unknown>,
+			idempotencyKey?: string,
+		) => Promise<Record<string, unknown>>;
+		query: (id: string, input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+	}> => {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const sendAndWait = async (
+			id: string,
+			frame: Record<string, unknown>,
+			label: string,
+		): Promise<Record<string, unknown>> => {
+			socket.send(JSON.stringify({ ...frame, id }));
+			await waitFor(() => frames.some(candidate => candidate.id === id), label);
+			return frames.find(candidate => candidate.id === id)!;
+		};
+		return {
+			socket,
+			frames,
+			control: (id, operation, input, idempotencyKey) =>
+				sendAndWait(
+					id,
+					{
+						type: "control_request",
+						operation,
+						input,
+						...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+					},
+					`${id} response`,
+				),
+			query: (id, input) => sendAndWait(id, { type: "query_request", query: "turn.result", input }, `${id} result`),
+		};
+	};
+	try {
+		// Lease time is controlled; socket/disk work and 15s wait guards stay real.
+		// Keep the 500ms lease and exact 350ms late-progress boundary without
+		// letting slow transport consume the remaining ownership-check window.
+		handlers = start(sessionContext, settings, sendText, true, new Map(), undefined, false);
+		const predecessorHandlers = handlers;
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const predecessor = await openClient();
+		const joinedPromise = predecessor.control("predecessor-joined", "turn.prompt", {
+			text: "predecessor joined text",
+		});
+		await predecessorDispatchStarted.promise;
+		live.idle = false;
+		const predecessorStart = { type: "agent_start" as const };
+		setAgentTerminalOwnerContext(predecessorStart, {
+			resourceRunId: "predecessor-run",
+			domain: predecessorDomain,
+		});
+		await handlers.get("agent_start")?.(predecessorStart, sessionContext);
+		predecessorDispatchReady.resolve();
+		const joined = await joinedPromise;
+		expect(joined).toMatchObject({ ok: true, result: { accepted: true } });
+		const joinedCorrelation = acceptedCorrelation(joined);
+		expect(joinedPromotion).toBeDefined();
+		joinedPromotion?.({ startsOwnRun: false });
+		expect(
+			await predecessor.query("predecessor-joined-result", { kind: "prompt", ...joinedCorrelation }),
+		).toMatchObject({
+			ok: true,
+			result: { status: "accepted" },
+		});
+
+		// Model submission has finished producing reconciliation before teardown;
+		// no terminal event has retired the joined attribution map yet.
+		settleSubmissions();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await closeSocket(predecessor.socket);
+		ledger.seal("predecessor-run");
+		expect(await ledger.waitForSettlement("predecessor-run", { graceMs: 0 })).toEqual({ status: "settled" });
+		const predecessorAborts = [...abortHandles];
+		expect(predecessorAborts.every(handle => handle === "predecessor-run")).toBe(true);
+
+		live.idle = true;
+		live.handle = "successor-deadline-run";
+		// session_shutdown is terminal for an extension instance. A process/session
+		// restart installs a fresh extension for the same logical session identity.
+		handlers = start(sessionContext, settings, sendText, true, new Map(), undefined, false);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const successor = await openClient();
+		const successorPrompt = await successor.control("successor-deadline", "turn.prompt", {
+			text: "successor deadline text",
+		});
+		expect(successorPrompt).toMatchObject({ ok: true, result: { accepted: true } });
+		const successorCorrelation = acceptedCorrelation(successorPrompt);
+		live.idle = false;
+		const successorStart = { type: "agent_start" as const };
+		setAgentTerminalOwnerContext(successorStart, {
+			resourceRunId: "successor-deadline-run",
+			domain: deadlineSuccessorDomain,
+		});
+		await handlers.get("agent_start")?.(successorStart, sessionContext);
+		const acceptedAt = Date.now();
+		clockNow = acceptedAt + 350;
+
+		const latePredecessorProgress = {
+			type: "tool_execution_update" as const,
+			toolCallId: "late-predecessor-tool",
+			toolName: "read",
+			args: {},
+			partialResult: { content: [{ type: "text" as const, text: "late predecessor progress" }] },
+		};
+		setAgentTerminalOwnerContext(latePredecessorProgress, {
+			resourceRunId: "predecessor-run",
+			domain: predecessorDomain,
+		});
+		await predecessorHandlers.get("tool_execution_update")?.(latePredecessorProgress, sessionContext);
+		const latePredecessorEnd = {
+			type: "agent_end" as const,
+			messages: [{ role: "assistant", stopReason: "stop", content: "late predecessor end" }],
+		};
+		setAgentTerminalOwnerContext(latePredecessorEnd, {
+			resourceRunId: "predecessor-run",
+			domain: predecessorDomain,
+		});
+		await predecessorHandlers.get("agent_end")?.(latePredecessorEnd, sessionContext);
+		expect(
+			await successor.query("successor-still-in-flight", { kind: "prompt", ...successorCorrelation }),
+		).toMatchObject({
+			ok: true,
+			result: { status: "in_flight" },
+		});
+		expect(live.handle).toBe("successor-deadline-run");
+		expect(await successor.control("successor-busy-check", "turn.prompt", { text: "stay busy" })).toMatchObject({
+			ok: false,
+			error: { code: "busy" },
+		});
+		const outsider = await openClient();
+		expect(
+			await outsider.control(
+				"successor-nonowner-abort",
+				"turn.abort",
+				{ mode: "terminal" },
+				"successor-nonowner-abort",
+			),
+		).toMatchObject({
+			ok: true,
+			result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+		});
+		expect(abortHandles).toEqual(predecessorAborts);
+		await closeSocket(outsider.socket);
+		expect(
+			successor.frames.some(
+				frame =>
+					(frame.type === "agent_end" || frame.type === "agent_failed") &&
+					frame.commandId === successorCorrelation.commandId &&
+					frame.turnId === successorCorrelation.turnId,
+			),
+		).toBe(false);
+		clockNow = acceptedAt + deadlineMs;
+		await waitFor(
+			() =>
+				successor.frames.some(
+					frame =>
+						(frame.type === "agent_end" || frame.type === "agent_failed") &&
+						frame.commandId === successorCorrelation.commandId &&
+						frame.turnId === successorCorrelation.turnId,
+				),
+			"successor-owned deadline terminal",
+		);
+		expect(
+			await successor.query("successor-deadline-result", { kind: "prompt", ...successorCorrelation }),
+		).toMatchObject({
+			ok: true,
+			result: {
+				status: "failed",
+				terminalAt: acceptedAt + deadlineMs,
+				error: { code: "prompt_deadline_exceeded" },
+			},
+		});
+		expect(abortHandles).toEqual([...predecessorAborts, "successor-deadline-run"]);
+		expect(abortAttempts.some(attempt => attempt.hasLiveDomain && attempt.handle !== attempt.activeHandle)).toBe(
+			false,
+		);
+		expect(abortHandles.every(handle => handle === "predecessor-run" || handle === "successor-deadline-run")).toBe(
+			true,
+		);
+
+		settleSubmissions();
+		const deadlineEnd = { type: "agent_end" as const, messages: [], stopReason: "cancelled" };
+		setAgentTerminalOwnerContext(deadlineEnd, {
+			resourceRunId: "successor-deadline-run",
+			domain: deadlineSuccessorDomain,
+		});
+		await handlers.get("agent_end")?.(deadlineEnd, sessionContext);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		live.idle = true;
+		live.handle = "successor-natural-run";
+		handlers = start(sessionContext, settings, sendText, true, new Map(), undefined, false);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const naturalClient = await openClient();
+		const naturalPrompt = await naturalClient.control("successor-natural", "turn.prompt", {
+			text: "successor natural text",
+		});
+		expect(naturalPrompt).toMatchObject({ ok: true, result: { accepted: true } });
+		const naturalCorrelation = acceptedCorrelation(naturalPrompt);
+		live.idle = false;
+		const naturalStart = { type: "agent_start" as const };
+		setAgentTerminalOwnerContext(naturalStart, {
+			resourceRunId: "successor-natural-run",
+			domain: naturalSuccessorDomain,
+		});
+		await handlers.get("agent_start")?.(naturalStart, sessionContext);
+		const successorProgress = {
+			type: "tool_execution_update" as const,
+			toolCallId: "successor-tool",
+			toolName: "read",
+			args: {},
+			partialResult: { content: [{ type: "text" as const, text: "successor text progress" }] },
+		};
+		setAgentTerminalOwnerContext(successorProgress, {
+			resourceRunId: "successor-natural-run",
+			domain: naturalSuccessorDomain,
+		});
+		await handlers.get("tool_execution_start")?.(
+			{ ...successorProgress, type: "tool_execution_start" },
+			sessionContext,
+		);
+		await handlers.get("tool_execution_update")?.(successorProgress, sessionContext);
+		const naturalEnd = {
+			type: "agent_end" as const,
+			messages: [{ role: "assistant", stopReason: "stop", content: "successor natural completion" }],
+		};
+		setAgentTerminalOwnerContext(naturalEnd, {
+			resourceRunId: "successor-natural-run",
+			domain: naturalSuccessorDomain,
+		});
+		await handlers.get("agent_end")?.(naturalEnd, sessionContext);
+		expect(
+			await naturalClient.query("successor-natural-result", { kind: "prompt", ...naturalCorrelation }),
+		).toMatchObject({
+			ok: true,
+			result: { status: "terminal_ok" },
+		});
+		const historicalResult = await naturalClient.query("successor-deadline-stays-failed", {
+			kind: "prompt",
+			...successorCorrelation,
+		});
+		try {
+			expect(historicalResult).toMatchObject({
+				ok: true,
+				result: { status: "failed", error: { code: "prompt_deadline_exceeded" } },
+			});
+		} catch (error) {
+			// Capture only after failure: no extra I/O or await can mask a restart race
+			// on the successful path. Keep quarantined documents before fixture cleanup.
+			const storePath = reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId);
+			let persistence: unknown;
+			try {
+				const basename = path.basename(storePath);
+				persistence = fs
+					.readdirSync(path.dirname(storePath))
+					.filter(name => name === basename || name.startsWith(`${basename}.`))
+					.map(name => {
+						try {
+							return { name, raw: fs.readFileSync(path.join(path.dirname(storePath), name), "utf8") };
+						} catch (captureError) {
+							return { name, captureError: String(captureError) };
+						}
+					});
+			} catch (captureError) {
+				persistence = { captureError: String(captureError) };
+			}
+			throw new Error(
+				`SDK restart lost historical deadline result: ${JSON.stringify({ historicalResult, successorCorrelation, persistence })}`,
+				{ cause: error },
+			);
+		}
+	} finally {
+		// Restore the fake lease clock before awaited teardown: if shutdown
+		// throws, an active Date.now spy would leak into every later test.
+		leaseClock.mockRestore();
+		predecessorDispatchReady.resolve();
+		settleSubmissions();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
 });
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
@@ -2015,6 +4477,9 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 				deliverAs: "followUp",
 				preflightSignal: expect.any(AbortSignal),
 				sdkRunCapability: expect.any(Object),
+				onQueuedPromoted: expect.any(Function),
+				onQueuedRunStartFailed: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
 			},
 		],
 	]);
@@ -4778,7 +7243,8 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	await waitFor(() => deliveries.length === 1, "terminal prompt accepted");
 	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	// The fixture harness fires agent_start without binding an exact run handle,
-	// so the prompt is accepted-but-not-started: terminal abort must cancel the
+	// so the prompt is normally accepted-but-not-started: terminal abort must
+	// cancel the
 	// in-flight session preflight and FINALIZE the accepted prompt as a pre-run
 	// cancellation (no_active_turn / terminal_no_effect) instead of terminalizing
 	// with no run handle (which would wrongly fence the connection).
@@ -4795,14 +7261,20 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-abort"),
 		"terminal abort uncertainty response",
 	);
-	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-abort")).toMatchObject({
-		ok: true,
-		result: {
-			selection: "turn",
-			turn: "no_active_turn",
-			terminal: "terminal_no_effect",
-		},
-	});
+	const abortResponse = frames.find(frame => frame.type === "control_response" && frame.id === "terminal-abort") as
+		| { ok?: unknown; result?: Record<string, unknown> }
+		| undefined;
+	expect(abortResponse?.ok).toBe(true);
+	expect(abortResponse?.result?.selection).toBe("turn");
+	// A worker can claim the turn between delivery and the abort on a loaded
+	// runner. Both legitimate finalizations must be accepted here; what must not
+	// happen is the no-run-handle fence this regression covers, which is why the
+	// response has to be a settled turn outcome rather than an error.
+	if (abortResponse?.result?.turn === "no_active_turn") {
+		expect(abortResponse.result.terminal).toBe("terminal_no_effect");
+	} else {
+		expect(abortResponse?.result).toMatchObject({ ownedWork: "left_running", resumeOnOwnedCompletion: true });
+	}
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
@@ -4820,44 +7292,58 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 			getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
 		},
 	};
-	const handlers = start(ctx);
+	const handlers = start(ctx, undefined, () => {}, false, new Map(), undefined, false);
 	const endpointAPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionA}.json`);
-	await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
-	const endpointA = JSON.parse(fs.readFileSync(endpointAPath, "utf8")) as { url: string; token: string };
-	const clientA = new WebSocket(`${endpointA.url}/?token=${encodeURIComponent(endpointA.token)}`);
-	sockets.push(clientA);
-	await new Promise<void>((resolve, reject) => {
-		clientA.addEventListener("open", () => resolve(), { once: true });
-		clientA.addEventListener("error", () => reject(new Error("session A WebSocket error")), { once: true });
-	});
+	try {
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
+		const endpointA = JSON.parse(fs.readFileSync(endpointAPath, "utf8")) as { url: string; token: string };
+		const clientA = new WebSocket(`${endpointA.url}/?token=${encodeURIComponent(endpointA.token)}`);
+		sockets.push(clientA);
+		await new Promise<void>((resolve, reject) => {
+			clientA.addEventListener("open", () => resolve(), { once: true });
+			clientA.addEventListener("error", () => reject(new Error("session A WebSocket error")), { once: true });
+		});
 
-	activeSessionId = sessionB;
-	await handlers.get("session_switch")?.(
-		{
-			type: "session_switch",
-			reason: "new",
-			previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
-		},
-		ctx,
-	);
-	const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
-	await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
-	const endpointB = JSON.parse(fs.readFileSync(endpointBPath, "utf8")) as { url: string; token: string };
-	expect(endpointB.token).not.toBe(endpointA.token);
-	await waitFor(() => clientA.readyState === WebSocket.CLOSED, "session A client close");
+		activeSessionId = sessionB;
+		await handlers.get("session_switch")?.(
+			{
+				type: "session_switch",
+				reason: "new",
+				previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
+			},
+			ctx,
+		);
+		const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
+		await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
+		const endpointB = JSON.parse(fs.readFileSync(endpointBPath, "utf8")) as { url: string; token: string };
+		expect(endpointB.token).not.toBe(endpointA.token);
+		await waitFor(() => clientA.readyState === WebSocket.CLOSED, "session A client close");
 
-	const staleTokenClient = new WebSocket(`${endpointB.url}/?token=${encodeURIComponent(endpointA.token)}`);
-	sockets.push(staleTokenClient);
-	await Promise.race([
-		new Promise<void>(resolve => {
-			staleTokenClient.addEventListener("close", () => resolve(), { once: true });
-			staleTokenClient.addEventListener("error", () => resolve(), { once: true });
-		}),
-		Bun.sleep(1_000).then(() => {
-			throw new Error("stale session token was not rejected by the replacement host");
-		}),
-	]);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		const staleTokenClient = new WebSocket(`${endpointB.url}/?token=${encodeURIComponent(endpointA.token)}`);
+		sockets.push(staleTokenClient);
+		await Promise.race([
+			new Promise<void>(resolve => {
+				staleTokenClient.addEventListener("close", () => resolve(), { once: true });
+				staleTokenClient.addEventListener("error", () => resolve(), { once: true });
+			}),
+			Bun.sleep(1_000).then(() => {
+				throw new Error("stale session token was not rejected by the replacement host");
+			}),
+		]);
+	} finally {
+		try {
+			await handlers.get("session_shutdown")!(
+				{ type: "session_shutdown" },
+				{
+					...ctx,
+					sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA },
+				},
+			);
+		} finally {
+			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		}
+	}
 });
 
 for (const eventType of ["session_switch", "session_branch"] as const) {
@@ -4882,18 +7368,31 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 				}),
 			},
 		};
-		// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
-		// throws the retained-retry AggregateError.
-		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
-		try {
-			const startupCapability = new SdkStartupCapability(undefined, "immediate", "rotation-failure-marker");
-			const handlers = start(ctx, undefined, () => {}, false, new Map(), {
+		const startupCapability = new SdkStartupCapability(undefined, "immediate", "rotation-failure-marker");
+		const handlers = start(
+			ctx,
+			undefined,
+			() => {},
+			false,
+			new Map(),
+			{
 				startupCapability,
 				lifecycleRequired: true,
-			});
+			},
+			false,
+		);
+		let restoreStop: (() => void) | undefined;
+		try {
+			await handlers.get("session_start")!({ type: "session_start" }, ctx);
 			await expect(startupCapability.promise).resolves.toEqual({ status: "started" });
 			const endpointAPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionA}.json`);
 			await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
+			// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
+			// throws the retained-retry AggregateError. Install this only after the full
+			// predecessor session_start handler and endpoint are ready, so startup cleanup
+			// cannot consume the rotation fault.
+			const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+			restoreStop = () => stop.mockRestore();
 
 			activeSessionId = sessionB;
 			// A retained predecessor cleanup must fail closed and rethrow before any
@@ -4910,21 +7409,25 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			// The failed predecessor release quarantines B: no successor endpoint is published.
 			const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
 			expect(fs.existsSync(endpointBPath)).toBe(false);
-
-			// With the mock restored, A's retained cleanup can still complete.
-			stop.mockRestore();
-			await expect(
-				handlers.get("session_shutdown")!(
-					{ type: "session_shutdown" },
-					{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA } },
-				),
-			).resolves.toBeUndefined();
-
-			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 		} finally {
-			stop.mockRestore();
+			// With the mock restored, A's retained cleanup can still complete. Keep
+			// this assertion and always shut down B as well, including when an earlier
+			// assertion fails before the rotation completes.
+			restoreStop?.();
+			try {
+				await expect(
+					handlers.get("session_shutdown")!(
+						{ type: "session_shutdown" },
+						{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA } },
+					),
+				).resolves.toBeUndefined();
+			} finally {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			}
 		}
-	});
+		// Rotating two real hosts and their predecessor releases exceeds the
+		// default 5s budget on a loaded shard; the assertions stay unchanged.
+	}, 30_000);
 }
 
 test("SDK host binds session query and control seams and excludes uninstalled resources", async () => {
@@ -5186,7 +7689,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		}),
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map([[bashTool.name, bashTool]]),
 	});
 	agentSession.setSdkPermissionMode("prompt");
@@ -5508,9 +8011,35 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { notificationsInitiallyEnabled: false });
-	const { sessionId, endpoint } = host;
+	const sessionId = `sdk-ui-provider-notify-priority-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		ui: { notify: () => {} },
+	};
+	const settings = isolatedNotificationSettings(path.join(cwd, ".gjc", "agent"), { "notifications.enabled": true });
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	const previousNotifications = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "0";
+	let handlers: Map<string, (event: unknown, context: unknown) => unknown> | undefined;
 	try {
+		handlers = start(
+			sessionContext,
+			settings,
+			async () => {},
+			false,
+			commands,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			async () => "attached",
+		);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previousNotifications;
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
@@ -5538,7 +8067,9 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		const priorNotifications = process.env.GJC_NOTIFICATIONS;
 		process.env.GJC_NOTIFICATIONS = "1";
 		try {
-			await host.runCommand("/notify on");
+			const notify = commands.get("notify");
+			expect(notify).toBeDefined();
+			await notify!.handler("on", sessionContext);
 		} finally {
 			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = priorNotifications;
@@ -5626,7 +8157,9 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		expect(await fallbackAnswer).toBe("Continue");
 		expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
 	} finally {
-		await host.stop();
+		await handlers?.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previousNotifications;
 	}
 });
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
@@ -5757,7 +8290,7 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 	await host.stop();
 });
 
-test("Q17 returns resource_gone without readable assistant text and reads a completed persisted turn after reopen", async () => {
+test("Q17 returns empty observation without readable assistant text and reads a completed persisted turn after reopen", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-"));
 	dirs.push(cwd);
 	const original = SessionManager.create(cwd, cwd);
@@ -5820,13 +8353,13 @@ test("Q17 returns resource_gone without readable assistant text and reads a comp
 			frames.some(
 				frame => frame.type === "control_command_result" && frame.requestId === "before" && frame.status === "ok",
 			),
-		"empty Q17 resource_gone response",
+		"empty Q17 empty observation response",
 	);
 	expect(
 		JSON.parse(
 			String(frames.find(frame => frame.type === "control_command_result" && frame.requestId === "before")?.message),
 		),
-	).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+	).toMatchObject({ ok: true, page: { items: [null] } });
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -5839,6 +8372,10 @@ test("Q17 returns resource_gone without readable assistant text and reads a comp
 		() => frames.some(frame => frame.type === "control_response" && frame.id === "completed-turn"),
 		"completed turn acknowledgement",
 	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "completed-turn")).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
 	await agentSession.waitForIdle();
 	await sessionManager.flush();
 	expect(sessionManager.getBranch()).toEqual(
@@ -6891,8 +9428,10 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	const publications: Array<Record<string, unknown>> = [];
 	const retired: Array<{ actionId: string; registrationEpoch: number }> = [];
 	let failures = 1;
+	let registrations = 0;
 	const server = {
 		registerArbitratedAsk(json: string) {
+			registrations += 1;
 			const action = JSON.parse(json) as Record<string, unknown>;
 			if (failures > 0) {
 				failures -= 1;
@@ -6921,7 +9460,8 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	});
 	arbiter.retain(gate("ordinary", false, 1));
 	arbiter.retain(gate("workflow-first", true, 0));
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs + 10);
+	await waitFor(() => publications.length === 1, "retry publication after the rejected registration");
+	expect(registrations).toBe(2);
 	expect(publications.map(action => action.workflowGateId)).toEqual([undefined]);
 	expect(publications[0]).toMatchObject({ options: ["one", "two"], recommendedIndex: 1 });
 	arbiter.complete("ordinary");
@@ -7742,11 +10282,15 @@ test("PresentationArbiter rejects claimed or stale retirement as terminal proof 
 
 test("PresentationArbiter fences an exhausted ordinary interactive head until explicit cancellation", async () => {
 	let registrationsFail = false;
+	let failedRegistrations = 0;
 	const published: string[] = [];
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
-				if (registrationsFail) throw new Error("unavailable");
+				if (registrationsFail) {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				const action = JSON.parse(json) as { id: string };
 				published.push(action.id);
 				return { actionId: action.id, registrationEpoch: published.length };
@@ -7799,9 +10343,14 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 	});
 	registrationsFail = true;
 	arbiter.reissueAfterFailure(first);
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	// Observe the exhausted retry chain instead of sleeping past its backoff:
+	// the head is fenced only once every registration attempt has failed.
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	registrationsFail = false;
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs);
+	expect(failedRegistrations).toBe(PresentationArbiter.maxRegistrationAttempts);
 	expect(arbiter.routeFor(first)).toBeUndefined();
 	expect(pendingInteractive.size).toBe(1);
 	expect(settles).toBe(0);
@@ -7818,11 +10367,15 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 
 test("PresentationArbiter terminally cancels an exhausted ordinary head exactly once before promotion", async () => {
 	const publications: string[] = [];
+	let failedRegistrations = 0;
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
 				const action = JSON.parse(json) as { id: string; question: string };
-				if (action.question === "Unavailable?") throw new Error("unavailable");
+				if (action.question === "Unavailable?") {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				publications.push(action.id);
 				return { actionId: action.id, registrationEpoch: publications.length };
 			},
@@ -7857,7 +10410,10 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 		selectedOptions: [],
 	});
 
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	expect(publications).toEqual([]);
 	expect(closes).toBe(0);
 
@@ -7872,10 +10428,14 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 test("PresentationArbiter fences already-terminal direct controls and resets exhausted head recovery", async () => {
 	const publications: string[] = [];
 	let registrationsFail = true;
+	let failedRegistrations = 0;
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
-				if (registrationsFail) throw new Error("unavailable");
+				if (registrationsFail) {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				const action = JSON.parse(json) as { id: string };
 				publications.push(action.id);
 				return { actionId: action.id, registrationEpoch: publications.length };
@@ -7895,7 +10455,10 @@ test("PresentationArbiter fences already-terminal direct controls and resets exh
 		allowEmpty: false,
 		selectedOptions: [],
 	});
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	registrationsFail = false;
 	arbiter.recover();
 	expect(publications).toHaveLength(1);

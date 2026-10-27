@@ -1,7 +1,16 @@
+import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isRetiredModelKey } from "../../model-retirements";
-import { getAntigravityUserAgent } from "../../providers/google-gemini-headers";
+import { getAntigravityUserAgent, getGeminiCliUserAgent } from "../../providers/google-gemini-headers";
 import type { Model } from "../../types";
+
+/**
+ * Returns the default Antigravity discovery User-Agent.
+ * Can be overridden via PI_AI_ANTIGRAVITY_USER_AGENT environment variable.
+ */
+export function getDefaultAntigravityUserAgent(): string {
+	return getAntigravityUserAgent();
+}
 
 const DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS = [
 	"https://daily-cloudcode-pa.googleapis.com",
@@ -35,6 +44,12 @@ export interface AntigravityDiscoveryApiModel {
 	modelProvider?: string;
 	isInternal?: boolean;
 	supportsVideo?: boolean;
+	/** Account-specific entitlement status */
+	entitlement?: string;
+	/** Whether the model is disabled for this account */
+	disabled?: boolean;
+	/** Per-account quota/tier information */
+	quota?: string;
 }
 
 /**
@@ -81,6 +96,9 @@ const AntigravityDiscoveryApiModelSchema: z.ZodType<AntigravityDiscoveryApiModel
 		modelProvider: z.preprocess(value => (typeof value === "string" ? value : undefined), z.string().optional()),
 		isInternal: z.preprocess(value => (typeof value === "boolean" ? value : undefined), z.boolean().optional()),
 		supportsVideo: z.preprocess(value => (typeof value === "boolean" ? value : undefined), z.boolean().optional()),
+		entitlement: z.preprocess(value => (typeof value === "string" ? value : undefined), z.string().optional()),
+		disabled: z.preprocess(value => (typeof value === "boolean" ? value : undefined), z.boolean().optional()),
+		quota: z.preprocess(value => (typeof value === "string" ? value : undefined), z.string().optional()),
 	})
 	.loose();
 const AntigravityDiscoveryAgentModelGroupSchema: z.ZodType<AntigravityDiscoveryAgentModelGroup> = z
@@ -154,7 +172,7 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	token: string;
 	/** Optional endpoint override. Defaults to Antigravity fallback endpoints. */
 	endpoint?: string;
-	/** Deprecated and ignored for antigravity discovery parity. */
+	/** Optional Google Cloud project ID for tier-gated model discovery. */
 	project?: string;
 	/** Optional user agent override. */
 	userAgent?: string;
@@ -168,6 +186,8 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	 * Default: `google-antigravity`.
 	 */
 	targetProvider?: "google-antigravity" | "google-gemini-cli";
+	/** Optional logger for debug diagnostics. */
+	logger?: Pick<typeof logger, "debug">;
 }
 
 /**
@@ -182,26 +202,39 @@ export async function fetchAntigravityDiscoveryModels(
 	const fetcher = options.fetcher ?? fetch;
 	const signal = options.signal ?? AbortSignal.timeout(5_000);
 	const targetProvider = options.targetProvider ?? "google-antigravity";
+	const userAgent = options.userAgent ?? getAntigravityDiscoveryUserAgent();
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
 		: DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS.map(trimTrailingSlashes);
+	const debugLogger = options.logger ?? logger;
 
 	for (const endpoint of endpoints) {
+		const redactedEndpoint = redactAntigravityEndpoint(endpoint);
 		let response: Response;
 		try {
+			const requestBody: Record<string, unknown> = {};
+			if (options.project) {
+				requestBody.project = options.project;
+			}
 			response = await fetcher(`${endpoint}${FETCH_AVAILABLE_MODELS_PATH}`, {
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${options.token}`,
 					"Content-Type": "application/json",
-					"User-Agent": options.userAgent ?? getAntigravityUserAgent(),
+					"User-Agent": userAgent,
 				},
-				body: JSON.stringify({}),
+				body: JSON.stringify(requestBody),
 				signal,
 			});
 		} catch {
 			continue;
 		}
+
+		debugLogger.debug("Antigravity discovery endpoint response", {
+			endpoint: redactedEndpoint,
+			status: response.status,
+			statusText: response.statusText,
+		});
 
 		if (!response.ok) {
 			continue;
@@ -228,14 +261,59 @@ export async function fetchAntigravityDiscoveryModels(
 			}
 		}
 
+		const debugEnabled = process.env.GJC_DEBUG_ANTIGRAVITY_DISCOVERY === "1";
+		const keptModelIds: string[] = [];
+		const filteredByDenylist: string[] = [];
+		const filteredByRetirement: string[] = [];
+		const filteredByInternal: string[] = [];
+		const filteredByDisabled: string[] = [];
+		const keptModelDetails: Record<string, Partial<AntigravityDiscoveryApiModel>> = {};
+		const filteredModelDetails: Record<string, Partial<AntigravityDiscoveryApiModel> & { reason: string }> = {};
+
 		const models: Model<"google-gemini-cli">[] = [];
+		const modelDropReasons: Record<string, string> = {};
 
 		for (const [modelId, model] of Object.entries(parsed.models ?? {})) {
-			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId) || isRetiredModelKey(targetProvider, modelId)) {
+			let dropReason: string | undefined;
+
+			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId)) {
+				dropReason = "denylist";
+			} else if (isRetiredModelKey(targetProvider, modelId)) {
+				dropReason = "retired";
+			} else if (model.disabled === true) {
+				dropReason = "disabled";
+			} else if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
+				dropReason = "isInternal-not-surfaced";
+			}
+
+			if (dropReason) {
+				modelDropReasons[modelId] = dropReason;
+				if (debugEnabled) {
+					if (dropReason === "denylist") filteredByDenylist.push(modelId);
+					else if (dropReason === "retired") filteredByRetirement.push(modelId);
+					else if (dropReason === "disabled") filteredByDisabled.push(modelId);
+					else filteredByInternal.push(modelId);
+					filteredModelDetails[modelId] = {
+						...model,
+						reason:
+							dropReason === "retired"
+								? `retired-${targetProvider}`
+								: dropReason === "isInternal-not-surfaced"
+									? "internal-not-surfaced"
+									: dropReason,
+					};
+				}
 				continue;
 			}
-			if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
-				continue;
+			if (debugEnabled) {
+				keptModelIds.push(modelId);
+				keptModelDetails[modelId] = {
+					displayName: model.displayName,
+					isInternal: model.isInternal,
+					entitlement: model.entitlement,
+					disabled: model.disabled,
+					quota: model.quota,
+				};
 			}
 
 			const supportsImages = model.supportsImages === true;
@@ -258,7 +336,102 @@ export async function fetchAntigravityDiscoveryModels(
 			});
 		}
 
+		if (Object.keys(modelDropReasons).length > 0) {
+			debugLogger.debug("Antigravity discovery dropped models", {
+				endpoint: redactedEndpoint,
+				dropReasons: modelDropReasons,
+			});
+		}
+
+		debugLogger.debug("Antigravity discovery kept models", {
+			endpoint: redactedEndpoint,
+			keptModelIds: models.map(m => m.id),
+		});
+
 		models.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+		if (debugEnabled) {
+			const allRawModelIds = Object.keys(parsed.models ?? {}).sort();
+			console.error("[GJC_DEBUG_ANTIGRAVITY_DISCOVERY]");
+			console.error(`  HTTP Status: ${response.status}`);
+			console.error(`  User-Agent: ${userAgent}`);
+			console.error(`  Endpoint: ${endpoint}`);
+			console.error(`  Total raw models from response: ${allRawModelIds.length}`);
+			console.error("\n  === KEPT MODELS ===");
+			console.error(`  Count: ${keptModelIds.length}`);
+			for (const modelId of keptModelIds) {
+				const details = keptModelDetails[modelId];
+				const attrs = [];
+				if (details?.entitlement) attrs.push(`entitlement=${details.entitlement}`);
+				if (details?.disabled === true) attrs.push("disabled=true");
+				if (details?.quota) attrs.push(`quota=${details.quota}`);
+				if (details?.isInternal === true) attrs.push("isInternal=true");
+				const attrStr = attrs.length > 0 ? ` [${attrs.join(", ")}]` : "";
+				console.error(`    ${modelId}${attrStr}`);
+			}
+			if (filteredByDenylist.length > 0) {
+				console.error(`\n  === FILTERED BY DENYLIST ===`);
+				console.error(`  Count: ${filteredByDenylist.length}`);
+				for (const modelId of filteredByDenylist) {
+					const details = filteredModelDetails[modelId];
+					const attrs = [];
+					if (details?.entitlement) attrs.push(`entitlement=${details.entitlement}`);
+					if (details?.disabled === true) attrs.push("disabled=true");
+					if (details?.quota) attrs.push(`quota=${details.quota}`);
+					if (details?.isInternal === true) attrs.push("isInternal=true");
+					const attrStr = attrs.length > 0 ? ` [${attrs.join(", ")}]` : "";
+					console.error(`    ${modelId}${attrStr}`);
+				}
+			}
+			if (filteredByRetirement.length > 0) {
+				console.error(`\n  === FILTERED BY RETIREMENT (${targetProvider}) ===`);
+				console.error(`  Count: ${filteredByRetirement.length}`);
+				for (const modelId of filteredByRetirement) {
+					const details = filteredModelDetails[modelId];
+					const attrs = [];
+					if (details?.entitlement) attrs.push(`entitlement=${details.entitlement}`);
+					if (details?.disabled === true) attrs.push("disabled=true");
+					if (details?.quota) attrs.push(`quota=${details.quota}`);
+					if (details?.isInternal === true) attrs.push("isInternal=true");
+					const attrStr = attrs.length > 0 ? ` [${attrs.join(", ")}]` : "";
+					console.error(`    ${modelId}${attrStr}`);
+				}
+			}
+			if (filteredByDisabled.length > 0) {
+				console.error(`\n  === FILTERED (disabled) ===`);
+				console.error(`  Count: ${filteredByDisabled.length}`);
+				for (const modelId of filteredByDisabled) {
+					const details = filteredModelDetails[modelId];
+					const attrs = [];
+					if (details?.entitlement) attrs.push(`entitlement=${details.entitlement}`);
+					if (details?.disabled === true) attrs.push("disabled=true");
+					if (details?.quota) attrs.push(`quota=${details.quota}`);
+					if (details?.isInternal === true) attrs.push("isInternal=true");
+					const attrStr = attrs.length > 0 ? ` [${attrs.join(", ")}]` : "";
+					console.error(`    ${modelId}${attrStr}`);
+				}
+			}
+			if (filteredByInternal.length > 0) {
+				console.error(`\n  === FILTERED (internal, not surfaced) ===`);
+				console.error(`  Count: ${filteredByInternal.length}`);
+				for (const modelId of filteredByInternal) {
+					const details = filteredModelDetails[modelId];
+					const attrs = [];
+					if (details?.entitlement) attrs.push(`entitlement=${details.entitlement}`);
+					if (details?.disabled === true) attrs.push("disabled=true");
+					if (details?.quota) attrs.push(`quota=${details.quota}`);
+					if (details?.isInternal === true) attrs.push("isInternal=true");
+					const attrStr = attrs.length > 0 ? ` [${attrs.join(", ")}]` : "";
+					console.error(`    ${modelId}${attrStr}`);
+				}
+			}
+			console.error(`\n  === SURFACE INFO ===`);
+			console.error(`  agentModelSorts surfaced: ${surfacedModelIds.size}`);
+			if (surfacedModelIds.size > 0) {
+				console.error(`    ${Array.from(surfacedModelIds).sort().join(", ")}`);
+			}
+		}
+
 		return models;
 	}
 
@@ -282,4 +455,16 @@ function toPositiveNumber(value: unknown, fallback: number): number {
 
 function trimTrailingSlashes(value: string): string {
 	return value.replace(/\/+$/, "");
+}
+
+export function getAntigravityDiscoveryUserAgent(): string {
+	return process.env.PI_AI_ANTIGRAVITY_USER_AGENT ? getAntigravityUserAgent() : getGeminiCliUserAgent();
+}
+
+function redactAntigravityEndpoint(value: string): string {
+	try {
+		return new URL(value).origin;
+	} catch {
+		return "invalid endpoint";
+	}
 }

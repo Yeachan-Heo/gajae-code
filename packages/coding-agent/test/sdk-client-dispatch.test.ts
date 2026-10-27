@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { SdkClient, type SdkClientError, SdkPreparedDispatchError } from "../src/sdk/client/client";
+import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp/adapter";
+import { SdkClient, SdkClientError, SdkPreparedDispatchError } from "../src/sdk/client/client";
 
 /*
  * Dispatch-aware requests (#4640).
@@ -594,6 +595,31 @@ test("synchronous send failure rejects as unavailable without onDispatch firing"
 	});
 });
 
+test("transport-origin markers distinguish closed-client failures from server error frames", async () => {
+	await withFakeTransport(async () => {
+		const closedClient = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		await closedClient.close();
+		await expect(closedClient.request({ type: "control_request", operation: "session.list" })).rejects.toMatchObject({
+			code: "connection_closed",
+			transport: true,
+		});
+
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const request = client.request({ type: "control_request", operation: "session.create" });
+		await flush();
+		const frame = sentFrame(socket);
+		socket.message({
+			type: "control_response",
+			id: frame.id,
+			ok: false,
+			error: { code: "unavailable", message: "server lifecycle failed" },
+		});
+		await expect(request).rejects.toMatchObject({ code: "unavailable", transport: false });
+		await client.close();
+	});
+});
+
 test("a throwing onDispatch observer cannot displace transport settlement", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 10_000 });
@@ -1134,6 +1160,152 @@ test("a send that throws after a reentrant close keeps the reentrant settlement"
 		// already settled this request as sent-uncertain, and that stands.
 		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
 		await client.close().catch(() => undefined);
+	});
+});
+
+test("ACP lifecycle fences a real SDK replay after delayed reconnect without sending another create", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { timeoutMs: 60_000, reconnectAttempts: 0 });
+		const first = await connect(client, "original");
+		const adapter = new AcpSdkAdapter({ client });
+		const input = { cwd: "/workspace", mcpServers: [{ name: "docs", command: "docs-mcp", args: [] }] };
+		const recovery = adapter.lifecycle("session.create", input, "delayed-reconnect").catch(error => error);
+		try {
+			for (let index = 0; index < 8; index++) await flush();
+			const frame = sentFrame(first);
+			const originalRecord = client.getSentRecord(frame.id as string);
+			first.readyState = FakeWebSocket.CLOSED;
+			first.emit("close");
+			for (let index = 0; index < 8; index++) await flush();
+			const replacement = FakeWebSocket.instances[1];
+			expect(replacement).toBeDefined();
+			// Complete reconnect only after the operation deadline, before firing timers.
+			clock.now += 21_000;
+			replacement.open();
+			replacement.message({ type: "hello", connectionId: "replacement" });
+			const failure = await recovery;
+			expect(failure).toMatchObject({ code: "uncertain_after_send" });
+			if (!(failure instanceof SdkClientError)) throw new Error("Expected SDK lifecycle uncertainty");
+			expect(failure.details).toBe(originalRecord);
+			expect(acpMcpLaunchFailure(failure, input.mcpServers)).toBe(failure);
+			expect(replacement.sent).toHaveLength(0);
+			expect(first.sent).toHaveLength(1);
+			expect(frame).toMatchObject({ operation: "session.create", input, idempotencyKey: "delayed-reconnect" });
+		} finally {
+			await adapter.close();
+		}
+	});
+});
+
+test("ACP after-send deadline retains real SDK identity and ignores a late acknowledgment", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { timeoutMs: 60_000, reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const adapter = new AcpSdkAdapter({ client });
+		let settlements = 0;
+		const recovery = adapter.lifecycle("session.create", { cwd: "/workspace" }, "late-real-ack").catch(error => {
+			settlements++;
+			return error;
+		});
+		try {
+			for (let index = 0; index < 8; index++) await flush();
+			const frame = sentFrame(socket);
+			const record = client.getSentRecord(frame.id as string);
+			expect(record?.fingerprint).toBeDefined();
+			clock.now += 21_000;
+			const due = [...clock.tasks]
+				.filter(([, task]) => task.due <= clock.now)
+				.sort((a, b) => a[1].order - b[1].order);
+			for (const [handle, task] of due) {
+				if (!clock.tasks.delete(handle)) continue;
+				task.callback();
+			}
+			const failure = await recovery;
+			expect(failure).toMatchObject({ code: "uncertain_after_send" });
+			if (!(failure instanceof SdkClientError)) throw new Error("Expected SDK lifecycle uncertainty");
+			expect(failure.details).toBe(record);
+			socket.message({ type: "broker_response", id: frame.id, ok: true, result: { sessionId: "too-late" } });
+			for (let index = 0; index < 8; index++) await flush();
+			expect(settlements).toBe(1);
+			expect(socket.sent).toHaveLength(1);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+		} finally {
+			await adapter.close();
+		}
+	});
+});
+
+for (const terminal of ["teardown", "cancel", "throw"] as const) {
+	test(`ACP real SDK replay preserves committed uncertainty after ${terminal}`, async () => {
+		await withFakeTransport(async () => {
+			const client = new SdkClient("ws://sdk.test", "token", { timeoutMs: 60_000, reconnectAttempts: 0 });
+			const first = await connect(client, "original");
+			const adapter = new AcpSdkAdapter({ client });
+			const recovery = adapter
+				.lifecycle("session.create", { cwd: "/workspace" }, "terminal-real-replay")
+				.catch(error => error);
+			try {
+				for (let index = 0; index < 8; index++) await flush();
+				const original = sentFrame(first);
+				const record = client.getSentRecord(original.id as string);
+				first.readyState = FakeWebSocket.CLOSED;
+				first.emit("close");
+				for (let index = 0; index < 8; index++) await flush();
+				const replacement = FakeWebSocket.instances[1];
+				expect(replacement).toBeDefined();
+				if (terminal === "teardown") await adapter.close();
+				else if (terminal === "cancel") await client.close();
+				else {
+					replacement.throwOnSend = new Error("replay wire write failed");
+					replacement.open();
+					replacement.message({ type: "hello", connectionId: "replacement" });
+				}
+				const failure = await recovery;
+				expect(failure).toMatchObject({ code: "uncertain_after_send" });
+				if (!(failure instanceof SdkClientError)) throw new Error("Expected SDK lifecycle uncertainty");
+				expect(failure.details).toBe(record);
+				expect(replacement.sent).toHaveLength(0);
+				expect(first.sent).toHaveLength(1);
+			} finally {
+				await adapter.close();
+			}
+		});
+	});
+}
+
+test("ACP real SDK committed replay returns the same session with the same operation, input and key", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { timeoutMs: 60_000, reconnectAttempts: 0 });
+		const first = await connect(client, "original");
+		const adapter = new AcpSdkAdapter({ client });
+		const input = { cwd: "/workspace" };
+		const recovery = adapter.lifecycle("session.create", input, "committed-real-replay");
+		try {
+			for (let index = 0; index < 8; index++) await flush();
+			const original = sentFrame(first);
+			// Durable create committed; lose its response and reconnect for same-key replay.
+			const committed = { sessionId: "only-created-session" };
+			first.readyState = FakeWebSocket.CLOSED;
+			first.emit("close");
+			for (let index = 0; index < 8; index++) await flush();
+			const replacement = FakeWebSocket.instances[1];
+			replacement.open();
+			replacement.message({ type: "hello", connectionId: "replacement" });
+			for (let index = 0; index < 8; index++) await flush();
+			const replay = sentFrame(replacement);
+			expect(replay).toMatchObject({
+				operation: original.operation,
+				input: original.input,
+				idempotencyKey: original.idempotencyKey,
+			});
+			expect(replay.id).not.toBe(original.id);
+			replacement.message({ type: "broker_response", id: replay.id, ok: true, result: committed });
+			await expect(recovery).resolves.toMatchObject({ result: { sessionId: "only-created-session" } });
+			expect(first.sent).toHaveLength(1);
+			expect(replacement.sent).toHaveLength(1);
+		} finally {
+			await adapter.close();
+		}
 	});
 });
 

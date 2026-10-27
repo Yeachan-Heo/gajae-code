@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { buildDocsIndexOutput } from "./check-public-version-sync";
-import { findExaMcpDocFindings, parseEmbeddedDocs } from "./verify-g002-gates";
+import {
+	findExaMcpDocFindings,
+	findMcpBuiltinQuarantineFindings,
+	findMcpTuiMetadataFindings,
+	parseEmbeddedDocs,
+} from "./verify-g002-gates";
 
 const generatedPath = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
 const sourcePaths = ["README.md", "docs/tools/web_search.md", "docs/environment-variables.md"];
@@ -32,6 +37,505 @@ function findings(generated = corpus(), sources: Record<string, string> = {}): P
 		return sources[file] ?? "Exa requires EXA_API_KEY.";
 	});
 }
+
+const exactMcpTuiEntry = [
+	'\t\tname: "mcp",',
+	"\t\thandleTui: async (command, runtime) => {",
+	"\t\t\t// MCP controls are unavailable to ordinary sessions.",
+	"\t\t\tif (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+	"\t\t\treturn false;",
+	"\t\t},",
+].join("\n");
+
+function registryWithEntries(entries: readonly string[]): string {
+	return [
+		"const BUILTIN_SLASH_COMMAND_REGISTRY = [",
+		...entries.flatMap(entry => ["\t{", entry, "\t},"]),
+		"];",
+	].join("\n");
+}
+
+describe("MCP command quarantine", () => {
+	test("allows the registered /mcp command when it is TUI-only and exact-capability gated", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		expect(registry).toMatch(/^\t\tname:\s*["']mcp["']/m);
+		expect(findMcpBuiltinQuarantineFindings(registry)).toEqual([]);
+	});
+
+	test("rejects a TUI handler that does not fall through before handling the command", () => {
+		const unguarded = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+				"return false;",
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(unguarded)).toContain(
+			"root /mcp TUI handler must fall through without exact MCP controls",
+		);
+	});
+
+	test("rejects side effects in the exact-capability fallback object", () => {
+		for (const fallback of [
+			"return { ...runMcp(), prompt: command.text };",
+			"return { prompt: command.text, extra: runMcp() };",
+			"return { prompt: command.text, prompt: runMcp() };",
+			"return { get prompt() { runMcp(); return command.text; } };",
+		]) {
+			const exposed = registryWithEntries([
+				exactMcpTuiEntry.replace("return { prompt: command.text };", fallback),
+			]);
+			expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+				"root /mcp TUI handler must fall through without exact MCP controls",
+			);
+		}
+	});
+
+	test("rejects MCP handler parameters that can execute or alter bindings before the guard", () => {
+		for (const signature of [
+			"async (command, runtime, _unused = runMcpControl()) => {",
+			"async (command, runtime = runMcpControl()) => {",
+			"async (command = runMcpControl(), runtime) => {",
+			"async ({ text: command }, runtime) => {",
+			"async (command, ...runtime) => {",
+		]) {
+			const exposed = registryWithEntries([
+				exactMcpTuiEntry.replace("async (command, runtime) => {", signature),
+			]);
+			expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+				"root /mcp TUI handler parameters must be command and runtime identifiers",
+			);
+		}
+	});
+
+	test("does not bind the capability guard to a module-scoped runtime instead of the handler parameter", () => {
+		const shadowedRuntime = [
+			'const runtime = { ctx: { session: { hasExactMcpControls: true } } };',
+			registryWithEntries([exactMcpTuiEntry.replaceAll("runtime", "sessionRuntime")]),
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(shadowedRuntime)).toContain(
+			"root /mcp TUI handler parameters must be command and runtime identifiers",
+		);
+	});
+
+	test("rejects a function binding that shadows the handler runtime parameter", () => {
+		const shadowedRuntime = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"\t\t\treturn false;",
+				"\t\t\tfunction runtime() {}\n\t\t\treturn false;",
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(shadowedRuntime)).toContain(
+			"root /mcp TUI handler parameters must be command and runtime identifiers",
+		);
+	});
+
+	test("rejects method-style MCP handler parameters with pre-guard defaults", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"handleTui: async (command, runtime) => {",
+				"async handleTui(command, runtime = runMcpControl()) {",
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp TUI handler parameters must be command and runtime identifiers",
+		);
+	});
+
+	test("rejects a default handler even when a TUI guard is also present", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\thandleTui: async (command, runtime) => {',
+				'\t\thandle: async (command, runtime) => false,\n\t\thandleTui: async (command, runtime) => {',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("rejects method-style default handlers", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\thandleTui: async (command, runtime) => {',
+				'\t\tasync handle(command, runtime) { return false; },\n\t\thandleTui: async (command, runtime) => {',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("rejects computed properties whose handler names cannot be verified", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\thandleTui: async (command, runtime) => {',
+				'\t\t[handlerName]: async () => false,\n\t\thandleTui: async (command, runtime) => {',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root slash-command registry entry contains an unverified computed property",
+		);
+	});
+
+	test("rejects a prototype-provided default MCP handler", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\tname: "mcp",',
+				'\t\tname: "mcp",\n\t\t__proto__: { handle: async () => false },',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root slash-command registry entry contains an unverified prototype",
+		);
+	});
+
+	test("recognizes MCP identity through a transparent TypeScript assertion", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry
+				.replace('\t\tname: "mcp",', '\t\tname: "mcp" as const,')
+				.replace(
+					'\t\thandleTui: async (command, runtime) => {',
+					'\t\thandle: async () => false,\n\t\thandleTui: async (command, runtime) => {',
+				),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("recognizes MCP aliases as root command entries", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry
+				.replace('\t\tname: "mcp",', '\t\tname: "other",\n\t\taliases: ["mcp"],')
+				.replace(
+					'\t\thandleTui: async (command, runtime) => {',
+					'\t\thandle: async () => false,\n\t\thandleTui: async (command, runtime) => {',
+				),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("rejects aliases that cannot be statically resolved", () => {
+		const unresolvedAliases = registryWithEntries([
+			exactMcpTuiEntry
+				.replace('\t\tname: "mcp",', '\t\tname: "other",')
+				.replace(
+					'\t\thandleTui: async (command, runtime) => {',
+					'\t\taliases: commandAliases,\n\t\thandleTui: async (command, runtime) => {',
+				),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(unresolvedAliases)).toContain(
+			"root slash-command registry contains unverified aliases",
+		);
+	});
+
+	test("rejects identifier entries before checking command names", () => {
+		const registry = [
+			'const mcpCommand = { name: "mcp", handle: async () => false };',
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [mcpCommand];",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(registry)).toContain(
+			"root slash-command registry contains an unverified entry",
+		);
+	});
+
+	test("rejects object spreads before checking command names", () => {
+		const registry = [
+			'const mcpCommand = { name: "mcp", handle: async () => false };',
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [{ ...mcpCommand }];",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(registry)).toContain(
+			"root slash-command registry entry contains an unverified spread",
+		);
+	});
+
+	test("rejects mutations and extra reads after the root registry declaration", () => {
+		const mutated = [
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [{ name: 'mcp' }];",
+			'BUILTIN_SLASH_COMMAND_REGISTRY.find(command => command.name === "mcp")!.handle = () => false;',
+			"const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY = BUILTIN_SLASH_COMMAND_REGISTRY.filter(command => true);",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects side effects while constructing the active registry", () => {
+		const mutated = [
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [{ name: 'mcp' }];",
+			"const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY = BUILTIN_SLASH_COMMAND_REGISTRY.filter(command => {",
+			"command.handle = () => false;",
+			"return true;",
+			"});",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects mutations through the active registry alias", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			'Object.assign(ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.find(command => command.name === "mcp")!, { handle: async () => false });',
+			lookupDeclaration,
+		].join("\n");
+		const mutated = registry.replace(lookupDeclaration, mutation);
+		expect(mutated).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects a root registry mutation after active-registry initialization", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			'BUILTIN_SLASH_COMMAND_REGISTRY.find(command => command.name === "mcp")!.handle = async () => false;',
+			lookupDeclaration,
+		].join("\n");
+		const mutated = registry.replace(lookupDeclaration, mutation);
+		expect(mutated).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects transformed active-registry exports", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const exportDeclaration =
+			"export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY;";
+		const transformedExport =
+			'export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.map(command => command.name === "mcp" ? { ...command, handle: async () => false } : command);';
+		const mutated = registry.replace(exportDeclaration, transformedExport);
+		expect(mutated).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects an active registry that is not derived from the audited root registry", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const activeRegistryStart = registry.indexOf("const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY:");
+		const lookupDeclarationStart = registry.indexOf("\nconst BUILTIN_SLASH_COMMAND_LOOKUP", activeRegistryStart);
+		expect(activeRegistryStart).toBeGreaterThanOrEqual(0);
+		expect(lookupDeclarationStart).toBeGreaterThan(activeRegistryStart);
+		const independentRegistry = [
+			registry.slice(0, activeRegistryStart),
+			'const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [{ name: "mcp", handle: async () => false }];',
+			registry.slice(lookupDeclarationStart),
+		].join("\n");
+		expect(independentRegistry).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(independentRegistry)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects a no-op active-registry filter that re-enables quarantined commands", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const noOpFilter = registry.replace(
+			'!QUARANTINED_UTILITY_SLASH_COMMANDS.has(command.name) &&\n\t\t(command.name !== "import-session" || IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE)',
+			"true",
+		);
+		expect(noOpFilter).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(noOpFilter)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects changes to the utility command quarantine set", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const unquarantinedSet = registry.replace('new Set(["agents"])', "new Set([])");
+		expect(unquarantinedSet).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(unquarantinedSet)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects unverified writes to the builtin dispatch lookup", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			lookupDeclaration,
+			'BUILTIN_SLASH_COMMAND_LOOKUP.set("mcp", { name: "mcp", handle: async () => false });',
+		].join("\n");
+		const unverifiedWriter = registry.replace(lookupDeclaration, mutation);
+		expect(unverifiedWriter).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(unverifiedWriter)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects mutation through a builtin lookup result", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			lookupDeclaration,
+			'BUILTIN_SLASH_COMMAND_LOOKUP.get("mcp")!.handle = async () => false;',
+		].join("\n");
+		const unverifiedMutation = registry.replace(lookupDeclaration, mutation);
+		expect(unverifiedMutation).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(unverifiedMutation)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects duplicate root /mcp registrations", () => {
+		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
+			"multiple root /mcp builtins are registered",
+		);
+	});
+
+	test("allows the quarantined state with no root /mcp command", () => {
+		expect(findMcpBuiltinQuarantineFindings(registryWithEntries(['\t\tname: "status",']))).toEqual([]);
+	});
+
+	test("requires session-gated TUI metadata for the root /mcp command", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		expect(findMcpTuiMetadataFindings(slashCommands, interactiveMode)).toEqual([]);
+
+		const staleComment = [
+			"/*",
+			"export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {",
+			"if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;",
+			'return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp");',
+			"}",
+			"*/",
+		].join("\n");
+		const unfilteredSlashCommands = slashCommands.replace(
+			'BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp")',
+			"BUILTIN_SLASH_COMMANDS",
+		);
+		expect(findMcpTuiMetadataFindings(`${staleComment}\n${unfilteredSlashCommands}`, interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+		const computedPropertySlashCommands = slashCommands.replace(
+			'command.name !== "mcp"',
+			"command[name] !== \"mcp\"",
+		);
+		expect(findMcpTuiMetadataFindings(computedPropertySlashCommands, interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("requires filtered builtin metadata to feed the constructor base commands", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const unfilteredBaseMetadata = interactiveMode.replace(
+			"this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];",
+			"this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];",
+		);
+		expect(unfilteredBaseMetadata).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, unfilteredBaseMetadata)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects re-adding the unfiltered builtin list during capability refresh", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const reintroducedBuiltins = interactiveMode.replace(
+			"\t\t\t...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),",
+			"\t\t\t...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),\n\t\t\t...BUILTIN_SLASH_COMMANDS,",
+		);
+		expect(reintroducedBuiltins).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, reintroducedBuiltins)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects computed capability lookups during TUI metadata initialization", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const computedCapability = interactiveMode.replace(
+			"this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;",
+			'const capabilityName = "autoCompactionEnabled" as const;\n\t\tthis.#sessionBuiltinMcpVisible = this.session[capabilityName];',
+		);
+		expect(computedCapability).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, computedCapability)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects overwriting the constructor MCP capability before builtin metadata is built", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const overwrittenCapability = interactiveMode.replace(
+			"this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;",
+			"this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;\n\t\tthis.#sessionBuiltinMcpVisible = this.session.autoCompactionEnabled;",
+		);
+		expect(overwrittenCapability).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, overwrittenCapability)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects a direct early return before refresh visibility updates", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const earlyReturn = interactiveMode.replace(
+			"\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);",
+			"\t\treturn;\n\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);",
+		);
+		expect(earlyReturn).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, earlyReturn)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects conditional exits before refresh visibility updates", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		for (const earlyExit of ["if (true) return;", "if (true) throw new Error();"]) {
+			const bypassedRefresh = interactiveMode.replace(
+				"\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);",
+				`\t\t${earlyExit}\n\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);`,
+			);
+			expect(bypassedRefresh).not.toBe(interactiveMode);
+			expect(findMcpTuiMetadataFindings(slashCommands, bypassedRefresh)).toContain(
+				"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+			);
+		}
+	});
+
+	test("rejects TUI metadata filters that do not hide /mcp without the exact capability", () => {
+		const slashCommands = [
+			"export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {",
+			"if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;",
+			"return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== 'mcp');",
+			"}",
+		].join("\n");
+		const interactiveMode = [
+			"const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.session.hasExactMcpControls);",
+			"this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];",
+		].join("\n");
+		expect(findMcpTuiMetadataFindings(slashCommands.replace("command.name !== 'mcp'", "true"), interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+		expect(
+			findMcpTuiMetadataFindings(slashCommands, interactiveMode.replace("this.session.hasExactMcpControls", "true")),
+		).toContain("ordinary TUI /mcp metadata is not filtered by the exact MCP capability");
+	});
+});
 
 describe("Exa MCP documentation scope", () => {
 	test("allows the actual unrelated standalone MCP negative statements", async () => {

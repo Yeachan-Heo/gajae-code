@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import { rmSync } from "node:fs";
+import { renameSync, rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
@@ -52,7 +52,13 @@ function pinWindowsLockRemoval(): void {
 	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: native.snapshotDirectoryTree,
-		exactRemoveDirectoryTree: target => {
+		exactRemoveDirectoryTree: (target, _snapshot, _parentIdentity, detachOnly) => {
+			// The Windows protocol detaches first, then removes the parked tree.
+			if (detachOnly && !target.endsWith(".removing")) {
+				const detachedPath = `${target}.removing`;
+				renameSync(target, detachedPath);
+				return { ok: true, detachedPath };
+			}
 			rmSync(target, { recursive: true, force: true });
 			return { ok: true };
 		},
@@ -376,6 +382,7 @@ describe("SDK session index", () => {
 	});
 	it("uses the native Windows process handle when signal-zero misreports a detached host", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-windows-live-"));
+		const index = new SessionIndex(dir);
 		const originalPlatform = process.platform;
 		const originalKill = process.kill;
 		const processRef = {
@@ -383,13 +390,15 @@ describe("SDK session index", () => {
 			status: () => "running" as const,
 		};
 		const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(processRef as never);
-		process.kill = (() => {
-			throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
-		}) as typeof process.kill;
-		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
-		pinWindowsLockRemoval();
 		try {
-			const index = await new SessionIndex(dir).open();
+			// Resolve the machine-specific lock identity before faking the platform;
+			// only the process-liveness branch below should see Windows here.
+			await index.open();
+			process.kill = (() => {
+				throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
+			}) as typeof process.kill;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			pinWindowsLockRemoval();
 			await index.append({
 				...event("windows-detached"),
 				hostIncarnation: processRef.incarnation,
@@ -1806,6 +1815,78 @@ describe("SDK session index", () => {
 			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
 		]);
 	});
+	it("projects a scoped session list with the same rows as the full projection", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-scoped-"));
+		const index = await new SessionIndex(dir).open();
+		const deleted = await index.append(event("scoped-deleted"));
+		await index.append({
+			type: "session_deleted",
+			sessionId: deleted.sessionId,
+			locator: deleted.locator,
+			endpointGeneration: deleted.endpointGeneration,
+			pid: deleted.pid,
+			...(deleted.processIncarnation === undefined ? {} : { processIncarnation: deleted.processIncarnation }),
+			...(deleted.hostIncarnation === undefined ? {} : { hostIncarnation: deleted.hostIncarnation }),
+		});
+		await index.append(event("scoped-a"));
+		await index.append({ ...event("scoped-a"), endpointGeneration: 2 });
+		await index.append({ ...event("scoped-b"), locator: { cwd: "r2", worktreeRoot: null, stateRoot: "q2" } });
+		await index.append(event("scoped-b"));
+
+		const full = index.listSessions();
+		expect(full.sessions.map(row => row.sessionId).sort()).toEqual(["scoped-a", "scoped-b"]);
+		for (const sessionId of ["scoped-a", "scoped-b", "scoped-deleted", "absent"]) {
+			const scoped = index.listSessions(undefined, new Set([sessionId]));
+			expect(scoped.sessions).toEqual(full.sessions.filter(row => row.sessionId === sessionId));
+			expect(scoped.indexSeq).toBe(full.indexSeq);
+			expect(scoped.warnings).toEqual(full.warnings);
+		}
+		expect(index.listSessions(undefined, new Set(["scoped-a", "scoped-b"])).sessions).toEqual(full.sessions);
+	});
+	it("dedupes rejection audit rows across cold readers", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-audit-dedupe-"));
+		const legacy = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "legacy-audit",
+			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: Date.now(),
+		};
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(sessionsDir, "index.jsonl"),
+			`${JSON.stringify({ ...legacy, checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">) })}\n`,
+		);
+		const auditPath = path.join(sessionsDir, "index-audit.jsonl");
+		await (await new SessionIndex(dir).open()).refresh();
+		const first = await fs.readFile(auditPath, "utf8");
+		expect(first.trim().split("\n")).toHaveLength(1);
+		// A torn trailing row does not disturb dedupe of the valid rows.
+		await fs.writeFile(auditPath, `${first}{"indexSeq":2`);
+		await (await new SessionIndex(dir).open()).refresh();
+		await (await new SessionIndex(dir).open()).refresh();
+		const rows = (await fs.readFile(auditPath, "utf8")).split("\n").filter(line => line.includes('"indexSeq":1,'));
+		expect(rows).toHaveLength(1);
+		// A closed but invalid JSON row naming seq 1 is not a dedupe record either:
+		// the valid rejection record must still be written.
+		await fs.writeFile(auditPath, '{"indexSeq":1,broken}\n');
+		await (await new SessionIndex(dir).open()).refresh();
+		const valid = (await fs.readFile(auditPath, "utf8"))
+			.split("\n")
+			.flatMap(line => {
+				try {
+					return [JSON.parse(line) as { indexSeq?: number }];
+				} catch {
+					return [];
+				}
+			})
+			.filter(record => record.indexSeq === 1);
+		expect(valid).toHaveLength(1);
+	});
 	it("preserves closure before deletion but rejects delayed closure evidence", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retirement-evidence-"));
 		const index = await new SessionIndex(dir).open();
@@ -1898,6 +1979,60 @@ describe("SDK session index", () => {
 		} finally {
 			FileLockTestHooks.afterParentMkdir = undefined;
 			spy.mockRestore();
+		}
+	});
+	it("locked refresh waits for queued local writes before reconciling authority", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-queued-write-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("first"));
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+
+		const lockEntered = deferred();
+		const releaseLock = deferred();
+		const previousHook = FileLockTestHooks.afterParentMkdir;
+		let blocked = false;
+		FileLockTestHooks.afterParentMkdir = async () => {
+			if (blocked) return;
+			blocked = true;
+			lockEntered.resolve();
+			await releaseLock.promise;
+		};
+
+		let trackStampReads = false;
+		let stampReads = 0;
+		const logPath = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const snapshotPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		const stat = fs.stat.bind(fs);
+		const statSpy = vi.spyOn(fs, "stat").mockImplementation((async (file, options) => {
+			if (trackStampReads && (path.resolve(String(file)) === logPath || path.resolve(String(file)) === snapshotPath))
+				stampReads++;
+			return await stat(file as Parameters<typeof fs.stat>[0], options as Parameters<typeof fs.stat>[1]);
+		}) as typeof fs.stat);
+		const append = writer.append(event("queued"));
+		try {
+			await lockEntered.promise;
+			trackStampReads = true;
+			const refresh = reader.refresh();
+			// Authority consumers must serialize behind pending writes even when the
+			// last completed filesystem stamp is unchanged.
+			expect(stampReads).toBe(0);
+
+			releaseLock.resolve();
+			await append;
+			await refresh;
+			expect(reader.listSessions().sessions).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ sessionId: "first" }),
+					expect.objectContaining({ sessionId: "queued" }),
+				]),
+			);
+		} finally {
+			releaseLock.resolve();
+			FileLockTestHooks.afterParentMkdir = previousHook;
+			statSpy.mockRestore();
+			await append.catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 	it("a changed index still takes the session-index lock, so the no-lock assertion discriminates (#4689)", async () => {

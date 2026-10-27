@@ -11,7 +11,9 @@ import {
 	type ImageContent,
 	type Message,
 	type Model,
+	type ProviderDiagnostic,
 	type ProviderSessionState,
+	readProviderDiagnostic,
 	type ServiceTier,
 	type SimpleStreamOptions,
 	streamSimple,
@@ -25,13 +27,14 @@ import {
 	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
-import { extractHttpStatusFromError } from "@gajae-code/utils";
+import { extractHttpStatusFromError, logger, redactCrashSecrets } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue, managedLocalErrorDiagnostic } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import { createAttemptScopeAuthority } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
 import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
+import { PromptPrefixTracker } from "./prompt-prefix-telemetry";
 import { createRunResourceLedger } from "./run-resource-ledger";
 import type {
 	AgentContext,
@@ -94,7 +97,10 @@ const PROVIDER_ACCEPTABLE_FAILURE_CODES = new Set([
 	"execution",
 ]);
 
-function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): { code: string; message: string } {
+function sanitizeAgentFailure(
+	error: unknown,
+	runtimeClassifiedCode?: string,
+): { code: string; message: string; providerDiagnostic?: ProviderDiagnostic } {
 	let code = "agent_failed";
 	try {
 		if (runtimeClassifiedCode !== undefined) {
@@ -114,7 +120,14 @@ function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): {
 	} catch {
 		// Untrusted provider errors may expose throwing accessors.
 	}
-	return { code, message: "Agent run failed." };
+	// Provenance is the adapter's private carrier, never a property the error
+	// declares about itself: a foreign error cannot label its own failure family.
+	const providerDiagnostic = readProviderDiagnostic(error);
+	return {
+		code,
+		message: "Agent run failed.",
+		...(providerDiagnostic === undefined ? {} : { providerDiagnostic }),
+	};
 }
 
 /** Only runtime-authenticated built-in constructors may contribute a name. */
@@ -150,6 +163,30 @@ function safeErrorStatus(error: unknown): number | undefined {
 		);
 	} catch {
 		return undefined;
+	}
+}
+
+/**
+ * The user-facing failure is deliberately generic, so the underlying cause is
+ * otherwise lost. Record it in the local debug log with credentials redacted
+ * and the text bounded; this never reaches the transcript or SDK clients.
+ */
+function describeRunFailureForLog(error: unknown): { cause: string; stack?: string } {
+	try {
+		const raw = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+		const chain: string[] = [raw];
+		let cause = error instanceof Error ? error.cause : undefined;
+		for (let depth = 0; cause !== undefined && depth < 3; depth++) {
+			chain.push(`caused by ${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}`);
+			cause = cause instanceof Error ? cause.cause : undefined;
+		}
+		const stack = error instanceof Error ? error.stack?.split("\n").slice(1, 9).join("\n") : undefined;
+		return {
+			cause: redactCrashSecrets(chain.join(" | ")).slice(0, 2000),
+			...(stack ? { stack: redactCrashSecrets(stack) } : {}),
+		};
+	} catch {
+		return { cause: "<unreadable error>" };
 	}
 }
 
@@ -241,6 +278,14 @@ export class AgentBusyError extends Error {
 		this.name = "AgentBusyError";
 	}
 }
+export type AgentQueuedRunStartDecision =
+	| { readonly consumedQueuedMessages: readonly AgentMessage[]; readonly disposition: "accepted" }
+	| {
+			readonly consumedQueuedMessages: readonly AgentMessage[];
+			readonly disposition: "not-started";
+			readonly error: Error;
+	  };
+
 export interface AgentOptions {
 	initialState?: Partial<AgentState>;
 
@@ -413,6 +458,8 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn (reassignable). */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Definitive start disposition for an exact dequeued own-run batch. */
+	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
 	/** Invoked with the steering messages dequeued mid-run for the current turn (reassignable). */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
@@ -435,6 +482,8 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 	/** Disable transport replay; fallback accounting is owned by the caller. */
 	fallbackManaged?: boolean;
+	/** Session policy owns context overflow; successful empty stops remain terminal. */
+	contextOverflowManaged?: boolean;
 	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
 	maintenanceContinuation?: boolean;
 	/**
@@ -502,6 +551,7 @@ export class Agent {
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#followUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
+	#steeringBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#toolInterruptPolicy: "abort_tools" | "finish_tools";
@@ -555,6 +605,7 @@ export class Agent {
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
+	#promptPrefixTracker = new PromptPrefixTracker();
 	#mainAttemptScopeObserver?: (scope: AttemptScope) => void;
 
 	get intentTracing(): boolean {
@@ -607,6 +658,7 @@ export class Agent {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn. Reassign at any time. */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
 	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
@@ -653,6 +705,7 @@ export class Agent {
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
+		this.onQueuedRunStartDecision = opts.onQueuedRunStartDecision;
 		this.onSteeringConsumed = opts.onSteeringConsumed;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
@@ -1293,6 +1346,33 @@ export class Agent {
 	}
 
 	/**
+	 * Enqueue a cohort of steering messages that one model step must receive
+	 * together.
+	 *
+	 * {@link steer} submits each message as its own unit, and the default
+	 * `one-at-a-time` mode then commits only the first of them per step. A cohort
+	 * keeps records that only make sense together — an incoming message and the
+	 * reply already sent on the model's behalf — inside a single steering unit in
+	 * either mode. Admission is all-or-nothing: either every message is queued or
+	 * none is.
+	 */
+	steerCohort(messages: readonly AgentMessage[], options?: { forceOneAtATime?: boolean }): SteerAdmission {
+		const head = messages[0];
+		if (!head) return { admitted: false, reason: "idle" };
+		assertUserImagePlaceholdersHavePayload([...messages]);
+		const runId = this.#activeRunId;
+		if (runId === undefined || !this.#state.isStreaming) return { admitted: false, reason: "idle" };
+		if (this.#abortController?.signal.aborted) return { admitted: false, reason: "aborting" };
+		for (const message of messages) {
+			if (options?.forceOneAtATime) this.#steeringForceOneAtATime.add(message);
+			this.#steeringQueue.push(message);
+		}
+		if (messages.length > 1) this.#steeringBatches.set(head, [...messages]);
+		for (const notify of [...this.#steeringWaiters]) notify();
+		return { admitted: true, runId };
+	}
+
+	/**
 	 * Resolves when a steering message is admitted AFTER this wait started, or
 	 * when `signal` aborts. The queue is not consumed and a message already
 	 * queued before the wait does not resolve it. Long observation tools use this
@@ -1344,6 +1424,26 @@ export class Agent {
 	markFollowUpBatch(messages: readonly AgentMessage[]): void {
 		const first = messages[0];
 		if (first && messages.length > 1) this.#followUpBatches.set(first, messages.slice());
+	}
+
+	/**
+	 * Delivery cohorts inside `messages`, keyed by every member. A cohort queued
+	 * together through `steer`/`steerCohort` keeps its metadata for the lifetime
+	 * of the message, so a cohort an ended run disowned (and the owner re-routed)
+	 * still reports as one unit here. A cohort counts only while its members are
+	 * still contiguous in the given order.
+	 */
+	steeringCohorts(messages: readonly AgentMessage[]): Map<AgentMessage, readonly AgentMessage[]> {
+		const cohorts = new Map<AgentMessage, readonly AgentMessage[]>();
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index];
+			if (!message) continue;
+			const cohort = this.#steeringBatches.get(message);
+			if (!cohort || cohort.length < 2) continue;
+			if (!cohort.every((entry, offset) => messages[index + offset] === entry)) continue;
+			for (const member of cohort) cohorts.set(member, cohort);
+		}
+		return cohorts;
 	}
 
 	clearSteeringQueue() {
@@ -1409,28 +1509,43 @@ export class Agent {
 		this.#followUpQueue = snapshot.followUp.slice();
 	}
 
+	/**
+	 * Steering units in queue order, up to `limit` units. A cohort queued together
+	 * counts as one unit, so the loop commits its members in the same step even
+	 * when the steering mode would otherwise take one record at a time.
+	 */
+	#steeringUnits(limit: number): AgentMessage[][] {
+		const units: AgentMessage[][] = [];
+		let index = 0;
+		while (index < this.#steeringQueue.length && units.length < limit) {
+			const message = this.#steeringQueue[index];
+			if (!message) break;
+			const batch = this.#steeringBatches.get(message);
+			const cohort =
+				batch && batch.length > 1 && batch.every((entry, offset) => this.#steeringQueue[index + offset] === entry)
+					? batch
+					: undefined;
+			units.push(cohort ? [...cohort] : [message]);
+			index += cohort ? cohort.length : 1;
+		}
+		return units;
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
-		if (this.#steeringMode === "one-at-a-time") {
-			if (this.#steeringQueue.length > 0) {
-				const first = this.#steeringQueue[0];
-				this.#steeringQueue = this.#steeringQueue.slice(1);
-				return [first];
-			}
-			return [];
+		const takes: AgentMessage[][] = [];
+		for (const unit of this.#steeringUnits(Number.POSITIVE_INFINITY)) {
+			const first = unit[0];
+			// A per-message sequential mark still delivers that message on its own,
+			// mirroring the follow-up override; a cohort holding it still travels whole.
+			const sequential = first !== undefined && this.#steeringForceOneAtATime.has(first);
+			if (takes.length > 0 && (sequential || this.#steeringMode === "one-at-a-time")) break;
+			takes.push(unit);
+			if (sequential || this.#steeringMode === "one-at-a-time") break;
 		}
-		// "all" batches within ONE poll only; a per-message sequential mark still
-		// delivers that message on its own, mirroring the follow-up override.
-		const first = this.#steeringQueue[0];
-		if (!first) return [];
-		if (this.#steeringForceOneAtATime.has(first)) {
-			this.#steeringQueue = this.#steeringQueue.slice(1);
-			return [first];
-		}
-		const forcedIndex = this.#steeringQueue.findIndex(message => this.#steeringForceOneAtATime.has(message));
-		const takeCount = forcedIndex === -1 ? this.#steeringQueue.length : forcedIndex;
-		const steering = this.#steeringQueue.slice(0, takeCount);
-		this.#steeringQueue = this.#steeringQueue.slice(takeCount);
-		return steering;
+		const taken = takes.flat();
+		if (taken.length === 0) return [];
+		this.#steeringQueue = this.#steeringQueue.slice(taken.length);
+		return taken;
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
@@ -1661,6 +1776,9 @@ export class Agent {
 		this.#state.error = undefined;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		// A reset starts a new provider cache lineage (/new, context clear, handoff):
+		// its first request must report `initial`, not a mutation of the old session.
+		this.#promptPrefixTracker = new PromptPrefixTracker();
 	}
 
 	/** Send a prompt with an AgentMessage */
@@ -1816,6 +1934,18 @@ export class Agent {
 		throw new Error("No queued messages to continue");
 	}
 
+	#notifyQueuedRunStartDecision(
+		consumedQueuedMessages: readonly AgentMessage[] | undefined,
+		decision: { disposition: "accepted" } | { disposition: "not-started"; error: Error },
+	): void {
+		if (!consumedQueuedMessages?.length) return;
+		try {
+			this.onQueuedRunStartDecision?.({ ...decision, consumedQueuedMessages });
+		} catch (error) {
+			logger.warn("Queued run start decision callback failed", { error });
+		}
+	}
+
 	/**
 	 * Run the agent loop.
 	 * If messages are provided, starts a new conversation turn with those messages.
@@ -1829,11 +1959,17 @@ export class Agent {
 		},
 	) {
 		const model = this.#state.model;
-		if (!model) throw new Error("No model configured");
+		if (!model) {
+			const error = new Error("No model configured");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
+		}
 
 		const maintenanceContinuation = options?.maintenanceContinuation === true;
 		if (maintenanceContinuation && this.#managedLogicalRunOwner === undefined) {
-			throw new Error("Maintenance continuation ownership is unavailable");
+			const error = new Error("Maintenance continuation ownership is unavailable");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
 		}
 		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
 
@@ -1869,13 +2005,16 @@ export class Agent {
 			this.#runningPrompt = undefined;
 			this.#resolveRunningPrompt = undefined;
 			resolve();
-			throw new Error("Prompt resource cancellation domain is unavailable");
+			const error = new Error("Prompt resource cancellation domain is unavailable");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
 		}
 		const logicalRunId = managedLogicalRunOwner ?? runId;
 		const scope = this.#attemptAuthority.mintMain();
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
+		this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "accepted" });
 		options?.onRunAccepted?.(handle, {
 			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
 		});
@@ -1979,6 +2118,7 @@ export class Agent {
 			maxRetryDelayMs: this.#maxRetryDelayMs,
 			requestMaxRetries: this.#requestMaxRetries,
 			streamMaxRetries: this.#streamMaxRetries,
+			contextOverflowManaged: options?.contextOverflowManaged,
 			streamFirstEventTimeoutMs: this.#streamFirstEventTimeoutMs,
 			...(fallbackManaged
 				? {
@@ -2030,6 +2170,7 @@ export class Agent {
 			transformToolCallArguments: this.#transformToolCallArguments,
 			intentTracing: this.#intentTracing,
 			appendOnlyContext: this.#appendOnlyContext,
+			promptPrefixTracker: this.#promptPrefixTracker,
 			beforeToolCall: this.beforeToolCall
 				? async (ctx, signal) => {
 						if (this.#activeRunId !== runId) return undefined;
@@ -2275,6 +2416,15 @@ export class Agent {
 				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
+			if (!abortController.signal.aborted) {
+				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			}
 
 			const errorMsg: AgentMessage = {
 				role: "assistant",
@@ -2295,6 +2445,7 @@ export class Agent {
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
 				errorStatus: safeErrorStatus(err),
+				...(sanitized.providerDiagnostic === undefined ? {} : { providerDiagnostic: sanitized.providerDiagnostic }),
 				// Local-diagnostic authority (`errorKind` + structured
 				// `bufferOverflow`) comes from ONE identity check: a foreign error
 				// that self-declares a local kind gets neither field, so the parent
@@ -2307,15 +2458,15 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			this.#emit({
-				type: "agent_failed",
-				// Runtime-authenticated classifiers only: abort comes from the
-				// signal, and a local staging failure comes from the identity-
-				// checked managedLocalErrorDiagnostic — a foreign error that
-				// self-declares a local kind still maps to agent_failed.
-				error: sanitizeAgentFailure(err, runtimeFailureCode),
-				scope: handle.scope,
-			});
+			if (!abortController.signal.aborted) {
+				this.#emit({
+					type: "agent_failed",
+					// Only the identity-checked local staging diagnostic may assert a
+					// local failure kind; a foreign self-declaration stays agent_failed.
+					error: sanitizeAgentFailure(err, runtimeFailureCode),
+					scope: handle.scope,
+				});
+			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
 				stopReason: abortController.signal.aborted ? "cancelled" : "error",
 				messages: [errorMsg],

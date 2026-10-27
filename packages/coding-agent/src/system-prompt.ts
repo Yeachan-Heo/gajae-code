@@ -5,6 +5,7 @@
 import * as os from "node:os";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { $env, getGpuCachePath, getProjectDir, hasFsCode, isEnoent, logger, prompt } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { $ } from "bun";
 import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
@@ -75,6 +76,31 @@ function sanitizeEmbeddedPromptContent(content: string): string {
 	return escapePromptMetadata(content, { preserveNewlines: true });
 }
 
+const UNTRUSTED_CONTENT_OPEN_LINE = "<untrusted-content>\n";
+const UNTRUSTED_CONTENT_CLOSE_LINE = "\n</untrusted-content>";
+
+/**
+ * Encode an inventory description. MCP descriptions already include a host-owned
+ * untrusted-content fence; keep those delimiters and encode only the body.
+ * A body that still contains a closing fence is not that wrapper, so encode the whole value.
+ */
+function escapeInventoryDescription(description: string): string {
+	const openLength = UNTRUSTED_CONTENT_OPEN_LINE.length;
+	const closeLength = UNTRUSTED_CONTENT_CLOSE_LINE.length;
+	if (
+		description.startsWith(UNTRUSTED_CONTENT_OPEN_LINE) &&
+		description.endsWith(UNTRUSTED_CONTENT_CLOSE_LINE) &&
+		description.length >= openLength + closeLength
+	) {
+		const body = description.slice(openLength, -closeLength);
+		if (!/<\/untrusted-content>/i.test(body)) {
+			const encodedBody = escapePromptMetadata(body, { preserveNewlines: true });
+			return `${UNTRUSTED_CONTENT_OPEN_LINE}${encodedBody}${UNTRUSTED_CONTENT_CLOSE_LINE}`;
+		}
+	}
+	return escapePromptMetadata(description, { preserveNewlines: true });
+}
+
 function firstNonEmpty(...values: (string | undefined | null)[]): string | null {
 	for (const value of values) {
 		const trimmed = value?.trim();
@@ -93,11 +119,44 @@ function parseWmicTable(output: string, header: string): string | null {
 }
 
 const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
+const SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS = 100;
+
+/**
+ * Resolve after `budgetMs` of event-loop-responsive time has elapsed.
+ *
+ * A plain wall-clock timer misfires when the loop is starved: concurrent
+ * sessions in one process (e.g. `bench:edit`) run seconds of synchronous
+ * startup work, the timer and the finished file I/O become ready together,
+ * and the timers phase runs first, so a step that needed milliseconds is
+ * reported as timed out (issue #5949). Each tick contributes at most two tick
+ * lengths, so blocked stretches do not consume the budget while a genuinely
+ * hung step still times out after roughly `budgetMs` of responsive time.
+ *
+ * Aborting `signal` stops the ticker and resolves `false`; exhausting the
+ * budget resolves `true`.
+ */
+export async function waitForResponsiveBudget(
+	budgetMs: number,
+	tickMs = SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	let consumed = 0;
+	let last = performance.now();
+	while (consumed < budgetMs) {
+		if (signal?.aborted) return false;
+		await Bun.sleep(Math.min(tickMs, budgetMs - consumed));
+		const now = performance.now();
+		consumed += Math.min(now - last, tickMs * 2);
+		last = now;
+	}
+	return !signal?.aborted;
+}
 
 async function getGpuModel(): Promise<string | null> {
 	switch (process.platform) {
 		case "win32": {
 			const output = await $`wmic path win32_VideoController get name`
+				.env(projectSafeSpawnEnv())
 				.quiet()
 				.text()
 				.catch(() => null);
@@ -105,6 +164,7 @@ async function getGpuModel(): Promise<string | null> {
 		}
 		case "linux": {
 			const output = await $`lspci`
+				.env(projectSafeSpawnEnv())
 				.quiet()
 				.text()
 				.catch(() => null);
@@ -313,8 +373,9 @@ export async function loadProjectContextFiles(
 }
 
 /**
- * Load the effective system prompt customization from SYSTEM.md.
- * Project-level SYSTEM.md overrides user-level SYSTEM.md.
+ * Load the user system prompt customization from SYSTEM.md.
+ * A repository SYSTEM.md is untrusted project text. It must not replace the
+ * user file or become the customization block.
  */
 export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {}): Promise<string | null> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
@@ -326,11 +387,6 @@ export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {
 	});
 
 	if (result.items.length === 0) return null;
-
-	const projectLevel = result.items.find(item => item.level === "project");
-	if (projectLevel) {
-		return projectLevel.content;
-	}
 
 	const userLevel = result.items.find(item => item.level === "user");
 	return userLevel?.content ?? null;
@@ -596,7 +652,12 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		} satisfies WorkspaceTree,
 	};
 
-	const deadline = Bun.sleep(SYSTEM_PROMPT_PREP_TIMEOUT_MS).then(() => "__timeout__" as const);
+	const deadlineController = new AbortController();
+	const deadline = waitForResponsiveBudget(
+		SYSTEM_PROMPT_PREP_TIMEOUT_MS,
+		SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS,
+		deadlineController.signal,
+	).then(() => "__timeout__" as const);
 	const timedOut: string[] = [];
 	const failed: Array<{ name: string; error: unknown }> = [];
 
@@ -643,26 +704,25 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
 
+	// Stop the deadline ticker as soon as every step settles so completed builds
+	// leave no background timers behind; each race has already been decided by then.
+	const preparedSteps = Promise.all([
+		withDeadline(
+			"customPrompt",
+			resolvePromptInput(customPrompt, "system prompt"),
+			prepDefaults.resolvedCustomPrompt,
+		),
+		withDeadline(
+			"appendSystemPrompt",
+			resolvePromptInput(appendSystemPrompt, "append system prompt"),
+			prepDefaults.resolvedAppendPrompt,
+		),
+		withDeadline("loadSystemPromptFiles", systemPromptCustomizationPromise, prepDefaults.systemPromptCustomization),
+		withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles),
+		withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
+	]).finally(() => deadlineController.abort());
 	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFileResult, workspaceTree] =
-		await Promise.all([
-			withDeadline(
-				"customPrompt",
-				resolvePromptInput(customPrompt, "system prompt"),
-				prepDefaults.resolvedCustomPrompt,
-			),
-			withDeadline(
-				"appendSystemPrompt",
-				resolvePromptInput(appendSystemPrompt, "append system prompt"),
-				prepDefaults.resolvedAppendPrompt,
-			),
-			withDeadline(
-				"loadSystemPromptFiles",
-				systemPromptCustomizationPromise,
-				prepDefaults.systemPromptCustomization,
-			),
-			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles),
-			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
-		]);
+		await preparedSteps;
 	const contextFiles = dedupeExactContextFiles(contextFileResult.contextFiles);
 	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 
@@ -709,18 +769,31 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
 	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
-	const toolInfo = toolNames.map(name => ({
-		name: toolPromptNames.get(name) ?? name,
-		internalName: name,
-		label: tools?.get(name)?.label ?? "",
-		description: tools?.get(name)?.description ?? "",
-	}));
+	// The inventory template is compiled with noEscape. Encode tool metadata here so a
+	// tools/list label or description cannot close <inventory> or insert a system block.
+	// Repeated MCP descriptions keep the host <untrusted-content> fence; only the body is encoded.
+	// The `tools` list stays raw so {{#has}} still matches the call name.
+	const toolInfo = toolNames.map(name => {
+		const meta = tools?.get(name);
+		return {
+			name: escapePromptMetadata(toolPromptNames.get(name) ?? name),
+			internalName: escapePromptMetadata(name),
+			label: escapePromptMetadata(meta?.label ?? ""),
+			description: escapeInventoryDescription(meta?.description ?? ""),
+		};
+	});
 
-	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
+	const rawSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
 	]);
-	const promptSources = [effectiveSystemPromptCustomization, resolvedCustomPrompt, resolvedAppendPrompt];
+	// Encode after dedupe so rule matching still sees the file text. The customization
+	// template is noEscape; the same encoder used for context files keeps a file from
+	// closing <system-prompt-customization> or forging a sibling marker.
+	const effectiveSystemPromptCustomization = rawSystemPromptCustomization
+		? sanitizeEmbeddedPromptContent(rawSystemPromptCustomization)
+		: "";
+	const promptSources = [rawSystemPromptCustomization, resolvedCustomPrompt, resolvedAppendPrompt];
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
 	const environment = await logger.time("getEnvironmentInfo", getEnvironmentInfo);
@@ -735,6 +808,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		path: escapePromptMetadata(rule.path),
 		content: sanitizeEmbeddedPromptContent(rule.content),
 	}));
+	// Both rulebook templates compile with noEscape. Encode the fields they interpolate
+	// so repository frontmatter cannot close <rules> or the name attribute.
+	const sanitizedRulebookRules = (rules ?? []).map(rule => ({
+		...rule,
+		name: escapePromptMetadata(rule.name),
+		description:
+			rule.description === undefined
+				? undefined
+				: escapePromptMetadata(rule.description, { preserveNewlines: true }),
+		globs: rule.globs?.map(glob => escapePromptMetadata(glob)),
+	}));
 	const data = {
 		systemPromptCustomization: effectiveSystemPromptCustomization,
 		customPrompt: resolvedCustomPrompt,
@@ -748,7 +832,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles: sanitizedContextFiles,
 		agentsMdSearch: { files: agentsMdFiles.map(file => escapePromptMetadata(file)) },
 		workspaceTree,
-		rules: rules ?? [],
+		rules: sanitizedRulebookRules,
 		alwaysApplyRules: sanitizedAlwaysApplyRules,
 		cwd: promptCwd,
 		intentTracing: !!intentField,

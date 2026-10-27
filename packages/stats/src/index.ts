@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { parseArgs } from "node:util";
-import { formatDuration, formatNumber, formatPercent } from "@gajae-code/utils";
+import { formatDuration, formatNumber, formatPercent, sanitizeDisplayLine } from "@gajae-code/utils";
 import { getDashboardStats, getTotalMessageCount, syncAllSessions } from "./aggregator";
 import { closeDb } from "./db";
 import { startServer } from "./server";
@@ -17,7 +17,11 @@ export {
 export { closeDb } from "./db";
 export { startServer } from "./server";
 export type {
+	AgentRole,
+	AgentStats,
 	AggregatedStats,
+	CacheMissAttribution,
+	CacheMissCause,
 	DashboardStats,
 	FolderStats,
 	MessageStats,
@@ -45,7 +49,7 @@ function normalizePremiumRequests(n: number): number {
  */
 async function printStats(): Promise<void> {
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder } = stats;
+	const { overall, failures, byModel, byFolder, byAgent } = stats;
 
 	console.log("\n=== AI Usage Statistics ===\n");
 
@@ -64,11 +68,29 @@ async function printStats(): Promise<void> {
 		console.log(`  Avg Tokens/s: ${overall.avgTokensPerSecond.toFixed(1)}`);
 	}
 
+	console.log("\nProvider Failures:");
+	console.log(
+		`  Error+Abort Share: ${formatPercent(failures.failureShare)} (${formatNumber(failures.erroredRequests)} errors, ${formatNumber(failures.abortedRequests)} aborts)`,
+	);
+	console.log(`  Failed Duration: ${formatDuration(failures.failedDurationMs)}`);
+	console.log(
+		`  Post-Failure Full-Miss Tokens: ${formatNumber(failures.postFailureFullMissTokens)} (${formatNumber(failures.postFailureFullMissRequests)}/${formatNumber(failures.postFailureRequests)} requests)`,
+	);
+
 	if (byModel.length > 0) {
 		console.log("\nBy Model:");
 		for (const m of byModel.slice(0, 10)) {
 			console.log(
-				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+				`  ${sanitizeDisplayLine(m.model)}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+			);
+		}
+	}
+
+	if (byAgent.length > 0) {
+		console.log("\nBy Agent Role:");
+		for (const agent of byAgent) {
+			console.log(
+				`  ${sanitizeDisplayLine(agent.agent)}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
 			);
 		}
 	}
@@ -76,7 +98,9 @@ async function printStats(): Promise<void> {
 	if (byFolder.length > 0) {
 		console.log("\nBy Folder:");
 		for (const f of byFolder.slice(0, 10)) {
-			console.log(`  ${f.folder}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`);
+			console.log(
+				`  ${sanitizeDisplayLine(f.folder)}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`,
+			);
 		}
 	}
 

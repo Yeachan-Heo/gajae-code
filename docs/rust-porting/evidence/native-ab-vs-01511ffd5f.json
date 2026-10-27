@@ -1,0 +1,1472 @@
+{
+  "schema": "gjc.rust-porting.ab-evidence/1",
+  "base": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+  "runs": [
+    {
+      "suite": "appearance",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "1605b508bf45dd012ce883e5ff1e02ebbdb06452",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.33642578125,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/appearance.ts",
+        "sha256": "fb91ff11b94ed6c3775ca06f0f32da366ed4633c60c860b874488e10a87ea7f9"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "A01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9875424688561721,
+            "upper": 1.0130401298490106
+          },
+          "p95": {
+            "lower": 0.9817265178037164,
+            "upper": 1.046574324211881
+          }
+        }
+      ]
+    },
+    {
+      "suite": "builtins",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "d61c1fea5d7a93ce1dad3fc990dda47c544b810e",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.83349609375,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/builtins.ts",
+        "sha256": "4d0c24ec03460eab565f8fd431e96249401fc3509e33e6a3a3b22d8f18b8cfa8"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 60,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "B01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9868370024243504,
+            "upper": 1.0074952208830292
+          },
+          "p95": {
+            "lower": 0.9937221204032548,
+            "upper": 1.0165491552586272
+          }
+        },
+        {
+          "id": "B02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9836021469982419,
+            "upper": 1.0108612819229221
+          },
+          "p95": {
+            "lower": 0.994195197954734,
+            "upper": 1.0072614284190198
+          }
+        },
+        {
+          "id": "B03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9991799131320068,
+            "upper": 1.0048519485224292
+          },
+          "p95": {
+            "lower": 0.9903711518537849,
+            "upper": 1.008898424916182
+          }
+        },
+        {
+          "id": "B04",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9937411457464382,
+            "upper": 1.007296067997742
+          },
+          "p95": {
+            "lower": 0.9929123687410328,
+            "upper": 1.0110742053023964
+          }
+        },
+        {
+          "id": "B05",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9849616346617754,
+            "upper": 0.9925041966194326
+          },
+          "p95": {
+            "lower": 0.9752051710337515,
+            "upper": 0.9956192308840771
+          }
+        },
+        {
+          "id": "B06",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9972797638254346,
+            "upper": 1.00698331162429
+          },
+          "p95": {
+            "lower": 0.9936589958481249,
+            "upper": 1.0113285849993585
+          }
+        },
+        {
+          "id": "B07",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.995440612531004,
+            "upper": 1.0174935020047473
+          },
+          "p95": {
+            "lower": 0.9750732074509428,
+            "upper": 1.0092489826584228
+          }
+        },
+        {
+          "id": "B08",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9975455767834505,
+            "upper": 1.0064619719557504
+          },
+          "p95": {
+            "lower": 0.995590758460365,
+            "upper": 1.0234874471064739
+          }
+        }
+      ]
+    },
+    {
+      "suite": "clipboard",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "f7aaeb741b08b920cd060b2889f8d83be3262c78",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 2.30029296875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/clipboard.ts",
+        "sha256": "3ace5bbc57119f9cd9b04d5d5abb5a6b0692f410454104978a75fd52fcd0508f"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "C01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9911190717584769,
+            "upper": 1.0067748363222317
+          },
+          "p95": {
+            "lower": 0.9503068651745733,
+            "upper": 1.0596570582260492
+          }
+        }
+      ]
+    },
+    {
+      "suite": "crash",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "33bead9203045fe3ffd2dc0ad9f0d610e848ffce",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.9697265625,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/crash.ts",
+        "sha256": "e985b30bba3243b86770afd28d7d3b759f08df45d004660900cd38a9a1007cf1"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "C01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.8986522779809081,
+            "upper": 1.007516365219508
+          },
+          "p95": {
+            "lower": 0.8853742966037497,
+            "upper": 0.9856602912559327
+          }
+        },
+        {
+          "id": "C02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.926103636569616,
+            "upper": 1.024193093309115
+          },
+          "p95": {
+            "lower": 0.9292445688210387,
+            "upper": 1.0021525736797985
+          }
+        }
+      ]
+    },
+    {
+      "suite": "edit-hotspots",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "9370a2bf6501ff5ed357d488a9124afc5673acf3",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 4.94140625,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/edit-hotspots.ts",
+        "sha256": "241f4c76d705b21d81c6f17637139d0d2554f5d947919a840f1d000f9a466ac4"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "H01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.8561144519157932,
+            "upper": 0.8633960047003526
+          },
+          "p95": {
+            "lower": 0.8515587203845356,
+            "upper": 0.8748697507860455
+          }
+        },
+        {
+          "id": "H02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.1396260882094665,
+            "upper": 0.14099905193921047
+          },
+          "p95": {
+            "lower": 0.1207708469173368,
+            "upper": 0.1234340456890199
+          }
+        },
+        {
+          "id": "H03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9567922339238975,
+            "upper": 0.974730326442463
+          },
+          "p95": {
+            "lower": 0.950627475209918,
+            "upper": 0.9872007165099301
+          }
+        },
+        {
+          "id": "H06",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9595395458104935,
+            "upper": 0.976792523697663
+          },
+          "p95": {
+            "lower": 0.8743992310157002,
+            "upper": 1.0064262763298821
+          }
+        }
+      ]
+    },
+    {
+      "suite": "iso",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "b7177658f0b55d94c6b05057fadd6d511d6ed3db",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.2724609375,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/iso.ts",
+        "sha256": "30a060e533f2397bdda7f14e51989d3ff3e7341bf77438e99719eaab241b124f"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 60,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "I01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.934131576654685,
+            "upper": 1.0114873107733728
+          },
+          "p95": {
+            "lower": 0.9461157467464536,
+            "upper": 1.0457158455338194
+          }
+        },
+        {
+          "id": "I02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9959390862944162,
+            "upper": 1.0057835104601485
+          },
+          "p95": {
+            "lower": 0.9917961335676626,
+            "upper": 1.0341300089047194
+          }
+        },
+        {
+          "id": "I03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9781265019961584,
+            "upper": 1.0282240025297216
+          },
+          "p95": {
+            "lower": 0.949700192999951,
+            "upper": 1.0767896963566146
+          }
+        }
+      ]
+    },
+    {
+      "suite": "keystroke",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "e832328b699db4160bdbd75b4f15141320993a73",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.22021484375,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/keystroke.ts",
+        "sha256": "901bce655c9790e286c8584ec59d2965cc55340337a06e13bf090d709d4e49c8"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 60,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "K01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9995715509854327,
+            "upper": 1.0180025717959709
+          },
+          "p95": {
+            "lower": 1.0211896859841716,
+            "upper": 1.0776000000000001
+          }
+        },
+        {
+          "id": "K02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 1,
+            "upper": 1.016880211511084
+          },
+          "p95": {
+            "lower": 0.9877818181818182,
+            "upper": 1.0631834750911302
+          }
+        },
+        {
+          "id": "K03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.6254918414918416,
+            "upper": 0.6308411214953271
+          },
+          "p95": {
+            "lower": 0.6295798709591813,
+            "upper": 0.6450543933054393
+          }
+        },
+        {
+          "id": "K04",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.735497860983555,
+            "upper": 0.7427267990050045
+          },
+          "p95": {
+            "lower": 0.7535550561797754,
+            "upper": 0.7651228861330327
+          }
+        },
+        {
+          "id": "K05",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.5326454430201436,
+            "upper": 0.5379072847682119
+          },
+          "p95": {
+            "lower": 0.5515473206533315,
+            "upper": 0.5637467332693772
+          }
+        }
+      ]
+    },
+    {
+      "suite": "mermaid-render",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.5107421875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/mermaid-render.ts",
+        "sha256": "c45fea27c3f7de73d435790172c8d8a0b452625e607d787177298246523fd517"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "M01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.46597891134854735,
+            "upper": 0.5050365308804204
+          },
+          "p95": {
+            "lower": 0.26254629038436983,
+            "upper": 0.2771762107315726
+          }
+        },
+        {
+          "id": "M02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.2809955371477431,
+            "upper": 0.2936638388872605
+          },
+          "p95": {
+            "lower": 0.19019354838709676,
+            "upper": 0.19834812209139324
+          }
+        }
+      ]
+    },
+    {
+      "suite": "natives-grep",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "e832328b699db4160bdbd75b4f15141320993a73",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.6923828125,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/grep.ts",
+        "sha256": "49f281753c2342a9ef120d6965a1068c2d18bca0551ce6d735e05f2a239a5dd4"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "G01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.29165752723550487,
+            "upper": 0.29759203688794555
+          },
+          "p95": {
+            "lower": 0.17806781093233115,
+            "upper": 0.19026224304130696
+          }
+        },
+        {
+          "id": "G02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.23364194294525828,
+            "upper": 0.23749832363358372
+          },
+          "p95": {
+            "lower": 0.1437881450716066,
+            "upper": 0.15391535397766348
+          }
+        },
+        {
+          "id": "G03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.7940545006868998,
+            "upper": 0.8116325480779704
+          },
+          "p95": {
+            "lower": 0.75741424979232,
+            "upper": 0.8023481777918244
+          }
+        },
+        {
+          "id": "G04",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.7703831119547329,
+            "upper": 0.7745459069993819
+          },
+          "p95": {
+            "lower": 0.7436455308642838,
+            "upper": 0.7796026856303983
+          }
+        },
+        {
+          "id": "G05",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.7240475455074271,
+            "upper": 0.7280576866837677
+          },
+          "p95": {
+            "lower": 0.7067719129090898,
+            "upper": 0.7581543777669595
+          }
+        },
+        {
+          "id": "G06",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.7202372106940272,
+            "upper": 0.723530791598304
+          },
+          "p95": {
+            "lower": 0.6563280323446287,
+            "upper": 0.7464289477952982
+          }
+        },
+        {
+          "id": "G07",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.8030648968693161,
+            "upper": 0.8089584709218756
+          },
+          "p95": {
+            "lower": 0.6923655179882869,
+            "upper": 0.7204345153467597
+          }
+        },
+        {
+          "id": "G08",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9888438555641066,
+            "upper": 1.027727058006013
+          },
+          "p95": {
+            "lower": 0.9888438555641066,
+            "upper": 1.028792503411229
+          }
+        }
+      ]
+    },
+    {
+      "suite": "power",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "33bead9203045fe3ffd2dc0ad9f0d610e848ffce",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 5.8447265625,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/power.ts",
+        "sha256": "9b614d8221b049e35ca9f734bb9d0fd5dd9c355da67b63674be12a4faf9cfb83"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "W01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9761904761904762,
+            "upper": 1.0213333333333334
+          },
+          "p95": {
+            "lower": 0.9314303797468354,
+            "upper": 1.0602675880911248
+          }
+        }
+      ]
+    },
+    {
+      "suite": "prof",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "33bead9203045fe3ffd2dc0ad9f0d610e848ffce",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.72509765625,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/prof.ts",
+        "sha256": "568fd7254c067966023455859855803fbe026a1168c045d418465c590f5051fc"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "R01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9988009592326139,
+            "upper": 1
+          },
+          "p95": {
+            "lower": 0.8572653236176597,
+            "upper": 0.9596928982725529
+          }
+        },
+        {
+          "id": "R02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9843574221888894,
+            "upper": 0.9954697443641463
+          },
+          "p95": {
+            "lower": 0.9364161849710984,
+            "upper": 1.0472928281205707
+          }
+        }
+      ]
+    },
+    {
+      "suite": "pty",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "33bead9203045fe3ffd2dc0ad9f0d610e848ffce",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.59619140625,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/pty.ts",
+        "sha256": "8a49ccec48aab959df6b7e744f3e1448814e4382f558f424afe0e879fd944511"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.987877887543638,
+            "upper": 1.0173324018569916
+          },
+          "p95": {
+            "lower": 0.9808041453174242,
+            "upper": 1.0255671256366552
+          }
+        },
+        {
+          "id": "P02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9569397092298015,
+            "upper": 1.0108671166302372
+          },
+          "p95": {
+            "lower": 0.8647685867743423,
+            "upper": 1.008701144006617
+          }
+        }
+      ]
+    },
+    {
+      "suite": "read-html",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.93505859375,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/read-html.ts",
+        "sha256": "efda80841675fecb53b04f534576a2fb4698bc7a60cd94372249172a6a202415"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "H01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9948990825688073,
+            "upper": 1.0144223639329675
+          },
+          "p95": {
+            "lower": 0.9815410870128748,
+            "upper": 1.0434945054945055
+          }
+        },
+        {
+          "id": "H02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9766355140186915,
+            "upper": 1.0215461882032704
+          },
+          "p95": {
+            "lower": 0.9113831758665735,
+            "upper": 1.0260740740740741
+          }
+        }
+      ]
+    },
+    {
+      "suite": "read-image",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "e832328b699db4160bdbd75b4f15141320993a73",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.77587890625,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/read-image.ts",
+        "sha256": "fcc182bb1ed53ffda17e3e3fb5000e66a1ffd8caba1065618f637c23aef5d803"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "I01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9903133097762072,
+            "upper": 1.0197842751251749
+          },
+          "p95": {
+            "lower": 0.9914037496979378,
+            "upper": 1.0475833645560133
+          }
+        }
+      ]
+    },
+    {
+      "suite": "read-pdf",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 5.89990234375,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/read-pdf.ts",
+        "sha256": "e2560b8f19ed712fce1404be736b5853a512d752e9ae33ae091e38e2e1bef8bd"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.5943757936895575,
+            "upper": 0.6246951765352299
+          },
+          "p95": {
+            "lower": 0.5797671179361732,
+            "upper": 0.6452814371777664
+          }
+        }
+      ]
+    },
+    {
+      "suite": "render-transcript",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "1605b508bf45dd012ce883e5ff1e02ebbdb06452",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 5.61279296875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/render-transcript.ts",
+        "sha256": "5adbe635b4484cf98c15a3f0cfd33c4682a30a33db1bd6e816d207aec15c6ccc"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "R01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.975216446996519,
+            "upper": 1.0050804230976356
+          },
+          "p95": {
+            "lower": 0.9631608206485771,
+            "upper": 1.077498916967509
+          }
+        },
+        {
+          "id": "R02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.99295186012356,
+            "upper": 1.0044085211705385
+          },
+          "p95": {
+            "lower": 0.9720956903627692,
+            "upper": 1.0107201769901664
+          }
+        },
+        {
+          "id": "R03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9572541011636656,
+            "upper": 0.9824588637069233
+          },
+          "p95": {
+            "lower": 0.9422095217243576,
+            "upper": 1.0245987987905818
+          }
+        }
+      ]
+    },
+    {
+      "suite": "rss",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "e832328b699db4160bdbd75b4f15141320993a73",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 5.939453125,
+        "physicalCores": 18
+      },
+      "adapter": null,
+      "rounds": [],
+      "cases": [],
+      "rss": {
+        "S1": {
+          "verdict": "PASS",
+          "ci": {
+            "lower": 0.994538407329105,
+            "upper": 1.008189424959943
+          }
+        },
+        "S2": {
+          "verdict": "PASS",
+          "ci": {
+            "lower": 0.9876390605686032,
+            "upper": 1.0026529890343119
+          }
+        },
+        "S3": {
+          "verdict": "PASS",
+          "ci": {
+            "lower": 1.0081265418662022,
+            "upper": 1.0182083029861617
+          }
+        },
+        "S4": {
+          "verdict": "PASS",
+          "ci": {
+            "lower": 0.9982979171419045,
+            "upper": 1.0155671655007528
+          }
+        },
+        "S5": {
+          "verdict": "PASS",
+          "ci": {
+            "lower": 1.0064861671247656,
+            "upper": 1.0153804467039136
+          }
+        },
+        "S7": {
+          "verdict": "PASS",
+          "ci": {
+            "lower": 0.996020974186913,
+            "upper": 1.001035530582104
+          }
+        }
+      },
+      "legacyEnvelopeRegressions": 0
+    },
+    {
+      "suite": "shell",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 2.84716796875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/shell.ts",
+        "sha256": "96da77ed34636effc8889ff124e9519dce03372876c7c64deb1294799fdbe0cd"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "S01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.968880397401605,
+            "upper": 1.0051545232625045
+          },
+          "p95": {
+            "lower": 0.9573685260328835,
+            "upper": 1.0128486694677872
+          }
+        }
+      ]
+    },
+    {
+      "suite": "startup",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 4.94873046875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/startup.ts",
+        "sha256": "ec7d14847848b62f2b5029e94fefac368eb0d27abe436ee727046687ec899169"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "S01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9174542250463886,
+            "upper": 0.9573912547194662
+          },
+          "p95": {
+            "lower": 0.9058997736761042,
+            "upper": 0.9460394277720865
+          }
+        },
+        {
+          "id": "S02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9125417797450095,
+            "upper": 0.959555863714788
+          },
+          "p95": {
+            "lower": 0.9058615987254549,
+            "upper": 0.9403615660249417
+          }
+        },
+        {
+          "id": "S03",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9227155464320367,
+            "upper": 0.9690487577976648
+          },
+          "p95": {
+            "lower": 0.9116313969224599,
+            "upper": 0.9613239599789363
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tools",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.560546875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tools.ts",
+        "sha256": "ca0b176fa07cf5242e36642457b0e4ea42bc7b834304b478369cb3b127c9f272"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "F01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.6195023280129961,
+            "upper": 0.6482791255281687
+          },
+          "p95": {
+            "lower": 0.4094629132469126,
+            "upper": 0.43906517343288226
+          }
+        },
+        {
+          "id": "W01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.8100744897458395,
+            "upper": 0.880085959368814
+          },
+          "p95": {
+            "lower": 0.5636794284383008,
+            "upper": 0.6701201250053512
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tools:ast_grep",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "9370a2bf6501ff5ed357d488a9124afc5673acf3",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.58251953125,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tools-ast-grep.ts",
+        "sha256": "757e8e8e488f8b5ae1fcedb73f229a9f46edda77b47ce30bdb55047171011885"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "A01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.775711003804507,
+            "upper": 0.7890644918710076
+          },
+          "p95": {
+            "lower": 0.6694143703925322,
+            "upper": 0.7993414489346148
+          }
+        },
+        {
+          "id": "A02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.34896516176538267,
+            "upper": 0.354319383873063
+          },
+          "p95": {
+            "lower": 0.3399262348856188,
+            "upper": 0.3658536169847393
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tools:bash",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "e832328b699db4160bdbd75b4f15141320993a73",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.30126953125,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tools-bash.ts",
+        "sha256": "fa899418306fd7f13c1e26a37522d99111f529e14f6435470e6354e3cb59153c"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "INCONCLUSIVE"
+        },
+        {
+          "blocks": 30,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "B01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.965478916813846,
+            "upper": 1.0125456859361197
+          },
+          "p95": {
+            "lower": 0.8662956715137922,
+            "upper": 1.0813999624527253
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tools:glob",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "e832328b699db4160bdbd75b4f15141320993a73",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.54345703125,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tools-glob.ts",
+        "sha256": "b474ccf9c946877b3708daef3149cb8bd16fa0affee9d25112abe6510ae372d6"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "G01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.5747743521846038,
+            "upper": 0.5916950140814315
+          },
+          "p95": {
+            "lower": 0.5370386260530632,
+            "upper": 0.6309478724742676
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tty-write",
+      "verdict": "FAIL",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.912109375,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tty-write.ts",
+        "sha256": "182904beb2f1b3c1578f1563a8acdbedd41b0f37fb0d7eed6d66253500ecfcd1"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "FAIL"
+        }
+      ],
+      "cases": [
+        {
+          "id": "W01",
+          "verdict": "FAIL",
+          "p50": {
+            "lower": 1.1280000000000001,
+            "upper": 1.2346491228070173
+          },
+          "p95": {
+            "lower": 1.0568988291132155,
+            "upper": 1.2144905863894881
+          }
+        },
+        {
+          "id": "W02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.6950991286040119,
+            "upper": 0.7530493828063833
+          },
+          "p95": {
+            "lower": 0.7590546844628742,
+            "upper": 0.9246641962490229
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tui-input-write",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.73046875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tui-input-write.ts",
+        "sha256": "eff82426b63844e3ed2b7ee38353ae80e2b58fc3e448bc5cf7d5a96331da57fd"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "I01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9647007113814897,
+            "upper": 0.9889929119965655
+          },
+          "p95": {
+            "lower": 0.9862118210500723,
+            "upper": 1.0308265869091977
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tui-render-frame",
+      "verdict": "PASS",
+      "baseSha": "01511ffd5f9ab55111ce7300a20449fd626f6112",
+      "headSha": "187a0dd12238ca9536f0250ec68bfdd68ddc8b5c",
+      "host": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "bun": "1.4.0",
+        "loadAverage1m": 6.75341796875,
+        "physicalCores": 18
+      },
+      "adapter": {
+        "path": "packages/natives/bench/tui-render-frame.ts",
+        "sha256": "c8301e90d60f53f332f41e0db30bbc80d466fd92895536445ae5aadd61d6c38b"
+      },
+      "rounds": [
+        {
+          "blocks": 15,
+          "verdict": "PASS"
+        }
+      ],
+      "cases": [
+        {
+          "id": "F01",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9150407329020384,
+            "upper": 0.9657702706491575
+          },
+          "p95": {
+            "lower": 0.9390523138834552,
+            "upper": 1.017039958484858
+          }
+        },
+        {
+          "id": "F02",
+          "verdict": "PASS",
+          "p50": {
+            "lower": 0.9926504133983465,
+            "upper": 1.0162288439923401
+          },
+          "p95": {
+            "lower": 0.9785626786443445,
+            "upper": 1.0590866624376758
+          }
+        }
+      ]
+    }
+  ]
+}

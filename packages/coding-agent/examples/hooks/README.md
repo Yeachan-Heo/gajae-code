@@ -31,7 +31,7 @@ cp permission-gate.ts ~/.gjc/agent/hooks/
 
 ## Writing Hooks
 
-See [docs/hooks.md](../../docs/hooks.md) for full documentation.
+See [docs/hooks.md](../../../../docs/hooks.md) for full documentation.
 
 ```typescript
 import type { HookAPI } from "@gajae-code/coding-agent/hooks";

@@ -276,81 +276,30 @@ export function hasRootMarkers(cwd: string, markers: string[]): boolean {
 }
 
 // =============================================================================
-// Local Binary Resolution
+// Trusted executable resolution
 // =============================================================================
 
 /**
- * Local bin directories to check before $PATH, ordered by priority.
- * Each entry maps a root marker to the bin directory to check.
- */
-const LOCAL_BIN_PATHS: Array<{ markers: string[]; binDir: string }> = [
-	// Node.js - check node_modules/.bin/
-	{ markers: ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"], binDir: "node_modules/.bin" },
-	// Python - check virtual environment bin directories
-	{ markers: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"], binDir: ".venv/bin" },
-	{ markers: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"], binDir: "venv/bin" },
-	{ markers: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"], binDir: ".env/bin" },
-	// Ruby - check vendor bundle and binstubs
-	{ markers: ["Gemfile", "Gemfile.lock"], binDir: "vendor/bundle/bin" },
-	{ markers: ["Gemfile", "Gemfile.lock"], binDir: "bin" },
-	// Go - check project-local bin
-	{ markers: ["go.mod", "go.sum"], binDir: "bin" },
-];
-
-const WINDOWS_LOCAL_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat"] as const;
-
-function resolveLocalCommand(basePath: string): string | null {
-	if (fs.existsSync(basePath)) return basePath;
-	if (process.platform !== "win32") return null;
-
-	// Package managers write Windows launchers with executable suffixes in node_modules/.bin.
-	for (const extension of WINDOWS_LOCAL_EXECUTABLE_EXTENSIONS) {
-		const candidate = `${basePath}${extension}`;
-		if (fs.existsSync(candidate)) return candidate;
-	}
-
-	return null;
-}
-
-/**
- * Resolve a command to an executable path.
- * Checks project-local bin directories first, then falls back to $PATH.
- *
- * @param command - The command name (e.g., "typescript-language-server")
- * @param cwd - Working directory to search from
- * @returns Absolute path to the executable, or null if not found
- */
-export function resolveCommand(command: string, cwd: string): string | null {
-	// Check local bin directories based on project markers
-	for (const { markers, binDir } of LOCAL_BIN_PATHS) {
-		if (hasRootMarkers(cwd, markers)) {
-			const localPath = path.join(cwd, binDir, command);
-			const resolvedLocalPath = resolveLocalCommand(localPath);
-			if (resolvedLocalPath) {
-				return resolvedLocalPath;
-			}
-		}
-	}
-
-	// Fall back to $PATH
-	return piUtils.$which(command);
-}
-
-/**
- * Resolve an LSP executable without consulting project-controlled bin directories.
+ * Resolve a host-spawn executable from $PATH without consulting project-controlled bin directories.
+ * LSP auto-detection and DAP adapter launch both use this rule.
  *
  * Trust is evaluated on both the discovered and canonical paths, but the returned
  * path is the discovered one: multiplexed launchers such as rustup pick the proxied
  * tool from argv[0], so `~/.cargo/bin/rust-analyzer -> rustup` must be spawned as
  * `rust-analyzer`, not as the resolved `rustup` binary.
  */
-function resolveTrustedLspCommand(command: string, cwd: string): string | null {
+export function resolveTrustedCommand(command: string, cwd: string): string | null {
 	if (!path.isAbsolute(command) && (command.includes("/") || command.includes("\\"))) return null;
 	const discovered = path.isAbsolute(command) ? command : piUtils.$which(command);
 	if (!discovered) return null;
 	if (isProjectControlledPath(discovered, cwd)) return null;
 	if (!canonicalExistingPath(discovered)) return null;
 	return discovered;
+}
+
+/** Same rule as `resolveTrustedCommand`: project-local bin directories are never searched. */
+export function resolveCommand(command: string, cwd: string): string | null {
+	return resolveTrustedCommand(command, cwd);
 }
 
 interface ConfigSource {
@@ -556,8 +505,8 @@ export function loadConfig(cwd: string): LspConfig {
 			// Check if project has root markers for this language
 			if (!hasRootMarkers(cwd, config.rootMarkers)) continue;
 
-			// Check if the language server binary is available (local or $PATH)
-			const resolved = resolveTrustedLspCommand(config.command, cwd);
+			// Check if a trusted language server binary is available on $PATH.
+			const resolved = resolveTrustedCommand(config.command, cwd);
 			if (!resolved) continue;
 
 			detected[name] = { ...config, resolvedCommand: resolved };
@@ -572,7 +521,7 @@ export function loadConfig(cwd: string): LspConfig {
 	for (const [name, config] of Object.entries(mergedWithRuntime)) {
 		if (config.disabled) continue;
 		if (!hasRootMarkers(cwd, config.rootMarkers)) continue;
-		const resolved = resolveTrustedLspCommand(config.command, cwd);
+		const resolved = resolveTrustedCommand(config.command, cwd);
 		if (!resolved) continue;
 		available[name] = { ...config, resolvedCommand: resolved };
 	}

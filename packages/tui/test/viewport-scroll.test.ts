@@ -440,6 +440,62 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("preserves the committed frontier after following live from semantic history", async () => {
+		const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
+		const tui = new TUI(term);
+		const transcript = new AnchoredTranscript();
+		for (let index = 0; index < 3; index++) transcript.addRow(`transcript-${index}`, `transcript-${index}`);
+		const working = new Lines(Array.from({ length: 3 }, (_value, index) => `working-${index}`));
+		const status = new Lines(["status"]);
+		tui.addChild(transcript);
+		tui.addChild(working);
+		tui.addChild(status);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setBottomPinnedComponent(status);
+
+		try {
+			tui.start();
+			await settle(term);
+			for (let index = 3; index < 14; index++) transcript.addRow(`transcript-${index}`, `transcript-${index}`);
+			tui.requestRender();
+			await settle(term);
+
+			working.replace([]);
+			tui.requestRender();
+			await settle(term);
+			const committedRows = Array.from({ length: 14 }, (_value, index) => `transcript-${index}`);
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(line => line.startsWith("transcript-")),
+			).toEqual(committedRows);
+
+			expect(tui.revealViewportAnchor("transcript-0", "top")).toBe(true);
+			await settle(term);
+			working.replace(["later-0"]);
+			tui.requestRender();
+			await settle(term);
+
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["transcript-12", "transcript-13", "later-0", "", "", "status"]);
+
+			working.replace(["later-0", "later-1"]);
+			tui.requestRender();
+			await settle(term);
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(line => line.startsWith("transcript-")),
+			).toEqual(committedRows);
+			expect(visible(term)).toEqual(["transcript-12", "transcript-13", "later-0", "later-1", "", "status"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("rebases a nested editor cursor when following a contracted manual viewport with IME reanchoring", async () => {
 		const previousImeCursor = Bun.env.GJC_TUI_IME_CURSOR;
 		Bun.env.GJC_TUI_IME_CURSOR = "1";
@@ -1267,7 +1323,7 @@ describe("registered viewport anchor", () => {
 		expect(rendered.anchors.some(anchor => anchor?.id === "literal-apc")).toBe(true);
 	});
 
-	it("wraps Kitty-protocol anchored prose into bounded rows without marker leakage while a genuine Kitty line bypasses", () => {
+	it("wraps Kitty-protocol anchored prose into bounded rows and strips a source Kitty line", () => {
 		const previousProtocol = TERMINAL.imageProtocol;
 		setTerminalImageProtocol(ImageProtocol.Kitty);
 		try {
@@ -1302,8 +1358,8 @@ describe("registered viewport anchor", () => {
 			expect(joined).not.toContain("GJC_ANCHOR");
 			expect(joined).not.toContain(ImageProtocol.Kitty);
 
-			// A genuine Kitty graphics line is still classified as an image and bypasses
-			// wrapping: it survives the same pipeline verbatim as a single unwrapped row.
+			// A Kitty APC is an image line at the terminal, but markdown source is not an
+			// image channel: the sequence is stripped before parse.
 			const kittyImageLine = `${ImageProtocol.Kitty}f=100,a=T,t=d;${"QUJD".repeat(64)}\x1b\\`;
 			expect(TERMINAL.isImageLine(kittyImageLine)).toBe(true);
 			expect(kittyImageLine.length).toBeGreaterThan(width);
@@ -1311,7 +1367,8 @@ describe("registered viewport anchor", () => {
 				width,
 				{ id: "kitty-image" },
 			);
-			expect(bypassed.lines).toEqual([kittyImageLine]);
+			expect(bypassed.lines.join("")).not.toContain(ImageProtocol.Kitty);
+			expect(bypassed.lines).toEqual([]);
 		} finally {
 			setTerminalImageProtocol(previousProtocol);
 		}

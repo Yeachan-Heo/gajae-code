@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { getModelDbPath } from "@gajae-code/utils/dirs";
 import type { Api, Model } from "./types";
 
-const CACHE_SCHEMA_VERSION = 5;
+const CACHE_SCHEMA_VERSION = 6;
 
 interface CacheRow {
 	provider_id: string;
@@ -16,6 +16,7 @@ interface CacheRow {
 	static_fingerprint: string;
 	dynamic_model_ids: string | null;
 	dynamic_model_provenance: string | null;
+	discovery_user_agent: string | null;
 	models: string;
 }
 
@@ -38,6 +39,8 @@ interface CacheEntry<TApi extends Api = Api> {
 	/** IDs returned by the authoritative dynamic provider catalog, when retained. */
 	dynamicModelIds: string[] | undefined;
 	dynamicModelProvenance: string | undefined;
+	/** User-Agent used during discovery; invalidates cache if it changes. */
+	discoveryUserAgent: string | undefined;
 }
 
 let sharedDb: Database | null = null;
@@ -63,6 +66,7 @@ function getDb(dbPath?: string): Database {
 			static_fingerprint TEXT NOT NULL DEFAULT '',
 			dynamic_model_ids TEXT,
 			dynamic_model_provenance TEXT,
+			discovery_user_agent TEXT,
 			models TEXT NOT NULL
 		)
 	`);
@@ -77,14 +81,20 @@ function getDb(dbPath?: string): Database {
 export function closeModelCache(dbPath?: string): boolean {
 	const resolvedPath = dbPath ?? getModelDbPath();
 	if (!sharedDb || sharedDbPath !== resolvedPath) return false;
-	sharedDb.close();
+	sharedDb.close(true);
 	sharedDb = null;
 	sharedDbPath = null;
 	return true;
 }
 
 function migrateCacheSchema(db: Database): void {
-	const columns = db.prepare("PRAGMA table_info(model_cache)").all() as TableInfoRow[];
+	const tableInfo = db.query("PRAGMA table_info(model_cache)");
+	let columns: TableInfoRow[];
+	try {
+		columns = tableInfo.all() as TableInfoRow[];
+	} finally {
+		tableInfo.finalize();
+	}
 	if (!columns.some(column => column.name === "static_fingerprint")) {
 		db.run("ALTER TABLE model_cache ADD COLUMN static_fingerprint TEXT NOT NULL DEFAULT ''");
 	}
@@ -94,7 +104,10 @@ function migrateCacheSchema(db: Database): void {
 	if (!columns.some(column => column.name === "dynamic_model_provenance")) {
 		db.run("ALTER TABLE model_cache ADD COLUMN dynamic_model_provenance TEXT");
 	}
-	db.run("UPDATE model_cache SET version = ? WHERE version IN (2, 3, 4)", [CACHE_SCHEMA_VERSION]);
+	if (!columns.some(column => column.name === "discovery_user_agent")) {
+		db.run("ALTER TABLE model_cache ADD COLUMN discovery_user_agent TEXT");
+	}
+	db.run("UPDATE model_cache SET version = ? WHERE version IN (2, 3, 4, 5)", [CACHE_SCHEMA_VERSION]);
 }
 
 export function readModelCache<TApi extends Api>(
@@ -102,11 +115,22 @@ export function readModelCache<TApi extends Api>(
 	ttlMs: number,
 	now: () => number,
 	dbPath?: string,
+	expectedDiscoveryUserAgent?: string,
 ): CacheEntry<TApi> | null {
 	try {
 		const db = getDb(dbPath);
-		const row = db.query<CacheRow, [string]>("SELECT * FROM model_cache WHERE provider_id = ?").get(providerId);
+		const select = db.query<CacheRow, [string]>("SELECT * FROM model_cache WHERE provider_id = ?");
+		let row: CacheRow | null;
+		try {
+			row = select.get(providerId);
+		} finally {
+			select.finalize();
+		}
 		if (!row || row.version !== CACHE_SCHEMA_VERSION) {
+			return null;
+		}
+		// Invalidate cache if discovery User-Agent has changed
+		if (expectedDiscoveryUserAgent !== undefined && row.discovery_user_agent !== expectedDiscoveryUserAgent) {
 			return null;
 		}
 		const models = JSON.parse(row.models) as Model<TApi>[];
@@ -120,6 +144,7 @@ export function readModelCache<TApi extends Api>(
 			staticFingerprint: row.static_fingerprint ?? "",
 			dynamicModelIds: row.dynamic_model_ids === null ? undefined : (JSON.parse(row.dynamic_model_ids) as string[]),
 			dynamicModelProvenance: row.dynamic_model_provenance ?? undefined,
+			discoveryUserAgent: row.discovery_user_agent ?? undefined,
 		};
 	} catch {
 		return null;
@@ -135,12 +160,13 @@ export function writeModelCache<TApi extends Api>(
 	dbPath?: string,
 	dynamicModelIds?: readonly string[],
 	dynamicModelProvenance?: string,
+	discoveryUserAgent?: string,
 ): void {
 	try {
 		const db = getDb(dbPath);
 		db.run(
-			`INSERT OR REPLACE INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT OR REPLACE INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, discovery_user_agent, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				providerId,
 				CACHE_SCHEMA_VERSION,
@@ -149,6 +175,7 @@ export function writeModelCache<TApi extends Api>(
 				staticFingerprint,
 				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
 				dynamicModelProvenance ?? null,
+				discoveryUserAgent ?? null,
 				JSON.stringify(models),
 			],
 		);
@@ -166,11 +193,12 @@ export function insertModelCacheIfAbsent<TApi extends Api>(
 	dbPath?: string,
 	dynamicModelIds?: readonly string[],
 	dynamicModelProvenance?: string,
+	discoveryUserAgent?: string,
 ): boolean {
 	try {
 		const result = getDb(dbPath).run(
-			`INSERT INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, discovery_user_agent, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(provider_id) DO NOTHING`,
 			[
 				providerId,
@@ -180,6 +208,7 @@ export function insertModelCacheIfAbsent<TApi extends Api>(
 				staticFingerprint,
 				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
 				dynamicModelProvenance ?? null,
+				discoveryUserAgent ?? null,
 				JSON.stringify(models),
 			],
 		);
@@ -195,6 +224,7 @@ export function updateModelCacheIfUnchanged<TApi extends Api>(
 	expectedDynamicModelIds: readonly string[] | undefined,
 	expectedDynamicModelProvenance: string | undefined,
 	expectedModels: readonly Model<TApi>[],
+	expectedDiscoveryUserAgent: string | undefined,
 	updatedAt: number,
 	models: Model<TApi>[],
 	authoritative: boolean,
@@ -202,30 +232,35 @@ export function updateModelCacheIfUnchanged<TApi extends Api>(
 	dbPath?: string,
 	dynamicModelIds?: readonly string[],
 	dynamicModelProvenance?: string,
+	discoveryUserAgent?: string,
 ): boolean {
 	try {
 		const expectedIds = expectedDynamicModelIds === undefined ? null : JSON.stringify(expectedDynamicModelIds);
 		const provenance = expectedDynamicModelProvenance ?? null;
+		const expectedUserAgent = expectedDiscoveryUserAgent ?? null;
 		const nextIds = dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds);
 		const nextProvenance = dynamicModelProvenance ?? null;
 		const expectedModelsJson = JSON.stringify(expectedModels);
 		const result = getDb(dbPath).run(
 			`UPDATE model_cache
 			 SET updated_at = ?, authoritative = ?, static_fingerprint = ?, dynamic_model_ids = ?,
-			     dynamic_model_provenance = ?, models = ?
+			     dynamic_model_provenance = ?, discovery_user_agent = ?, models = ?
 			 WHERE provider_id = ? AND updated_at = ?
-			   AND dynamic_model_ids IS ? AND dynamic_model_provenance IS ? AND models = ?`,
+			   AND dynamic_model_ids IS ? AND dynamic_model_provenance IS ?
+			   AND discovery_user_agent IS ? AND models = ?`,
 			[
 				updatedAt,
 				authoritative ? 1 : 0,
 				staticFingerprint,
 				nextIds,
 				nextProvenance,
+				discoveryUserAgent ?? null,
 				JSON.stringify(models),
 				providerId,
 				expectedUpdatedAt,
 				expectedIds,
 				provenance,
+				expectedUserAgent,
 				expectedModelsJson,
 			],
 		);

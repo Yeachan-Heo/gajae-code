@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { stream } from "@gajae-code/ai/stream";
 import { getBundledModel } from "../src/models";
 import { streamAzureOpenAIResponses } from "../src/providers/azure-openai-responses";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
@@ -229,6 +230,76 @@ function createNoProgressOpenAICompletionsStream(signal: AbortSignal | undefined
 	});
 }
 
+function createStalledOpenAICompletionsStream(signal: AbortSignal | undefined, modelId: string): Response {
+	const encoder = new TextEncoder();
+	let abortListener: (() => void) | undefined;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(
+				encoder.encode(
+					`data: ${JSON.stringify({
+						id: "chatcmpl-stalled",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: modelId,
+						choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }],
+					})}\n\n`,
+				),
+			);
+			abortListener = () => {
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+				const reason = signal?.reason;
+				controller.error(reason instanceof Error ? reason : new Error("request aborted"));
+			};
+			if (signal?.aborted) {
+				queueMicrotask(() => abortListener?.());
+			} else {
+				signal?.addEventListener("abort", abortListener, { once: true });
+			}
+		},
+		cancel() {
+			if (abortListener) signal?.removeEventListener("abort", abortListener);
+		},
+	});
+	return new Response(stream, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+function createStalledOpenAIResponsesStream(signal: AbortSignal | undefined): Response {
+	const encoder = new TextEncoder();
+	let abortListener: (() => void) | undefined;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			const events = [
+				{ type: "response.created", response: { id: "resp_stalled" } },
+				{ type: "response.in_progress", response: { id: "resp_stalled", status: "in_progress" } },
+			];
+			controller.enqueue(
+				encoder.encode(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`),
+			);
+			abortListener = () => {
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+				const reason = signal?.reason;
+				controller.error(reason instanceof Error ? reason : new Error("request aborted"));
+			};
+			if (signal?.aborted) {
+				queueMicrotask(() => abortListener?.());
+			} else {
+				signal?.addEventListener("abort", abortListener, { once: true });
+			}
+		},
+		cancel() {
+			if (abortListener) signal?.removeEventListener("abort", abortListener);
+		},
+	});
+	return new Response(stream, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
 function createDelayedFetch(delayMs: number, responseFactory: () => Response): typeof fetch {
 	async function mockFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		await waitForDelayOrAbort(delayMs, getRequestSignal(input, init));
@@ -423,6 +494,184 @@ describe("OpenAI-family first-event timeouts", () => {
 		expect(result.content).toContainEqual({ type: "text", text: "partial" });
 	});
 
+	it("uses a configured model idle timeout for custom OpenAI-compatible providers", async () => {
+		await withEnv(
+			{
+				GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS: "invalid",
+				PI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_OPENAI_STREAM_IDLE_TIMEOUT_MS: undefined,
+			},
+			async () => {
+				const model: Model<"openai-completions"> = {
+					...openAICompletionsModel,
+					id: "claude-opus-5-5",
+					name: "Claude Opus 5.5 via proxy",
+					provider: "custom-proxy",
+					baseUrl: "https://proxy.example.com/v1",
+					streamIdleTimeoutMs: 20,
+				};
+				global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
+					Promise.resolve(
+						createStalledOpenAICompletionsStream(getRequestSignal(input, init), model.id),
+					)) as typeof fetch;
+
+				const controller = new AbortController();
+				const pending = streamOpenAICompletions(model, baseContext(), {
+					apiKey: "test-key",
+					signal: controller.signal,
+					streamFirstEventTimeoutMs: 1_000,
+				}).result();
+				let settled = false;
+				void pending.then(() => {
+					settled = true;
+				});
+				await Bun.sleep(75);
+				const timedOutAtConfiguredWindow = settled;
+				if (!settled) {
+					// Stop the stream instead of leaking a pending 120s-default watchdog
+					// when the configured timeout is ignored.
+					controller.abort(new Error("test cleanup"));
+				}
+				const result = await pending;
+
+				expect(timedOutAtConfiguredWindow).toBe(true);
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toBe("OpenAI completions stream stalled while waiting for the next event");
+			},
+		);
+	});
+
+	it("uses a configured model idle timeout for OpenAI Responses proxies", async () => {
+		await withEnv(
+			{
+				GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS: "invalid",
+				PI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_OPENAI_STREAM_IDLE_TIMEOUT_MS: undefined,
+			},
+			async () => {
+				const model: Model<"openai-responses"> = {
+					...openAIResponsesModel,
+					id: "claude-opus-5-5",
+					name: "Claude Opus 5.5 via proxy",
+					provider: "custom-proxy",
+					baseUrl: "https://proxy.example.com/v1",
+					streamIdleTimeoutMs: 20,
+				};
+				global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
+					Promise.resolve(createStalledOpenAIResponsesStream(getRequestSignal(input, init)))) as typeof fetch;
+
+				const controller = new AbortController();
+				const pending = streamOpenAIResponses(model, baseContext(), {
+					apiKey: "test-key",
+					signal: controller.signal,
+					streamFirstEventTimeoutMs: 1_000,
+				}).result();
+				let settled = false;
+				void pending.then(() => {
+					settled = true;
+				});
+				await Bun.sleep(75);
+				const timedOutAtConfiguredWindow = settled;
+				if (!settled) {
+					controller.abort(new Error("test cleanup"));
+				}
+				const result = await pending;
+
+				expect(timedOutAtConfiguredWindow).toBe(true);
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toBe("OpenAI responses stream stalled while waiting for the next event");
+			},
+		);
+	});
+
+	it("uses the longer request idle timeout for OpenAI completions setup", async () => {
+		vi.useFakeTimers();
+		await withEnv(
+			{
+				GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_OPENAI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined,
+			},
+			async () => {
+				const model: Model<"openai-completions"> = {
+					...openAICompletionsModel,
+					provider: "custom-proxy",
+					baseUrl: "https://proxy.example.com/v1",
+					streamIdleTimeoutMs: 120_000,
+				};
+				const delayedFetch = createDelayedFetch(150_000, () => createOpenAICompletionsSuccessResponse(model.id));
+				global.fetch = Object.assign(delayedFetch, { preconnect: originalFetch.preconnect });
+
+				const pending = streamOpenAICompletions(model, baseContext(), {
+					apiKey: "test-key",
+					requestMaxRetries: 0,
+					streamIdleTimeoutMs: 300_000,
+				}).result();
+				await flushMicrotasks();
+
+				vi.advanceTimersByTime(120_000);
+				await flushMicrotasks();
+				let settled = false;
+				void pending.then(() => {
+					settled = true;
+				});
+				await flushMicrotasks();
+				expect(settled).toBe(false);
+
+				vi.advanceTimersByTime(30_000);
+				await flushMicrotasks();
+				const result = await pending;
+				expect(result.stopReason).toBe("stop");
+				expect(getFirstTextContent(result)).toMatchObject({ type: "text", text: "Hello delayed" });
+			},
+		);
+	});
+
+	it("uses the longer request idle timeout for OpenAI Responses setup", async () => {
+		vi.useFakeTimers();
+		await withEnv(
+			{
+				GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_OPENAI_STREAM_IDLE_TIMEOUT_MS: undefined,
+				PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined,
+			},
+			async () => {
+				const model: Model<"openai-responses"> = {
+					...openAIResponsesModel,
+					provider: "custom-proxy",
+					baseUrl: "https://proxy.example.com/v1",
+					streamIdleTimeoutMs: 120_000,
+				};
+				const delayedFetch = createDelayedFetch(150_000, createOpenAIResponsesSuccessResponse);
+				global.fetch = Object.assign(delayedFetch, { preconnect: originalFetch.preconnect });
+
+				const pending = streamOpenAIResponses(model, baseContext(), {
+					apiKey: "test-key",
+					requestMaxRetries: 0,
+					streamIdleTimeoutMs: 300_000,
+				}).result();
+				await flushMicrotasks();
+
+				vi.advanceTimersByTime(120_000);
+				await flushMicrotasks();
+				let settled = false;
+				void pending.then(() => {
+					settled = true;
+				});
+				await flushMicrotasks();
+				expect(settled).toBe(false);
+
+				vi.advanceTimersByTime(30_000);
+				await flushMicrotasks();
+				const result = await pending;
+				expect(result.stopReason).toBe("stop");
+				expect(getFirstTextContent(result)).toMatchObject({ type: "text", text: "Hello delayed" });
+			},
+		);
+	});
+
 	it("surfaces the Azure OpenAI responses first-event timeout message", async () => {
 		await expectFirstEventTimeout(
 			streamFirstEventTimeoutMs =>
@@ -474,6 +723,106 @@ describe("OpenAI-family first-event timeouts", () => {
 				}).result(),
 			"OpenAI completions stream timed out while waiting for the first event",
 		);
+	});
+
+	describe("github-copilot caller aborts (#912)", () => {
+		function makeCopilotResponsesModel(baseUrl: string): Model<"openai-responses"> {
+			return {
+				id: "gpt-5-mini",
+				name: "GPT-5 Mini",
+				api: "openai-responses",
+				provider: "github-copilot",
+				baseUrl,
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 64000,
+				headers: { "User-Agent": "opencode/1.3.15" },
+			};
+		}
+
+		function makeContext(): Context {
+			return {
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+			};
+		}
+
+		/**
+		 * Issue #912: github-copilot provider hangs the UI on `Working...` and ESC
+		 * does not unstick it. The user-facing symptom is "spinner spins forever".
+		 *
+		 * Root cause exposed by this test: when the upstream Copilot SSE stream is
+		 * stuck (server holds the response open without sending events) and the
+		 * underlying body reader does not surface the AbortSignal, the provider's
+		 * stream-consumption loop only races the SDK iterator against the idle/first
+		 * -event watchdog (default 100s). It does NOT race against the caller's abort
+		 * signal, so ESC has no observable effect for ~100 seconds — exactly the
+		 * "infinite Working..." UX the user reports.
+		 *
+		 * The mock here returns a 200 + text/event-stream response whose body is a
+		 * ReadableStream that intentionally ignores the upstream signal — emulating
+		 * the broken Copilot path / a misbehaving HTTP/2 reverse proxy. The provider
+		 * MUST still settle within a tight bound after the caller aborts. We allow
+		 * up to 3 seconds to absorb scheduling jitter while still being orders of
+		 * magnitude tighter than the 100s watchdog.
+		 */
+		it("settles within bounded time when the caller aborts a hung Copilot response that ignores fetch abort", async () => {
+			const fetchInvoked = Promise.withResolvers<void>();
+
+			// A body that never enqueues data and never reacts to the upstream
+			// signal — this is the regression vector. Real Bun fetch normally
+			// propagates abort to the body reader, but we cannot rely on it for
+			// every transport (HTTP/2, intermediaries, native sockets).
+			global.fetch = (async (input: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+				const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+				if (!url.endsWith("/responses")) {
+					throw new Error(`Unexpected fetch to ${url}`);
+				}
+
+				const body = new ReadableStream<Uint8Array>({
+					start(_controller) {
+						// Intentionally do nothing. No enqueue, no close, no error.
+						// The body parser will hang on the first read until something
+						// closes it from outside (which here only ESC/abort can do).
+					},
+				});
+
+				fetchInvoked.resolve();
+
+				return new Response(body, {
+					status: 200,
+					headers: {
+						"Content-Type": "text/event-stream",
+						"Cache-Control": "no-cache",
+					},
+				});
+			}) as typeof fetch;
+
+			const model = makeCopilotResponsesModel("https://api.githubcopilot.example/test");
+			const controller = new AbortController();
+			const providerStream = stream(model, makeContext(), {
+				apiKey: JSON.stringify({ token: "ghu_test_token", enterpriseUrl: undefined }),
+				signal: controller.signal,
+			});
+
+			await fetchInvoked.promise;
+			await Bun.sleep(50);
+			controller.abort();
+
+			// Bound: 3 seconds. The first-event watchdog default is 100s, so any
+			// pass within 3s implies the provider observed the abort signal
+			// directly rather than waiting for the watchdog.
+			const result = await Promise.race([
+				providerStream.result(),
+				Bun.sleep(3_000).then(() => {
+					throw new Error("providerStream.result() did not settle within 3s after abort");
+				}),
+			]);
+
+			expect(result.stopReason).toBe("aborted");
+		}, 10_000);
 	});
 
 	it("keeps caller aborts as aborted for Azure OpenAI responses", async () => {

@@ -179,6 +179,109 @@ async function assertDirectoryNotSymlink(directoryPath: string): Promise<void> {
 	}
 }
 
+/** Group-write and world-write bits. Either one lets another user rename the session directory. */
+const GROUP_OR_WORLD_WRITABLE = 0o022;
+
+interface DirectoryIdentityStat {
+	isDirectory(): boolean;
+	isSymbolicLink(): boolean;
+	dev: number;
+	ino: number;
+	uid: number;
+	mode: number;
+}
+
+interface ManagedRootIdentity {
+	readonly dev: number;
+	readonly ino: number;
+	readonly uid: number;
+}
+
+function isUnsafeDirectory(stat: DirectoryIdentityStat): boolean {
+	return !stat.isDirectory() || stat.isSymbolicLink();
+}
+
+function managedRootIdentity(stat: DirectoryIdentityStat): ManagedRootIdentity {
+	return { dev: stat.dev, ino: stat.ino, uid: stat.uid };
+}
+
+function sameManagedRoot(stat: DirectoryIdentityStat, recorded: ManagedRootIdentity): boolean {
+	if (isUnsafeDirectory(stat) || stat.dev !== recorded.dev || stat.ino !== recorded.ino) return false;
+	// A later chmod to 0755 keeps the same directory. Only a writable bit, a new
+	// inode, or a different owner means the root was replaced or opened up.
+	if (process.platform === "win32") return true;
+	return stat.uid === recorded.uid && (stat.mode & GROUP_OR_WORLD_WRITABLE) === 0;
+}
+
+/**
+ * An existing managed session directory is adopted only when this user owns it
+ * and the group and world cannot write it. Windows has no POSIX owner bits.
+ */
+function assertAdoptedManagedRoot(stat: DirectoryIdentityStat): void {
+	if (isUnsafeDirectory(stat)) throw new Error("Unsafe local:// root");
+	if (process.platform === "win32") return;
+	const uid = process.getuid?.();
+	if (uid === undefined || stat.uid !== uid || (stat.mode & GROUP_OR_WORLD_WRITABLE) !== 0) {
+		throw new Error("Unsafe local:// root");
+	}
+}
+
+function assertManagedParentSync(localRoot: string): void {
+	let parentStat: fsSync.Stats;
+	try {
+		parentStat = fsSync.lstatSync(path.dirname(localRoot));
+	} catch {
+		throw new Error("Unsafe local:// root");
+	}
+	assertAdoptedManagedRoot(parentStat);
+}
+
+/**
+ * Keep a pinned root unless a changed inode is validated as a settled
+ * recreation. A root created by this call may be rebound after migration.
+ */
+function acceptManagedRootForInit(
+	localRoot: string,
+	rootStat: DirectoryIdentityStat,
+	recorded: ManagedRootIdentity | undefined,
+	adoptedExisting: boolean,
+): void {
+	if (recorded && adoptedExisting) {
+		if (sameManagedRoot(rootStat, recorded)) return;
+		const pending = pendingCreatedRoots.get(localRoot);
+		if (pending && sameManagedRoot(rootStat, pending)) return;
+		if (isSettledRecreatedManagedRoot(localRoot, rootStat)) return;
+		throw new Error("Unsafe local:// root");
+	}
+	if (recorded || adoptedExisting) {
+		assertAdoptedManagedRoot(rootStat);
+		return;
+	}
+	if (isUnsafeDirectory(rootStat)) throw new Error("Unsafe local:// root");
+}
+
+/**
+ * A pinned root whose inode changed is still ours when a gjc initializer
+ * completed it: the temp sweeper (or `gjc gc`) removed the directory and
+ * another process for the same session recreated it, writing a settled
+ * migration marker. POSIX owner and write-bit checks on the root and parent
+ * protect this exception. Windows changed-inode adoption stays fail-closed
+ * until this path validates the replacement's identity and ACLs.
+ */
+function isSettledRecreatedManagedRoot(localRoot: string, rootStat: DirectoryIdentityStat): boolean {
+	if (process.platform === "win32") return false;
+	try {
+		assertAdoptedManagedRoot(rootStat);
+		assertManagedParentSync(localRoot);
+		const marker = path.join(localRoot, LEGACY_MIGRATION_MARKER);
+		const markerStat = fsSync.lstatSync(marker);
+		if (!markerStat.isFile() || markerStat.isSymbolicLink()) return false;
+		return isSettledMigrationMarkerValue(fsSync.readFileSync(marker, "utf8"));
+	} catch {
+		return false;
+	}
+}
+
 const LEGACY_MIGRATION_MARKER = ".gjc-local-legacy-migrated-v1";
 const MAX_LEGACY_LOCAL_BYTES = 64 * 1024 * 1024;
 
@@ -508,8 +611,32 @@ async function migrateLegacyLocal(
 	}
 }
 
-const initializedLocalRoots = new Set<string>();
+const initializedLocalRoots = new Map<string, ManagedRootIdentity>();
+/** A directory this process created and has not finished migrating. */
+const pendingCreatedRoots = new Map<string, ManagedRootIdentity>();
 const initializingLocalRoots = new Map<string, Promise<string>>();
+
+function assertRememberedManagedRoot(localRoot: string, recorded: ManagedRootIdentity): void {
+	let stat: fsSync.Stats;
+	try {
+		stat = fsSync.lstatSync(localRoot);
+	} catch {
+		throw new Error("Unsafe local:// root");
+	}
+	if (!sameManagedRoot(stat, recorded)) throw new Error("Unsafe local:// root");
+}
+
+function rememberManagedRoot(localRoot: string, expected: ManagedRootIdentity): void {
+	let stat: fsSync.Stats;
+	try {
+		stat = fsSync.lstatSync(localRoot);
+	} catch {
+		throw new Error("Unsafe local:// root");
+	}
+	if (!sameManagedRoot(stat, expected)) throw new Error("Unsafe local:// root");
+	initializedLocalRoots.set(localRoot, managedRootIdentity(stat));
+	pendingCreatedRoots.delete(localRoot);
+}
 
 /**
  * Completes the mandatory legacy migration gate for a local root.
@@ -559,16 +686,21 @@ async function initializeManagedLocalRoot(options: LocalProtocolOptions, localRo
 
 	await fs.mkdir(scratchParent, { recursive: true, mode: 0o700 });
 	await assertDirectoryNotSymlink(scratchParent);
+	assertAdoptedManagedRoot(await fs.lstat(scratchParent));
+	let adoptedExisting = false;
 	try {
 		await fs.mkdir(localRoot, { mode: 0o700 });
 	} catch (error) {
 		if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-			await assertDirectoryNotSymlink(localRoot);
+			adoptedExisting = true;
 		} else {
 			throw error;
 		}
 	}
-	await assertDirectoryNotSymlink(localRoot);
+	const rootStat = await fs.lstat(localRoot);
+	const recorded = initializedLocalRoots.get(localRoot);
+	acceptManagedRootForInit(localRoot, rootStat, recorded, adoptedExisting);
+	if (!adoptedExisting) pendingCreatedRoots.set(localRoot, managedRootIdentity(rootStat));
 	await migrateLegacyLocal(options, localRoot, scratchParent);
 
 	const resolvedScratchParent = await fs.realpath(scratchParent);
@@ -577,7 +709,10 @@ async function initializeManagedLocalRoot(options: LocalProtocolOptions, localRo
 	if (resolvedLocalRoot === resolvedScratchParent) {
 		throw new Error("Unsafe local:// root");
 	}
-	initializedLocalRoots.add(resolvedLocalRoot);
+	// Key the lexical path the sync resolver checks. realpath(/var -> /private/var)
+	// is a different string for the same directory, so caching only the real path
+	// let a later rename-swap skip this identity check.
+	rememberManagedRoot(localRoot, managedRootIdentity(rootStat));
 	return resolvedLocalRoot;
 }
 
@@ -587,18 +722,41 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 		initializeExplicitLocalRootSync(explicitRoot);
 		return;
 	}
-	if (initializedLocalRoots.has(localRoot)) return;
+	const recorded = initializedLocalRoots.get(localRoot);
+	if (recorded) {
+		assertManagedParentSync(localRoot);
+		let present: fsSync.Stats | undefined;
+		try {
+			present = fsSync.lstatSync(localRoot);
+		} catch (error) {
+			if (!isEnoent(error)) throw new Error("Unsafe local:// root");
+		}
+		if (present) {
+			if (sameManagedRoot(present, recorded)) {
+				assertRememberedManagedRoot(localRoot, recorded);
+				return;
+			}
+			const pending = pendingCreatedRoots.get(localRoot);
+			if (!(pending && sameManagedRoot(present, pending)) && !isSettledRecreatedManagedRoot(localRoot, present)) {
+				throw new Error("Unsafe local:// root");
+			}
+		}
+	}
 	const scratchParent = path.dirname(localRoot);
 	fsSync.mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
 	const parentStat = fsSync.lstatSync(scratchParent);
 	if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("Unsafe local:// root");
+	assertAdoptedManagedRoot(parentStat);
+	let adoptedExisting = false;
 	try {
 		fsSync.mkdirSync(localRoot, { mode: 0o700 });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		adoptedExisting = true;
 	}
 	const rootStat = fsSync.lstatSync(localRoot);
-	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Unsafe local:// root");
+	acceptManagedRootForInit(localRoot, rootStat, recorded, adoptedExisting);
+	if (!adoptedExisting) pendingCreatedRoots.set(localRoot, managedRootIdentity(rootStat));
 	const marker = path.join(localRoot, LEGACY_MIGRATION_MARKER);
 	try {
 		// Accept exactly the marker states the async gate treats as settled. A
@@ -608,7 +766,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 		// async gate had already completed.
 		if (!isSettledMigrationMarkerValue(fsSync.readFileSync(marker, "utf8")))
 			throw new Error("Unsafe local:// migration marker");
-		initializedLocalRoots.add(localRoot);
+		rememberManagedRoot(localRoot, managedRootIdentity(rootStat));
 		return;
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
@@ -629,7 +787,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 		if (!isSettledMigrationMarkerValue(fsSync.readFileSync(marker, "utf8")))
 			throw new Error("Unsafe local:// migration marker");
 	}
-	initializedLocalRoots.add(localRoot);
+	rememberManagedRoot(localRoot, managedRootIdentity(rootStat));
 }
 
 export function resolveLocalRoot(options: LocalProtocolOptions): string {
@@ -696,6 +854,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		LocalProtocolHandler.#override = undefined;
 		LocalProtocolHandler.#ownedOverrides = [];
 		initializedLocalRoots.clear();
+		pendingCreatedRoots.clear();
 		initializingLocalRoots.clear();
 	}
 

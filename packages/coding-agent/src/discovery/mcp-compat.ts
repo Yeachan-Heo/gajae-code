@@ -110,14 +110,40 @@ interface CodexMcpServerConfig {
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
-	env_vars?: string[];
+	/** List of env-var names, or `{ name }` entries. Not a value table. */
+	env_vars?: unknown;
 	url?: string;
 	http_headers?: Record<string, string>;
-	env_http_headers?: Record<string, string>;
-	bearer_token_env_var?: string;
+	/** Header name to env-var name. Not a header value. */
+	env_http_headers?: unknown;
+	/** Env-var name whose value is the bearer token. Not the token. */
+	bearer_token_env_var?: unknown;
 	cwd?: string;
 	startup_timeout_sec?: number;
 	tool_timeout_sec?: number;
+}
+
+/** POSIX env-var name. Rejects values that are not names so they are not stored. */
+function isEnvVarName(value: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+/** `${NAME}` keeps the indirection. Callers must not read the process environment. */
+function envVarReference(name: string): string {
+	return `\${${name}}`;
+}
+
+function codexEnvVarEntry(entry: unknown): { name: string; source: string | undefined } | undefined {
+	if (typeof entry === "string") return isEnvVarName(entry) ? { name: entry, source: undefined } : undefined;
+	if (isRecord(entry) && typeof entry.name === "string" && isEnvVarName(entry.name)) {
+		return { name: entry.name, source: typeof entry.source === "string" ? entry.source : undefined };
+	}
+	return undefined;
+}
+
+/** Codex remote-executor sources have no local GJC equivalent. */
+function isUnsupportedEnvSource(source: string | undefined): boolean {
+	return source !== undefined && source !== "local";
 }
 
 /**
@@ -125,8 +151,22 @@ interface CodexMcpServerConfig {
  * section. Codex's config does not carry an `enabled` concept; imported servers
  * default to autoload (startup) behavior after import. Bounded to the supplied
  * content: no filesystem scanning, no user-home reads.
+ *
+ * `env_vars`, `env_http_headers`, and `bearer_token_env_var` name variables.
+ * The process environment is not read. A local name is stored as `${NAME}`
+ * only when the destination keeps operator config. A project destination omits
+ * the reference: project mcp.json is expanded on a later run, and a name such
+ * as `CI_JOB_JWT_V2` is not treated as sensitive, so persisting it would
+ * forward a host value. The source level is metadata and does not decide this.
+ * A static `env` or `http_headers` value is copied. An entry whose source is
+ * not `local` is skipped.
  */
-function extractCodexMcpServers(toml: Record<string, unknown>): Record<string, Partial<MCPServer>> {
+function extractCodexMcpServers(
+	toml: Record<string, unknown>,
+	warnings: string[],
+	sourcePath: string,
+	omitEnvReferences: boolean,
+): Record<string, Partial<MCPServer>> {
 	if (!toml.mcp_servers || !isRecord(toml.mcp_servers)) return {};
 
 	const codexServers = toml.mcp_servers as Record<string, CodexMcpServerConfig>;
@@ -146,11 +186,38 @@ function extractCodexMcpServers(toml: Record<string, unknown>): Record<string, P
 		};
 
 		const env: Record<string, string> = { ...(isStringRecord(serverConfig.env) ? serverConfig.env : {}) };
-		if (Array.isArray(serverConfig.env_vars)) {
-			for (const varName of serverConfig.env_vars) {
-				if (typeof varName !== "string") continue;
-				const value = Bun.env[varName];
-				if (value !== undefined) env[varName] = value;
+		if (serverConfig.env_vars !== undefined && !Array.isArray(serverConfig.env_vars)) {
+			warnings.push(
+				`skipped env_vars for "${name}" in ${sourcePath} because it is not a list of environment variable names`,
+			);
+		} else if (Array.isArray(serverConfig.env_vars)) {
+			for (const entry of serverConfig.env_vars) {
+				const parsed = codexEnvVarEntry(entry);
+				if (!parsed) {
+					warnings.push(
+						`skipped env_vars entry for "${name}" in ${sourcePath} because it is not an environment variable name`,
+					);
+					continue;
+				}
+				if (isUnsupportedEnvSource(parsed.source)) {
+					warnings.push(
+						`skipped env_vars entry ${parsed.name} for "${name}" in ${sourcePath} because source "${parsed.source}" is not executed locally`,
+					);
+					continue;
+				}
+				if (Object.hasOwn(env, parsed.name)) {
+					warnings.push(
+						`kept static env ${parsed.name} for "${name}" in ${sourcePath} and did not read the environment`,
+					);
+					continue;
+				}
+				if (omitEnvReferences) {
+					warnings.push(
+						`skipped project-scope environment reference ${parsed.name} for "${name}" in ${sourcePath} so a later load cannot expand a host value`,
+					);
+					continue;
+				}
+				env[parsed.name] = envVarReference(parsed.name);
 			}
 		}
 		if (Object.keys(env).length > 0) server.env = env;
@@ -158,16 +225,50 @@ function extractCodexMcpServers(toml: Record<string, unknown>): Record<string, P
 		const headers: Record<string, string> = {
 			...(isStringRecord(serverConfig.http_headers) ? serverConfig.http_headers : {}),
 		};
-		if (isRecord(serverConfig.env_http_headers)) {
+		if (serverConfig.env_http_headers !== undefined && !isRecord(serverConfig.env_http_headers)) {
+			warnings.push(
+				`skipped env_http_headers for "${name}" in ${sourcePath} because it is not a table of environment variable names`,
+			);
+		} else if (isRecord(serverConfig.env_http_headers)) {
 			for (const [headerName, envVarName] of Object.entries(serverConfig.env_http_headers)) {
-				if (typeof envVarName !== "string") continue;
-				const value = Bun.env[envVarName];
-				if (value !== undefined) headers[headerName] = value;
+				if (typeof envVarName !== "string" || !isEnvVarName(envVarName)) {
+					warnings.push(
+						`skipped env_http_headers entry for "${name}" in ${sourcePath} because its value is not an environment variable name`,
+					);
+					continue;
+				}
+				if (Object.hasOwn(headers, headerName)) {
+					warnings.push(
+						`kept static header ${headerName} for "${name}" in ${sourcePath} and did not read ${envVarName}`,
+					);
+					continue;
+				}
+				if (omitEnvReferences) {
+					warnings.push(
+						`skipped project-scope environment reference ${envVarName} for "${name}" in ${sourcePath} so a later load cannot expand a host value`,
+					);
+					continue;
+				}
+				headers[headerName] = envVarReference(envVarName);
 			}
 		}
-		if (typeof serverConfig.bearer_token_env_var === "string") {
-			const token = Bun.env[serverConfig.bearer_token_env_var];
-			if (token) headers.Authorization = `Bearer ${token}`;
+		if (serverConfig.bearer_token_env_var !== undefined) {
+			const bearerName = serverConfig.bearer_token_env_var;
+			if (typeof bearerName !== "string" || !isEnvVarName(bearerName)) {
+				warnings.push(
+					`skipped bearer_token_env_var for "${name}" in ${sourcePath} because it is not an environment variable name`,
+				);
+			} else if (Object.hasOwn(headers, "Authorization")) {
+				warnings.push(
+					`kept static Authorization for "${name}" in ${sourcePath} and did not read bearer_token_env_var ${bearerName}`,
+				);
+			} else if (omitEnvReferences) {
+				warnings.push(
+					`skipped project-scope environment reference ${bearerName} for "${name}" in ${sourcePath} so a later load cannot expand a host value`,
+				);
+			} else {
+				headers.Authorization = `Bearer ${envVarReference(bearerName)}`;
+			}
 		}
 		if (Object.keys(headers).length > 0) server.headers = headers;
 
@@ -192,6 +293,7 @@ export function normalizeCodexMcpToml(
 	content: string,
 	sourcePath: string,
 	level: "project" | "user" = "project",
+	options?: { omitEnvReferences?: boolean },
 ): MCPCompatNormalizeResult {
 	const items: MCPServer[] = [];
 	const warnings: string[] = [];
@@ -212,7 +314,8 @@ export function normalizeCodexMcpToml(
 			}
 		}
 	}
-	const servers = extractCodexMcpServers(parsed);
+	const omitEnvReferences = options?.omitEnvReferences ?? level === "project";
+	const servers = extractCodexMcpServers(parsed, warnings, sourcePath, omitEnvReferences);
 	for (const [name, config] of Object.entries(servers)) {
 		items.push({
 			name,

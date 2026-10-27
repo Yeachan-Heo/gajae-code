@@ -3,13 +3,47 @@
 `gjc sdk session` is the broker-bound command family for operating live GJC SDK
 sessions from the terminal. It replaces the removed `gjc daemon session` route.
 
-The command family has six semantic verbs — `list`, `inspect`,
-`send`, `status`, `tail`, and `retire` — plus the explicit `raw` hatch that dispatches one
+The command family has seven semantic verbs — `list`, `inspect`,
+`send`, `status`, `tail`, `close`, and `retire` — plus the explicit `raw` hatch that dispatches one
 SDK operation as `control`, `query`, or `global`.
 
 The session CLI is advisory tooling over the SDK: every semantic verb resolves
 sessions through the SDK broker, and output is rendered through a versioned,
 credential-free DTO. Endpoint credentials are never printed.
+
+## Command-local help
+
+Discovery is static and inert for every public SDK and daemon parent, leaf and
+alias; it does not initialize a broker, settings, transport or evidence store.
+Use the deepest known command for its arguments, applicable options and risks:
+
+```sh
+gjc sdk session raw query --help --json
+gjc daemon reload --help --help-section options --help-page 1
+```
+
+`-h` is equivalent to `--help`. Sections traverse in this fixed order:
+`overview`, `usage`, `children`, `arguments`, `options`, `examples`, `recovery`.
+The defaults are `overview` and page `1`; an empty section has a valid page 1.
+Each response includes only the selected node and, in `children`, its immediate
+children. Follow the returned `next.argv` unchanged, including
+`--help-revision <sha256>`, section, page and `--json` when selected. A changed
+revision requires a new traversal; do not merge pages from different revisions.
+
+Valued selectors accept separate or `=` operands. Pages are positive decimal
+safe integers. Repeated/invalid selectors, selectors without actual help, and
+unknown descendants fail with usage exit 2 at the nearest known command.
+`--help=json` is unsupported. Option values and tokens after `--` do not activate
+help or JSON mode. Syntax containing `<placeholders>` is documentation, not a
+ready-to-run recovery command.
+
+Text and `gjc.command-help` version 1 JSON responses are each at most 8192 UTF-8
+bytes including the newline. Text escapes controls and labels display literals;
+never paste escaped display text as shell argv. Complete entries have stable
+IDs. Oversized values use non-executable base64 fragments: concatenate contiguous
+`offsetBytes` ranges, verify `totalBytes` and `sha256`, then decode the complete
+UTF-8 JSON value. `sectionComplete` ends a section; only `documentComplete: true`
+with `next: null` ends traversal. Help paging never reruns an operation.
 
 ## Broker authority
 
@@ -20,9 +54,76 @@ results. The broker is started on demand (`ensureBroker`) when discovery is
 absent, and an unavailable broker fails closed with a typed operational error
 (exit 1).
 
-`--agent-dir` selects the broker state directory; `--repo` selects the
-workspace directory used for saved-session resolution (default: the current
-directory).
+### Attach-only mode
+
+Set `GJC_SDK_BROKER_AUTOSTART=0` when a supervisor (for example a system
+service) owns the broker. Every SDK client entry point — `gjc sdk session`,
+`gjc sdk search`, `gjc sdk spawn`, the SDK and coordinator MCP servers, ACP,
+and session hosts — then only attaches to a live, reusable broker and never
+spawns, retires, or restarts one. When discovery is absent, stale, names a
+dead process, or names a live broker this client cannot reuse, the call fails
+with `broker_unavailable` (exit 1) and leaves the incumbent untouched. Broker
+management refuses too, before any effect: `gjc doctor` broker restart reports
+`attach_only_refused`, and `scripts/restart-sdk-broker.ts` exits with an error
+without closing hosts or stopping the broker. Restart through the supervisor
+instead. Any other value, or an unset variable, keeps on-demand startup. The
+broker entrypoints ignore the variable, so it is safe for broker descendants to
+inherit it. A supervisor that wants its broker's session hosts to stay
+attach-only sets the variable on the broker process as well.
+
+`--attach-only` is the per-invocation flag form on `gjc sdk session …`,
+`gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve`. `gjc sdk serve` needs
+neither: it only reads broker discovery and never starts a broker.
+
+### Supervised broker: `gjc sdk broker run`
+
+`gjc sdk broker run [--agent-dir <dir>]` is the stable foreground broker
+command for supervisors such as systemd or launchd. It owns the broker for the
+agent directory (default: the configured agent directory; a relative path
+resolves against the current directory) and never detaches: the published
+discovery pid is the supervised process itself.
+
+- It serves until SIGTERM or SIGINT, stops gracefully (discovery is removed),
+  then exits with the signal status: 143 for SIGTERM, 130 for SIGINT. Under
+  systemd, set `SuccessExitStatus=143` so a normal stop is not reported as a
+  failure.
+- It exits 1 without serving when another live broker already owns the agent
+  directory (even one this version cannot reuse), or when startup fails. It
+  never retires the other owner. Startup also fails when the off-thread
+  publication-liveness watchdog cannot be armed. That attempt removes its
+  discovery file and lock instead of leaving a live pid published without
+  the watchdog.
+- It exits 1 when it stops abnormally while serving: its discovery root was
+  lost or replaced, or its heartbeat could not be renewed. A requested
+  `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.
+- It is SIGKILLed (signal status 137, not exit 1) when a discovery
+  publication write blocks the process so the event loop cannot reach that
+  same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
+  TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
+  `SuccessExitStatus`. stderr includes `sdk broker: publication-liveness-timeout`
+  only when that write can finish without waiting. A full stderr pipe does
+  not postpone the SIGKILL. While the event loop is still running, the
+  exit-1 path above is the one that runs.
+- Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
+  else starts a competing broker. Set the variable on the broker unit as well
+  if its session hosts should stay attach-only.
+
+```ini
+[Service]
+ExecStart=/path/to/gjc sdk broker run --agent-dir /home/me/.gjc/agent
+Environment=GJC_SDK_BROKER_AUTOSTART=0
+SuccessExitStatus=143
+Restart=on-failure
+```
+
+`--agent-dir` selects the broker state directory. It may appear at the session
+family level before the verb (`gjc sdk session --agent-dir <dir> list`) or on a
+leaf command. `--repo` selects the workspace directory for scoped listing or
+saved-session resolution (default: the current directory). For compatibility,
+`inspect`, `send`, `status`, and `raw query` also accept `--repo`, but ignore it:
+the exact session ID selects the broker target. Successful calls print a
+path-free warning to stderr. Failed `--json` calls keep stderr empty and return
+their structured error; command-local help identifies `--repo` as compatibility-only.
 
 ## Semantic verbs
 
@@ -58,7 +159,7 @@ exact canonical path match. Unreadable or removed row workspaces are excluded
 from Git scopes deterministically and reported in `warnings`.
 
 The raw global `session.list` route remains unfiltered, and `inspect`, `send`,
-`status`, `tail`, `retire`, and raw control/query behavior is unchanged.
+`status`, `tail`, `close`, `retire`, and raw control/query behavior is unchanged.
 
 For a process-isolated caller that needs bounded discovery, request exactly one
 Broker page instead of the semantic all-pages list:
@@ -73,7 +174,9 @@ gjc sdk session raw global --op session.list --page --cursor <opaque-cursor> \
 `--page` preserves the Broker page envelope, including `indexSeq`, `warnings`,
 the bounded `sessions` array, and the opaque `continuationCursor`. The cursor
 is a snapshot continuation: pass it back unchanged, with the same `--limit`,
-and never restart from the first page or locally slice an all-pages result.
+and never restart from the first page or locally slice an all-pages result. A
+continuation cursor cannot be combined with `cwd` or `resolveSessionId`; exact
+saved-session resolution is a separate, single-page lookup.
 Semantic `gjc sdk session list` remains the fully paginated, scope-filtered
 operation.
 
@@ -108,10 +211,17 @@ operation reference used for later reconciliation.
   terminal state or the wait window (`--timeout-ms`, default 30s) elapses.
   `send --wait` never cancels a running turn; a window that elapses before a
   terminal state is reported as `wait_timeout` with the last observed status.
+- `send` only starts a new turn. While the session is running a turn the host
+  refuses `turn.prompt` before admission, and the CLI reports error code `busy`
+  with `outcomeCertainty: "not-applied"`. To correct the running turn use
+  `raw control <sessionId> --op turn.steer --json-input '{"text":"..."}'`;
+  otherwise wait for the session to become idle and send again.
 
 - `--text` and the JSON input sources (`--json-input`,
   `--json-input-file` — which must be a `0600` regular file —
   `--json-input-stdin`) are mutually exclusive for the prompt body.
+- File input is read through one descriptor, rejects symlink/replacement races,
+  and is capped at 4 MiB before JSON parsing.
 
 ### status
 
@@ -158,6 +268,11 @@ transcript entries.
   verifies the unexpired claim and exchanges it for a fresh connection-owned
   cursor pinned to the exact prior revision; direct cross-connection cursor
   consumption remains rejected, so reconnect never echoes or rewinds a cursor.
+- `--after-transcript-id` selects the caller's last observed transcript row;
+  live resumes require it alongside `--cursor`, while offline tails may use the
+  boundary directly. The boundary is recoverable: an unknown row leaves the
+  retained snapshot intact, while a boundary older than the retained window
+  fails closed with a retention gap.
 - `--timeout-ms` bounds live follow; a session whose lifecycle already ended
   (terminal or `terminalUncertain`) replays retained history and exits instead
   of hanging.
@@ -165,6 +280,32 @@ transcript entries.
 A deleted session has no tail (`session_deleted`). A stopped session replays
 its retained transcript without an endpoint (offline source), bounded to the
 most recent retained entries.
+
+### close
+
+`gjc sdk session close <sessionId>` is the official semantic wrapper for the
+`session.close` broker global. It ends one live session: the broker validates
+indexed authority, asks the host to shut down gracefully, escalates to SIGTERM
+against the durably identified session process when graceful teardown exceeds
+the bounded deadline, and appends terminal `session_closed` evidence. A session
+whose ownership is `terminalUncertain` is refused rather than signalled — that
+is what `retire` is for.
+
+```sh
+gjc sdk session close <sessionId> [--agent-dir <agent-dir>] [--idempotency-key <key>]
+```
+
+Closing never attaches to the session. A Router attachment registers the
+calling process as a live client and renews the host's abandonment window,
+which is the opposite of the intent, so the lifecycle mutation is answered by
+the broker over its own client.
+
+`--idempotency-key` is optional here, unlike the raw `session.close` global. The
+default request key is derived from the session id and the current endpoint
+generation/incarnation. A retry against the same live host replays the same
+lifecycle request; a host resumed under the same session id receives a fresh
+request identity and is closed by a new lifecycle operation. Pass
+`--idempotency-key` explicitly to supply a caller-chosen attempt key.
 
 ### retire
 
@@ -187,6 +328,10 @@ operation and returns the broker/host response:
 
 - `raw control <sessionId> --op <operation>` — one control operation with
   `--json-input*`; `--confirm` confirms destructive control operations.
+  Turn control ids are `turn.prompt`, `turn.steer` (`{"text":...}`),
+  `turn.follow_up`, `turn.abort` and `turn.abort_and_prompt`. An unknown id is
+  a usage error (exit `2`, diagnostic `sdk_unknown_operation`) and is never
+  dispatched.
 - `raw query <sessionId> --query <operation>` — one query; `--cursor` passes a
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
@@ -215,6 +360,61 @@ not proof that the create did not execute, so callers must not resubmit solely
 because lookup reports `not_found`. Reconciliation failures exit nonzero while
 preserving the structured outcome in JSON.
 
+### Legacy lifecycle admission fence
+
+`operation_failed` with diagnostic `lifecycle_legacy_history_ambiguous` means the
+broker refused the **new request before dispatch** because a pre-index ledger
+row cannot establish that its target is unrelated. The underlying broker code is
+`legacy_lifecycle_ambiguous`, distinct from key reuse (`idempotency_conflict`) and
+an already admitted operation with an uncertain effect (`terminal_uncertain`).
+The public outcome and retryability remain `unknown`: refusing this request does
+not settle earlier effects.
+
+- Preserve the original operation, caller request key, exact target/input, and
+  ledger. A new key, empty/config-only transcript, `live:false`, or `deleted:false`
+  is not proof that a legacy effect did not occur. Do not force deletion or edit,
+  truncate, or remove the ledger.
+- For a prior `session.create` whose original key and create target are known,
+  use the read-only `session.lookup` command above. `not_found`, `conflict`, and
+  `uncertain` do not authorize another mutation. Public lookup currently supports
+  create only; do not invent a lookup for delete or close.
+- `retire` is limited to its complete identity-bound uncertain-create proof.
+  It is not an override for opaque legacy rows. Missing original identity or
+  terminal effect evidence requires operator/maintainer investigation; there is
+  no automatic safe retirement for such a row. Preserve it unresolved.
+- Proven final `terminal_ok`/`terminal_error` legacy rows recording only other
+  sessions may already pass admission with an unrelated key. Rows recording the
+  target, lacking target evidence, or reusing its key remain fenced. Unresolved
+  `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
+  history stays fenced even for an apparently unrelated empty session. Recovery
+  after restart marking a row `terminal_uncertain` is not proof of no effect.
+- `session.spawn` claim mirrors are not legacy requests. Current brokers mark
+  each mirror with `spawnAnchor: true` in its row, and a marked mirror never
+  fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
+  written by brokers that predate the marker have no durable field, position, or
+  timestamp that proves they are mirrors (in-place legacy migration rewrites
+  row timestamps), so the broker never infers them: they stay fenced like any
+  other unkeyed row.
+- Operator release of a pre-marker mirror: with the broker stopped, write
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
+  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
+  only identities you can match to a `claim.lifecycleIdentity` in a preserved
+  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
+  genuine legacy request removes its fence. The broker never writes or derives
+  this file. It honors a listed identity only while that identity's entire
+  history is a single unkeyed, unmarked `accepted` row with no session target
+  and no quarantined or corruption-uncertain history; other entries, and the
+  whole file when it is malformed or cannot be read (for example a directory or
+  a file without read permission), are ignored and stay fenced. An unreadable
+  file is logged as a broker warning and never stops the broker from starting. A still-fenced
+  identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
+  restores its fence at the next broker start.
+
+This diagnostic identifies the actual admission guard without exposing ledger
+identities, request hashes, filesystem paths, credentials, or broker free text.
+Other failures do not receive it; do not attribute every unknown delete outcome
+to legacy history.
+
 A separately connected local controller can stop the active turn and its exact
 owned work with an explicitly confirmed operator abort:
 
@@ -236,6 +436,19 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+The route reaches every session host on the current gjc, including a TUI or a
+direct CLI session the Broker did not launch. A Broker-launched host is bound by
+its lifecycle request id; any other host publishes a process-local random marker
+in its own endpoint registration in the Broker-owned session index, and the
+Broker echoes exactly that marker. The marker never appears in endpoint
+discovery, `session list`, or any SDK response, so an endpoint-token holder
+cannot forge it. When the operator abort stops a turn, the host's terminal shows
+`Turn stopped by a remote operator.` A host that published no marker (a gjc that
+predates the operator route) is refused before dispatch with
+`authorization_denied`, `outcomeCertainty: "not-applied"`, and diagnostic
+`sdk_operator_control_unsupported`; unlike `endpoint_stale`, retrying the same
+request cannot succeed until the session restarts on a current gjc.
 
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and
@@ -283,11 +496,92 @@ direct discovery-file reads, and output is versioned and credential-free.
 
 ## Exit codes and error envelope
 
-Verbs exit `0` on success and write JSON to stdout. Failures write a JSON error
-envelope to stdout with a non-zero exit: usage errors exit `2`, operational
-failures (broker unavailable, session unavailable, retention gap, wait
-timeout) exit `1`. Error details are recursively redacted of secret-shaped
-fields before rendering.
+Session verbs exit `0` and keep their existing successful JSON stdout contract,
+including when `--json` is absent. **Machine callers must explicitly add
+`--json` for machine-readable failures.** Ordinary failures otherwise write
+bounded text to stderr only. With `--json`, failure writes exactly one
+`gjc.command-error` version 1 envelope and newline to stdout, with empty stderr.
+Both modes are limited to 8192 UTF-8 bytes including formatting and newline.
+Usage errors exit `2`; operation failures (including unavailable broker/session,
+retention gaps and `send --wait` timeouts) exit `1`. A live `session tail` wait
+window is a bounded observation rather than an operational failure: it exits `0`
+with `terminal: false` and all items observed before the deadline.
+
+The envelope preserves `command`, `error.code`, `category`, `retryability`,
+`outcomeCertainty`, allowlisted `references` and evidence-based `nextSteps`, plus
+`omittedOptional`, `complete`, `evidence` and `continuation`. Safe fields are
+explicitly projected; arbitrary exception messages, request bodies, credentials
+and stacks are not public error evidence. Do not infer non-execution from a
+nonzero exit or timeout: `wait_timeout` after acceptance means applied work,
+whereas `uncertain_after_send` means the outcome is unknown. Preserve session,
+operation, idempotency, claim, command and turn references when supplied.
+A `busy` refusal from `send` is definite: the prompt was never admitted, so
+there is no operation record to reconcile. A `session list` whose scope needs a
+Git repository but runs outside one is a usage error with diagnostic
+`sdk_scope_requires_repository`.
+
+Error guidance performs no additional probes, status calls, retries, restarts or
+kills. Execute an appropriate explicit observation only when the task warrants
+it; reconcile before considering replay. `retire` is a proof-bound mutation,
+not a generic status check, and requires confirmed intent and actual applicable
+proof. Daemon `stop`/`restart` interrupt work; `--force` permits SIGKILL escalation.
+Daemon kinds are `telegram`, `discord`, `slack` (default `telegram`); `daemon`
+defaults to `status`, and `reload` aliases `restart`. There is no
+`gjc daemon restart sdk` recovery command. Never repeat successful mutations
+when a multi-target daemon result contains failures.
+
+### Retained error evidence
+
+When essential sanitized reconciliation references do not fit inline, the CLI
+may retain them locally, but advertises `evidence.status: "retained"` and a
+continuation only after successful publication and read-back verification.
+Retrieval is an explicit family-root operation, not an operation retry:
+
+```text
+gjc sdk --error-ref <32-lowercase-hex-id> --error-sha256 <64-lowercase-hex> [--error-page <N>] [--error-agent-dir <dir>] [--json]
+gjc daemon --error-ref <32-lowercase-hex-id> --error-sha256 <64-lowercase-hex> [--error-page <N>] [--error-agent-dir <dir>] [--json]
+```
+
+Use the actual returned argv rather than constructing a locator. Ref and digest
+are required together; page defaults to 1 and is a positive decimal safe integer.
+Selectors support separate/equals forms; duplicates are invalid. Retrieval is
+exclusive with help, operation positionals and operation flags. Scope/page
+selectors require retrieval. `--error-agent-dir` is distinct from SDK operation
+`--agent-dir`; daemon worker `--agent-dir` is private. Retrieval uses only the
+explicit/default root and checks the stored family, never scans other roots.
+
+The store is `<effective-agent-dir>/cli-error-evidence-v1`. Records expire exactly
+24 hours after creation, without sliding reads. Expiry refuses retrieval; lazy
+cleanup is not a promise of immediate secure erasure. Limits are 64 committed
+records, 1 MiB per record and 16 MiB committed aggregate, plus at most one 1 MiB
+pending file and one 4096-byte lock: at most 66 files and 17 MiB + 4096 bytes of
+logical payload (filesystem allocation overhead is separate). Unexpired records
+are not evicted to make space. POSIX owner-only permissions are verified; an
+unsupported secure permission mechanism fails closed. No success/help output
+initializes the store and there is no background cleanup service.
+
+Successful retrieval is `gjc.command-error-evidence` version 1 on stdout, exit 0,
+with each text/JSON page bounded to 8192 bytes. It means retrieval succeeded, not
+that the original operation did. Follow the pinned digest/scope/mode continuation;
+reassemble contiguous base64 bytes and verify total length and SHA256 before
+UTF-8/JSON decoding or using references. Pages contain immutable retained evidence,
+not resampled runtime state.
+
+Disk, permissions, quota, lock contention or verification failure may prevent
+retention. The original failure remains nonzero with its original outcome
+certainty and retryability: `complete: false`, `evidence.status: "unavailable"`,
+and `continuation: null`, with the explicit warning that necessary evidence
+could not be retained and **do not blindly retry the original operation**.
+Missing essential evidence is not described as optional, and no invented path,
+ID, digest or fallback store is advertised. Lossless retrieval is guaranteed only
+for successfully published records within their retention lifetime; expiry,
+deletion or corruption can make later retrieval unavailable.
+
+These bounds do not paginate successful session/search/spawn/guides results.
+Search outside Git retains its successful exit-0 result; observing an unhealthy
+daemon is still a successful status operation. Serve preflight errors use the
+ordinary failure contract; after relay ownership, protocol framing and termination
+remain unchanged, without CLI error envelopes injected into the stream.
 
 ## Scoped search (`gjc sdk search`)
 
@@ -309,6 +603,60 @@ continuation that supplies a different scope or anchor fails with
 
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+## Read-only broker observation (`gjc sdk diagnostics broker`)
+
+`gjc sdk diagnostics broker [--agent-dir <dir>] [--expected-generation <id>] [--timeout-ms <ms>] [--json]`
+observes an already running broker publication. Unlike every other broker
+command on this page it never calls `ensureBroker`: it cannot start, ensure,
+retire, restart or recover a broker, cannot spawn a host, and writes no error
+evidence — not even for malformed input. It answers only from an already-owned
+healthy retained publication; a broker that owns no publication reports typed
+unavailability instead of acquiring the authority to reply.
+
+Selection is exact. Without `--agent-dir` no alternative root is scanned, and a
+replacement publication observed mid-request fails closed rather than
+reconnecting. A second observation is a new explicit invocation, never an
+automatic retry.
+
+`--timeout-ms` (1..10000, default 2000) is one absolute budget for the whole
+observation — the native lease, connect, authentication and the final identity
+recheck all draw from it, and expiry outranks a later refusal. It is a **work
+budget, not a guaranteed wall-clock return**: the unchanged SDK client close
+grace can extend settlement past the budget, and a synchronous kernel read
+already in flight is not forcibly cancelled. Expect the observation to stop
+doing new work at the deadline, not to return at exactly that instant.
+
+The result is `schema: gjc.broker-observation`, `version: 1`, an `observedAt`
+client timestamp, and exactly one of:
+
+- `broker`: `generation` (the broker's publication-incarnation id, fixed at its
+  startup — not the endpoint generation and not the package version),
+  `build.packageVersion`, `build.buildId` (startup-captured trusted metadata, or
+  `null`), and `diagnosticProtocol: 1`.
+- `unavailable`: `reason` plus a fixed message keyed by that reason. The reasons
+  are exactly `absent`, `stale`, `incompatible`, `authentication_failed`,
+  `unsupported`, `generation_mismatch`, `transport_unavailable`, `timeout`,
+  `invalid_response` and `unsafe_discovery`. Messages are literals, never
+  exception text.
+
+Malformed input is **not** an unavailable reason. Bad argv is a usage error: the
+CLI prints the fixed usage block and exits `2` without observing anything, and
+the SDK facade rejects the same inputs by throwing a typed options error to the
+caller before any observation begins. `invalid_arguments` is that caller-error
+surface, not a value the result DTO can carry.
+
+Exit codes are `0` for an observed broker, `1` for typed unavailability, and `2`
+for malformed argv. All output stays within 8192 UTF-8 bytes and identifying
+fields are never truncated into misleading values. A broker too old to publish a
+generation and diagnostic protocol is `unsupported`; compatibility is never
+synthesized. The document carries no pid, path, URL, port, token, argv or
+environment value.
+
+Observation qualifies on darwin arm64 with Bun 1.4.0 on a local
+ownership-enforcing APFS volume, and activates only the fixed package or cached
+native artifact — a missing or mismatched artifact is `unsupported`, never
+extracted or repaired. It is observation, not signed supply-chain attestation.
 
 ## Local-only spawn (`gjc sdk spawn`)
 

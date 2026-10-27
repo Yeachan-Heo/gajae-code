@@ -326,7 +326,7 @@ function sanitizeEvent(event: AssistantMessageEvent): AssistantMessageEvent | un
 		case "done":
 			return { ...event, message: sanitizeMessage(event.message) };
 		case "error":
-			return { ...event, error: sanitizeMessage(event.error) };
+			return { type: "error", reason: event.reason, error: sanitizeMessage(event.error) };
 		case "toolChoiceIncapability":
 			return event;
 		case "thinking_start":

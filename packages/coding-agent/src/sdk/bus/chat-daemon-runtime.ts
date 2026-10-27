@@ -318,6 +318,9 @@ export class ChatDaemonRuntime {
 		this.#router = new SessionRouter({
 			agentDir: input.agentDir,
 			observer: true,
+			// A lean final answer carries no messageRef, so the raw native copy of a
+			// positioned frame has no identity to collapse onto and would post twice.
+			positionedNotificationEffects: true,
 			correlateFrame,
 			deps: {
 				...deps.routerDeps,
@@ -738,6 +741,7 @@ export class ChatDaemonRuntime {
 			!shouldPublishChatFrame(normalizedFrame, this.input.config.presentation?.verbosity)
 		)
 			return;
+		const keepLiteral = this.input.config.presentation?.redact === false;
 		const payload = this.#presentation?.fanout(notification)[0];
 		const body = payload?.body;
 		const content =
@@ -758,6 +762,7 @@ export class ChatDaemonRuntime {
 					...(notification.type === "action_needed"
 						? { actionId: notification.id, options: notification.options }
 						: {}),
+					...(keepLiteral ? { literal: true as const } : {}),
 				}),
 			);
 		if (this.#slack)
@@ -768,6 +773,7 @@ export class ChatDaemonRuntime {
 					notification.type === "action_needed" && notification.kind === "ask" ? notification.id : undefined,
 					attachment.generation,
 					publicationId,
+					keepLiteral,
 				),
 			);
 	}

@@ -83,6 +83,31 @@ test("machine-local identity parsing is strict and machine IDs are keyed per ins
 	).rejects.toThrow("unavailable or malformed");
 });
 
+test("shared installation roots still derive distinct identities from distinct machine IDs", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-machine-identity-shared-root-"));
+	temporaryDirectories.push(directory);
+	const readMachineId =
+		(machineId: string) =>
+		async (file: string): Promise<string> => {
+			if (file === "/etc/machine-id") return `${machineId}\n`;
+			throw Object.assign(new Error("missing"), { code: "ENOENT" });
+		};
+	const hostA = await loadInstallationHostId({
+		platform: "linux",
+		configRootDir: directory,
+		readFile: readMachineId("00112233445566778899aabbccddeeff"),
+	});
+	const sharedSecret = await fs.promises.readFile(path.join(directory, "machine-identity.secret"), "utf8");
+	const hostB = await loadInstallationHostId({
+		platform: "linux",
+		configRootDir: directory,
+		readFile: readMachineId("ffeeddccbbaa99887766554433221100"),
+	});
+
+	expect(await fs.promises.readFile(path.join(directory, "machine-identity.secret"), "utf8")).toBe(sharedSecret);
+	expect(hostB).not.toBe(hostA);
+});
+
 test("machine identity secret creation falls back when hard links are unavailable", async () => {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-machine-identity-"));
 	temporaryDirectories.push(directory);

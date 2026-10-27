@@ -13,6 +13,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isEnoent } from "@gajae-code/utils";
 import * as git from "../utils/git";
 import { HARNESS_FILENAME, normalizePathSpec } from "./harness";
 
@@ -49,10 +50,16 @@ export function getCurrentAutoresearchBranch(workDir: string): Promise<string | 
  * Mission state under `.gjc/**` is intentionally NOT listed here: it is
  * runtime-owned and only the sanctioned `gjc autoresearch` CLI writes it.
  */
-export function isAutoresearchAuthorizedResearchPath(_cwd: string, rawPath: string): boolean {
+export function isAutoresearchAuthorizedResearchPath(cwd: string, rawPath: string): boolean {
 	const normalized = normalizePathSpec(rawPath);
 	if (normalized === ".") return false;
-	return normalized === HARNESS_FILENAME;
+	if (normalized !== HARNESS_FILENAME) return false;
+	try {
+		// Writes follow an existing harness symlink into its referent.
+		return !fs.lstatSync(path.join(cwd, HARNESS_FILENAME)).isSymbolicLink();
+	} catch (error) {
+		return isEnoent(error);
+	}
 }
 
 /**

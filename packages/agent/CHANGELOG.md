@@ -2,6 +2,102 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- `AgentTool` accepts optional `matcherDigest` and `matcherEntries` hooks that project the source a call introduces (combined, or per file) for pre-execution stream matchers such as TTSR `astCondition` rules.
+
+### Fixed
+
+- A tool call whose run is cancelled while an asynchronous `beforeToolCall` hook is pending no longer dispatches after the hook settles; non-abortable tools previously still executed after the aborted result was emitted.
+
+- Compaction and branch summaries reinserted into the next turn are encoded inside the summary template, so markup in the summary cannot close that block.
+
+- GenAI telemetry no longer enables message-content capture from project dotenv values whose escape sequences Bun decodes before provenance checks.
+
+- Tool results that include an image carry a host trust notice beside the image on the provider request, while text-only tool results and user-attached images stay unchanged.
+
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Preserve a completed terminal outcome when a subscriber aborts after an accepted assistant response with no pending tool calls.
+
+- Standalone agent loops now report `agent_end.stopReason: "cancelled"` when cancellation aborts a provider request or pending tool execution, including when a pause is requested at the same boundary.
+
+- Preserve completed agent runs when a subscriber aborts after a final assistant message is accepted, while still reporting cancellation for interrupted tool execution and continuations.
+
+- A project `.env` value of `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` no longer turns GenAI message-content capture on. An operator value the project does not declare is unchanged, including a downgrade before the first read. Removing the variable before that read keeps capture off, even when a trusted agent env file still says `full`.
+
+- The typed `incompleteArgumentsReason` an adapter recorded on a tool-call block survives the accepted attempt snapshot. The snapshot rewrote every incomplete call to `malformed`, so a call the adapter had typed as `truncated`, `conflicting`, or `ambiguous` reached dispatch with only the boolean left and was reported with the generic wording.
+- An incomplete tool call with no typed reason is no longer reported as an output-token-limit truncation unless the turn actually stopped for length, or as a decode failure the provider never declared. The rejection keeps the same actionable `Re-issue the call` guidance.
+
+- Billing callbacks now receive the provider-effective service tier after a downgrade, avoiding cost-tier mismatches.
+- Lossless message snapshots preserve the provider-effective service tier when other metadata is not cloneable.
+
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- Add `AgentPromptOptions.contextOverflowManaged` so session owners can classify and recover context overflow at their session boundary while keeping successful empty stops terminal in the agent loop.
+
+## [0.18.8] - 2026-10-08
+
+### Fixed
+
+- Promote zero-token empty provider responses to explicit errors, including responses without typed transport metadata.
+- Preserve clean-attempt fallback for typed capacity overloads after earlier committed tool work, while blocking replay of observable output.
+
+- Preserve managed fallback retries when a provider stages an empty assistant text placeholder before reporting a statusless overload, while retaining non-empty terminal error content.
+
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+### Fixed
+
+- A run that fails with the generic `Agent run failed.` now logs its underlying cause (error name, message, `cause` chain, and a short stack) as a `warn` entry in the local gjc log, with credentials redacted. The transcript and SDK clients still receive only the generic message; previously the cause was discarded entirely, so these failures could not be diagnosed.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+## [0.18.1] - 2026-09-29
+
+### Changed
+
+- Cap the default non-adaptive auto-compaction threshold at 300,000 tokens; explicit thresholds and adaptive compaction remain unchanged. Opt-in context promotion retains the promoted model's reserve-based headroom.
+- Keep recent context strictly below the default ceiling even when the configured keep floor or token correction would otherwise reach it.
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- `agent_failed` and the terminal assistant message now carry the optional bounded `providerDiagnostic` when the provider adapter classified the failure from its own structured metadata. Thrown errors are read only through the adapter's private carrier; terminal assistant messages carry the validated DTO. A foreign thrown error that self-declares a `providerDiagnostic` property gets none. The sanitized failure code and fixed message are unchanged.
+
+## [0.17.7] - 2026-09-25
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Performance
+
+- Bound stream abort-race retention to the current read and reuse history hashes when checking append-only context rewrites.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

@@ -22,14 +22,54 @@ External and managed integrations attach through SDK-core surfaces only:
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
 
 For terminal-side session operation, use the broker-bound [SDK session CLI](./sdk-session-cli.md):
-`gjc sdk session list|inspect|send|status|tail` plus the explicit `raw`
+`gjc sdk session list|inspect|send|status|tail|close|retire` plus the explicit `raw`
 `control|query|global` hatch. The CLI resolves the exact attachment through SDK
-core and emits credential-free JSON.
+core and emits credential-free JSON on success. Add `--json` explicitly for
+machine failures; default ordinary failures are text on stderr, not JSON stdout.
+
+### Public CLI discovery and recovery
+
+Use `gjc sdk --help` or deepest local help such as
+`gjc sdk session raw query --help --json` and `gjc daemon reload --help`.
+Help covers only public paths and immediate children, never worker-only actions
+or flags. `--help-section overview|usage|children|arguments|options|examples|recovery`
+and `--help-page <N>` select bounded static pages; follow `next.argv` with its
+`--help-revision <sha256>` and mode intact. `-h` is accepted, `--help=json` is not.
+Selectors require actual help, valid positive decimal pages and no duplicates.
+Help is inert and never initializes runtime services or storage.
+
+Ordinary errors use `gjc.command-error` version 1: with `--json`, one stdout
+JSON envelope and empty stderr; otherwise stderr text. Help, errors and explicit
+error-evidence pages are bounded to 8192 UTF-8 bytes including newline. Existing
+successful result shapes and serve frames after relay ownership are unchanged.
+Do not treat a timeout as proof that work was not applied; preserve returned
+references and reconcile rather than blindly replaying a mutation.
+
+Oversized essential sanitized error evidence may be retained for exactly 24
+hours in `<effective-agent-dir>/cli-error-evidence-v1`: 64 committed records,
+1 MiB each, 16 MiB committed aggregate, with one additional pending file up to
+1 MiB and a lock up to 4096 bytes. Follow a verified continuation using
+`gjc sdk` or `gjc daemon` with `--error-ref <id> --error-sha256 <digest>`, optional
+`--error-page <N> --error-agent-dir <dir>`, and `--json` for machine output.
+Retrieval is root-only, exclusive with help/operations, and never searches other
+roots or replays the original operation. Reconstruct contiguous base64 fragments
+and verify length/digest before decoding; fragments are not executable commands.
+Publication failure reports incomplete/unavailable evidence and no continuation,
+not fabricated recovery. Availability is conditional on successful publication
+and the retention lifetime, not a promise to overcome disk failure or deletion.
+
+Recovery hints perform no extra probes or automatic recovery. Daemon targets are
+`telegram`, `discord`, `slack`, not the SDK broker: never suggest
+`gjc daemon restart sdk`. `reload` aliases `restart`; stop/restart interrupt work
+and `--force` permits hard-kill escalation. Session retirement requires actual
+proof and confirmed intent, not merely an uncertain result. See the
+[full help, error and evidence contract](./sdk-session-cli.md#command-local-help).
 
 ## Migration from removed external transports
 
-The retired `--mode rpc`, `rpc-ui`, `bridge`, and `gjc sdk serve` transports
-have no replacement wire client. Process-isolated controllers use Coordinator
+The retired `--mode rpc`, `rpc-ui` and `bridge` transports have no replacement
+wire client. The existing `gjc sdk serve` relay remains discoverable CLI tooling,
+not an external SDK attachment API. Process-isolated controllers use Coordinator
 MCP, `gjc sdk session`, or a configured managed adapter. In-process applications
 use the [embedding SDK](./sdk-embedding.md).
 
@@ -104,6 +144,19 @@ This boundary prevents a child from newly loading caller-cwd or user-global Bun 
 
 Broker and per-session discovery tokens remain in their authoritative private discovery files for SDK-core resolution. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
+### Recovering legacy broker locks
+
+Broker lock records written before host qualification do not identify which machine created them. A machine cannot safely infer that such a lock belongs to it from a locally absent or reused PID when the agent directory is shared. GJC therefore refuses to reclaim a host-unqualified lock automatically; the error links here rather than treating an unverifiable owner as dead.
+
+For a legacy lock that blocks startup, recover it only after confirming that every GJC broker using the same agent directory has stopped on every host that can access that directory:
+
+1. Stop the GJC processes or supervisor services that can start the broker on each host using that agent directory. Do not proceed while any broker may still be serving sessions or renewing discovery.
+2. Copy `sdk/broker.lock` and `sdk/broker.json` to a backup location outside the agent directory. Preserve the originals until startup and session state have been checked.
+3. Move both `sdk/broker.lock` and `sdk/broker.json` out of the `sdk` directory. Do not use this procedure for a host-qualified lock or while any host may still be running a broker.
+4. Start one GJC process using the agent directory and verify broker startup before restarting other clients or supervisors.
+
+This procedure is a one-time operator migration for old host-unqualified records, not a way to take over a lock from a running broker. If all brokers cannot be stopped or the record already contains a host identity, preserve the lock and investigate the owning host instead.
+
 ## Internal protocol
 
 The following frame shapes are SDK-core implementation details for maintainers.
@@ -154,6 +207,20 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
+Live tool content on both the broker-created bus host and SDK-only host uses
+`{type:"event", kind:"tool_execution_start"|"tool_execution_update"|"tool_execution_end", payload:{event_type,event}}`.
+Prompt owners receive their command/turn correlation. Explicit observers must
+negotiate **both** `turn_stream` and `session_host_observer_v1`; their copy has no
+other client's correlation, and an owner also observing receives no duplicate.
+On the internal wire, `hello` or `event_replay.capabilities` declares these opt-ins
+on the authenticated connection; replay negotiation merges with existing caps.
+Capabilities do not confer lifecycle or session identity authority.
+Tool updates carry cumulative `partialResult` snapshots, not append-only deltas;
+replace the prior snapshot. The end frame's `result` is authoritative, including
+when it differs from the last update. These content frames are best-effort and
+not retained in lifecycle replay. A replay acknowledgement without content is
+not evidence that a running tool produced no output.
+
 `bash_folded` — a foreground bash wait left the foreground and became a background job. Emitted once per fold into the replayable session event ring (so late-connecting clients receive it on `event_replay`), with `generic_safe` adapter disposition:
 
 ```json
@@ -164,7 +231,7 @@ Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 - A replayed frame may describe a job that has since finished. `runtime.jobs.list` is the source of truth: each running/recent job carries `metadata.backgrounded` and, whenever it is `true` because of a fold, `metadata.foldReason` with the same values. The `bash.background` control (C52) returns `{ backgrounded: true, jobId }` on a fresh fold, `already_backgrounded` when no wait is foldable but a running job of this session was already folded (by steer, chord, timer, or a prior control call), `no_active_bash` when nothing is running or foldable, and `not_foldable` when a live wait refused the fold.
 - A `turn.steer` that folds a running bash behaves exactly like a TUI steer: the steer is consumed by the same turn at the tool boundary immediately after the fold result; `turn.steer_status` is unchanged.
 
-The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
+The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), `awaiting_input` (a foreground `bash` command printed a browser sign-in or device-code prompt and went quiet; carries only `toolCallId`, `toolName`, and `kind` — `browser_auth` or `device_code` — never the URL, code, command, or output; delivered live only to clients that advertise the `awaiting_input_v1` capability and never retained for `event_replay`; a notice detected while notification policy is provisional is held and delivered on activation if the command is still running), and `pong`.
 
 ### Internal inbound frames
 
@@ -298,8 +365,47 @@ type SdkPromptTerminalOutcome =
 			code: "prompt_failed" | "prompt_deadline_exceeded";
 			message: string;
 			provenance: "agent_failed" | "deadline";
+		phase: "submission" | "post_start";
+		category: "provider_transport" | "provider_rejected" | "agent_runtime" | "deadline" | "unknown";
+		providerCode?: string;
+			providerDiagnostic?: {
+				category:
+					| "auth"
+					| "rate_limit"
+					| "quota"
+					| "context_limit"
+					| "invalid_request"
+					| "provider_unavailable"
+					| "unknown";
+				httpStatus?: number;
+				code?: string;
+				evidence: "structured_status" | "structured_code";
+			};
 	  };
 ```
+
+`providerDiagnostic` is an optional, purely additive classification of *why* the
+provider refused, so a caller can distinguish an auth rejection from a rate
+limit or an upstream outage without parsing text. It is minted only by a
+provider adapter from structured provider metadata (an SDK HTTP error or an
+explicit SSE protocol error envelope); message text, response headers, request
+IDs and the legacy heuristic HTTP status never produce one. `httpStatus` is an
+integer in `400..599` and is absent for an error delivered inside an HTTP 200
+stream. `code` is a canonical token from a closed allowlist, never a raw
+provider string. Contradictory evidence (a status that disagrees with the code,
+a conflicting nested code, an out-of-range status, an unreadable field) yields
+no diagnostic at all rather than a guess, and an unsupported code is discarded
+while an independently valid status may still classify. `billing_error` maps to
+`unknown`, not `quota`; `quota` and `context_limit` are reserved and are not
+emitted by the current adapter.
+
+The field never changes the outcome it accompanies: `code`, `message`,
+`provenance`, `phase`, `category`, `providerCode`, receipt state, retry and
+fallback behaviour and CLI exit codes are identical with or without it. Records
+without the field stay valid, and a decoded or persisted diagnostic that fails
+revalidation is stripped rather than invalidating the record. A late
+`agent_failed` may fill a diagnostic that a settled failure is missing; it never
+replaces an existing one and never rewrites the settled terminal.
 
 `turn.prompt` returns `{ accepted: true, commandId, turnId, clientRef? }` only after
 its asynchronous preflight accepts the prompt. That receipt is a durable,
@@ -333,17 +439,134 @@ The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
 also include a bounded sanitized `error.code` and `error.message`. Cursors, partial
 generated-ID pairs, mixed selectors, and extra selector fields are rejected.
 
-Correlated `agent_end` and `agent_failed` frames carry the same finalized
-`outcome`. Clients must correlate those frames and Q26 by the prompt identifiers,
-not infer terminality from stream activity or an earlier pending claim.
+Correlated `agent_failed` is a sanitized, nonterminal diagnostic. It may arrive
+while the prompt is still `accepted` or `in_flight` and does not itself carry a
+finalized `outcome` or prove that the exact run and its tools have settled. The
+correlated `agent_end` carries the terminal `outcome`; a finalized Q26 record
+remains the authoritative result. Clients correlate these frames and Q26 by the
+prompt identifiers, not infer terminality from a failure diagnostic, stream
+activity, or an earlier pending claim.
 
-Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. A non-terminal prompt record at restart finalizes its pending outcome and receipt state. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
+Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. An ordinary non-terminal prompt record at restart finalizes its pending outcome and receipt state. A prompt with the explicit `deadlineRecoveryPending` marker is the exception: it remains `accepted` or `in_flight`, and its staged pending outcome is not exposed by Q26 while the SDK retains a durable recovery owner. A process restart does not recreate a missing exact-run/tool observation, so the pending outcome stays private until a real terminal event or new settlement evidence arrives. If ownership or settlement remains uncertain, the record stays nonterminal and recoverable instead of being converted into a synthetic deadline failure. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
+
+### Request-owned queue cancellation and execution deadlines
+
+SDK-only ordinary abort cancels a snapshot of its authenticated requester's
+already-admitted preflights, including a prompt accepted durably but not yet
+started. It cancels those per-request controllers without borrowing another
+run's abort authority; foreign admissions and later pipelined requests are not
+part of the snapshot. A local `aborted: true` acknowledges cancellation, not a
+new durable execution terminal. For already-accepted work, recover its original
+`clientRef` through `turn.result`; unconfirmed terminal persistence remains
+uncertain and never permits mutation replay.
+
+Before consumption, a prompt diverted into steering retains its own queue-removal
+capability; cancelling it must not abort unrelated active work. After consumption,
+its durable completion belongs to the exact consuming run and cancellation domain.
+A trusted natural terminal settles each joined accepted prompt with its own
+correlation. Confirmed queue removal settles only that submission, without waiting
+for an unrelated run. A deterministic cancellation receipt waits for that
+submission's durable terminal; held or failed persistence remains uncertain,
+including same-key replay. Retired queue authority cannot be reused to abort the
+root run.
+
+Confirmed queue residence suspends the terminal lease. Actual consumption or
+own-run promotion starts a fresh bounded lease, renewed only by attributable
+progress in the same consuming run and cancellation domain. Session teardown
+retires joined attribution; late predecessor progress or terminal events cannot
+adopt or settle a successor. Transport or delivery failure alone does not prove
+execution settled and does not retire a live unsettled execution owner.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
 `clientRef` fails before execution with `client_ref_conflict`, but callers must not
 reuse a `clientRef` as a retry mechanism: after eviction the same value can identify
 a new prompt while the old outcome remains unknown.
+
+### GJC-private SDK image staging
+
+Authenticated machine attachments can stage image bytes without enlarging the
+private SDK's **256 KiB frame limit**. These are internal GJC SDK controls, not
+standard ACP methods, MCP tools, or a new public image capability. Attach through
+the Router as usual; do not discover endpoints or credentials yourself.
+
+When installed, `runtime.capabilities` lists `turn.image.begin`, `turn.image.append`,
+`turn.image.finish`, and `turn.image.discard`. A custom host transport must provide
+authoritative live-connection membership and the host's internal read-only definitive
+exact-run settlement observer; otherwise the controls are not installed. This observer
+waits for ledger settlement events independently of socket or host lifetime, not a
+bounded snapshot or polling loop.
+The notifications host also requires its internal run-domain and terminal-owner
+observers and active-handle accessor before advertising staging.
+Model-facing and chat adapters cannot invoke these machine-only controls.
+
+1. `turn.image.begin` takes `{ mimeType, byteLength, sha256, batchId? }` and returns
+   `{ id, nextSequence: 0 }`. Supported formats are static PNG, JPEG, WebP, and GIF;
+   animated PNG, WebP, and GIF images are rejected. The digest is lowercase SHA-256
+   of the original bytes. Each image is at most 20 MiB.
+2. `turn.image.append` takes `{ id, sequence, data }`, with canonical base64 encoding
+   of at most 96 KiB decoded bytes, and acknowledges `nextSequence` and
+   `receivedBytes`. Sequence numbers must be contiguous.
+3. `turn.image.finish` takes `{ id }` and validates size, digest, MIME, dimensions,
+   static-image policy, and decoding without transcoding. `turn.image.discard` takes
+   `{ id }` to abandon an unredeemed upload.
+4. `turn.prompt` can take `stagedImages: [{ id }]` instead of `images`. Redemption is
+   atomic, ordered, one-shot, and scoped to the same authenticated connection and
+   session. Image-only prompts may use `text: ""`; direct and staged images cannot
+   be mixed. Provider input retains the original bytes and MIME without transcoding or
+   byte loss.
+
+There are at most 16 outstanding uploads and 16 images per prompt. Each session has
+separate 64 MiB upload-source and accepted-source admission limits; accepted base64
+storage is charged in addition to source bytes against the shared 256 MiB process
+budget, along with transient decode memory. Each session permits one in-flight
+`finish`; another session can decode concurrently when process capacity permits. Uploads
+expire after 120 seconds without valid progress; optional same-owner `batchId`
+progress renews only live peers. Stock hosts remove unredeemed leases on
+disconnect. Custom transports should forward close notifications for immediate
+reclamation; every access, including async decode completion, also rechecks
+liveness, and missed close notifications cannot extend the expiry deadline. Accepted
+image capacity belongs to the consuming execution, not the socket: disconnect,
+queue residence, an unrelated terminal, or uncertainty alone cannot release it.
+Failed admission or confirmed queue removal releases never-executed capacity.
+Acceptance or cancellation does not prove an unadopted producer has stopped retaining
+images: its capacity remains charged until that submission actually settles.
+Once execution starts, an exact resource-settlement proof is required: even an
+attributed cancelled `agent_end` or transport teardown may leave tools running.
+Each retiring reservation has one event-driven settlement continuation, with no
+polling or observation cutoff. A late exact settlement releases its capacity even
+after transport or host teardown; shutdown does not wait for a still-live producer.
+Unknown runs, quarantine, and observer failures retain capacity and produce a
+process-level diagnostic rather than claiming settlement. Internal budget snapshots
+expose retained process source/accepted and transient charges. The existing ledger makes quarantine
+irreversible, so quarantined executions remain charged for this process's lifetime
+rather than claiming their tombstones prove settlement. An adopted execution
+without an exact resource handle or owning domain also stays charged.
+
+Promotion into an own-run is not itself proof that execution started. If the
+execution producer positively refuses that exact queued invocation before it can
+start, its image reservation retires only after the enqueue producer returns.
+This is a failed prompt, not queue cancellation; normal durable-publication
+rules still apply. Missing lifecycle events, a generic error, or teardown do not
+provide this no-start authority. Started or ambiguous executions still require
+their exact settlement proof.
+
+An ambiguous prompt response must not be replayed: recover the original `clientRef`
+through the correlated `turn.result` contract. Reusing a retained
+`clientRef` returns `client_ref_conflict` before staged-image redemption, not a second
+acknowledgement or execution. Missing or consumed staged IDs return
+`image_upload_unavailable`; a closed session or connection still returns `resource_gone`.
+
+ACP's public contract remains `session/prompt` with `ContentBlock.image`
+(`type: "image"`, base64 `data`, and `mimeType`), negotiated through
+`agentCapabilities.promptCapabilities.image`. See the pinned
+`@agentclientprotocol/sdk` schema and the upstream [content specification](https://agentclientprotocol.com/protocol/content).
+That capability does not advertise `turn.image.*` or `stagedImages`. This SDK
+foundation does **not** change ACP's existing oversized-prompt rejection; a separate
+ACP consumer must bridge standard inline images to staging internally and retain
+the public schema, cancellation, and capability semantics.
+
+### Cancellation outcomes and inactivity limits
 
 `turn.abort` returns a typed disposition. A caller that does not own the target
 receives `resource_gone`; it must not treat that result as cancellation of another
@@ -365,6 +588,47 @@ wedged or continuously noisy prompt still reaches a deterministic terminal outco
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
+
+`sdk.flushWorktreeOnDeadline` (default `true`) autosaves uncommitted changes in the session's linked worktree as a WIP commit when a prompt deadline retires a prompt. For a primary checkout it requires an explicit `true` opt-in written in the user/global config or a runtime override, because the checkout is a directory the session does not own. A project `.gjc/settings.json` or `.gjc/config.yml` does not count. Without that user opt-in, the flush is skipped and the prompt still terminalizes.
+
+At expiry, the SDK fences the exact accepted prompt's run and waits for its
+dispatched tools to settle before publishing `prompt_deadline_exceeded`. A
+cancellation produced by that deadline fence does not replace the timeout
+failure with a successful `cancelled` result. If exact run or tool settlement
+cannot be proven, Q26 remains `accepted` or `in_flight`, the pending outcome
+stays private, and no terminal frame is published until recovery proves
+settlement.
+
+## Read-only broker observation
+
+`observeExistingBroker({ agentDir, expectedGeneration?, timeoutMs? })` reports what an
+already running broker publishes about itself and does nothing else. It owns discovery
+and authentication internally, so callers never receive credentials, socket coordinates
+or private discovery objects, and it is the only broker entry point that cannot start,
+ensure, retire, restart or recover a broker, spawn a host, replay a lifecycle operation
+or write error evidence. It never enters `SessionRouter`, `SessionLifecycleService`,
+`ensureBroker`, `Broker.start`, retirement, recovery, lifecycle lookup, model resolution
+or session enumeration.
+
+The returned value is a detached frozen snapshot, not the broker's mutable discovery
+object: `schema: "gjc.broker-observation"`, `version: 1`, `ok`, `observedAt`, and either
+a `broker` record (`generation`, `build.packageVersion`, `build.buildId | null`,
+`diagnosticProtocol: 1`) or an `unavailable` record whose `message` is a fixed literal
+keyed by `reason`. `generation` is the broker's publication-incarnation id fixed at its
+startup — not `endpointGeneration`, not the package version — and the initial
+publication, the authenticated response and the final publication must all agree on it
+and on the internal owner/process/root identity. An `expectedGeneration` mismatch, or a
+replacement publication observed during the request, fails closed without reconnecting
+or ensuring.
+
+`timeoutMs` (1..10000, default 2000) is a single absolute budget for the whole
+observation; expiry outranks a later refusal. A broker that publishes no generation or
+diagnostic protocol is `unsupported` rather than a synthesized compatibility success.
+The CLI projection of this facade is `gjc sdk diagnostics broker` — see
+[SDK session CLI](sdk-session-cli.md). Observation qualifies on darwin arm64 with Bun
+1.4.0 on a local ownership-enforcing APFS volume and activates only the fixed package or
+cached native artifact; a missing or mismatched artifact is `unsupported`, never
+extracted or repaired. This is observation, not signed supply-chain attestation.
 
 ## Skill invoke reconciliation
 
@@ -465,6 +729,57 @@ cursor contract and returns `error.code: "cursor_expired"` with
 `error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
 cross-query or selector mismatches return `invalid_input`.
 
+## Project progress snapshot (Q32)
+
+`Q32` / `session.progress` returns one read-only snapshot of the session's
+project progress for orchestrators that supervise GJC as a subordinate agent.
+It is the same projection the human `/progress` command renders — one
+computation over durable session state (goal mode, todos, the session ultragoal
+plan `goals.json`, active workflow state and HUD chips, subagent lifecycle
+records, recorded quality-gate receipts and review verdicts) — so the two views
+cannot disagree. The query accepts no input fields, writes nothing, and never
+invokes a model.
+
+ACP clients call it through `_gjc/sdk/query`:
+
+```json
+{ "method": "_gjc/sdk/query", "params": { "sessionId": "…", "query": "session.progress" } }
+```
+
+ACP clients also get the human view as the builtin `/progress` command: it is
+advertised in `available_commands_update`, and a prompt consisting of exactly
+`/progress` is answered by rendering this query's snapshot as plain text
+(`end_turn`, no model turn). Like any prompt it holds the session's prompt
+slot until the report is published, so a concurrent prompt gets `conflict`;
+`session/cancel` ends it with `cancelled` without aborting a host turn.
+`/progress` with arguments is an ordinary prompt, as in the TUI.
+
+MCP (`gjc_session_query`) and `gjc sdk session raw query` use the same query
+name. The response is a single-item page whose item has
+`schema: "gjc.project_progress.v1"`:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | Completion state: `complete`, `awaiting-completion`, `blocked`, `in-progress`, `not-started`, `paused`, `dropped`, or `no-tracked-work`. |
+| `completion` | `basis` (`ultragoal-stories`, `todos`, `goal-status`, or `none`), `done`/`total` counted units, `percent` (`null` when `basis` is `none`), `allUnitsDone`, `complete`, and a plain-language `explanation`. |
+| `execution` | `goal`, `ultragoal` (story counts plus bounded per-story status and receipt flag), and `todos` (counts plus bounded items); each is `null` when not recorded. |
+| `activeWork` | `story`: the active story, else the next pending one, in Ultragoal scheduler order — blocked, review-blocked, and failed stories are never reported as next (failed stories are only retried on an explicit `--retry-failed`), so it is `null` when nothing is schedulable. `todo`: the in-progress (or next pending) todo. `workflows`: active workflows with their phase and HUD chips, bounded, with `omittedWorkflows` counting the rest. `agents`: subagent counts, where `waiting` is queued or paused subagents. |
+| `verification` | `storyReceipts` (complete stories with and without a quality-gate receipt; `null` until a story is complete) and published `reviewVerdicts`. |
+| `attention` | Blockers, pending items, and notes, each with `kind`, `source` (`ultragoal`, `workflow`, `subagents`, `todos`, `goal`, `state`), a stable `ref` (story id, workflow skill, or source key) when one exists, and text. |
+| `sources` | `sessionStateRead`; `unreadable` durable sources (`workflow-state`, `ultragoal-plan`), which are excluded from every count; `recovered` sources whose snapshot record was unreadable but whose contents were rebuilt from authoritative per-entry records (per-workflow `active/<skill>.json` entries); `discarded` sources whose readable derived snapshot still listed workflows without an active per-entry record (for example, a deactivation whose snapshot rebuild never ran), which are dropped as stale and never reported as active; and `unresolved` sources listing workflows without an active per-entry record in a snapshot that cannot be identified as legacy state or a derived snapshot, which are neither reported as active nor confirmed absent. An unreadable workflow snapshot with nothing to recover from is `unreadable`, never reported as "no active workflows". Workflows are always projected from the per-entry records; only a legacy root-only snapshot without `active_skills` keeps its own workflow. A per-entry record that exists but cannot be read or holds no usable workflow entry (for example `{}`) makes `workflow-state` `unreadable`; it is never treated as a deleted entry. |
+
+Semantics are deliberately conservative. Units count equally and open units
+earn no partial credit; `percent` is never 100 while a unit is open and never 0
+once one is done. `complete` requires every counted unit done, the session goal
+(if any) complete, and no subagent running, queued, or paused; otherwise a
+finished unit set reports `awaiting-completion`. Verification reports only
+recorded receipts and verdicts: receipt freshness is not validated and no
+confidence score is derived. Subagent counts come from the session's in-memory job records and
+reset with the process. Lists are bounded (`omittedStories`, `omittedItems`,
+`omittedWorkflows`, `omittedAttention` report the remainder) and durable text is stripped of
+control characters and length-bounded. A session without a progress source
+returns `unavailable`; input fields return `invalid_request`.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:
@@ -490,7 +805,7 @@ raw-control flow documented in the [SDK session CLI guide](./sdk-session-cli.md)
 
 `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 control clients continue to work; new clients must send it now. It cannot become mandatory, or be removed from the controls, before SDK v4 and at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before the gate resolver runs. Neither control accepts a presentation ID, remaps an old ID to a reminted gate, or uses heuristic matching.
 
-Q12 (`workflow.gates.list`) exposes durable query records and additive SDK v3 diagnostics. A pending record preserves its workflow fields including `gate_id` and adds `id: "pending:<gate_id>"` and `tag: "pending"`. A restart quarantine diagnostic uses `id: "diagnostic:<gate_id>"`, `tag: "quarantined"`, and optional `lifecycle` containing `state: "quarantined"`, its restart reason, `quarantinedAt`, and an optional `supersededByGateId` after a remint. Diagnostics are query-only: they cannot be routed, answered, or promoted. Treat Q12 as the durable status surface, not as generic-reply authority.
+Q12 (`workflow.gates.list`) exposes durable query records and additive SDK v3 diagnostics. A pending record preserves its workflow fields including `gate_id` and adds `id: "pending:<gate_id>"`, `tag: "pending"`, and `answer_recorded: false`. An accepted-answer diagnostic uses `id: "diagnostic:<gate_id>"`, `tag: "accepted"`, `answer_recorded: true`, and `resolved_at`, plus one `post_accept_disposition` value (`accepted`, `terminalized`, `advanced`, `continuation_lost`, or `unknown`) so an operator can distinguish a gate still waiting for continuation from one whose answer was durably advanced. A restart quarantine diagnostic uses `id: "diagnostic:<gate_id>"`, `tag: "quarantined"`, `answer_recorded`, and optional `lifecycle` containing `state: "quarantined"`, its restart reason, `quarantinedAt`, and an optional `supersededByGateId` after a remint. When available, every record also carries the originating `runtime_turn_id`; raw answers and derived answer values are never exposed. Diagnostics are query-only: they cannot be routed, answered, or promoted. Treat Q12 as the durable status surface, not as generic-reply authority.
 
 ### Coordinator MCP question pull loop
 
@@ -611,6 +926,21 @@ The result is an observation of one locked index reconciliation cut:
   authority, and detected generation reuse. Consumers must preserve uncertain
   lifecycle state rather than treating `unknown` as retired. Expired positive
   evidence is reported specifically as `proof_expired`.
+
+Every host start takes a new event generation from the agent directory's
+per-session generation authority (`sdk/event-generations/`). Allocation runs
+under a cross-process file lock and returns a value strictly above every
+generation previously issued for the session, with the host's wall-clock start
+time in milliseconds only as a floor. A session resumed by a later process
+therefore never reuses an earlier host's `(generation, seq)` event coordinates,
+still outranks the earlier host's retained index identity after the clock steps
+backward, and two hosts started in the same millisecond never share a
+generation. A host that cannot reach the authority keeps serving its local
+endpoint but publishes to the session index only after the authority reserves
+exactly the generation it serves. Treat a generation as an opaque safe integer,
+not a counter that starts at `1`: replay cursors and notification publication
+ids recorded against one generation never position or deduplicate another
+generation's events.
 
 Proof survives Broker, Router, and consumer process restart because it is read
 from the durable session index, not Router attachment memory. Positive terminal
@@ -817,8 +1147,9 @@ or gateway details outside logged payloads.
 answer remotely, so its `question` and `options` are always sent unredacted
 (otherwise it would be unanswerable). When redaction is enabled, `idle`
 summaries are removed and streamed content frames (`turn_stream`,
-`context_update`, `image_attachment`) are suppressed at their emit sites. When
-redaction is disabled, all content is delivered unchanged.
+`context_update`, `image_attachment`) are suppressed at their emit sites. The
+content-free `awaiting_input` notice is still delivered. When redaction is
+disabled, all content is delivered unchanged.
 
 ### Local `/notify`
 
@@ -845,6 +1176,12 @@ SDK core exposes two related provider-neutral capabilities:
    than deriving a replacement identity from the numeric generation. A supplied
    saved-session `sessionIdentity` is enforced as the transcript snapshot
    precondition for resume and fork.
+   For `session.list` targets that include `cwd` and `resolveSessionId`, the
+   Broker attaches `savedSession` only after managed-scope and transcript
+   identity validation. It retries one complete scan after a concurrent source
+   change; a continued omission includes `savedSessionOmission` with the
+   requested session ID and a path-free reason, never transcript contents or
+   credentials.
 2. **`SessionRouter`** owns live attachment discovery and transport. It validates
    the exact indexed endpoint generation, keeps credentials and `SdkClient`
    instances private, replays from the attachment cursor, reconnects after
@@ -887,8 +1224,9 @@ mapping.
 
 - paired provider identity and operation capability are checked before the
   Broker call;
-- retries reuse the same provider request key, so one request produces one
-  Broker ledger identity and at most one lifecycle effect;
+- retries reuse the same provider request key; replay and at-most-once lifecycle
+  effects apply while the Broker ledger retains that identity. Eligible settled
+  identities may be evicted oldest-first under capacity pressure;
 - `terminal_uncertain` remains uncertain and is reconciled from Broker ledger,
   effect marker, process incarnation, endpoint/index, readiness, and exact
   cleanup evidence only;

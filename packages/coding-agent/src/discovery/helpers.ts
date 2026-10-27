@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
+import { directoryCaseSensitive, type FileType as FileTypeEnum, type glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
@@ -12,6 +12,7 @@ import {
 	logger,
 	normalizePathForComparison,
 	parseFrontmatter,
+	pathIsWithin,
 	tryParseJson,
 } from "@gajae-code/utils";
 import type { ExtensionModule } from "../capability/extension-module";
@@ -202,11 +203,24 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 }
 
 /** Build the filesystem authority for a provider read. */
-export function getReadOptions(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
-	scope: ReadScope,
-): ReadFileOptions | undefined {
-	if (!ctx.isolatedHome) return undefined;
+type DiscoveryReadContext = Pick<
+	LoadContext,
+	"home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity" | "bypassCache"
+> & {
+	repoRoot?: string | null;
+	cwd?: string;
+};
+
+export function getReadOptions(ctx: DiscoveryReadContext, scope: ReadScope): ReadFileOptions | undefined {
+	if (!ctx.isolatedHome) {
+		const boundary = scope === "project" ? (ctx.repoRoot ?? ctx.cwd) : undefined;
+		if (!boundary) return ctx.bypassCache ? { bypassCache: true } : undefined;
+		return {
+			...(ctx.bypassCache ? { bypassCache: true as const } : {}),
+			containmentRoot: boundary,
+			scope,
+		};
+	}
 	return {
 		isolatedHome: true,
 		home: ctx.home,
@@ -219,12 +233,14 @@ export function getReadOptions(
 }
 
 export async function getReadOptionsForContainment(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+	ctx: DiscoveryReadContext,
 	scope: ReadScope,
 	containmentRoot?: string,
 ): Promise<ReadFileOptions | undefined> {
 	const options = getReadOptions(ctx, scope);
-	if (!options || !containmentRoot) return options;
+	// Ordinary reads keep the repository boundary from getReadOptions. The extra
+	// root is an isolated-home constraint and was not applied on this path before.
+	if (!ctx.isolatedHome || !options || !containmentRoot) return options;
 	const containmentRootIdentity = await capturePathIdentity(containmentRoot);
 	if (!containmentRootIdentity) return undefined;
 	return { ...options, containmentRoot, containmentRootIdentity };
@@ -292,7 +308,7 @@ export function buildRuleFromMarkdown(
 	},
 ): Rule {
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
-	const { condition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
+	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
 	let globs: string[] | undefined;
 	if (Array.isArray(frontmatter.globs)) {
@@ -323,6 +339,7 @@ export function buildRuleFromMarkdown(
 		alwaysApply: frontmatter.alwaysApply === true,
 		description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
 		condition,
+		astCondition,
 		scope,
 		interruptMode,
 		repeatMode,
@@ -444,8 +461,8 @@ async function globIf(
 	fileType: FileTypeEnum,
 	recursive: boolean = true,
 ): Promise<Array<{ path: string }>> {
+	const { glob } = await discoveryNatives();
 	try {
-		const { glob } = await discoveryNatives();
 		const result = await glob({ pattern, path: dir, gitignore: true, hidden: false, fileType, recursive });
 		return result.matches;
 	} catch {
@@ -473,6 +490,8 @@ export interface ScanSkillsFromDirOptions {
 	linkContainmentRoot?: string;
 	/** Filesystem authority for explicit-home reads. */
 	scope?: ReadScope;
+	/** User-owned permission to follow symlinks outside a user-scope scan root. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -492,6 +511,8 @@ export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
 
 export const SkillDiscoveryTestHooks: {
 	afterCandidateValidated?: (candidatePath: string) => void | Promise<void>;
+	afterSkillLinksCaptured?: (candidatePath: string) => void | Promise<void>;
+	afterSkillPathResolved?: (candidatePath: string) => void | Promise<void>;
 	afterAuthorityRootValidated?: (root: string) => void | Promise<void>;
 	afterAuthorityRootMissing?: (root: string) => void | Promise<void>;
 	afterContainedRootValidated?: (root: string) => void | Promise<void>;
@@ -509,6 +530,25 @@ interface ScanRootLinkIdentity {
 	ino: bigint;
 	linkText: string;
 	target: DirectoryIdentity;
+}
+
+interface SkillFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	realPath: string;
+}
+
+interface SkillLinkIdentity {
+	path: string;
+	dev: bigint;
+	ino: bigint;
+	linkText: string;
+	target: {
+		dev: bigint;
+		ino: bigint;
+		realPath: string;
+		kind: "directory" | "file";
+	};
 }
 
 async function captureScanRootLinkIdentity(root: string): Promise<ScanRootLinkIdentity | null> {
@@ -566,6 +606,38 @@ async function directoryIdentityIsCurrent(
 			current.ino === expected.ino &&
 			normalizePathForComparison(current.realPath) === normalizePathForComparison(expected.realPath)
 		);
+	} catch {
+		return false;
+	}
+}
+
+async function captureSkillLinkIdentity(linkPath: string): Promise<SkillLinkIdentity | null> {
+	const observed = await fs.promises.lstat(linkPath, { bigint: true });
+	if (!observed.isSymbolicLink()) return null;
+	const linkText = await fs.promises.readlink(linkPath);
+	const realPath = await fs.promises.realpath(linkPath);
+	const target = await fs.promises.stat(realPath, { bigint: true });
+	const kind = target.isDirectory() ? "directory" : target.isFile() ? "file" : undefined;
+	if (!kind) return null;
+	return {
+		path: linkPath,
+		dev: observed.dev,
+		ino: observed.ino,
+		linkText,
+		target: { dev: target.dev, ino: target.ino, realPath, kind },
+	};
+}
+
+async function skillLinkIdentityIsCurrent(expected: SkillLinkIdentity): Promise<boolean> {
+	try {
+		const observed = await fs.promises.lstat(expected.path, { bigint: true });
+		if (!observed.isSymbolicLink() || observed.dev !== expected.dev || observed.ino !== expected.ino) return false;
+		if ((await fs.promises.readlink(expected.path)) !== expected.linkText) return false;
+		const realPath = await fs.promises.realpath(expected.path);
+		if (normalizePathForComparison(realPath) !== normalizePathForComparison(expected.target.realPath)) return false;
+		const target = await fs.promises.stat(realPath, { bigint: true });
+		const kind = target.isDirectory() ? "directory" : target.isFile() ? "file" : undefined;
+		return kind === expected.target.kind && target.dev === expected.target.dev && target.ino === expected.target.ino;
 	} catch {
 		return false;
 	}
@@ -687,7 +759,36 @@ export async function scanSkillsFromDir(
 		const relative = path.relative(realRoot, candidate);
 		return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 	};
-	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
+	const skillPathAndLinksAreCurrent = async (
+		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
+	): Promise<boolean> => {
+		try {
+			const [realPath, currentFile, currentLinks] = await Promise.all([
+				fs.promises.realpath(skillPath),
+				expectedFile ? fs.promises.stat(expectedFile.realPath, { bigint: true }) : Promise.resolve(undefined),
+				Promise.all(linkIdentities.map(skillLinkIdentityIsCurrent)),
+			]);
+			if (!expectedFile) return isWithinRoot(realPath) && currentLinks.every(Boolean);
+			if (!currentFile) return false;
+			return (
+				normalizePathForComparison(realPath) === normalizePathForComparison(expectedFile.realPath) &&
+				currentFile.isFile() &&
+				currentFile.nlink === 1n &&
+				currentFile.dev === expectedFile.dev &&
+				currentFile.ino === expectedFile.ino &&
+				currentLinks.every(Boolean)
+			);
+		} catch {
+			return false;
+		}
+	};
+	const openSkillFileSafely = async (
+		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
+	): Promise<FileHandle> => {
 		if (
 			!(await scanRootIsCurrent()) ||
 			(options.authorityRoot &&
@@ -701,14 +802,14 @@ export async function scanSkillsFromDir(
 			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
 		const handle = await fs.promises.open(skillPath, flags);
 		try {
-			const [opened, observed, currentPath, currentScanRoot, currentAuthorityRoot] = await Promise.all([
+			const [opened, observed, currentScanRoot, currentAuthorityRoot, currentSkillPath] = await Promise.all([
 				handle.stat({ bigint: true }),
 				fs.promises.lstat(skillPath, { bigint: true }),
-				fs.promises.realpath(skillPath),
 				scanRootIsCurrent(),
 				options.authorityRoot && authorityIdentity
 					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
 					: true,
+				skillPathAndLinksAreCurrent(skillPath, expectedFile, linkIdentities),
 			]);
 			if (
 				!opened.isFile() ||
@@ -717,9 +818,10 @@ export async function scanSkillsFromDir(
 				!observed.isFile() ||
 				opened.dev !== observed.dev ||
 				opened.ino !== observed.ino ||
-				!isWithinRoot(currentPath) ||
+				(expectedFile !== undefined && (opened.dev !== expectedFile.dev || opened.ino !== expectedFile.ino)) ||
 				!currentScanRoot ||
-				!currentAuthorityRoot
+				!currentAuthorityRoot ||
+				!currentSkillPath
 			) {
 				throw new Error(`Unsafe skill file: ${skillPath}`);
 			}
@@ -729,15 +831,20 @@ export async function scanSkillsFromDir(
 			throw error;
 		}
 	};
-	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
-		const handle = await openSkillFileSafely(skillPath);
+	const readSkillContentSafely = async (
+		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
+	): Promise<string> => {
+		const handle = await openSkillFileSafely(skillPath, expectedFile, linkIdentities);
 		try {
 			const content = await handle.readFile({ encoding: "utf8" });
 			if (
 				!(await scanRootIsCurrent()) ||
 				(options.authorityRoot &&
 					authorityIdentity &&
-					!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
+					!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity))) ||
+				!(await skillPathAndLinksAreCurrent(skillPath, expectedFile, linkIdentities))
 			) {
 				throw new Error(`Unsafe skill authority root for: ${skillPath}`);
 			}
@@ -748,8 +855,10 @@ export async function scanSkillsFromDir(
 	};
 	const readSkillFrontmatterSafely = async (
 		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
 	): Promise<{ frontmatter: SkillFrontmatter | null; size: number }> => {
-		const handle = await openSkillFileSafely(skillPath);
+		const handle = await openSkillFileSafely(skillPath, expectedFile, linkIdentities);
 		try {
 			const size = Number((await handle.stat({ bigint: true })).size);
 			const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
@@ -780,20 +889,64 @@ export async function scanSkillsFromDir(
 			await handle.close();
 		}
 	};
-	const loadSkill = async (candidatePath: string) => {
+	const loadSkill = async (candidatePath: string, expectedCanonicalPath?: string) => {
 		try {
+			const linkIdentities = (
+				await Promise.all([
+					captureSkillLinkIdentity(path.dirname(candidatePath)),
+					captureSkillLinkIdentity(candidatePath),
+				])
+			).filter((identity): identity is SkillLinkIdentity => identity !== null);
+			await SkillDiscoveryTestHooks.afterSkillLinksCaptured?.(candidatePath);
 			const skillPath = await fs.promises.realpath(candidatePath);
-			if (!isWithinRoot(skillPath)) {
-				warnings.push(`Refusing skill path outside scan root: ${candidatePath}`);
+			await SkillDiscoveryTestHooks.afterSkillPathResolved?.(candidatePath);
+			if (
+				expectedCanonicalPath &&
+				normalizePathForComparison(skillPath) !== normalizePathForComparison(expectedCanonicalPath)
+			) {
+				warnings.push(`Refusing changed skill path during isolated-home scan: ${candidatePath}`);
 				return;
 			}
-			const stat = await fs.promises.stat(skillPath);
-			if (!stat.isFile() || stat.nlink !== 1) {
+			const allowOutsideRoot = options.allowExternalUserSkillSymlinks && level === "user";
+			if (!isWithinRoot(skillPath) && !allowOutsideRoot) {
+				const remedy =
+					level === "user"
+						? `add ${path.dirname(path.dirname(skillPath))} to skills.customDirectories to load it, or enable skills.trustUserSkills`
+						: "keep project skill targets inside the skills scan root";
+				warnings.push(
+					`Refusing skill path outside scan root: ${candidatePath} (resolves to ${skillPath}; ${remedy})`,
+				);
+				return;
+			}
+			const stat = await fs.promises.stat(skillPath, { bigint: true });
+			if (!stat.isFile() || stat.nlink !== 1n) {
 				warnings.push(`Skill path is not a regular file: ${candidatePath}`);
 				return;
 			}
+			const pinExternalTarget = !isWithinRoot(skillPath) && allowOutsideRoot;
+			const fileLink = linkIdentities.find(identity => identity.path === candidatePath);
+			const parentLink = linkIdentities.find(identity => identity.path === path.dirname(candidatePath));
+			let capturedLinkTargetPath: string | undefined;
+			if (fileLink?.target.kind === "file") {
+				capturedLinkTargetPath = fileLink.target.realPath;
+			} else if (parentLink?.target.kind === "directory") {
+				capturedLinkTargetPath = path.join(parentLink.target.realPath, path.basename(candidatePath));
+			}
+			if (
+				pinExternalTarget &&
+				(!capturedLinkTargetPath ||
+					normalizePathForComparison(skillPath) !== normalizePathForComparison(capturedLinkTargetPath))
+			) {
+				warnings.push(`Refusing skill path not bound to its captured external link target: ${candidatePath}`);
+				return;
+			}
+			const fileIdentity = pinExternalTarget ? { dev: stat.dev, ino: stat.ino, realPath: skillPath } : undefined;
+			const pinnedLinkIdentities = pinExternalTarget ? linkIdentities : [];
 			await SkillDiscoveryTestHooks.afterCandidateValidated?.(candidatePath);
-			const { frontmatter, size } = await readSkillFrontmatterSafely(skillPath);
+			const { frontmatter, size } = await readSkillFrontmatterSafely(skillPath, fileIdentity, pinnedLinkIdentities);
+			if (!(await skillPathAndLinksAreCurrent(skillPath, fileIdentity, pinnedLinkIdentities))) {
+				throw new Error(`Unsafe skill link for: ${candidatePath}`);
+			}
 			if (!frontmatter) {
 				if (size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
 					warnings.push(
@@ -817,8 +970,9 @@ export async function scanSkillsFromDir(
 			items.push({
 				name,
 				path: skillPath,
+				discoveryPath: candidatePath,
 				loadContent: async () => {
-					const content = await readSkillContentSafely(skillPath);
+					const content = await readSkillContentSafely(skillPath, fileIdentity, pinnedLinkIdentities);
 					return parseFrontmatter(content, { source: skillPath }).body;
 				},
 				frontmatter: frontmatter as SkillFrontmatter,
@@ -835,14 +989,10 @@ export async function scanSkillsFromDir(
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-		const skillPath = await canonicalizePathWithinHome(
-			_ctx,
-			path.join(scanDir, entry.name, "SKILL.md"),
-			containmentRoot,
-			scope,
-		);
-		if (!skillPath) continue;
-		work.push(loadSkill(skillPath));
+		const candidatePath = path.join(scanDir, entry.name, "SKILL.md");
+		const canonicalSkillPath = await canonicalizePathWithinHome(_ctx, candidatePath, containmentRoot, scope);
+		if (!canonicalSkillPath) continue;
+		work.push(loadSkill(candidatePath, _ctx.isolatedHome ? canonicalSkillPath : undefined));
 	}
 	await Promise.all(work);
 
@@ -866,8 +1016,7 @@ export async function readContainedFile(
 		rootIdentity = capturedRoot;
 		if (
 			expectedRootIdentity !== undefined &&
-			(rootIdentity.dev !== BigInt(expectedRootIdentity.dev) ||
-				rootIdentity.ino !== BigInt(expectedRootIdentity.ino))
+			(rootIdentity.dev !== expectedRootIdentity.dev || rootIdentity.ino !== expectedRootIdentity.ino)
 		)
 			return null;
 		await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);
@@ -917,8 +1066,17 @@ export async function readContainedFile(
  * Expand environment variables in a string.
  * Supports ${VAR} and ${VAR:-default} syntax.
  */
-function expandEnvVars(value: string, extraEnv?: Record<string, string>): string {
+const SENSITIVE_ENV_NAME = /key|secret|token|pass|auth|credential|cookie|dsn|url$/i;
+
+export function isSensitiveEnvName(name: string): boolean {
+	return SENSITIVE_ENV_NAME.test(name);
+}
+
+function expandEnvVars(value: string, extraEnv?: Record<string, string>, skipSensitiveNames = false): string {
 	return value.replace(/\$\{([^}:]+)(?::-([^}]*))?\}/g, (_, varName: string, defaultValue?: string) => {
+		if (skipSensitiveNames && isSensitiveEnvName(varName)) {
+			return defaultValue !== undefined ? defaultValue : `\${${varName}}`;
+		}
 		const envValue = extraEnv?.[varName] ?? Bun.env[varName];
 		if (envValue !== undefined) return envValue;
 		if (defaultValue !== undefined) return defaultValue;
@@ -929,17 +1087,17 @@ function expandEnvVars(value: string, extraEnv?: Record<string, string>): string
 /**
  * Recursively expand environment variables in an object.
  */
-export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>): T {
+export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>, skipSensitiveNames = false): T {
 	if (typeof obj === "string") {
-		return expandEnvVars(obj, extraEnv) as T;
+		return expandEnvVars(obj, extraEnv, skipSensitiveNames) as T;
 	}
 	if (Array.isArray(obj)) {
-		return obj.map(item => expandEnvVarsDeep(item, extraEnv)) as T;
+		return obj.map(item => expandEnvVarsDeep(item, extraEnv, skipSensitiveNames)) as T;
 	}
 	if (obj !== null && typeof obj === "object") {
 		const result: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(obj)) {
-			result[key] = expandEnvVarsDeep(value, extraEnv);
+			result[key] = expandEnvVarsDeep(value, extraEnv, skipSensitiveNames);
 		}
 		return result as T;
 	}
@@ -1378,6 +1536,25 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
+/** Directory that owns a resolved project registry, or "" when there is none. */
+function projectPluginRegistryAnchor(resolvedProjectPath: string | null): string {
+	if (!resolvedProjectPath) return "";
+	return path.dirname(path.dirname(path.dirname(resolvedProjectPath)));
+}
+
+/**
+ * Ordinary loads cache by home, registry files, and project anchor. Two trees can
+ * share one canonical registry file and still need different inside-anchor results.
+ */
+function pluginRootsCacheKey(
+	canonicalHome: string,
+	gjcRegistryPath: string | undefined,
+	projectRegistryPath: string | undefined,
+	projectAnchor: string,
+): string {
+	return `${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}:${projectAnchor}`;
+}
+
 /** Invalidate the exact user/project registry pair and their resolved-root cache entry. */
 export async function invalidateClaudePluginRoots(home: string, cwd?: string, isolatedHome = false): Promise<void> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
@@ -1395,7 +1572,14 @@ export async function invalidateClaudePluginRoots(home: string, cwd?: string, is
 	])) {
 		if (registryPath) invalidateFsCache(registryPath);
 	}
-	pluginRootsCache.delete(`${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`);
+	pluginRootsCache.delete(
+		pluginRootsCacheKey(
+			canonicalHome,
+			gjcRegistryPath,
+			projectRegistryPath,
+			projectPluginRegistryAnchor(resolvedProjectPath),
+		),
+	);
 }
 
 async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
@@ -1482,6 +1666,68 @@ async function resolveIsolatedPluginPath(home: string, value: string): Promise<s
  * must reject, and reusing that result would cross the home boundary.
  */
 
+/** Reject install paths inside the registry owner's tree. Windows components use the parent directory's case rule. */
+export function projectRegistryInstallPathIsInsideAnchor(
+	projectAnchor: string,
+	installPath: string,
+	options?: { platform?: NodeJS.Platform; sensitivity?: (directory: string) => boolean },
+): boolean {
+	if (projectAnchor.trim() === "" || installPath.trim() === "") return true;
+	const platform = options?.platform ?? process.platform;
+	if (platform !== "win32") return pathIsWithin(projectAnchor, installPath);
+	const sensitivity = options?.sensitivity ?? windowsDirectoryIsCaseSensitive;
+	return win32PathIsWithin(projectAnchor, installPath, sensitivity);
+}
+
+function windowsDirectoryIsCaseSensitive(directory: string): boolean {
+	let current = directory;
+	while (true) {
+		try {
+			fs.statSync(current);
+			return directoryCaseSensitive(current) === true;
+		} catch {
+			const parent = path.win32.dirname(current);
+			if (parent === current) return false;
+			current = parent;
+		}
+	}
+}
+
+function win32PathIsWithin(root: string, candidate: string, sensitivity: (directory: string) => boolean): boolean {
+	const spell = (input: string) => {
+		const resolved = path.win32.resolve(input);
+		if (process.platform !== "win32") return resolved;
+		try {
+			return fs.realpathSync(resolved);
+		} catch {
+			return resolved;
+		}
+	};
+	const split = (input: string) => {
+		const parsed = path.win32.parse(input);
+		return {
+			volume: parsed.root,
+			parts: input
+				.slice(parsed.root.length)
+				.split(/[\\/]+/)
+				.filter(Boolean),
+		};
+	};
+	const anchor = split(spell(root));
+	const target = split(spell(candidate));
+	if (anchor.volume.toLowerCase() !== target.volume.toLowerCase()) return false;
+	for (let index = 0; index < anchor.parts.length; index++) {
+		const part = target.parts[index];
+		if (part === undefined) return false;
+		const parent = index === 0 ? anchor.volume : path.win32.join(anchor.volume, ...anchor.parts.slice(0, index));
+		const same = sensitivity(parent)
+			? anchor.parts[index] === part
+			: anchor.parts[index].toLowerCase() === part.toLowerCase();
+		if (!same) return false;
+	}
+	return true;
+}
+
 export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
@@ -1495,7 +1741,8 @@ export async function listClaudePluginRoots(
 	const projectRegistryPath = resolvedProjectPath
 		? await canonicalizePluginRegistryPath(canonicalHome, resolvedProjectPath, isolatedHome)
 		: undefined;
-	const cacheKey = `${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`;
+	const projectAnchor = projectPluginRegistryAnchor(resolvedProjectPath);
+	const cacheKey = pluginRootsCacheKey(canonicalHome, gjcRegistryPath, projectRegistryPath, projectAnchor);
 	if (!isolatedHome) {
 		const cached = pluginRootsCache.get(cacheKey);
 		if (cached) return cached;
@@ -1604,6 +1851,12 @@ export async function listClaudePluginRoots(
 							: entry.installPath;
 						if (!installPath) {
 							warnings.push(`Plugin ${pluginId} installPath escapes the isolated home`);
+							continue;
+						}
+						if (projectRegistryInstallPathIsInsideAnchor(projectAnchor, installPath)) {
+							warnings.push(
+								`Ignoring project plugin ${pluginId} installPath inside the project tree: ${installPath}`,
+							);
 							continue;
 						}
 						projectRoots.push({

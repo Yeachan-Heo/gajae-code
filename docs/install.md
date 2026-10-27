@@ -30,6 +30,14 @@ The installer downloads the current platform's GitHub release asset, verifies HT
 Unix default location: `~/.local/bin/gjc` (`GJC_INSTALL_DIR` overrides).
 Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
 
+### PDF extraction in standalone builds
+
+Standalone and source builds extract PDF text through the native `pdf-inspector` backend. The native addon is included with supported platform builds; no JavaScript PDF package, WebAssembly sidecar, or current-working-directory lookup is required. Conversion returns page markers and document metadata. No OCR engine is bundled, so a document with no extracted text reports the page numbers that require OCR rather than treating raw PDF bytes as text. `:raw` remains an explicit request for the original response.
+
+Published package tarballs include the patched MIT-licensed Markit 0.5.3 converter under `vendor/markit-ai` for DOCX, PPTX, XLSX, EPUB, and RTF conversion. Its license, upstream package manifest, and deterministic provenance/hash inventory are retained. Direct `npm pack` and `bun pm pack` use the checked-in vendor tree, not borrowed or staged `node_modules` graphs. The release packer retains its canonical archive limits and deterministic-output checks.
+
+Maintainers regenerate the converter with `bun packages/coding-agent/scripts/vendor-markit.ts --generate`. This fetches only the pinned registry artifact, verifies its SHA-512 integrity, and applies `packages/coding-agent/vendor/markit-ai.patch` in an owned temporary directory without executing upstream code. `bun packages/coding-agent/scripts/vendor-markit.ts --check` verifies local inventory and patch hashes without network access; package check and build run this verification. Normal packing does not modify installed dependencies or create ownership receipts requiring recovery.
+
 ## Korean launcher alias
 
 `가재씨` is installed alongside `gjc` as a launcher alias on package-manager installs. Standalone binaries expose `gjc`. On Windows, use `gjc` (or run from Windows Terminal / PowerShell with UTF-8 `chcp 65001` if a Hangul alias is needed).
@@ -100,6 +108,7 @@ Interactive startup checks GitHub releases for a newer GJC version in the backgr
 
 - Standalone binary or former Bun/npm install on a supported platform → `gjc update` installs the matching GitHub release binary. Existing standalone binaries are atomically replaced. Package-manager installs migrate to a separate user binary path, even at the same version; shims are neither overwritten nor uninstalled. A target that already passes release-checksum, version, and smoke-test verification is reused without downloading the binary again (unless `--force` is set).
 - Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
+- Project dependency install (`<project>/node_modules/.bin/gjc`, including the real `.exe` that Windows dependency installs place there) → update the dependency, not the file: `gjc update` refuses with package-manager instructions because that file belongs to the project's lockfile, and replacing it fails on Windows ACLs (#6842).
 - Unsupported platform or unknown target → rerun the documented platform installer.
 
 Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.

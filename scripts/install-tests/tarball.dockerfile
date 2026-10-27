@@ -9,7 +9,7 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 
 # Install Rust (needed to build native addon)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
 ENV PATH="/root/.cargo/bin:$PATH"
 
 # Install Node.js (needed for verdaccio and npm)
@@ -23,6 +23,9 @@ RUN npm install -g verdaccio
 # Copy local repo
 WORKDIR /repo
 COPY . .
+
+# Install the toolchain pinned by rust-toolchain.toml
+RUN rustup toolchain install && rustup show active-toolchain
 
 # Build the project
 RUN bun install --frozen-lockfile

@@ -27,30 +27,26 @@ export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scop
 	// short-lived registry credential. It grants nothing in this repository, and
 	// it is what removes the long-lived NPM_TOKEN from the release path.
 	{ workflow: ".github/workflows/ci.yml", job: "publish", scope: "id-token" },
-	// PR contract validation publishes a head-bound CHECK RUN under the required
-	// context name for issue_comment-triggered runs (issue #4703): the comment
-	// event's own check associates with the default-branch SHA, so authorization
-	// and its revocation must update the same required authority on the exact head.
-	{ workflow: ".github/workflows/pr-validation.yml", job: "validate", scope: "checks" },
+	// Re-request review workflow needs pull-requests and issues write permissions
+	// to request reviews and react to comments on PRs triggered by issue_comment.
+	{ workflow: ".github/workflows/re-review.yml", job: "request-review-on-comment", scope: "pull-requests" },
+	{ workflow: ".github/workflows/re-review.yml", job: "request-review-on-comment", scope: "issues" },
 ];
 
 export const REQUIRED_READ_DEFAULT: readonly string[] = [
 	".github/workflows/ci.yml",
 	".github/workflows/dev-ci.yml",
-	".github/workflows/pr-validation.yml",
 	".github/workflows/public-site-sync.yml",
 	".github/workflows/spoofed-version-sync.yml",
 ];
 
-const READ_SCOPE_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
-	".github/workflows/pr-validation.yml": ["contents", "pull-requests"],
-};
+const REQUIRED_READ_SCOPES: readonly string[] = ["contents"];
 
 const EXPECTED_WORKFLOW_DEFAULT = "an explicit least-privilege permissions block";
 const EXPECTED_SCOPE_VALUE = '"read", "write", or "none"';
 const EXPECTED_NON_WRITE_SCOPE = '"read" or "none"';
 const EXPECTED_PERMISSION_VALUE = '"read-all" or a permissions mapping';
-const JOB_WRITE_ALLOWLIST_NOTE = 'only jobs "release_finalize" (contents: write) and "publish" (id-token: write) in .github/workflows/ci.yml may hold write scopes';
+const JOB_WRITE_ALLOWLIST_NOTE = 'only jobs "release_finalize" (contents: write) and "publish" (id-token: write) in .github/workflows/ci.yml, and "request-review-on-comment" (pull-requests: write, issues: write) in .github/workflows/re-review.yml may hold write scopes';
 
 type RecordValue = Record<string, unknown>;
 
@@ -127,8 +123,7 @@ function evaluateScopeMapping(
 		const permissionPath = `${pathPrefix}.${scope}`;
 		// On a required workflow default, every non-`contents` scope is forbidden
 		// outright; the exact-mapping pass below owns that path's single diagnostic.
-		const allowedReadScopes = READ_SCOPE_ALLOWLIST[workflow] ?? ["contents"];
-		if (requiredReadDefault && job === undefined && !allowedReadScopes.includes(scope)) continue;
+		if (requiredReadDefault && job === undefined && !REQUIRED_READ_SCOPES.includes(scope)) continue;
 		if (value === "write") {
 			if (job === undefined || !isAllowlisted(workflow, job, scope)) {
 				// Required workflows must be exactly `contents: read`, so "none" is not a
@@ -184,14 +179,13 @@ function evaluateWorkflowDefault(
 		}
 	}
 
-	// Required workflows carry an explicit allowlisted read-scope mapping.
+	// Required workflows may only declare contents: read.
 	if (requiredReadDefault && isRecord(permissions)) {
-		const allowedReadScopes = READ_SCOPE_ALLOWLIST[workflow] ?? ["contents"];
 		for (const scope of Object.keys(permissions)) {
-			if (allowedReadScopes.includes(scope)) continue;
-			workflowViolation(violations, workflow, `permissions.${scope}`, displayValue(permissions[scope]), `<absent>; allowed read scopes are ${allowedReadScopes.join(", ")}`);
+			if (REQUIRED_READ_SCOPES.includes(scope)) continue;
+			workflowViolation(violations, workflow, `permissions.${scope}`, displayValue(permissions[scope]), `<absent>; allowed read scopes are ${REQUIRED_READ_SCOPES.join(", ")}`);
 		}
-		for (const scope of allowedReadScopes) {
+		for (const scope of REQUIRED_READ_SCOPES) {
 			if (permissions[scope] !== "read" && !hasViolationAt(violations, workflow, `permissions.${scope}`)) {
 				workflowViolation(violations, workflow, `permissions.${scope}`, hasOwn(permissions, scope) ? displayValue(permissions[scope]) : "<absent>", displayValue("read"));
 			}

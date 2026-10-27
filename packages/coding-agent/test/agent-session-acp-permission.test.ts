@@ -86,7 +86,7 @@ function makeBridge(outcome: ClientBridgePermissionOutcome): ClientBridge {
 async function createSession(
 	tools: AgentTool[],
 	bridge?: ClientBridge,
-	permissionMode: "allow" | "prompt" = "prompt",
+	permissionMode: "allow" | "prompt" | "deny" = "prompt",
 	extensionRunner?: ExtensionRunner,
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -111,7 +111,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 		extensionRunner,
 	});
@@ -146,7 +146,10 @@ async function createSessionWithMockModel(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { getApiKey: () => "test-key" } as never,
+		modelRegistry: {
+			getApiKey: () => "test-key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 	sess.setSdkPermissionMode("prompt");
@@ -1084,4 +1087,404 @@ it("read tool: requestPermission is never called for non-gated tools", async () 
 
 	expect(permissionSpy).toHaveBeenCalledTimes(0);
 	expect(readTool.executeCalls).toBe(1);
+});
+
+it("computer tool takes the ACP permission path before executing", async () => {
+	const computerTool = makeFakeTool("computer");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([computerTool], bridge);
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-computer", { action: "screenshot" }, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(requests.map(({ toolName, title }) => ({ toolName, title }))).toEqual([
+		{ toolName: "computer", title: "Computer screenshot" },
+	]);
+	expect(computerTool.executeCalls).toBe(1);
+});
+
+it("computer tool permission rejection prevents execution", async () => {
+	const computerTool = makeFakeTool("computer");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	session = await createSession([computerTool], bridge);
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-computer-reject",
+			{ action: "click", x: 1, y: 2 },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by user \(computer\)/);
+	expect(computerTool.executeCalls).toBe(0);
+});
+
+it("computer tool is rejected when the session permission mode is deny", async () => {
+	const computerTool = makeFakeTool("computer");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([computerTool], bridge, "deny");
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-computer-deny",
+			{ action: "type", text: "hello" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by session permission policy \(computer\)/);
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(computerTool.executeCalls).toBe(0);
+});
+
+it("still allows a tool outside the permission set to run without an ACP prompt", async () => {
+	const outsideTool = makeFakeTool("browser");
+	const bridge = makeBridge({ outcome: "cancelled" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([outsideTool], bridge);
+
+	await session.setActiveToolsByName(["browser"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "browser");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-browser", { action: "screenshot" }, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(outsideTool.executeCalls).toBe(1);
+});
+
+it("still allows the computer tool when the session permission mode is allow", async () => {
+	const computerTool = makeFakeTool("computer");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([computerTool], bridge, "allow");
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute(
+		"call-computer-allow",
+		{ action: "screenshot" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(computerTool.executeCalls).toBe(1);
+});
+
+it("python tool takes the ACP permission path before executing", async () => {
+	const pythonTool = makeFakeTool("python");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([pythonTool], bridge);
+
+	await session.setActiveToolsByName(["python"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "python");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute(
+		"call-python",
+		{ action: "execute", code: "print(1)" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(requests.map(({ toolName, title, kind }) => ({ toolName, title, kind }))).toEqual([
+		{ toolName: "python", title: "print(1)", kind: "execute" },
+	]);
+	expect(pythonTool.executeCalls).toBe(1);
+});
+
+it("python tool is rejected in prompt mode when no permission provider is connected", async () => {
+	const pythonTool = makeFakeTool("python");
+	session = await createSession([pythonTool], undefined, "prompt");
+
+	await session.setActiveToolsByName(["python"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "python");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-python-unconnected",
+			{ action: "execute", code: "import os" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/no permission provider is connected \(python\)/);
+	expect(pythonTool.executeCalls).toBe(0);
+});
+
+it("python tool permission rejection prevents execution", async () => {
+	const pythonTool = makeFakeTool("python");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	session = await createSession([pythonTool], bridge);
+
+	await session.setActiveToolsByName(["python"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "python");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-python-reject",
+			{ action: "execute", code: "print(1)" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by user \(python\)/);
+	expect(pythonTool.executeCalls).toBe(0);
+});
+
+it("python tool is rejected when the session permission mode is deny", async () => {
+	const pythonTool = makeFakeTool("python");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([pythonTool], bridge, "deny");
+
+	await session.setActiveToolsByName(["python"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "python");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-python-deny",
+			{ action: "execute", code: "print(1)" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by session permission policy \(python\)/);
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(pythonTool.executeCalls).toBe(0);
+});
+
+it("python tool uses the SDK permission provider when no ACP bridge is connected", async () => {
+	const pythonTool = makeFakeTool("python");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	session = await createSession([pythonTool], undefined, "prompt");
+	session.setSdkPermissionProvider(async toolCall => {
+		requests.push(toolCall);
+		return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+	});
+
+	await session.setActiveToolsByName(["python"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "python");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute(
+		"call-python-sdk",
+		{ action: "execute", code: "print(1)" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(requests.map(({ toolName, title, kind }) => ({ toolName, title, kind }))).toEqual([
+		{ toolName: "python", title: "print(1)", kind: "execute" },
+	]);
+	expect(pythonTool.executeCalls).toBe(1);
+});
+
+it("still allows a non-python tool to run in prompt mode without a permission call", async () => {
+	const readTool = makeFakeTool("read");
+	const bridge = makeBridge({ outcome: "cancelled" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([readTool], bridge, "prompt");
+
+	await session.setActiveToolsByName(["read"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "read");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-read-still-allowed", {}, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(readTool.executeCalls).toBe(1);
+});
+
+it("still allows the python tool when the session permission mode is allow", async () => {
+	const pythonTool = makeFakeTool("python");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([pythonTool], bridge, "allow");
+
+	await session.setActiveToolsByName(["python"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "python");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute(
+		"call-python-allow",
+		{ action: "execute", code: "print(1)" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(pythonTool.executeCalls).toBe(1);
+});
+
+it("recipe tool takes the ACP permission path before executing", async () => {
+	const recipeTool = makeFakeTool("recipe");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([recipeTool], bridge);
+
+	await session.setActiveToolsByName(["recipe"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "recipe");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-recipe", { op: "build --release" }, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(requests.map(({ toolName, title, kind }) => ({ toolName, title, kind }))).toEqual([
+		{ toolName: "recipe", title: "build --release", kind: "execute" },
+	]);
+	expect(recipeTool.executeCalls).toBe(1);
+});
+
+it("recipe tool permission rejection prevents execution", async () => {
+	const recipeTool = makeFakeTool("recipe");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	session = await createSession([recipeTool], bridge);
+
+	await session.setActiveToolsByName(["recipe"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "recipe");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute("call-recipe-reject", { op: "test" }, undefined, undefined as never, undefined as never),
+	).rejects.toThrow(/rejected by user \(recipe\)/);
+	expect(recipeTool.executeCalls).toBe(0);
+});
+
+it("recipe tool is rejected when the session permission mode is deny", async () => {
+	const recipeTool = makeFakeTool("recipe");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([recipeTool], bridge, "deny");
+
+	await session.setActiveToolsByName(["recipe"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "recipe");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute("call-recipe-deny", { op: "echo injected" }, undefined, undefined as never, undefined as never),
+	).rejects.toThrow(/rejected by session permission policy \(recipe\)/);
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(recipeTool.executeCalls).toBe(0);
+});
+
+it("recipe tool is rejected in prompt mode when no permission provider is connected", async () => {
+	const recipeTool = makeFakeTool("recipe");
+	session = await createSession([recipeTool], undefined, "prompt");
+
+	await session.setActiveToolsByName(["recipe"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "recipe");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute("call-recipe-unconnected", { op: "build" }, undefined, undefined as never, undefined as never),
+	).rejects.toThrow(/no permission provider is connected \(recipe\)/);
+	expect(recipeTool.executeCalls).toBe(0);
+});
+
+it("recipe tool uses the SDK permission provider when no ACP bridge is connected", async () => {
+	const recipeTool = makeFakeTool("recipe");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	session = await createSession([recipeTool], undefined, "prompt");
+	session.setSdkPermissionProvider(async toolCall => {
+		requests.push(toolCall);
+		return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+	});
+
+	await session.setActiveToolsByName(["recipe"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "recipe");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-recipe-sdk", { op: "test" }, undefined, undefined as never, undefined as never);
+
+	expect(requests.map(({ toolName, title, kind }) => ({ toolName, title, kind }))).toEqual([
+		{ toolName: "recipe", title: "test", kind: "execute" },
+	]);
+	expect(recipeTool.executeCalls).toBe(1);
+});
+
+it("still allows a tool outside the permission set to run when the session permission mode is deny", async () => {
+	const readTool = makeFakeTool("read");
+	const bridge = makeBridge({ outcome: "cancelled" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([readTool], bridge, "deny");
+
+	await session.setActiveToolsByName(["read"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "read");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-read-deny-still-allowed", {}, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(readTool.executeCalls).toBe(1);
+});
+
+it("still allows the recipe tool when the session permission mode is allow", async () => {
+	const recipeTool = makeFakeTool("recipe");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([recipeTool], bridge, "allow");
+
+	await session.setActiveToolsByName(["recipe"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "recipe");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute(
+		"call-recipe-allow",
+		{ op: "build --release" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(recipeTool.executeCalls).toBe(1);
 });

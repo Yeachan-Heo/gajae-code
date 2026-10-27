@@ -146,6 +146,29 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 	};
 }
 
+/**
+ * Consecutive definite-disabled config reads required before a running owner
+ * retires. A non-atomic rewrite can briefly expose a truncated file that parses
+ * as valid YAML with `notifications.enabled` defaulted off, so one read is not
+ * a settled verdict. With the 5 s heartbeat tick this retires within ~10 s.
+ */
+const DISABLED_READS_BEFORE_RETIRE = 2;
+
+/**
+ * True only when the current config definitely disables this provider:
+ * `notifications.enabled: false`, the provider switched off, or a missing
+ * config file (the same results that keep a new owner from starting). Read or
+ * validation errors (half-written file, incomplete or quarantined provider) are
+ * indeterminate and keep the owner serving.
+ */
+async function configDisablesProvider(agentDir: string, kind: ChatDaemonKind): Promise<boolean> {
+	try {
+		return (await loadConfig(agentDir, kind)) === undefined;
+	} catch {
+		return false;
+	}
+}
+
 function ownerPid(ownerId: string): number | undefined {
 	const match = /^(\d+)(?:-|$)/.exec(ownerId);
 	const pid = Number(match?.[1]);
@@ -231,10 +254,24 @@ export async function runChatDaemonInternal(
 			return;
 		}
 		await runtime.start();
+		let disabledReads = 0;
+		const retireIfDisabled = async (): Promise<void> => {
+			if (!(await configDisablesProvider(agentDir, kind))) {
+				disabledReads = 0;
+				return;
+			}
+			if (++disabledReads < DISABLED_READS_BEFORE_RETIRE || stopping) return;
+			// Same orderly path as an operator stop: stop the transport, let the
+			// serve loop exit, and release ownership as stopped in `finally`.
+			stopping = true;
+			await stopRuntime();
+		};
+		// The returned promise never rejects; tests await it to drive one tick.
 		interval = (deps.setInterval ?? setInterval)(() => {
-			void (async () => {
+			return (async () => {
 				try {
 					if (!(await renewHeartbeat())) await terminateForLostOwnership();
+					else await retireIfDisabled();
 				} catch (error) {
 					terminalError ??= error;
 					stopping = true;

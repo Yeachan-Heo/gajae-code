@@ -69,6 +69,7 @@ const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"config.list/get": "getConfigItems",
 	"session.branch_candidates": "getBranchCandidates",
 	"extensions.list": "getExtensions",
+	"session.progress": "getProjectProgress",
 };
 
 export interface SdkSurfacePolicy {
@@ -79,6 +80,7 @@ export interface SdkSurfacePolicy {
 export interface SdkSurfacePolicyOptions {
 	bindings: Iterable<string>;
 	workflowGateAvailable: boolean;
+	imageUploadsAvailable?: boolean;
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -95,6 +97,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
+					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!WORKFLOW_GATE_CONTROL_OPERATIONS.has(operation.sdkId) || options.workflowGateAvailable) &&
 					(!required[operation.sdkId] || hasBinding(required[operation.sdkId]!)),
 			).map(operation => operation.sdkId),
@@ -128,11 +131,13 @@ export function createSdkCapabilities(
 export function createSdkSurfacePolicyForContext(
 	ctx: ExtensionContext,
 	workflowGateAvailable = false,
+	imageUploadsAvailable = false,
 ): SdkSurfacePolicy {
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
 		bindings,
 		workflowGateAvailable,
+		imageUploadsAvailable,
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

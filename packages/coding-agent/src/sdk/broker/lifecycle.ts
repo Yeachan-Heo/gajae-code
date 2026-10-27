@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import type { NativeExactUnlinkResult } from "@gajae-code/natives";
+import type { NativeExactFileIdentity, NativeExactUnlinkResult } from "@gajae-code/natives";
 
 let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
 
@@ -13,7 +13,7 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, getSessionsDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
 	loadAcceptedModelPresetRegistry,
 	loadAcceptedModelPresetRegistryAsync,
@@ -43,7 +43,19 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
+import {
+	type ManagedGcProtocolScopeInspector,
+	type ManagedScope,
+	managedGcProtocolScopeInspectorForScope,
+	resolveManagedGcScopeForRead,
+	taskArtifactOwnerStorageContextForScope,
+} from "../../session/internal/managed-session-scope";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
+import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
+import {
+	hasSiblingTaskArtifactOwnerTranscript,
+	taskArtifactOwnerLocatorFromTranscriptBytes,
+} from "../../session/internal/task-artifact-owner-transcript";
 import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
@@ -52,6 +64,18 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import { parseFirstJsonlLine } from "../../session/session-transcript-header";
+import type { SessionWorkLease } from "../../session/session-work-lease";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerLocator,
+	TaskArtifactOwnerRetirementOutcome,
+	TaskArtifactOwnerStorageContext,
+} from "../../session/task-artifact-owner-codec";
+import {
+	retireTaskArtifactOwner,
+	verifyTaskArtifactOwnerPhysicalRetirement,
+} from "../../session/task-artifact-owner-retirement";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
@@ -63,6 +87,7 @@ import {
 	resolveManagedSessionScope,
 } from "../session-directory";
 import {
+	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
@@ -87,6 +112,7 @@ import {
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import {
+	DEAD_HOST_HEARTBEAT_SILENCE_MS,
 	type IndexedSession,
 	isSessionAuthorityEligible,
 	resolveSessionLocator,
@@ -94,6 +120,7 @@ import {
 } from "./session-index";
 import {
 	cancellableSleep,
+	DEFAULT_BROKER_PRESPAWN_PREPARATION_TIMEOUT_MS,
 	DEFAULT_READINESS_TIMEOUT_MS,
 	deriveLifecycleOuterDeadlines,
 	isValidReadinessTimeoutMs,
@@ -102,6 +129,12 @@ import {
 	readPreparationTimeouts,
 	startupQueueWaitMs,
 } from "./startup-budget";
+import {
+	type BrokerTaskArtifactOwnerCleanupValidation,
+	type BrokerTaskArtifactOwnerRetirementDisposition,
+	decodeBrokerTaskArtifactOwnerCleanupFields,
+	serializeBrokerTaskArtifactOwnerRetirementDisposition,
+} from "./task-artifact-owner-validation";
 import { worktreeOccupant } from "./worktree-occupancy";
 
 export {
@@ -119,15 +152,308 @@ const MAX_EFFECT_MARKER_LENGTH = 128;
 const MAX_PROCESS_INCARNATION_LENGTH = 256;
 const DEAD_LIFECYCLE_MARKER_EXPIRY_MS = 60 * 60 * 1000;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
+/** Keep detached host stderr diagnostic-only and bounded on disk. */
+const CHILD_STDERR_TAIL_BYTES = 512;
+const LIFECYCLE_DIAGNOSTIC_MARKER = "[lifecycle-diagnostic-v1]";
+
+type ChildStderrCapture = {
+	tail(): string;
+	exitCode(): number | null | undefined;
+	signalCode(): NodeJS.Signals | null | undefined;
+	flush(): Promise<void>;
+	cleanup(): Promise<void>;
+};
+
+type ChildStderrSink = {
+	path: string;
+	drainer: ChildProcess;
+	drainExited: Promise<void>;
+	parentReleased: boolean;
+};
+
+const CHILD_STDERR_LOG_NAME = /^lifecycle-spawn\.[A-Za-z0-9-]+\.log$/u;
+const CHILD_STDERR_ORPHAN_EXPIRY_MS = 60 * 60 * 1000;
+
+/**
+ * Detached hosts outlive the broker, so stderr must not use a broker-owned
+ * pipe. A detached drainer owns the read side and writes only the bounded tail
+ * to disk, keeping both the host and the artifact safe across broker restarts.
+ */
+function openChildStderrSink(agentDir: string): ChildStderrSink | undefined {
+	// Bun on Windows cannot hand a pipe stream without an underlying fd to a
+	// child's stdio ("Passing a stream.Readable without an underlying file
+	// descriptor as stdio[2] is not yet implemented"), which would turn every
+	// launch into spawn_failed. Windows keeps stdio ignored; the stage/child
+	// diagnostics still apply, only the stderr tail reads as `none`.
+	if (process.platform === "win32") return undefined;
+	let logPath: string | undefined;
+	try {
+		const directory = path.join(agentDir, "sdk");
+		fsSync.mkdirSync(directory, { recursive: true, mode: 0o700 });
+		logPath = path.join(directory, `lifecycle-spawn.${randomUUID()}.log`);
+		const logDescriptor = fsSync.openSync(logPath, "w", 0o600);
+		fsSync.closeSync(logDescriptor);
+		const command = resolveSdkInternalSpawnCommand("stderr-drain-internal");
+		const drainer = spawn(
+			command.file,
+			[...command.args, "--path", logPath, "--max-bytes", String(CHILD_STDERR_TAIL_BYTES)],
+			{
+				...(command.cwd === undefined ? {} : { cwd: command.cwd }),
+				detached: true,
+				stdio: ["pipe", "ignore", "ignore"],
+				env: command.env,
+			},
+		);
+		if (!drainer.stdin) throw new Error("lifecycle stderr drainer has no stdin");
+		const drainExit = Promise.withResolvers<void>();
+		const resolveDrainExit = (): void => drainExit.resolve();
+		drainer.once("exit", resolveDrainExit);
+		drainer.once("error", resolveDrainExit);
+		drainer.unref();
+		void reapOrphanedChildStderrLogs(agentDir).catch(() => undefined);
+		return { path: logPath, drainer, drainExited: drainExit.promise, parentReleased: false };
+	} catch {
+		if (logPath) {
+			try {
+				fsSync.unlinkSync(logPath);
+			} catch {}
+		}
+		return undefined;
+	}
+}
+
+function closeChildStderrSink(sink: ChildStderrSink | undefined): void {
+	if (!sink || sink.parentReleased) return;
+	sink.parentReleased = true;
+	// `end()` closes only the broker's duplicate write end after the child has
+	// inherited its own descriptor. `destroy()` can close the shared descriptor
+	// before a fast child starts writing under Bun's stream implementation.
+	sink.drainer.stdin?.end();
+}
+
+async function abortChildStderrSink(sink: ChildStderrSink | undefined): Promise<void> {
+	if (!sink) return;
+	closeChildStderrSink(sink);
+	if (sink.drainer.exitCode === null) sink.drainer.kill();
+	await Promise.race([sink.drainExited, Bun.sleep(100)]);
+	await fs.unlink(sink.path).catch(() => undefined);
+}
+
+function readChildStderrTail(logPath: string): string {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fsSync.openSync(logPath, fsSync.constants.O_RDONLY);
+		const stat = fsSync.fstatSync(descriptor);
+		if (!stat.isFile() || stat.size <= 0) return "";
+		const length = Math.min(CHILD_STDERR_TAIL_BYTES, stat.size);
+		const buffer = Buffer.alloc(length);
+		fsSync.readSync(descriptor, buffer, 0, length, stat.size - length);
+		return buffer.toString("utf8");
+	} catch {
+		return "";
+	} finally {
+		if (descriptor !== undefined) {
+			try {
+				fsSync.closeSync(descriptor);
+			} catch {
+				// Best effort diagnostic read.
+			}
+		}
+	}
+}
+
+function captureChildStderr(child: ChildProcess, sink: ChildStderrSink | undefined): ChildStderrCapture {
+	let observedExitCode: number | null | undefined;
+	let observedSignalCode: NodeJS.Signals | null | undefined;
+	child.once("exit", (code, signal) => {
+		observedExitCode = code;
+		observedSignalCode = signal;
+	});
+	return {
+		tail: () => (sink ? readChildStderrTail(sink.path) : ""),
+		exitCode: () => observedExitCode,
+		signalCode: () => observedSignalCode,
+		flush: async () => {
+			if (
+				child.exitCode === null &&
+				child.signalCode === null &&
+				observedExitCode === undefined &&
+				observedSignalCode === undefined
+			)
+				return;
+			if (sink) await Promise.race([sink.drainExited, Bun.sleep(250)]);
+		},
+		cleanup: async () => {
+			if (!sink) return;
+			closeChildStderrSink(sink);
+			// The drainer writes through a descriptor it already holds, so unlinking
+			// here retires the artifact for successful and failed launches alike: any
+			// later host output lands on an unlinked inode and dies with the drainer.
+			await fs.unlink(sink.path).catch(() => undefined);
+		},
+	};
+}
+
+/** Remove lifecycle stderr artifacts abandoned by a broker or detached host crash. */
+export async function reapOrphanedChildStderrLogs(
+	agentDir: string,
+	limit = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
+): Promise<number> {
+	let directory: fsSync.Dir;
+	try {
+		directory = await fs.opendir(path.join(agentDir, "sdk"));
+	} catch {
+		return 0;
+	}
+	const cutoff = Date.now() - CHILD_STDERR_ORPHAN_EXPIRY_MS;
+	let inspected = 0;
+	let reaped = 0;
+	for await (const entry of directory) {
+		if (inspected >= Math.max(0, limit)) break;
+		inspected += 1;
+		if (!entry.isFile() || !CHILD_STDERR_LOG_NAME.test(entry.name)) continue;
+		try {
+			const target = path.join(agentDir, "sdk", entry.name);
+			const stat = await fs.stat(target);
+			if (stat.mtimeMs >= cutoff) continue;
+			await fs.unlink(target);
+			reaped += 1;
+		} catch {
+			// A concurrent drainer or another broker may own the artifact.
+		}
+	}
+	return reaped;
+}
+
+async function settleChildExitObservation(child: ChildProcess, stderr?: ChildStderrCapture): Promise<void> {
+	const exitCode = stderr?.exitCode();
+	const signalCode = stderr?.signalCode();
+	if (
+		child.exitCode !== null ||
+		child.signalCode !== null ||
+		(exitCode !== null && exitCode !== undefined) ||
+		(signalCode !== null && signalCode !== undefined)
+	)
+		return;
+	const exited = Promise.withResolvers<void>();
+	child.once("exit", () => exited.resolve());
+	await Promise.race([exited.promise, Bun.sleep(100)]);
+}
+
+type ChildLifecycleStatus = {
+	state: "alive" | "exited" | "uncertain";
+	pid?: number;
+	exitCode: number | null;
+	signalCode: NodeJS.Signals | null;
+};
+
+function childLifecycleStatus(
+	broker: Broker,
+	child: ChildProcess,
+	authority: EffectMarker | undefined,
+	stderrCapture?: ChildStderrCapture,
+): ChildLifecycleStatus {
+	const exitCode = child.exitCode ?? stderrCapture?.exitCode() ?? null;
+	const signalCode = child.signalCode ?? stderrCapture?.signalCode() ?? null;
+	if (exitCode !== null || signalCode !== null)
+		return { state: "exited", ...(child.pid === undefined ? {} : { pid: child.pid }), exitCode, signalCode };
+	if (authority) {
+		const observation = observeProcess(authority.pid, authority.incarnation, value =>
+			processIncarnationForBroker(broker, value),
+		);
+		return {
+			state: observation,
+			pid: authority.pid,
+			exitCode,
+			signalCode,
+		};
+	}
+	return {
+		state: "uncertain",
+		...(child.pid === undefined ? {} : { pid: child.pid }),
+		exitCode,
+		signalCode,
+	};
+}
+
+/**
+ * The drainer keeps only the last `CHILD_STDERR_TAIL_BYTES`, so a credential
+ * that straddles the cutoff (or exceeds the tail) survives as a bare suffix that
+ * `sanitizeSdkStartupMessage` can no longer match exactly. Any tail prefix that
+ * is a suffix of a known secret is therefore redacted before sanitization.
+ */
+function redactTruncatedSecretPrefix(tail: string, knownSecrets: Iterable<unknown>): string {
+	if (!tail) return tail;
+	const leadingReplacement = tail.startsWith("\uFFFD") ? 1 : 0;
+	const body = tail.slice(leadingReplacement);
+	// A one- or two-character overlap is as likely to be coincidence as a cut
+	// credential and reveals nothing usable; keep the diagnostic readable there.
+	const minimumOverlap = 3;
+	let longestMatch = 0;
+	for (const secret of knownSecrets) {
+		if (typeof secret !== "string" || secret.length < minimumOverlap) continue;
+		const max = Math.min(secret.length, body.length);
+		for (let length = max; length > Math.max(longestMatch, minimumOverlap - 1); length--) {
+			if (body.startsWith(secret.slice(secret.length - length))) {
+				longestMatch = length;
+				break;
+			}
+		}
+	}
+	return longestMatch === 0 ? tail : `[redacted-secret]${body.slice(longestMatch)}`;
+}
+
+function lifecycleChildDiagnostic(
+	stage: string,
+	waitingFor: string,
+	status: ChildLifecycleStatus,
+	stderr: ChildStderrCapture | undefined,
+	cause?: string,
+	knownSecrets: Iterable<unknown> = lifecycleKnownSecrets(),
+): string {
+	const parts = [LIFECYCLE_DIAGNOSTIC_MARKER, `stage=${stage}`, `waiting_for=${waitingFor}`, `child=${status.state}`];
+	if (status.pid !== undefined) parts.push(`pid=${status.pid}`);
+	if (status.state === "exited") {
+		parts.push(`exit=${status.exitCode ?? "null"}`, `signal=${status.signalCode ?? "none"}`);
+	} else {
+		parts.push("exit=not_observed", "signal=not_observed");
+	}
+	const rawStderr = redactTruncatedSecretPrefix(stderr?.tail() ?? "", knownSecrets).trim();
+	if (rawStderr) parts.push(`stderr=${JSON.stringify(sanitizeSdkStartupMessage(rawStderr, knownSecrets))}`);
+	else parts.push("stderr=none");
+	if (cause) parts.push(`cause=${sanitizeSdkStartupMessage(cause, knownSecrets)}`);
+	return parts.join(" ");
+}
+
+function validateLifecycleExecutable(file: string): void {
+	// Bun's Node-compatible spawn can emit an ENOENT error before the returned
+	// ChildProcess has an opportunity to receive an `error` listener. Validate
+	// absolute launch paths first so a missing or non-executable runtime becomes a
+	// normal broker response instead of an uncaught broker exception. Bare names
+	// still resolve through PATH at spawn time.
+	if (!path.isAbsolute(file)) return;
+	const stat = fsSync.statSync(file);
+	if (!stat.isFile()) throw new Error(`Lifecycle runtime executable is not a regular file: ${file}`);
+	fsSync.accessSync(file, fsSync.constants.X_OK);
+}
+
+function lifecycleChildExitDiagnostic(child?: ChildProcess): string | undefined {
+	if (!child) return undefined;
+	const parts: string[] = [];
+	if (child.exitCode !== null && child.exitCode !== 0) parts.push(`exit=${child.exitCode}`);
+	if (child.signalCode) parts.push(`signal=${child.signalCode}`);
+	return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+export function lifecycleFailureMessage(message: string, child?: ChildProcess): string {
+	const details = [lifecycleChildExitDiagnostic(child)].filter((value): value is string => value !== undefined);
+	return details.length > 0 ? `${message} (${details.join("; ")})` : message;
+}
 
 function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
 	const parts = [`Session ${id} ${READY_THEN_EXIT_MESSAGE}.`];
-	if (child && child.exitCode !== null) parts.push(`exit=${child.exitCode}`);
-	if (child?.signalCode) parts.push(`signal=${child.signalCode}`);
-	// Host stderr is deliberately excluded: the detached host receives launch
-	// configuration and inherited credentials, and no pattern-based redaction can
-	// prove arbitrary child output free of that material; its stderr is discarded
-	// by the OS and never captured (#4712 review).
+	const diagnostic = lifecycleFailureMessage("", child).trim();
+	if (diagnostic) parts.push(diagnostic);
 	return fail("ready_then_exited", parts.join(" "));
 }
 
@@ -135,20 +461,34 @@ const STARTUP_CLEANUP_UNCERTAIN_MESSAGE =
 	"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.";
 
 export function terminalUncertainStartupMessage(response: BrokerResponse): string {
-	if (response.ok || response.error.code !== "spawn_failed") return STARTUP_CLEANUP_UNCERTAIN_MESSAGE;
+	if (response.ok) return STARTUP_CLEANUP_UNCERTAIN_MESSAGE;
+	// Ordinary spawn errors may contain executable paths; keep the historical
+	// path-free fallback for those. Lifecycle diagnostics are deliberately
+	// recognizable and already bounded/redacted, so preserve their stage/cause
+	// fields even when cleanup proof is the part that failed.
+	const original = response.error.message.includes(LIFECYCLE_DIAGNOSTIC_MARKER)
+		? sanitizeSdkStartupMessage(response.error.message)
+		: "SDK internal process could not be started.";
 	logger.warn("sdk broker retained a sanitized launch failure after uncertain startup cleanup", {
-		message: sanitizeSdkStartupMessage(response.error.message),
+		message: original,
 	});
-	return `${STARTUP_CLEANUP_UNCERTAIN_MESSAGE} Original launch failure: SDK internal process could not be started.`;
+	return `${STARTUP_CLEANUP_UNCERTAIN_MESSAGE} Original launch failure: ${original}`;
 }
 
 export async function waitForChildSpawn(
-	spawned: Pick<ChildProcess, "off" | "on" | "once">,
+	spawned: Pick<ChildProcess, "off" | "on" | "once" | "pid">,
 	onPostSpawnError: (error: Error) => void = error =>
 		logger.warn("sdk session child emitted an error after successful spawn", {
 			message: sanitizeSdkStartupMessage(error),
 		}),
 ): Promise<void> {
+	// Bun may publish the `spawn` event synchronously for native executables.
+	// A populated PID is already the same ownership fact the event conveys, so
+	// do not wait forever for an event that was emitted before this listener ran.
+	if (spawned.pid !== undefined) {
+		spawned.on("error", onPostSpawnError);
+		return;
+	}
 	const spawnOutcome = Promise.withResolvers<void>();
 	const onSpawn = () => {
 		spawned.off("error", onError);
@@ -207,6 +547,7 @@ type LifecycleCommandResolver = () => LifecycleCommand;
 const lifecycleCommandResolversForTest = new WeakMap<Broker, LifecycleCommandResolver>();
 const lifecycleCleanupHooksForTest = new WeakMap<Broker, () => void>();
 const startupAdmittedInputs = new WeakSet<Input>();
+const startupBrokerDerivedAdmissions = new WeakMap<Input, { admittedAt: number; preSpawnDeadlineAt: number }>();
 const startupLaunchInputs = new WeakMap<Input, SessionLaunch>();
 type EnsureLaunchWorktreeForTest = (
 	plan: GjcLaunchWorktreePlan,
@@ -317,7 +658,10 @@ export function hasValidLifecycleDeadlines(value: LifecycleDeadlines, now = Date
 type Input = Record<string, unknown>;
 // The admitted launch deadline must survive the response phase: executeLifecycle
 // receives the caller's original input after startup admission has expanded it.
-type LifecycleEffectIntentWithDeadline = LifecycleEffectIntent & { lifecycleCleanupDeadlineAt?: number };
+type LifecycleEffectIntentWithDeadline = LifecycleEffectIntent & {
+	lifecycleCleanupDeadlineAt?: number;
+	admissionCleanupDeadlineAt?: number;
+};
 export const isCanonicalSessionId = (value: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const defaultStateRoot = (cwd: string) => path.join(path.resolve(cwd), ".gjc", "state");
 const hasDefaultStateRoot = (cwd: string, root: string) => path.resolve(root) === defaultStateRoot(cwd);
@@ -607,6 +951,14 @@ type SessionLaunch = {
 	modelId?: string;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
+	/**
+	 * Per-session environment for the hosted session (#6735). Applied to the
+	 * session host's spawn environment (and therefore inherited by its Bash
+	 * executor) on top of the broker's own environment, after `unsetEnv` has
+	 * removed inherited names. Broker-reserved `GJC_*` names are rejected.
+	 */
+	env?: Record<string, string>;
+	unsetEnv?: string[];
 	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
 	coordinatorStateDir?: string;
 	coordinatorSessionId?: string;
@@ -618,7 +970,240 @@ type SessionLaunch = {
 	worktreePlan?: GjcLaunchWorktreePlan;
 };
 
+const CREDENTIAL_NAME_PATTERN = /(?:token|secret|password|credential|api[_-]?key|auth|cookie)/iu;
+const SESSION_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+const SESSION_ENV_MAX_ENTRIES = 256;
+const SESSION_ENV_MAX_VALUE_LENGTH = 131_072;
+
+function isSessionEnvName(name: unknown): name is string {
+	return (
+		typeof name === "string" &&
+		name.length <= 256 &&
+		SESSION_ENV_NAME_PATTERN.test(name) &&
+		// GJC_* carries broker-issued launch authority (request, effect marker,
+		// state root, coordinator correlation); a caller must not shadow it.
+		!name.toUpperCase().startsWith("GJC_")
+	);
+}
+
+const sessionEnvKey = (name: string): string => (process.platform === "win32" ? name.toUpperCase() : name);
+
+/**
+ * Validates the optional per-session `env`/`unsetEnv` pair (#6735). Returns
+ * null when either is malformed so the caller fails the launch closed.
+ */
+export function lifecycleSessionEnv(input: {
+	env?: unknown;
+	unsetEnv?: unknown;
+}): { env?: Record<string, string>; unsetEnv?: string[] } | null {
+	let env: Record<string, string> | undefined;
+	if (input.env !== undefined) {
+		if (input.env === null || typeof input.env !== "object" || Array.isArray(input.env)) return null;
+		const entries = Object.entries(input.env as Record<string, unknown>);
+		if (entries.length > SESSION_ENV_MAX_ENTRIES) return null;
+		const seen = new Set<string>();
+		for (const [name, value] of entries) {
+			if (
+				!isSessionEnvName(name) ||
+				typeof value !== "string" ||
+				value.length > SESSION_ENV_MAX_VALUE_LENGTH ||
+				value.includes("\0") ||
+				seen.has(sessionEnvKey(name))
+			)
+				return null;
+			seen.add(sessionEnvKey(name));
+		}
+		env = Object.fromEntries(entries) as Record<string, string>;
+	}
+	let unsetEnv: string[] | undefined;
+	if (input.unsetEnv !== undefined) {
+		if (!Array.isArray(input.unsetEnv) || input.unsetEnv.length > SESSION_ENV_MAX_ENTRIES) return null;
+		const keys = new Set<string>();
+		for (const name of input.unsetEnv) {
+			if (!isSessionEnvName(name) || keys.has(sessionEnvKey(name))) return null;
+			keys.add(sessionEnvKey(name));
+		}
+		// Setting and unsetting the same name is contradictory, not a precedence question.
+		if (env && Object.keys(env).some(name => keys.has(sessionEnvKey(name)))) return null;
+		unsetEnv = [...(input.unsetEnv as string[])];
+	}
+	return { ...(env ? { env } : {}), ...(unsetEnv ? { unsetEnv } : {}) };
+}
+
+/**
+ * Composes the inherited part of a lifecycle session host's environment:
+ * drops the process-local master capability, every `unsetEnv` name, and any
+ * inherited name an explicit per-session `env` entry replaces (case-folded on
+ * Windows so `Path` and `PATH` never both reach the child), then layers the
+ * per-session `env` on top. Broker-issued `GJC_*` keys are applied after this.
+ */
+export function lifecycleSessionHostBaseEnv(
+	inherited: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>,
+	launch: { env?: Readonly<Record<string, string>>; unsetEnv?: readonly string[] },
+): Record<string, string> {
+	const removed = new Set([...(launch.unsetEnv ?? []), ...Object.keys(launch.env ?? {})].map(sessionEnvKey));
+	// Valid names like `__proto__` must remain own environment entries.
+	const base = Object.create(null) as Record<string, string>;
+	for (const [name, value] of Object.entries(inherited)) {
+		if (name === "GJC_MASTER_CAPABILITY" || typeof value !== "string" || removed.has(sessionEnvKey(name))) continue;
+		base[name] = value;
+	}
+	return { ...base, ...launch.env };
+}
+
+function lifecycleLaunchKnownSecrets(launch: SessionLaunch): string[] {
+	const secrets = [
+		...lifecycleKnownSecrets(),
+		...(launch.coordinatorSidecarSigningKey ? [launch.coordinatorSidecarSigningKey] : []),
+		...(launch.mcpServers ?? []).flatMap(server => {
+			if ("url" in server) {
+				// Only credential-bearing headers are secrets. Treating every header
+				// value (`X-Tenant: a`) as one would redact ordinary characters out of
+				// the diagnostic this path exists to expose.
+				return Object.entries(server.headers ?? {}).flatMap(([name, value]) => {
+					const scheme = /^(?:Bearer|Basic)\s+/iu;
+					if (!CREDENTIAL_NAME_PATTERN.test(name) && !scheme.test(value)) return [];
+					const bare = value.replace(scheme, "");
+					return bare === value ? [value] : [value, bare];
+				});
+			}
+			if (!server.env) return [];
+			return Object.entries(server.env)
+				.filter(([name, value]) => value && CREDENTIAL_NAME_PATTERN.test(name))
+				.map(([, value]) => value);
+		}),
+		...Object.entries(launch.env ?? {})
+			.filter(([name, value]) => value && CREDENTIAL_NAME_PATTERN.test(name))
+			.map(([, value]) => value),
+	];
+	return [...new Set(secrets.filter(secret => typeof secret === "string" && secret.length > 0))];
+}
+
 type CleanupEvidence = BrokerCleanupEvidence;
+
+function brokerTaskArtifactOwnerCleanupFields(cleanup: CleanupEvidence): Record<string, unknown> {
+	const fields: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(cleanup)) {
+		if (key.startsWith("taskArtifactOwner")) fields[key] = value;
+	}
+	return fields;
+}
+
+function managedOwnerScopeFromInventory(scope: ManagedSessionScope): ManagedScope {
+	const resolved = resolveManagedGcScopeForRead({
+		cwd: scope.legacyLexicalCwd,
+		agentDir: scope.agentDir,
+		sessionsRoot: scope.sessionsRoot,
+	});
+	if (
+		resolved.kind !== "resolved" ||
+		resolved.scope.apiVersion !== scope.apiVersion ||
+		resolved.scope.layoutVersion !== scope.layoutVersion ||
+		resolved.scope.identityVersion !== scope.identityVersion ||
+		resolved.scope.agentDir !== scope.agentDir ||
+		resolved.scope.sessionsRoot !== scope.sessionsRoot ||
+		resolved.scope.canonicalCwd !== scope.canonicalCwd ||
+		resolved.scope.legacyLexicalCwd !== scope.legacyLexicalCwd ||
+		resolved.scope.directoryName !== scope.directoryName ||
+		resolved.scope.directoryPath !== scope.directoryPath
+	)
+		throw new Error("managed_task_artifact_owner_scope_changed");
+	return resolved.scope;
+}
+
+function taskArtifactOwnerTranscriptMatches(
+	storage: FileSessionStorage,
+	target: VerifiedSessionDeleteTarget,
+	evidence: TaskArtifactOwnerDeletionEvidence,
+): boolean {
+	const transcriptPath = target.detachedTranscriptPath ?? target.transcriptPath;
+	try {
+		const parent = fsSync.lstatSync(path.dirname(transcriptPath), { bigint: true });
+		if (
+			!parent.isDirectory() ||
+			parent.isSymbolicLink() ||
+			parent.dev !== target.transcriptParentIdentity?.dev ||
+			parent.ino !== target.transcriptParentIdentity?.ino
+		)
+			return false;
+		const snapshot = storage.readSnapshotSync(transcriptPath);
+		const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+		if (
+			!snapshot.stat.isFile ||
+			snapshot.stat.dev !== target.transcriptIdentity.dev ||
+			snapshot.stat.ino !== target.transcriptIdentity.ino ||
+			snapshot.stat.nlink !== target.transcriptIdentity.nlink ||
+			snapshot.stat.size !== target.transcriptIdentity.size ||
+			snapshot.stat.mtimeNs !== target.transcriptIdentity.mtimeNs ||
+			digest !== target.transcriptIdentity.sha256
+		)
+			return false;
+		const header = parseFirstJsonlLine(snapshot.bytes);
+		if (
+			!header ||
+			typeof header.cwd !== "string" ||
+			canonicalExistingPath(header.cwd) !== canonicalExistingPath(target.cwd)
+		)
+			return false;
+		const locator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, target.sessionId);
+		return (
+			locator?.schemaVersion === evidence.locator.schemaVersion &&
+			locator.ownerId === evidence.locator.ownerId &&
+			locator.directoryDev === evidence.locator.directoryDev &&
+			locator.directoryIno === evidence.locator.directoryIno
+		);
+	} catch {
+		return false;
+	}
+}
+
+function taskArtifactOwnerFailureDiagnostic(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		message.startsWith("task_artifact_owner_") ? message : `task_artifact_owner_cleanup_failed:${message}`
+	).slice(0, 4096);
+}
+
+function taskArtifactOwnerRetirementDisposition(
+	outcome: TaskArtifactOwnerRetirementOutcome,
+): BrokerTaskArtifactOwnerRetirementDisposition {
+	return serializeBrokerTaskArtifactOwnerRetirementDisposition(outcome);
+}
+
+function captureTaskArtifactOwnerEvidence(
+	storage: FileSessionStorage,
+	target: VerifiedSessionDeleteTarget,
+): { evidence?: TaskArtifactOwnerDeletionEvidence; error?: string } {
+	const transcriptPath = target.detachedTranscriptPath ?? target.transcriptPath;
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch {
+		return { error: "task_artifact_owner_transcript_unavailable" };
+	}
+	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+	if (
+		!snapshot.stat.isFile ||
+		snapshot.stat.dev !== target.transcriptIdentity.dev ||
+		snapshot.stat.ino !== target.transcriptIdentity.ino ||
+		snapshot.stat.nlink !== target.transcriptIdentity.nlink ||
+		snapshot.stat.size !== target.transcriptIdentity.size ||
+		snapshot.stat.mtimeNs !== target.transcriptIdentity.mtimeNs ||
+		digest !== target.transcriptIdentity.sha256
+	)
+		return { error: "task_artifact_owner_transcript_identity_mismatch" };
+	try {
+		const locator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, target.sessionId);
+		if (!locator) return {};
+		const context = target.taskArtifactOwnerStorageContext;
+		if (!context) return { error: "task_artifact_owner_context_missing" };
+		const evidence = captureTaskArtifactOwnerDeletionEvidence(context, target.sessionId, locator);
+		return evidence ? { evidence } : { error: "task_artifact_owner_evidence_missing" };
+	} catch (error) {
+		return { error: taskArtifactOwnerFailureDiagnostic(error) };
+	}
+}
+
 type CleanupIdentity = {
 	dev: bigint;
 	ino: bigint;
@@ -1127,6 +1712,7 @@ const lifecycleMarkerPath = (root: string, id: string) => path.join(root, "sdk",
 const lifecycleReadyPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.ready.json`);
 const lifecycleFailurePath = (root: string, id: string, effectMarker: string) =>
 	path.join(root, "sdk", `${id}.lifecycle.failure.${effectMarker}.json`);
+const lifecycleFailurePromotionPath = (failurePath: string) => `${failurePath}.promoting`;
 type EffectMarker = { pid: number; effectMarker: string; incarnation: string };
 type ReadyAuthority = {
 	endpoint: Record<string, unknown>;
@@ -1141,7 +1727,7 @@ type ReadinessResult =
 	| { kind: "ready_then_exited" }
 	| { kind: "ready_probe_failed"; probe: ReadyAuthorityProbe }
 	| { kind: "child_exited" }
-	| { kind: "timeout" };
+	| { kind: "timeout"; stage: "readiness"; waitingFor: string };
 type BrokerIndex = Pick<Broker, "index">;
 const processIncarnationReadersForTest = new WeakMap<BrokerIndex, (pid: number) => string | undefined>();
 
@@ -1324,9 +1910,9 @@ export async function reapDeadLifecycleMarkers(
 	let inspected = 0;
 	for await (const entry of directoryHandle) {
 		if (inspected >= inspectionLimit) break;
-		inspected += 1;
 		const name = entry.name;
 		if (!entry.isFile() || !name.endsWith(".lifecycle.json")) continue;
+		inspected += 1;
 		const id = name.slice(0, -".lifecycle.json".length);
 		if (!isCanonicalSessionId(id)) continue;
 		const markerPath = path.join(directory, name);
@@ -1398,6 +1984,108 @@ export async function reapDeadLifecycleMarkers(
 	return reaped;
 }
 
+/**
+ * Retires one launch id's lifecycle marker pair after its recorded owner has
+ * exited. Unlike the bounded background sweep, this launch-local repair is
+ * not age-gated and does not require the ready sibling to contain the same
+ * effect marker: the primary marker is the owner authority for this id.
+ */
+type RetireExitedLifecycleMarkerPairHook = () => void | Promise<void>;
+
+async function retireExitedLifecycleMarkerPairImpl(
+	root: string,
+	id: string,
+	afterObservation?: RetireExitedLifecycleMarkerPairHook,
+): Promise<boolean> {
+	if (!isCanonicalSessionId(id)) return false;
+	let directory: string;
+	let directoryIdentity: { dev: bigint; ino: bigint };
+	try {
+		const canonicalRoot = fsSync.realpathSync(root);
+		directory = path.join(canonicalRoot, "sdk");
+		const directoryStat = fsSync.lstatSync(directory, { bigint: true });
+		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return false;
+		directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
+	} catch {
+		return false;
+	}
+	const markerPath = lifecycleMarkerPath(path.dirname(directory), id);
+	const primary = captureLifecycleFile(markerPath, true, true);
+	if (!primary) return false;
+	let marker: EffectMarker;
+	try {
+		const parsed = parseLifecycleJson(primary.bytes);
+		if (!isExactEffectMarker(parsed)) return false;
+		marker = parsed;
+	} catch {
+		return false;
+	}
+	if (observeProcess(marker.pid, marker.incarnation) !== "exited") return false;
+	await afterObservation?.();
+	const readyPath = lifecycleReadyPath(path.dirname(directory), id);
+	const ready = captureLifecycleFile(readyPath, true, true);
+	try {
+		const currentParent = lifecycleParentIdentity(directory);
+		if (
+			!currentParent ||
+			BigInt(currentParent.dev) !== directoryIdentity.dev ||
+			BigInt(currentParent.ino) !== directoryIdentity.ino
+		)
+			return false;
+		const currentPrimary = captureLifecycleFile(markerPath, true, true);
+		await afterObservation?.();
+		if (
+			!currentPrimary ||
+			!sameLifecycleCleanupIdentity(
+				currentPrimary.identity,
+				serializeCleanupIdentity({ ...primary.identity, size: Number(primary.identity.size) }),
+			)
+		)
+			return false;
+		const currentMarker = parseLifecycleJson(currentPrimary.bytes);
+		if (!isExactEffectMarker(currentMarker) || !sameEffectMarker(currentMarker, marker)) return false;
+		if (ready) {
+			const currentReady = captureLifecycleFile(readyPath, true, true);
+			if (
+				!currentReady ||
+				!sameLifecycleCleanupIdentity(
+					currentReady.identity,
+					serializeCleanupIdentity({ ...ready.identity, size: Number(ready.identity.size) }),
+				)
+			)
+				return false;
+			const removedReady = nativeLifecycle().exactUnlinkDirect(readyPath, {
+				...ready.identity,
+				parentDev: directoryIdentity.dev,
+				parentIno: directoryIdentity.ino,
+				quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
+			});
+			if (!removedReady.ok && removedReady.code !== "not_found") return false;
+		}
+		const removedMarker = nativeLifecycle().exactUnlinkDirect(markerPath, {
+			...primary.identity,
+			parentDev: directoryIdentity.dev,
+			parentIno: directoryIdentity.ino,
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(markerPath)}`,
+		});
+		return removedMarker.ok || removedMarker.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+export async function retireExitedLifecycleMarkerPair(root: string, id: string): Promise<boolean> {
+	return retireExitedLifecycleMarkerPairImpl(root, id);
+}
+
+export async function retireExitedLifecycleMarkerPairForTest(
+	root: string,
+	id: string,
+	afterObservation: RetireExitedLifecycleMarkerPairHook,
+): Promise<boolean> {
+	return retireExitedLifecycleMarkerPairImpl(root, id, afterObservation);
+}
+
 export async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -1421,29 +2109,265 @@ export async function writeEffectMarker(root: string, id: string, marker: Effect
 	}
 }
 
+export class LifecycleReadinessCleanupError extends Error {
+	constructor(cause: unknown) {
+		super("Lifecycle readiness marker cleanup could not be proven.", { cause });
+		this.name = "LifecycleReadinessCleanupError";
+	}
+}
+
+type LifecyclePublicationIdentity = {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	sha256: string;
+};
+
+async function captureOpenedLifecycleFileIdentity(
+	handle: fs.FileHandle,
+): Promise<LifecyclePublicationIdentity & { nlink: bigint }> {
+	const stat = await handle.stat({ bigint: true });
+	if (
+		!stat.isFile() ||
+		stat.nlink !== 1n ||
+		stat.size > BigInt(MAX_LIFECYCLE_METADATA_BYTES) ||
+		!Number.isSafeInteger(Number(stat.size))
+	)
+		throw new Error("Lifecycle temporary file identity is invalid.");
+	const contents = Buffer.alloc(Number(stat.size));
+	const { bytesRead } = await handle.read(contents, 0, contents.length, 0);
+	if (bytesRead !== contents.length) throw new Error("Lifecycle temporary file changed during identity capture.");
+	const current = await handle.stat({ bigint: true });
+	if (
+		!current.isFile() ||
+		current.dev !== stat.dev ||
+		current.ino !== stat.ino ||
+		current.nlink !== stat.nlink ||
+		current.size !== stat.size ||
+		current.mtimeNs !== stat.mtimeNs
+	)
+		throw new Error("Lifecycle temporary file changed during identity capture.");
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: createHash("sha256").update(contents).digest("hex"),
+		nlink: stat.nlink,
+	};
+}
+
+function removeLifecyclePublicationFile(
+	file: string,
+	identity: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+	allowHardLink = false,
+): boolean {
+	try {
+		const result = nativeLifecycle().exactUnlinkDirect(file, {
+			...identity,
+			...(allowHardLink ? { allowHardLink: true } : {}),
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(file)}`,
+		});
+		return result.ok || result.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+function removeOwnedLifecycleReadyMarker(
+	root: string,
+	id: string,
+	identity: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+): boolean {
+	return removeLifecyclePublicationFile(lifecycleReadyPath(root, id), identity, parent);
+}
+
 /** The child writes this only after its endpoint and semantic ready event are both live. */
-export async function writeSessionLifecycleReady(root: string, id: string, effectMarker: string): Promise<void> {
+export async function writeSessionLifecycleReady(
+	root: string,
+	id: string,
+	effectMarker: string,
+	canPublish: () => boolean = () => true,
+	onPublishing?: (revoke: () => Promise<boolean>) => void,
+	onPublished?: () => void,
+): Promise<void> {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
+	const native = nativeLifecycle();
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const parent = lifecycleParentIdentity(directory);
+	if (!parent) throw new Error("Lifecycle readiness directory identity is unavailable.");
+	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
 	const temporary = path.join(directory, `.${id}.lifecycle.ready.${randomUUID()}.tmp`);
-	const handle = await fs.open(
-		temporary,
-		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
-		0o600,
-	);
+	const readyPath = lifecycleReadyPath(root, id);
+
+	let handle: fs.FileHandle | undefined;
+	let published = false;
+	let placeholderHandle: fs.FileHandle | undefined;
+	let temporaryCreatedByUs = false;
+	let placeholderCreatedByUs = false;
+	let publicationAttempted = false;
+	let publicationIdentity: (NativeExactFileIdentity & LifecyclePublicationIdentity) | undefined;
+	let placeholderIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
+	let directoryChanged = false;
+	let retainedPublicationPath: string | undefined;
+	let revocation: Promise<boolean> | undefined;
+	const parentStillOwned = (): boolean => {
+		const current = lifecycleParentIdentity(directory);
+		return current !== undefined && current.dev === parent.dev && current.ino === parent.ino;
+	};
+	const capturePublicationIdentity = async (
+		fileHandle: fs.FileHandle,
+		file: string,
+	): Promise<NativeExactFileIdentity & LifecyclePublicationIdentity> => ({
+		...(await captureOpenedLifecycleFileIdentity(fileHandle)),
+		parentDev: parentIdentity.dev,
+		parentIno: parentIdentity.ino,
+		quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(file)}`,
+	});
+	const revoke = (): Promise<boolean> => {
+		if (revocation) return revocation;
+		const identity = publicationIdentity;
+		if (!identity) return Promise.resolve(false);
+		revocation = Promise.resolve().then(() => {
+			try {
+				const result = native.exactUnlinkDirect(readyPath, identity);
+				return result.ok || result.code === "not_found";
+			} catch {
+				return false;
+			}
+		});
+		return revocation;
+	};
 	try {
-		await handle.writeFile(canonicalJson({ pid: process.pid, effectMarker, incarnation }));
+		handle = await fs.open(
+			temporary,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
+			0o600,
+		);
+		temporaryCreatedByUs = true;
+		directoryChanged = true;
+		const contents = Buffer.from(canonicalJson({ pid: process.pid, effectMarker, incarnation }), "utf8");
+		await handle.writeFile(contents);
 		await handle.sync();
-	} finally {
+		publicationIdentity = await capturePublicationIdentity(handle, readyPath);
+		if (publicationIdentity.sha256 !== createHash("sha256").update(contents).digest("hex"))
+			throw new Error("Lifecycle readiness temp contents changed during startup.");
 		await handle.close();
-	}
-	try {
-		await fs.rename(temporary, lifecycleReadyPath(root, id));
+		handle = undefined;
+		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
+		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed before publication.");
+		placeholderHandle = await fs.open(
+			readyPath,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
+			0o600,
+		);
+		placeholderCreatedByUs = true;
+		directoryChanged = true;
+		await placeholderHandle.sync();
+		placeholderIdentity = await captureOpenedLifecycleFileIdentity(placeholderHandle);
+		if (placeholderIdentity.size !== 0n || placeholderIdentity.nlink !== 1n)
+			throw new Error("Lifecycle readiness placeholder identity is invalid.");
+		await placeholderHandle.close();
+		placeholderHandle = undefined;
+		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed before commit.");
+		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication commit.");
+		publicationAttempted = true;
+		const publication = nativeLifecycle().exactReplacePath(
+			temporary,
+			readyPath,
+			{
+				...publicationIdentity,
+				parentDev: parentIdentity.dev,
+				parentIno: parentIdentity.ino,
+			},
+			{
+				...placeholderIdentity,
+				parentDev: parentIdentity.dev,
+				parentIno: parentIdentity.ino,
+			},
+		);
+		if (!publication.ok || publication.retainedPlaceholderPath || publication.retainedUnknownPath) {
+			retainedPublicationPath = publication.retainedPlaceholderPath ?? publication.retainedUnknownPath;
+			throw new Error(`Lifecycle readiness atomic publication failed: ${publication.code ?? "unknown"}.`);
+		}
+		published = true;
+		temporaryCreatedByUs = false;
+		placeholderCreatedByUs = false;
+		onPublishing?.(revoke);
 		await syncDirectory(directory);
+		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed after publication.");
+		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed during publication.");
+		onPublished?.();
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		if (temporaryCreatedByUs && !publicationIdentity && handle) {
+			try {
+				publicationIdentity = await capturePublicationIdentity(handle, readyPath);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (placeholderCreatedByUs && !placeholderIdentity && placeholderHandle) {
+			try {
+				placeholderIdentity = await captureOpenedLifecycleFileIdentity(placeholderHandle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (placeholderHandle) {
+			try {
+				await placeholderHandle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		const parentIsStillOwned = parentStillOwned();
+		if (!parentIsStillOwned)
+			cleanupErrors.push(new Error("Lifecycle readiness temporary parent identity changed during publication."));
+		if (retainedPublicationPath)
+			cleanupErrors.push(new Error("Native readiness publication retained an unresolved path."));
+		if (parentIsStillOwned) {
+			let readyPathRemoved = false;
+			if ((published || publicationAttempted) && publicationIdentity)
+				readyPathRemoved = removeOwnedLifecycleReadyMarker(root, id, publicationIdentity, parentIdentity);
+			if (!readyPathRemoved && placeholderCreatedByUs && placeholderIdentity)
+				readyPathRemoved = removeLifecyclePublicationFile(readyPath, placeholderIdentity, parentIdentity);
+			if ((published || publicationAttempted || placeholderCreatedByUs) && !readyPathRemoved)
+				cleanupErrors.push(new Error("Lifecycle readiness authority could not be exactly revoked."));
+			if (temporaryCreatedByUs) {
+				if (
+					!publicationIdentity ||
+					!removeLifecyclePublicationFile(temporary, publicationIdentity, parentIdentity, true)
+				)
+					cleanupErrors.push(new Error("The exact lifecycle readiness temp file could not be removed."));
+			}
+		}
+		if (directoryChanged && parentIsStillOwned) {
+			try {
+				await syncDirectory(directory);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0)
+			throw new LifecycleReadinessCleanupError(new AggregateError([error, ...cleanupErrors]));
+		throw error;
 	} finally {
-		await fs.rm(temporary, { force: true });
+		if (handle) await handle.close().catch(() => {});
 	}
 }
 
@@ -1553,6 +2477,338 @@ async function syncDirectory(directory: string): Promise<void> {
 	}
 }
 
+export class LifecycleFailurePublicationCleanupError extends Error {
+	readonly unresolvedPaths: readonly string[];
+	constructor(cause: unknown, unresolvedPaths: readonly string[] = []) {
+		super("Lifecycle failure receipt cleanup could not be proven.", { cause });
+		this.name = "LifecycleFailurePublicationCleanupError";
+		this.unresolvedPaths = [...unresolvedPaths];
+	}
+}
+
+function unresolvedLifecycleFailurePaths(error: unknown): readonly string[] {
+	try {
+		return error instanceof LifecycleFailurePublicationCleanupError ? error.unresolvedPaths : [];
+	} catch {
+		return [];
+	}
+}
+
+function removeOwnedFailurePublicationFile(
+	file: string,
+	identity: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+): boolean {
+	try {
+		const result = nativeLifecycle().exactUnlinkDirect(file, {
+			...identity,
+			allowHardLink: true,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(file)}`,
+		});
+		return result.ok || result.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+function incompleteFailureArtifact(artifact: LifecycleFailureArtifact): LifecycleFailureArtifact {
+	return {
+		...artifact,
+		rollback: {
+			endpointGeneration: artifact.rollback.endpointGeneration,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		},
+	};
+}
+
+function hasCompleteFailureRollback(rollback: SdkStartupRollbackResult): boolean {
+	return rollback.fenced && rollback.runtimeRemoved && rollback.hostStopped && rollback.brokerRegistrationReleased;
+}
+
+type LifecycleFailurePromotionFence = { path: string; identity: LifecyclePublicationIdentity };
+
+async function writeLifecycleFailurePromotionFence(
+	target: string,
+	artifact: LifecycleFailureArtifact,
+	artifactBytes: Buffer,
+	parent: { dev: bigint; ino: bigint },
+	parentStillOwned: () => boolean,
+): Promise<LifecycleFailurePromotionFence> {
+	const fencePath = lifecycleFailurePromotionPath(target);
+	const bytes = Buffer.from(
+		canonicalJson({
+			pid: artifact.pid,
+			effectMarker: artifact.effectMarker,
+			incarnation: artifact.incarnation,
+			artifactDigest: createHash("sha256").update(artifactBytes).digest("hex"),
+		}),
+		"utf8",
+	);
+	let handle: fs.FileHandle | undefined;
+	let createdByUs = false;
+	let identity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
+	try {
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed before promotion fencing.");
+		handle = await fs.open(
+			fencePath,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
+			0o600,
+		);
+		createdByUs = true;
+		await handle.writeFile(bytes);
+		await handle.sync();
+		identity = await captureOpenedLifecycleFileIdentity(handle);
+		if (identity.sha256 !== createHash("sha256").update(bytes).digest("hex"))
+			throw new Error("Lifecycle failure receipt promotion fence changed during setup.");
+		await handle.close();
+		handle = undefined;
+		return { path: fencePath, identity };
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		if (handle && createdByUs && !identity) {
+			try {
+				identity = await captureOpenedLifecycleFileIdentity(handle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (createdByUs) {
+			if (!identity) cleanupErrors.push(new Error("Lifecycle failure promotion fence identity is unavailable."));
+			else if (!removeLifecyclePublicationFile(fencePath, identity, parent))
+				cleanupErrors.push(new Error("Lifecycle failure promotion fence could not be exactly removed."));
+		}
+		if (cleanupErrors.length > 0)
+			throw new LifecycleFailurePublicationCleanupError(
+				new AggregateError([error, ...cleanupErrors], "Lifecycle failure promotion fence cleanup failed."),
+			);
+		throw error;
+	}
+}
+
+/**
+ * Reconcile a promotion fence left by a crash after fencing but before removal.
+ * Returns true if the fence was validated and removed; false if it remains (fail-closed).
+ */
+async function reconcileLifecycleFailurePromotionFence(
+	target: string,
+	expected: EffectMarker,
+	parent: { dev: bigint; ino: bigint },
+): Promise<boolean> {
+	const fencePath = lifecycleFailurePromotionPath(target);
+	const parentPath = path.dirname(target);
+	const parentIdentity = lifecycleParentIdentity(parentPath);
+
+	// If parent changed, stay fail-closed
+	if (!parentIdentity || parentIdentity.dev !== parent.dev.toString() || parentIdentity.ino !== parent.ino.toString())
+		return false;
+
+	let fenceHandle: fs.FileHandle | undefined;
+	try {
+		// Try to read the fence to get the expected artifact digest
+		fenceHandle = await fs.open(fencePath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const fenceStat = await fenceHandle.stat({ bigint: true });
+
+		if (!fenceStat.isFile() || fenceStat.nlink !== 1n || fenceStat.size > 4096n) {
+			// Invalid fence file; stay fail-closed
+			await fenceHandle.close();
+			return false;
+		}
+
+		const fenceBytes = Buffer.alloc(Number(fenceStat.size) + 1);
+		const { bytesRead } = await fenceHandle.read(fenceBytes, 0, fenceBytes.length, 0);
+		await fenceHandle.close();
+		fenceHandle = undefined;
+
+		if (bytesRead > 4096) return false;
+
+		const fenceContent: unknown = parseLifecycleJson(fenceBytes.subarray(0, bytesRead));
+		if (
+			typeof fenceContent !== "object" ||
+			fenceContent === null ||
+			typeof (fenceContent as Record<string, unknown>).pid !== "number" ||
+			typeof (fenceContent as Record<string, unknown>).effectMarker !== "string" ||
+			typeof (fenceContent as Record<string, unknown>).incarnation !== "string" ||
+			typeof (fenceContent as Record<string, unknown>).artifactDigest !== "string"
+		)
+			return false;
+
+		const fence = fenceContent as {
+			pid: number;
+			effectMarker: string;
+			incarnation: string;
+			artifactDigest: string;
+		};
+
+		// Validate fence matches expected marker
+		if (
+			fence.pid !== expected.pid ||
+			fence.effectMarker !== expected.effectMarker ||
+			fence.incarnation !== expected.incarnation
+		)
+			return false;
+
+		// Now check if the final receipt exists and matches the fence's recorded digest
+		const finalReceipt = await readLifecycleFailureArtifact(target, expected, true);
+		if (finalReceipt) {
+			// Final receipt exists; validate its digest matches
+			const finalDigest = createHash("sha256").update(finalReceipt.bytes).digest("hex");
+			if (finalDigest === fence.artifactDigest) {
+				// Validation succeeded; try to remove the fence
+				let fenceHandle: fs.FileHandle | undefined;
+				try {
+					fenceHandle = await fs.open(fencePath, fsSync.constants.O_RDONLY);
+					const fenceIdentity = await captureOpenedLifecycleFileIdentity(fenceHandle);
+					await fenceHandle.close();
+					fenceHandle = undefined;
+
+					if (removeLifecyclePublicationFile(fencePath, fenceIdentity, parent)) {
+						await syncDirectory(parentPath);
+						return true;
+					}
+					// Failed to remove fence; stay fail-closed
+					return false;
+				} catch {
+					if (fenceHandle) {
+						try {
+							await fenceHandle.close();
+						} catch {
+							// Ignore close errors
+						}
+					}
+					return false;
+				}
+			}
+		}
+
+		// Check if only staged receipt exists
+		const stagedReceipt = await readLifecycleFailureArtifact(target, expected, true);
+		if (stagedReceipt) {
+			// Staged receipt exists but final doesn't match; try to validate against it
+			const stagedDigest = createHash("sha256").update(stagedReceipt.bytes).digest("hex");
+			if (stagedDigest !== fence.artifactDigest) {
+				// Digest mismatch; stay fail-closed
+				return false;
+			}
+			// Staged matches; we could remove fence here, but since it's staged (not promoted),
+			// we should stay fail-closed to maintain the original promotion intent
+			return false;
+		}
+
+		// No receipt found matching the fence; stay fail-closed
+		return false;
+	} catch {
+		if (fenceHandle) {
+			try {
+				await fenceHandle.close();
+			} catch {
+				// Ignore close errors
+			}
+		}
+
+		// On any error, stay fail-closed
+		return false;
+	}
+}
+
+async function replaceOwnedFailureReceipt(
+	directory: string,
+	target: string,
+	replacement: LifecycleFailureArtifact,
+	expectedDestination: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+): Promise<boolean> {
+	const bytes = Buffer.from(canonicalJson(replacement), "utf8");
+	const temporary = path.join(directory, `.${replacement.effectMarker}.lifecycle.failure.replace.${randomUUID()}.tmp`);
+	let handle: fs.FileHandle | undefined;
+	let temporaryCreatedByUs = false;
+	let sourceIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
+	let unresolvedPaths: string[] = [];
+	try {
+		handle = await fs.open(
+			temporary,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
+			0o600,
+		);
+		temporaryCreatedByUs = true;
+		await handle.writeFile(bytes);
+		await handle.sync();
+		sourceIdentity = await captureOpenedLifecycleFileIdentity(handle);
+		if (sourceIdentity.sha256 !== createHash("sha256").update(bytes).digest("hex"))
+			throw new Error("Replacement lifecycle failure receipt temp changed during publication.");
+		await handle.close();
+		handle = undefined;
+		const result = nativeLifecycle().exactReplacePath(
+			temporary,
+			target,
+			{
+				...sourceIdentity,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+			},
+			{
+				...expectedDestination,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+			},
+		);
+		if (!result.ok || result.retainedPlaceholderPath || result.retainedUnknownPath) {
+			unresolvedPaths = [result.retainedPlaceholderPath, result.retainedUnknownPath].filter(
+				(pathname): pathname is string => pathname !== undefined,
+			);
+			throw new Error(`Lifecycle failure receipt replacement failed: ${result.code ?? "unknown"}.`);
+		}
+		return true;
+	} catch (error) {
+		const cleanupErrors: unknown[] = [error];
+		if (handle && temporaryCreatedByUs && !sourceIdentity) {
+			try {
+				sourceIdentity = await captureOpenedLifecycleFileIdentity(handle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (temporaryCreatedByUs) {
+			if (!sourceIdentity) {
+				unresolvedPaths.push(temporary);
+				cleanupErrors.push(new Error("Replacement lifecycle failure receipt temp identity is unavailable."));
+			} else if (!removeLifecyclePublicationFile(temporary, sourceIdentity, parent, true)) {
+				unresolvedPaths.push(temporary);
+				cleanupErrors.push(new Error("Replacement lifecycle failure receipt temp could not be exactly removed."));
+			} else {
+				try {
+					await syncDirectory(directory);
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+		}
+		if (unresolvedPaths.length > 0 || cleanupErrors.length > 1)
+			throw new LifecycleFailurePublicationCleanupError(
+				new AggregateError(cleanupErrors, "Replacement lifecycle failure receipt cleanup was not confirmed."),
+				unresolvedPaths,
+			);
+		return false;
+	}
+}
 /** Writes bounded startup diagnostics. The child stamps its own pid; the broker may stamp a proven child identity. */
 export async function writeSessionLifecycleFailure(
 	root: string,
@@ -1584,41 +2840,242 @@ export async function writeSessionLifecycleFailure(
 		rollback,
 		...(transcript ? { transcript } : {}),
 	};
-	const bytes = Buffer.from(canonicalJson(artifact), "utf8");
-	if (bytes.length > MAX_LIFECYCLE_METADATA_BYTES)
+	const completeRollback = hasCompleteFailureRollback(rollback);
+	// This path has no supported Windows parent-directory durability barrier.
+	// Keep the receipt incomplete there rather than treating a file flush as a
+	// durable namespace commit.
+	const completeRollbackPromotionAvailable = process.platform !== "win32";
+	const stagedArtifact = completeRollback ? incompleteFailureArtifact(artifact) : artifact;
+	const stagedBytes = Buffer.from(canonicalJson(stagedArtifact), "utf8");
+	const finalBytes = Buffer.from(canonicalJson(artifact), "utf8");
+	if (stagedBytes.length > MAX_LIFECYCLE_METADATA_BYTES || finalBytes.length > MAX_LIFECYCLE_METADATA_BYTES)
 		throw new Error("Lifecycle startup failure exceeds the metadata size ceiling.");
+	const parent = lifecycleParentIdentity(directory);
+	if (!parent) throw new Error("Lifecycle failure receipt parent identity is unavailable.");
+	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
+	const parentStillOwned = (): boolean => {
+		const current = lifecycleParentIdentity(directory);
+		return current !== undefined && current.dev === parent.dev && current.ino === parent.ino;
+	};
 	const target = lifecycleFailurePath(root, id, effectMarker);
 	const temporary = path.join(directory, `.${id}.lifecycle.failure.${effectMarker}.${randomUUID()}.tmp`);
+	let handle: fs.FileHandle | undefined;
+	let temporaryCreatedByUs = false;
+	let temporaryIdentity: LifecyclePublicationIdentity | undefined;
 	let published = false;
+	let directoryChanged = false;
+	let targetIdentity: LifecyclePublicationIdentity | undefined;
+	let existingFinal = false;
+	let promotionFence: LifecycleFailurePromotionFence | undefined;
 	try {
-		const handle = await fs.open(
+		handle = await fs.open(
 			temporary,
-			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
 			0o600,
 		);
-		try {
-			await handle.writeFile(bytes);
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
+		temporaryCreatedByUs = true;
+		directoryChanged = true;
+		await handle.writeFile(stagedBytes);
+		await handle.sync();
+		temporaryIdentity = await captureOpenedLifecycleFileIdentity(handle);
+		if (temporaryIdentity.sha256 !== createHash("sha256").update(stagedBytes).digest("hex"))
+			throw new Error("Lifecycle failure receipt temp contents changed during startup.");
+		await handle.close();
+		handle = undefined;
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent identity changed before publication.");
 		try {
 			await fs.link(temporary, target);
 			published = true;
+			targetIdentity = temporaryIdentity;
+			directoryChanged = true;
+			if (!parentStillOwned())
+				throw new Error("Lifecycle failure receipt parent identity changed after publication.");
 		} catch (writeError) {
 			if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
+			if (!parentStillOwned())
+				throw new Error("Lifecycle failure receipt parent identity changed during collision check.");
 			const existing = await readLifecycleFailureArtifact(target, artifact);
-			if (!existing?.bytes.equals(bytes)) throw new Error("Lifecycle startup failure artifact collision.");
+			if (existing?.bytes.equals(finalBytes)) {
+				existingFinal = true;
+				targetIdentity = existing.identity;
+			} else if (existing?.bytes.equals(stagedBytes)) {
+				targetIdentity = existing.identity;
+			} else {
+				throw new Error("Lifecycle startup failure artifact collision.");
+			}
 		}
-	} finally {
-		await fs.rm(temporary, { force: true });
-		if (published) await syncDirectory(directory);
+		if (!removeLifecyclePublicationFile(temporary, temporaryIdentity, parentIdentity, true))
+			throw new Error("The exact lifecycle failure temporary file could not be removed.");
+		directoryChanged = true;
+		await syncDirectory(directory);
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent identity changed after staging sync.");
+		if (completeRollback && completeRollbackPromotionAvailable && !existingFinal) {
+			if (!targetIdentity) throw new Error("Lifecycle failure receipt promotion lacks exact staging identity.");
+			promotionFence = await writeLifecycleFailurePromotionFence(
+				target,
+				artifact,
+				finalBytes,
+				parentIdentity,
+				parentStillOwned,
+			);
+			directoryChanged = true;
+			await syncDirectory(directory);
+			if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed after promotion fencing.");
+			const promoted = await replaceOwnedFailureReceipt(directory, target, artifact, targetIdentity, parentIdentity);
+			if (!promoted) {
+				const current = await readLifecycleFailureArtifact(target, artifact, true);
+				let safeIncompleteState = current?.bytes.equals(stagedBytes) === true;
+				if (current?.bytes.equals(finalBytes)) {
+					safeIncompleteState = await replaceOwnedFailureReceipt(
+						directory,
+						target,
+						stagedArtifact,
+						current.identity,
+						parentIdentity,
+					);
+					if (!safeIncompleteState)
+						safeIncompleteState = removeOwnedFailurePublicationFile(target, current.identity, parentIdentity);
+				}
+				if (!safeIncompleteState)
+					throw new LifecycleFailurePublicationCleanupError(
+						new Error("Failed complete rollback publication could not be downgraded or revoked."),
+					);
+				throw new LifecycleFailurePublicationCleanupError(
+					new Error("Complete rollback receipt promotion was not durably confirmed."),
+				);
+			}
+			directoryChanged = true;
+			await syncDirectory(directory);
+			if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed after promotion sync.");
+			if (!removeLifecyclePublicationFile(promotionFence.path, promotionFence.identity, parentIdentity))
+				throw new LifecycleFailurePublicationCleanupError(
+					new Error("The durable failure receipt promotion fence could not be removed."),
+				);
+			promotionFence = undefined;
+			directoryChanged = true;
+			await syncDirectory(directory);
+			if (!parentStillOwned())
+				throw new Error("Lifecycle failure receipt parent changed after promotion fence removal.");
+		}
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		if (temporaryCreatedByUs && !temporaryIdentity && handle) {
+			try {
+				temporaryIdentity = await captureOpenedLifecycleFileIdentity(handle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (handle) await handle.close().catch(cleanupError => cleanupErrors.push(cleanupError));
+		if (temporaryCreatedByUs && temporaryIdentity) {
+			if (published) {
+				const current = await readLifecycleFailureArtifact(target, artifact, true);
+				if (current?.bytes.equals(finalBytes) && !existingFinal) {
+					const downgraded = await replaceOwnedFailureReceipt(
+						directory,
+						target,
+						stagedArtifact,
+						current.identity,
+						parentIdentity,
+					);
+					if (!downgraded && !removeOwnedFailurePublicationFile(target, current.identity, parentIdentity))
+						cleanupErrors.push(
+							new Error("The all-true lifecycle failure receipt could not be downgraded or revoked."),
+						);
+				} else if (current?.bytes.equals(stagedBytes) && !existingFinal) {
+					if (!removeOwnedFailurePublicationFile(target, current.identity, parentIdentity))
+						cleanupErrors.push(new Error("The incomplete lifecycle failure receipt could not be revoked."));
+				}
+			}
+			if (!removeOwnedFailurePublicationFile(temporary, temporaryIdentity, parentIdentity))
+				cleanupErrors.push(new Error("The exact lifecycle failure temporary file could not be removed."));
+			directoryChanged = true;
+		} else if (temporaryCreatedByUs) {
+			cleanupErrors.push(new Error("Lifecycle failure receipt temp identity was unavailable for cleanup."));
+		}
+		if (directoryChanged) {
+			try {
+				await syncDirectory(directory);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		const unresolvedReplacementPaths = unresolvedLifecycleFailurePaths(error);
+		if (promotionFence) {
+			if (unresolvedReplacementPaths.length > 0) {
+				cleanupErrors.push(
+					new Error("Lifecycle failure promotion fence retained because native replacement paths are unresolved."),
+				);
+			} else {
+				const current = await readLifecycleFailureArtifact(target, artifact, true);
+				const targetAbsent = (() => {
+					try {
+						fsSync.lstatSync(target);
+						return false;
+					} catch (error) {
+						return (error as NodeJS.ErrnoException).code === "ENOENT";
+					}
+				})();
+				if (!targetAbsent && !current?.bytes.equals(stagedBytes)) {
+					cleanupErrors.push(
+						new Error("Lifecycle failure promotion fence retained because canonical state is unresolved."),
+					);
+				} else {
+					let canonicalStateSynced = false;
+					try {
+						await syncDirectory(directory);
+						canonicalStateSynced = true;
+					} catch (cleanupError) {
+						cleanupErrors.push(cleanupError);
+					}
+					if (canonicalStateSynced) {
+						if (removeLifecyclePublicationFile(promotionFence.path, promotionFence.identity, parentIdentity)) {
+							promotionFence = undefined;
+							try {
+								await syncDirectory(directory);
+							} catch (cleanupError) {
+								cleanupErrors.push(cleanupError);
+							}
+						} else {
+							cleanupErrors.push(new Error("Lifecycle failure promotion fence could not be exactly removed."));
+						}
+					} else {
+						cleanupErrors.push(
+							new Error("Lifecycle failure promotion fence retained without durable canonical state."),
+						);
+					}
+				}
+			}
+		}
+		if (cleanupErrors.length > 0)
+			throw new LifecycleFailurePublicationCleanupError(
+				new AggregateError([error, ...cleanupErrors]),
+				unresolvedReplacementPaths,
+			);
+		throw error;
 	}
+}
+
+function lifecycleFailurePromotionIsPending(file: string, parentIdentity: { dev: string; ino: string }): boolean {
+	const parentPath = path.dirname(file);
+	const before = lifecycleParentIdentity(parentPath);
+	if (!before || before.dev !== parentIdentity.dev || before.ino !== parentIdentity.ino) return true;
+	let pending: boolean;
+	try {
+		fsSync.lstatSync(lifecycleFailurePromotionPath(file));
+		pending = true;
+	} catch (error) {
+		pending = (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+	const after = lifecycleParentIdentity(parentPath);
+	return pending || !after || after.dev !== parentIdentity.dev || after.ino !== parentIdentity.ino;
 }
 
 async function readLifecycleFailureArtifact(
 	file: string,
 	expected: EffectMarker,
+	allowPromotionFence = false,
+	attemptFenceReconciliation = false,
 ): Promise<
 	| {
 			artifact: LifecycleFailureArtifact;
@@ -1630,6 +3087,9 @@ async function readLifecycleFailureArtifact(
 > {
 	let handle: fs.FileHandle | undefined;
 	try {
+		const parentPath = path.dirname(file);
+		const parentIdentity = lifecycleParentIdentity(parentPath);
+		if (!parentIdentity) return undefined;
 		handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile() || stat.nlink !== 1n || stat.size > 4096n) return undefined;
@@ -1644,6 +3104,40 @@ async function readLifecycleFailureArtifact(
 			canonicalJson(value) !== decodeLifecycleUtf8(raw)
 		)
 			return undefined;
+		// A complete rollback receipt on Windows lacks a durable directory-entry
+		// commit witness because Node cannot flush the containing directory here.
+		if (process.platform === "win32" && hasCompleteFailureRollback(value.rollback)) return undefined;
+		const parentAfterRead = lifecycleParentIdentity(parentPath);
+		if (!parentAfterRead || parentAfterRead.dev !== parentIdentity.dev || parentAfterRead.ino !== parentIdentity.ino)
+			return undefined;
+		const promotionPending = lifecycleFailurePromotionIsPending(file, parentIdentity);
+		const parentAfterFence = lifecycleParentIdentity(parentPath);
+		if (
+			!parentAfterFence ||
+			parentAfterFence.dev !== parentIdentity.dev ||
+			parentAfterFence.ino !== parentIdentity.ino
+		)
+			return undefined;
+
+		if (!allowPromotionFence && promotionPending) {
+			// Try to reconcile the fence if this is the startup path
+			if (attemptFenceReconciliation) {
+				await handle.close();
+				handle = undefined;
+
+				const reconciled = await reconcileLifecycleFailurePromotionFence(file, expected, {
+					dev: BigInt(parentIdentity.dev),
+					ino: BigInt(parentIdentity.ino),
+				});
+
+				if (reconciled) {
+					// Fence was removed; retry the read without reconciliation to avoid recursion
+					return readLifecycleFailureArtifact(file, expected, allowPromotionFence, false);
+				}
+			}
+			// Reconciliation didn't happen or failed; stay fail-closed
+			return undefined;
+		}
 		return {
 			artifact: value,
 			bytes: raw,
@@ -1712,11 +3206,13 @@ function lifecycleCleanupPlan(
 	const directory = path.join(root, "sdk");
 	const parentIdentity = lifecycleParentIdentity(directory);
 	if (!parentIdentity) throw new Error("Lifecycle cleanup parent identity is unavailable.");
+	const failurePath = lifecycleFailurePath(root, id, expected.effectMarker);
 	const candidates = [
-		lifecycleFailurePath(root, id, expected.effectMarker),
+		failurePath,
 		path.join(directory, `${id}.json`),
 		lifecycleReadyPath(root, id),
 		lifecycleMarkerPath(root, id),
+		lifecycleFailurePromotionPath(failurePath),
 	];
 	const files: LifecycleCleanupFile[] = candidates.flatMap(file => {
 		const captured = captureLifecycleFile(
@@ -1779,7 +3275,7 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original: string): boolean {
+export function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original: string): boolean {
 	const directory = path.join(path.resolve(root), "sdk");
 	if (path.dirname(original) !== directory) return false;
 	const basename = path.basename(original);
@@ -1787,7 +3283,10 @@ function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original:
 		basename === `${id}.json` ||
 		basename === `${id}.lifecycle.json` ||
 		basename === `${id}.lifecycle.ready.json` ||
-		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename)
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename) ||
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json\\.promoting$`).test(
+			basename,
+		)
 	);
 }
 
@@ -2449,6 +3948,43 @@ async function executeUncertainRetirement(
 	return retirementProof(retirementIdentity, receipt.indexSeq);
 }
 
+/**
+ * Fence a coordinator's dead-host cleanup against the broker's current index
+ * authority. This is deliberately separate from ordinary `session.close`: the
+ * runtime endpoint is already known to be unavailable, so the broker must make
+ * the exact generation terminal under its index lock before coordinator state is
+ * removed. A fresh heartbeat, successor, ambiguous row, or terminal-uncertain
+ * authority refuses the fence.
+ */
+async function executeStaleSessionRetirement(broker: Broker, input: Input): Promise<BrokerResponse> {
+	const id = sessionId(input);
+	if (!id) return fail("invalid_input", "sessionId is required.");
+	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	const requestedAuthority = requestedCloseAuthority(input);
+	if ("error" in requestedAuthority) return requestedAuthority.error;
+	if (!requestedAuthority.authority)
+		return fail("invalid_input", "stale session retirement requires endpoint authority.");
+	const cwd = lifecycleCwd(input);
+	if (!cwd) return fail("invalid_input", "stale session retirement requires cwd.");
+	const result = await broker.index.retireStaleIfCurrent({
+		sessionId: id,
+		workspace: cwd,
+		endpointGeneration: requestedAuthority.authority.endpointGeneration,
+		endpointIncarnation: requestedAuthority.authority.endpointIncarnation,
+	});
+	if (result === "not_found") return fail("not_found", "session is not indexed");
+	if (result === "stale") return fail("endpoint_stale", "session endpoint authority changed or is unresolved.");
+	return {
+		ok: true,
+		result: {
+			sessionId: id,
+			retired: true,
+			...(result === "already_retired" ? { alreadyRetired: true } : {}),
+			heartbeatSilenceMs: DEAD_HOST_HEARTBEAT_SILENCE_MS,
+		},
+	};
+}
+
 function validateLifecycleCleanupFile(root: string, id: string, file: LifecycleCleanupFile): boolean {
 	const directory = path.join(path.resolve(root), "sdk");
 	const original = path.resolve(file.path);
@@ -3029,6 +4565,24 @@ export async function readSessionLifecycleFailure(
 ): Promise<LifecycleFailureArtifact | undefined> {
 	return (await readLifecycleFailureArtifact(lifecycleFailurePath(root, id, expected.effectMarker), expected))
 		?.artifact;
+}
+
+/**
+ * Read a failure artifact with startup-time fence reconciliation.
+ * Called during startup/restart paths to recover from crashes during fence promotion.
+ * Exposed for testing.
+ */
+export function readSessionLifecycleFailureWithReconciliation(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+): Promise<LifecycleFailureArtifact | undefined> {
+	return readLifecycleFailureArtifact(
+		lifecycleFailurePath(root, id, expected.effectMarker),
+		expected,
+		false,
+		true,
+	).then(result => result?.artifact);
 }
 
 export async function readSessionLifecycleFailureForTest(
@@ -3722,6 +5276,52 @@ async function terminateSpawnedChild(
 			failure.artifact.rollback.brokerRegistrationReleased;
 		if (!rollbackComplete) {
 			if (!readyThenExitToleranceEnabled()) {
+				// A child that exited with a non-zero status before publishing any
+				// lifecycle receipt has no durable rollback to wait for. Prove the
+				// owned artifacts are gone and release its registration, but retain
+				// terminal uncertainty for timeouts, clean exits, and child-authored
+				// startup receipts whose rollback is incomplete.
+				if (failure || child.exitCode === null || child.exitCode === 0) return failClosed();
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+				const publishedReady = (await probePublishedReadyAuthority(root, id, expected)).kind === "matched";
+				if (publishedReady) return failClosed();
+				const artifactsRemoved = await removeOwnedLifecycleArtifacts(
+					root,
+					id,
+					expected,
+					undefined,
+					undefined,
+					proofBudget,
+				);
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+				await broker.index.refresh();
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+				const registered = broker.index
+					.listSessions()
+					.sessions.find(session => session.sessionId === id && session.pid === pid);
+				let registrationReleased =
+					!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) ||
+					registered?.terminal === true ||
+					registered?.terminalUncertain === true;
+				if (registered && !registrationReleased) {
+					registrationReleased = await broker.index.unregisterIfCurrent(registered);
+					if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+					await broker.index.refresh();
+					registrationReleased =
+						registrationReleased || !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker);
+				}
+				const stillExited =
+					observeProcess(pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
+					"exited";
+				const endpointGone = await endpointRemoved(root, id);
+				if (
+					stillExited &&
+					artifactsRemoved &&
+					endpointGone &&
+					registrationReleased &&
+					lifecycleProofWithinDeadline(proofBudget)
+				)
+					return true;
 				return failClosed();
 			}
 			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
@@ -4137,12 +5737,11 @@ async function currentReadyAuthority(
 			token?: unknown;
 			pid?: unknown;
 		};
-		// Native-alive owned readiness is the admission authority. `record.live`
-		// also requires a fresh index heartbeat projection, which can lag a just-
-		// registered detached Windows host. Never admit a terminal/uncertain or
-		// native-dead child; do not refuse a native-alive ready host for a stale live bit.
-		await broker.heartbeatSessions();
-		await broker.index.refresh();
+		// Native-alive owned readiness is the admission authority. The indexed
+		// projection can lag a just-registered detached Windows host, so the
+		// change-stamp refresh is deliberately separate from heartbeat liveness.
+		// Never admit a terminal/uncertain or native-dead child.
+		await broker.index.refreshIfChanged();
 		const record = broker.index
 			.listSessions()
 			.sessions.find(
@@ -4216,6 +5815,7 @@ async function waitForReady(
 	deadline: number,
 	expected: EffectMarker,
 	timing: LifecycleTiming,
+	child?: ChildProcess,
 	signal: "session_ready" | typeof SESSION_PREPARED_EVENT = "session_ready",
 ): Promise<ReadinessResult> {
 	const classifyExitedAfterReady = async (): Promise<ReadinessResult> => {
@@ -4227,7 +5827,7 @@ async function waitForReady(
 			: { kind: "child_exited" };
 	};
 	while (timing.now() < deadline) {
-		const startupFailure = await readSessionLifecycleFailure(root, id, expected);
+		const startupFailure = await readSessionLifecycleFailureWithReconciliation(root, id, expected);
 		if (startupFailure) {
 			if (
 				observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
@@ -4238,11 +5838,12 @@ async function waitForReady(
 			}
 			return { kind: "startup_failed", failure: startupFailure };
 		}
-		if (
-			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
-			"exited"
-		) {
-			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
+		const childExited = child !== undefined && (child.exitCode !== null || child.signalCode !== null);
+		const processObservation = observeProcess(expected.pid, expected.incarnation, value =>
+			processIncarnationForBroker(broker, value),
+		);
+		if (childExited || processObservation === "exited") {
+			const finalStartupFailure = await readSessionLifecycleFailureWithReconciliation(root, id, expected);
 			if (finalStartupFailure) {
 				const afterReady = await classifyExitedAfterReady();
 				if (afterReady.kind !== "child_exited") return afterReady;
@@ -4306,7 +5907,7 @@ async function waitForReady(
 		const remaining = deadline - timing.now();
 		if (remaining > 0) await timing.sleep(Math.min(POLL_MS, remaining));
 	}
-	return { kind: "timeout" };
+	return { kind: "timeout", stage: "readiness", waitingFor: signal };
 }
 
 function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorktreeIntent | undefined {
@@ -4487,6 +6088,12 @@ async function launchInput(
 	if (input.mcpServers !== undefined && !isSessionLifecycleMcpServers(input.mcpServers))
 		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
 	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
+	const sessionEnv = lifecycleSessionEnv(input);
+	if (!sessionEnv)
+		return fail(
+			"invalid_input",
+			"env must map valid non-GJC_ variable names to strings, and unsetEnv must list distinct valid names not also set in env.",
+		);
 
 	/**
 	 * Prepared readiness is an explicit creation-only intent. Only the two exact
@@ -4536,6 +6143,7 @@ async function launchInput(
 			modelId,
 			modelPreset,
 			mcpServers,
+			...sessionEnv,
 			worktree,
 			worktreePlan,
 			...(readiness ? { readiness } : {}),
@@ -4559,6 +6167,7 @@ async function launchInput(
 			sessionIdentity: saved.identity,
 			modelPreset,
 			mcpServers,
+			...sessionEnv,
 			worktree,
 			worktreePlan,
 			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
@@ -4593,6 +6202,7 @@ async function launchInput(
 		modelId,
 		modelPreset,
 		mcpServers,
+		...sessionEnv,
 		worktree,
 		worktreePlan,
 		...(coordinatorStateDir ? { coordinatorStateDir } : {}),
@@ -4607,6 +6217,8 @@ type ValidatedDelete = {
 	target: VerifiedSessionDeleteTarget;
 	metadataRoot: string;
 	transcriptParentIdentity: { dev: string; ino: string };
+	taskArtifactOwnerCaptureError?: string;
+	inspectProtocol?: ManagedGcProtocolScopeInspector;
 };
 function cleanupIdentity(
 	identity: BrokerCleanupEvidence["transcriptIdentity"],
@@ -4680,8 +6292,12 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 		(artifactsIdentity.dev !== artifactTreeIdentity.dev || artifactsIdentity.ino !== artifactTreeIdentity.ino)
 	)
 		return fail("terminal_uncertain", "Artifact cleanup tree does not match its ledger-bound root identity.");
-	if (cleanup.phase === "artifacts" && cleanup.artifactsRemoved === true)
-		return fail("terminal_uncertain", "Artifacts-phase cleanup receipt falsely claims artifact completion.");
+	if (
+		cleanup.phase === "artifacts" &&
+		cleanup.artifactsRemoved === true &&
+		cleanup.taskArtifactOwnerDeletionEvidence === undefined
+	)
+		return fail("terminal_uncertain", "Artifacts-phase cleanup receipt lacks immutable owner evidence.");
 	if (
 		cleanup.artifactsRemoved === true &&
 		cleanup.artifactTree &&
@@ -4885,7 +6501,126 @@ async function validateDeletePath(
 			canonicalExistingPath(replay.metadataRoot) !== canonicalRequestedRoot
 		)
 			return fail("invalid_input", "Cleanup receipt does not match the requested saved-session locator.");
-		return replay;
+		const ownerFields = brokerTaskArtifactOwnerCleanupFields(cleanup);
+		if (Object.keys(ownerFields).length === 0) {
+			const sessionsRoot = canonicalExistingPath(getSessionsDir(broker.settings.agentDir));
+			const relative = path.relative(sessionsRoot, replay.target.transcriptPath);
+			if (
+				path.resolve(replay.target.sessionsRoot) !== sessionsRoot ||
+				relative === "" ||
+				relative === ".." ||
+				relative.startsWith(`..${path.sep}`) ||
+				path.isAbsolute(relative)
+			)
+				return fail("terminal_uncertain", "Cleanup receipt does not match the configured session root.");
+			return replay;
+		}
+		const inventory = await managedCandidates(broker, cwd, "Saved");
+		if ("ok" in inventory) return inventory;
+		const transcriptRelative = path.relative(inventory.scope.sessionsRoot, replay.target.transcriptPath);
+		if (
+			path.resolve(replay.target.sessionsRoot) !== inventory.scope.sessionsRoot ||
+			transcriptRelative === "" ||
+			transcriptRelative === ".." ||
+			transcriptRelative.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(transcriptRelative)
+		)
+			return fail("terminal_uncertain", "Cleanup receipt does not match the current managed session authority.");
+		replay.target.sessionsRoot = inventory.scope.sessionsRoot;
+		let ownerContext: TaskArtifactOwnerStorageContext;
+		let ownerScope: ManagedScope;
+		try {
+			ownerScope = managedOwnerScopeFromInventory(inventory.scope);
+			ownerContext = taskArtifactOwnerStorageContextForScope(ownerScope);
+		} catch {
+			return fail(
+				"terminal_uncertain",
+				"Managed task-artifact-owner authority could not be restored for cleanup replay.",
+			);
+		}
+		let owner: BrokerTaskArtifactOwnerCleanupValidation;
+		try {
+			owner = decodeBrokerTaskArtifactOwnerCleanupFields(
+				ownerFields,
+				ownerContext,
+				id,
+				cleanup.phase,
+				cleanup.artifactsRemoved,
+			);
+		} catch {
+			return fail("terminal_uncertain", "Cleanup receipt contains invalid task-artifact owner state.");
+		}
+		let captureError = owner.cleanupDiagnostic;
+		if (!owner.deletionEvidence && captureError === "task_artifact_owner_writer_not_quiescent") {
+			const retainedPaths = [
+				replay.target.detachedArtifactsPath,
+				replay.target.detachedTranscriptPath,
+				replay.target.retainedArtifactsSuccessorPath,
+				replay.target.retainedArtifactsPlaceholderPath,
+				replay.target.retainedArtifactsUnknownPath,
+				replay.target.retainedTranscriptSuccessorPath,
+				replay.target.retainedTranscriptPlaceholderPath,
+				replay.target.retainedTranscriptUnknownPath,
+			];
+			const plannedPaths = [
+				cleanup.plannedArtifactsPath,
+				cleanup.artifactTree?.plannedPath,
+				cleanup.plannedTranscriptPath,
+			];
+			const occupiedPlan = plannedPaths.some(planned => {
+				if (!planned) return false;
+				return [planned, `${planned}.removing`].some(candidate => {
+					try {
+						fsSync.lstatSync(candidate);
+						return true;
+					} catch (error) {
+						return (error as NodeJS.ErrnoException).code !== "ENOENT";
+					}
+				});
+			});
+			if (
+				cleanup.phase !== "artifacts" ||
+				cleanup.artifactsRemoved === true ||
+				Object.keys(ownerFields).some(key => key !== "taskArtifactOwnerCleanupError") ||
+				retainedPaths.some(candidate => candidate !== undefined) ||
+				occupiedPlan ||
+				transcriptParentStat.dev.toString() !== replay.transcriptParentIdentity.dev ||
+				transcriptParentStat.ino.toString() !== replay.transcriptParentIdentity.ino
+			)
+				return fail(
+					"terminal_uncertain",
+					"Initial task-artifact owner capture cannot be retried after unverified cleanup effects.",
+				);
+			replay.target.taskArtifactOwnerStorageContext = ownerContext;
+			const captured = captureTaskArtifactOwnerEvidence(replay.storage, replay.target);
+			if (!captured.evidence && !captured.error)
+				return fail(
+					"terminal_uncertain",
+					"The original task-artifact owner claim could not be restored for capture retry.",
+				);
+			if (captured.evidence) {
+				replay.target.taskArtifactOwnerDeletionEvidence = captured.evidence;
+				replay.target.deferTaskArtifactOwnerRetirement = true;
+			}
+			captureError = captured.error;
+		}
+		if (owner.deletionEvidence) {
+			replay.target.taskArtifactOwnerStorageContext = ownerContext;
+			replay.target.taskArtifactOwnerDeletionEvidence = owner.deletionEvidence;
+			replay.target.deferTaskArtifactOwnerRetirement = true;
+			if (owner.retirementContinuation)
+				replay.target.taskArtifactOwnerRetirementContinuation = owner.retirementContinuation;
+			if (owner.retirementOutcome) replay.target.taskArtifactOwnerRetirementOutcome = owner.retirementOutcome;
+			if (owner.retired) replay.target.taskArtifactOwnerRetired = true;
+			if (owner.payloadRetired) replay.target.taskArtifactOwnerPayloadRetired = true;
+			if (owner.namespaceRetained) replay.target.taskArtifactOwnerNamespaceRetained = true;
+			if (owner.transcriptDeleted) replay.target.taskArtifactOwnerTranscriptDeleted = true;
+		}
+		return {
+			...replay,
+			inspectProtocol: managedGcProtocolScopeInspectorForScope(ownerScope),
+			...(captureError && !owner.deletionEvidence ? { taskArtifactOwnerCaptureError: captureError } : {}),
+		};
 	}
 	const inventory = await managedCandidates(broker, cwd, "Saved");
 	if ("ok" in inventory) return inventory;
@@ -4897,7 +6632,6 @@ async function validateDeletePath(
 	const match = matches[0]!;
 	if (inventory.migrationPolicy === "disabled" && match.provenance === "legacy")
 		return fail("legacy_migration_disabled", "Saved legacy session migration is disabled for this workspace.");
-
 	const storage = new FileSessionStorage();
 	let snapshot: SessionStorageSnapshot;
 	try {
@@ -4926,28 +6660,56 @@ async function validateDeletePath(
 	} catch {
 		return fail("invalid_input", "session.delete transcript parent changed during authorization.");
 	}
+	let ownerContext: TaskArtifactOwnerStorageContext | undefined;
+	let ownerScope: ManagedScope | undefined;
+	let ownerCaptureError: string | undefined;
+	let ownerLocator: TaskArtifactOwnerLocator | undefined;
+	try {
+		ownerLocator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, id);
+	} catch (error) {
+		ownerCaptureError = taskArtifactOwnerFailureDiagnostic(error);
+	}
+	if (ownerLocator) {
+		try {
+			ownerScope = managedOwnerScopeFromInventory(inventory.scope);
+			ownerContext = taskArtifactOwnerStorageContextForScope(ownerScope);
+		} catch {
+			return fail("invalid_input", "Managed task-artifact-owner authority could not be established for deletion.");
+		}
+	}
+	const target: VerifiedSessionDeleteTarget = {
+		sessionsRoot: canonicalExistingPath(inventory.scope.sessionsRoot),
+		transcriptPath: candidatePath,
+		sessionId: id,
+		cwd,
+		transcriptIdentity: {
+			dev: snapshot.stat.dev,
+			ino: snapshot.stat.ino,
+			nlink: snapshot.stat.nlink,
+			size: snapshot.stat.size,
+			mtimeNs: snapshot.stat.mtimeNs,
+			sha256: digest,
+		},
+		transcriptParentIdentity: { dev: transcriptParentStat.dev, ino: transcriptParentStat.ino },
+		...(ownerContext ? { taskArtifactOwnerStorageContext: ownerContext } : {}),
+	};
+	const capturedOwner: { evidence?: TaskArtifactOwnerDeletionEvidence; error?: string } = ownerCaptureError
+		? { error: ownerCaptureError }
+		: captureTaskArtifactOwnerEvidence(storage, target);
+	if (capturedOwner.evidence) {
+		target.taskArtifactOwnerDeletionEvidence = capturedOwner.evidence;
+		target.deferTaskArtifactOwnerRetirement = true;
+	}
 	return {
 		storage,
-		target: {
-			sessionsRoot: canonicalExistingPath(inventory.scope.sessionsRoot),
-			transcriptPath: candidatePath,
-			sessionId: id,
-			cwd,
-			transcriptIdentity: {
-				dev: snapshot.stat.dev,
-				ino: snapshot.stat.ino,
-				nlink: snapshot.stat.nlink,
-				size: snapshot.stat.size,
-				mtimeNs: snapshot.stat.mtimeNs,
-				sha256: digest,
-			},
-			transcriptParentIdentity: { dev: transcriptParentStat.dev, ino: transcriptParentStat.ino },
-		},
+		target,
 		metadataRoot: canonicalRequestedRoot,
+		...(ownerScope ? { inspectProtocol: managedGcProtocolScopeInspectorForScope(ownerScope) } : {}),
 		transcriptParentIdentity: {
 			dev: transcriptParentStat.dev.toString(),
 			ino: transcriptParentStat.ino.toString(),
 		},
+		...(capturedOwner.error ? { taskArtifactOwnerCaptureError: capturedOwner.error } : {}),
 	};
 }
 type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
@@ -5090,9 +6852,27 @@ async function executeLifecycleResponse(
 	if (requestedSourceSessionId !== undefined && !isCanonicalSessionId(requestedSourceSessionId))
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
-		await broker.index.refresh();
-		await broker.heartbeatSessions();
-		await broker.index.refresh();
+		// Creates without managed-worktree admission have no existing session
+		// authority to reconcile, so the change-stamp fast path avoids replaying
+		// the full index under its lock on every ACP spawn. Managed-worktree creates
+		// must serialize with registrations before checking checkout occupancy.
+		if (operation === "session.create" && lifecycleWorktreeTarget(input) === undefined)
+			await broker.index.refreshIfChanged();
+		else await broker.index.refresh();
+		if (operation === "session.create") {
+			// Creation has no existing session authority to reconcile. Keep the
+			// broker's periodic/startup heartbeat checkpoint as the reaping owner,
+			// but do not make a new session wait behind an O(hosts) process-table
+			// pass on the shared agent directory.
+			void broker.heartbeatSessions().catch(error => {
+				logger.warn(`sdk broker: deferred create heartbeat checkpoint failed: ${String(error)}`);
+			});
+		} else {
+			await broker.heartbeatSessions();
+			// The heartbeat mutates the durable index; resume/fork must re-read its
+			// authority before validating the source session below.
+			await broker.index.refresh();
+		}
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
 			const authority = requestedSessionId
@@ -5150,6 +6930,7 @@ async function executeLifecycleResponse(
 		const timing = lifecycleTiming(broker);
 		const admissionGranted = startupAdmittedInputs.has(input);
 		if (!admissionGranted) {
+			const startupReceivedAt = timing.now();
 			const suppliedDeadlineFields = [
 				input.receivedAt,
 				input.requestedReadinessTimeoutMs,
@@ -5177,15 +6958,26 @@ async function executeLifecycleResponse(
 				);
 			}
 			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
-				const admittedInput = launch.worktreePlan
-					? { ...input, admittedAt, requestedReadinessTimeoutMs }
-					: { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
+				const callerSuppliedDeadlines = suppliedDeadlineFields.some(value => value !== undefined);
+				let admittedInput: Input;
+				if (launch.worktreePlan) admittedInput = { ...input, admittedAt, requestedReadinessTimeoutMs };
+				else if (callerSuppliedDeadlines) admittedInput = { ...input };
+				else admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
 				startupAdmittedInputs.add(admittedInput);
+				if (!launch.worktreePlan && !callerSuppliedDeadlines)
+					startupBrokerDerivedAdmissions.set(admittedInput, {
+						admittedAt,
+						preSpawnDeadlineAt: Math.min(
+							admittedAt + DEFAULT_BROKER_PRESPAWN_PREPARATION_TIMEOUT_MS,
+							startupReceivedAt + queueWaitMs,
+						),
+					});
 				startupLaunchInputs.set(admittedInput, launch);
 				try {
 					return await executeLifecycleResponse(broker, operation, admittedInput, identity, cleanup);
 				} finally {
 					startupLaunchInputs.delete(admittedInput);
+					startupBrokerDerivedAdmissions.delete(admittedInput);
 					startupAdmittedInputs.delete(admittedInput);
 				}
 			});
@@ -5213,6 +7005,8 @@ async function executeLifecycleResponse(
 		let readinessDeadline: number;
 		let terminationStartDeadline: number;
 		let outerCleanupDeadlineAt: number | undefined;
+		const brokerAdmission = startupBrokerDerivedAdmissions.get(input);
+		const preSpawnDeadlineAt = brokerAdmission?.preSpawnDeadlineAt;
 		if (launch.worktreePlan) {
 			const prepTimeouts = readPreparationTimeouts(input);
 			if (!prepTimeouts.ok) return fail("invalid_input", PREPARATION_TIMEOUT_INVALID_MESSAGE);
@@ -5243,6 +7037,10 @@ async function executeLifecycleResponse(
 			lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
 			readinessDeadline = deadlines.semanticReadyDeadlineAt;
 			terminationStartDeadline = deadlines.terminationStartDeadlineAt;
+			if (preSpawnDeadlineAt !== undefined) {
+				outerCleanupDeadlineAt = preSpawnDeadlineAt + deadlines.requestedReadinessTimeoutMs;
+				lifecycleDeadline = outerCleanupDeadlineAt;
+			}
 		}
 
 		if (!hasProcessIncarnationAuthority())
@@ -5266,6 +7064,9 @@ async function executeLifecycleResponse(
 			childOwnershipEstablished: false,
 			lifecycleCleanupDeadlineAt:
 				outerCleanupDeadlineAt ?? (childDeadlines as LifecycleDeadlines).lifecycleCleanupDeadlineAt,
+			...(brokerAdmission
+				? { admissionCleanupDeadlineAt: (childDeadlines as LifecycleDeadlines).lifecycleCleanupDeadlineAt }
+				: {}),
 			...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
 		};
 
@@ -5360,6 +7161,7 @@ async function executeLifecycleResponse(
 				terminationStartDeadline = childDeadlines.terminationStartDeadlineAt;
 				lifecycleDeadline = childDeadlines.lifecycleCleanupDeadlineAt;
 			}
+			await retireExitedLifecycleMarkerPair(launch.root, launch.id);
 			await reapDeadLifecycleMarkers(launch.root);
 		} catch (error) {
 			if (launch.worktreePlan && worktreeReceipt?.created && !worktreeReceipt.reused) {
@@ -5367,7 +7169,22 @@ async function executeLifecycleResponse(
 			}
 			return mapPreparationFailure(error);
 		}
-		if (!launch.worktreePlan && timing.now() >= readinessDeadline)
+		if (preSpawnDeadlineAt !== undefined && brokerAdmission !== undefined) {
+			const prepFinishedAt = timing.now();
+			if (prepFinishedAt >= preSpawnDeadlineAt)
+				return fail(
+					"readiness_timeout",
+					`Broker pre-spawn preparation exceeded its ${Math.max(0, preSpawnDeadlineAt - brokerAdmission.admittedAt)} ms allowance after ${Math.max(0, prepFinishedAt - brokerAdmission.admittedAt)} ms.`,
+				);
+			// Only broker-derived tuples restart here; exact caller deadlines remain unchanged.
+			childDeadlines = deriveLifecycleDeadlines(
+				prepFinishedAt,
+				(childDeadlines as LifecycleDeadlines).requestedReadinessTimeoutMs,
+			);
+			readinessDeadline = childDeadlines.semanticReadyDeadlineAt;
+			terminationStartDeadline = childDeadlines.terminationStartDeadlineAt;
+			lifecycleDeadline = childDeadlines.lifecycleCleanupDeadlineAt;
+		} else if (!launch.worktreePlan && timing.now() >= readinessDeadline)
 			return fail(
 				"readiness_timeout",
 				"Lifecycle preparation exhausted the semantic readiness deadline before spawning.",
@@ -5420,28 +7237,31 @@ async function executeLifecycleResponse(
 			...(launch.coordinatorSessionBranch ? { coordinatorSessionBranch: launch.coordinatorSessionBranch } : {}),
 		};
 		let child: ChildProcess | undefined;
+		let childStderr: ChildStderrCapture | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		let childSpawned = false;
+		const knownSecrets = lifecycleLaunchKnownSecrets(launch);
+		const childStderrSink = openChildStderrSink(broker.settings.agentDir);
+		// Runs once every diagnostic that reads the stderr tail has been composed.
+		const cleanupChildStderr = async (): Promise<void> => {
+			if (childStderr) await childStderr.cleanup();
+			else await abortChildStderrSink(childStderrSink);
+		};
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
+				validateLifecycleExecutable(cmd.file);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
-					// stdio stays "ignore": `unref()` does not detach an active
-					// stdio handle, so a parent-owned stderr pipe would keep the
-					// broker process alive for the host's whole lifetime (retention
-					// through restart/shutdown). Host stderr is therefore discarded
-					// by the OS rather than captured (#4712 review).
-					stdio: "ignore",
+					// The detached drainer owns the read side, so the host's stderr remains
+					// usable after this broker exits while the artifact stays bounded.
+					stdio: ["ignore", "ignore", childStderrSink?.drainer.stdin ?? "ignore"],
 					env: {
 						// Master capability is process-local to direct Bash children and must
-						// never cross a broker lifecycle launch boundary.
-						...Object.fromEntries(
-							Object.entries("kind" in cmd ? cmd.env : process.env).filter(
-								([key]) => key !== "GJC_MASTER_CAPABILITY",
-							),
-						),
+						// never cross a broker lifecycle launch boundary. Per-session env
+						// (#6735) is layered here, below the broker-issued GJC_* keys.
+						...lifecycleSessionHostBaseEnv("kind" in cmd ? cmd.env : process.env, launch),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,
@@ -5479,6 +7299,7 @@ async function executeLifecycleResponse(
 				});
 			});
 			if (!authorizedSpawn.authorized) {
+				await cleanupChildStderr();
 				return fail(
 					"startup_admission_refused",
 					"SDK host startup was refused because the broker no longer owns the session root.",
@@ -5486,6 +7307,8 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
+			childStderr = captureChildStderr(spawned, childStderrSink);
+			closeChildStderrSink(childStderrSink);
 			await waitForChildSpawn(spawned);
 			childSpawned = true;
 			const pid = spawned.pid;
@@ -5499,6 +7322,7 @@ async function executeLifecycleResponse(
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
 		} catch (error) {
+			closeChildStderrSink(childStderrSink);
 			const terminated =
 				child && childSpawned
 					? await terminateSpawnedChild(
@@ -5513,139 +7337,231 @@ async function executeLifecycleResponse(
 						)
 					: true;
 
-			return terminated
-				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
+			const response = terminated
+				? fail(
+						"spawn_failed",
+						lifecycleFailureMessage(
+							`Unable to spawn session: ${sanitizeSdkStartupMessage(error, knownSecrets)}`,
+							child,
+						),
+					)
 				: fail(
 						"terminal_uncertain",
-						`Unable to establish spawned-session ownership and could not prove the child dead: ${error instanceof Error ? error.message : String(error)}`,
+						lifecycleFailureMessage(
+							`Unable to establish spawned-session ownership and could not prove the child dead: ${sanitizeSdkStartupMessage(error, knownSecrets)}`,
+							child,
+						),
 					);
+			await cleanupChildStderr();
+			return response;
 		}
-		if (!child || !spawnedAuthority) {
-			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
-		}
-		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
-		const readiness = await waitForReady(
-			broker,
-			launch.id,
-			launch.root,
-			readinessDeadline,
-			spawnedAuthority,
-			timing,
-			launch.readiness === "deferred" ? SESSION_PREPARED_EVENT : "session_ready",
-		);
-
-		if (readiness.kind !== "ready") {
-			const terminated = await terminateSpawnedChild(
-				child,
+		try {
+			if (!child || !spawnedAuthority) {
+				return fail("spawn_failed", "Unable to retain the spawned session process identity.");
+			}
+			await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
+			const readiness = await waitForReady(
 				broker,
 				launch.id,
 				launch.root,
-				lifecycleDeadline,
-				terminationStartDeadline,
+				readinessDeadline,
 				spawnedAuthority,
 				timing,
+				child,
+				launch.readiness === "deferred" ? SESSION_PREPARED_EVENT : "session_ready",
 			);
 
-			if (!terminated)
-				return readiness.kind === "ready_probe_failed"
-					? fail(
-							"endpoint_unreadable",
-							`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)}; cleanup could not be proven.`,
-						)
-					: fail(
-							"terminal_uncertain",
-							`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
-						);
-			// Host stderr never reaches caller-visible error strings: the detached
-			// host handles launch configuration and inherited credentials, so its
-			// output cannot be proven free of secret material — it is discarded at
-			// the OS level (stdio "ignore"), never captured (#4712 review).
-			return readiness.kind === "startup_failed"
-				? fail(
-						readiness.failure.code ?? "spawn_failed",
-						readiness.failure.message,
-						undefined,
-						readiness.failure.details,
-					)
-				: readiness.kind === "ready_then_exited"
-					? readyThenExitedResponse(launch.id, child)
-					: readiness.kind === "ready_probe_failed"
+			if (readiness.kind !== "ready") {
+				if (readiness.kind !== "timeout") await settleChildExitObservation(child, childStderr);
+				if (readiness.kind !== "timeout") await childStderr?.flush();
+				const statusAtFailure = childLifecycleStatus(broker, child, spawnedAuthority, childStderr);
+				const diagnostic =
+					readiness.kind === "startup_failed"
+						? lifecycleChildDiagnostic(
+								readiness.failure.phase,
+								"startup completion",
+								statusAtFailure,
+								childStderr,
+								readiness.failure.message,
+								knownSecrets,
+							)
+						: readiness.kind === "timeout"
+							? lifecycleChildDiagnostic(
+									readiness.stage,
+									readiness.waitingFor,
+									statusAtFailure,
+									childStderr,
+									undefined,
+									knownSecrets,
+								)
+							: readiness.kind === "ready_probe_failed"
+								? lifecycleChildDiagnostic(
+										"readiness",
+										"session_ready",
+										statusAtFailure,
+										childStderr,
+										undefined,
+										knownSecrets,
+									)
+								: readiness.kind === "child_exited"
+									? lifecycleChildDiagnostic(
+											"readiness",
+											"session_ready",
+											statusAtFailure,
+											childStderr,
+											undefined,
+											knownSecrets,
+										)
+									: undefined;
+				const terminated = await terminateSpawnedChild(
+					child,
+					broker,
+					launch.id,
+					launch.root,
+					lifecycleDeadline,
+					terminationStartDeadline,
+					spawnedAuthority,
+					timing,
+				);
+
+				if (!terminated)
+					return readiness.kind === "ready_probe_failed"
 						? fail(
 								"endpoint_unreadable",
-								`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)}.`,
+								`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)}; cleanup could not be proven. ${diagnostic ?? "stage=readiness waiting_for=session_ready child=uncertain exit=not_observed signal=not_observed stderr=none"}`,
 							)
-						: readiness.kind === "child_exited"
-							? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
-							: fail(
-									"readiness_timeout",
-									`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
-								);
-		}
-		await reconcileReadyScope(broker, launch.id, launch.cwd, launch.root, spawnedAuthority);
-		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
-		if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
-			const exited =
-				child.exitCode !== null ||
-				observeProcess(spawnedAuthority.pid, spawnedAuthority.incarnation, value =>
-					processIncarnationForBroker(broker, value),
-				) === "exited";
-			const terminated = await terminateSpawnedChild(
-				child,
-				broker,
-				launch.id,
-				launch.root,
-				lifecycleDeadline,
-				terminationStartDeadline,
-				spawnedAuthority,
-				timing,
-			);
-			if (exited && readyThenExitToleranceEnabled())
+						: fail(
+								"terminal_uncertain",
+								`Session ${launch.id} did not become ready and its spawned process could not be verified dead. ${diagnostic ?? "stage=readiness waiting_for=session_ready child=uncertain exit=not_observed signal=not_observed stderr=none"}`,
+							);
+				return readiness.kind === "startup_failed"
+					? fail(
+							readiness.failure.code ?? "spawn_failed",
+							// The child-side normalizer only knows process-scoped secrets; launch-scoped
+							// ones (sidecar key, MCP headers) must be redacted here before the message
+							// leaves the broker.
+							`${sanitizeSdkStartupMessage(readiness.failure.message, knownSecrets)} ${diagnostic ?? "stage=startup waiting_for=startup completion child=uncertain exit=not_observed signal=not_observed stderr=none"}`,
+							undefined,
+							readiness.failure.details,
+						)
+					: readiness.kind === "ready_then_exited"
+						? readyThenExitedResponse(launch.id, child)
+						: readiness.kind === "ready_probe_failed"
+							? fail(
+									"endpoint_unreadable",
+									`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)} ${diagnostic}.`,
+								)
+							: readiness.kind === "child_exited"
+								? fail(
+										"spawn_failed",
+										`Session ${launch.id} exited before registering readiness. ${diagnostic}.`,
+									)
+								: fail(
+										"readiness_timeout",
+										`Session ${launch.id} did not register an endpoint before the readiness timeout. ${diagnostic}.`,
+									);
+			}
+			await reconcileReadyScope(broker, launch.id, launch.cwd, launch.root, spawnedAuthority);
+			const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
+			if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
+				const exited =
+					child.exitCode !== null ||
+					observeProcess(spawnedAuthority.pid, spawnedAuthority.incarnation, value =>
+						processIncarnationForBroker(broker, value),
+					) === "exited";
+				const terminated = await terminateSpawnedChild(
+					child,
+					broker,
+					launch.id,
+					launch.root,
+					lifecycleDeadline,
+					terminationStartDeadline,
+					spawnedAuthority,
+					timing,
+				);
+				if (exited && readyThenExitToleranceEnabled())
+					return terminated
+						? readyThenExitedResponse(launch.id, child)
+						: fail(
+								"terminal_uncertain",
+								`Session ${launch.id} ${READY_THEN_EXIT_MESSAGE} and cleanup could not be proven.`,
+							);
 				return terminated
-					? readyThenExitedResponse(launch.id, child)
+					? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
 					: fail(
 							"terminal_uncertain",
-							`Session ${launch.id} ${READY_THEN_EXIT_MESSAGE} and cleanup could not be proven.`,
+							"Session readiness authority changed and its spawned process could not be verified dead.",
 						);
+			}
+			if (!spawnedAuthority) {
+				return fail("endpoint_stale", "Session endpoint authority is unavailable.");
+			}
+			const replayIncarnation = endpointIncarnation(
+				{
+					endpointGeneration: verified.endpointGeneration,
+					endpointMtimeMs: verified.endpointMtimeMs,
+					pid: spawnedAuthority.pid,
+					...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
+				},
+				launch.id,
+			);
+			if (!replayIncarnation) {
+				return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
+			}
+			return {
+				ok: true,
+				result: {
+					sessionId: launch.id,
+					cwd: launch.cwd,
+					endpointGeneration: verified.endpointGeneration,
+					endpointIncarnation: replayIncarnation,
+					pid: verified.endpoint.pid,
+					endpointMtimeMs: verified.endpointMtimeMs,
+					endpoint: verified.endpoint,
+					// Public, ledger-replayable evidence of the bootstrap authority that
+					// reached this runtime. The private key never enters the response.
+					...(launch.coordinatorSidecarKeyId ? { coordinatorSidecarKeyId: launch.coordinatorSidecarKeyId } : {}),
+					...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
+					...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
+				},
+			};
+		} catch (error) {
+			let terminated = false;
+			if (child && childSpawned) {
+				try {
+					terminated = await terminateSpawnedChild(
+						child,
+						broker,
+						launch.id,
+						launch.root,
+						lifecycleDeadline,
+						terminationStartDeadline,
+						spawnedAuthority,
+						timing,
+					);
+				} catch {
+					terminated = false;
+				}
+			}
 			return terminated
-				? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
+				? fail(
+						"spawn_failed",
+						`Unable to complete lifecycle startup: ${error instanceof Error ? error.message : String(error)}`,
+					)
 				: fail(
 						"terminal_uncertain",
-						"Session readiness authority changed and its spawned process could not be verified dead.",
+						`Unable to complete lifecycle startup and could not prove the child dead: ${error instanceof Error ? error.message : String(error)}`,
 					);
+		} finally {
+			await cleanupChildStderr();
 		}
-		if (!spawnedAuthority) return fail("endpoint_stale", "Session endpoint authority is unavailable.");
-		const replayIncarnation = endpointIncarnation(
-			{
-				endpointGeneration: verified.endpointGeneration,
-				endpointMtimeMs: verified.endpointMtimeMs,
-				pid: spawnedAuthority.pid,
-				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
-			},
-			launch.id,
-		);
-		if (!replayIncarnation) return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
-		return {
-			ok: true,
-			result: {
-				sessionId: launch.id,
-				cwd: launch.cwd,
-				endpointGeneration: verified.endpointGeneration,
-				endpointIncarnation: replayIncarnation,
-				pid: verified.endpoint.pid,
-				endpointMtimeMs: verified.endpointMtimeMs,
-				endpoint: verified.endpoint,
-				// Public, ledger-replayable evidence of the bootstrap authority that
-				// reached this runtime. The private key never enters the response.
-				...(launch.coordinatorSidecarKeyId ? { coordinatorSidecarKeyId: launch.coordinatorSidecarKeyId } : {}),
-				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
-				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
-			},
-		};
 	}
 
 	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (operation === "session.close" && input.forceRetireStale === true)
+		return await executeStaleSessionRetirement(broker, input);
 	await broker.index.refresh();
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
@@ -5974,15 +7890,45 @@ async function executeLifecycleResponse(
 		const transcriptParentIdentity = cleanup?.transcriptParentIdentity ?? validated.transcriptParentIdentity;
 		const durableArtifactsPlan =
 			cleanup?.artifactTree?.plannedPath ?? cleanup?.plannedArtifactsPath ?? cleanupTarget.plannedArtifactsPath;
+		let ownerRetirementOutcome = cleanupTarget.taskArtifactOwnerRetirementOutcome
+			? taskArtifactOwnerRetirementDisposition(cleanupTarget.taskArtifactOwnerRetirementOutcome)
+			: undefined;
+		let ownerTranscriptDeleted = cleanupTarget.taskArtifactOwnerTranscriptDeleted;
+		let freshPayloadRetirementForThisAttempt = false;
+		const ownerNamespacePending =
+			cleanupTarget.taskArtifactOwnerPayloadRetired === true &&
+			cleanupTarget.taskArtifactOwnerNamespaceRetained === true &&
+			cleanupTarget.taskArtifactOwnerRetired !== true;
 		const preauthorizedCleanup: CleanupEvidence = {
 			cleanupReceiptVersion: 1,
-			phase: cleanupTarget.artifactsRemoved ? "transcript" : "artifacts",
+			phase:
+				cleanupTarget.artifactsRemoved &&
+				!ownerNamespacePending &&
+				(cleanupTarget.taskArtifactOwnerRetired === true || !cleanupTarget.taskArtifactOwnerDeletionEvidence)
+					? "transcript"
+					: "artifacts",
 			sessionId: cleanupTarget.sessionId,
 			sessionsRoot: cleanupTarget.sessionsRoot,
 			transcriptPath: cleanupTarget.transcriptPath,
 			cwd: cleanupTarget.cwd,
 			...(cleanupTarget.artifactsRemoved ? { artifactsRemoved: true } : {}),
 			...(cleanupTarget.artifactsAbsentAtAuthorization ? { artifactsAbsentAtAuthorization: true as const } : {}),
+			...(cleanupTarget.taskArtifactOwnerDeletionEvidence
+				? { taskArtifactOwnerDeletionEvidence: cleanupTarget.taskArtifactOwnerDeletionEvidence }
+				: {}),
+			...(cleanupTarget.taskArtifactOwnerRetirementContinuation
+				? { taskArtifactOwnerRetirementContinuation: cleanupTarget.taskArtifactOwnerRetirementContinuation }
+				: {}),
+			...(ownerRetirementOutcome ? { taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome } : {}),
+			...(cleanupTarget.taskArtifactOwnerPayloadRetired ? { taskArtifactOwnerPayloadRetired: true as const } : {}),
+			...(cleanupTarget.taskArtifactOwnerNamespaceRetained
+				? { taskArtifactOwnerNamespaceRetained: true as const }
+				: {}),
+			...(cleanupTarget.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+			...(ownerTranscriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true as const } : {}),
+			...(validated.taskArtifactOwnerCaptureError
+				? { taskArtifactOwnerCleanupError: validated.taskArtifactOwnerCaptureError }
+				: {}),
 			metadataRoot: validated.metadataRoot,
 			transcriptIdentity: serializeCleanupIdentity(cleanupTarget.transcriptIdentity),
 			transcriptParentIdentity,
@@ -6082,6 +8028,145 @@ async function executeLifecycleResponse(
 			});
 			return pending;
 		};
+		const cleanupWithFreshOwnerPayload = (receipt: CleanupEvidence): CleanupEvidence => {
+			const current = { ...receipt };
+			delete current.taskArtifactOwnerDeletionEvidence;
+			delete current.taskArtifactOwnerRetirementContinuation;
+			delete current.taskArtifactOwnerRetirementOutcome;
+			delete current.taskArtifactOwnerPayloadRetired;
+			delete current.taskArtifactOwnerNamespaceRetained;
+			delete current.taskArtifactOwnerRetired;
+			delete current.taskArtifactOwnerTranscriptDeleted;
+			delete current.taskArtifactOwnerCleanupError;
+			return {
+				...current,
+				...(cleanupTarget.taskArtifactOwnerDeletionEvidence
+					? { taskArtifactOwnerDeletionEvidence: cleanupTarget.taskArtifactOwnerDeletionEvidence }
+					: {}),
+				...(cleanupTarget.taskArtifactOwnerRetirementContinuation
+					? { taskArtifactOwnerRetirementContinuation: cleanupTarget.taskArtifactOwnerRetirementContinuation }
+					: {}),
+				...(ownerRetirementOutcome ? { taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome } : {}),
+				...(cleanupTarget.taskArtifactOwnerPayloadRetired
+					? { taskArtifactOwnerPayloadRetired: true as const }
+					: {}),
+				...(cleanupTarget.taskArtifactOwnerNamespaceRetained
+					? { taskArtifactOwnerNamespaceRetained: true as const }
+					: {}),
+				...(cleanupTarget.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+				...(ownerTranscriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true as const } : {}),
+			};
+		};
+		const publishTaskArtifactOwnerPending = async (
+			error: unknown,
+			receipt: CleanupEvidence = preauthorizedCleanup,
+		): Promise<BrokerResponse> => {
+			const diagnostic = taskArtifactOwnerFailureDiagnostic(error);
+			const evidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			const ownerReceipt: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(receipt),
+				phase: "artifacts",
+				artifactsRemoved: receipt.artifactsRemoved === true && evidence ? true : undefined,
+				artifactsAbsentAtAuthorization:
+					receipt.artifactsRemoved === true ? undefined : receipt.artifactsAbsentAtAuthorization,
+				taskArtifactOwnerCleanupError: diagnostic,
+			};
+			const pending = fail(
+				"cleanup_pending",
+				`Saved session cleanup is pending in artifacts: ${diagnostic}`,
+				ownerReceipt,
+			);
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: pending,
+			});
+			return pending;
+		};
+		const persistFreshTaskArtifactOwnerRetirement = async (
+			receipt: CleanupEvidence,
+		): Promise<BrokerResponse | undefined> => {
+			const evidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			if (!evidence) return undefined;
+			const ownerContext = cleanupTarget.taskArtifactOwnerStorageContext;
+			if (!ownerContext)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_context_missing", receipt);
+			if (
+				ownerTranscriptDeleted === true
+					? !logicalTranscriptRetirementMatches()
+					: !taskArtifactOwnerTranscriptMatches(validated.storage, cleanupTarget, evidence)
+			)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_transcript_identity_mismatch", receipt);
+			let outcome: TaskArtifactOwnerRetirementOutcome;
+			try {
+				if (
+					await hasSiblingTaskArtifactOwnerTranscript(
+						validated.storage,
+						cleanupTarget.transcriptPath,
+						evidence.locator,
+						ownerContext,
+						validated.inspectProtocol,
+					)
+				)
+					return await publishTaskArtifactOwnerPending(
+						"task_artifact_owner_shared_with_sibling_transcript",
+						receipt,
+					);
+				outcome = retireTaskArtifactOwner(
+					ownerContext,
+					evidence,
+					cleanupTarget.taskArtifactOwnerRetirementContinuation,
+				);
+			} catch (error) {
+				freshPayloadRetirementForThisAttempt = false;
+				return await publishTaskArtifactOwnerPending(error, receipt);
+			}
+			freshPayloadRetirementForThisAttempt = outcome.kind === "payload_retired";
+			cleanupTarget.taskArtifactOwnerRetirementOutcome = outcome;
+			ownerRetirementOutcome = taskArtifactOwnerRetirementDisposition(outcome);
+			cleanupTarget.taskArtifactOwnerRetired = outcome.kind === "completed" ? true : undefined;
+			cleanupTarget.taskArtifactOwnerRetirementContinuation =
+				outcome.kind === "completed" ? undefined : outcome.continuation;
+			cleanupTarget.taskArtifactOwnerPayloadRetired = outcome.kind === "payload_retired" ? true : undefined;
+			cleanupTarget.taskArtifactOwnerNamespaceRetained = outcome.kind === "payload_retired" ? true : undefined;
+			if (outcome.kind === "completed") ownerTranscriptDeleted = undefined;
+			const ownerError =
+				outcome.kind === "uncertain"
+					? taskArtifactOwnerFailureDiagnostic(outcome.reason)
+					: outcome.kind === "cleanup_pending"
+						? taskArtifactOwnerFailureDiagnostic(
+								outcome.nativeOutcome?.code ?? "task_artifact_owner_cleanup_pending",
+							)
+						: undefined;
+			const ownerReceipt: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(receipt),
+				phase: "artifacts",
+				artifactsRemoved: true,
+				artifactsAbsentAtAuthorization: undefined,
+				...(ownerError ? { taskArtifactOwnerCleanupError: ownerError } : {}),
+			};
+			const stateResponse = fail(
+				"cleanup_pending",
+				outcome.kind === "payload_retired"
+					? "Task-artifact payload is retired; its native namespace remains pending in artifacts."
+					: outcome.kind === "completed"
+						? "Task-artifact owner retirement is durably complete; transcript cleanup is preauthorized."
+						: `Task-artifact owner retirement remains ${outcome.kind} in artifacts.`,
+				ownerReceipt,
+			);
+			await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: stateResponse });
+			return outcome.kind === "completed" || outcome.kind === "payload_retired" ? undefined : stateResponse;
+		};
+		const storageOwnerFields = (): Partial<VerifiedSessionDeleteTarget> => {
+			const evidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			if (!evidence) return {};
+			if (!cleanupTarget.taskArtifactOwnerStorageContext) throw new Error("task_artifact_owner_context_missing");
+			return {
+				deferTaskArtifactOwnerRetirement: true,
+				...(cleanupTarget.taskArtifactOwnerRetirementOutcome
+					? { taskArtifactOwnerRetirementOutcome: cleanupTarget.taskArtifactOwnerRetirementOutcome }
+					: {}),
+			};
+		};
 		const canonicalArtifactsPath = cleanupTarget.transcriptPath.slice(0, -6);
 		const transcriptCleanupAuthorityIsAbsent = (): boolean =>
 			[
@@ -6137,6 +8222,11 @@ async function executeLifecycleResponse(
 				return false;
 			}
 		};
+		const logicalTranscriptRetirementMatches = (): boolean =>
+			transcriptParentMatchesPersistedIdentity() &&
+			pathIsAbsent(cleanupTarget.transcriptPath) &&
+			pathIsAbsent(cleanupTarget.retainedTranscriptSuccessorPath) &&
+			pathIsAbsent(cleanupTarget.retainedTranscriptUnknownPath);
 		const retainedTranscriptIdentityIsAbsentFromParent = (): boolean => {
 			const transcriptParent = path.dirname(cleanupTarget.transcriptPath);
 			const expectedParent = preauthorizedCleanup.transcriptParentIdentity;
@@ -6232,31 +8322,81 @@ async function executeLifecycleResponse(
 				preauthorizedCleanup,
 			),
 		});
-		let deleted: VerifiedSessionDeleteResult;
-		try {
-			const completedArtifactReplay = cleanup?.phase === "transcript" && cleanup.artifactsRemoved === true;
-			if (completedArtifactReplay && !pathIsAbsent(canonicalArtifactsPath))
+		if (validated.taskArtifactOwnerCaptureError)
+			return await publishTaskArtifactOwnerPending(validated.taskArtifactOwnerCaptureError);
+		if (
+			cleanup?.phase === "artifacts" &&
+			cleanupTarget.artifactsRemoved === true &&
+			cleanupTarget.taskArtifactOwnerDeletionEvidence &&
+			cleanupTarget.taskArtifactOwnerRetired !== true
+		) {
+			if (!pathIsAbsent(canonicalArtifactsPath))
 				return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
-			if (
-				completedArtifactReplay &&
-				transcriptCleanupAuthorityIsAbsent() &&
-				retainedTranscriptIdentityIsAbsentFromParent()
-			)
-				return fail(
-					"cleanup_pending",
-					"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
+			const ownerPending = await persistFreshTaskArtifactOwnerRetirement(preauthorizedCleanup);
+			if (ownerPending) return ownerPending;
+		}
+		let deleted: VerifiedSessionDeleteResult | undefined;
+		if (cleanup?.taskArtifactOwnerTranscriptDeleted === true) {
+			if (!logicalTranscriptRetirementMatches())
+				return await publishTaskArtifactOwnerPending(
+					"task_artifact_owner_transcript_disposition_mismatch",
 					preauthorizedCleanup,
 				);
-			else {
+			if (cleanupTarget.taskArtifactOwnerPayloadRetired === true) {
+				const residual = fail(
+					"cleanup_pending",
+					"Transcript retirement is complete; the task-artifact owner namespace remains pending in artifacts.",
+					cleanupWithFreshOwnerPayload({ ...preauthorizedCleanup, phase: "artifacts", artifactsRemoved: true }),
+				);
+				await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: residual });
+				return residual;
+			}
+			if (cleanupTarget.taskArtifactOwnerRetired === true) {
+				const ownerEvidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+				const ownerContext = cleanupTarget.taskArtifactOwnerStorageContext;
+				const ownerOutcome = cleanupTarget.taskArtifactOwnerRetirementOutcome;
+				if (!ownerEvidence || !ownerContext || !ownerOutcome)
+					return await publishTaskArtifactOwnerPending(
+						"task_artifact_owner_retired_evidence_missing",
+						preauthorizedCleanup,
+					);
+				try {
+					verifyTaskArtifactOwnerPhysicalRetirement(ownerContext, ownerEvidence, ownerOutcome);
+				} catch (error) {
+					return await publishTaskArtifactOwnerPending(error, preauthorizedCleanup);
+				}
+				deleted = { kind: "deleted" };
+			}
+		}
+		try {
+			if (deleted === undefined) {
+				const completedArtifactReplay = cleanup?.phase === "transcript" && cleanup.artifactsRemoved === true;
+				if (completedArtifactReplay && !pathIsAbsent(canonicalArtifactsPath))
+					return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
+				if (
+					completedArtifactReplay &&
+					transcriptCleanupAuthorityIsAbsent() &&
+					retainedTranscriptIdentityIsAbsentFromParent()
+				)
+					return fail(
+						"cleanup_pending",
+						"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
+						preauthorizedCleanup,
+					);
 				if (!transcriptParentMatchesPersistedIdentity())
 					return fail(
 						"cleanup_pending",
 						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
 						preauthorizedCleanup,
 					);
-				deleted = await validated.storage.deleteSessionVerified(cleanupTarget);
+				deleted = await validated.storage.deleteSessionVerified(
+					{ ...cleanupTarget, ...storageOwnerFields() },
+					validated.inspectProtocol,
+				);
 			}
 		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("task_artifact_owner_"))
+				return await publishTaskArtifactOwnerPending(error);
 			if (error instanceof SessionDeleteVerificationError) {
 				if (cleanup?.phase === "artifacts")
 					return await publishChangedArtifactRoot(
@@ -6275,6 +8415,7 @@ async function executeLifecycleResponse(
 				`Unable to delete saved session artifacts: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+		if (!deleted) return fail("unavailable", "Saved session deletion did not produce an outcome.");
 		if (
 			deleted.kind === "deleted" &&
 			cleanup?.phase === "transcript" &&
@@ -6298,10 +8439,22 @@ async function executeLifecycleResponse(
 					cleanupTarget.detachedArtifactsPath,
 					"Saved session cleanup is pending in artifacts: an authorized quarantine alias remains after exact removal.",
 				);
-			const transcriptPhaseCleanup: CleanupEvidence = {
-				...preauthorizedCleanup,
-				phase: "transcript",
+			const returnedOwnerEvidence = deleted.taskArtifactOwnerDeletionEvidence;
+			if (
+				cleanupTarget.taskArtifactOwnerDeletionEvidence &&
+				returnedOwnerEvidence &&
+				JSON.stringify(cleanupTarget.taskArtifactOwnerDeletionEvidence) !== JSON.stringify(returnedOwnerEvidence)
+			)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_evidence_changed_during_delete");
+			if (returnedOwnerEvidence && !cleanupTarget.taskArtifactOwnerDeletionEvidence)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_evidence_not_prepared_before_effect");
+			const ownerEvidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			const artifactCompletionCleanup: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(preauthorizedCleanup),
+				phase: ownerEvidence ? "artifacts" : "transcript",
 				artifactsRemoved: true,
+				artifactsAbsentAtAuthorization: undefined,
+				...(ownerEvidence ? { taskArtifactOwnerDeletionEvidence: ownerEvidence } : {}),
 				detachedArtifactsPath: undefined,
 				retainedArtifactsSuccessorPath: undefined,
 				retainedArtifactsPlaceholderPath: undefined,
@@ -6317,12 +8470,41 @@ async function executeLifecycleResponse(
 						}
 					: {}),
 			};
-
 			await broker.ledger.transition(identity, "effect_started", {
 				intendedSessionId: id,
 				response: fail(
 					"cleanup_pending",
-					"Saved session artifacts were removed; transcript cleanup is preauthorized.",
+					"Saved session artifacts are removed; owner cleanup is durably preauthorized.",
+					artifactCompletionCleanup,
+				),
+			});
+			if (ownerEvidence && cleanupTarget.taskArtifactOwnerRetired !== true) {
+				const ownerPending = await persistFreshTaskArtifactOwnerRetirement(artifactCompletionCleanup);
+				if (ownerPending) return ownerPending;
+			}
+			const ownerNamespaceRetained =
+				cleanupTarget.taskArtifactOwnerPayloadRetired === true &&
+				cleanupTarget.taskArtifactOwnerNamespaceRetained === true;
+			const transcriptPhaseCleanup: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(artifactCompletionCleanup),
+				phase: ownerNamespaceRetained ? "artifacts" : "transcript",
+				artifactsRemoved: true,
+				artifactsAbsentAtAuthorization: undefined,
+				...(artifactCompletionCleanup.artifactTree
+					? {
+							artifactTree: {
+								...artifactCompletionCleanup.artifactTree,
+								detachedPath: undefined,
+								completed: true as const,
+							},
+						}
+					: {}),
+			};
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail(
+					"cleanup_pending",
+					"Saved session artifacts and owner cleanup are durably recorded; transcript cleanup is preauthorized.",
 					transcriptPhaseCleanup,
 				),
 			});
@@ -6334,33 +8516,39 @@ async function executeLifecycleResponse(
 					"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
 					transcriptPhaseCleanup,
 				);
-			else {
-				if (!transcriptParentMatchesPersistedIdentity())
-					return fail(
-						"cleanup_pending",
-						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
-						transcriptPhaseCleanup,
-					);
-				try {
-					deleted = await validated.storage.deleteSessionVerified({
+			if (!transcriptParentMatchesPersistedIdentity())
+				return fail(
+					"cleanup_pending",
+					"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
+					transcriptPhaseCleanup,
+				);
+			try {
+				deleted = await validated.storage.deleteSessionVerified(
+					{
 						...cleanupTarget,
+						...storageOwnerFields(),
 						expectedArtifactsIdentity: undefined,
 						detachedArtifactsPath: undefined,
 						artifactsRemoved: true,
-					});
-				} catch (error) {
-					if (error instanceof SessionDeleteVerificationError && error.kind === "artifacts")
-						return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
-					if (error instanceof SessionDeleteVerificationError)
-						return fail(
-							"invalid_input",
-							`Saved session deletion verification failed (${error.kind}): ${error.message}`,
-						);
+					},
+					validated.inspectProtocol,
+				);
+			} catch (error) {
+				if (error instanceof Error && error.message.startsWith("task_artifact_owner_"))
+					return await publishTaskArtifactOwnerPending(error, transcriptPhaseCleanup);
+				if (error instanceof SessionDeleteVerificationError && error.kind === "artifacts")
+					return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
+				if (error instanceof SessionDeleteVerificationError)
 					return fail(
-						"unavailable",
-						`Unable to delete saved session transcript: ${error instanceof Error ? error.message : String(error)}`,
+						"invalid_input",
+						`Saved session deletion verification failed (${error.kind}): ${error.message}`,
 					);
-				}
+				if (freshPayloadRetirementForThisAttempt)
+					return await publishTaskArtifactOwnerPending(error, transcriptPhaseCleanup);
+				return fail(
+					"unavailable",
+					`Unable to delete saved session transcript: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
 			if (deleted.kind === "deleted" && !pathIsAbsent(canonicalArtifactsPath))
 				return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
@@ -6376,13 +8564,47 @@ async function executeLifecycleResponse(
 				"Saved session cleanup is pending in artifacts: a planned quarantine alias remains before terminal completion.",
 			);
 		const retainedRootArtifactsPlan = durableArtifactsPlan;
-		if (deleted.kind === "cleanup_pending")
-			return fail(
+		if (deleted.kind === "cleanup_pending") {
+			if (deleted.phase === "task_artifact_owner" && !deleted.artifactsRemoved)
+				return await publishTaskArtifactOwnerPending(deleted.error.message);
+			const ownerEvidence =
+				deleted.taskArtifactOwnerDeletionEvidence ?? cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			const ownerRetired = deleted.taskArtifactOwnerRetired ?? cleanupTarget.taskArtifactOwnerRetired;
+			const ownerPayloadRetired =
+				deleted.taskArtifactOwnerPayloadRetired ?? cleanupTarget.taskArtifactOwnerPayloadRetired;
+			const ownerNamespaceRetained =
+				deleted.taskArtifactOwnerNamespaceRetained ?? cleanupTarget.taskArtifactOwnerNamespaceRetained;
+			const retainedOwnerNamespace = ownerPayloadRetired === true && ownerNamespaceRetained === true;
+			const ownerContinuation =
+				deleted.taskArtifactOwnerRetirementContinuation ?? cleanupTarget.taskArtifactOwnerRetirementContinuation;
+			const ownerOutcome = deleted.taskArtifactOwnerRetirementOutcome
+				? taskArtifactOwnerRetirementDisposition(deleted.taskArtifactOwnerRetirementOutcome)
+				: ownerRetirementOutcome;
+			const transcriptDeleted =
+				deleted.taskArtifactOwnerTranscriptDeleted === true || ownerTranscriptDeleted === true;
+			const ownerError =
+				deleted.phase === "task_artifact_owner" || deleted.error.message.startsWith("task_artifact_owner_")
+					? taskArtifactOwnerFailureDiagnostic(deleted.error)
+					: undefined;
+			const publicPhase =
+				retainedOwnerNamespace || deleted.phase === "task_artifact_owner" ? "artifacts" : deleted.phase;
+			const pending = fail(
 				"cleanup_pending",
-				`Saved session cleanup is pending in ${deleted.phase}: ${deleted.error.message}`,
+				`Saved session cleanup is pending in ${publicPhase}: ${deleted.error.message}`,
 				{
 					cleanupReceiptVersion: 1,
-					phase: deleted.phase,
+					phase: publicPhase,
+					...(ownerEvidence && (deleted.phase === "task_artifact_owner" || retainedOwnerNamespace)
+						? { artifactsRemoved: true }
+						: {}),
+					...(ownerEvidence ? { taskArtifactOwnerDeletionEvidence: ownerEvidence } : {}),
+					...(ownerContinuation ? { taskArtifactOwnerRetirementContinuation: ownerContinuation } : {}),
+					...(ownerOutcome ? { taskArtifactOwnerRetirementOutcome: ownerOutcome } : {}),
+					...(ownerPayloadRetired ? { taskArtifactOwnerPayloadRetired: true as const } : {}),
+					...(ownerNamespaceRetained ? { taskArtifactOwnerNamespaceRetained: true as const } : {}),
+					...(ownerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+					...(transcriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true as const } : {}),
+					...(ownerError ? { taskArtifactOwnerCleanupError: ownerError } : {}),
 					sessionId: validated.target.sessionId,
 					sessionsRoot: validated.target.sessionsRoot,
 					transcriptPath: validated.target.transcriptPath,
@@ -6466,6 +8688,34 @@ async function executeLifecycleResponse(
 						: {}),
 				},
 			);
+			await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: pending });
+			return pending;
+		}
+		if (
+			deleted.kind === "deleted" &&
+			cleanupTarget.taskArtifactOwnerPayloadRetired === true &&
+			cleanupTarget.taskArtifactOwnerNamespaceRetained === true
+		) {
+			if (!logicalTranscriptRetirementMatches())
+				return await publishTaskArtifactOwnerPending(
+					"task_artifact_owner_transcript_disposition_mismatch",
+					preauthorizedCleanup,
+				);
+			if (record) await appendSessionDeletedEvidence(broker, record);
+			const residual = fail(
+				"cleanup_pending",
+				"Transcript retirement is complete; the task-artifact owner namespace remains pending in artifacts.",
+				{
+					...cleanupWithFreshOwnerPayload(preauthorizedCleanup),
+					phase: "artifacts",
+					artifactsRemoved: true,
+					artifactsAbsentAtAuthorization: undefined,
+					taskArtifactOwnerTranscriptDeleted: true,
+				},
+			);
+			await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: residual });
+			return residual;
+		}
 
 		const completion = { ok: true, result: { sessionId: id } } as const;
 		if (metadataCleanup.lifecycleFiles?.length) {
@@ -6513,17 +8763,32 @@ async function exactCleanupProof(
 	expected: EffectMarker | undefined,
 	evidence: { artifact: LifecycleFailureArtifact } | undefined,
 	proofBudget?: LifecycleProofBudget,
+	allowObservedWindowsReadyExit = false,
 ): Promise<LifecycleCleanupProof | undefined> {
 	const rollback = evidence?.artifact.rollback;
+	const durableRollbackComplete =
+		rollback?.fenced === true &&
+		rollback.runtimeRemoved &&
+		rollback.hostStopped &&
+		rollback.brokerRegistrationReleased;
+	// Windows deliberately keeps the failure receipt incomplete because its
+	// directory-entry publication cannot be flushed. A broker-observed
+	// ready-then-exit can still authorize the separate ledger-backed exact
+	// artifact cleanup below when process, endpoint, and registration absence
+	// are independently verified.
+	const observedWindowsReadyExit =
+		process.platform === "win32" &&
+		allowObservedWindowsReadyExit &&
+		rollback?.fenced === false &&
+		rollback.runtimeRemoved === false &&
+		rollback.hostStopped === false &&
+		rollback.brokerRegistrationReleased === false;
 	if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
 	if (
 		!root ||
 		!id ||
 		!expected ||
-		!rollback?.fenced ||
-		!rollback.runtimeRemoved ||
-		!rollback.hostStopped ||
-		!rollback.brokerRegistrationReleased ||
+		(!durableRollbackComplete && !observedWindowsReadyExit) ||
 		observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) !==
 			"exited"
 	)
@@ -6610,6 +8875,26 @@ export interface LifecycleExecutionOutcome {
 	deferredArtifactCleanup?: () => Promise<void>;
 }
 
+export function classifyLateAdmissionSpawnFailure(
+	response: BrokerResponse,
+	effectIntent: LifecycleEffectIntentWithDeadline | undefined,
+	now: number,
+	messageSource: BrokerResponse,
+): BrokerResponse {
+	if (
+		response.ok ||
+		response.error.code !== "spawn_failed" ||
+		effectIntent?.childOwnershipEstablished !== true ||
+		effectIntent.admissionCleanupDeadlineAt === undefined ||
+		now < effectIntent.admissionCleanupDeadlineAt
+	)
+		return response;
+	return {
+		...response,
+		error: { code: "terminal_uncertain", message: terminalUncertainStartupMessage(messageSource) },
+	};
+}
+
 /** Returns the response together with every durable lifecycle fact needed for truthful replay. */
 export async function executeLifecycle(
 	broker: Broker,
@@ -6618,6 +8903,7 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
+	const timing = lifecycleTiming(broker);
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)
 		proofBudget = lifecycleProofBudgetFromEffectIntent(broker, broker.ledger.get(identity)?.effectIntent);
@@ -6671,16 +8957,25 @@ export async function executeLifecycle(
 			const binding = validateLifecycleDeleteMetadataBinding(broker, operation, input, identity, cleanup);
 			if (binding) return { response: binding };
 		}
+		const reconciled = await reconcileLifecycleCleanup(
+			broker,
+			identity,
+			cleanup,
+			operation === "session.delete"
+				? { ok: true, result: { sessionId: cleanup.sessionId } }
+				: fail("spawn_failed", "No ready SDK endpoint remains available."),
+			proofBudget,
+		);
 		return {
-			response: await reconcileLifecycleCleanup(
-				broker,
-				identity,
-				cleanup,
+			response:
 				operation === "session.delete"
-					? { ok: true, result: { sessionId: cleanup.sessionId } }
-					: fail("spawn_failed", "No ready SDK endpoint remains available."),
-				proofBudget,
-			),
+					? reconciled
+					: classifyLateAdmissionSpawnFailure(
+							reconciled,
+							broker.ledger.get(identity)?.effectIntent,
+							timing.now(),
+							reconciled,
+						),
 		};
 	}
 	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
@@ -6708,26 +9003,28 @@ export async function executeLifecycle(
 		expected,
 		evidence,
 		proofBudget,
+		!response.ok ? response.error.code === "ready_then_exited" : false,
 	);
-	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
-		? {
-				artifactDigest: evidence.digest,
-				phase: evidence.artifact.phase,
-				reason: evidence.artifact.reason,
-				message: evidence.artifact.message,
-				...(evidence.artifact.code === undefined
-					? {}
-					: { code: evidence.artifact.code, details: evidence.artifact.details }),
-				rollback: {
-					endpointGeneration: evidence.artifact.rollback.endpointGeneration,
-					fenced: evidence.artifact.rollback.fenced,
-					runtimeRemoved: evidence.artifact.rollback.runtimeRemoved,
-					hostStopped: evidence.artifact.rollback.hostStopped,
-					brokerRegistrationReleased: evidence.artifact.rollback.brokerRegistrationReleased,
-				},
-				...(cleanupProof ? { cleanupProof } : {}),
-			}
-		: undefined;
+	const startupFailure: LifecycleStartupFailureReceipt | undefined =
+		evidence && !response.ok
+			? {
+					artifactDigest: evidence.digest,
+					message: evidence.artifact.message,
+					phase: evidence.artifact.phase,
+					reason: evidence.artifact.reason,
+					...(evidence.artifact.code === undefined
+						? {}
+						: { code: evidence.artifact.code, details: evidence.artifact.details }),
+					rollback: {
+						endpointGeneration: evidence.artifact.rollback.endpointGeneration,
+						fenced: evidence.artifact.rollback.fenced,
+						runtimeRemoved: evidence.artifact.rollback.runtimeRemoved,
+						hostStopped: evidence.artifact.rollback.hostStopped,
+						brokerRegistrationReleased: evidence.artifact.rollback.brokerRegistrationReleased,
+					},
+					...(cleanupProof ? { cleanupProof } : {}),
+				}
+			: undefined;
 	const durableEffectsBody: Omit<LifecycleDurableEffectsReceipt, "digest"> = {
 		...(priorDurableEffects?.worktree ? { worktree: priorDurableEffects.worktree } : {}),
 		...(evidence?.artifact.transcript
@@ -6846,8 +9143,10 @@ export async function executeLifecycle(
 										...(startupFailure ? { startupFailure } : {}),
 									}
 			: response;
+	// The extended proof window may reconcile artifacts after the original
+	// admission deadline, but cannot retroactively prove a timely spawn failure.
 	return {
-		response: terminalResponse,
+		response: classifyLateAdmissionSpawnFailure(terminalResponse, entry?.effectIntent, timing.now(), response),
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};
@@ -6870,8 +9169,8 @@ export interface SessionHostRuntimeEvidence {
 	attachedClients: SessionHostAttachmentReader;
 	/** Optional subset of attached sockets that only observes the host. */
 	observerClients?: SessionHostAttachmentReader;
-	/** Whether this runtime currently has agent work in flight. */
-	workInFlight: () => boolean;
+	/** One authoritative lease held by every admitted or continuing work state. */
+	workLease: SessionWorkLease;
 }
 
 /** One runtime's live publication, retractable only by its owner. */
@@ -6941,15 +9240,15 @@ export function sessionHostAttachedClients(): number | undefined {
 }
 
 /**
- * Whether any runtime in this process has agent work in flight right now.
+ * Whether any runtime in this process still holds its authoritative work lease.
  *
  * Positive evidence only: a runtime that publishes nothing, or whose reader
  * fails, reports no work, so this can never keep an abandoned host alive.
  */
-export function sessionHostWorkInFlight(): boolean {
-	for (const { workInFlight } of sessionHostRuntimes) {
+export function sessionHostWorkLeaseActive(): boolean {
+	for (const { workLease } of sessionHostRuntimes) {
 		try {
-			if (workInFlight()) return true;
+			if (workLease.isHeld()) return true;
 		} catch {}
 	}
 	return false;

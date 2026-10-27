@@ -1,5 +1,5 @@
 /**
- * `gjc migrate` — import MCP servers and skills from other coding agents.
+ * `gjc migrate` — import MCP servers, skills, slash commands, and instruction files from other coding agents.
  */
 import * as os from "node:os";
 import * as path from "node:path";
@@ -53,8 +53,20 @@ export function resolveSources(from: string[]): MigrateSource[] {
 
 function resolveDestinations(project: boolean, cwd: string): MigrateDestinations {
 	const scope = project ? "project" : "user";
-	const skillsDir = project ? path.join(getProjectAgentDir(cwd), "skills") : path.join(getAgentDir(), "skills");
-	return { mcpConfigPath: getMCPConfigPath(scope, cwd), skillsDir };
+	const agentDir = project ? getProjectAgentDir(cwd) : getAgentDir();
+	const skillsDir = path.join(agentDir, "skills");
+	const commandsDir = path.join(agentDir, "commands");
+	const agentsDir = path.join(agentDir, "agents");
+	const hooksDir = path.join(agentDir, "hooks");
+	const instructionsPath = path.join(agentDir, "AGENTS.md");
+	return {
+		mcpConfigPath: getMCPConfigPath(scope, cwd),
+		skillsDir,
+		commandsDir,
+		agentsDir,
+		hooksDir,
+		instructionsPath,
+	};
 }
 
 /** Run the migration and return the report (does not set process.exitCode). */
@@ -66,15 +78,16 @@ export async function runMigrate(args: MigrateCommandArgs): Promise<MigrateRepor
 
 	const results: AdapterResult[] = [];
 	for (const source of sources) {
-		results.push(await getAdapter(source).collect({ homeDir }));
+		results.push(await getAdapter(source).collect({ homeDir, cwd, scope: args.project ? "project" : "user" }));
 	}
 
-	const { actions, warnings } = await planMigration({ results, destinations, force: args.force });
-	const finalActions = args.dryRun ? actions : await executeActions(actions);
+	const { actions, warnings, manualActions } = await planMigration({ results, destinations, force: args.force });
+	const finalActions = args.dryRun ? actions : await executeActions(actions, { project: args.project });
 
 	return buildReport({
 		actions: finalActions,
 		warnings,
+		manualActions,
 		sources,
 		destinations,
 		dryRun: args.dryRun,

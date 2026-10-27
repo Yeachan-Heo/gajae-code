@@ -5,7 +5,14 @@ import * as path from "node:path";
 const repoRoot = path.resolve(import.meta.dir, "..");
 const ignorePath = path.join(repoRoot, "Dockerfile.dockerignore");
 const dockerfilePath = path.join(repoRoot, "Dockerfile");
-const requiredExclusions = ["assets/", "issues/", ".plans/", "geobench/"];
+const requiredExclusions = [
+	"assets/",
+	"issues/",
+	".plans/",
+	"geobench/",
+	".gjc/state/sdk/",
+	".gjc/state/chat/sdk/",
+];
 
 function stripComment(line: string): string {
 	const hash = line.indexOf("#");

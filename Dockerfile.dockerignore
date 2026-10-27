@@ -18,6 +18,8 @@ geobench/
 .opencode/
 .pi_config/
 .gjc/plugins/
+.gjc/state/sdk/
+.gjc/state/chat/sdk/
 
 # VCS, editors, IDEs — irrelevant to the build, churn on every IDE keystroke.
 .git/

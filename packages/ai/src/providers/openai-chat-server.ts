@@ -46,7 +46,14 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 function isServiceTier(value: unknown): value is ResolvedServiceTier {
-	return value === "auto" || value === "default" || value === "flex" || value === "scale" || value === "priority";
+	return (
+		value === "auto" ||
+		value === "default" ||
+		value === "flex" ||
+		value === "scale" ||
+		value === "priority" ||
+		value === "ultrafast"
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +406,7 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
 				logprobs: null,
 			},
 		],
+		...(message.serviceTier ? { service_tier: message.serviceTier } : {}),
 		usage: buildUsage(message),
 	};
 }
@@ -536,6 +544,7 @@ export function encodeStream(
 			model: requestedModelId,
 			system_fingerprint: null,
 			choices: [],
+			...(message.serviceTier ? { service_tier: message.serviceTier } : {}),
 			usage: buildUsage(message),
 		});
 	};
@@ -671,7 +680,10 @@ export function encodeStream(
 										: hasToolCalls
 											? "tool_calls"
 											: "stop";
-							writeSse(controller, baseChunk({}, finishReason));
+							writeSse(controller, {
+								...baseChunk({}, finishReason),
+								...(event.message.serviceTier ? { service_tier: event.message.serviceTier } : {}),
+							});
 							if (includeUsage) writeUsage(controller, event.message);
 							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 							controller.close();

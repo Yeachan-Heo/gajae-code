@@ -1,33 +1,115 @@
 import { describe, expect, it } from "bun:test";
+import { hookFetch } from "@gajae-code/utils";
 import {
+	applyUltrafastTierModelPolicies,
+	CODEX_GPT6_IDS,
+	fetchAntigravityModels,
 	injectAlibabaTokenPlanModels,
-	injectCodexAstraModel,
+	injectCodexGpt6Models,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
+	restoreSeedLimits,
 } from "../scripts/generate-models";
+import modelsJson from "../src/models.json" with { type: "json" };
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../src/provider-models/openai-compat";
+import { getGeminiCliUserAgent } from "../src/providers/google-gemini-headers";
 import type { Model } from "../src/types";
 
-describe("injectCodexAstraModel", () => {
-	it("adds the reviewed Codex fallback exactly once", () => {
+describe("fetchAntigravityModels", () => {
+	it("forwards the stored project ID to discovery", async () => {
+		let requestBody: unknown;
+		const requestUserAgents: string[] = [];
+		using _hook = hookFetch((input, init) => {
+			if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+				throw new Error(`Unexpected URL: ${String(input)}`);
+			}
+			requestBody = JSON.parse(String(init?.body ?? "{}")) as unknown;
+			const userAgent = new Headers(init?.headers).get("user-agent");
+			if (userAgent) requestUserAgents.push(userAgent);
+			return new Response(JSON.stringify({ models: { "gemini-4-argon": { displayName: "Gemini 4 Argon" } } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const models = await fetchAntigravityModels({
+			accessToken: "generator-access-token",
+			projectId: "generator-project",
+		});
+
+		expect(requestBody).toEqual({ project: "generator-project" });
+		expect(requestUserAgents).toEqual([getGeminiCliUserAgent()]);
+		expect(models.map(model => model.id)).toEqual(["gemini-4-argon"]);
+	});
+});
+
+describe("injectCodexGpt6Models", () => {
+	it("resets the seed row of every injected Codex GPT-6 model", () => {
+		const models: Model[] = [];
+		injectCodexGpt6Models(models);
+
+		expect(new Set(models.map(model => model.id))).toEqual(new Set(CODEX_GPT6_IDS));
+		const bundled = modelsJson["openai-codex"] as Record<string, { contextWindow: number }>;
+		for (const id of CODEX_GPT6_IDS) expect(bundled[id]?.contextWindow).not.toBe(272_000);
+	});
+
+	it("adds the reviewed Codex fallbacks exactly once", () => {
 		const models: Model[] = [];
 
-		injectCodexAstraModel(models);
-		injectCodexAstraModel(models);
+		injectCodexGpt6Models(models);
+		injectCodexGpt6Models(models);
 
 		expect(models).toEqual([
 			expect.objectContaining({
 				id: "gpt-6-astra",
-				name: "GPT-6-Astra",
+				name: "GPT-6 Astra",
 				api: "openai-codex-responses",
 				provider: "openai-codex",
 				reasoning: true,
 				input: ["text", "image"],
-				contextWindow: 272_000,
-				maxTokens: 128_000,
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
 				preferWebsockets: true,
 				priority: 1,
 			}),
+			expect.objectContaining({
+				id: "gpt-6-sol",
+				name: "GPT-6 Sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
+				id: "gpt-6.1-sol",
+				name: "GPT-6.1 Sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
+				id: "gpt-6-luna",
+				name: "GPT-6 Luna",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+			}),
 		]);
+		expect(models.filter(model => model.id === "gpt-6-sol")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6-sol")).not.toHaveProperty("priority");
+		expect(models.filter(model => model.id === "gpt-6.1-sol")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6.1-sol")).not.toHaveProperty("priority");
 	});
 
 	it("preserves authenticated discovery metadata", () => {
@@ -41,13 +123,101 @@ describe("injectCodexAstraModel", () => {
 			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 300_000,
-			maxTokens: 128_000,
+			maxTokens: UNK_MAX_TOKENS,
 		};
 		const models: Model[] = [discovered];
 
-		injectCodexAstraModel(models);
+		injectCodexGpt6Models(models);
 
-		expect(models).toEqual([discovered]);
+		expect(models.find(model => model.id === "gpt-6-astra")).toEqual(discovered);
+	});
+});
+
+describe("applyUltrafastTierModelPolicies", () => {
+	const model = (provider: string, id: string): Model =>
+		({
+			id,
+			name: id,
+			api: "openai-responses",
+			provider,
+			baseUrl: "https://example.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_000,
+			compat: { supportsReasoningEffort: true },
+		}) as Model;
+
+	it("preserves model-specific ultrafast support without enabling other tiers", () => {
+		const models = [
+			model("openai", "gpt-6-astra"),
+			model("openai-codex", "gpt-6.1-sol"),
+			model("github-copilot", "gpt-6-astra"),
+			model("opencode-zen", "gpt-6.1-sol"),
+			model("openai-codex", "gpt-6-sol"),
+		];
+		models[2]!.compat = { ...models[2]!.compat, supportsServiceTier: true };
+		models[3]!.compat = { ...models[3]!.compat, supportsServiceTier: true };
+
+		applyUltrafastTierModelPolicies(models);
+
+		expect(models[0]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[1]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[2]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[3]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[4]?.compat).toEqual({ supportsReasoningEffort: true });
+	});
+
+	it("does not infer ultrafast support for GPT-5.6 models", () => {
+		const models = [
+			model("openai", "gpt-5.6-sol"),
+			model("openai-codex", "gpt-5.6-sol"),
+			model("github-copilot", "gpt-5.6-sol"),
+			model("opencode-zen", "gpt-5.6-sol"),
+		];
+
+		applyUltrafastTierModelPolicies(models);
+
+		expect(models.map(candidate => candidate.compat?.supportsUltrafastTier)).toEqual([
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+		]);
+	});
+});
+
+describe("restoreSeedLimits", () => {
+	const unknownCodexModel = (overrides: Partial<Model> = {}): Model =>
+		({
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+			...overrides,
+		}) as Model;
+	const seed = new Map([["openai-codex/gpt-6-astra", { contextWindow: 272_000, maxTokens: 128_000 }]]);
+
+	it("restores both limits when discovery leaves both unknown", () => {
+		const [restored] = restoreSeedLimits([unknownCodexModel()], seed);
+		expect(restored.contextWindow).toBe(272_000);
+		expect(restored.maxTokens).toBe(128_000);
+	});
+
+	it("restores only the limit that is still unknown", () => {
+		const [onlyMax] = restoreSeedLimits([unknownCodexModel({ contextWindow: 300_000 })], seed);
+		expect(onlyMax.contextWindow).toBe(300_000);
+		expect(onlyMax.maxTokens).toBe(128_000);
+		const [onlyContext] = restoreSeedLimits([unknownCodexModel({ maxTokens: 64_000 })], seed);
+		expect(onlyContext.contextWindow).toBe(272_000);
+		expect(onlyContext.maxTokens).toBe(64_000);
 	});
 });
 
@@ -318,5 +488,32 @@ describe("injectMuseSparkModels", () => {
 				},
 			}),
 		]);
+	});
+});
+
+describe("pricing normalization", () => {
+	it("validates that negative pricing is not used in bundled models", () => {
+		const allModels: Model[] = [];
+
+		for (const providerModels of Object.values(modelsJson as unknown as Record<string, Record<string, Model>>)) {
+			for (const model of Object.values(providerModels)) {
+				allModels.push(model);
+			}
+		}
+
+		// Verify that no model has negative pricing
+		for (const model of allModels) {
+			expect(model.cost.input).toBeGreaterThanOrEqual(0);
+			expect(model.cost.output).toBeGreaterThanOrEqual(0);
+			expect(model.cost.cacheRead).toBeGreaterThanOrEqual(0);
+			expect(model.cost.cacheWrite).toBeGreaterThanOrEqual(0);
+		}
+
+		// Specifically verify the jev-router has been fixed
+		const jevRouter = allModels.find(m => m.provider === "openrouter" && m.id === "typesafe/jev-router");
+		if (jevRouter) {
+			expect(jevRouter.cost.input).toBe(0);
+			expect(jevRouter.cost.output).toBe(0);
+		}
 	});
 });

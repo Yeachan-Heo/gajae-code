@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod/v4";
-import { Effort } from "../src/model-thinking";
+import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
-import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
+import { detectOpenAICompat, resolveOpenAICompat } from "../src/providers/openai-completions-compat";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
 import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
 
@@ -96,6 +96,283 @@ function baseContext(): Context {
 		],
 	};
 }
+
+// #827
+describe("reasoning models avoid incompatible forced tool_choice", () => {
+	/**
+	 * Repro lineage for #827 — OpenCode Go Kimi models reject forced `tool_choice`
+	 * while thinking is enabled. Later Go captures also showed generic upstream
+	 * 400s for forced `tool_choice` even when reasoning was omitted, so the
+	 * OpenCode Go Kimi path now degrades forced choices to auto/no explicit
+	 * `tool_choice` instead of forwarding the forced directive.
+	 */
+	const echoTool: Tool = {
+		name: "echo",
+		description: "Echo input",
+		parameters: z.object({ text: z.string() }),
+	};
+
+	const ctx: Context = {
+		messages: [{ role: "user", content: "do it", timestamp: Date.now() }],
+		tools: [echoTool],
+	};
+
+	function abortedSignal(): AbortSignal {
+		const controller = new AbortController();
+		controller.abort();
+		return controller.signal;
+	}
+
+	function kimiOpencodeGoModel(id = "kimi-k2.6"): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/v1",
+			id,
+			name: id === "kimi-k2.7-code" ? "Kimi K2.7 Code" : id === "kimi-k2.5" ? "Kimi K2.5" : "Kimi K2.6",
+			reasoning: true,
+		};
+	}
+
+	function kimiOpenRouterModel(): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "moonshotai/kimi-k2",
+			name: "Kimi K2 (OpenRouter)",
+			reasoning: true,
+		};
+	}
+
+	function captureBody(
+		model: Model<"openai-completions">,
+		opts: Parameters<typeof streamOpenAICompletions>[2],
+	): Promise<unknown> {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(model, ctx, {
+			...opts,
+			apiKey: "test-key",
+			signal: abortedSignal(),
+			onPayload: payload => resolve(payload),
+		});
+		return promise;
+	}
+
+	interface CompletionsBody {
+		tool_choice?: unknown;
+		tools?: unknown[];
+		reasoning_effort?: unknown;
+		reasoning?: unknown;
+		thinking?: unknown;
+	}
+
+	it("omits forced tool_choice on every OpenCode Go Kimi variant and keeps supported reasoning", async () => {
+		for (const modelId of ["kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code"]) {
+			const body = (await captureBody(kimiOpencodeGoModel(modelId), {
+				reasoning: "high",
+				toolChoice: "any",
+			})) as CompletionsBody;
+
+			expect(body.tool_choice).toBeUndefined();
+			expect(body.reasoning_effort).toBe("high");
+		}
+	});
+
+	it("preserves reasoning_effort when toolChoice is auto", async () => {
+		const body = (await captureBody(kimiOpencodeGoModel(), {
+			reasoning: "high",
+			toolChoice: "auto",
+		})) as CompletionsBody;
+
+		expect(body.tool_choice).toBe("auto");
+		expect(body.reasoning_effort).toBe("high");
+	});
+
+	it("strips OpenRouter-shaped reasoning object on forced toolChoice for Kimi via OpenRouter", async () => {
+		const body = (await captureBody(kimiOpenRouterModel(), {
+			reasoning: "high",
+			toolChoice: { type: "tool", name: "echo" },
+		})) as CompletionsBody;
+
+		expect(body.tool_choice).toMatchObject({ type: "function", function: { name: "echo" } });
+		expect(body.reasoning).toBeUndefined();
+		expect(body.reasoning_effort).toBeUndefined();
+	});
+	it("sends explicit thinking disabled for Moonshot Kimi K2.6 when a named tool is forced", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "moonshot",
+			baseUrl: "https://api.moonshot.ai/v1",
+			id: "kimi-k2.6",
+			name: "Kimi K2.6",
+			reasoning: true,
+		};
+		const body = (await captureBody(model, {
+			toolChoice: { type: "tool", name: "echo" },
+		})) as CompletionsBody;
+
+		expect(body.tool_choice).toMatchObject({ type: "function", function: { name: "echo" } });
+		expect(body.thinking).toEqual({ type: "disabled" });
+		expect(body.reasoning).toBeUndefined();
+		expect(body.reasoning_effort).toBeUndefined();
+	});
+
+	it("strips reasoning_effort for Anthropic Claude models served via openai-completions (e.g. LiteLLM/OpenRouter proxies)", async () => {
+		// LiteLLM / Vertex proxies often expose Anthropic model through chat-completions; Anthropic
+		// itself rejects reasoning + forced tool_choice (see anthropic.ts:disableThinkingIfToolChoiceForced),
+		// so the same constraint must follow the model when it's reached through the OpenAI shape.
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "litellm",
+			baseUrl: "http://localhost:4000/v1",
+			id: "claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6 (LiteLLM)",
+			reasoning: true,
+			compat: { supportsReasoningEffort: true },
+		};
+
+		const body = (await captureBody(model, {
+			reasoning: "high",
+			toolChoice: "any",
+		})) as CompletionsBody;
+
+		expect(body.tool_choice).toBe("required");
+		expect(body.reasoning_effort).toBeUndefined();
+	});
+	it("does not strip reasoning on non-Kimi models even with forced tool_choice", async () => {
+		// Non-kimi reasoning model — OpenAI itself accepts forced tool_choice with reasoning.
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			id: "gpt-5-mini",
+			reasoning: true,
+			compat: { supportsReasoningEffort: true },
+		};
+
+		const body = (await captureBody(model, {
+			reasoning: "high",
+			toolChoice: "any",
+		})) as CompletionsBody;
+
+		expect(body.tool_choice).toBe("required");
+		expect(body.reasoning_effort).toBe("high");
+	});
+});
+
+// #945
+describe("OpenCode Go DeepSeek omits unsupported tool_choice", () => {
+	const echoTool: Tool = {
+		name: "echo",
+		description: "Echo input",
+		parameters: z.object({ text: z.string() }),
+	};
+
+	const context: Context = {
+		messages: [{ role: "user", content: "call echo", timestamp: Date.now() }],
+		tools: [echoTool],
+	};
+
+	function abortedSignal(): AbortSignal {
+		const controller = new AbortController();
+		controller.abort();
+		return controller.signal;
+	}
+
+	async function capturePayload(
+		opts: Parameters<typeof streamOpenAICompletions>[2],
+	): Promise<Record<string, unknown>> {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(getBundledModel("opencode-go", "deepseek-v4-pro"), context, {
+			...opts,
+			apiKey: "test-key",
+			signal: abortedSignal(),
+			onPayload: payload => resolve(payload),
+		});
+		return (await promise) as Record<string, unknown>;
+	}
+
+	it("marks deepseek-v4-pro as not supporting tool_choice via compat override", () => {
+		const model = getBundledModel("opencode-go", "deepseek-v4-pro") as Model<"openai-completions">;
+		expect(model.compat?.supportsToolChoice).toBe(false);
+	});
+
+	it("omits tool_choice from payload but preserves tools and reasoning_effort", async () => {
+		const body = await capturePayload({ reasoning: "high", toolChoice: "auto" });
+		expect(body.tools).toBeDefined();
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.reasoning_effort).toBe("high");
+	});
+});
+
+// #969
+describe("OpenAI completions custom reasoning metadata", () => {
+	const testContext: Context = {
+		messages: [{ role: "user", content: "hello", timestamp: 0 }],
+	};
+
+	function customOpenAICompatModel(): Model<"openai-completions"> {
+		return {
+			id: "gpt-5.1",
+			name: "GPT-5.1 proxy",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://proxy.example.com/v1",
+			reasoning: true,
+			compat: { supportsReasoningEffort: true },
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.XHigh,
+			},
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_384,
+		};
+	}
+
+	it("uses the configured xhigh effort for custom OpenAI-compatible models", async () => {
+		const model = customOpenAICompatModel();
+		let payload: Record<string, unknown> | undefined;
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				payload = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+				return createSseResponse([
+					{
+						id: "chatcmpl-969",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: model.id,
+						choices: [{ index: 0, delta: { content: "ok" } }],
+					},
+					{
+						id: "chatcmpl-969",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: model.id,
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					},
+					"[DONE]",
+				]);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		expect(getSupportedEfforts(model)).toContain(Effort.XHigh);
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			reasoning: "xhigh",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(payload?.reasoning_effort).toBe("xhigh");
+	});
+});
 
 describe("openai-completions compatibility", () => {
 	it("never sends reasoning controls to Groq compound systems after late metadata overrides", async () => {
@@ -241,6 +518,7 @@ describe("openai-completions compatibility", () => {
 		expect(xaiCompat("x-ai/grok-4.6", "openai", "https://api.openai.com/v1")).toBe(false);
 		expect((await captureXaiPayload("grok-4.5", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.6", "xhigh")).reasoning_effort).toBe("xhigh");
+		expect((await captureXaiPayload("grok-4.7", "xhigh")).reasoning_effort).toBe("xhigh");
 		expect((await captureXaiPayload("grok-4.7", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.20-0309-reasoning", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.6", "xhigh", "https://proxy.example.com/v1")).reasoning_effort).toBe(
@@ -386,6 +664,7 @@ describe("openai-completions compatibility", () => {
 			supportsUsageInStreaming: true,
 			supportsToolChoice: true,
 			supportsForcedToolChoice: true,
+			supportsUltrafastTier: false,
 			toolChoiceSupport: "named",
 			disableReasoningOnForcedToolChoice: false,
 			disableReasoningOnToolChoice: false,
@@ -894,6 +1173,150 @@ describe("openai-completions compatibility", () => {
 				controller: "mlx",
 			}),
 		);
+	});
+
+	it("does not re-add extraBody tool_choice on deliberate no-tools turns", async () => {
+		// An endpoint whose tool_choice default is "none" (IO Intelligence)
+		// injects {tool_choice:"auto"} via extraBody so ordinary agent turns
+		// can still call tools. Side-channel turns that deliberately opt out
+		// of tools (context.tools set to an empty list with toolChoice
+		// "none") strip their tool_choice; the extraBody merge must not
+		// resurrect it, or the payload carries tool_choice with an empty
+		// tools list — the exact shape strict backends reject.
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			compat: {
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const context: Context = {
+			...baseContext(),
+			tools: [],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			toolChoice: "none",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		expect(payload).not.toHaveProperty("tool_choice");
+	});
+
+	it("keeps extraBody tool_choice when tools are offered", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			compat: {
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const tool: Tool = {
+			name: "get_weather",
+			description: "Get the weather",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		const context: Context = {
+			...baseContext(),
+			tools: [tool],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		const tools = payload.tools as { type: string; function: { name: string } }[];
+		expect(tools).toHaveLength(1);
+		expect(tools[0]).toMatchObject({ type: "function", function: { name: "get_weather" } });
+		expect(payload.tool_choice).toBe("auto");
+	});
+
+	it("suppresses reasoning for an extraBody tool_choice default", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			reasoning: true,
+			compat: {
+				supportsReasoningEffort: true,
+				disableReasoningOnToolChoice: true,
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const tool: Tool = {
+			name: "get_weather",
+			description: "Get the weather",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		const context: Context = {
+			...baseContext(),
+			tools: [tool],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			reasoning: "high",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		expect(payload.tool_choice).toBe("auto");
+		expect(payload).not.toHaveProperty("reasoning_effort");
+	});
+
+	it("keeps an explicit forced tool_choice over the extraBody default", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			compat: {
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const tool: Tool = {
+			name: "set_title",
+			description: "Set the conversation title",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		const context: Context = {
+			...baseContext(),
+			tools: [tool],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			toolChoice: "required",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		expect(payload.tool_choice).toBe("required");
 	});
 
 	it("preserves the streamed reasoning field name when replay requires reasoning content", async () => {
@@ -1550,5 +1973,284 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 			.map(b => (b as { text: string }).text)
 			.join("");
 		expect(text).toBe("keep <\uff5cas-is\uff5c> please");
+	});
+});
+
+// #1207
+describe("DeepSeek V4 keeps reasoning with tools", () => {
+	const echoTool: Tool = {
+		name: "echo",
+		description: "Echo input",
+		parameters: z.object({ text: z.string() }),
+	};
+
+	const contextWithTools: Context = {
+		messages: [{ role: "user", content: "call echo", timestamp: Date.now() }],
+		tools: [echoTool],
+	};
+
+	async function capturePayload(model: Model<"openai-completions">): Promise<Record<string, unknown>> {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(model, contextWithTools, {
+			apiKey: "test-key",
+			signal: createAbortedSignal(),
+			reasoning: "minimal",
+			toolChoice: "auto",
+			maxTokens: 123,
+			onPayload: payload => resolve(payload),
+		});
+		return (await promise) as Record<string, unknown>;
+	}
+
+	function customDeepseekFlash(): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash",
+			provider: "ds",
+			baseUrl: "https://api.deepseek.com/v1",
+			reasoning: true,
+			compat: {
+				supportsReasoningEffort: true,
+				reasoningEffortMap: { xhigh: "max" },
+			},
+		};
+	}
+
+	it("detects the documented direct DeepSeek V4 compat shape", () => {
+		const model = getBundledModel("deepseek", "deepseek-v4-flash") as Model<"openai-completions">;
+		const compat = detectOpenAICompat(model);
+
+		expect(compat.supportsToolChoice).toBe(false);
+		expect(compat.maxTokensField).toBe("max_tokens");
+		expect(compat.extraBody).toEqual({ thinking: { type: "enabled" } });
+		expect(compat.reasoningEffortMap).toMatchObject({
+			minimal: "high",
+			low: "high",
+			medium: "high",
+			high: "high",
+			xhigh: "max",
+		});
+	});
+
+	it("merges partial user reasoning maps with DeepSeek defaults", () => {
+		const compat = resolveOpenAICompat(customDeepseekFlash());
+
+		expect(compat.supportsToolChoice).toBe(false);
+		expect(compat.reasoningEffortMap).toMatchObject({
+			minimal: "high",
+			low: "high",
+			medium: "high",
+			xhigh: "max",
+		});
+	});
+
+	it("omits tool_choice but preserves documented reasoning when tools are present", async () => {
+		const body = await capturePayload(customDeepseekFlash());
+
+		expect(body.tools).toBeDefined();
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.reasoning_effort).toBe("high");
+		expect(body.thinking).toEqual({ type: "enabled" });
+		expect(body.max_tokens).toBe(123);
+		expect(body.max_completion_tokens).toBeUndefined();
+	});
+
+	it("preserves OpenRouter reasoning when tool_choice auto is present", async () => {
+		const model = getBundledModel("openrouter", "deepseek/deepseek-v4-flash") as Model<"openai-completions">;
+		const compat = detectOpenAICompat(model);
+		const body = await capturePayload(model);
+
+		expect(compat.disableReasoningOnToolChoice).toBe(false);
+		expect(body.tools).toBeDefined();
+		expect(body.tool_choice).toBe("auto");
+		expect(body.reasoning).toEqual({ effort: "high" });
+		expect(body.reasoning_effort).toBeUndefined();
+	});
+});
+
+// #959
+describe("direct DeepSeek chat-template token stripping", () => {
+	const model: Model<"openai-completions"> = {
+		...getBundledModel("deepseek", "deepseek-v4-flash"),
+	};
+
+	it("strips leaked deepseek chat-template markers from visible text for deepseek providers", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "去改前端交互描述：" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "<｜Assistant｜>\n\n" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "让我找到对应位置并修改。" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => (block as { text: string }).text)
+			.join("");
+
+		expect(text).toBe("去改前端交互描述：让我找到对应位置并修改。");
+		expect(text).not.toContain("<｜Assistant｜>");
+	});
+
+	it("holds partial deepseek markers across chunks before stripping them", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-deepseek-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "去改前端交互描述：<｜Ass" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "istant｜>\n\n让我找到对应位置并修改。" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => (block as { text: string }).text)
+			.join("");
+
+		expect(text).toBe("去改前端交互描述：让我找到对应位置并修改。");
+		expect(text).not.toContain("<｜Assistant｜>");
+	});
+});
+
+// #911
+describe("Mistral typed content parts assemble into visible text", () => {
+	const model: Model<"openai-completions"> = {
+		...getBundledModel("mistral", "mistral-medium-2604"),
+	};
+
+	it("normalizes array-of-parts delta.content into the assembled text without [object Object]", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { content: [{ type: "text", text: "Hello" }] },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { content: [{ type: "text", text: ", world" }] },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => (b as { text: string }).text)
+			.join("");
+
+		expect(text).not.toContain("[object Object]");
+		expect(text).toBe("Hello, world");
+	});
+
+	it("handles mixed string and array-of-parts content shapes within one stream", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "plain " } }],
+			},
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							content: [
+								{ type: "text", text: "and " },
+								{ type: "text", text: "typed" },
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => (b as { text: string }).text)
+			.join("");
+
+		expect(text).not.toContain("[object Object]");
+		expect(text).toBe("plain and typed");
 	});
 });

@@ -40,6 +40,72 @@ describe("AuthStorage session credential selectors", () => {
 		}
 	});
 
+	test("detects credential pins across all session scopes", async () => {
+		const storage = await createStorage();
+		try {
+			storage.acquireCredentialScope("session-a");
+			storage.acquireCredentialScope("session-b");
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(false);
+			storage.setSessionCredentialSelector("session-a", "anthropic", {
+				kind: "email",
+				value: "first@example.com",
+			});
+			storage.setSessionCredentialSelector("session-b", "anthropic", {
+				kind: "email",
+				value: "second@example.com",
+			});
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(true);
+
+			storage.releaseCredentialScope("session-a");
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(true);
+			storage.releaseCredentialScope("session-b");
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(false);
+
+			storage.acquireCredentialScope("auto-session");
+			storage.setSessionCredentialAuto("anthropic", "auto-session");
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(false);
+			storage.releaseCredentialScope("auto-session");
+
+			storage.acquireCredentialScope("unavailable-session");
+			storage.setSessionCredentialSelector("unavailable-session", "anthropic", {
+				kind: "email",
+				value: "first@example.com",
+			});
+			storage.markSessionCredentialUnavailable("unavailable-session", "anthropic", {
+				kind: "email",
+				value: "first@example.com",
+			});
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(true);
+			storage.setSessionCredentialAuto("anthropic", "unavailable-session");
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(false);
+			storage.releaseCredentialScope("unavailable-session");
+
+			storage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "first@example.com" });
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(true);
+		} finally {
+			storage.close();
+		}
+	});
+
+	test("credential pin queries normalize OAuth provider aliases", async () => {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		store.saveOAuth("openai-codex", oauth("codex"));
+		const storage = new AuthStorage(store);
+		await storage.reload();
+		try {
+			storage.acquireCredentialScope("alias-session");
+			storage.setSessionCredentialSelector("alias-session", "openai-codex-device", {
+				kind: "email",
+				value: "codex@example.com",
+			});
+
+			expect(storage.hasAnyCredentialPin("openai-codex")).toBe(true);
+			expect(storage.hasAnyCredentialPin("openai-codex-device")).toBe(true);
+		} finally {
+			storage.close();
+		}
+	});
+
 	test("AUTO masks a process-global selector for one session only", async () => {
 		const storage = await createStorage();
 		try {
@@ -48,6 +114,7 @@ describe("AuthStorage session credential selectors", () => {
 			storage.setSessionCredentialAuto("anthropic", "auto-session");
 
 			expect(storage.resolveEffectiveCredentialSelector("anthropic", "auto-session")).toBeUndefined();
+			expect(storage.hasAnyCredentialPin("anthropic")).toBe(true);
 			expect(storage.getOAuthCredential("anthropic")?.accountId).toBe("account-second");
 			expect(storage.getOAuthCredential("anthropic", "auto-session")?.accountId).toBe("account-first");
 		} finally {

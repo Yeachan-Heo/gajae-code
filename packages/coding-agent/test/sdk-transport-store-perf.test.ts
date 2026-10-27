@@ -57,6 +57,7 @@ async function relay(sink: Writable = new PassThrough()) {
 	});
 	ws.readyState = 1;
 	ws.emit("open");
+	ws.emit("message", { data: JSON.stringify({ type: "hello" }) });
 	return { pair: await started, ws, input, sink, errors };
 }
 
@@ -183,6 +184,8 @@ describe("SDK transport/store bounded hot paths", () => {
 	test("forwards 256 one-KiB fragments byte-identically with one frame concatenation", async () => {
 		const fixture = await relay();
 		try {
+			// Forwarding begins only after the upstream host's hello.
+			fixture.ws.emit("message", { data: '{"type":"hello"}' });
 			const frame = Buffer.from(`"${"漢🙂x".repeat(32767)}${" ".repeat(6)}"`);
 			expect(frame.length).toBe(REQUEST_FRAME_BYTES);
 			const concat = spyOn(Buffer, "concat");
@@ -221,6 +224,7 @@ describe("SDK transport/store bounded hot paths", () => {
 	test("rejects an empty frame after a complete frame in the same chunk", async () => {
 		const fixture = await relay();
 		try {
+			fixture.ws.emit("message", { data: '{"type":"hello"}' });
 			fixture.input.emit("data", Buffer.from("{}\n\n"));
 			await expect(fixture.pair.done).rejects.toThrow("protocol_error");
 			expect(fixture.ws.messages).toEqual(["{}"]);

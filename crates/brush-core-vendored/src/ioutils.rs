@@ -71,6 +71,6 @@ impl std::io::Write for FailingReaderWriter {
 
 impl From<FailingReaderWriter> for openfiles::OpenFile {
 	fn from(frw: FailingReaderWriter) -> Self {
-		Self::Stream(Box::new(frw))
+		Self::Stream(Box::new(frw), openfiles::HeldInput::default())
 	}
 }

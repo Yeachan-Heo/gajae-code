@@ -260,10 +260,24 @@ function isRecognizedClipboardTempPath(filePath: string, platform: NodeJS.Platfo
 	return CLIPBOARD_TEMP_BASENAME_PATTERN.test(api.basename(resolved));
 }
 
+/**
+ * Drop trailing CR/LF in one backward scan.
+ * A quantified `(\r\n|\r|\n)` alternation overlaps on those bytes and backtracks when `$` fails.
+ */
+function trimTrailingTerminalNewlines(text: string): string {
+	let end = text.length;
+	while (end > 0) {
+		const code = text.charCodeAt(end - 1);
+		if (code !== 10 && code !== 13) break;
+		end -= 1;
+	}
+	return end === text.length ? text : text.slice(0, end);
+}
+
 /** Resolve one recognized clipboard-temp image path lexically, before any filesystem access. */
 export function resolvePastedImagePath(text: string, options: ResolvePastedImagePathOptions = {}): string | undefined {
 	const platform = options.platform ?? process.platform;
-	const terminalNewlinesTrimmed = text.replace(/(?:\r\n|\r|\n)+$/, "");
+	const terminalNewlinesTrimmed = trimTrailingTerminalNewlines(text);
 	if (/\r|\n/.test(terminalNewlinesTrimmed)) return undefined;
 	const candidates = decodePastedPathCandidates(terminalNewlinesTrimmed, options, 1);
 	if (candidates?.length !== 1) return undefined;

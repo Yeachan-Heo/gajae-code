@@ -13,6 +13,7 @@
  */
 
 import type {
+	AgentRole,
 	AggregatedStats,
 	CostTimeSeriesPoint,
 	ModelPerformancePoint,
@@ -44,6 +45,7 @@ export interface MessageStats {
 	sessionFile: string;
 	entryId: string;
 	folder: string;
+	agent: AgentRole;
 	model: string;
 	provider: string;
 	api: string;

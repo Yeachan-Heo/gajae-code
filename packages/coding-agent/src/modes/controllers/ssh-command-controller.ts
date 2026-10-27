@@ -3,7 +3,7 @@
  *
  * Handles /ssh subcommands for managing SSH host configurations.
  */
-import { getProjectDir, getSSHConfigPath } from "@gajae-code/utils";
+import { getProjectDir, getSSHConfigPath, sanitizeDisplayLine } from "@gajae-code/utils";
 import { type SSHHost, sshCapability } from "../../capability/ssh";
 import { loadCapability } from "../../discovery";
 import { addSSHHost, readSSHConfigFile, removeSSHHost, type SSHHostConfig } from "../../ssh/config-writer";
@@ -17,6 +17,14 @@ import {
 	type ScopeValue,
 	showCommandMessage,
 } from "./command-controller-shared";
+
+/**
+ * One terminal row for an untrusted `/ssh list` field.
+ * Ordinary names, hosts, usernames, and ports are unchanged.
+ */
+export function sshListTerminalLabel(value: string): string {
+	return sanitizeDisplayLine(value);
+}
 
 export class SSHCommandController {
 	constructor(private ctx: InteractiveModeContext) {}
@@ -134,7 +142,9 @@ export class SSHCommandController {
 					this.ctx.showError("Missing value for --port.");
 					return;
 				}
-				const parsed = Number.parseInt(value, 10);
+				// Same rule as the ACP `/ssh add` parser: `Number.parseInt` accepts
+				// trailing garbage ("22oops" -> 22), which would save a typo as a port.
+				const parsed = /^\d+$/.test(value) ? Number.parseInt(value, 10) : Number.NaN;
 				if (Number.isNaN(parsed) || parsed < 1 || parsed > 65535) {
 					this.ctx.showError("Invalid --port value. Must be an integer between 1 and 65535.");
 					return;
@@ -285,7 +295,7 @@ export class SSHCommandController {
 				for (const name of userHosts) {
 					const config = userConfig.hosts![name];
 					const details = this.#formatHostDetails(config);
-					lines.push(`  ${theme.fg("accent", name)} ${details}`);
+					lines.push(`  ${theme.fg("accent", sshListTerminalLabel(name))} ${details}`);
 				}
 				lines.push("");
 			}
@@ -296,7 +306,7 @@ export class SSHCommandController {
 				for (const name of projectHosts) {
 					const config = projectConfig.hosts![name];
 					const details = this.#formatHostDetails(config);
-					lines.push(`  ${theme.fg("accent", name)} ${details}`);
+					lines.push(`  ${theme.fg("accent", sshListTerminalLabel(name))} ${details}`);
 				}
 				lines.push("");
 			}
@@ -306,7 +316,10 @@ export class SSHCommandController {
 				for (const { providerName, shortPath, items: hosts } of groupBySource(discoveredHosts, h => h._source)) {
 					lines.push(
 						theme.fg("accent", "Discovered") +
-							theme.fg("muted", ` (${providerName}: ${shortPath}):`) +
+							theme.fg(
+								"muted",
+								` (${sshListTerminalLabel(providerName)}: ${sshListTerminalLabel(shortPath)}):`,
+							) +
 							theme.fg("dim", " read-only"),
 					);
 					for (const host of hosts) {
@@ -315,7 +328,7 @@ export class SSHCommandController {
 							username: host.username,
 							port: host.port,
 						});
-						lines.push(`  ${theme.fg("accent", host.name)} ${details}`);
+						lines.push(`  ${theme.fg("accent", sshListTerminalLabel(host.name))} ${details}`);
 					}
 					lines.push("");
 				}
@@ -330,11 +343,11 @@ export class SSHCommandController {
 	/**
 	 * Format host details (host, user, port) for display
 	 */
-	#formatHostDetails(config: { host?: string; username?: string; port?: number }): string {
+	#formatHostDetails(config: { host?: string; username?: string; port?: number | string }): string {
 		const parts: string[] = [];
-		if (config.host) parts.push(config.host);
-		if (config.username) parts.push(`user=${config.username}`);
-		if (config.port && config.port !== 22) parts.push(`port=${config.port}`);
+		if (config.host) parts.push(sshListTerminalLabel(String(config.host)));
+		if (config.username) parts.push(`user=${sshListTerminalLabel(String(config.username))}`);
+		if (config.port && config.port !== 22) parts.push(`port=${sshListTerminalLabel(String(config.port))}`);
 		return theme.fg("dim", parts.length > 0 ? `[${parts.join(", ")}]` : "");
 	}
 

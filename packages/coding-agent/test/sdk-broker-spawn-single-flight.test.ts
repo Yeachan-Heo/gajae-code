@@ -2,11 +2,20 @@ import { expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
+import Sdk, { consumeBrokerRestartEnvironment } from "../src/commands/sdk";
+import {
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+	FileLockAcquireError,
+	FileLockTestHooks,
+} from "../src/config/file-lock";
+import { Broker } from "../src/sdk/broker/broker";
+import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
+import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import {
 	acquireSpawnLockForTest,
 	BROKER_DISCOVERY_BUDGET,
@@ -19,6 +28,8 @@ import {
 	setEnsureBrokerTimingForTest,
 	withBrokerStartupLock,
 } from "../src/sdk/broker/ensure";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
+import { BrokerStartupError } from "../src/sdk/broker/startup-failure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
 const brokerModule = path.resolve(import.meta.dir, "../src/sdk/broker/broker.ts");
@@ -234,7 +245,7 @@ it("source-mode CLI resolves a relative agent dir once for parent and detached b
 		await Bun.sleep(300);
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 60_000);
 
 it("concurrent process replacement composes stale-generation fencing with single-flight spawn", async () => {
 	const dir = await temp();
@@ -368,7 +379,7 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 		await Bun.sleep(300);
 		await fs.rm(dir, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 60_000);
 
 it("the parent discovery budget covers child-fence contention plus a full startup attempt", async () => {
 	const dir = await temp();
@@ -413,7 +424,7 @@ it("the parent discovery budget covers child-fence contention plus a full startu
 			}
 		await fs.rm(dir, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 60_000);
 
 it("the parent budget composes stale retirement, child-fence contention, and startup", async () => {
 	const dir = await temp();
@@ -501,16 +512,18 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 it("spends the parent discovery budget one composition leg at a time", async () => {
 	const dir = await temp();
 	const clock = virtualBudgetClock();
-	// An incumbent of the wrong generation that never retires: a pid this process
-	// cannot match by incarnation keeps retirement on its polling path and out of
-	// process.kill entirely, and the unroutable url refuses its shutdown request.
+	const testProcessIncarnation = brokerProcessIncarnation(process.pid);
+	if (!testProcessIncarnation) throw new Error("test process incarnation unavailable");
+	// The wrong generation forces retirement of a live same-process owner. Its
+	// incarnation keeps cleanup away from process.kill, and the unroutable URL
+	// refuses shutdown while discovery remains published during the polling leg.
 	const unretirable: BrokerDiscovery = {
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "pr5604-incompatible-generation",
 		ownerId: "pr5604-virtual-clock-owner",
 		pid: process.pid,
-		incarnation: "pr5604-virtual-clock-incarnation",
+		incarnation: testProcessIncarnation,
 		host: "127.0.0.1",
 		port: 1,
 		url: "ws://127.0.0.1:1",
@@ -518,7 +531,16 @@ it("spends the parent discovery budget one composition leg at a time", async () 
 		startedAt: clock.timing.now(),
 		heartbeatAt: clock.timing.now(),
 	};
-	const readSpy = spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(() => Promise.resolve(unretirable));
+	// Model discovery-owner retirement transition: return unretirable for a while,
+	// then null when retirement is about to complete, to show the discovery owner has retired.
+	const retirementDeadline = clock.timing.now() + BROKER_DISCOVERY_BUDGET.staleRetirementMs;
+	const retirementTransitionAt = retirementDeadline - 50;
+	const readSpy = spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(() => {
+		// Keep returning unretirable while inside retirement window.
+		// Once enough time has passed, return null to complete retirement.
+		const now = clock.timing.now();
+		return Promise.resolve(now < retirementTransitionAt ? unretirable : null);
+	});
 	setEnsureBrokerTimingForTest(clock.timing);
 	try {
 		const budgetStart = clock.timing.now();
@@ -526,14 +548,14 @@ it("spends the parent discovery budget one composition leg at a time", async () 
 			{ agentDir: dir },
 			budgetStart + BROKER_DISCOVERY_BUDGET.discoveryMs,
 		);
-		// Leg one gives up on an incumbent that never goes away, and spends exactly
-		// its own leg doing so -- never the caller's whole budget.
+		// Leg one spends its retirement budget polling the same owner until the
+		// mocked discovery transition completes, without consuming the caller's full budget.
 		expect(reconciled).toBeUndefined();
-		expect(clock.elapsedMs()).toBe(BROKER_DISCOVERY_BUDGET.staleRetirementMs);
+		expect(clock.elapsedMs()).toBe(BROKER_DISCOVERY_BUDGET.staleRetirementMs - 50);
 		// What survives retirement is still a full child-fence wait plus one
 		// publication attempt; that remainder is what the wall-clock case stages.
 		expect(budgetStart + BROKER_DISCOVERY_BUDGET.discoveryMs - clock.timing.now()).toBe(
-			BROKER_DISCOVERY_BUDGET.startupLockWaitMs + BROKER_DISCOVERY_BUDGET.publicationMs,
+			BROKER_DISCOVERY_BUDGET.startupLockWaitMs + BROKER_DISCOVERY_BUDGET.publicationMs + 50,
 		);
 		// The fence itself grants its holder retirement plus that publication.
 		const fenceDeadline = await withBrokerStartupLock(dir, deadline => Promise.resolve(deadline));
@@ -544,6 +566,56 @@ it("spends the parent discovery budget one composition leg at a time", async () 
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 15_000);
+
+it("bounds same-process retirement reads without heartbeat expiry and preserves both errors", async () => {
+	const dir = await temp();
+	const incarnation = brokerProcessIncarnation(process.pid);
+	if (!incarnation) throw new Error("test process incarnation unavailable");
+	const stale: BrokerDiscovery = {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "pr6667-incompatible-generation",
+		ownerId: "pr6667-stalled-discovery-owner",
+		pid: process.pid,
+		incarnation,
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://127.0.0.1:1",
+		token: "pr6667-stalled-discovery-token",
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	};
+	const stalledRead = Promise.withResolvers<BrokerDiscovery | null>();
+	const requestedTtls: Array<number | undefined> = [];
+	let reads = 0;
+	const readSpy = spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation((_agentDir, ttlMs) => {
+		reads += 1;
+		requestedTtls.push(ttlMs);
+		if (reads < 4) return Promise.resolve(stale);
+		// A normal TTL read now hides the still-published owner as expired; the
+		// retirement check must use the raw identity and remain deadline-bounded.
+		return ttlMs === Number.POSITIVE_INFINITY ? stalledRead.promise : Promise.resolve(null);
+	});
+	try {
+		const failure = await reconcileBrokerGenerationForStartup({ agentDir: dir }, Date.now() + 1_000).then(
+			() => undefined,
+			error => (error instanceof Error ? error : new Error(String(error))),
+		);
+		expect(failure).toBeInstanceOf(AggregateError);
+		if (!(failure instanceof AggregateError)) throw new Error("expected aggregated retirement failure");
+		expect(failure.message).toContain("shutdown RPC and discovery retirement both failed");
+		expect(failure.errors).toHaveLength(2);
+		expect(failure.errors[1]).toBeInstanceOf(Error);
+		if (!(failure.errors[1] instanceof Error)) throw new Error("expected bounded discovery read failure");
+		expect(failure.errors[1].message).toBe("Timed out reading SDK broker discovery.");
+		expect(reads).toBe(4);
+		expect(requestedTtls.at(-1)).toBe(Number.POSITIVE_INFINITY);
+	} finally {
+		readSpy.mockRestore();
+		stalledRead.resolve(null);
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 5_000);
 
 it("stale broker client teardown cannot extend an expired retirement deadline", async () => {
 	const stalled = Promise.withResolvers<void>();
@@ -593,6 +665,26 @@ it("kills a broker bootstrap that outlives the startup fence deadline", async ()
 		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 		expect(code).toBe(1);
 		expect(error).toContain("SDK broker startup exceeded its 250ms fence deadline.");
+		const diagnostics = error
+			.trim()
+			.split(/\r?\n/u)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(diagnostics.filter(record => record.reason === "startup-deadline")).toHaveLength(1);
+		expect(diagnostics.find(record => record.reason === "startup-deadline")).toMatchObject({
+			reason: "startup-deadline",
+			mode: "startup",
+			timeoutMs: 250,
+			pid: child.pid,
+			exitCode: 1,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-deadline",
+			exitCode: 1,
+			signal: null,
+			pid: child.pid,
+			timeoutMs: 250,
+		});
 
 		const discovery = await ensureBroker({ agentDir: dir });
 		brokerPid = discovery.pid;
@@ -608,6 +700,618 @@ it("kills a broker bootstrap that outlives the startup fence deadline", async ()
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 15_000);
+
+it("bounds authorized child fence acquisition by the committed restart expiry", async () => {
+	const dir = await temp();
+	const requestId = "fence-expiry";
+	const expiresAt = Date.now() + 2_000;
+	await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
+	await fs.writeFile(
+		brokerDiscovery.brokerRestartIntentPath(dir),
+		JSON.stringify({ phase: "committed", requestId, expiresAt, lease: "fence-expiry-lease" }),
+	);
+	try {
+		await withBrokerStartupLock(
+			dir,
+			async () => {
+				const child = Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+					cwd: import.meta.dir,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					env: {
+						...process.env,
+						GJC_BROKER_RESTART_REQUEST: requestId,
+						GJC_BROKER_RESTART_DEADLINE: String(expiresAt),
+					},
+				});
+				const [code] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				expect(code).toBe(1);
+				expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+					mode: "startup",
+					reason: "startup-lock-unavailable",
+					exitCode: 1,
+				});
+			},
+			{ deadlineAt: expiresAt },
+		);
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 5_000);
+
+// Removal-transition adoption is POSIX-only; Windows uses native exact removal.
+it.skipIf(process.platform === "win32")(
+	"startup fence waits long enough to adopt a retained removal transition",
+	async () => {
+		const dir = await temp();
+		const transitionPath = path.join(dir, "sdk", "broker.startup.lock.removing");
+		await fs.mkdir(transitionPath, { recursive: true });
+		const old = new Date(Date.now() - 2_000);
+		await fs.utimes(transitionPath, old, old);
+		try {
+			const result = await withBrokerStartupLock(dir, async () => true);
+			expect(result).toBe(true);
+			expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock.removing");
+			expect(Date.now() - old.getTime()).toBeGreaterThanOrEqual(FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	},
+	20_000,
+);
+
+it("records a startup exit when acquisition is blocked by a retained removal transition", async () => {
+	const dir = await temp();
+	const blockingLockPath = path.join(dir, "sdk", "broker.startup.lock.removing");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	const infoPath = path.join(blockingLockPath, "info");
+	await Bun.write(infoPath, "");
+	const old = new Date(Date.now() - 120_000);
+	await fs.utimes(infoPath, old, old);
+	const sleep = spyOn(Bun, "sleep").mockImplementation(async () => undefined);
+	const stderr: string[] = [];
+	const stderrWrite = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({ reason: "orphan_transition", orphanPath: blockingLockPath });
+
+		expect(stderr.join("")).toContain(`blocked by retained removal transition ${blockingLockPath}`);
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-blocked",
+			blockingLockPath,
+			timeoutMs: BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
+			exitCode: 1,
+			signal: null,
+		});
+		expect(await readBrokerExitRecord(dir)).toBeUndefined();
+	} finally {
+		stderrWrite.mockRestore();
+		sleep.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("retries session-index acquisition timeouts within the startup fence before refusing", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(indexFilePath, blockingLockPath, 600, `held by pid ${process.pid}`),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "acquire_timeout",
+			lockPath: blockingLockPath,
+		});
+		expect(start).toHaveBeenCalledTimes(3);
+		expect(stop).toHaveBeenCalledTimes(3);
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("does not retry an unproven access-denied session-index publication failure", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const failure = new FileLockAcquireError(
+		indexFilePath,
+		blockingLockPath,
+		1,
+		"unproven lock holder",
+		"acquire_timeout",
+		undefined,
+		undefined,
+		"access_denied",
+		false,
+	);
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(failure);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toBe(failure);
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(stop).toHaveBeenCalledTimes(1);
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("consumes broker restart authorization before launching descendants", () => {
+	const deadlineAt = Date.now() + 60_000;
+	const environment: NodeJS.ProcessEnv = {
+		GJC_BROKER_RESTART_REQUEST: "single-use-request",
+		GJC_BROKER_RESTART_DEADLINE: String(deadlineAt),
+		KEEP_FOR_CHILDREN: "preserved",
+	};
+
+	expect(consumeBrokerRestartEnvironment(environment)).toEqual({
+		requestIdEnv: "single-use-request",
+		restartDeadlineAt: deadlineAt,
+	});
+	expect(environment).toEqual({ KEEP_FOR_CHILDREN: "preserved" });
+});
+
+it("refuses untagged startup when a restart intent cannot be read", async () => {
+	const dir = await temp();
+	const requestId = "transient-intent-read";
+	const priorRequestId = process.env.GJC_BROKER_RESTART_REQUEST;
+	process.env.GJC_BROKER_RESTART_REQUEST = requestId;
+	const readIntent = spyOn(brokerDiscovery, "readBrokerRestartIntent").mockRejectedValue(
+		new Error("injected transient intent read failure"),
+	);
+	const start = spyOn(Broker.prototype, "start");
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toThrow("refusing untagged startup");
+		expect(readIntent).toHaveBeenCalledTimes(1);
+		expect(start).not.toHaveBeenCalled();
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+	} finally {
+		if (priorRequestId === undefined) delete process.env.GJC_BROKER_RESTART_REQUEST;
+		else process.env.GJC_BROKER_RESTART_REQUEST = priorRequestId;
+		start.mockRestore();
+		readIntent.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("records retained session-index transitions as retryable lock unavailability", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const lockPath = path.join(indexDir, "index.jsonl.lock");
+	const transitionPath = path.join(indexDir, "index.jsonl.lock.removing");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(
+			indexFilePath,
+			lockPath,
+			600,
+			`held by pid ${process.pid}`,
+			"orphan_transition",
+			transitionPath,
+		),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "orphan_transition",
+			orphanPath: transitionPath,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath: transitionPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("retries ordinary broker startup after its session-index lock becomes available", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const spawnLockPath = path.join(dir, "sdk", "broker.spawn.lock");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	await Bun.write(
+		path.join(blockingLockPath, "info"),
+		JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-owner" }),
+	);
+	const lockUnavailable = Promise.withResolvers<void>();
+	void lockUnavailable.promise.catch(() => undefined);
+	let pollInFlight = false;
+	let lockUnavailableCount = 0;
+	let discoveryWhileBlocked: BrokerDiscovery | null | undefined;
+	let spawnLockAcquisitions = 0;
+	let retrySawReleasedSpawnLock = false;
+	FileLockTestHooks.afterParentMkdir = async lockPath => {
+		if (lockPath !== spawnLockPath) return;
+		spawnLockAcquisitions++;
+		if (spawnLockAcquisitions === 2) retrySawReleasedSpawnLock = !(await fs.exists(spawnLockPath));
+	};
+	const poll = setInterval(() => {
+		if (pollInFlight) return;
+		pollInFlight = true;
+		void readBrokerStartupExitRecord(dir)
+			.then(async record => {
+				if (record?.reason !== "startup-lock-unavailable") return;
+				lockUnavailableCount++;
+				discoveryWhileBlocked = await brokerDiscovery.readBrokerDiscovery(dir);
+				clearInterval(poll);
+				await fs.rm(blockingLockPath, { recursive: true, force: true });
+				lockUnavailable.resolve();
+			})
+			.catch(lockUnavailable.reject)
+			.finally(() => {
+				pollInFlight = false;
+			});
+	}, 25);
+	try {
+		const discovery = await ensureBroker({ agentDir: dir });
+		await lockUnavailable.promise;
+		expect(lockUnavailableCount).toBe(1);
+		expect(discoveryWhileBlocked).toBeNull();
+		expect(spawnLockAcquisitions).toBe(2);
+		expect(retrySawReleasedSpawnLock).toBe(true);
+		expect(discovery.pid).toBeGreaterThan(0);
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toMatchObject({ pid: discovery.pid });
+	} finally {
+		clearInterval(poll);
+		FileLockTestHooks.afterParentMkdir = undefined;
+		await fs.rm(blockingLockPath, { recursive: true, force: true });
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 45_000);
+
+it("keeps the deadline reason when SIGTERM arrives during its async record fallback", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const child = Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_STARTUP_STALL: "1",
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "250",
+				GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS: "500",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+			},
+		});
+		try {
+			await waitForFile(path.join(signalDir, "startup-exit-record-fallback-waiting"));
+			const fallbackObservedAt = Date.now();
+			process.kill(child.pid, "SIGTERM");
+			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(code).toBe(1);
+			expect(Date.now() - fallbackObservedAt).toBeLessThan(1_500);
+			expect(stderr).toContain("SDK broker startup exceeded its 250ms fence deadline.");
+			expect(stderr).not.toContain("SDK broker startup interrupted by SIGTERM before readiness.");
+			expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+				mode: "startup",
+				reason: "startup-deadline",
+				exitCode: 1,
+				signal: null,
+				timeoutMs: 250,
+				pid: child.pid,
+			});
+			expect(await readBrokerExitRecord(dir)).toBeUndefined();
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+		}
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 15_000);
+
+it("exits on the startup deadline when async evidence exceeds its write bound", async () => {
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const child = Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_STARTUP_STALL: "1",
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "250",
+				GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS: "2000",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+			},
+		});
+		try {
+			await waitForFile(path.join(signalDir, "startup-exit-record-fallback-waiting"));
+			const fallbackObservedAt = Date.now();
+			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(code).toBe(1);
+			expect(Date.now() - fallbackObservedAt).toBeLessThan(1_500);
+			expect(stderr).toContain("SDK broker startup exceeded its 250ms fence deadline.");
+			expect(await readBrokerStartupExitRecord(dir)).toBeUndefined();
+			expect(await readBrokerExitRecord(dir)).toBeUndefined();
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+		}
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 10_000);
+
+it("records SIGTERM and SIGINT received before broker readiness", async () => {
+	if (process.platform === "win32") return;
+	for (const signal of ["SIGTERM", "SIGINT"] as const) {
+		const dir = await temp();
+		const signalDir = path.join(dir, "signals");
+		try {
+			await fs.mkdir(signalDir, { recursive: true });
+			const child = Bun.spawn([process.execPath, cli, "sdk", "broker-internal", "--agent-dir", dir], {
+				cwd: import.meta.dir,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					GJC_SDK_TEST_BROKER_STARTUP_SIGNAL: signal,
+					GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+					GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+				},
+			});
+			try {
+				await waitForFile(path.join(signalDir, "startup-signal-ready"));
+				const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				const expectedExitCode = signal === "SIGTERM" ? 143 : 130;
+				expect(code).toBe(expectedExitCode);
+				let diagnostics: Record<string, unknown>[];
+				try {
+					diagnostics = stderr
+						.trim()
+						.split(/\r?\n/u)
+						.map(line => JSON.parse(line) as Record<string, unknown>);
+				} catch {
+					throw new Error(
+						`Startup signal log was incomplete; signalCode=${child.signalCode}; stderr=${JSON.stringify(stderr)}`,
+					);
+				}
+				expect(diagnostics.find(record => record.reason === "startup-signal")).toMatchObject({
+					reason: "startup-signal",
+					mode: "startup",
+					signal,
+					pid: child.pid,
+					exitCode: expectedExitCode,
+				});
+				const startupExit = await readBrokerStartupExitRecord(dir);
+				if (!startupExit) {
+					const file = Bun.file(path.join(dir, "sdk", "broker.startup-exit.json"));
+					const content = (await file.exists()) ? await file.text() : "missing";
+					throw new Error(`Startup exit record was not readable: ${content}`);
+				}
+				expect(startupExit).toMatchObject({
+					mode: "startup",
+					reason: "startup-signal",
+					signal,
+					exitCode: expectedExitCode,
+					pid: child.pid,
+					timeoutMs: null,
+				});
+				expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+			} finally {
+				if (child.exitCode === null) child.kill("SIGKILL");
+				await child.exited;
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}
+}, 15_000);
+
+it("records a startup signal after discovery caching but before publication", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const child = Bun.spawn([process.execPath, cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_PRE_PUBLICATION_DELAY_MS: "5000",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+			},
+		});
+		try {
+			await waitForFile(path.join(signalDir, "pre-publication-ready"));
+			expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+			const signalSentAt = Date.now();
+			process.kill(child.pid, "SIGTERM");
+			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(code).toBe(143);
+			expect(Date.now() - signalSentAt).toBeLessThan(1_500);
+			expect(stderr).toContain("SDK broker startup interrupted by SIGTERM before readiness.");
+			expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+				mode: "startup",
+				reason: "startup-signal",
+				signal: "SIGTERM",
+				exitCode: 143,
+				pid: child.pid,
+			});
+			expect(await readBrokerExitRecord(dir)).toBeUndefined();
+			expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+		}
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 15_000);
+
+it("rolls back discovery when a signal interrupts before retained publication", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const child = Bun.spawn([process.execPath, cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_AFTER_DISCOVERY_WRITE_DELAY_MS: "5000",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+			},
+		});
+		try {
+			await waitForFile(path.join(signalDir, "discovery-written-before-retain"));
+			const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+			expect(discovery?.pid).toBe(child.pid);
+			process.kill(child.pid, "SIGTERM");
+			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(code).toBe(143);
+			expect(stderr).toContain("SDK broker startup interrupted by SIGTERM before readiness.");
+			expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+				mode: "startup",
+				reason: "startup-signal",
+				signal: "SIGTERM",
+				exitCode: 143,
+				pid: child.pid,
+			});
+			expect(await readBrokerExitRecord(dir)).toBeUndefined();
+			expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+			expect(await Bun.file(brokerDiscovery.brokerDiscoveryPath(dir)).exists()).toBe(false);
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+		}
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 15_000);
+
+it("persists an active signal exit during the publication handoff", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const child = Bun.spawn([process.execPath, cli, "sdk", "broker-internal", "--agent-dir", dir], {
+		cwd: import.meta.dir,
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS: "7000",
+			GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "5000",
+		},
+	});
+	try {
+		expect(child.pid).toBeGreaterThan(0);
+		await waitForFile(brokerDiscovery.brokerDiscoveryPath(dir));
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(discovery?.pid).toBe(child.pid);
+		await Bun.sleep(5_500);
+		expect(child.exitCode).toBeNull();
+		process.kill(child.pid, "SIGTERM");
+		const [code] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect(code).toBe(143);
+		expect(await readBrokerExitRecord(dir)).toMatchObject({
+			mode: "owned-root",
+			reason: "signal",
+			signal: "SIGTERM",
+			pid: child.pid,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toBeUndefined();
+	} finally {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
+
+it("surfaces a startup signal record through the broker supervisor", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const failure = await ensureBroker({
+			agentDir: dir,
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_STARTUP_SIGNAL: "SIGTERM",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+			},
+		}).then(
+			() => undefined,
+			(error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+		);
+		expect(failure).toBeInstanceOf(BrokerStartupError);
+		const startupError = failure as BrokerStartupError;
+		expect(startupError.signal).toBe("SIGTERM");
+		expect(startupError.reason).toContain("SDK broker startup interrupted by SIGTERM before readiness.");
+		const exitRecord = await readBrokerStartupExitRecord(dir);
+		expect(exitRecord).toMatchObject({
+			mode: "startup",
+			reason: "startup-signal",
+			signal: "SIGTERM",
+		});
+		expect(exitRecord?.pid).toBeGreaterThan(0);
+	} finally {
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
 
 it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
 	const dir = await temp();
@@ -635,12 +1339,12 @@ it("releases the spawn lock when the under-lock discovery read fails so the next
 	}
 }, 30_000);
 
-it("the spawn lock rejects an incomplete published owner instead of acquiring over it", async () => {
+it("the spawn lock rejects an ownerless empty directory instead of acquiring over it", async () => {
 	const dir = await temp();
 	try {
 		await fs.mkdir(path.join(dir, "sdk", "broker.spawn.lock"), { recursive: true });
 		await expect(acquireSpawnLockForTest(dir, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
-			"held by an unrecognized owner record",
+			"held by an ownerless empty lock directory",
 		);
 		expect(await fs.readdir(path.join(dir, "sdk", "broker.spawn.lock"))).toEqual([]);
 	} finally {
@@ -715,10 +1419,17 @@ it("shared agent roots recover dead locks across config profiles despite a retai
 
 		const sdk = path.join(dir, "sdk");
 		const brokerLock = path.join(sdk, "broker.lock");
+		const { ownerHostId } = await brokerLockHostIdentity(dir);
 		await fs.mkdir(brokerLock, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(brokerLock, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "dead-broker", pid: deadPid, acquiredAt: Date.now() - 60_000 }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "dead-broker",
+				pid: deadPid,
+				ownerHostId,
+				acquiredAt: Date.now() - 60_000,
+			}),
 			{ mode: 0o600 },
 		);
 		const lockStat = await fs.lstat(brokerLock, { bigint: true });

@@ -3,7 +3,7 @@
  */
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { logger } from "@gajae-code/utils";
+import { $pickenv, logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseThinkingLevel } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
@@ -46,8 +46,6 @@ export interface Args {
 	allowHome?: boolean;
 	provider?: string;
 	model?: string;
-	smol?: string;
-	slow?: string;
 	plan?: string;
 	mpreset?: string;
 	default?: boolean;
@@ -228,10 +226,6 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			result.provider = takeFlagValue(args, i++, "--provider");
 		} else if (arg === "--model") {
 			result.model = takeFlagValue(args, i++, "--model");
-		} else if (arg === "--smol") {
-			result.smol = takeFlagValue(args, i++, "--smol");
-		} else if (arg === "--slow") {
-			result.slow = takeFlagValue(args, i++, "--slow");
 		} else if (arg === "--plan") {
 			result.plan = takeFlagValue(args, i++, "--plan");
 		} else if (arg === "--mpreset") {
@@ -426,4 +420,14 @@ export function assertLocalLaunchArgs(parsed: Args): void {
 	for (const [name, token] of CONSUMER_FLAGS_BY_ARGS.get(parsed) ?? []) {
 		if (!launchFlagIsOwnedBy(name, "local")) throw new CliParseError(`Unknown option: ${token}`);
 	}
+}
+
+/**
+ * Resolve the ephemeral `plan` model-role override that plan mode switches to.
+ *
+ * Precedence is CLI `--plan` > `GJC_PLAN_MODEL` > legacy `PI_PLAN_MODEL`.
+ * `$pickenv` trims values and treats empty/whitespace as unset.
+ */
+export function resolvePlanModelOverride(parsed: Pick<Args, "plan">): string | undefined {
+	return parsed.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
 }

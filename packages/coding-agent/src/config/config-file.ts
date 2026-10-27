@@ -1,8 +1,13 @@
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, isEnoent, logger } from "@gajae-code/utils";
+import { renameNoReplacePath } from "@gajae-code/natives";
+import { getAgentDir, isEnoent, isFsError, logger } from "@gajae-code/utils";
 import { JSONC, YAML } from "bun";
 import type { ZodType } from "zod/v4";
+
+// Volumes without hard links fail `link`. Windows maps FAT ERROR_INVALID_FUNCTION to EISDIR.
+const HARD_LINK_UNAVAILABLE = new Set(["EACCES", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV"]);
 
 /** Minimal subset of the AJV ConfigSchemaError shape this module actually relies on. */
 interface ConfigSchemaError {
@@ -10,9 +15,107 @@ interface ConfigSchemaError {
 	message: string | undefined;
 }
 
+/** True when the final path component exists, including a dangling symlink. */
+function ymlPathPresent(ymlPath: string): boolean {
+	try {
+		fs.lstatSync(ymlPath);
+		return true;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
+function hardLinkUnavailable(error: unknown): boolean {
+	return isFsError(error) && HARD_LINK_UNAVAILABLE.has(error.code);
+}
+
+function stagedRegularFile(tmpPath: string): boolean {
+	try {
+		return fs.lstatSync(tmpPath).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function discardStaged(tmpPath: string): void {
+	try {
+		fs.unlinkSync(tmpPath);
+	} catch {
+		// Unpublished, or the no-replace rename already moved this name.
+	}
+}
+
+/** Publish the completed private file when `link` is not supported. Never replaces `ymlPath`. */
+function publishStagedWithoutHardLink(tmpPath: string, ymlPath: string): void {
+	const published = renameNoReplacePath(tmpPath, ymlPath);
+	if (!published.ok && published.reason !== "destination_exists") {
+		discardStaged(tmpPath);
+		throw new Error(`config migration could not publish without a hard link (${published.reason})`);
+	}
+	discardStaged(tmpPath);
+}
+
+/**
+ * Publish a new regular file as mode 0600. The bytes go to a private inode
+ * opened with O_EXCL and O_NOFOLLOW. `link` then attaches that inode to
+ * `ymlPath` and fails when the name exists, so a final-component symlink is
+ * not followed and an existing file is not replaced. A volume without hard
+ * links publishes that same completed file with a no-replace rename. The
+ * destination name stays absent until the bytes are complete.
+ */
+function writeNewOwnerOnlyNoFollow(ymlPath: string, content: string): void {
+	// Ancestor symlinks only. The final component stays unresolved so no-follow still applies.
+	ymlPath = path.join(fs.realpathSync(path.dirname(ymlPath)), path.basename(ymlPath));
+	const noFollow = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+	const tmpPath = path.join(
+		path.dirname(ymlPath),
+		`.${path.basename(ymlPath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+	);
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+		if (process.platform !== "win32") fs.fchmodSync(fd, 0o600);
+		fs.writeFileSync(fd, content);
+		fs.fsyncSync(fd);
+		fs.closeSync(fd);
+		fd = undefined;
+	} catch (error) {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// The original failure is the one that must surface.
+			}
+			try {
+				fs.unlinkSync(tmpPath);
+			} catch {
+				// The destination name was not published.
+			}
+		}
+		throw error;
+	}
+	try {
+		fs.linkSync(tmpPath, ymlPath);
+	} catch (error) {
+		// The name is already present: a finished peer publish, or a file or symlink we must not replace.
+		if (isFsError(error) && (error.code === "EEXIST" || error.code === "ELOOP")) {
+			discardStaged(tmpPath);
+			return;
+		}
+		if (hardLinkUnavailable(error) && stagedRegularFile(tmpPath)) {
+			publishStagedWithoutHardLink(tmpPath, ymlPath);
+			return;
+		}
+		discardStaged(tmpPath);
+		throw error;
+	}
+	discardStaged(tmpPath);
+}
+
 function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 	try {
-		if (fs.existsSync(ymlPath)) return;
+		if (ymlPathPresent(ymlPath)) return;
 		if (!fs.existsSync(jsonPath)) return;
 
 		const content = fs.readFileSync(jsonPath, "utf-8");
@@ -21,7 +124,7 @@ function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 			logger.warn("migrateJsonToYml: invalid json structure", { path: jsonPath });
 			return;
 		}
-		fs.writeFileSync(ymlPath, YAML.stringify(parsed, null, 2));
+		writeNewOwnerOnlyNoFollow(ymlPath, YAML.stringify(parsed, null, 2));
 	} catch (error) {
 		logger.warn("migrateJsonToYml: migration failed", { error: String(error) });
 	}

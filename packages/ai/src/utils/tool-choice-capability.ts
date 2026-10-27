@@ -138,9 +138,11 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
 	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
 	const lockPath = `${cachePath}.mutation.lock`;
-	const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 	const owner = `${process.pid}:${crypto.randomUUID()}`;
+	const maxWaitMs = 2000;
+	const startTime = Date.now();
 	while (true) {
+		if (Date.now() - startTime > maxWaitMs) return;
 		try {
 			fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
 			const descriptor = fs.openSync(lockPath, "wx", 0o600);
@@ -162,13 +164,13 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 				const staleOwner =
 					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
 				if (staleOwner && !exactUnlinkCapabilityLock(lockPath, lockOwner)) {
-					Atomics.wait(sleeper, 0, 0, 10);
+					Bun.sleepSync(10);
 					continue;
 				}
 			} catch {
 				// The lock changed while this waiter was being inspected.
 			}
-			Atomics.wait(sleeper, 0, 0, 10);
+			Bun.sleepSync(10);
 		}
 	}
 }

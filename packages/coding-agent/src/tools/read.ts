@@ -14,7 +14,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getActiveSkills } from "../extensibility/skills";
 import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
 import { InternalUrlRouter } from "../internal-urls";
-import { parseInternalUrl } from "../internal-urls/parse";
+import { normalizeInternalUrlInput, parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
@@ -26,14 +26,15 @@ import {
 	formatMiddleElisionMarker,
 	truncateHead,
 	truncateHeadBytes,
-	truncateLine,
 	truncateMiddleWindows,
 	truncateTailBytes,
+	truncateTextWithSecretAwareness,
 } from "../session/streaming-output";
 import { fileHyperlink, renderCodeCell, renderMarkdownCell, renderStatusLine, tryResolveInternalUrlSync } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import { ImageInputTooLargeError, loadImageInput, MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
+import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-limits";
+import { ImageInputTooLargeError, loadImageInput } from "../utils/image-loading";
 import { convertFileWithMarkit } from "../utils/markit";
 import { buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
 import { type ArchiveReader, openArchive, parseArchivePathCandidates } from "./archive-reader";
@@ -253,12 +254,7 @@ function renderReadWindow(
 		const hash = shouldAddHashLines && segment.kind === "lines";
 		const numbers = !hash && shouldAddLineNumbers;
 		const renderContent =
-			!hash && maxColumns > 0
-				? segment.content
-						.split("\n")
-						.map(line => truncateLine(line, maxColumns).text)
-						.join("\n")
-				: segment.content;
+			!hash && maxColumns > 0 ? truncateTextWithSecretAwareness(segment.content, maxColumns).text : segment.content;
 		return formatTextWithMode(renderContent, segment.origin.startLine, hash, numbers);
 	};
 	const marker = formatMiddleElisionMarker(window.elidedLines, window.elidedBytes);
@@ -1879,6 +1875,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			entityLabel: string;
 			raw?: boolean;
 			immutable?: boolean;
+			wrapUntrusted?: boolean;
 			truncationDirection?: TruncationDirection;
 			cacheLinesFor?: string;
 		},
@@ -1906,17 +1903,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				// A partial line is a byte suffix, not a complete source line. Never
 				// give it an anchor that could make the preview look fully readable.
 				const numbers = !hash && shouldAddLineNumbers && segment.kind === "lines";
-				const renderContent =
-					!options.raw && !hash && maxColumns > 0
-						? segment.content
-								.split("\n")
-								.map(line => {
-									const result = truncateLine(line, maxColumns);
-									if (result.wasTruncated) columnTruncated = maxColumns;
-									return result.text;
-								})
-								.join("\n")
-						: segment.content;
+				let renderContent = segment.content;
+				if (!options.raw && !hash && maxColumns > 0) {
+					const result = truncateTextWithSecretAwareness(segment.content, maxColumns);
+					if (result.wasTruncated) columnTruncated = maxColumns;
+					renderContent = result.text;
+				}
 				return formatTextWithMode(renderContent, segment.origin.startLine, hash, numbers);
 			};
 			let text = "";
@@ -1990,7 +1982,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const finalText =
 			notices.length > 0 ? (outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n")) : outputText;
 		details.spillEligible = parts.length > 0 && !hasPartialSegment;
-		resultBuilder.text(finalText);
+		resultBuilder.text(options.wrapUntrusted ? wrapUntrustedContent(finalText) : finalText);
 		if (columnTruncated > 0) resultBuilder.limits({ columnMax: columnTruncated });
 		return resultBuilder.done();
 	}
@@ -2097,12 +2089,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const collectedLines = streamResult.lines;
 			const cacheLines = collectedLines.slice();
 			if (!rawSelector && !shouldAddHashLines && maxColumns > 0) {
-				for (let i = 0; i < collectedLines.length; i++) {
-					const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
-					if (wasTruncated) {
-						collectedLines[i] = text;
-						columnTruncated = maxColumns;
-					}
+				const clipped = truncateTextWithSecretAwareness(collectedLines.join("\n"), maxColumns);
+				if (clipped.wasTruncated) {
+					collectedLines.splice(0, collectedLines.length, ...clipped.text.split("\n"));
+					columnTruncated = maxColumns;
 				}
 			}
 
@@ -2745,7 +2735,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// off the URL and surfaced via parseSel rather than confusing handlers.
 		const internalRouter = InternalUrlRouter.instance();
 		if (internalRouter.canHandle(readPath)) {
-			const internalTarget = splitInternalUrlSel(readPath, {
+			const internalTarget = splitInternalUrlSel(normalizeInternalUrlInput(readPath), {
 				activeSkillNames: getActiveSkills().map(skill => skill.name),
 			});
 			const parsed = parseSel(internalTarget.sel);
@@ -2844,8 +2834,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 
 		const imageMetadata = await readImageMetadata(absolutePath);
-		const mimeType = imageMetadata?.mimeType;
 		const ext = path.extname(absolutePath).toLowerCase();
+		const mimeType = imageMetadata?.mimeType ?? (ext === ".svg" ? "image/svg+xml" : undefined);
 		const shouldConvertWithMarkit = CONVERTIBLE_EXTENSIONS.has(ext);
 		// Read the file based on type
 		let content: Array<TextContent | ImageContent> | undefined;
@@ -3136,11 +3126,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const directionalMaxColumns = rawSelector ? 0 : resolveOutputMaxColumns(this.session.settings);
 						if (!rawSelector && !shouldAddDirectionalHashLines && directionalMaxColumns > 0) {
 							for (const segment of windowSegments(window)) {
-								if (
-									segment.content
-										.split("\n")
-										.some(line => truncateLine(line, directionalMaxColumns).wasTruncated)
-								) {
+								if (truncateTextWithSecretAwareness(segment.content, directionalMaxColumns).wasTruncated) {
 									columnTruncated = directionalMaxColumns;
 									break;
 								}
@@ -3268,12 +3254,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const shouldAddHashLines = !rawSelector && displayMode.hashLines;
 						const maxColumns = resolveOutputMaxColumns(this.session.settings);
 						if (!rawSelector && !shouldAddHashLines && maxColumns > 0) {
-							for (let i = 0; i < collectedLines.length; i++) {
-								const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
-								if (wasTruncated) {
-									collectedLines[i] = text;
-									columnTruncated = maxColumns;
-								}
+							const clipped = truncateTextWithSecretAwareness(collectedLines.join("\n"), maxColumns);
+							if (clipped.wasTruncated) {
+								collectedLines.splice(0, collectedLines.length, ...clipped.text.split("\n"));
+								columnTruncated = maxColumns;
 							}
 						}
 
@@ -3561,6 +3545,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			mcpManager: this.session.getMcpManager?.(),
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
+		// issue:// and pr:// are remote third-party text. SSH artifacts are marked
+		// by their protocol handler and wrapped after selection/truncation below.
+		const wrapUntrusted = scheme === "issue" || scheme === "pr" || resource.untrusted === true;
 
 		// If extraction was used, return directly (no pagination)
 		if (hasExtraction) {
@@ -3580,6 +3567,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				entityLabel: "resource",
 				immutable: resource.immutable,
 				raw,
+				wrapUntrusted,
 				truncationDirection: direction,
 			});
 		}
@@ -3590,9 +3578,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			sourcePath: resource.sourcePath,
 			sourceInternal: url,
 			entityLabel: "resource",
-			ignoreResultLimits: scheme === "skill",
+			ignoreResultLimits: scheme === "skill" || scheme === "embedded",
 			immutable: resource.immutable,
 			raw,
+			wrapUntrusted,
 			truncationDirection: direction,
 			bodyFooterPath: parsedSel.kind === "none" && !raw ? url : undefined,
 		});

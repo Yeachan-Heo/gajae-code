@@ -3,8 +3,8 @@
  *
  * Lets the agent hand off to another available skill in the current turn. The
  * callee's SKILL.md is dispatched through the same custom-message path used by
- * `/skill:<name>` typing, as a user-attribution message delivered same-turn
- * (without `deliverAs: "nextTurn"`). When the caller is one of the canonical
+ * `/skill:<name>` typing, as a user-attribution message steered into the
+ * current turn (`deliverAs: "steer"`). When the caller is one of the canonical
  * workflow skills, the tool first runs the native state handoff so workflow
  * mode-state and `skill-active-state.json` transition atomically. Runtime
  * project/user skills have no native workflow mode-state, so they are dispatched
@@ -24,10 +24,15 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gjc-plugins";
 import { findRuntimeSkillByName } from "../extensibility/runtime-skill-discovery";
 import { buildSkillPromptMessage } from "../extensibility/skills";
-import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
+import {
+	executionApprovalLineage,
+	hasSanctionedRalplanFinalAdmissionForHandoff,
+	runNativeStateCommand,
+} from "../gjc-runtime/state-runtime";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
@@ -37,7 +42,7 @@ import {
 	isCanonicalGjcWorkflowSkillFilesystemAlias,
 } from "../skill-state/canonical-skills";
 import type { ToolSession } from ".";
-import { ToolError } from "./tool-errors";
+import { ToolError, throwIfAborted } from "./tool-errors";
 
 const TERMINAL_PHASES = new Set(["complete", "completed", "handoff", "failed", "cancelled", "canceled", "inactive"]);
 
@@ -187,6 +192,10 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					this.#session.home,
 					agentDir,
 					this.#session.profileAuthority,
+					resolveGlobalUserSkillLinkTrust({
+						trustUserSkills: this.#session.settings.getGlobal("skills.trustUserSkills"),
+						enablePiUser: this.#session.settings.getGlobal("skills.enablePiUser"),
+					}),
 				));
 			if (!skill) {
 				const available = formatAvailableSkills(skills);
@@ -209,6 +218,24 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				}
 				const cwd = this.#session.cwd;
 				const sessionId = activeState?.session_id?.trim();
+				if (activeSkill === "ralplan" && requestedName === "ultragoal") {
+					if (!sessionId) {
+						throw new ToolError("skill tool: Ralplan to Ultragoal handoff requires a session id");
+					}
+					if (!(await hasSanctionedRalplanFinalAdmissionForHandoff(this.#session.cwd, sessionId))) {
+						const lineage = await executionApprovalLineage(this.#session.cwd, sessionId, "ralplan");
+						const approvalMode = lineage === "crystal" ? "deep-interview" : "ralplan";
+						const approval = await runNativeStateCommand(
+							["approve-execution", "--mode", approvalMode, "--session-id", sessionId, "--json"],
+							this.#session.cwd,
+						);
+						if (approval.status !== 0) {
+							throw new ToolError(
+								`skill tool: Ralplan execution approval failed (status=${approval.status}): ${(approval.stderr ?? "").trim() || "no detail"}`,
+							);
+						}
+					}
+				}
 				const handoffArgs = ["handoff", "--mode", activeSkill, "--to", requestedName, "--json"];
 				if (sessionId) {
 					handoffArgs.push("--session-id", sessionId);
@@ -235,6 +262,11 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 			});
 
+			// `untilAborted` rejects the tool on abort but does not stop this callback.
+			// A prompt prepared after the source run was aborted must be dropped: a
+			// steer the ended run cannot admit falls back to an independent follow-up
+			// and would restart the run the user just stopped.
+			throwIfAborted(signal);
 			await sendCustomMessage(
 				{
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -243,7 +275,11 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					details: built.details,
 					attribution: "user",
 				},
-				{ triggerTurn: false },
+				// Steer, not the implicit follow-up a streaming session falls back to: a
+				// follow-up is only delivered once the agent would otherwise stop, so the
+				// callee prompt would land after the caller's final answer and re-activate
+				// the callee in an extra turn.
+				{ triggerTurn: false, deliverAs: "steer" },
 			);
 
 			const summary = JSON.stringify({

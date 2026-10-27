@@ -734,7 +734,7 @@ export class HookSelectorComponent extends Container {
 
 		const currentText = editor.getExpandedText();
 		try {
-			this.#tui.stop();
+			this.#tui.suspend();
 			const result = await openInEditor(editorCmd, currentText);
 			if (result !== null) {
 				editor.setText(result);

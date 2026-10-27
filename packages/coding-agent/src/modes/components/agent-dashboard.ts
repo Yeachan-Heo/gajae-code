@@ -90,14 +90,22 @@ export function resolveAgentCreationModel(
 	modelPatterns: string[],
 	modelRegistry: ModelRegistry,
 	settings: Settings | undefined,
+	credentialSessionId?: string,
 ) {
-	const { model } = resolveModelOverride(modelPatterns, modelRegistry, settings);
+	const { model } = resolveModelOverride(
+		modelPatterns,
+		modelRegistry,
+		settings,
+		undefined,
+		undefined,
+		credentialSessionId,
+	);
 	if (model) return model;
 	if (modelPatterns.length > 0) {
 		throw new Error(`Configured model selector(s) did not resolve: ${modelPatterns.join(", ")}.`);
 	}
 
-	const fallbackModel = modelRegistry.getAvailable()[0];
+	const fallbackModel = modelRegistry.getAvailable(credentialSessionId)[0];
 	if (!fallbackModel) {
 		throw new Error("No available model to generate agent specification.");
 	}
@@ -612,7 +620,12 @@ export class AgentDashboard extends Container {
 				settings?.getModelRole("default"),
 			settings,
 		);
-		const selectedModel = resolveAgentCreationModel(modelPatterns, modelRegistry, settings);
+		const selectedModel = resolveAgentCreationModel(
+			modelPatterns,
+			modelRegistry,
+			settings,
+			this.modelContext.credentialSessionId,
+		);
 
 		const systemPrompt = prompt.render(agentCreationArchitectPrompt, { TASK_TOOL_NAME: "task" });
 		const userPrompt = prompt.render(agentCreationUserPrompt, { request: description });
@@ -701,7 +714,7 @@ export class AgentDashboard extends Container {
 		if (!modelRegistry) return [];
 		const query = input.trim().toLowerCase();
 		if (!query) return [];
-		const available = modelRegistry.getAvailable();
+		const available = modelRegistry.getAvailable(this.modelContext.credentialSessionId);
 		const seen = new Set<string>();
 		const matches: string[] = [];
 		for (const model of available) {
@@ -757,6 +770,9 @@ export class AgentDashboard extends Container {
 			patterns,
 			modelRegistry,
 			this.#settingsManager ?? undefined,
+			undefined,
+			undefined,
+			this.modelContext.credentialSessionId,
 		);
 		if (!model) return undefined;
 		return {

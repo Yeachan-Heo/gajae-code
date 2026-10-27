@@ -312,7 +312,7 @@ describe("regression: insertion uses newStartLine fallback (2E)", () => {
 });
 
 describe("regression: seekSequence character-based fallback (2F)", () => {
-	test("seekSequence falls back to character-based matching when line-based fails", () => {
+	test("seekSequence falls back to character-based matching when line-based fails", async () => {
 		// Lines with subtle differences that line-based fuzzy matching might miss
 		const lines = [
 			"function calculateTotal(items) {",
@@ -330,28 +330,28 @@ describe("regression: seekSequence character-based fallback (2F)", () => {
 			"    sum += item.price*item.quantity;", // no spaces around *
 		];
 
-		const result = seekSequence(lines, pattern, 0, false);
+		const result = await seekSequence(lines, pattern, 0, false);
 		expect(result.index).toBe(2);
 		expect(result.confidence).toBeGreaterThan(0.9);
 	});
 
-	test("seekSequence handles normalized unicode matching", () => {
+	test("seekSequence handles normalized unicode matching", async () => {
 		const lines = ['const message = "Hello – World";', "console.log(message);"];
 
 		// Pattern uses ASCII dash instead of en-dash
 		const pattern = ['const message = "Hello - World";'];
 
-		const result = seekSequence(lines, pattern, 0, false);
+		const result = await seekSequence(lines, pattern, 0, false);
 		expect(result.index).toBe(0);
 	});
 
-	test("seekSequence finds pattern with whitespace differences", () => {
+	test("seekSequence finds pattern with whitespace differences", async () => {
 		const lines = ["  function   foo()  {", "    return   42;", "  }"];
 
 		// Pattern has normalized whitespace
 		const pattern = ["function foo() {", "return 42;"];
 
-		const result = seekSequence(lines, pattern, 0, false);
+		const result = await seekSequence(lines, pattern, 0, false);
 		expect(result.index).toBe(0);
 	});
 });

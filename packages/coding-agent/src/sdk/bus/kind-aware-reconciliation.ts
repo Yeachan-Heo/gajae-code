@@ -8,7 +8,10 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	failedPromptOutcome,
 	failureEvidence,
+	failureProviderDiagnostic,
 	type PromptFailureEvidence,
+	providerDiagnosticField,
+	publicTerminalOutcome,
 	rephaseFailedOutcome,
 	sanitizePromptFailure,
 } from "../prompt-failure";
@@ -88,6 +91,7 @@ const normalizeTerminalOutcome = (
 			provenance: candidate.provenance as "agent_failed" | "deadline",
 			...(typeof candidate.providerCode === "string" ? { providerCode: candidate.providerCode } : {}),
 			evidence,
+			...providerDiagnosticField(candidate.providerDiagnostic),
 		});
 	}
 	return undefined;
@@ -97,6 +101,7 @@ const failedOutcomeForError = (
 	error: { code: string; message: string },
 	evidence: PromptFailureEvidence = {},
 	providerCodeOverride?: string,
+	providerDiagnostic?: unknown,
 ): SdkPromptTerminalOutcome =>
 	failedPromptOutcome({
 		code: "prompt_failed",
@@ -107,7 +112,47 @@ const failedOutcomeForError = (
 				? { providerCode: error.code }
 				: {}),
 		evidence,
+		...providerDiagnosticField(providerDiagnostic),
 	});
+
+/**
+ * Additive late enrichment: a diagnostic may only fill a hole in an already
+ * settled failed outcome. It never replaces an existing diagnostic, and never
+ * touches status, terminalAt, receipt, ownership or the primary classifier.
+ */
+const enrichOutcomeDiagnostic = (
+	outcome: SdkPromptTerminalOutcome | undefined,
+	diagnostic: unknown,
+): SdkPromptTerminalOutcome | undefined => {
+	if (outcome?.kind !== "failed" || outcome.providerDiagnostic !== undefined) return outcome;
+	const field = providerDiagnosticField(diagnostic);
+	return field.providerDiagnostic === undefined ? outcome : { ...outcome, ...field };
+};
+
+/**
+ * A late diagnostic may only be credited to the failure it describes: the
+ * record has no primary classifier yet (this frame is establishing it), or the
+ * incoming classifier is exactly the one already recorded.
+ */
+const diagnosticForSamePrimaryCode = (record: { error?: { code: string } }, failure: { code: string }): boolean =>
+	record.error === undefined || record.error.code === failure.code;
+
+/**
+ * A collected diagnostic belongs to ONE failure. It may fill a hole in the
+ * selected terminal only when that terminal describes the same failure: the
+ * primary the record classified must equal the primary the outcome reports.
+ * Inheriting across primaries put an auth/401 classification on a provider_down
+ * terminal, which is a false statement about the failure.
+ */
+const diagnosticBelongsToOutcome = (
+	record: { error?: { code: string } },
+	outcome: SdkPromptTerminalOutcome | undefined,
+): boolean => {
+	if (outcome?.kind !== "failed") return false;
+	const recordPrimary = record.error?.code;
+	if (recordPrimary === undefined) return true;
+	return recordPrimary === (outcome.providerCode ?? outcome.code);
+};
 
 const isDeadlineOutcome = (outcome: SdkPromptTerminalOutcome | undefined): boolean =>
 	outcome?.kind === "failed" && outcome.provenance === "deadline";
@@ -481,7 +526,12 @@ export function createKindAwareReconciliation(
 								? providerErrorRecord
 								: { code: providerOutcome.code, message: providerOutcome.message };
 						} else if (providerError) {
-							outcome = failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity));
+							outcome = failedOutcomeForError(
+								providerErrorRecord,
+								failureEvidence(record, frame.hasActivity),
+								undefined,
+								record.providerDiagnostic,
+							);
 							error = providerErrorRecord;
 						} else if (
 							incomingOutcome?.kind === "stopped" ||
@@ -500,7 +550,12 @@ export function createKindAwareReconciliation(
 								? providerErrorRecord
 								: { code: providerOutcome.code, message: providerOutcome.message };
 						} else if (record.status === "failed" && providerError) {
-							outcome = failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity));
+							outcome = failedOutcomeForError(
+								providerErrorRecord,
+								failureEvidence(record, frame.hasActivity),
+								undefined,
+								record.providerDiagnostic,
+							);
 							error = providerErrorRecord;
 						} else if (
 							record.status === "terminal_ok" &&
@@ -542,9 +597,29 @@ export function createKindAwareReconciliation(
 				// survives reconnect/restart reconciliation.
 				if (frame.type === "agent_failed") {
 					const failure = sanitizePromptFailure(frame.error);
+					// Attribution: a diagnostic describes ONE failure. A late frame whose
+					// primary classifier differs from the settled one belongs to a
+					// different failure and must not be credited to this terminal, even
+					// though the correlation matches.
+					const lateDiagnostic = diagnosticForSamePrimaryCode(record, failure)
+						? failureProviderDiagnostic(frame.error)
+						: undefined;
+					if (record.providerDiagnostic === undefined && lateDiagnostic !== undefined)
+						record.providerDiagnostic = lateDiagnostic;
+					// A settled failed terminal may still be missing its diagnostic; the
+					// late reason fills that hole only, leaving status, terminalAt,
+					// receipt and the primary classifier exactly as settled.
+					const enrichedOutcome = enrichOutcomeDiagnostic(record.outcome, lateDiagnostic);
+					const outcomeEnriched = enrichedOutcome !== record.outcome;
+					if (outcomeEnriched) record.outcome = enrichedOutcome;
 					if (record.error?.code === "prompt_deadline_exceeded") {
 						record.error = failure;
-						record.outcome = failedOutcomeForError(failure, failureEvidence(record, frame.hasActivity));
+						record.outcome = failedOutcomeForError(
+							failure,
+							failureEvidence(record, frame.hasActivity),
+							undefined,
+							record.providerDiagnostic,
+						);
 						record.status = "failed";
 						return { value: undefined, changed: true };
 					}
@@ -552,7 +627,7 @@ export function createKindAwareReconciliation(
 						record.error !== undefined &&
 						!(record.error.code === "agent_failed" && failure.code !== "agent_failed")
 					)
-						return { value: undefined, changed: false };
+						return { value: undefined, changed: outcomeEnriched };
 					record.error = sanitizePromptFailure(frame.error);
 					return { value: undefined, changed: true };
 				}
@@ -571,6 +646,11 @@ export function createKindAwareReconciliation(
 				// agent_failed is additive diagnostics; agent_end remains the sole
 				// terminal lifecycle boundary for the correlated invocation.
 				const failure = sanitizePromptFailure(frame.error);
+				const diagnostic = diagnosticForSamePrimaryCode(record, failure)
+					? failureProviderDiagnostic(frame.error)
+					: undefined;
+				if (record.providerDiagnostic === undefined && diagnostic !== undefined)
+					record.providerDiagnostic = diagnostic;
 				if (record.error === undefined || (record.error.code === "agent_failed" && failure.code !== "agent_failed"))
 					record.error = failure;
 				delete record.deadlineRecoveryPending;
@@ -596,10 +676,22 @@ export function createKindAwareReconciliation(
 				if (frameOutcome?.kind === "failed" && frameOutcome.provenance === "agent_failed")
 					terminalOutcome = frameOutcome;
 				else if (providerError && (pendingOutcome.kind !== "failed" || isDeadlineOutcome(pendingOutcome)))
-					terminalOutcome = failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity));
+					terminalOutcome = failedOutcomeForError(
+						providerErrorRecord,
+						failureEvidence(record, frame.hasActivity),
+						undefined,
+						record.providerDiagnostic,
+					);
 				else if (isDeadlineOutcome(pendingOutcome) && frameOutcome?.kind === "stopped")
 					terminalOutcome = frameOutcome;
-				record.outcome = terminalOutcome;
+				// The selection above is untouched. A frame or pending outcome is built
+				// from evidence and carries no diagnostic, so fill that hole additively
+				// from the same-failure classification agent_failed already recorded --
+				// the host reconciler delivers the same field for the same input.
+				record.outcome =
+					(diagnosticBelongsToOutcome(record, terminalOutcome)
+						? enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic)
+						: terminalOutcome) ?? terminalOutcome;
 				delete record.pendingOutcome;
 				if (terminalOutcome.kind === "failed") {
 					record.status = "failed";
@@ -622,10 +714,18 @@ export function createKindAwareReconciliation(
 					? frameOutcome
 					: providerError &&
 							(frameOutcome === undefined || isDeadlineOutcome(frameOutcome) || frameOutcome.kind === "stopped")
-						? failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity))
+						? failedOutcomeForError(
+								providerErrorRecord,
+								failureEvidence(record, frame.hasActivity),
+								undefined,
+								record.providerDiagnostic,
+							)
 						: frameOutcome;
 				if (terminalOutcome !== undefined) {
-					record.outcome = terminalOutcome;
+					record.outcome =
+						(diagnosticBelongsToOutcome(record, terminalOutcome)
+							? enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic)
+							: terminalOutcome) ?? terminalOutcome;
 					if (terminalOutcome.kind === "failed") {
 						record.status = "failed";
 						if (!providerError) record.error = { code: terminalOutcome.code, message: terminalOutcome.message };
@@ -704,13 +804,23 @@ export function createKindAwareReconciliation(
 				providerErrorRecord !== undefined && providerErrorRecord.code !== "prompt_deadline_exceeded";
 			const requestedProviderCode = requestedOutcome?.kind === "failed" ? requestedOutcome.providerCode : undefined;
 			const finalOutcome = providerError
-				? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
+				? failedOutcomeForError(
+						providerErrorRecord,
+						failureEvidence(record),
+						requestedProviderCode,
+						record.providerDiagnostic,
+					)
 				: requestedOutcome?.kind === "stopped"
 					? requestedOutcome
 					: providerError &&
 							(requestedOutcome === undefined ||
 								(requestedOutcome.kind === "failed" && isDeadlineOutcome(requestedOutcome)))
-						? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
+						? failedOutcomeForError(
+								providerErrorRecord,
+								failureEvidence(record),
+								requestedProviderCode,
+								record.providerDiagnostic,
+							)
 						: requestedOutcome;
 			record.terminalAt = now();
 			if (finalOutcome?.kind === "failed") {
@@ -804,7 +914,7 @@ export function createKindAwareReconciliation(
 			...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
 			terminalAt: record.terminalAt as number,
 			receiptState: record.receiptState ?? "unknown",
-			...(record.outcome !== undefined ? { outcome: record.outcome } : {}),
+			...(record.outcome !== undefined ? { outcome: publicTerminalOutcome(record.outcome) } : {}),
 		};
 		if (record.status === "terminal_ok")
 			return {
@@ -845,7 +955,7 @@ export function createKindAwareReconciliation(
 			...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
 			terminalAt: record.terminalAt as number,
 			receiptState: record.receiptState ?? "unknown",
-			...(record.outcome !== undefined ? { outcome: record.outcome } : {}),
+			...(record.outcome !== undefined ? { outcome: publicTerminalOutcome(record.outcome) } : {}),
 			...(reportableTurnResultContent(record.content) ? { content: record.content } : {}),
 		};
 		if (record.status === "terminal_ok")
@@ -877,7 +987,8 @@ export function createKindAwareReconciliation(
 							rephased.kind === "failed" &&
 							(outcome.phase !== rephased.phase ||
 								outcome.category !== rephased.category ||
-								outcome.message !== rephased.message)
+								outcome.message !== rephased.message ||
+								outcome.providerDiagnostic !== rephased.providerDiagnostic)
 						)
 							sanitizedDurableRecord = true;
 						return rephased;
@@ -903,8 +1014,15 @@ export function createKindAwareReconciliation(
 									}
 								: { ...record, ...(safeError === undefined ? {} : { error: safeError }) };
 					} else {
+						// A durable diagnostic is revalidated on the way in: a malformed
+						// value is stripped instead of invalidating an otherwise valid row.
+						const diagnosticField = providerDiagnosticField(record.providerDiagnostic);
+						if (record.providerDiagnostic !== undefined && diagnosticField.providerDiagnostic === undefined)
+							sanitizedDurableRecord = true;
+						const { providerDiagnostic: _durableDiagnostic, ...rest } = record;
 						hydrated = {
-							...record,
+							...rest,
+							...diagnosticField,
 							...(record.error === undefined ? {} : { error: sanitizePromptFailure(record.error) }),
 							outcome: safeOutcome(record.outcome),
 							pendingOutcome: safeOutcome(record.pendingOutcome),

@@ -50,13 +50,17 @@ export async function writeMCPConfigFile(filePath: string, config: MCPConfigFile
 	const dir = path.dirname(filePath);
 	await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
 
-	// Write to temp file first (atomic write)
-	const tmpPath = `${filePath}.tmp`;
+	// A predictable `${file}.tmp` can already be a symlink planted in the project.
+	// Write a unique sibling and fail closed if that path exists.
+	const tmpPath = `${filePath}.${crypto.randomUUID()}.tmp`;
 	const content = JSON.stringify(withSchema(config), null, 2);
-	await fs.promises.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
-
-	// Rename to final path (atomic on most systems)
-	await fs.promises.rename(tmpPath, filePath);
+	try {
+		await fs.promises.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+		await fs.promises.rename(tmpPath, filePath);
+	} catch (error) {
+		await fs.promises.rm(tmpPath, { force: true });
+		throw error;
+	}
 	// Invalidate the capability fs cache so subsequent reads see the new content
 	invalidateFsCache(filePath);
 }

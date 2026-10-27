@@ -1,0 +1,369 @@
+{
+  "archiveSha256": "4cc8a7a291da6f9579be9453c15f6b7af49880ab47a10c9fe253f3b0cffcc5ee",
+  "cases": [
+    {
+      "id": "literal",
+      "output": {
+        "totalMatches": 2,
+        "filesWithMatches": 2,
+        "filesSearched": 321,
+        "limitReached": null,
+        "matches": [
+          {
+            "path": "operator-swap-nullish-003/expected/system-prompt.ts",
+            "lineNumber": 606,
+            "line": "      toolNames = ['read', 'bash', 'python', 'edit', 'write']; // TODO: Why?",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-003/input/system-prompt.ts",
+            "lineNumber": 606,
+            "line": "      toolNames = ['read', 'bash', 'python', 'edit', 'write']; // TODO: Why?",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "regex",
+      "output": {
+        "totalMatches": 756,
+        "filesWithMatches": 122,
+        "filesSearched": 159,
+        "limitReached": true,
+        "matches": [
+          {
+            "path": "access-remove-optional-chain-002/expected/render.ts",
+            "lineNumber": 29,
+            "line": "export function renderMCPCall(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-002/expected/render.ts",
+            "lineNumber": 51,
+            "line": "export function renderMCPResult(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-002/input/render.ts",
+            "lineNumber": 29,
+            "line": "export function renderMCPCall(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-002/input/render.ts",
+            "lineNumber": 51,
+            "line": "export function renderMCPResult(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/expected/terminal-capabilities.ts",
+            "lineNumber": 58,
+            "line": "export function isNotificationSuppressed(): boolean {",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/expected/terminal-capabilities.ts",
+            "lineNumber": 64,
+            "line": "function getForcedImageProtocol(): ImageProtocol | null | undefined {",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/expected/terminal-capabilities.ts",
+            "lineNumber": 74,
+            "line": "function parseMajorMinorVersion(versionRaw?: string): { major: number; minor: number } | null {",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/expected/terminal-capabilities.ts",
+            "lineNumber": 89,
+            "line": "export function isWindowsTerminalPreviewSixelSupported(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "multiline",
+      "output": {
+        "totalMatches": 14,
+        "filesWithMatches": 6,
+        "filesSearched": 321,
+        "limitReached": true,
+        "matches": [
+          {
+            "path": "identifier-identifier-multi-edit-003/expected/segments.ts",
+            "lineNumber": 21,
+            "line": "export type { SegmentContext } from './types';",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "identifier-identifier-multi-edit-003/input/segments.ts",
+            "lineNumber": 21,
+            "line": "export type { SegmentContext } from './types';",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "import-swap-named-imports-001/expected/index.ts",
+            "lineNumber": 7,
+            "line": "export { StringEnum } from '@oh-my-pi/pi-ai';",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "import-swap-named-imports-001/expected/index.ts",
+            "lineNumber": 9,
+            "line": "export { Container, Markdown, Spacer, Text } from '@oh-my-pi/pi-tui';",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "case-insensitive",
+      "output": {
+        "totalMatches": 32,
+        "filesWithMatches": 4,
+        "filesSearched": 321,
+        "limitReached": true,
+        "matches": [
+          {
+            "path": "operator-swap-nullish-004/expected/verify.ts",
+            "lineNumber": 4,
+            "line": " * Compares output files against expected fixtures with byte-for-byte equality.",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/expected/verify.ts",
+            "lineNumber": 111,
+            "line": "    const expectedFixtureFiles = await listFiles(expectedDir);",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/expected/verify.ts",
+            "lineNumber": 112,
+            "line": "    const expectedFiles = files?.length ? files.slice().sort() : expectedFixtureFiles;",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/expected/verify.ts",
+            "lineNumber": 117,
+            "line": "    const missingExpected = expectedFiles.filter((file) => !expectedFixtureFiles.includes(file));",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/expected/verify.ts",
+            "lineNumber": 122,
+            "line": "        error: `Expected files missing from fixture: ${formatFileList(missingExpected)}`,",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/input/verify.ts",
+            "lineNumber": 4,
+            "line": " * Compares output files against expected fixtures with byte-for-byte equality.",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/input/verify.ts",
+            "lineNumber": 111,
+            "line": "    const expectedFixtureFiles = await listFiles(expectedDir);",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/input/verify.ts",
+            "lineNumber": 112,
+            "line": "    const expectedFiles = files?.length ? files.slice().sort() : expectedFixtureFiles;",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/input/verify.ts",
+            "lineNumber": 117,
+            "line": "    const missingExpected = expectedFiles.filter((file) => !expectedFixtureFiles.includes(file));",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "operator-swap-nullish-004/input/verify.ts",
+            "lineNumber": 122,
+            "line": "        error: `Expected files missing from fixture: ${formatFileList(missingExpected)}`,",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "glob-filter",
+      "output": {
+        "totalMatches": 1,
+        "filesWithMatches": 1,
+        "filesSearched": 79,
+        "limitReached": null,
+        "matches": [
+          {
+            "path": "operator-swap-nullish-003/input/system-prompt.ts",
+            "lineNumber": 606,
+            "line": "      toolNames = ['read', 'bash', 'python', 'edit', 'write']; // TODO: Why?",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "context-lines",
+      "output": {
+        "totalMatches": 41,
+        "filesWithMatches": 28,
+        "filesSearched": 79,
+        "limitReached": true,
+        "matches": [
+          {
+            "path": "access-remove-optional-chain-001/input/rubygems.ts",
+            "lineNumber": 39,
+            "line": "export const handleRubyGems: SpecialHandler = async (",
+            "contextBefore": [
+              {
+                "lineNumber": 38,
+                "line": " */"
+              }
+            ],
+            "contextAfter": [
+              {
+                "lineNumber": 40,
+                "line": "  url: string,"
+              }
+            ],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/input/terminal-capabilities.ts",
+            "lineNumber": 124,
+            "line": "export const TERMINAL_ID: TerminalId = (() => {",
+            "contextBefore": [
+              {
+                "lineNumber": 123,
+                "line": ""
+              }
+            ],
+            "contextAfter": [
+              {
+                "lineNumber": 125,
+                "line": "  function caseEq(a: string, b: string): boolean {"
+              }
+            ],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/input/terminal-capabilities.ts",
+            "lineNumber": 165,
+            "line": "export const TERMINAL = (() => {",
+            "contextBefore": [
+              {
+                "lineNumber": 164,
+                "line": ""
+              }
+            ],
+            "contextAfter": [
+              {
+                "lineNumber": 166,
+                "line": "  const terminal = getTerminalInfo(TERMINAL_ID);"
+              }
+            ],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "binary-skip",
+      "output": {
+        "totalMatches": 0,
+        "filesWithMatches": 0,
+        "filesSearched": 321,
+        "limitReached": null,
+        "matches": []
+      }
+    },
+    {
+      "id": "pcre2-lookahead",
+      "output": {
+        "error": "Regex error: regex parse error:\n    (?:export(?=\\s))\n             ^^^\nerror: look-around, including look-ahead and look-behind, is not supported"
+      }
+    }
+  ]
+}

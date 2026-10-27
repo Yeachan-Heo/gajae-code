@@ -144,7 +144,7 @@ function applyPathIdentityTypes(dts: string): string {
 			ok: false;
 			platform?: never;
 			canonicalPath?: never;
-			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+			code: "access_denied" | "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }`;
 	const security = `export type NativeOwnerOnlySecurityResult =
 	| {
@@ -215,6 +215,7 @@ function applyPathIdentityTypes(dts: string): string {
 	| {
 			ok: false;
 			code:
+				| "access_denied"
 				| "not_found"
 				| "not_directory"
 				| "network_unsupported"
@@ -260,7 +261,10 @@ function applyPathIdentityTypes(dts: string): string {
 			/^export declare function repairOwnerOnlyPathSecurityExpected\([^\n]*$/m,
 			'export declare function repairOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult',
 		)
-		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
+		.replace(
+			/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}|export type NativeCanonicalDirectoryIdentity =[\s\S]*?(?=\n\n(?:export\b|\/\*\*)|$)/,
+			identity,
+		)
 		.replace(
 			/export interface NativeOwnerOnlySecurityResult \{[\s\S]*?\n\}|export type NativeOwnerOnlySecurityResult =[\s\S]*?(?=\n\n(?:export\b|\/\*\*)|$)/,
 			security,

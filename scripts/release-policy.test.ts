@@ -25,17 +25,16 @@ function jobSection(workflowText: string, jobName: string): string {
 }
 
 describe("stable release policy", () => {
-	test("tag releases resolve metadata, build natives, then binaries, then prepare, then publish npm, then finalize the GitHub Release", async () => {
+	test("tag releases build native addons before binaries, then prepare, publish npm, and finalize the GitHub Release", async () => {
 		const ci = await workflow();
 		const stages = ["release_metadata", "native", "binaries", "release_prepare", "release_approval", "publish", "release_finalize"];
-		const positions = stages.map(stage => ci.indexOf(`   ${stage}:`));
-		for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
-
+		for (const stage of stages) expect(ci.indexOf(`   ${stage}:`)).toBeGreaterThanOrEqual(0);
+		const patterns = await Bun.file(path.join(repoRoot, "scripts/agpl-removal-patterns.json")).json();
+		for (const token of patterns.tokens as Array<{ value: string }>) {
+			expect(ci.toLowerCase()).not.toContain(token.value.toLowerCase());
+		}
 		expect(jobSection(ci, "native")).toContain("needs: [release_metadata]");
 		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata]");
-		expect(jobSection(ci, "release_prepare")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
-		expect(jobSection(ci, "publish")).toContain("needs: [release_prepare, release_approval, release_metadata]");
-		expect(jobSection(ci, "release_finalize")).toContain("needs: [publish, release_metadata]");
 		for (const stage of ["native", "binaries"]) {
 			const section = jobSection(ci, stage);
 			expect(section).toContain("startsWith(github.ref, 'refs/tags/v')");
@@ -48,6 +47,7 @@ describe("stable release policy", () => {
 		const publish = jobSection(ci, "publish");
 		expect(publish).toContain("Publish sealed tarballs to npm");
 		const finalize = jobSection(ci, "release_finalize");
+		expect(finalize).toContain("needs: [publish, release_metadata]");
 		expect(finalize).toContain("softprops/action-gh-release");
 		expect(finalize).toContain("draft: false");
 	});
@@ -201,6 +201,11 @@ describe("stable release policy", () => {
 		expect(publish).toContain("Publish sealed tarballs to npm");
 		expect(publish).toContain("sha512sum --check --strict");
 		expect(publish).toContain("gajae-release-oidc-publish-receipt-v1.json");
+		// Registry observation must bypass the CDN-cached packument (max-age=300):
+		// `npm view` made every package wait up to five minutes and timed out 0.17.5.
+		expect(publish).not.toContain("npm view");
+		expect(publish).toContain('"${registry}$(registry_path "$1")/$2"');
+		expect(publish).toContain('"${registry}-/package/$(registry_path "$1")/dist-tags"');
 	});
 
 	test("gates the OIDC boundary on the approval environment without changing the publish subject", async () => {
@@ -245,6 +250,15 @@ describe("stable release policy", () => {
 		);
 		expect(prepareBranch).toContain("await checkTypeDeclarations()");
 		expect(publishScript.slice(publishScript.indexOf("await publishFromExpectedEvidence"))).not.toContain("checkTypeDeclarations");
+	});
+
+	test("observes registry state through uncached per-document reads outside the publish boundary", async () => {
+		const publishScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		// Finalize re-observes right after publication; a CDN-cached packument read
+		// (`npm view`, max-age=300) would see a stale 404 or an old dist-tag and fail it.
+		expect(publishScript).not.toMatch(/\$`npm view/u);
+		expect(publishScript).toContain("async function readRegistryDocument(");
+		expect(publishScript).toContain('packageName.replace("/", "%2f")');
 	});
 
 	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {

@@ -4,8 +4,8 @@ import type { AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { Container, type KeyId, Markdown, Spacer, Text } from "@gajae-code/tui";
-import { isEnoent, prompt } from "@gajae-code/utils";
-import { resolveLocalUrlToPath } from "../../internal-urls";
+import { isEnoent, prompt, resolveEquivalentPath, pathIsWithin as rootContainsCandidate } from "@gajae-code/utils";
+import { resolveLocalRoot, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
@@ -13,6 +13,7 @@ import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-co
 };
 import type { AgentSession, TemporaryProviderSessionScope } from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
+import { canonicalWindowsPathWithin, pathIsWithin, writeFileAtomically } from "../../tools/atomic-file-write";
 import { normalizeLocalScheme } from "../../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../../tools/resolve";
 import { ToolError } from "../../tools/tool-errors";
@@ -31,6 +32,40 @@ import { INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS } from "./input-controller";
 import type { ModeGate } from "./mode-gate";
 
 const ABORT_TIMEOUT_MS = INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS;
+
+/** Whether `candidate` stays inside `root` after equivalent-path normalization. */
+export function planEditorTargetWithinRoot(root: string, candidate: string): boolean {
+	if (!rootContainsCandidate(root, candidate)) return false;
+	// `pathIsWithin` is `(target, root)`. Normalize first so equivalent paths still match.
+	if (!pathIsWithin(resolveEquivalentPath(candidate), resolveEquivalentPath(root))) return false;
+	if (process.platform !== "win32") return true;
+	return canonicalWindowsPathWithin(root, candidate);
+}
+
+async function canonicalPlanEditorPath(resolved: string, trustBoundary: string): Promise<string> {
+	let real = path.resolve(resolved);
+	try {
+		real = await fs.realpath(resolved);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	let boundary = trustBoundary;
+	if (process.platform === "win32") {
+		try {
+			boundary = await fs.realpath(trustBoundary);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+	if (!planEditorTargetWithinRoot(boundary, real)) {
+		throw new Error(`plan path '${resolved}' resolves outside trust boundary '${trustBoundary}'`);
+	}
+	return real;
+}
+
+function isOutsidePlanRoot(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("resolves outside trust boundary");
+}
 
 type PlanModeControllerContext = {
 	readonly session: AgentSession;
@@ -55,6 +90,8 @@ type PlanModeControllerContext = {
 	handleClearCommand(): Promise<boolean>;
 	handleCompactCommand(instructions?: string): Promise<CompactionOutcome>;
 	updateEditorChrome(): void;
+	/** Test seam. Production callers keep the process editor command. */
+	getEditorCommand?: () => string | undefined;
 };
 
 /** Owns plan-mode state, model scope, plan review, approval, and restoration. */
@@ -63,6 +100,7 @@ export class PlanModeController {
 	#paused = false;
 	#planFilePath: string | undefined;
 	#previousTools: string[] | undefined;
+	#previousMCPToolNames: string[] | undefined;
 	#previousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#providerSessionScope: TemporaryProviderSessionScope | undefined;
@@ -125,6 +163,7 @@ export class PlanModeController {
 		const planFilePath = options?.planFilePath ?? "local://PLAN.md";
 		const previousTools = this.ctx.session.getActiveToolNames();
 		this.#previousTools = previousTools;
+		this.#previousMCPToolNames = this.ctx.session.getActiveMCPToolNames();
 		this.#planFilePath = planFilePath;
 		this.#enabled = true;
 		const planTools = this.ctx.session.isExplicitEmptyToolSelection()
@@ -132,7 +171,20 @@ export class PlanModeController {
 			: this.ctx.session.getToolByName("resolve")
 				? [...new Set([...previousTools, "resolve"])]
 				: previousTools;
-		await this.ctx.session.setActiveToolsByName(planTools);
+		try {
+			await this.ctx.session.setActiveToolsByName(planTools, {
+				explicit: false,
+				persistMCPSelection: false,
+				retryOnMcpCatalogChange: true,
+			});
+		} catch (error) {
+			this.#enabled = false;
+			this.#planFilePath = undefined;
+			this.#previousTools = undefined;
+			this.#previousMCPToolNames = undefined;
+			this.ctx.modeGate.exit("plan");
+			throw error;
+		}
 		this.ctx.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
@@ -151,7 +203,12 @@ export class PlanModeController {
 	async exit(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
 		if (!this.#enabled) return;
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
-		if (this.#previousTools !== undefined) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (this.#previousTools !== undefined)
+			await this.ctx.session.setActiveToolsByName(this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), {
+				explicit: false,
+				persistMCPSelection: false,
+				retryOnMcpCatalogChange: true,
+			});
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
 			if (await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
 				this.#providerSessionScope = undefined;
@@ -175,11 +232,22 @@ export class PlanModeController {
 		this.#paused = options?.paused ?? false;
 		this.#planFilePath = undefined;
 		this.#previousTools = undefined;
+		this.#previousMCPToolNames = undefined;
 		this.#previousModelState = undefined;
 		if (!this.#paused) this.ctx.modeGate.exit("plan");
 		this.#updateStatus();
 		this.ctx.sessionManager.appendModeChange(this.#paused ? "plan_paused" : "none");
 		if (!options?.silent) this.ctx.showStatus(this.#paused ? "Plan mode paused." : "Plan mode disabled.");
+	}
+
+	#restoreToolsWithCurrentMCPSelection(previousTools: readonly string[]): string[] {
+		const previousMCPToolNames = new Set(this.#previousMCPToolNames ?? []);
+		return [
+			...new Set([
+				...previousTools.filter(name => !previousMCPToolNames.has(name)),
+				...this.ctx.session.getActiveMCPToolNames(),
+			]),
+		];
 	}
 
 	async flushPendingModelSwitch(): Promise<void> {
@@ -332,19 +400,26 @@ export class PlanModeController {
 
 	async #readFile(planFilePath: string): Promise<string | null> {
 		try {
-			return await Bun.file(this.#resolvePath(planFilePath)).text();
+			const resolved = this.#resolvePath(planFilePath);
+			const readable = planFilePath.startsWith("local:")
+				? resolved
+				: await canonicalPlanEditorPath(resolved, path.resolve(this.ctx.sessionManager.getCwd()));
+			return await Bun.file(readable).text();
 		} catch (error) {
-			if (isEnoent(error)) return null;
+			if (isEnoent(error) || isOutsidePlanRoot(error)) return null;
 			throw error;
 		}
 	}
+	#localProtocolOptions() {
+		return {
+			getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
+			isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
+			getSessionId: () => this.ctx.sessionManager.getSessionId(),
+		};
+	}
 	#resolvePath(planFilePath: string): string {
 		return planFilePath.startsWith("local:")
-			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), {
-					getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
-					isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
-					getSessionId: () => this.ctx.sessionManager.getSessionId(),
-				})
+			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), this.#localProtocolOptions())
 			: path.resolve(this.ctx.sessionManager.getCwd(), planFilePath);
 	}
 	async #finalizeApprovedPlan(planContent: string, planFilePath: string, finalPlanFilePath: string): Promise<void> {
@@ -392,15 +467,23 @@ export class PlanModeController {
 		this.ctx.requestRender();
 	}
 	async #openEditor(planFilePath: string): Promise<string | null> {
-		const command = getEditorCommand();
+		const command = this.ctx.getEditorCommand?.() ?? getEditorCommand();
 		if (!command) {
 			this.ctx.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
 			return null;
 		}
 		const resolved = this.#resolvePath(planFilePath);
+		const localPlan = planFilePath.startsWith("local:");
+		const trustBoundary = localPlan
+			? path.resolve(resolveLocalRoot(this.#localProtocolOptions()))
+			: path.resolve(this.ctx.sessionManager.getCwd());
 		let text: string;
+		let publishPath = resolved;
 		try {
-			text = await Bun.file(resolved).text();
+			// Read the path the boundary check accepted. A non-local plan path is
+			// the session directory, including after symlink resolution.
+			publishPath = localPlan ? resolved : await canonicalPlanEditorPath(resolved, trustBoundary);
+			text = await Bun.file(publishPath).text();
 		} catch (error) {
 			if (isEnoent(error)) this.ctx.showError(`Plan file not found at ${planFilePath}`);
 			else this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
@@ -420,7 +503,9 @@ export class PlanModeController {
 				trimTrailingNewline: false,
 			});
 			if (result !== null) {
-				await Bun.write(resolved, result);
+				// Lexical checks do not see a symlink. Bind the save to the same root
+				// the read used so a link inside it cannot publish outside.
+				await writeFileAtomically(publishPath, result, { trustBoundary });
 				this.ctx.showStatus("Plan updated in external editor.");
 			}
 			return result;
@@ -445,12 +530,17 @@ export class PlanModeController {
 		},
 	): Promise<void> {
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
-		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
+		const previousMCPToolNames = new Set(this.#previousMCPToolNames ?? this.ctx.session.getActiveMCPToolNames());
+		const previousNonMCPToolNames = (this.#previousTools ?? this.ctx.session.getActiveToolNames()).filter(
+			name => !previousMCPToolNames.has(name),
+		);
 		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
+		let mcpToolNamesBeforeSessionSwitch: string[] = [];
 		try {
 			await this.exit({ silent: true });
+			mcpToolNamesBeforeSessionSwitch = this.ctx.session.getActiveMCPToolNames();
 			if (!options.preserveContext) {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
 				if (sessionSwitchCompleted)
@@ -478,7 +568,16 @@ export class PlanModeController {
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
-		if (previousTools.length) await this.ctx.session.setActiveToolsByName(previousTools);
+		const currentMCPToolNames = this.ctx.session.getActiveMCPToolNames();
+		const restoredMCPToolNames = this.ctx.session.hasMCPToolSelectionAuthority()
+			? currentMCPToolNames
+			: [...mcpToolNamesBeforeSessionSwitch, ...currentMCPToolNames];
+		const restoredTools = [...new Set([...previousNonMCPToolNames, ...restoredMCPToolNames])];
+		if (restoredTools.length)
+			await this.ctx.session.setActiveToolsByName(restoredTools, {
+				explicit: false,
+				persistMCPSelection: !options.preserveContext && sessionSwitchCompleted,
+			});
 		if (!sessionSwitchCompleted)
 			return this.ctx.showWarning(
 				"Plan approved, but the new session could not be created — execution was not dispatched.",

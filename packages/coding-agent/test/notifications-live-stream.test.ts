@@ -205,6 +205,7 @@ async function bootSession(
 		},
 		getContextUsage: () => undefined,
 		getModel: () => undefined,
+		getActivePromptHandle: () => undefined,
 	} as NotificationSessionContext;
 
 	registerNotificationRuntime(cleanup, {

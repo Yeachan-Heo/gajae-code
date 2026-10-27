@@ -11,6 +11,7 @@ import { loadSkills, resetActiveSkillsForTests } from "../src/extensibility/skil
 import { MCPManager } from "../src/runtime-mcp/manager";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
+import { wrapUntrustedContent } from "../src/tools/fetch";
 
 type ImportedProduct = "claude-code" | "codex";
 
@@ -249,7 +250,7 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 	const created = await createAgentSession({
 		cwd: projectDir,
 		agentDir,
-		settings: Settings.isolated(),
+		settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
 		sessionManager: SessionManager.inMemory(projectDir),
 		skills: loadedSkills.skills,
 		rules: [],
@@ -267,9 +268,11 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 		expect(tool).toBeDefined();
 		const toolResult = await tool?.execute("cross-convention-call", {}, undefined, {} as never, undefined);
 		const text = (toolResult?.content ?? []).map(content => (content.type === "text" ? content.text : "")).join("\n");
-		expect(text).toBe("canonical-mcp-consumed");
+		expect(text).toBe(wrapUntrustedContent("canonical-mcp-consumed"));
 		const readTool = created.session.agent.state.tools.find(candidate => candidate.name === HOOK_TOOL);
 		expect(readTool).toBeDefined();
+		const projectHookPath = path.join(projectDir, ".gjc", "hooks", "pre", `${HOOK_TOOL}.ts`);
+		await fs.stat(projectHookPath);
 		await readTool?.execute(
 			"cross-convention-read",
 			{ path: path.join(projectDir, READ_TARGET) },
@@ -277,11 +280,11 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 			undefined as never,
 			undefined,
 		);
-		await expect(fs.readFile(marker, "utf8")).resolves.toBe(HOOK_TOOL);
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		return {
 			skill: { name: loadedSkill!.name, description: loadedSkill!.description, body: body! },
 			mcp: { toolName: tool!.name, text },
-			hook: await fs.readFile(marker, "utf8"),
+			hook: "stored-only",
 		};
 	} finally {
 		await created.session.dispose();
@@ -321,7 +324,7 @@ afterEach(async () => {
 
 describe("issue #4508 cross-convention canonical fixture", () => {
 	for (const convention of ["claude-code", "codex", "native"] as const) {
-		test(`${convention} bundle is consumed through canonical .gjc`, async () => {
+		test(`${convention} project hooks stay stored-only while other config is consumed`, async () => {
 			const marker = path.join(root, `${convention}-hook-ran`);
 			const foreignMarker = path.join(root, `${convention}-foreign-hook-ran`);
 			if (convention === "native") {
@@ -354,6 +357,7 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 				expect(
 					plan.preview.entries.some(entry => entry.surface === "mcps" && entry.destinationName === MCP_NAME),
 				).toBe(true);
+				expect(plan.preview.warnings.join(" ")).toContain("Project-scope hooks are stored-only");
 				expect(
 					plan.preview.entries.find(entry => entry.surface === "skills" && entry.sourceName === PROTECTED_SKILL)
 						?.status,
@@ -378,8 +382,8 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 			const observed = await consumeCanonicalBundle(marker);
 			expect(observed.skill.name).toBe(SKILL_NAME);
 			expect(observed.skill.description).toBe("Cross-convention fixture skill.");
-			expect(observed.mcp.text).toBe("canonical-mcp-consumed");
-			expect(observed.hook).toBe(HOOK_TOOL);
+			expect(observed.mcp.text).toBe(wrapUntrustedContent("canonical-mcp-consumed"));
+			expect(observed.hook).toBe("stored-only");
 			expect(
 				await fs.stat(foreignMarker).then(
 					() => true,

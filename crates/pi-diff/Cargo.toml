@@ -1,0 +1,13 @@
+# Vendored from oh-my-pi (MIT) crates/pi-diff/Cargo.toml @ a85bd5228d9f0f619deade1db78fa49420a721e1
+# Local modifications: none.
+[package]
+name = "pi-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

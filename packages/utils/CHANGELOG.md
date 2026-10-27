@@ -2,6 +2,181 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+### Fixed
+
+- Crash-log redaction now recognizes separated and camelCase account-key credential fields.
+
+- Generic `auth=` fields no longer cause crash redaction to consume the rest of the log line; later fields are independently scrubbed and diagnostic context remains readable while nonstandard `Authorization:` header values stay redacted only through physical or escaped newline boundaries, without swallowing fields after escaped-quote values in serialized JSON.
+
+- Crash redaction preserves diagnostic fields after backtick-quoted authorization values.
+
+- Crash-log credential scrubbing now recognizes credential keys wrapped in raw or escaped backticks.
+
+- Crash logs and HTML exports now redact complete backtick-quoted scalar credential values, including values containing spaces.
+
+- Crash redaction now prefilters credential assignments and containers before invoking expensive matchers, keeping long ordinary diagnostics bounded.
+
+- Crash-log redaction now keeps comma-separated cookie pairs inside the redacted cookie value.
+
+- Crash redaction now recognizes compound camelCase credential suffixes such as `ApiKey`, `SecretKey`, `AccessToken`, `RefreshToken`, `SessionToken`, and `ClientSecret`, including two-letter acronym prefixes such as `DBPassword` and `openAIApiKey`/`OpenAIApiKey`.
+
+- Cookie redaction now preserves following diagnostic fields while still scrubbing semicolon-separated cookie values.
+
+- Crash and HTML export redaction now recognizes credential field names with dotted segments.
+
+- Crash-log and HTML-export redaction now masks encryption and signing key fields.
+
+- Crash redaction now fully masks credentials wrapped in backslash-escaped backticks, including values nested in serialized containers and authorization headers, while preserving following diagnostics.
+
+- Crash redaction now parses escaped single- and double-quote delimiters in serialized credential containers, preventing closing braces or brackets inside quoted values from exposing later secrets.
+
+- Crash redaction now recognizes passphrase labels such as `passphrase`, `sshPassphrase`, and `key_passphrase`.
+- Multi-segment camelCase prefixes such as `gitHubAccessToken`, `azureDevOpsToken`, `myDatabasePassword`, and `GoogleCloudSecretKey` are now recognized without broadening lookalike matches.
+- Durable crash records redact full quoted values, complete bracketed arrays/objects under sensitive labels, and complete Cookie/Set-Cookie header values, including whitespace-bearing, escaped, and unterminated credentials; escaped Cookie newlines preserve following diagnostics. URL userinfo is scrubbed when it contains only a username token or an empty password. Arbitrary unquoted Authorization schemes are redacted through line end, while short Bearer/Basic/Token credentials preserve following diagnostic fields. CamelCase credential fields such as `authToken`, `githubToken`, and `dbPassword` are recognized without matching ordinary lookalike identifiers; long non-credential keys avoid quadratic matching.
+
+- Crash redaction no longer re-masks a value that is already a redaction placeholder (`«redacted-npm-token»`, `[REDACTED_TOKEN]`), so generated commit messages and crash records keep the specific credential type an earlier pass identified. A value that only begins with a placeholder is still masked.
+
+- Crash-log redaction now bounds quoted credential values to their physical line, preserving later diagnostics.
+
+- Crash-log credential redaction now handles long standards-compliant URL schemes without quadratic matching.
+
+- Malformed unterminated credential containers no longer consume later crash-log diagnostic lines.
+
+- Crash redaction preserves diagnostics after escaped credential values before markup delimiters.
+
+- Crash redaction now recognizes password confirmation fields, including snake_case and camelCase variants.
+
+- Credential redaction now recognizes plural cookie fields and redacts cookie-jar containers.
+
+- Crash-log redaction now treats plural and prefixed plural cookie labels as complete multi-pair values.
+
+- Crash redaction now masks commas and semicolons inside unquoted credential values while preserving following field context.
+
+- Crash-log and HTML-export redaction now recognizes abbreviated password keys such as `pwd`, `dbPwd`, and `user_pwd`.
+
+- Crash redaction now consumes shell-concatenated quoted credential values and preserves following colon-delimited diagnostic fields.
+
+- Crash logs and shared HTML now redact URL credentials containing raw `@`, backtick-quoted containers, and complete cookie assignments.
+
+- Crash redaction recognizes separated and camelCase `secret_key_base` credential fields.
+
+- Crash redaction now handles nested serialization escape depth in credential containers and preserves diagnostics after escaped quoted values followed by punctuation.
+
+- Crash redaction now recognizes Azure `SharedAccessKey` connection-string fields without redacting `SharedAccessKeyName` identifiers.
+
+- Crash redaction now recognizes Azure `SharedAccessSignature` connection-string fields without redacting signature-name metadata.
+
+- Crash redaction now keeps shell-escaped delimiters inside unquoted credential values while still stopping at escaped newline boundaries.
+
+- Crash redaction now masks unquoted multiword credential values while preserving later diagnostic fields.
+
+- Crash redaction now recognizes space-separated credential labels such as `API Key` and `Secret Access Key`.
+
+- Crash-log redaction now masks indented bodies of credential-valued YAML literal and folded block scalars while preserving headers and following diagnostics.
+
+- Crash redaction now recognizes YAML anchors and tags before credential block-scalar markers.
+
+- Crash redaction now masks credential block scalars in YAML sequence mappings while preserving sibling fields.
+
+- Home credential files are no longer loaded when the working directory is that home through another path spelling. A lexical path match still skips them, and the same directory reached by a symlink, macOS `/tmp`, or a bind mount is skipped too. A different directory still supplies the home dotenv and shell startup files.
+
+- A project `.env` can no longer hide a harness-directory assignment behind an unquoted backslash before `#`. The provenance check now reads the same value Bun loads, and a different shell value is still kept.
+
+- Frontmatter parsing removes a complete HTML comment in one forward scan, so a long run of unterminated comment openers stays cheap.
+
+- Frontmatter key normalization stores a `__proto__` key as own data, so a kebab-case key in that value cannot replace the returned object's prototype.
+
+- On POSIX, the rotating-log directory and the active log file are owner-only when they can be opened. An entry the owner cannot open is left unchanged, and that skip is reported through the configured transports. A file-only logger does not write the terminal. A directory path ending in `/.` is repaired as that directory, so a symlink swapped into the name is not chmodded. Retained dated logs and compressed archives keep their mode. Root aliases, including a directory whose opened inode is the filesystem root, are not chmodded. A symlinked log directory keeps its target mode, while a regular log file reached through it is still tightened. A trailing backslash stays part of a POSIX directory name.
+
+- The bash tool's shell processes now also drop project-provided `PERLLIB`, `_JAVA_OPTIONS`, npm's `node-options` and `script-shell` (in any case, with `_` or `-`), `RIPGREP_CONFIG_PATH`, `TAR_OPTIONS`, `RSYNC_RSH`, `MAKEFLAGS`, `MAKEFILES`, `SHELLOPTS`, and `PS4` when the value comes from the project `.env`. A repository could previously use them to run its own program from `perl`, `java`, `npm`, `rg` (a config file adding `--pre`), `tar`, `rsync`, `make`, or any `bash -c` (xtrace with a `PS4` command substitution). Project dotenv keys Bun loads that are not shell identifiers (e.g. `npm_config_node-options`) now count as project-declared for provenance. Values the launching shell exported are still honored.
+
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Crash logs redact a stack before splitting it. When the stack starts with `name: message`, or with a name-only header for an empty message, and no credential replacement crosses that boundary, only the header is flattened and later frame lines stay. If a credential crosses the boundary, or the stack has another shape, the redacted stack is one field so the credential is still removed. The record fingerprint is computed from that stored diagnostic, so recovery can rebind it.
+
+- Crash text now masks an `AWS_SECRET_ACCESS_KEY` value, a bare 40-character AWS secret, and a percent-encoded `sessionid` cookie.
+
+- Project dotenv loading includes the development env file and its local overlay when `NODE_ENV` is unset, and the provenance snapshot uses that same file list so those values stay project-controlled. The manual fallback preserves Bun-style variable interpolation.
+
+- A project `.env` can no longer set `GJC_HARNESS_SOCKET_DIR` or `GJC_HARNESS_ROOT_REGISTRY_DIR`. A different literal shell value is kept. A shell value that matches the project declaration, or a dynamic project declaration, is dropped. A double-quoted escape Bun decodes is treated as dynamic and dropped the same way.
+
+- A project `.env` can no longer make bash tool commands run repository code. `BASH_ENV`/`ENV` and `ZDOTDIR` (shell startup files), `GIT_CONFIG_*`/`GIT_CONFIG_PARAMETERS`, `XDG_CONFIG_HOME`, `HOME`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `GIT_DIR`/`GIT_COMMON_DIR` (all of which can supply e.g. `core.fsmonitor`, which git executes during `git status`), `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND`, `GIT_TEMPLATE_DIR`, and `GIT_EXTERNAL_DIFF`/`GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_ASKPASS`/`GIT_SEQUENCE_EDITOR` are dropped from the bash tool's isolated shell worker chain, the in-process native shell used on Windows, and interactive PTY sessions when the project declares them. If removing a project home selector leaves `HOME` unset, GJC supplies the trusted account home when available, preventing Git for Windows from falling back to a project-controlled profile. A value exported by the launching shell is kept, except when the project declares the same key with the same value or dynamically: provenance is then ambiguous and the variable is dropped, as for credentials. Python kernels keep their documented environment.
+
+- The bash tool's shell processes now also drop project-provided `NODE_OPTIONS`, `PYTHONPATH`, `PYTHONUSERBASE`, `PYTHONSTARTUP`, `PERL5OPT`, `PERL5LIB`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, and the `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides when the value comes from the project `.env`, so a repository cannot make `node`, `python3`, `perl`, `java`, or any dynamically linked command run repository code; values the launching shell exported are still honored.
+
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Fixed
+
+- A project dotenv declaration whose quotes this line parser does not decode, such as `GJC_CODING_AGENT_DIR`, is refused instead of being treated as an operator override.
+
+- A project `.env` can no longer redirect `GJC_GITHUB_CACHE_DB` outside the config root.
+
+- Build stable Windows path keys with ordinal filesystem casing and proven volume-level case-insensitive semantics so distinct Unicode filename spellings do not collide.
+- When a parent lacks a usable file ID, canonicalize its path when possible and fold only the final entry name, preserving ancestor casing.
+- Keep stable path identity in a dedicated subpath so importing the utils root barrel does not load native bindings.
+- Normalize ordinary Win32 trailing-dot and trailing-space aliases when deriving keys for missing path entries.
+
+- When the launching shell does not export `SHELL`, a project `.env` declaration of `SHELL` no longer selects the shell that runs bash tool commands with the agent's environment and credentials; the inherited value or the standard bash/sh fallback is used instead.
+
+- A project `.env` declaration of `NODE_TLS_REJECT_UNAUTHORIZED` no longer disables TLS certificate verification for the process; combined with a project `HTTPS_PROXY`, it previously let the proxy read provider API keys. A value exported by the launching shell is still honored.
+
+## [0.18.8] - 2026-10-08
+
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+### Fixed
+
+- A `GJC_CLEANUP_DEADLINE_MS` above `2147483647` (about 24.9 days) no longer makes the exit-bound cleanup deadline expire at once. The deadline was passed straight to `setTimeout`, which treats longer delays as 1 ms, so shutdown skipped the cleanup it was meant to wait for; it is now capped at the timer maximum.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+## [0.18.1] - 2026-09-29
+
+### Fixed
+
+- A log file that cannot be opened or written (permission denied, the path taken by a directory, too many open files, or the log directory removed while gjc runs) no longer crashes the process from the next `logger` call. `winston-daily-rotate-file` never listened for errors on its underlying file stream, so the failure surfaced as an uncaught exception; the logger now drops the record instead, as it already intended for logging failures.
+
+## [0.18.0] - 2026-09-27
+
+### Changed
+
+- Mermaid ASCII helpers now call the lazily loaded native renderer instead of a TypeScript rendering dependency.
+
+## [0.17.7] - 2026-09-25
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Added
+
+- `CommandEntry` accepts an optional `dispatch(argv, context)` hook, so a registered command family can own its own inert parsing, help, lazy loading and failure rendering before the generic help and command-load path runs. `gjc sdk` and `gjc daemon` use it to intercept their family argv and keep private worker grammar out of public discovery.
+
+### Fixed
+
+- Keep test log isolation away from inherited operator sinks, including XDG paths and symlinked descendants.
+
 ## [0.17.2] - 2026-09-18
 
 ### Fixed

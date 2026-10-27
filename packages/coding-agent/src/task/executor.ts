@@ -33,10 +33,12 @@ import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
+import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	isExplicitProviderModelOverride,
+	refreshMissingQualifiedModelProviders,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -49,6 +51,7 @@ import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { PlanModeState } from "../plan-mode/state";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
@@ -57,13 +60,16 @@ import { discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
 import { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
+import type { ClientBridge } from "../session/client-bridge";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+import { isCanonicalGjcWorkflowSkillFilesystemAlias } from "../skill-state/canonical-skills";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
 import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
+import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -72,11 +78,13 @@ import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
 import { classifyProviderRetryFromTransport, providerNameFromModel } from "./provider-retry-status";
+import { containSubagentRoleBody } from "./role-body";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type AgentSource,
 	type AutoroutingAttempt,
 	type AutoroutingAttemptCode,
 	type AutoroutingPreflightFailure,
@@ -218,6 +226,89 @@ export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model 
 	};
 }
 
+/**
+ * A repository agent may preload an ordinary skill. Bundled workflow names stay
+ * on the interactive skill path. User and bundled agents still preload those names.
+ */
+export function projectAgentMayPreloadSkill(source: AgentSource, skillName: string): boolean {
+	return source !== "project" || !isCanonicalGjcWorkflowSkillFilesystemAlias(skillName);
+}
+
+/**
+ * Not an approved command word. Paired with the read-only profile, a quoted
+ * form of this word is rejected too. An empty overlap must stay distinct from
+ * an unrestricted child, which has no profile and no prefixes.
+ */
+const CHILD_BASH_EMPTY_OVERLAP_PREFIX = ";";
+
+function normalizedBashPrefixes(prefixes: readonly string[] | undefined): string[] {
+	const unique: string[] = [];
+	for (const prefix of prefixes ?? []) {
+		const trimmed = prefix.trim();
+		if (trimmed.length === 0 || unique.includes(trimmed)) continue;
+		unique.push(trimmed);
+	}
+	return unique;
+}
+
+function bashPrefixWords(prefix: string): string[] {
+	return prefix
+		.trim()
+		.split(/\s+/u)
+		.filter(word => word.length > 0);
+}
+
+/** True when every command matched by `specific` is also matched by `broader`. */
+function bashPrefixCovers(broader: string, specific: string): boolean {
+	const left = bashPrefixWords(broader);
+	const right = bashPrefixWords(specific);
+	if (left.length === 0 || left.length > right.length) return false;
+	return left.every((word, index) => word === right[index]);
+}
+
+/**
+ * Bash posture for a task child. An unrestricted parent keeps the child agent's
+ * allowlist. A restricted parent is copied, and a child allowlist can only narrow it.
+ * An empty overlap is read-only with a prefix the bash gate cannot approve.
+ */
+export function resolveChildBashRestriction(input: {
+	parentProfile?: BashRestrictionProfile;
+	parentPrefixes?: readonly string[];
+	childPrefixes?: readonly string[];
+}): { bashRestrictionProfile?: BashRestrictionProfile; bashAllowedPrefixes?: string[] } {
+	const parentPrefixes = normalizedBashPrefixes(input.parentPrefixes);
+	const childPrefixes = normalizedBashPrefixes(input.childPrefixes);
+	if (input.parentProfile === undefined && parentPrefixes.length === 0) {
+		return childPrefixes.length > 0 ? { bashAllowedPrefixes: childPrefixes } : {};
+	}
+	let bashAllowedPrefixes: string[] | undefined;
+	if (parentPrefixes.length === 0) {
+		bashAllowedPrefixes = childPrefixes.length > 0 ? childPrefixes : undefined;
+	} else if (childPrefixes.length === 0) {
+		bashAllowedPrefixes = parentPrefixes;
+	} else {
+		const merged: string[] = [];
+		for (const parentPrefix of parentPrefixes) {
+			for (const childPrefix of childPrefixes) {
+				if (bashPrefixCovers(childPrefix, parentPrefix)) merged.push(parentPrefix);
+				else if (bashPrefixCovers(parentPrefix, childPrefix)) merged.push(childPrefix);
+			}
+		}
+		const unique = normalizedBashPrefixes(merged);
+		if (unique.length === 0) {
+			return {
+				bashRestrictionProfile: "read-only",
+				bashAllowedPrefixes: [CHILD_BASH_EMPTY_OVERLAP_PREFIX],
+			};
+		}
+		bashAllowedPrefixes = unique;
+	}
+	return {
+		...(input.parentProfile ? { bashRestrictionProfile: input.parentProfile } : {}),
+		...(bashAllowedPrefixes ? { bashAllowedPrefixes } : {}),
+	};
+}
+
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -261,6 +352,8 @@ export interface ExecutorOptions {
 	 * Manual/direct parents (no active profile) keep exact resolution.
 	 */
 	parentActiveModelProfile?: string;
+	/** Parent session's model profile ownership marker for propagating to subagent sessions. */
+	parentModelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 	parentSessionId?: string;
 	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
@@ -296,6 +389,27 @@ export interface ExecutorOptions {
 	 * the same immutable child settings snapshot.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/**
+	 * Parent ACP/SDK approval mode. `deny` and `prompt` replace the child
+	 * default (`allow`) before the first prompt. `allow` is that default.
+	 */
+	sdkPermissionMode?: "prompt" | "allow" | "deny";
+	/**
+	 * Parent plan-mode state. Copied onto the child before the first prompt so
+	 * `enforcePlanModeWrite` still refuses product-file writes.
+	 */
+	planModeState?: PlanModeState;
+	/**
+	 * Parent bash posture. Applied before the child prompt so a read-only or
+	 * workflow allowlist cannot be cleared by spawn. A child allowlist may only narrow it.
+	 */
+	bashRestrictionProfile?: BashRestrictionProfile;
+	parentBashAllowedPrefixes?: string[];
+	/**
+	 * Parent client bridge. Only `requestPermission` is copied onto the child.
+	 * Terminal, filesystem, and deferAgentInitiatedTurns stay on the parent.
+	 */
+	clientBridge?: ClientBridge;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -338,28 +452,32 @@ export interface ExecutorOptions {
 export class ManagedTaskPersistence {
 	readonly #artifacts: ArtifactManager;
 	readonly #taskId: string;
+	readonly #getArtifacts: () => ArtifactManager;
 
-	constructor(artifacts: ArtifactManager, taskId: string) {
+	constructor(artifacts: ArtifactManager, taskId: string, getArtifacts: () => ArtifactManager = () => artifacts) {
 		this.#artifacts = artifacts;
 		this.#taskId = validateAllocatedTaskId(taskId);
+		this.#getArtifacts = getArtifacts;
 		if (!artifacts.getManagedSubtreeRootAuthority())
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
 	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
-		const store = this.#artifacts.getManagedStore();
+		const artifacts = this.#getArtifacts();
+		const store = artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
-		this.#artifacts.assertManagedBinding();
-		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		artifacts.assertManagedBinding();
+		const sessionFile = path.join(artifacts.dir, `${this.#taskId}.jsonl`);
 		const session = await SessionManager.openNestedManaged(
 			sessionFile,
-			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			SessionManager.nestedManagedDestination(store, artifacts.dir),
 			store,
 			undefined,
 			cwd,
 			sessionMemoryMode,
 		);
-		this.#artifacts.assertManagedBinding();
+		artifacts.assertManagedBinding();
+		session.registerManagedTranscriptRelocationResolver(this.#getArtifacts);
 		return session;
 	}
 	async openStagedSession(attemptId = this.#taskId): Promise<SessionManager> {
@@ -381,8 +499,10 @@ export class ManagedTaskPersistence {
 	}
 
 	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
-		await withArtifactManagerFinalizationTurn(this.#artifacts, () =>
-			this.#artifacts.publishManagedOutputGeneration(
+		const artifacts = this.#getArtifacts();
+		artifacts.assertManagedBinding();
+		await withArtifactManagerFinalizationTurn(artifacts, () =>
+			artifacts.publishManagedOutputGeneration(
 				`${this.#taskId}.md.selector.json`,
 				`${this.#taskId}.md`,
 				Buffer.from(rawOutput, "utf8"),
@@ -392,8 +512,12 @@ export class ManagedTaskPersistence {
 	}
 }
 
-export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
-	return new ManagedTaskPersistence(artifacts, taskId);
+export function createManagedTaskPersistence(
+	artifacts: ArtifactManager,
+	taskId: string,
+	getArtifacts?: () => ArtifactManager,
+): ManagedTaskPersistence {
+	return new ManagedTaskPersistence(artifacts, taskId, getArtifacts);
 }
 
 const MAX_REVIEW_FINDINGS_ARTIFACT_BYTES = 16 * 1024 * 1024;
@@ -1002,6 +1126,16 @@ function autoroutingAttemptDisposition(failure: AutoroutingPreflightFailure): {
 	return { code: "unclassified_terminal", advance: false };
 }
 
+/** Permission callback only. Terminal, filesystem, and defer flags stay on the parent. */
+function permissionOnlyBridge(bridge: ClientBridge | undefined): ClientBridge | undefined {
+	if (!bridge?.requestPermission || bridge.capabilities.requestPermission !== true) return undefined;
+	const requestPermission = bridge.requestPermission.bind(bridge);
+	return {
+		capabilities: { requestPermission: true },
+		requestPermission: (toolCall, options, signal) => requestPermission(toolCall, options, signal),
+	};
+}
+
 export async function runSubprocessOnce(options: ExecutorOptions): Promise<SingleResult> {
 	const {
 		cwd,
@@ -1418,6 +1552,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 		forwardSubagentEvent(event);
 
 		const now = Date.now();
+		progress.lastActivityMs = now;
 		let flushProgress = false;
 		// A retry is recovered at the first assistant provider event, before the
 		// session emits auto_retry_end after message completion.
@@ -1719,23 +1854,29 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			checkAbort();
 			// Pin authStorage to modelRegistry.authStorage — mirrors the createAgentSession invariant.
 			const registryFromParent = options.modelRegistry !== undefined;
+			const effectiveAgentDir = options.agentDir ?? settings.getAgentDir();
 			const registryAuthStorage =
 				options.authStorage ??
 				options.modelRegistry?.authStorage ??
-				(await awaitAbortable(discoverAuthStorage(settings.getAgentDir())));
+				(await awaitAbortable(discoverAuthStorage(effectiveAgentDir)));
 			if (options.modelRegistry === undefined && options.authStorage === undefined)
 				ownedAuthStorage = registryAuthStorage;
 			ownedModelRegistry = options.modelRegistry
 				? undefined
-				: new ModelRegistry(registryAuthStorage, path.join(settings.getAgentDir(), "models.yml"), settings, {
-						agentDir: settings.getAgentDir(),
+				: new ModelRegistry(registryAuthStorage, path.join(effectiveAgentDir, "models.yml"), settings, {
+						agentDir: effectiveAgentDir,
 						automaticRefresh: false,
 					});
-			const modelRegistry = options.modelRegistry ?? ownedModelRegistry!;
+			let modelRegistry = options.modelRegistry ?? ownedModelRegistry!;
 			const authStorage = modelRegistry.authStorage;
-			if (options.authStorage && options.authStorage !== authStorage) {
+			// Reject if both authStorage and modelRegistry are provided with different instances.
+			if (
+				options.authStorage !== undefined &&
+				options.modelRegistry !== undefined &&
+				options.authStorage !== authStorage
+			) {
 				throw new Error(
-					"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
+					"options.authStorage and options.modelRegistry.authStorage must be the same instance or one must be omitted",
 				);
 			}
 			checkAbort();
@@ -1754,17 +1895,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const canonicalChildScope = getSubagentCanonicalScope(options.parentSessionId, options.subagentId ?? id);
 
 			if (options.preflightProbe || options.preflightDurable) preflightOperation = "auth_resolve";
-			const {
-				model,
-				thinkingLevel: resolvedThinkingLevel,
-				explicitThinkingLevel,
-				authFallbackUsed: resolvedAuthFallbackUsed,
-				requestedModel,
-				fallbackReason,
-				activeIndex,
-				parentFallbackSelector,
-				skips,
-			} = await awaitAbortable(
+			const resolveConfiguredModel = () =>
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
 					options.preflightProbe || options.preflightDurable ? undefined : options.parentActiveModelPattern,
@@ -1776,8 +1907,44 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 						...(options.parentActiveModelProfile ? { aliasIntent: "preset-equivalent" } : {}),
 					},
 					canonicalChildScope,
-				),
-			);
+				);
+			let resolution = await awaitAbortable(resolveConfiguredModel());
+			if (
+				!resolution.model &&
+				registryFromParent &&
+				isExplicitProviderModelOverride(modelPatterns) &&
+				resolution.skips.some(skip => skip.reason === "unknown_model")
+			) {
+				ownedModelRegistry = new ModelRegistry(
+					registryAuthStorage,
+					path.join(effectiveAgentDir, "models.yml"),
+					settings,
+					{
+						agentDir: effectiveAgentDir,
+						automaticRefresh: false,
+					},
+				);
+				await awaitAbortable(
+					refreshMissingQualifiedModelProviders(
+						modelPatterns,
+						ownedModelRegistry,
+						options.parentCredentialSessionId ?? options.parentSessionId,
+					),
+				);
+				modelRegistry = ownedModelRegistry;
+				resolution = await awaitAbortable(resolveConfiguredModel());
+			}
+			const {
+				model,
+				thinkingLevel: resolvedThinkingLevel,
+				explicitThinkingLevel,
+				authFallbackUsed: resolvedAuthFallbackUsed,
+				requestedModel,
+				fallbackReason,
+				activeIndex,
+				parentFallbackSelector,
+				skips,
+			} = resolution;
 			if (!model && isExplicitProviderModelOverride(modelPatterns)) {
 				const skipReasons = [...new Set(skips.map(skip => skip.reason))];
 				if ((options.preflightProbe || options.preflightDurable) && skipReasons.includes("unauthenticated")) {
@@ -1985,6 +2152,11 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			}
 
 			if (options.preflightProbe || options.preflightDurable) preflightOperation = "tool_bootstrap";
+			const childBash = resolveChildBashRestriction({
+				parentProfile: options.bashRestrictionProfile,
+				parentPrefixes: options.parentBashAllowedPrefixes,
+				childPrefixes: agent.bashAllowedPrefixes,
+			});
 			const { session } = await awaitAbortable(
 				canonicalSdk.createAgentSession({
 					cwd: worktree ?? cwd,
@@ -1997,6 +2169,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					activeModelProfile: options.parentActiveModelProfile,
+					modelProfileOwnershipMarker: options.parentModelProfileOwnershipMarker,
 					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
@@ -2011,14 +2184,15 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					promptTemplates: options.promptTemplates,
 					workspaceTree: options.workspaceTree,
 					systemPrompt: defaultPrompt => {
-						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: prompt.render(agent.systemPrompt, {
-								// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
-								ultragoalRedTeam: resolveUltragoalRedTeamActivation({
-									executionMode: options.executionMode,
-									assignment: options.assignment ?? task,
-								}),
+						const renderedRole = prompt.render(agent.systemPrompt, {
+							// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
+							ultragoalRedTeam: resolveUltragoalRedTeamActivation({
+								executionMode: options.executionMode,
+								assignment: options.assignment ?? task,
 							}),
+						});
+						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+							agent: containSubagentRoleBody(renderedRole),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
@@ -2055,7 +2229,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					agentId: id,
 					agentDisplayName: agent.name,
 					agentRosterLabel: options.description,
-					bashAllowedPrefixes: agent.bashAllowedPrefixes,
+					bashAllowedPrefixes: childBash.bashAllowedPrefixes,
+					bashRestrictionProfile: childBash.bashRestrictionProfile,
 					enableLsp: lspEnabled,
 					skipPythonPreflight,
 					enableMCP,
@@ -2068,6 +2243,22 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			);
 
 			activeSession = session;
+			// Plan mode is session state, not a tool-list filter. Copy it before the
+			// first prompt so product writes hit the same read-only guard as the parent.
+			if (options.planModeState?.enabled) {
+				session.setPlanModeState({
+					enabled: true,
+					planFilePath: options.planModeState.planFilePath,
+					...(options.planModeState.workflow ? { workflow: options.planModeState.workflow } : {}),
+					...(options.planModeState.reentry !== undefined ? { reentry: options.planModeState.reentry } : {}),
+				});
+			}
+			// `allow` is the child default. deny/prompt must be copied before the first prompt.
+			if (options.sdkPermissionMode === "deny" || options.sdkPermissionMode === "prompt") {
+				session.setSdkPermissionMode(options.sdkPermissionMode);
+			}
+			const approvalBridge = permissionOnlyBridge(options.clientBridge);
+			if (approvalBridge) session.setClientBridge(approvalBridge);
 			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
 			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
 			if (!parentFallbackSelector) {
@@ -2118,7 +2309,9 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const parentOwnedToolNames = new Set(["todo_write"]);
 			const filteredSubagentTools = subagentToolNames.filter(name => !parentOwnedToolNames.has(name));
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
-				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
+				await awaitAbortable(
+					session.setActiveToolsByName(filteredSubagentTools, { explicit: false, persistMCPSelection: false }),
+				);
 			}
 
 			if (!options.preflightProbe && !options.preflightDurable) {
@@ -2328,6 +2521,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
+					if (!projectAgentMayPreloadSkill(options.agent.source, skill.name)) continue;
 					const { message } = await buildSkillPromptMessage(skill, "");
 					await session.sendCustomMessage(
 						{
@@ -2848,6 +3042,39 @@ function preflightTerminalResult(
 
 /** Run routed initial tasks through the bounded probe/durable candidate ledger. */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	// Resume routing resolves credentials before dispatch; do not let an unexpected
+	// lookup exception bypass terminalization just because the initial probe ledger is off.
+	if (
+		(options.runMode ?? "initial") !== "initial" &&
+		options.autoroutingCandidates &&
+		options.autoroutingPreflightErrors
+	) {
+		const failedSelector = options.autoroutingCandidates.find(selector =>
+			options.autoroutingPreflightErrors?.has(selector),
+		);
+		if (failedSelector) {
+			const preflightError = options.autoroutingPreflightErrors.get(failedSelector);
+			const failure = classifyAutoroutingPreflightFailure(preflightError, "auth_resolve");
+			const { code } = autoroutingAttemptDisposition(failure);
+			const skips = buildBoundedRoutingSkips(options.autoroutingSkips);
+			const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
+			return preflightTerminalResult(
+				{ ...options, routing: routedOptions },
+				[{ selector: failedSelector, phase: "probe", code }],
+				"preflight_exhausted",
+			);
+		}
+	}
+	if ((options.runMode ?? "initial") !== "initial" && options.autoroutingCandidates?.length === 0 && options.routing) {
+		const skippedCandidates = options.autoroutingSkips?.filter(skip => skip.code === "credential_unavailable") ?? [];
+		return preflightTerminalResult(
+			{ ...options, routing: { ...options.routing, ...buildBoundedRoutingSkips(options.autoroutingSkips) } },
+			skippedCandidates
+				.slice(0, 6)
+				.map(skip => ({ selector: skip.selector, phase: "probe", code: "credential_unavailable" })),
+			"all_candidates_skipped",
+		);
+	}
 	if (
 		!options.autoroutingPreflight ||
 		(options.runMode ?? "initial") !== "initial" ||

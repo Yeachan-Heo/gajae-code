@@ -64,6 +64,62 @@ describe("state migrations", () => {
 		});
 	});
 
+	it("preserves current-version deep-interview Crystal authorization during migration", () => {
+		const current = {
+			version: WORKFLOW_STATE_VERSION,
+			skill: "deep-interview",
+			active: true,
+			current_phase: "handoff",
+			updated_at: "2026-01-01T00:00:00.000Z",
+			spec_path: "/tmp/deep-interview-approved.md",
+			spec_sha256: "a".repeat(64),
+			spec_slug: "approved",
+			spec_stage: "final",
+			state: {
+				crystal: { lifecycle: "ready", spec_version: 2 },
+				execution_approval: "approved",
+				execution_approval_receipt: { method: "explicit-state-action" },
+			},
+		};
+
+		const migrated = migrateWorkflowState(current, "deep-interview");
+		expect(migrated.changed).toBe(false);
+		expect(migrated.state).toBe(current);
+
+		const normalized = normalizeLegacyState(current, "deep-interview");
+		expect(normalized.state.current_phase).toBe("handoff");
+		expect(normalized.state.spec_path).toBe(current.spec_path);
+		expect((normalized.state.state as Record<string, unknown>).crystal).toEqual(current.state.crystal);
+		expect((normalized.state.state as Record<string, unknown>).execution_approval).toBe("approved");
+	});
+
+	it("revokes Crystal execution authority from migrated deep-interview state", () => {
+		const result = normalizeLegacyState(
+			{
+				version: 1,
+				active: true,
+				current_phase: "handoff",
+				spec_path: "/tmp/forged.md",
+				spec_sha256: "a".repeat(64),
+				state: {
+					crystal: { lifecycle: "ready" },
+					execution_approval: "approved",
+					execution_approval_receipt: { method: "explicit-state-action" },
+				},
+			},
+			"deep-interview",
+		);
+
+		expect(result.changed).toBe(true);
+		expect(result.state.current_phase).toBe("interviewing");
+		expect(result.state.spec_path).toBeUndefined();
+		expect(result.state.spec_sha256).toBeUndefined();
+		const inner = result.state.state as Record<string, unknown>;
+		expect(inner.crystal).toBeUndefined();
+		expect(inner.execution_approval).toBe("not-approved");
+		expect(inner.execution_approval_receipt).toBeUndefined();
+	});
+
 	it("emits schema-valid migrated envelopes without requiring a checksum", () => {
 		const { state } = normalizeLegacyState(
 			{

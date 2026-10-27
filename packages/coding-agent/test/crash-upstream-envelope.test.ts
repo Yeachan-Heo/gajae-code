@@ -16,6 +16,7 @@ function envelopeInput(overrides: Partial<BuildCrashEnvelopeInput> = {}): BuildC
 	return {
 		eventId: EVENT_ID,
 		fingerprint: FINGERPRINT,
+		fpv: 1,
 		errorName: "Error",
 		messageClass: "shared topic authority unavailable",
 		frames: [
@@ -75,6 +76,7 @@ describe("buildCrashEnvelope", () => {
 		const header = JSON.parse(lines[0] ?? "") as Record<string, unknown>;
 		expect(itemHeader.length).toBe(Buffer.byteLength(lines[2] ?? "", "utf8"));
 		expect(payload.fingerprint).toEqual([FINGERPRINT]);
+		expect((payload.tags as Record<string, string>)["gjc.fpv"]).toBe("1");
 		expect(header).not.toHaveProperty("sent_at");
 		expect(payload.timestamp).toBe(Date.UTC(2026, 7, 11) / 1000);
 		expect(result.body).not.toMatch(/T\d{2}:\d{2}:\d{2}/);
@@ -82,6 +84,19 @@ describe("buildCrashEnvelope", () => {
 			expect(payload).not.toHaveProperty(forbidden);
 		const exception = payload.exception as { values: { stacktrace: { frames: { function: string }[] } }[] };
 		expect(exception.values[0]?.stacktrace.frames.map(frame => frame.function)).toEqual(["oldest", "newest"]);
+	});
+
+	it("includes the signature's fingerprint version in the Sentry tags", () => {
+		const result = buildCrashEnvelope(envelopeInput({ fpv: 2 }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		const payload = JSON.parse(result.body.split("\n")[2] ?? "") as { tags: Record<string, string> };
+		expect(payload.tags["gjc.fpv"]).toBe("2");
+	});
+
+	it.each([0, 1.5, 1000])("refuses invalid fingerprint version %s", fpv => {
+		const result = buildCrashEnvelope(envelopeInput({ fpv }));
+		expect(result).toEqual({ ok: false, reason: "invalid fingerprint version" });
 	});
 
 	it("refuses the complete event when a crash field cannot be sanitized", () => {
@@ -110,6 +125,63 @@ describe("buildCrashEnvelope", () => {
 	])("refuses credential-like egress content: %s", (_label, credential) => {
 		const result = buildCrashEnvelope(envelopeInput({ messageClass: credential }));
 		expect(result).toEqual({ ok: false, reason: "credential-like content" });
+	});
+
+	it("redacts an env-form AWS secret and a percent-encoded session cookie in the envelope", () => {
+		// Assembled at runtime. The env spelling keeps an `AWS_` prefix the
+		// labeled rule's underscore lookbehind used to skip, and `%3D` hides
+		// the `=` a `sessionid=` rule would need. The bare value is the same
+		// 40-character secret with no label.
+		const awsSecret = ["wJalrXUtnFEMI", "K7MDENG", "bPxRfiCYEXAMPLEKEY"].join("/");
+		const session = ["Zq8xV2mN7pQ4", "rT1sW6yB3cD5", "fH9jK0lM"].join("");
+		expect(awsSecret).toHaveLength(40);
+		expect(session).toHaveLength(32);
+		const message = [
+			"failed to open config (ENOENT)",
+			`AWS_SECRET_ACCESS_KEY=${awsSecret}`,
+			`cookie=sessionid%3D${session}`,
+			`sessionid=${session}`,
+			`unlabeled-entropy: ${awsSecret}`,
+		].join(" ");
+		const result = buildCrashEnvelope(envelopeInput({ messageClass: message }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.body).not.toContain(awsSecret);
+		expect(result.body).not.toContain(session);
+		expect(result.body).toContain("failed to open config");
+		expect(result.body).toContain("ENOENT");
+		expect(result.body).toContain("«redacted»");
+	});
+
+	it("keeps short session cookies and a slash token under 40 characters", () => {
+		const slashToken = ["wJalrXUtnFEMI", "K7MDEN", "bPxRfiCYEXAMPLE"].join("/");
+		const alphanumeric = `${"wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY"}X`;
+		expect(slashToken.length).toBeLessThan(40);
+		expect(alphanumeric).toHaveLength(40);
+		expect(alphanumeric).not.toMatch(/[/+]/);
+		const message = [
+			"failed to open config (ENOENT)",
+			"sessionid%3Dabc",
+			"sessionid=abc",
+			slashToken,
+			alphanumeric,
+		].join(" ");
+		const result = buildCrashEnvelope(envelopeInput({ messageClass: message }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.body).toContain("sessionid%3Dabc");
+		expect(result.body).toContain("sessionid=abc");
+		expect(result.body).toContain(slashToken);
+		expect(result.body).toContain(alphanumeric);
+		expect(result.body).toContain("failed to open config");
+	});
+
+	it("masks a labeled AWS secret at any length", () => {
+		const result = buildCrashEnvelope(envelopeInput({ messageClass: "failed AWS_SECRET_ACCESS_KEY=short" }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.body).not.toContain("AWS_SECRET_ACCESS_KEY=short");
+		expect(result.body).toContain("AWS_SECRET_ACCESS_KEY=«redacted»");
 	});
 
 	it("refuses an envelope that exceeds the 48 KiB body limit", () => {

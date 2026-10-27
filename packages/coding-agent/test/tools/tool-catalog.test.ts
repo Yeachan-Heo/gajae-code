@@ -12,6 +12,18 @@ describe("generated tool catalog", () => {
 		const regenerated = await generateToolCatalogData();
 		expect(regenerated).toEqual(TOOL_CATALOG);
 	});
+	test("advertised descriptions contain no unrendered or undefined template values", () => {
+		// TOOL_CATALOG is exported, and deferred (discoverable) tools advertise its description
+		// until they materialize, so a template variable missing from the generator's
+		// settings must not render as "undefined" or a raw {{PLACEHOLDER}}.
+		for (const [name, entry] of Object.entries(TOOL_CATALOG)) {
+			const description = entry.description ?? "";
+			expect({ name, match: description.match(/\b(?:undefined|NaN)\b|\{\{[^}]*\}\}/)?.[0] }).toEqual({
+				name,
+				match: undefined,
+			});
+		}
+	});
 	test("move_session is generated with essential loadMode and exclusive non-abortable metadata", () => {
 		expect(TOOL_CATALOG.move_session?.loadMode).toBe("essential");
 		expect(TOOL_CATALOG.move_session?.deferrable).toBe(false);
@@ -21,7 +33,8 @@ describe("generated tool catalog", () => {
 
 	test("ambient agent fixtures cannot contaminate generated task metadata", async () => {
 		const project = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tool-catalog-project-"));
-		const pluginRoot = path.join(project, "review-plugin");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tool-catalog-plugin-"));
+		const pluginRoot = path.join(outside, "review-plugin");
 		const registryPath = path.join(project, ".gjc", "plugins", "installed_plugins.json");
 		try {
 			const agentsDir = path.join(pluginRoot, "agents");
@@ -68,6 +81,7 @@ describe("generated tool catalog", () => {
 		} finally {
 			clearPluginRootsAndCaches([registryPath]);
 			await fs.rm(project, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
 		}
 	});
 

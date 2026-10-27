@@ -7,8 +7,10 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	directoryCaseSensitive,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
+	exactReplaceRetained,
 	exactRestore,
 	exactUnlink,
 	exactUnlinkDirect,
@@ -18,6 +20,7 @@ import {
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
+	windowsOrdinalCaseFold,
 } from "../native/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -69,7 +72,47 @@ afterEach(async () => {
 	);
 });
 
+describe("directory case sensitivity API", () => {
+	it.skipIf(process.platform === "win32")("returns unknown off Windows", () => {
+		expect(directoryCaseSensitive(os.tmpdir())).toBeNull();
+	});
+
+	it.skipIf(process.platform === "win32")("preserves text off Windows", () => {
+		expect(windowsOrdinalCaseFold("İ")).toBe("İ");
+	});
+});
+
 describe.skipIf(process.platform !== "win32")("Windows native path identity", () => {
+	it("reports the case-sensitivity flag for an ordinary directory", async () => {
+		expect(directoryCaseSensitive(await temporaryDirectory())).toBe(false);
+	});
+
+	it("folds Windows ordinal case without Unicode expansions", () => {
+		expect(windowsOrdinalCaseFold("session")).toBe("SESSION");
+		expect(windowsOrdinalCaseFold("İ")).not.toBe(windowsOrdinalCaseFold("i̇"));
+	});
+
+	it.skipIf(!process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY)(
+		"reports case-sensitive child names for a configured directory",
+		() => {
+			expect(directoryCaseSensitive(process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY!)).toBe(true);
+		},
+	);
+
+	it.skipIf(!process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY)(
+		"queries case-sensitive child names on a configured UNC share",
+		() => {
+			expect(directoryCaseSensitive(process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY!)).toBe(true);
+		},
+	);
+
+	it.skipIf(!process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY)(
+		"queries case-insensitive child names on a configured UNC share",
+		() => {
+			expect(directoryCaseSensitive(process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY!)).toBe(false);
+		},
+	);
+
 	it("keeps retained publication refusal structured on Windows", async () => {
 		const root = await temporaryDirectory();
 		let refusal: unknown;
@@ -153,6 +196,133 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(exactReplacePath(source, destination, sourceIdentity, destinationIdentity)).toEqual({ ok: true });
 		expect(await fs.readFile(destination, "utf8")).toBe("new-state");
 		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("publishes a retained self-replacement for owner-only executables (#6096)", async () => {
+		// exactReplaceRetained reads each retained handle's owner and DACL to enforce
+		// the no-shared-write invariant. Without READ_CONTROL on those handles,
+		// GetSecurityInfo fails and every real Windows `gjc update` stopped at
+		// acl_unavailable before promotion.
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.exe");
+		const destination = path.join(root, "gjc.exe");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.writeFile(source, "new-binary");
+		await fs.writeFile(destination, "old-binary");
+		// Exact replacement validates ownership as well as the DACL; pin the
+		// fixture owner instead of relying on the runner's temp-file default.
+		await runIcacls(source, "/setowner", user);
+		await runIcacls(destination, "/setowner", user);
+		expect(applyOwnerOnlyPathSecurity(source, "file")).toEqual({ ok: true });
+		expect(applyOwnerOnlyPathSecurity(destination, "file")).toEqual({ ok: true });
+		const parent = await parentIdentity(source);
+		const identity = async (pathname: string, contents: string) => {
+			const stat = await fs.stat(pathname, { bigint: true });
+			return {
+				...parent,
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256(contents),
+			};
+		};
+
+		const result = exactReplaceRetained(
+			source,
+			destination,
+			"gjc.exe.backup",
+			await identity(source, "new-binary"),
+			await identity(destination, "old-binary"),
+		);
+
+		expect(result.code).toBeUndefined();
+		expect(result.ok).toBe(true);
+		expect(await fs.readFile(destination, "utf8")).toBe("new-binary");
+		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
+	});
+
+	async function retainedReplaceFixture(root: string) {
+		const source = path.join(root, "staged.exe");
+		const destination = path.join(root, "gjc.exe");
+		await fs.writeFile(source, "new-binary");
+		await fs.writeFile(destination, "old-binary");
+		const parent = await parentIdentity(source);
+		const identity = async (pathname: string, contents: string) => {
+			const stat = await fs.stat(pathname, { bigint: true });
+			return {
+				...parent,
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256(contents),
+			};
+		};
+		return {
+			source,
+			destination,
+			replace: async () =>
+				exactReplaceRetained(
+					source,
+					destination,
+					"gjc.exe.backup",
+					await identity(source, "new-binary"),
+					await identity(destination, "old-binary"),
+				),
+		};
+	}
+
+	// What a default %LOCALAPPDATA%\gjc install inherits (#6096, #6916).
+	async function applyDefaultProfileDacl(pathname: string, user: string): Promise<void> {
+		await runIcacls(pathname, "/inheritance:r", "/grant:r", `${user}:F`, "*S-1-5-18:F", "*S-1-5-32-544:F");
+	}
+
+	it("publishes over an executable carrying the default profile DACL and an Administrators owner", async () => {
+		// An elevated token's default owner is BUILTIN\Administrators, and the
+		// profile DACL grants SYSTEM and Administrators full control. Both are
+		// trusted principals, so a stock elevated install must update.
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const root = await temporaryDirectory();
+		const fixture = await retainedReplaceFixture(root);
+		for (const pathname of [fixture.source, fixture.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			await runIcacls(pathname, "/setowner", "*S-1-5-32-544");
+		}
+
+		const result = await fixture.replace();
+
+		expect(result.code).toBeUndefined();
+		expect(result.ok).toBe(true);
+		expect(await fs.readFile(fixture.destination, "utf8")).toBe("new-binary");
+		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
+	});
+
+	it("accepts a read/execute grant for another principal but refuses a shared write grant", async () => {
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const readOnlyRoot = await temporaryDirectory();
+		const readOnly = await retainedReplaceFixture(readOnlyRoot);
+		for (const pathname of [readOnly.source, readOnly.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			// (RX) carries SYNCHRONIZE; it must not count as a write grant (#6096).
+			await runIcacls(pathname, "/grant", "*S-1-5-32-545:RX");
+		}
+		expect(await readOnly.replace()).toMatchObject({ ok: true });
+
+		const sharedRoot = await temporaryDirectory();
+		const shared = await retainedReplaceFixture(sharedRoot);
+		for (const pathname of [shared.source, shared.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			await runIcacls(pathname, "/grant", "*S-1-5-32-545:M");
+		}
+		expect(await shared.replace()).toMatchObject({ ok: false, code: "acl_present" });
+		expect(await fs.readFile(shared.destination, "utf8")).toBe("old-binary");
+		expect(await fs.readFile(shared.source, "utf8")).toBe("new-binary");
 	});
 
 	it("retries a transient destination sharing violation and succeeds after the holder releases", async () => {
@@ -564,6 +734,39 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
 	});
+	it("accepts a BUILTIN Administrators-owned managed directory with the current user's safe DACL", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "managed-admin-owned");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(directory);
+		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+
+		try {
+			await runIcacls(directory, "/setowner", "*S-1-5-32-544");
+			expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+		} finally {
+			await runIcacls(directory, "/setowner", user);
+		}
+	});
+	it("continues rejecting managed directories owned by SYSTEM", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "managed-system-owned");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(directory);
+		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+
+		try {
+			await runIcacls(directory, "/setowner", "*S-1-5-18");
+			expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({
+				ok: false,
+				code: "owner_mismatch",
+			});
+		} finally {
+			await runIcacls(directory, "/setowner", user);
+		}
+	});
 	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
 		const root = await temporaryDirectory();
 		const directory = path.join(root, "legacy-managed");
@@ -668,6 +871,38 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		expect(await fs.readFile(source, "utf8")).toBe("candidate-bytes");
 	});
 
+	it("reports a denied staged-source open as a pre-mutation access denial, not an owner mismatch", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged");
+		const destination = path.join(root, "published");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(source);
+		await fs.writeFile(path.join(source, "info"), "owner");
+		// Deny DELETE on the source and DELETE_CHILD on its parent so the
+		// publisher's DELETE-access source open fails with STATUS_ACCESS_DENIED.
+		await runIcacls(source, "/deny", `${user}:(DE)`);
+		await runIcacls(root, "/deny", `${user}:(DC)`);
+
+		try {
+			expect(renameNoReplacePath(source, destination)).toEqual({
+				ok: false,
+				code: "access_denied",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "access_denied",
+				primitive: "windows_rename_noreplace",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			});
+		} finally {
+			await runIcacls(root, "/remove:d", user);
+			await runIcacls(source, "/remove:d", user);
+		}
+		expect(await fs.readFile(path.join(source, "info"), "utf8")).toBe("owner");
+		await expect(fs.stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("does not delete a replacement when exact handle identity differs", async () => {
 		const root = await temporaryDirectory();
 		const file = path.join(root, "replacement.jsonl");
@@ -725,6 +960,34 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		).toEqual({ ok: true });
 		await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(fs.stat(path.join(root, directQuarantine))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("enforces requireHardLink without breaking one-link allowHardLink cleanup", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "single-link.tmp");
+		await fs.writeFile(file, "authorized");
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await parentIdentity(file);
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.parentDev,
+			parentIno: parent.parentIno,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("authorized"),
+			quarantineName: ".single-link.cleanup",
+			allowHardLink: true,
+		};
+
+		expect(exactUnlinkDirect(file, { ...identity, requireHardLink: true })).toEqual({
+			ok: false,
+			code: "hard_link_unsupported",
+		});
+		expect(await fs.readFile(file, "utf8")).toBe("authorized");
+		expect(exactUnlinkDirect(file, identity)).toEqual({ ok: true });
+		await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("retains a regular file when direct cleanup parent authority changes", async () => {

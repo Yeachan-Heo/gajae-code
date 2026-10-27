@@ -1,0 +1,5 @@
+{
+	"preSyncObservedOnCurrentHost": "dark",
+	"darwinAllowed": ["dark", "light"],
+	"otherPlatformValue": null
+}

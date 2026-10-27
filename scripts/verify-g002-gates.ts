@@ -10,6 +10,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import traverse, { type NodePath } from "@babel/traverse";
+import { parse } from "@babel/parser";
+import type * as Babel from "@babel/types";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const EXPECTED_DEFINITIONS = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
@@ -389,6 +392,1185 @@ async function verifyBroadWorkflowExposure(): Promise<GateResult> {
 	};
 }
 
+function getStaticMcpMemberName(member: Babel.ObjectMethod | Babel.ObjectProperty | Babel.SpreadElement): string | undefined {
+	if (member.type === "SpreadElement") return undefined;
+	if (member.computed) return member.key.type === "StringLiteral" ? member.key.value : undefined;
+	if (member.key.type === "Identifier") return member.key.name;
+	if (member.key.type === "StringLiteral") return member.key.value;
+	return undefined;
+}
+
+function unwrapMcpPropertyValue(value: Babel.ObjectProperty["value"]): Babel.ObjectProperty["value"] {
+	let expression = value;
+	while (
+		expression.type === "ParenthesizedExpression" ||
+		expression.type === "TSAsExpression" ||
+		expression.type === "TSTypeAssertion" ||
+		expression.type === "TSSatisfiesExpression" ||
+		expression.type === "TSNonNullExpression"
+	) {
+		expression = expression.expression;
+	}
+	return expression;
+}
+
+function getStaticMcpString(value: Babel.ObjectProperty["value"]): string | undefined {
+	const expression = unwrapMcpPropertyValue(value);
+	return expression.type === "StringLiteral" ? expression.value : undefined;
+}
+
+function getStaticMcpAliases(entry: Babel.ObjectExpression): string[] | undefined {
+	const aliasProperties = entry.properties.filter(member => getStaticMcpMemberName(member) === "aliases");
+	if (aliasProperties.length === 0) return [];
+	const aliasProperty = aliasProperties[0];
+	if (aliasProperties.length !== 1 || aliasProperty?.type !== "ObjectProperty") return undefined;
+
+	const aliasesValue = unwrapMcpPropertyValue(aliasProperty.value);
+	if (aliasesValue.type !== "ArrayExpression") return undefined;
+	const aliases: string[] = [];
+	for (const element of aliasesValue.elements) {
+		if (!element || element.type === "SpreadElement") return undefined;
+		const alias = getStaticMcpString(element);
+		if (alias === undefined) return undefined;
+		aliases.push(alias);
+	}
+	return aliases;
+}
+
+function getMcpHandlerBody(member: Babel.ObjectMethod | Babel.ObjectProperty): Babel.BlockStatement | undefined {
+	if (member.type === "ObjectMethod") return member.body;
+	if (member.value.type === "ArrowFunctionExpression" || member.value.type === "FunctionExpression") {
+		return member.value.body.type === "BlockStatement" ? member.value.body : undefined;
+	}
+	return undefined;
+}
+
+function hasExactMcpHandlerParameters(member: Babel.ObjectMethod | Babel.ObjectProperty): boolean {
+	const parameters =
+		member.type === "ObjectMethod"
+			? member.params
+			: member.value.type === "ArrowFunctionExpression" || member.value.type === "FunctionExpression"
+				? member.value.params
+				: undefined;
+	const command = parameters?.[0];
+	const runtime = parameters?.[1];
+	const body = getMcpHandlerBody(member);
+	const shadowedParameter = body?.body.some(
+		statement =>
+			statement.type === "FunctionDeclaration" &&
+			(statement.id?.name === "command" || statement.id?.name === "runtime"),
+	);
+	return (
+		parameters?.length === 2 &&
+		command?.type === "Identifier" &&
+		command.name === "command" &&
+		runtime?.type === "Identifier" &&
+		runtime.name === "runtime" &&
+		!shadowedParameter
+	);
+}
+
+function hasMcpMemberAccessChain(expression: Babel.Expression, root: string, properties: readonly string[]): boolean {
+	let current = expression;
+	for (let index = properties.length - 1; index >= 0; index--) {
+		if (
+			current.type !== "MemberExpression" ||
+			current.computed ||
+			current.property.type !== "Identifier" ||
+			current.property.name !== properties[index] ||
+			current.object.type === "Super"
+		) {
+			return false;
+		}
+		current = current.object;
+	}
+	return current.type === "Identifier" && current.name === root;
+}
+
+function isExactMcpFallback(statement: Babel.Statement): boolean {
+	if (statement.type !== "IfStatement" || statement.alternate !== null) return false;
+	const condition = statement.test;
+	if (
+		condition.type !== "UnaryExpression" ||
+		condition.operator !== "!" ||
+		!hasMcpMemberAccessChain(condition.argument, "runtime", ["ctx", "session", "hasExactMcpControls"])
+	) {
+		return false;
+	}
+	const fallback = statement.consequent;
+	if (fallback.type !== "ReturnStatement" || !fallback.argument || fallback.argument.type !== "ObjectExpression") return false;
+	if (fallback.argument.properties.length !== 1) return false;
+	const prompt = fallback.argument.properties[0];
+	return (
+		prompt?.type === "ObjectProperty" &&
+		!prompt.computed &&
+		getStaticMcpMemberName(prompt) === "prompt" &&
+		prompt.value.type === "MemberExpression" &&
+		!prompt.value.computed &&
+		prompt.value.object.type === "Identifier" &&
+		prompt.value.object.name === "command" &&
+		prompt.value.property.type === "Identifier" &&
+		prompt.value.property.name === "text"
+	);
+}
+
+function isMcpFilterMember(expression: Babel.Node, object: string, property: string): boolean {
+	return (
+		expression.type === "MemberExpression" &&
+		!expression.computed &&
+		expression.object.type === "Identifier" &&
+		expression.object.name === object &&
+		expression.property.type === "Identifier" &&
+		expression.property.name === property
+	);
+}
+
+function isApprovedMcpRegistryFilter(expression: Babel.Node, parameterName: string): boolean {
+	if (expression.type !== "LogicalExpression" || expression.operator !== "&&") return false;
+	const utilityQuarantine = expression.left;
+	if (
+		utilityQuarantine.type !== "UnaryExpression" ||
+		utilityQuarantine.operator !== "!" ||
+		utilityQuarantine.argument.type !== "CallExpression" ||
+		utilityQuarantine.argument.optional ||
+		utilityQuarantine.argument.arguments.length !== 1 ||
+		!isMcpFilterMember(utilityQuarantine.argument.callee, "QUARANTINED_UTILITY_SLASH_COMMANDS", "has")
+	) {
+		return false;
+	}
+	const quarantinedCommandName = utilityQuarantine.argument.arguments[0];
+	if (!quarantinedCommandName || !isMcpFilterMember(quarantinedCommandName, parameterName, "name")) return false;
+
+	const retainedDescriptorFilter = expression.right;
+	if (retainedDescriptorFilter.type !== "LogicalExpression" || retainedDescriptorFilter.operator !== "||") {
+		return false;
+	}
+	const importSessionExclusion = retainedDescriptorFilter.left;
+	return (
+		importSessionExclusion.type === "BinaryExpression" &&
+		importSessionExclusion.operator === "!==" &&
+		isMcpFilterMember(importSessionExclusion.left, parameterName, "name") &&
+		importSessionExclusion.right.type === "StringLiteral" &&
+		importSessionExclusion.right.value === "import-session" &&
+		retainedDescriptorFilter.right.type === "Identifier" &&
+		retainedDescriptorFilter.right.name === "IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE"
+	);
+}
+
+function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "filter"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (
+		!callPath?.isCallExpression() ||
+		callPath.node.callee !== memberPath.node ||
+		callPath.node.optional ||
+		callPath.node.arguments.length !== 1
+	) {
+		return false;
+	}
+	const declarationPath = callPath.parentPath;
+	if (
+		!declarationPath?.isVariableDeclarator() ||
+		declarationPath.node.init !== callPath.node ||
+		declarationPath.node.id.type !== "Identifier" ||
+		declarationPath.node.id.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY"
+	) {
+		return false;
+	}
+	const variableDeclarationPath = declarationPath.parentPath;
+	if (
+		!variableDeclarationPath?.isVariableDeclaration() ||
+		variableDeclarationPath.node.kind !== "const" ||
+		variableDeclarationPath.node.declarations.length !== 1
+	) {
+		return false;
+	}
+	const callback = callPath.node.arguments[0];
+	if (
+		callback?.type !== "ArrowFunctionExpression" ||
+		callback.async ||
+		callback.generator ||
+		callback.params.length !== 1 ||
+		callback.params[0]?.type !== "Identifier" ||
+		callback.body.type === "BlockStatement"
+	) {
+		return false;
+	}
+	return isApprovedMcpRegistryFilter(callback.body, callback.params[0].name);
+}
+
+function isSafeMcpLookupSet(
+	statement: Babel.Statement,
+	key: { name: string; member?: string },
+	commandName: string,
+): boolean {
+	if (statement.type !== "ExpressionStatement" || statement.expression.type !== "CallExpression") return false;
+	const call = statement.expression;
+	if (
+		call.optional ||
+		!isMcpFilterMember(call.callee, "BUILTIN_SLASH_COMMAND_LOOKUP", "set") ||
+		call.arguments.length !== 2
+	) {
+		return false;
+	}
+	const keyArgument = call.arguments[0];
+	const commandArgument = call.arguments[1];
+	return (
+		keyArgument !== undefined &&
+		keyArgument.type !== "SpreadElement" &&
+		keyArgument.type !== "ArgumentPlaceholder" &&
+		(key.member
+			? keyArgument.type === "MemberExpression" &&
+				!keyArgument.computed &&
+				keyArgument.object.type === "Identifier" &&
+				keyArgument.object.name === key.name &&
+				keyArgument.property.type === "Identifier" &&
+				keyArgument.property.name === key.member
+			: keyArgument.type === "Identifier" && keyArgument.name === key.name) &&
+		commandArgument?.type === "Identifier" &&
+		commandArgument.name === commandName
+	);
+}
+
+function isSafeMcpLookupLoop(statement: Babel.ForOfStatement): boolean {
+	if (
+		statement.await ||
+		statement.right.type !== "Identifier" ||
+		statement.right.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY" ||
+		statement.left.type !== "VariableDeclaration" ||
+		statement.left.kind !== "const" ||
+		statement.left.declarations.length !== 1 ||
+		statement.left.declarations[0]?.id.type !== "Identifier" ||
+		statement.left.declarations[0].id.name !== "command" ||
+		statement.body.type !== "BlockStatement" ||
+		statement.body.body.length !== 2
+	) {
+		return false;
+	}
+	const [commandLookup, aliasLoop] = statement.body.body;
+	return (
+		commandLookup !== undefined &&
+		isSafeMcpLookupSet(commandLookup, { name: "command", member: "name" }, "command") &&
+		aliasLoop?.type === "ForOfStatement" &&
+		!aliasLoop.await &&
+		aliasLoop.left.type === "VariableDeclaration" &&
+		aliasLoop.left.kind === "const" &&
+		aliasLoop.left.declarations.length === 1 &&
+		aliasLoop.left.declarations[0]?.id.type === "Identifier" &&
+		aliasLoop.left.declarations[0].id.name === "alias" &&
+		aliasLoop.right.type === "LogicalExpression" &&
+		aliasLoop.right.operator === "??" &&
+		hasMcpMemberAccessChain(aliasLoop.right.left, "command", ["aliases"]) &&
+		aliasLoop.right.right.type === "ArrayExpression" &&
+		aliasLoop.right.right.elements.length === 0 &&
+		aliasLoop.body.type === "BlockStatement" &&
+		aliasLoop.body.body.length === 1 &&
+		isSafeMcpLookupSet(aliasLoop.body.body[0]!, { name: "alias" }, "command")
+	);
+}
+
+function isExpectedMcpLookupDeclaration(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const declaratorPath = identifierPath.parentPath;
+	if (!declaratorPath?.isVariableDeclarator() || declaratorPath.node.id !== identifierPath.node) return false;
+	const declarationPath = declaratorPath.parentPath;
+	const initializer = declaratorPath.node.init;
+	return (
+		declarationPath?.isVariableDeclaration() === true &&
+		declarationPath.node.kind === "const" &&
+		declarationPath.node.declarations.length === 1 &&
+		initializer?.type === "NewExpression" &&
+		initializer.callee.type === "Identifier" &&
+		initializer.callee.name === "Map" &&
+		initializer.arguments.length === 0
+	);
+}
+
+function isExpectedMcpLookupGet(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.optional ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "get"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (!callPath?.isCallExpression() || callPath.node.callee !== memberPath.node || callPath.node.optional) return false;
+	const resultPath = callPath.parentPath;
+	if (
+		resultPath?.isOptionalMemberExpression() &&
+		resultPath.node.object === callPath.node &&
+		!resultPath.node.computed &&
+		resultPath.node.property.type === "Identifier" &&
+		resultPath.node.property.name === "handle"
+	) {
+		const dispatchPath = resultPath.parentPath;
+		return dispatchPath?.isOptionalCallExpression() === true && dispatchPath.node.callee === resultPath.node;
+	}
+	if (
+		resultPath?.isVariableDeclarator() &&
+		resultPath.node.init === callPath.node &&
+		resultPath.node.id.type === "Identifier" &&
+		resultPath.node.id.name === "command" &&
+		resultPath.parentPath?.isVariableDeclaration() &&
+		resultPath.parentPath.node.kind === "const"
+	) {
+		const functionPath = resultPath.getFunctionParent();
+		return (
+			functionPath?.node.type === "FunctionDeclaration" &&
+			(functionPath.node.id?.name === "executeBuiltinSlashCommand" ||
+				functionPath.node.id?.name === "executeLocalHeadlessBuiltinSlashCommand")
+		);
+	}
+	if (resultPath?.isReturnStatement() && resultPath.node.argument === callPath.node) {
+		const functionPath = resultPath.getFunctionParent();
+		return functionPath?.node.type === "FunctionDeclaration" && functionPath.node.id?.name === "lookupBuiltinSlashCommand";
+	}
+	return false;
+}
+
+function isExpectedMcpLookupSet(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.optional ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "set"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (!callPath?.isCallExpression() || callPath.node.callee !== memberPath.node || callPath.node.optional) return false;
+	const statementPath = callPath.parentPath;
+	if (!statementPath?.isExpressionStatement()) return false;
+	let ancestor: NodePath<Babel.Node> | null = statementPath.parentPath;
+	while (ancestor) {
+		if (ancestor.isForOfStatement() && isSafeMcpLookupLoop(ancestor.node)) return true;
+		ancestor = ancestor.parentPath;
+	}
+	return false;
+}
+
+function hasOnlyExpectedMcpLookupUse(program: Babel.File, required: boolean): boolean {
+	let declarationCount = 0;
+	let populationWrites = 0;
+	let reads = 0;
+	let hasUnverifiedReference = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (identifierPath.node.name !== "BUILTIN_SLASH_COMMAND_LOOKUP") return;
+			if (identifierPath.parentPath?.isVariableDeclarator() && identifierPath.parentPath.node.id === identifierPath.node) {
+				declarationCount++;
+				if (!isExpectedMcpLookupDeclaration(identifierPath)) hasUnverifiedReference = true;
+				return;
+			}
+			if (isExpectedMcpLookupGet(identifierPath)) {
+				reads++;
+				return;
+			}
+			if (isExpectedMcpLookupSet(identifierPath)) {
+				populationWrites++;
+				return;
+			}
+			hasUnverifiedReference = true;
+		},
+	});
+	if (!required) return declarationCount === 0 && populationWrites === 0 && reads === 0 && !hasUnverifiedReference;
+	return declarationCount === 1 && populationWrites === 2 && reads > 0 && !hasUnverifiedReference;
+}
+
+function isExpectedQuarantinedUtilitySetDeclaration(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const declaratorPath = identifierPath.parentPath;
+	if (!declaratorPath?.isVariableDeclarator() || declaratorPath.node.id !== identifierPath.node) return false;
+	const declarationPath = declaratorPath.parentPath;
+	const initializer = declaratorPath.node.init;
+	const entries =
+		initializer?.type === "NewExpression" && initializer.arguments.length === 1 ? initializer.arguments[0] : undefined;
+	const entry = entries?.type === "ArrayExpression" ? entries.elements[0] : undefined;
+	return (
+		declarationPath?.isVariableDeclaration() === true &&
+		declarationPath.node.kind === "const" &&
+		declarationPath.node.declarations.length === 1 &&
+		initializer?.type === "NewExpression" &&
+		initializer.callee.type === "Identifier" &&
+		initializer.callee.name === "Set" &&
+		initializer.arguments.length === 1 &&
+		entries?.type === "ArrayExpression" &&
+		entries.elements.length === 1 &&
+		entry?.type === "StringLiteral" &&
+		entry.value === "agents"
+	);
+}
+
+function isExpectedQuarantinedUtilitySetHas(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.optional ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "has"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	return (
+		callPath?.isCallExpression() === true &&
+		callPath.node.callee === memberPath.node &&
+		!callPath.node.optional &&
+		callPath.node.arguments.length === 1
+	);
+}
+
+function hasOnlyExpectedQuarantinedUtilitySetUse(program: Babel.File, required: boolean): boolean {
+	let declarationCount = 0;
+	let references = 0;
+	let hasUnverifiedReference = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (identifierPath.node.name !== "QUARANTINED_UTILITY_SLASH_COMMANDS") return;
+			if (identifierPath.parentPath?.isVariableDeclarator() && identifierPath.parentPath.node.id === identifierPath.node) {
+				declarationCount++;
+				if (!isExpectedQuarantinedUtilitySetDeclaration(identifierPath)) hasUnverifiedReference = true;
+				return;
+			}
+			references++;
+			if (!isExpectedQuarantinedUtilitySetHas(identifierPath)) hasUnverifiedReference = true;
+		},
+	});
+	if (!required) return declarationCount === 0 && references === 0 && !hasUnverifiedReference;
+	return declarationCount === 1 && references === 1 && !hasUnverifiedReference;
+}
+
+function isSafeMcpMetadataMapReference(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "map"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (
+		!callPath?.isCallExpression() ||
+		callPath.node.callee !== memberPath.node ||
+		callPath.node.optional ||
+		callPath.node.arguments.length !== 1
+	) {
+		return false;
+	}
+	const callback = callPath.node.arguments[0];
+	const callbackParameter = callback?.type === "ArrowFunctionExpression" ? callback.params[0] : undefined;
+	if (
+		callback?.type !== "ArrowFunctionExpression" ||
+		callback.async ||
+		callback.generator ||
+		callback.params.length !== 1 ||
+		callbackParameter?.type !== "Identifier" ||
+		callback.body.type !== "ObjectExpression"
+	) {
+		return false;
+	}
+	const expectedProperties = ["name", "description", "subcommands", "inlineHint", "priority"];
+	return (
+		callback.body.properties.length === expectedProperties.length &&
+		callback.body.properties.every((property, index) => {
+			const expectedProperty = expectedProperties[index];
+			return (
+				property.type === "ObjectProperty" &&
+				!property.computed &&
+				!property.shorthand &&
+				getStaticMcpMemberName(property) === expectedProperty &&
+				property.value.type === "MemberExpression" &&
+				!property.value.computed &&
+				property.value.object.type === "Identifier" &&
+				property.value.object.name === callbackParameter.name &&
+				property.value.property.type === "Identifier" &&
+				property.value.property.name === expectedProperty
+			);
+		})
+	);
+}
+
+function hasOnlyExpectedActiveMcpRegistryUse(program: Babel.File): boolean {
+	let activeRegistryDeclarations = 0;
+	let referenceCount = 0;
+	let lookupReferences = 0;
+	let metadataReferences = 0;
+	let exportReferences = 0;
+	let hasUnverifiedReference = false;
+	let hasUnverifiedDeclaration = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (identifierPath.node.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY") return;
+			const parentPath = identifierPath.parentPath;
+			if (parentPath?.isVariableDeclarator() && parentPath.node.id === identifierPath.node) {
+				activeRegistryDeclarations++;
+				const declarationPath = parentPath.parentPath;
+				if (
+					!declarationPath?.isVariableDeclaration() ||
+					declarationPath.node.kind !== "const" ||
+					declarationPath.node.declarations.length !== 1
+				) {
+					hasUnverifiedDeclaration = true;
+				}
+				return;
+			}
+			referenceCount++;
+			if (parentPath?.isForOfStatement() && parentPath.node.right === identifierPath.node) {
+				if (isSafeMcpLookupLoop(parentPath.node)) lookupReferences++;
+				else hasUnverifiedReference = true;
+				return;
+			}
+			if (
+				parentPath?.isVariableDeclarator() &&
+				parentPath.node.init === identifierPath.node &&
+				parentPath.node.id.type === "Identifier" &&
+				parentPath.node.id.name === "BUILTIN_SLASH_COMMANDS_INTERNAL" &&
+				parentPath.parentPath?.parentPath?.isExportNamedDeclaration()
+			) {
+				exportReferences++;
+				return;
+			}
+			if (isSafeMcpMetadataMapReference(identifierPath)) metadataReferences++;
+			else hasUnverifiedReference = true;
+		},
+	});
+	if (activeRegistryDeclarations === 0) return referenceCount === 0;
+	return (
+		activeRegistryDeclarations === 1 &&
+		!hasUnverifiedDeclaration &&
+		!hasUnverifiedReference &&
+		lookupReferences === 1 &&
+		metadataReferences === 1 &&
+		exportReferences === 1
+	);
+}
+
+function hasOnlyExpectedMcpRegistryUse(
+	program: Babel.File,
+	registryDeclaration: Babel.VariableDeclarator,
+): boolean {
+	let referenceCount = 0;
+	let hasActiveRegistryDeclaration = false;
+	let hasExpectedFilterReference = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (
+				identifierPath.node.name === "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY" &&
+				identifierPath.parentPath?.isVariableDeclarator() &&
+				identifierPath.parentPath.node.id === identifierPath.node
+			) {
+				hasActiveRegistryDeclaration = true;
+			}
+			if (
+				identifierPath.node.name !== "BUILTIN_SLASH_COMMAND_REGISTRY" ||
+				identifierPath.node === registryDeclaration.id
+			) {
+				return;
+			}
+			referenceCount++;
+			if (isActiveMcpRegistryFilterReference(identifierPath)) hasExpectedFilterReference = true;
+		},
+	});
+	if (!hasActiveRegistryDeclaration) {
+		return (
+			referenceCount === 0 &&
+			hasOnlyExpectedActiveMcpRegistryUse(program) &&
+			hasOnlyExpectedMcpLookupUse(program, false) &&
+			hasOnlyExpectedQuarantinedUtilitySetUse(program, false)
+		);
+	}
+	return (
+		referenceCount === 1 &&
+		hasExpectedFilterReference &&
+		hasOnlyExpectedActiveMcpRegistryUse(program) &&
+		hasOnlyExpectedMcpLookupUse(program, true) &&
+		hasOnlyExpectedQuarantinedUtilitySetUse(program, true)
+	);
+}
+
+export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): string[] {
+	let registry: Babel.ArrayExpression | undefined;
+	let registryDeclaration: Babel.VariableDeclarator | undefined;
+	let source: Babel.File;
+	try {
+		source = parse(builtinRegistry, { sourceType: "module", plugins: ["typescript"] });
+		for (const statement of source.program.body) {
+			if (statement.type !== "VariableDeclaration") continue;
+			for (const declaration of statement.declarations) {
+				if (declaration.id.type !== "Identifier" || declaration.id.name !== "BUILTIN_SLASH_COMMAND_REGISTRY") continue;
+				if (statement.kind !== "const" || declaration.init?.type !== "ArrayExpression") {
+					return ["root slash-command registry could not be isolated"];
+				}
+				registry = declaration.init;
+				registryDeclaration = declaration;
+				break;
+			}
+			if (registry) break;
+		}
+	} catch {
+		return ["root slash-command registry could not be parsed"];
+	}
+	if (!registry || !registryDeclaration) return ["root slash-command registry could not be isolated"];
+	if (!hasOnlyExpectedMcpRegistryUse(source, registryDeclaration)) {
+		return ["root slash-command registry has an unverified additional use or mutation"];
+	}
+
+	const mcpEntries: Babel.ObjectExpression[] = [];
+	for (const element of registry.elements) {
+		if (!element) continue;
+		if (element.type === "SpreadElement") return ["root slash-command registry contains an unverified spread"];
+		if (element.type !== "ObjectExpression") return ["root slash-command registry contains an unverified entry"];
+		if (element.properties.some(property => property.type === "SpreadElement")) {
+			return ["root slash-command registry entry contains an unverified spread"];
+		}
+		const hasUnverifiedPrototype = element.properties.some(
+			property =>
+				property.type === "ObjectProperty" &&
+				!property.computed &&
+				!property.shorthand &&
+				getStaticMcpMemberName(property) === "__proto__",
+		);
+		if (hasUnverifiedPrototype) {
+			return ["root slash-command registry entry contains an unverified prototype"];
+		}
+		if (
+			element.properties.some(
+				property =>
+					property.type !== "SpreadElement" && property.computed && property.key.type !== "StringLiteral",
+			)
+		) {
+			return ["root slash-command registry entry contains an unverified computed property"];
+		}
+
+		const nameProperties = element.properties.filter(
+			(property): property is Babel.ObjectProperty =>
+				property.type === "ObjectProperty" && getStaticMcpMemberName(property) === "name",
+		);
+		if (nameProperties.length !== 1) return ["root slash-command registry contains an unverified command name"];
+		const nameProperty = nameProperties[0];
+		const name = nameProperty ? getStaticMcpString(nameProperty.value) : undefined;
+		if (name === undefined) return ["root slash-command registry contains an unverified command name"];
+
+		const aliases = getStaticMcpAliases(element);
+		if (aliases === undefined) return ["root slash-command registry contains unverified aliases"];
+		if (name === "mcp" || aliases.includes("mcp")) mcpEntries.push(element);
+	}
+
+	if (mcpEntries.length === 0) return [];
+	const findings: string[] = [];
+	if (mcpEntries.length > 1) findings.push("multiple root /mcp builtins are registered");
+	for (const entry of mcpEntries) {
+		if (entry.properties.some(property => getStaticMcpMemberName(property) === "handle")) {
+			findings.push("root /mcp builtin has an unrestricted default handler");
+		}
+
+		const tuiHandlers = entry.properties.filter(
+			(property): property is Babel.ObjectMethod | Babel.ObjectProperty =>
+				getStaticMcpMemberName(property) === "handleTui" && property.type !== "SpreadElement",
+		);
+		if (tuiHandlers.length !== 1) {
+			findings.push("root /mcp builtin must define exactly one TUI-only handler");
+			continue;
+		}
+		if (!hasExactMcpHandlerParameters(tuiHandlers[0]!)) {
+			findings.push("root /mcp TUI handler parameters must be command and runtime identifiers");
+			continue;
+		}
+		const handlerBody = getMcpHandlerBody(tuiHandlers[0]!);
+		if (!handlerBody || !handlerBody.body[0] || !isExactMcpFallback(handlerBody.body[0])) {
+			findings.push("root /mcp TUI handler must fall through without exact MCP controls");
+		}
+	}
+	return findings;
+}
+
+export function findMcpTuiMetadataFindings(slashCommandsSource: string, interactiveModeSource: string): string[] {
+	try {
+		const slashCommands = parse(slashCommandsSource, { sourceType: "module", plugins: ["typescript"] });
+		const interactiveMode = parse(interactiveModeSource, { sourceType: "module", plugins: ["typescript"] });
+		const filterIsSafe = slashCommands.program.body.some(statement => {
+			if (statement.type !== "ExportNamedDeclaration" || statement.declaration?.type !== "FunctionDeclaration") {
+				return false;
+			}
+			const declaration = statement.declaration;
+			const [capabilityBranch, filteredReturn] = declaration.body.body;
+			if (
+				declaration.id?.name !== "getBuiltinSlashCommandsForSession" ||
+				declaration.params.length !== 1 ||
+				declaration.params[0]?.type !== "Identifier" ||
+				declaration.params[0].name !== "hasExactMcpControls" ||
+				declaration.body.body.length !== 2 ||
+				capabilityBranch?.type !== "IfStatement" ||
+				capabilityBranch.test.type !== "Identifier" ||
+				capabilityBranch.test.name !== "hasExactMcpControls" ||
+				capabilityBranch.alternate !== null ||
+				capabilityBranch.consequent.type !== "ReturnStatement" ||
+				capabilityBranch.consequent.argument?.type !== "Identifier" ||
+				capabilityBranch.consequent.argument.name !== "BUILTIN_SLASH_COMMANDS" ||
+				filteredReturn?.type !== "ReturnStatement" ||
+				filteredReturn.argument?.type !== "CallExpression" ||
+				filteredReturn.argument.optional ||
+				filteredReturn.argument.callee.type !== "MemberExpression" ||
+				filteredReturn.argument.callee.computed ||
+				filteredReturn.argument.callee.object.type !== "Identifier" ||
+				filteredReturn.argument.callee.object.name !== "BUILTIN_SLASH_COMMANDS" ||
+				filteredReturn.argument.callee.property.type !== "Identifier" ||
+				filteredReturn.argument.callee.property.name !== "filter"
+			) {
+				return false;
+			}
+			const predicate = filteredReturn.argument.arguments[0];
+			return (
+				filteredReturn.argument.arguments.length === 1 &&
+				predicate?.type === "ArrowFunctionExpression" &&
+				!predicate.async &&
+				!predicate.generator &&
+				predicate.params.length === 1 &&
+				predicate.params[0]?.type === "Identifier" &&
+				predicate.params[0].name === "command" &&
+				predicate.body.type === "BinaryExpression" &&
+				predicate.body.operator === "!==" &&
+				predicate.body.left.type === "MemberExpression" &&
+				!predicate.body.left.computed &&
+				predicate.body.left.object.type === "Identifier" &&
+				predicate.body.left.object.name === "command" &&
+				predicate.body.left.property.type === "Identifier" &&
+				predicate.body.left.property.name === "name" &&
+				predicate.body.right.type === "StringLiteral" &&
+				predicate.body.right.value === "mcp"
+		);
+		});
+		const interactiveClass = interactiveMode.program.body
+			.map(statement => (statement.type === "ExportNamedDeclaration" ? statement.declaration : statement))
+			.find(
+				(declaration): declaration is Babel.ClassDeclaration =>
+					declaration?.type === "ClassDeclaration" && declaration.id?.name === "InteractiveMode",
+			);
+		if (!interactiveClass) throw new Error("InteractiveMode class is missing");
+		const method = (name: string): Babel.ClassMethod | Babel.ClassPrivateMethod | undefined =>
+			interactiveClass.body.body.find((member): member is Babel.ClassMethod | Babel.ClassPrivateMethod => {
+				if (member.type !== "ClassMethod" && member.type !== "ClassPrivateMethod") return false;
+				return name.startsWith("#")
+					? member.key.type === "PrivateName" && member.key.id.name === name.slice(1)
+					: member.key.type === "Identifier" && member.key.name === name;
+			});
+		const refreshHelper = method("#refreshSessionBuiltinSlashCommandVisibility");
+		const thisPrivate = (node: Babel.Node, property: string): boolean =>
+			node.type === "MemberExpression" &&
+			!node.computed &&
+			node.object.type === "ThisExpression" &&
+			node.property.type === "PrivateName" &&
+			node.property.id.name === property;
+		const refreshBody = refreshHelper?.body.body ?? [];
+		const commandNameMember = (node: Babel.Node, parameter: string): boolean =>
+			node.type === "MemberExpression" &&
+			!node.computed &&
+			!node.optional &&
+			node.object.type === "Identifier" &&
+			node.object.name === parameter &&
+			node.property.type === "Identifier" &&
+			node.property.name === "name";
+		const isExpectedBuiltinCommandNamesDeclaration = (statement: Babel.Statement): boolean => {
+			if (
+				statement.type !== "VariableDeclaration" ||
+				statement.kind !== "const" ||
+				statement.declarations.length !== 1
+			) {
+				return false;
+			}
+			const declaration = statement.declarations[0];
+			const initializer = declaration?.init;
+			if (
+				declaration?.id.type !== "Identifier" ||
+				declaration.id.name !== "builtinCommandNames" ||
+				initializer?.type !== "NewExpression" ||
+				initializer.callee.type !== "Identifier" ||
+				initializer.callee.name !== "Set" ||
+				initializer.arguments.length !== 1
+			) {
+				return false;
+			}
+			const names = initializer.arguments[0];
+			if (
+				names?.type !== "CallExpression" ||
+				names.optional ||
+				names.arguments.length !== 1 ||
+				names.callee.type !== "MemberExpression" ||
+				names.callee.computed ||
+				names.callee.optional ||
+				names.callee.object.type !== "Identifier" ||
+				names.callee.object.name !== "BUILTIN_SLASH_COMMANDS" ||
+				names.callee.property.type !== "Identifier" ||
+				names.callee.property.name !== "map"
+			) {
+				return false;
+			}
+			const mapper = names.arguments[0];
+			return (
+				mapper?.type === "ArrowFunctionExpression" &&
+				!mapper.async &&
+				!mapper.generator &&
+				mapper.params.length === 1 &&
+				mapper.params[0]?.type === "Identifier" &&
+				mapper.params[0].name === "command" &&
+				commandNameMember(mapper.body, "command")
+			);
+		};
+		const builtinCommandNamesDeclarationIndices = refreshBody.flatMap((statement, index) =>
+			isExpectedBuiltinCommandNamesDeclaration(statement) ? [index] : [],
+		);
+		const isExpectedBuiltinCommandNamesTail = (element: Babel.Node | null | undefined): boolean => {
+			if (element?.type !== "SpreadElement") return false;
+			const filter = element.argument;
+			if (
+				filter.type !== "CallExpression" ||
+				filter.optional ||
+				filter.arguments.length !== 1 ||
+				filter.callee.type !== "MemberExpression" ||
+				filter.callee.computed ||
+				filter.callee.optional ||
+				!thisPrivate(filter.callee.object, "baseSlashCommands") ||
+				filter.callee.property.type !== "Identifier" ||
+				filter.callee.property.name !== "filter"
+			) {
+				return false;
+			}
+			const predicate = filter.arguments[0];
+			if (
+				predicate?.type !== "ArrowFunctionExpression" ||
+				predicate.async ||
+				predicate.generator ||
+				predicate.params.length !== 1 ||
+				predicate.params[0]?.type !== "Identifier" ||
+				predicate.params[0].name !== "command" ||
+				predicate.body.type !== "UnaryExpression" ||
+				predicate.body.operator !== "!" ||
+				predicate.body.argument.type !== "CallExpression" ||
+				predicate.body.argument.optional ||
+				predicate.body.argument.arguments.length !== 1 ||
+				!isMcpFilterMember(predicate.body.argument.callee, "builtinCommandNames", "has")
+			) {
+				return false;
+			}
+			return commandNameMember(predicate.body.argument.arguments[0]!, "command");
+		};
+		const isExpectedPreviousSlashCommandTail = (statement: Babel.Statement): boolean => {
+			if (
+				statement.type !== "VariableDeclaration" ||
+				statement.kind !== "const" ||
+				statement.declarations.length !== 1
+			) {
+				return false;
+			}
+			const declaration = statement.declarations[0];
+			const initializer = declaration?.init;
+			if (
+				declaration?.id.type !== "Identifier" ||
+				declaration.id.name !== "previousSlashCommandTail" ||
+				initializer?.type !== "CallExpression" ||
+				initializer.optional ||
+				initializer.arguments.length !== 1 ||
+				initializer.callee.type !== "MemberExpression" ||
+				initializer.callee.computed ||
+				initializer.callee.optional ||
+				!thisPrivate(initializer.callee.object, "resolvedSlashCommands") ||
+				initializer.callee.property.type !== "Identifier" ||
+				initializer.callee.property.name !== "slice"
+			) {
+				return false;
+			}
+			const offset = initializer.arguments[0];
+			return (
+				offset?.type === "MemberExpression" &&
+				!offset.computed &&
+				!offset.optional &&
+				thisPrivate(offset.object, "baseSlashCommands") &&
+				offset.property.type === "Identifier" &&
+				offset.property.name === "length"
+			);
+		};
+		const previousSlashCommandTailIndices = refreshBody.flatMap((statement, index) =>
+			isExpectedPreviousSlashCommandTail(statement) ? [index] : [],
+		);
+		const constructor = method("constructor");
+		const refreshCommands = method("refreshSlashCommandState");
+		const constructorBody = constructor?.body.body ?? [];
+		const constructorCapabilityAssignments: Babel.AssignmentExpression[] = [];
+		if (constructor) {
+			traverse(interactiveMode, {
+				AssignmentExpression(assignmentPath) {
+					if (
+						assignmentPath.findParent(parentPath => parentPath.node === constructor) &&
+						thisPrivate(assignmentPath.node.left, "sessionBuiltinMcpVisible")
+					) {
+						constructorCapabilityAssignments.push(assignmentPath.node);
+					}
+				},
+			});
+		}
+		const initSlashCommandsIndex = constructorBody.findIndex(
+			statement =>
+				statement.type === "VariableDeclaration" &&
+				statement.kind === "const" &&
+				statement.declarations.some(
+					declaration =>
+						declaration.id.type === "Identifier" &&
+						declaration.id.name === "sessionBuiltinSlashCommands" &&
+						declaration.init?.type === "CallExpression" &&
+						declaration.init.callee.type === "Identifier" &&
+						declaration.init.callee.name === "getBuiltinSlashCommandsForSession" &&
+						declaration.init.arguments[0]?.type === "MemberExpression" &&
+						thisPrivate(declaration.init.arguments[0], "sessionBuiltinMcpVisible"),
+				),
+		);
+		const initializationAssignmentIndex = constructorBody.findIndex(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				constructorCapabilityAssignments.includes(statement.expression) &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
+				statement.expression.right.type === "MemberExpression" &&
+				!statement.expression.right.computed &&
+				statement.expression.right.object.type === "MemberExpression" &&
+				!statement.expression.right.object.computed &&
+				statement.expression.right.object.object.type === "ThisExpression" &&
+				statement.expression.right.object.property.type === "Identifier" &&
+				statement.expression.right.object.property.name === "session" &&
+				statement.expression.right.property.type === "Identifier" &&
+				statement.expression.right.property.name === "hasExactMcpControls",
+		);
+		const initialization =
+			constructorCapabilityAssignments.length === 1 &&
+			initializationAssignmentIndex >= 0 &&
+			initializationAssignmentIndex < initSlashCommandsIndex;
+		const baseSlashCommandsAssignments = constructorBody.filter(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				thisPrivate(statement.expression.left, "baseSlashCommands"),
+		);
+		const baseSlashCommandsIndex = constructorBody.findIndex(statement => {
+			if (
+				baseSlashCommandsAssignments.length !== 1 ||
+				statement.type !== "ExpressionStatement" ||
+				statement.expression.type !== "AssignmentExpression" ||
+				statement.expression.operator !== "=" ||
+				!thisPrivate(statement.expression.left, "baseSlashCommands") ||
+				statement.expression.right.type !== "ArrayExpression"
+			) {
+				return false;
+			}
+			const elements = statement.expression.right.elements;
+			return (
+				elements.length === 3 &&
+				elements[0]?.type === "SpreadElement" &&
+				elements[0].argument.type === "Identifier" &&
+				elements[0].argument.name === "sessionBuiltinSlashCommands" &&
+				elements[1]?.type === "SpreadElement" &&
+				elements[1].argument.type === "Identifier" &&
+				elements[1].argument.name === "hookCommands" &&
+				elements[2]?.type === "SpreadElement" &&
+				elements[2].argument.type === "Identifier" &&
+				elements[2].argument.name === "customCommands"
+			);
+		});
+		const initSlashCommands = initSlashCommandsIndex >= 0 && initSlashCommandsIndex < baseSlashCommandsIndex;
+		const capabilitySnapshot = refreshBody[0];
+		const capabilitySnapshotIsExact =
+			capabilitySnapshot?.type === "VariableDeclaration" &&
+			capabilitySnapshot.kind === "const" &&
+			capabilitySnapshot.declarations.length === 1 &&
+			capabilitySnapshot.declarations[0]?.id.type === "Identifier" &&
+			capabilitySnapshot.declarations[0].id.name === "hasExactMcpControls" &&
+			capabilitySnapshot.declarations[0].init?.type === "MemberExpression" &&
+			!capabilitySnapshot.declarations[0].init.computed &&
+			capabilitySnapshot.declarations[0].init.object.type === "MemberExpression" &&
+			!capabilitySnapshot.declarations[0].init.object.computed &&
+			capabilitySnapshot.declarations[0].init.object.object.type === "ThisExpression" &&
+			capabilitySnapshot.declarations[0].init.object.property.type === "Identifier" &&
+			capabilitySnapshot.declarations[0].init.object.property.name === "session" &&
+			capabilitySnapshot.declarations[0].init.property.type === "Identifier" &&
+			capabilitySnapshot.declarations[0].init.property.name === "hasExactMcpControls";
+		const capabilityNoopGuard = refreshBody[1];
+		const capabilityNoopReturn =
+			capabilityNoopGuard?.type === "IfStatement" &&
+			capabilityNoopGuard.alternate === null &&
+			capabilityNoopGuard.test.type === "BinaryExpression" &&
+			capabilityNoopGuard.test.operator === "===" &&
+			capabilityNoopGuard.test.left.type === "Identifier" &&
+			capabilityNoopGuard.test.left.name === "hasExactMcpControls" &&
+			thisPrivate(capabilityNoopGuard.test.right, "sessionBuiltinMcpVisible") &&
+			capabilityNoopGuard.consequent.type === "ReturnStatement" &&
+			capabilityNoopGuard.consequent.argument === null
+				? capabilityNoopGuard.consequent
+				: undefined;
+		const refreshCapabilityFlagIndex = refreshBody.findIndex(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
+				statement.expression.right.type === "Identifier" &&
+				statement.expression.right.name === "hasExactMcpControls",
+		);
+		const rebuildSlashCommandsIndex = refreshBody.findIndex(
+			statement => {
+				if (
+					statement.type !== "ExpressionStatement" ||
+					statement.expression.type !== "AssignmentExpression" ||
+					statement.expression.operator !== "=" ||
+					!thisPrivate(statement.expression.left, "baseSlashCommands") ||
+					statement.expression.right.type !== "ArrayExpression"
+				) {
+					return false;
+				}
+				const elements = statement.expression.right.elements;
+				const sessionBuiltins = elements[0];
+				return (
+					elements.length === 2 &&
+					builtinCommandNamesDeclarationIndices.length === 1 &&
+					builtinCommandNamesDeclarationIndices[0]! < refreshBody.indexOf(statement) &&
+					previousSlashCommandTailIndices.length === 1 &&
+					previousSlashCommandTailIndices[0]! < refreshBody.indexOf(statement) &&
+					sessionBuiltins?.type === "SpreadElement" &&
+					sessionBuiltins.argument.type === "CallExpression" &&
+					sessionBuiltins.argument.callee.type === "Identifier" &&
+					sessionBuiltins.argument.callee.name === "getBuiltinSlashCommandsForSession" &&
+					sessionBuiltins.argument.arguments.length === 1 &&
+					sessionBuiltins.argument.arguments[0]?.type === "Identifier" &&
+					sessionBuiltins.argument.arguments[0].name === "hasExactMcpControls" &&
+					isExpectedBuiltinCommandNamesTail(elements[1])
+				);
+			},
+		);
+		const rebuildResolvedSlashCommandsIndex = refreshBody.findIndex(
+			statement => {
+				if (
+					statement.type !== "ExpressionStatement" ||
+					statement.expression.type !== "AssignmentExpression" ||
+					statement.expression.operator !== "=" ||
+					!thisPrivate(statement.expression.left, "resolvedSlashCommands") ||
+					statement.expression.right.type !== "ArrayExpression"
+				) {
+					return false;
+				}
+				const elements = statement.expression.right.elements;
+				const baseCommands = elements[0];
+				const preservedTail = elements[1];
+				return (
+					elements.length === 2 &&
+					previousSlashCommandTailIndices.length === 1 &&
+					previousSlashCommandTailIndices[0]! < refreshBody.indexOf(statement) &&
+					baseCommands?.type === "SpreadElement" &&
+					thisPrivate(baseCommands.argument, "baseSlashCommands") &&
+					preservedTail?.type === "SpreadElement" &&
+					preservedTail.argument.type === "Identifier" &&
+					preservedTail.argument.name === "previousSlashCommandTail"
+				);
+			},
+		);
+		const updateAutocompleteIndex = refreshBody.findIndex(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "CallExpression" &&
+				statement.expression.callee.type === "MemberExpression" &&
+				statement.expression.callee.property.type === "Identifier" &&
+				statement.expression.callee.property.name === "setAutocompleteProvider" &&
+				statement.expression.arguments.length === 1 &&
+				statement.expression.arguments[0]?.type === "CallExpression" &&
+				statement.expression.arguments[0].callee.type === "MemberExpression" &&
+				statement.expression.arguments[0].callee.property.type === "Identifier" &&
+				statement.expression.arguments[0].callee.property.name === "createAutocompleteProvider" &&
+				statement.expression.arguments[0].arguments[0]?.type === "MemberExpression" &&
+				thisPrivate(statement.expression.arguments[0].arguments[0], "resolvedSlashCommands"),
+		);
+		let hasUnexpectedRefreshExit = false;
+		if (refreshHelper) {
+			traverse(interactiveMode, {
+				ReturnStatement(returnPath) {
+					if (
+						returnPath.getFunctionParent()?.node === refreshHelper &&
+						returnPath.node !== capabilityNoopReturn
+					) {
+						hasUnexpectedRefreshExit = true;
+					}
+				},
+				ThrowStatement(throwPath) {
+					if (throwPath.getFunctionParent()?.node === refreshHelper) hasUnexpectedRefreshExit = true;
+				},
+			});
+		}
+		const refreshActionsAreReachable =
+			refreshBody.length === 8 &&
+			capabilitySnapshotIsExact &&
+			capabilityNoopReturn !== undefined &&
+			!hasUnexpectedRefreshExit &&
+			previousSlashCommandTailIndices.length === 1 &&
+			previousSlashCommandTailIndices[0] === 2 &&
+			builtinCommandNamesDeclarationIndices.length === 1 &&
+			builtinCommandNamesDeclarationIndices[0] === 3 &&
+			rebuildSlashCommandsIndex === 4 &&
+			refreshCapabilityFlagIndex === 5 &&
+			rebuildResolvedSlashCommandsIndex === 6 &&
+			updateAutocompleteIndex === 7;
+		const refreshBodyStatements = refreshCommands?.body.body ?? [];
+		const loadIndex = refreshBodyStatements.findIndex(
+			statement =>
+				statement.type === "VariableDeclaration" &&
+				statement.declarations.some(
+					declaration =>
+						declaration.id.type === "Identifier" &&
+						declaration.id.name === "fileCommands" &&
+						declaration.init?.type === "AwaitExpression" &&
+						declaration.init.argument.type === "CallExpression" &&
+						declaration.init.argument.callee.type === "Identifier" &&
+						declaration.init.argument.callee.name === "loadSlashCommands",
+				),
+		);
+		const refreshIndices = refreshBodyStatements.flatMap((statement, index) =>
+			statement.type === "ExpressionStatement" &&
+			statement.expression.type === "CallExpression" &&
+			thisPrivate(statement.expression.callee, "refreshSessionBuiltinSlashCommandVisibility")
+				? [index]
+				: [],
+		);
+		return filterIsSafe &&
+			initialization &&
+			initSlashCommands &&
+			baseSlashCommandsIndex > initSlashCommandsIndex &&
+			refreshActionsAreReachable &&
+			loadIndex >= 0 &&
+			refreshIndices.length >= 2 &&
+			refreshIndices[0]! < loadIndex &&
+			refreshIndices.at(-1)! > loadIndex
+			? []
+			: ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];
+	} catch {
+		return ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];
+	}
+}
+
 async function verifyMcpQuarantine(): Promise<GateResult> {
 	const codingPackage = await readJson("packages/coding-agent/package.json");
 	const exportsRecord = isRecord(codingPackage.exports) ? codingPackage.exports : {};
@@ -398,9 +1580,14 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 	const missingPrivateBlocks = REQUIRED_PRIVATE_EXPORT_BLOCKS.filter(key => exportsRecord[key] !== null);
 	const builtinRegistry = await readText("packages/coding-agent/src/slash-commands/builtin-registry.ts");
 	const acpBuiltins = await readText("packages/coding-agent/src/slash-commands/acp-builtins.ts");
-	// Only a root-level slash-command entry is public. Nested subcommands such as
-	// `/aside mcp` are intentionally allowed and must not trip the quarantine gate.
+	const slashCommands = await readText("packages/coding-agent/src/extensibility/slash-commands.ts");
+	const interactiveMode = await readText("packages/coding-agent/src/modes/interactive-mode.ts");
+	// The root /mcp TUI entry is a supported control surface only for sessions
+	// holding the exact MCP capability. Nested subcommands such as `/aside mcp`
+	// and this guarded TUI command must not become default or ACP MCP access.
 	const exposesMcpBuiltin = /^\t\tname:\s*["']mcp["']/m.test(builtinRegistry);
+	const mcpBuiltinQuarantineFindings = findMcpBuiltinQuarantineFindings(builtinRegistry);
+	const mcpTuiMetadataFindings = findMcpTuiMetadataFindings(slashCommands, interactiveMode);
 	const importsMcpBuiltinHandler = builtinRegistry.includes("handleMcpAcp");
 	const acpReferencesMcpHandler = acpBuiltins.includes("handleMcpAcp");
 	const acpAdvertisesMcpCommand = /name:\s*["']mcp["']/.test(acpBuiltins);
@@ -430,7 +1617,10 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 		`exposed private package keys: ${exposedMcpKeys.join(", ") || "<none>"}`,
 		`blocked private package keys: ${blockedMcpKeys.join(", ") || "<none>"}`,
 		`missing private export blocks: ${missingPrivateBlocks.join(", ") || "<none>"}`,
-		`default /mcp builtin registered: ${exposesMcpBuiltin}`,
+		`root /mcp literal-name builtin registered: ${exposesMcpBuiltin}`,
+		`root /mcp builtin restricted to exact-config TUI: ${exposesMcpBuiltin && mcpBuiltinQuarantineFindings.length === 0}`,
+		`root /mcp builtin quarantine findings: ${mcpBuiltinQuarantineFindings.join(", ") || "<none>"}`,
+		`ordinary TUI /mcp metadata findings: ${mcpTuiMetadataFindings.join(", ") || "<none>"}`,
 		`default /mcp handler imported: ${importsMcpBuiltinHandler}`,
 		`ACP /mcp command advertised: ${acpAdvertisesMcpCommand}`,
 		`ACP MCP handler referenced: ${acpReferencesMcpHandler}`,
@@ -445,7 +1635,7 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 	];
 
 	return {
-		name: "MCP quarantine/no default discoverable MCP",
+		name: "MCP quarantine/no unrestricted default MCP access",
 		passed:
 			exposedMcpKeys.length === 0 &&
 			missingPrivateBlocks.length === 0 &&
@@ -454,7 +1644,8 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 			publicDocFindings.length === 0 &&
 			exaMcpDocFindings.length === 0 &&
 			removedPublicDocsStillPresent.length === 0 &&
-			!exposesMcpBuiltin &&
+			mcpBuiltinQuarantineFindings.length === 0 &&
+			mcpTuiMetadataFindings.length === 0 &&
 			!importsMcpBuiltinHandler &&
 			!acpAdvertisesMcpCommand &&
 			!acpReferencesMcpHandler &&

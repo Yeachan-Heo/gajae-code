@@ -6,6 +6,7 @@ This document describes how the coding-agent currently loads models, applies ove
 
 Primary implementation files:
 
+- `src/config/config-hot-reload.ts`: interactive configuration watching, snapshot validation, and lifecycle cleanup
 - `src/config/model-registry.ts` — loads embedded + signed-registry + custom models, provider overrides, runtime discovery, auth integration
 - `src/config/model-resolver.ts` — parses model patterns and selects models for the default and agent roles
 - `src/config/settings-schema.ts` — model-related settings (`modelRoles`, provider transport preferences)
@@ -22,6 +23,36 @@ Legacy behavior still present:
 
 - If `models.yml` is missing and `models.json` exists at the same location, it is migrated to `models.yml`.
 - Explicit `.json` / `.jsonc` config paths are still supported when passed programmatically to `ModelRegistry`.
+
+## Editing configuration in an open session
+
+On Linux, foreground interactive sessions watch the resolved user `config.yml` and
+`models.yml` paths. Saving either file schedules a validated reload; no restart,
+provider discovery request, or explicit preset reselection is required. Atomic
+editor saves are supported.
+
+Automatic reload requires verified private directory ownership and permissions.
+macOS and Windows do not yet have equivalent permission verification, so automatic
+reload is disabled on those platforms. Restart the session after editing either file.
+
+Changes apply between requests, not during a streamed response. The active
+preset's new mappings apply to subsequent requests and delegated work; explicit
+session model or role overrides remain authoritative. Editing `modelProfile.default`
+affects the next startup, not the current active preset. The status line and open model selector
+refresh after the runtime accepts the change.
+
+Invalid YAML, invalid settings, or removal of an active preset or required model
+rejects the change with a visible diagnostic. The accepted runtime configuration
+remains in use until the file is repaired. Deleting an already accepted config
+file is also rejected rather than silently resetting the running session.
+Reloading does not rewrite configuration files or persist session overrides.
+
+This is configuration reload, not process or extension reload. Startup-only
+services such as MCP processes, extension code, and notification daemons still
+require a restart. Project configuration precedence is preserved, but project
+file watching and automatic reload in ACP, SDK, print, and background hosts are
+not enabled by this feature. A session without an active preset does not acquire
+one merely because a custom preset exists on disk.
 
 ## `models.yml` shape
 
@@ -162,7 +193,7 @@ providers:
 | `deepinfra` | `service_tier: "priority"` | Sent only for the first-class `deepinfra` provider ID and only with the `priority` tier. |
 | `opencodex` | `service_tier: "priority"` | First-class OpenCodex discovery opts in automatically; OpenCodex Fast Mode must remain `Auto` for client passthrough. When OpenCodex uses ChatGPT authentication, a final `service_tier: "default"` is not downgrade evidence. |
 
-Custom OpenAI-compatible providers remain fail-closed unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Use that opt-in only when the proxy preserves or intentionally realizes OpenAI's `service_tier` contract:
+Custom OpenAI-compatible providers remain fail-closed for `priority`, `flex`, and `scale` unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Ultrafast is separate: only models that explicitly set `compat.supportsUltrafastTier: true` send that tier, and this flag does not enable the other service tiers.
 
 ```yaml
 providers:
@@ -198,6 +229,7 @@ gjc setup provider --preset glm
 gjc setup provider --preset alibaba-token-plan
 gjc setup provider --preset cline-pass
 gjc setup provider --preset commandcode-goat
+gjc setup provider --preset ionet
 ```
 
 The same presets are available inside the TUI:
@@ -209,9 +241,10 @@ The same presets are available inside the TUI:
 /provider add --preset alibaba-token-plan
 /provider add --preset cline-pass
 /provider add --preset commandcode-goat
+/provider add --preset ionet
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, or `CMD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, `CMD_API_KEY`, or `IONET_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. The IO Intelligence preset (aliases: `io-net`, `io-intelligence`) writes an OpenAI-compatible custom provider named `ionet` for [IO Intelligence](https://io.net) by io.net; model ids are `org/name` pairs discovered live from the endpoint's `/models` route, so no models are hardcoded. Create the corresponding API key in the provider dashboard before inference.
 
 ## Signed remote preset registry
 
@@ -286,14 +319,14 @@ Cancellation discards provisional output and emits exactly one cancelled `agent_
 
 Built-in profiles are grouped by provider mix and tier:
 
-- `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex Luna-only profile with maximum reasoning on delegated roles
+- `codex-{eco,medium,pro}` — tiers tuned by model and reasoning effort: Eco is GPT-6 Luna only, Medium and Pro are GPT-6.1 Sol only; `lunamaxxing` — OpenAI Codex GPT-6 Luna-only profile with maximum reasoning on delegated roles
 - `astra-{lite,default,heavy}` — additive OpenAI Codex profiles led by `openai-codex/gpt-6-astra`, displayed as `ASTRA-Lite`, `ASTRA-Default`, and `ASTRA-Heavy` in the CODEX group
 - `opencodego` — single OpenCode Go preset (Kimi K3 default and planner, DeepSeek executor/architect, MiMo critic)
 - `commandcode-goat` — Command Code GOAT preset (GLM-5.3 default, DeepSeek V4 Flash executor, Kimi K3 planner, GLM-5.2 critic, and DeepSeek V4 Pro architect)
-- Provider-agnostic open-model profiles are named by the model families they require. Single-family choices are `open-weights-{glm,deepseek,kimi,luna}`; two-family choices are `open-weights-glm-deepseek`, `open-weights-kimi-deepseek`, and `open-weights-kimi-glm`; `open-weights-kimi-glm-deepseek` uses all three open-weight families; `open-weights-all` adds GPT-5.6 Luna. Choose the smallest combination covered by the models available through your configured providers. Every selector is a bare final-segment alias with `required_providers: []`, so each family may come from any authenticated bundled or custom provider under Provider Priority. GPT-5.6 Luna is proprietary despite its inclusion in this group.
+- Provider-agnostic open-model profiles are named by the model families they require. Single-family choices are `open-weights-{glm,deepseek,kimi,luna}`; two-family choices are `open-weights-glm-deepseek`, `open-weights-kimi-deepseek`, and `open-weights-kimi-glm`; `open-weights-kimi-glm-deepseek` uses all three open-weight families; `open-weights-all` retains GPT-5.6 Luna for provider-agnostic resolution. Choose the smallest combination covered by the models available through your configured providers. Every selector is a bare final-segment alias with `required_providers: []`, so each family may come from any authenticated bundled or custom provider under Provider Priority. GPT-5.6 Luna is proprietary despite its inclusion in this group.
 - `macos-omlx-{fast,balanced,quality}` — oMLX presets for local Apple Silicon inference, tuned by measured same-machine throughput. `fast` pins the 4-bit and `balanced` the 8-bit quant of Qwen 3.6 35B A3B; `quality` keeps the 8-bit MoE for the default, executor, planner, and architect roles and routes the critic to the official dense `Qwen3.8-27B-8bit` checkpoint; `macos-omlx-abliterated-{fast,balanced}` both pin `Qwen3.8-27B-Uncensored-MLX-4bit`, the faster of the measured uncensored quants. Every preset uses one role-effort ladder — critic and architect `high`, planner `medium`, executor and default `low` — and `fast`, `balanced`, and the abliterated presets serve a single model, so sub-agents never trigger an oMLX model unload/reload; `quality` swaps models only for the critic role. Selectors use the ids the local server returns from `/v1/models`; activate after starting oMLX on its default loopback endpoint (see [Implicit oMLX discovery](#implicit-omlx-discovery)) — the provider is keyless, so no `/login` is needed.
-- `claude-opus` — Anthropic OAuth preset that prefers `claude-opus-5` and deterministically falls back to `claude-opus-4-6` when Opus 5 is absent from the active catalog
-- `claude-fable` — Anthropic OAuth preset on `claude-fable-5-1` (default/architect `xhigh`, critic `high`, planner `low`) with `claude-sonnet-5` on the executor role. Fable 5.1 is served only by Anthropic's first-party API; it requires a Claude Code compatibility version of at least `2.1.251` and answers older fingerprints with an HTTP 400 `claude_code_version_too_old`.
+- `claude-opus` — Anthropic OAuth preset that prefers `claude-opus-5-5` at medium default/planner effort and high critic/architect effort, with deterministic fallback to `claude-opus-4-6`
+- `claude-fable` — Anthropic OAuth preset on `claude-fable-5-1` (default/architect `xhigh`, critic `high`, planner `low`) with `claude-sonnet-5-5` on the executor role. Fable 5.1 is served only by Anthropic's first-party API; it requires a Claude Code compatibility version of at least `2.1.251` and answers older fingerprints with an HTTP 400 `claude_code_version_too_old`.
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `grok-45-{eco,medium,pro}`, `grok-46-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`. The versioned Grok profiles use the existing xAI OAuth/subscription provider: `/login xai` authenticates both versions. Direct `/model` assignment requires an explicit effort for `xai/grok-4.5` (`low`, `medium`, or `high`) and `xai/grok-4.6` (`low`, `medium`, `high`, or `xhigh`) instead of leaving the role at `(inherit)`.
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
 - Combos: `opus-codex`, `codex-opencodego`, `fable-opus-codex`, `astra-fable`, and `astra-fable-opus`
@@ -302,9 +335,10 @@ GLM-5.3 always enables thinking and accepts only `low`, `high`, and `max`; `max`
 
 Gemini 3.7 Flash is bundled wherever Gemini 3.6 Flash already was (`google/gemini-3.7-flash`, `google-gemini-cli/gemini-3.7-flash`, Copilot, Antigravity effort variants, OpenCode Zen, OpenRouter, Vercel AI Gateway, Cursor, and the other 3.6 Flash gateways). First-class Google transports use `google-level` thinking and accept only `low`, `medium`, and `high`; `minimal` is rejected because the official Gemini API returns an error. Provider defaults stay on the existing Pro-class models.
 
-The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Terra low/Luna low/Luna high/Terra xhigh/Terra high to default/executor/planner/critic/architect; Medium assigns Sol low/Terra low/Terra high/Sol xhigh/Sol high; Pro assigns Sol medium/Terra medium/Sol high/Sol max/Sol xhigh; and LunaMaxxing assigns Luna medium/Luna xhigh/Luna max/Luna max/Luna max. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5:medium` for planner. The descriptive repeated local exact-edit evidence informs only selected executor-style TypeScript tasks; it does not evaluate or prove default, planner, architect, or critic performance. See [GPT-5.6 Codex preset benchmark](./gpt-5.6-codex-preset-benchmark.md). The Alibaba Pro role evidence and its limits are recorded separately in [Alibaba Token Plan Pro profile benchmark](./alibaba-token-plan-pro-profile-benchmark.md). Cursor Eco uses Composer 2.5 for every role; Medium keeps standard Composer for default/planning and spends the Fast premium on execution, criticism, and architecture; Pro uses Composer 2.5 Fast throughout. Composer does not expose a strength value through the current Cursor RPC, so these profiles use exact model IDs without inert generic effort suffixes. See [Cursor Composer profile tiers](./cursor-composer-profile-tiers.md). Effort suffixes are clamped to each model's supported thinking range at preview and activation time. Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-2.5`, `minimax-code/MiniMax-M3`). User-defined profiles override built-ins by exact profile name.
 
-GPT-6 Astra supports `low`, `medium`, `high`, `xhigh`, and `max`; the ASTRA profiles use only those catalog-backed levels. In default/executor/architect/planner/critic order, `astra-lite` assigns Astra medium/Luna xhigh/Terra xhigh/Astra xhigh/Sol high; `astra-default` assigns Astra medium/Luna max/Terra xhigh/Astra xhigh/Sol xhigh; and `astra-heavy` assigns Astra medium/Sol max/Astra max/Sol max/Astra max. `astra-fable` keeps the ASTRA-Default default, executor, and planner bindings while routing architect and critic to `anthropic/claude-fable-5-1:xhigh`; `astra-fable-opus` additionally routes planner to `anthropic/claude-opus-5:medium`. Both combinations require `openai-codex` and `anthropic` availability, either directly or through the configured preset proxy. The existing Codex presets and the `openai-codex` recommendation remain unchanged.
+The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Luna low/Luna low/Luna high/Luna xhigh/Luna high to default/executor/planner/critic/architect, which is Medium with Sol lowered to Luna at the same effort; Medium assigns Sol low/Sol low/Sol high/Sol xhigh/Sol high; Pro assigns Sol medium/Sol medium/Sol high/Sol max/Sol xhigh; Sol is `openai-codex/gpt-6.1-sol` and Luna is `openai-codex/gpt-6-luna`; and LunaMaxxing assigns Luna medium/Luna xhigh/Luna max/Luna max/Luna max. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5-5:medium` for planner.
+
+GPT-6 Astra supports `low`, `medium`, `high`, `xhigh`, and `max`; the ASTRA profiles use only those catalog-backed levels. In default/executor/architect/planner/critic order, `astra-lite` assigns Astra medium/Luna xhigh/Sol xhigh/Astra xhigh/Sol high; `astra-default` assigns Astra medium/Luna max/Sol xhigh/Astra xhigh/Sol xhigh; and `astra-heavy` assigns Astra medium/Sol max/Astra max/Sol max/Astra max. `astra-fable` keeps the ASTRA-Default default, executor, and planner bindings while routing architect and critic to `anthropic/claude-fable-5-1:xhigh`; `astra-fable-opus` additionally routes planner to `anthropic/claude-opus-5-5:medium`.
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
 
@@ -414,7 +448,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 ## OpenAI-compatible proxy configuration
 
 OpenAI-compatible proxy providers should use schema-supported provider keys first:
-The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
+The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. For a fully custom id, `gjc setup provider --compat openai --provider <id> --base-url <url> --api-key-env <ENV> --discover [--model <id>]` (or `/provider add` with `--discover`) persists the same live discovery without requiring manual model ids. The Add-custom-provider wizard automatically probes after OpenAI-compatible URL and credentials are supplied, offers the discovered catalog, and retains retry and manual entry when discovery fails or returns no models. Anthropic-compatible setup keeps manual entry. Leaving discovery cancels its preview; cancellation before the atomic configuration commit prevents saving the provider, and credential-restoration failures are reported without secret material. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
 
 ```yaml
 providers:
@@ -442,6 +476,20 @@ providers:
 ```
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
+
+For long reasoning gaps on an OpenAI-compatible endpoint, configure `streamIdleTimeoutMs` in milliseconds at the provider level, on an individual model, or in that model's `modelOverrides` entry. A model-level value overrides the provider value; `0` disables the inter-event watchdog. A request's explicit `streamIdleTimeoutMs` wins first, followed by the environment override, the models.yml value, then the built-in provider/model floor and 120-second default. Values must not exceed 2,147,483,647 ms, and model-configured values are not supported with `transport: pi-native`; configure the upstream model in the auth-gateway instead. This setting applies to `openai-completions` and `openai-responses` models.
+
+```yaml
+providers:
+  reasoning-proxy:
+    baseUrl: https://api.proxy.example/v1
+    apiKeyEnv: PROXY_API_KEY
+    api: openai-responses
+    streamIdleTimeoutMs: 300000
+    models:
+      - id: claude-opus-5-5
+        streamIdleTimeoutMs: 450000
+```
 
 For an unknown custom endpoint, `reasoning: true` declares model capability but does not prove the proxy accepts a control parameter. A familiar provider id or model-family name is not transport evidence: configurable LiteLLM/vLLM/local endpoints still fail closed. Add `thinking` and `compat.supportsReasoningEffort: true` only when the endpoint documents OpenAI-style `reasoning_effort`; set `compat.thinkingFormat` as well when it uses a different documented request shape. Otherwise GJC keeps reasoning-level controls unavailable and omits the parameter.
 
@@ -538,6 +586,7 @@ Must define at least one of:
 - `headers`
 - `compat`
 - `requestTransform`
+- `streamIdleTimeoutMs`
 - `disableStrictTools`
 - `modelOverrides`
 - `discovery`
@@ -741,6 +790,8 @@ Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entrie
 ### Explicit provider discovery
 
 You can configure discovery yourself:
+
+For `openai-models-list`, `apiByModelPrefix` routes are matched against model IDs without case sensitivity; the longest matching prefix wins.
 
 ```yaml
 providers:
@@ -973,7 +1024,7 @@ The built-in model generator also assigns this automatically for `*-spark` model
 
 ## Compatibility and routing fields
 
-The `compat` block on a provider or model overrides the URL-based auto-detection in `packages/ai/src/providers/openai-completions-compat.ts`. It is validated by `OpenAICompatSchema` in `packages/coding-agent/src/config/model-registry.ts` and consumed by every `openai-completions` transport (`packages/ai/src/providers/openai-completions.ts`). The canonical type is `OpenAICompat` in `packages/ai/src/types.ts`.
+The `compat` block on a provider or model overrides the URL-based auto-detection in `packages/ai/src/providers/openai-completions-compat.ts`. It is validated by `ModelCompatSchema` (exported as `OpenAICompatSchema`) in `packages/coding-agent/src/config/models-config-schema.ts` and consumed by every `openai-completions` transport (`packages/ai/src/providers/openai-completions.ts`). The canonical type is `OpenAICompat` in `packages/ai/src/types.ts`.
 
 `models.yml` accepts the following keys (all optional; unset falls back to URL detection):
 
@@ -981,13 +1032,19 @@ Request shaping:
 
 - `supportsStore` — emit `store: false` on requests. Default: auto (off for non-standard endpoints).
 - `supportsDeveloperRole` — use the `developer` system role for reasoning models instead of `system`. Default: auto.
+- `supportsMultipleSystemMessages` — send system-prompt content as multiple separate blocks instead of merging it into one. Default: `true` for canonical Anthropic endpoints and `false` for unknown or strict-template hosts. Setting it to `true` preserves separate blocks, which is preferred for KV-cache reuse when the trailing prompt changes between calls.
 - `sendSessionHeaders` — forward the agent session id as `session_id` and `x-session-id` request headers so OpenAI-compatible relays/proxies can do session-affinity routing and reuse a server-side prompt cache. Default: `false`. Caller-set `headers`/`requestTransform` values are never overwritten.
-- `supportsResponsesSessionAffinity` — for `openai-responses`, opt in to forwarding `session_id` and `x-client-request-id` affinity headers to a custom OpenAI-compatible relay. Canonical OpenAI routing remains automatic; known non-OpenAI provider IDs are rejected. Default: `false`.
+- `supportsResponsesSessionAffinity` — for `openai-responses`, opt in to forwarding `session_id` and `x-client-request-id` affinity headers to a custom OpenAI-compatible relay. Canonical OpenAI routing remains automatic; known non-OpenAI provider IDs are rejected. Relays whose base URL has a loopback hostname opt in automatically, because the ChatGPT codex backend only reuses a warmed prompt prefix for requests that carry a session identity — set `false` to opt a loopback relay back out. Default: `false` for remote relays.
+- `supportsServiceTier` — opt a custom OpenAI-compatible endpoint into `priority`, `flex`, and `scale` request fields. This does not imply ultrafast support.
+- `supportsUltrafastTier` — opt a specific model into `service_tier: "ultrafast"` when the endpoint documents that capability. This is independent of `supportsServiceTier`; models without this flag fail closed.
 - `supportsUsageInStreaming` — send `stream_options: { include_usage: true }` to receive token usage on streaming responses. Default: `true`.
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
+- `toolChoiceSupport` — the highest `tool_choice` level the endpoint accepts: `"none"` (no `tool_choice` parameter), `"auto"`, `"required"` (any tool), or `"named"` (a specific function). Default: auto-detected. This is the modern enum form of `supportsToolChoice` / `supportsForcedToolChoice`; a model with no explicit value is normalized to `"auto"`.
+- `supportsForcedToolChoice` — legacy flag for whether `tool_choice` may force a call (`any` / a named tool). Default: `true`, except known incompatible Anthropic models. Prefer `toolChoiceSupport` on new entries.
+- `disableReasoningOnToolChoice` — disable reasoning whenever the request carries `tool_choice` at all (not only a forced call). Default: auto-detected (DeepSeek reasoning models), which covers endpoints that accept `tools` and `tool_choice` but reject `tool_choice` while thinking is enabled.
 - `disableReasoningOnForcedToolChoice` — drop `reasoning_effort` / OpenRouter `reasoning` whenever `tool_choice` forces a call. Default: auto (Kimi/Anthropic-fronted endpoints).
-- `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.).
+- `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.). A `tool_choice` here acts as an endpoint default rather than an override: it applies only on a turn that offers tools and resolved no directive of its own, so forced-tool directives are preserved and deliberate no-tools turns are left untouched.
 
 Reasoning / thinking:
 
@@ -997,6 +1054,7 @@ Reasoning / thinking:
 - `reasoningContentField` — assistant field carrying chain-of-thought: `"reasoning_content"`, `"reasoning"`, or `"reasoning_text"`. Default: auto.
 - `requiresReasoningContentForToolCalls` — assistant tool-call turns must round-trip the reasoning field (DeepSeek-R1, Kimi, OpenRouter when reasoning is on). Default: `false`.
 - `requiresAssistantContentForToolCalls` — assistant tool-call turns must include non-empty text content (Kimi). Default: `false`.
+- `allowsSyntheticReasoningContentForToolCalls` — accept a synthetic placeholder (e.g. `"."`) when an assistant tool-call turn is missing `reasoning_content`. Default: `true`. Set `false` for providers that validate the exact reasoning value (DeepSeek).
 
 Tool / message normalization:
 
@@ -1013,6 +1071,12 @@ Gateway routing (only applied when `baseUrl` matches the gateway):
 - `vercelGatewayRouting.only` / `vercelGatewayRouting.order` — provider routing on `ai-gateway.vercel.sh` (see <https://vercel.com/docs/ai-gateway/models-and-providers/provider-options>).
 
 Provider-level `compat` is the baseline; per-model `compat` is deep-merged on top, with `openRouterRouting`, `vercelGatewayRouting`, and `extraBody` merged as nested objects.
+Provider-level keys outside `compat` (all optional):
+
+- `authHeader` — treat the resolved `apiKey` as a raw `Authorization` header value instead of a bearer token. Default: `false`.
+- `webSearch` — provider-level web-search routing for the provider's models: `"on"`, `"off"`, or `"auto"` (let the `web_search` tool decide per request).
+- `transport` — streaming transport override. The only accepted value is `"pi-native"`, which dispatches every model under the provider through the auth-gateway's `POST /v1/pi/stream` endpoint instead of the per-provider SDK. The provider's `baseUrl` must point at a compatible `gjc auth-gateway`, and `apiKey` must carry the gateway bearer.
+- `openaiCompat` — local OpenAI-compatible endpoint descriptor (`baseUrl` required, plus optional `apiKey` / `apiKeyEnv`) used by the local-provider smoke check.
 
 ### Anthropic compatibility (`anthropic-messages`)
 
@@ -1024,7 +1088,7 @@ Prompt-cache modes:
 - `explicit` — emit block-level breakpoints instead. Use this for endpoints that reject top-level `cache_control` but support Anthropic's explicit content-block markers.
 - `none` — emit no generated Anthropic cache controls. Per-request or configured `cacheRetention: none` also disables generated caching.
 
-Without an explicit mode, canonical Anthropic endpoints default to `automatic`, Claude-family model ids on non-canonical compatible endpoints default to `explicit`, and unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`. Set `promptCacheMode: automatic` only when a gateway is known to pass through Anthropic's top-level cache control without adding conflicting block markers.
+Without an explicit mode, canonical Anthropic endpoints default to `automatic`, Claude-family model ids on non-canonical compatible endpoints default to `explicit`, and unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`. When `long` retention is requested (the default) against a compatible endpoint that leaves `supportsLongCacheRetention` unset, GJC omits `ttl` and logs a warning once per provider session naming the provider and model; set the flag to `true` for gateways that forward `ttl: "1h"` (idle gaps of 5-60 minutes then keep hitting the cache instead of rewriting the whole prefix), or to `false` to acknowledge the ~5m lifetime and silence the warning. Set `promptCacheMode: automatic` only when a gateway is known to pass through Anthropic's top-level cache control without adding conflicting block markers.
 
 If a gateway attaches enough cache markers of its own that ours push the request past Anthropic's four-breakpoint limit, Anthropic rejects it with `A maximum of 4 blocks with cache_control may be provided.` Those extra markers are not visible in the request GJC builds, so the limit is handled at runtime rather than predicted. Because the rejection means "too many" rather than "none allowed", recovery reduces the generated breakpoints one step at a time: `explicit` mode normally emits two markers (a conversation-prefix anchor and a current-turn refresh point), so the first retry keeps only the prefix anchor, and generated caching is disabled entirely only if that is rejected too. The reduced setting persists for the rest of the provider session, so an endpoint with one free slot keeps caching its conversation prefix instead of losing caching altogether. Set `promptCacheMode: none` on a gateway that never has a free slot to skip the wasted attempts.
 

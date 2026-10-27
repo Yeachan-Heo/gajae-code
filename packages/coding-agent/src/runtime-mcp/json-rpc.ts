@@ -6,6 +6,7 @@
  */
 import { logger } from "@gajae-code/utils";
 import { cancelMCPStream, MCP_HTTP_TIMEOUT_MS, MCP_MAX_CONTENT_BYTES, readMCPResponseText } from "./content-limits";
+import { fetchMcpRespectingOrigin } from "./mcp-redirect";
 import { redactMCPDiagnosticValue, redactMCPEndpoint } from "./redaction";
 
 /** Parse SSE response format (lines starting with "data: ") */
@@ -70,7 +71,7 @@ export async function callMCP<T = unknown>(
 
 	const signal = AbortSignal.timeout(MCP_HTTP_TIMEOUT_MS);
 	const response = await translateMCPTimeout(
-		fetch(url, {
+		fetchMcpRespectingOrigin(url, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
 			body: JSON.stringify(body),

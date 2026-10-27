@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as z from "zod/v4";
+import { getBundledModel } from "../src/models";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
-import type { Model } from "../src/types";
+import type { AssistantMessage, Context, Model, Tool } from "../src/types";
 import {
 	clearToolChoiceIncapabilityRegistryForTests,
 	getToolChoiceCapabilityOverride,
@@ -139,5 +141,164 @@ describe("OpenAI completions tool choice capability", () => {
 		expect(calls).toBe(1);
 		expect(result.stopReason).toBe("error");
 		expect(getToolChoiceCapabilityOverride(testModel)).toBeUndefined();
+	});
+});
+
+describe("OpenAI completions empty-tool choice serialization", () => {
+	// #1227: Explicit tools: [] opts out; only undefined tools with history retains
+	// the Anthropic-proxy tools: [] sentinel. Neither empty shape sends tool_choice.
+	function abortedSignal(): AbortSignal {
+		const controller = new AbortController();
+		controller.abort();
+		return controller.signal;
+	}
+
+	function bedrockModel(): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			id: "bedrock-claude-sonnet-4-6",
+			name: "Bedrock Claude Sonnet 4.6 (LiteLLM)",
+			provider: "litellm-bedrock",
+			baseUrl: "https://example.test/v1",
+		};
+	}
+
+	async function capturePayload(
+		context: Context,
+		opts: Parameters<typeof streamOpenAICompletions>[2],
+	): Promise<Record<string, unknown>> {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(bedrockModel(), context, {
+			...opts,
+			apiKey: "test-key",
+			signal: abortedSignal(),
+			onPayload: payload => resolve(payload),
+		});
+		return (await promise) as Record<string, unknown>;
+	}
+
+	function assistantWithToolCall(): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_1", name: "search", arguments: { q: "x" } }],
+			api: "openai-completions",
+			provider: "litellm-bedrock",
+			model: "bedrock-claude-sonnet-4-6",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+	}
+
+	const echoTool: Tool = {
+		name: "echo",
+		description: "Echo input",
+		parameters: z.object({ text: z.string() }),
+	};
+
+	it("omits both tools and tool_choice when /btw passes empty tools + toolChoice none", async () => {
+		// Mirrors AgentSession.runEphemeralTurn: context.tools = [] is explicit
+		// (prevents tool-catalog leakage in IRC replies) and toolChoice = "none".
+		// `[]` is truthy, so buildParams used to land in the `if (context.tools)`
+		// branch and emit `"tools": []` on the wire — LiteLLM → Bedrock then
+		// translated that into an empty `toolConfig` block and Bedrock rejected
+		// the request whenever the conversation already held toolUse/toolResult
+		// content. The `.length` guard now skips the branch on empty arrays so
+		// the wire body carries no `tools` field at all, which is the only shape
+		// every downstream proxy accepts.
+		const body = await capturePayload(
+			{
+				messages: [{ role: "user", content: "what is X", timestamp: Date.now() }],
+				tools: [],
+			},
+			{ toolChoice: "none" },
+		);
+
+		expect(body.tools).toBeUndefined();
+		expect(body.tool_choice).toBeUndefined();
+	});
+
+	it("omits both tools and tool_choice when /btw passes empty tools + has tool history", async () => {
+		// The critical /btw scenario: session already has tool history (prior agentic
+		// turn) AND context.tools = []. After the .length guard skips the first branch,
+		// the caller-opted-out case must NOT fall through to the hasToolHistory sentinel
+		// — that would still emit `"tools": []` and cause the same Bedrock rejection.
+		// The `context.tools === undefined` guard on the second branch ensures we only
+		// inject the Anthropic-proxy sentinel when tools were omitted entirely.
+		const body = await capturePayload(
+			{
+				messages: [
+					{ role: "user", content: "search now", timestamp: Date.now() },
+					assistantWithToolCall(),
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "search",
+						content: [{ type: "text", text: "result" }],
+						isError: false,
+						timestamp: Date.now(),
+					},
+					{ role: "user", content: "btw what is X", timestamp: Date.now() },
+				],
+				tools: [], // explicit opt-out, as AgentSession.runEphemeralTurn does
+			},
+			{ toolChoice: "none" },
+		);
+
+		expect(body.tools).toBeUndefined();
+		expect(body.tool_choice).toBeUndefined();
+	});
+
+	it("drops tool_choice when tool history is present without explicit tools", async () => {
+		// hasToolHistory() branch: no context.tools, but messages contain a prior
+		// assistant toolCall — buildParams injects `tools: []` for Anthropic-proxy
+		// compat, and toolChoice="none" must still be stripped to keep LiteLLM from
+		// emitting a malformed Bedrock toolConfig.
+		const body = await capturePayload(
+			{
+				messages: [
+					{ role: "user", content: "search now", timestamp: Date.now() },
+					assistantWithToolCall(),
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "search",
+						content: [{ type: "text", text: "result" }],
+						isError: false,
+						timestamp: Date.now(),
+					},
+					{ role: "user", content: "follow-up", timestamp: Date.now() },
+				],
+			},
+			{ toolChoice: "none" },
+		);
+
+		expect(body.tools).toEqual([]);
+		expect(body.tool_choice).toBeUndefined();
+	});
+
+	it("keeps tool_choice none when real tools are present", async () => {
+		// Sanity: with non-empty tools, tool_choice="none" is legal Bedrock input
+		// (toolConfig has entries) and must still be forwarded so the model knows
+		// it should not call any tool this turn.
+		const body = await capturePayload(
+			{
+				messages: [{ role: "user", content: "answer in prose", timestamp: Date.now() }],
+				tools: [echoTool],
+			},
+			{ toolChoice: "none" },
+		);
+
+		expect(Array.isArray(body.tools)).toBe(true);
+		expect((body.tools as unknown[]).length).toBe(1);
+		expect(body.tool_choice).toBe("none");
 	});
 });

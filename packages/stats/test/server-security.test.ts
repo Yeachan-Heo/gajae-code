@@ -22,12 +22,32 @@ const EMPTY_DASHBOARD: DashboardStats = {
 		firstTimestamp: 0,
 		lastTimestamp: 0,
 	},
+	failures: {
+		totalRequests: 0,
+		erroredRequests: 0,
+		abortedRequests: 0,
+		failureShare: 0,
+		failedDurationMs: 0,
+		postFailureRequests: 0,
+		postFailureFullMissRequests: 0,
+		postFailureFullMissTokens: 0,
+	},
 	byModel: [],
 	byFolder: [],
+	byAgent: [],
 	timeSeries: [],
 	modelSeries: [],
 	modelPerformanceSeries: [],
 	costSeries: [],
+	cacheMissAttribution: {
+		trackedRequests: 0,
+		prefixMisses: 0,
+		clientCausedMisses: 0,
+		providerSideMisses: 0,
+		modelSwitchMisses: 0,
+		clientCausedShare: 0,
+		byCause: [],
+	},
 };
 
 describe("stats server request policy", () => {

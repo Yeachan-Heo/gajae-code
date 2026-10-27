@@ -62,6 +62,7 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			sendCustomMessage: vi.fn(async () => undefined),
 			sendUserMessage: vi.fn(async () => undefined),
 			navigateTree: vi.fn(async () => ({ cancelled: false })),
+			notifySessionIdentityChanged: vi.fn(async () => undefined),
 			switchSession: vi.fn(async () => {
 				sessionId = nextSessionId;
 				return true;

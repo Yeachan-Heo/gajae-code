@@ -69,8 +69,8 @@ export interface CredentialRefreshResponse {
 	entry: AuthCredentialSnapshotEntry;
 }
 
-/** Optional MCP client metadata; the broker still selects the stored token endpoint. */
-export type CredentialRefreshRequest = MCPOAuthRefreshClient;
+/** Optional MCP metadata and client snapshot revision for conditional refresh. */
+export type CredentialRefreshRequest = MCPOAuthRefreshClient & { expectedRevision?: number };
 
 /** POST /v1/credential/:id/disable request body. */
 export interface CredentialDisableRequest {

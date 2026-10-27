@@ -18,21 +18,14 @@ const compiledDefineFlags = ['process.env.PI_COMPILED="true"'];
 const releaseDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="release"'];
 const devDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="dev"'];
 
-// NOTE: mupdf must NOT be marked --external here. Compiled binaries cannot
-// resolve bare "mupdf" imports (and its Emscripten loader cannot find the
-// wasm asset inside the bunfs), which broke markit PDF conversion in every
-// standalone release (#5433). mupdf is bundled instead: its wasm is embedded
-// via `with { type: "file" }` and routed to the loader through the hook in
-// packages/coding-agent/src/utils/mupdf-wasm.ts, and the bundled
-// `require("mupdf")` inside markit-ai is replaced by the patch in
-// patches/markit-ai@0.5.3.patch.
-
 export const releaseEntrypoints = [
 	"./packages/coding-agent/src/cli.ts",
 	"./packages/stats/src/sync-worker.ts",
 	"./packages/coding-agent/src/tools/browser/tab-worker-entry.ts",
 	"./packages/coding-agent/src/eval/js/worker-entry.ts",
 	"./packages/coding-agent/src/config/atomic-yaml-patch-worker.ts",
+	"./packages/coding-agent/src/sdk/broker/broker-exit-writer-worker.ts",
+	"./packages/coding-agent/src/sdk/broker/publication-liveness-watchdog-worker.ts",
 	"./packages/coding-agent/src/gjc-runtime/coordinator-sidecar-bootstrap-worker.ts",
 	"./packages/natives/native/index.js",
 	"./packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts",
@@ -52,6 +45,8 @@ export const devEntrypoints = [
 	"./src/tools/browser/tab-worker-entry.ts",
 	"./src/eval/js/worker-entry.ts",
 	"./src/config/atomic-yaml-patch-worker.ts",
+	"./src/sdk/broker/broker-exit-writer-worker.ts",
+	"./src/sdk/broker/publication-liveness-watchdog-worker.ts",
 	"./src/gjc-runtime/coordinator-sidecar-bootstrap-worker.ts",
 	// W5b: natives has no static importer anymore (global native gate), so the
 	// dev bundle must list it as an extra entrypoint like the release build or
@@ -93,6 +88,11 @@ export function buildCompileArgs(options: CompileArgOptions): string[] {
 		// bunfs extra entrypoint (which --minify silently dropped, crashing
 		// v0.9.3–v0.9.6 releases at startup).
 		"--minify",
+		// Splitting keeps `await import()` boundaries as separate bunfs chunks, so
+		// `--version`/`--help` and the self-spawned helper processes stop parsing
+		// the whole app at startup (#5940). Do not add `--bytecode`: it needs
+		// `--format=esm` with splitting and crashed agent turns in Bun 1.4.0.
+		"--splitting",
 		...compileAutoloadDisableFlags,
 		"--keep-names",
 	];

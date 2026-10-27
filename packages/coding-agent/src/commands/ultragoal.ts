@@ -8,6 +8,7 @@ import {
 	writeCurrentSessionGoalModeState,
 	writePendingGoalModeRequest,
 } from "../gjc-runtime/goal-mode-request";
+import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 import { isUltragoalHelpInvocation, runNativeUltragoalCommand } from "../gjc-runtime/ultragoal-runtime";
 
 export default class Ultragoal extends Command {
@@ -44,16 +45,23 @@ export default class Ultragoal extends Command {
 		const { objective, goalsPath, provenance } = await readUltragoalGjcObjective(cwd);
 
 		await writeCurrentSessionGoalModeState({
-			sessionFile: process.env[GJC_SESSION_FILE_ENV],
+			// Bun has already copied the project dotenv into the environment. A
+			// value that matches that snapshot must not select the transcript.
+			sessionFile: trustedCoordinatorEnv(GJC_SESSION_FILE_ENV),
 			objective,
 			provenance,
 		});
-		await writePendingGoalModeRequest({
-			cwd,
-			objective,
-			goalsPath,
-			provenance,
-			sessionId: process.env[GJC_SESSION_ID_ENV],
-		});
+		// A matching or dynamic project declaration must not select the session.
+		// Skip the write in that case: the helper falls back to the same env value.
+		const sessionId = trustedCoordinatorEnv(GJC_SESSION_ID_ENV);
+		if (sessionId !== undefined || !process.env[GJC_SESSION_ID_ENV]?.trim()) {
+			await writePendingGoalModeRequest({
+				cwd,
+				objective,
+				goalsPath,
+				provenance,
+				sessionId,
+			});
+		}
 	}
 }

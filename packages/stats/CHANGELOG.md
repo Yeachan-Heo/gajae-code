@@ -2,6 +2,71 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Flatten control characters in the stats console summary labels so a session model or folder cannot forge a row or emit a terminal escape.
+
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+## [0.18.8] - 2026-10-08
+
+### Fixed
+
+- By-model stats charts keep a model label of `__proto__` in its own bucket instead of writing the shared object prototype.
+
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+### Fixed
+
+- The stats dashboard API answers `400 Bad Request` for a malformed `?limit=` on `/api/stats/recent` and `/api/stats/errors`, and for a malformed `/api/request/:id`. Before, `limit=abc` failed with a 500 SQLite `datatype mismatch`, a negative limit returned every stored request because SQLite treats a negative `LIMIT` as unlimited, and an id such as `1abc` was read as `1`.
+
+## [0.18.1] - 2026-09-29
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Dashboard stats now include a `failures` report: the error+abort share of requests, time spent in failed requests, and the prompt tokens re-paid by requests that missed the cache entirely right after a failure in the same session. `gjc stats --summary` and `gjc-stats --sync` print it under "Provider Failures", so provider-failure cost can be compared across time windows (#5948).
+
+## [0.17.7] - 2026-09-25
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Added
+
+- Add default/executor/planner/architect/critic usage totals to the stats summary and JSON output, attributing existing persisted subagent identities and leaving legacy sessions without identity metadata as `unknown`.
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Fixed
+
+- Preserve historical assistant session entries that omit `stopReason` when syncing `gjc stats`.
+
+- Keep stats synchronization working when historical assistant entries contain partial cost data or malformed required metadata. Preserve finite recorded costs, estimate missing costs with existing catalog pricing, and skip malformed entries without changing source transcripts.
+- Preserve recorded nonzero cost components with a zero total when reopening the stats database, and allow request-detail lookup past malformed JSONL entries.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

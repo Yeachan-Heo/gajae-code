@@ -75,7 +75,7 @@ for (const abort of [false, true]) {
 			[createUserMessage("hello")],
 			{ systemPrompt: [], messages: [], tools: [] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: messages => messages as Message[],
 				onAbortRaceReactionChange: delta => {
 					pendingAbortReactions += delta;
@@ -111,7 +111,7 @@ it("cleans the pending abort race when the provider rejects", async () => {
 		[createUserMessage("hello")],
 		{ systemPrompt: [], messages: [], tools: [] },
 		{
-			model: mock.model,
+			model: mock,
 			convertToLlm: messages => messages as Message[],
 			onAbortRaceReactionChange: delta => {
 				pendingAbortReactions += delta;

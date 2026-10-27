@@ -25,5 +25,7 @@ describe("STT setup guidance", () => {
 		expect(usage).toContain("Alt+H is Option+H");
 		expect(usage).toContain("forward Option as Meta/Esc");
 		expect(usage).toContain("macos-option-as-alt = true");
+		expect(formatSTTUsage("darwin", "Apple_Terminal")).toContain("Use Option as Meta key");
+		expect(formatSTTUsage("darwin", "iTerm.app")).toContain("Esc+");
 	});
 });

@@ -9,7 +9,13 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
-import { Broker, type BrokerResponse, setPublicationObservationForTest } from "../src/sdk/broker/broker";
+import {
+	Broker,
+	type BrokerResponse,
+	lifecycleTargetForTest,
+	normalizeBrokerInput,
+	setPublicationObservationForTest,
+} from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
@@ -21,6 +27,7 @@ import {
 } from "../src/sdk/broker/discovery";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
+	BROKER_DISCOVERY_BUDGET,
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
 	ensureBroker,
@@ -28,19 +35,30 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { completeBrokerProcess } from "../src/sdk/broker/internal";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	getBrokerIdentityKey,
+} from "../src/sdk/broker/identity";
 import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
+	setLifecycleCommandResolverForTest,
 	terminalUncertainStartupMessage,
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
+import * as processIncarnation from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
+import { publishedRuntimeAbortCapability } from "../src/sdk/broker/runtime-abort-capability";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
-import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	hasBrokerRuntimeAbortCapability,
+} from "../src/sdk/host/control/runtime-gate";
 import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -246,11 +264,196 @@ it("never lets the master capability cross into a cold-started broker", () => {
 	const environment = brokerSpawnEnvironmentForTest(command, {
 		PATH: process.env.PATH,
 		GJC_MASTER_CAPABILITY: "must-not-cross-the-lifecycle-boundary",
+		GJC_MASTER_OWNER_SESSION_ID: "must-not-cross-the-owner-session-boundary",
+		gJc_Master_Capability: "mixed-capability",
+		gJc_Master_Owner_Session_Id: "mixed-owner-session",
 		OWNED_SENTINEL: "kept",
 	});
 	expect(environment.GJC_MASTER_CAPABILITY).toBeUndefined();
+	expect(environment.GJC_MASTER_OWNER_SESSION_ID).toBeUndefined();
+	expect(environment.gJc_Master_Capability).toBeUndefined();
+	expect(environment.gJc_Master_Owner_Session_Id).toBeUndefined();
 	expect(JSON.stringify(environment)).not.toContain("must-not-cross-the-lifecycle-boundary");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
+it("strips inherited TUI session identity from a cold-started broker", () => {
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		environment: {
+			PATH: process.env.PATH,
+			GJC_SESSION_CONTEXT_BUDGET_BYTES: "1073741824",
+			GJC_SESSION_FILE: "/tui/session.jsonl",
+			GJC_SESSION_ID: "tui-session",
+			GJC_SESSION_CWD: "/tui/workspace",
+			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
+			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
+			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
+			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
+			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
+			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
+			GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
+			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
+			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
+			GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true",
+			GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
+			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
+			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
+			GJC_TMUX_SESSION: "user-configured-tmux",
+			GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
+			GJC_TMUX_LAUNCHED: "1",
+			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+			GJC_TMUX_OWNER_STATE_DIR: "/tmp/tui-owner-state",
+			GJC_TMUX_OWNER_SERVER_KEY: "tui-server-key",
+			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: "tui-child-token",
+			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
+			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
+			GJC_STATE_ROOT: "/tui/.gjc/state",
+			TMUX: "/tmp/tmux,1234,0",
+			TMUX_PANE: "%7",
+			GJC_MOUSE: "1",
+			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_PROFILE: "1",
+			OWNED_SENTINEL: "kept",
+			gJc_Session_Custom_Marker: "mixed-tui-session-marker",
+			gJc_Coordinator_Session_Launch_Id: "mixed-tui-launch",
+			gJc_Lifecycle_Request_Id: "mixed-tui-lifecycle",
+			gJc_Managed_Owner_Child_Token: "mixed-owner-token",
+			gJc_Session_Context_Budget_Bytes: "2147483648",
+		},
+	});
+	const environment = brokerSpawnEnvironmentForTest(command);
+
+	for (const name of [
+		"GJC_SESSION_FILE",
+		"GJC_SESSION_ID",
+		"GJC_SESSION_CWD",
+		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
+		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_COORDINATOR_SESSION_STATE_FILE",
+		"GJC_COORDINATOR_SESSION_BRANCH",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
+		"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+		"GJC_COORDINATOR_SIDECAR_SIGNING_KEY",
+		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
+		"GJC_COORDINATOR_SIDECAR_KEY_ID",
+		"GJC_TMUX_ACTIVE_SESSION",
+		"GJC_TMUX_LAUNCHED",
+		"GJC_TMUX_OWNER_GENERATION",
+		"GJC_TMUX_OWNER_STATE_DIR",
+		"GJC_TMUX_OWNER_SERVER_KEY",
+		"GJC_MANAGED_OWNER_RUN_ID",
+		"GJC_MANAGED_OWNER_CHILD_TOKEN",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_STATE_ROOT",
+		"TMUX",
+		"TMUX_PANE",
+		"gJc_Session_Custom_Marker",
+		"gJc_Coordinator_Session_Launch_Id",
+		"gJc_Lifecycle_Request_Id",
+		"gJc_Managed_Owner_Child_Token",
+	])
+		expect(environment[name]).toBeUndefined();
+	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_SESSION).toBe("user-configured-tmux");
+	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.gJc_Session_Context_Budget_Bytes).toBe("2147483648");
+	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
+	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
+	expect(environment.GJC_MOUSE).toBe("1");
+	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
+it("strips inherited session markers from compiled broker environments", () => {
+	const markerPath = "/$bunfs/root/internal-source-marker-2178-abcd.txt";
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		execPath: process.execPath,
+		environment: {
+			PATH: process.env.PATH,
+			GJC_SESSION_CONTEXT_BUDGET_BYTES: "1073741824",
+			GJC_SESSION_FILE: "/tui/session.jsonl",
+			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
+			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
+			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
+			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
+			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
+			gJc_Session_Id: "mixed-tui-session",
+			gJc_Coordinator_Session_Readiness_File: "/tmp/mixed-ready.json",
+			gJc_Coordinator_Sidecar_Key_Id: "mixed-key-id",
+			gJc_Managed_Owner_Child_Token: "mixed-owner-token",
+			gJc_Lifecycle_Request_Id: "mixed-lifecycle-request",
+			gJc_State_Root: "/tmp/mixed-state-root",
+			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
+			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
+			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
+			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
+			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: "tui-child-token",
+			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
+			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
+			GJC_STATE_ROOT: "/tui/.gjc/state",
+			GJC_MASTER_CAPABILITY: "compiled-master-capability",
+			GJC_MASTER_OWNER_SESSION_ID: "compiled-master-owner",
+			gJc_Master_Capability: "compiled-mixed-capability",
+			gJc_Master_Owner_Session_Id: "compiled-mixed-owner",
+			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_SESSION: "user-configured-tmux",
+			GJC_TMUX_PROFILE: "1",
+			GJC_MOUSE: "1",
+			PI_COMPILED: "1",
+			GJC_COMPILED: "1",
+		},
+		markerPath,
+		embeddedFiles: [{ name: path.basename(markerPath) }],
+	});
+	const environment = brokerSpawnEnvironmentForTest(command);
+
+	expect(command.kind).toBe("compiled");
+	for (const name of [
+		"GJC_SESSION_FILE",
+		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
+		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+		"gJc_Session_Id",
+		"gJc_Coordinator_Session_Readiness_File",
+		"gJc_Coordinator_Sidecar_Key_Id",
+		"gJc_Managed_Owner_Child_Token",
+		"gJc_Lifecycle_Request_Id",
+		"gJc_State_Root",
+		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
+		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
+		"GJC_COORDINATOR_SIDECAR_KEY_ID",
+		"GJC_TMUX_OWNER_GENERATION",
+		"GJC_MANAGED_OWNER_RUN_ID",
+		"GJC_MANAGED_OWNER_CHILD_TOKEN",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_STATE_ROOT",
+		"GJC_MASTER_CAPABILITY",
+		"GJC_MASTER_OWNER_SESSION_ID",
+		"gJc_Master_Capability",
+		"gJc_Master_Owner_Session_Id",
+	])
+		expect(environment[name]).toBeUndefined();
+	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_SESSION).toBe("user-configured-tmux");
+	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
+	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
+	expect(environment.PI_COMPILED).toBe("1");
+	expect(environment.GJC_COMPILED).toBe("1");
+	expect(environment.GJC_MOUSE).toBe("1");
 });
 
 it("fails closed when compiled marker evidence disagrees", () => {
@@ -553,27 +756,6 @@ async function waitForDiscovery(agentDir: string, children?: Bun.Subprocess[]) {
 	}
 	throw new Error("Timed out waiting for broker discovery.");
 }
-describe("broker process completion", () => {
-	it("exits zero only after successful broker completion", async () => {
-		const exit = vi.fn((code: number): never => {
-			throw new Error(`exit:${code}`);
-		});
-		await expect(completeBrokerProcess({ completion: Promise.resolve() } as Broker, exit)).rejects.toThrow("exit:0");
-		expect(exit).toHaveBeenCalledWith(0);
-	});
-
-	it("propagates broker completion failure without invoking success exit", async () => {
-		const failure = new Error("broker teardown failed");
-		const exit = vi.fn((_code: number): never => {
-			throw new Error("unexpected exit");
-		});
-		await expect(completeBrokerProcess({ completion: Promise.reject(failure) } as Broker, exit)).rejects.toBe(
-			failure,
-		);
-		expect(exit).not.toHaveBeenCalled();
-	});
-});
-
 it("keeps unresolved session cleanup authority through lifecycle ledger compaction", async () => {
 	const dir = await temp();
 	const ledger = await new LifecycleLedger(dir, { maxRows: 2 }).open();
@@ -1644,13 +1826,55 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
+	it("reclaims a broker lock whose live PID has a different incarnation", async () => {
 		const dir = await temp();
 		const lock = path.join(dir, "sdk", "broker.lock");
+		const hostIdentity = await brokerLockHostIdentity(dir);
+		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
+		const staleIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
 		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(lock, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "live-unpublished-owner", pid: process.pid, acquiredAt: Date.now() }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "reused-pid-owner",
+				pid: process.pid,
+				incarnation: staleIncarnation,
+				ownerHostId: hostIdentity.ownerHostId,
+				acquiredAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			const discovery = await broker.start();
+			expect(discovery.pid).toBe(process.pid);
+			expect(discovery.ownerId).not.toBe("reused-pid-owner");
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: discovery.ownerId,
+				pid: process.pid,
+				incarnation: discovery.incarnation,
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const { ownerHostId } = await brokerLockHostIdentity(dir);
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "live-unpublished-owner",
+				pid: process.pid,
+				ownerHostId,
+				acquiredAt: Date.now(),
+			}),
 			{ mode: 0o600 },
 		);
 		const contenders = Array.from({ length: 3 }, () => new Broker({ agentDir: dir }));
@@ -1667,6 +1891,98 @@ describe("SDK broker identity and discovery", () => {
 			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
 				ownerId: "live-unpublished-owner",
 				pid: process.pid,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("keeps a broker lock when its live owner's PID and incarnation match", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const hostIdentity = await brokerLockHostIdentity(dir);
+		const incarnation = processIncarnation.processIncarnation(process.pid);
+		if (!incarnation) throw new Error("Current process incarnation is unavailable");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "matching-live-owner",
+				pid: process.pid,
+				incarnation,
+				ownerHostId: hostIdentity.ownerHostId,
+				acquiredAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "matching-live-owner",
+				pid: process.pid,
+				incarnation,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("keeps a broker lock when its owner is on a foreign host with mismatched incarnation", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
+		const staleIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "foreign-host-owner",
+				pid: process.pid,
+				incarnation: staleIncarnation,
+				ownerHostId: "some-foreign-host",
+				acquiredAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is attributed to a different host");
+			// Lock should NOT have been reclaimed despite incarnation mismatch
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "foreign-host-owner",
+				ownerHostId: "some-foreign-host",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("keeps a broker lock when its owner is legacy (host-unqualified) with mismatched incarnation", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
+		const staleIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "legacy-unqualified-owner",
+				pid: process.pid,
+				incarnation: staleIncarnation,
+				acquiredAt: Date.now(),
+				// NO ownerHostId field - legacy record
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
+			// Lock should NOT have been reclaimed despite incarnation mismatch
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "legacy-unqualified-owner",
 			});
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
@@ -1785,43 +2101,51 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("terminates and reaps the spawned broker when discovery times out", async () => {
-		const dir = await temp();
-		// Force ensureBroker's discovery reads to never resolve a live record so the
-		// discovery wait is doomed from the start. The real broker still spawns and
-		// stays alive as a detached daemon, which is exactly the orphan path the reap
-		// must close. Capture its pid from the discovery file (bypassing the spy)
-		// before ensureBroker times out and reaps it.
-		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
-		try {
-			const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
-			void (async () => {
-				const deadline = Date.now() + 12_000;
-				while (Date.now() < deadline) {
-					try {
-						const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
-							pid?: number;
-						};
-						if (typeof raw.pid === "number") return onPid(raw.pid);
-					} catch {}
-					await sleep(25);
-				}
-				onPid(undefined);
-			})();
-			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
-				"Timed out waiting for detached SDK broker discovery.",
-			);
-			const brokerPid = await gotPid;
-			// The spawned detached broker must have been terminated + reaped, not orphaned.
-			expect(typeof brokerPid).toBe("number");
-			expect(brokerDiscovery.isPidAlive(brokerPid!)).toBe(false);
-			// No owner handle leaked for the failed agent dir.
-			expect(brokerOwnerForTest(dir)).toBeUndefined();
-		} finally {
-			spy.mockRestore();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	}, 30_000);
+	it(
+		"terminates and reaps the spawned broker when discovery times out",
+		async () => {
+			const dir = await temp();
+			// Force ensureBroker's discovery reads to never resolve a live record so the
+			// discovery wait is doomed from the start. The real broker still spawns and
+			// stays alive as a detached daemon, which is exactly the orphan path the reap
+			// must close. Capture its pid from the discovery file (bypassing the spy)
+			// before ensureBroker times out and reaps it.
+			const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+			try {
+				const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
+				void (async () => {
+					const deadline = Date.now() + 12_000;
+					while (Date.now() < deadline) {
+						try {
+							const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
+								pid?: number;
+							};
+							if (typeof raw.pid === "number") return onPid(raw.pid);
+						} catch {}
+						await sleep(25);
+					}
+					onPid(undefined);
+				})();
+				await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
+					"Timed out waiting for detached SDK broker discovery.",
+				);
+				const brokerPid = await gotPid;
+				// The spawned detached broker must have been terminated, not orphaned. The
+				// trampoline reparents it away from this process, so once killed it may stay
+				// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
+				// reports such a zombie as present. Process-identity observation classifies
+				// it as absent, which is the same authority the production reap path uses.
+				expect(typeof brokerPid).toBe("number");
+				expect(processIncarnation.observeProcessIncarnation(brokerPid!).status).toBe("absent");
+				// No owner handle leaked for the failed agent dir.
+				expect(brokerOwnerForTest(dir)).toBeUndefined();
+			} finally {
+				spy.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+		BROKER_DISCOVERY_BUDGET.discoveryMs + 5_000,
+	);
 	it("fails fast and reaps the spawned broker when it exits before discovery", async () => {
 		const dir = await temp();
 		// Plant an unsupported session-index snapshot so the spawned broker's start()
@@ -1889,7 +2213,10 @@ describe("SDK broker identity and discovery", () => {
 			},
 		});
 
-		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, { gracefulMs: 1, killVerifyMs: 1 });
+		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, undefined, undefined, {
+			gracefulMs: 1,
+			killVerifyMs: 1,
+		});
 
 		expect(signals).toEqual([]);
 	});
@@ -1919,7 +2246,7 @@ describe("SDK broker identity and discovery", () => {
 				return true;
 			},
 		});
-		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, {
+		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, undefined, undefined, {
 			gracefulMs: 1,
 			killVerifyMs: 1,
 		});
@@ -1989,6 +2316,47 @@ describe("SDK broker identity and discovery", () => {
 		await owner?.stop();
 		expect(brokerOwnerForTest(dir)).toBeUndefined();
 		await fs.rm(dir, { recursive: true, force: true });
+	});
+	it("adopts a reusable discovery published by a competing broker before reaping the losing spawn", async () => {
+		const dir = await temp();
+		const winner = new Broker({ agentDir: dir });
+		try {
+			const winnerDiscovery = await winner.start();
+			let hiddenReads = 0;
+			let forceAbsentObservation = false;
+			const readOriginal = brokerDiscovery.readBrokerDiscovery;
+			const observeOriginal = processIncarnation.observeProcessIncarnation;
+			const readSpy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(async (agentDir, ttl) => {
+				if (agentDir === dir && hiddenReads < 2) {
+					hiddenReads += 1;
+					if (hiddenReads === 2) forceAbsentObservation = true;
+					return null;
+				}
+				if (agentDir === dir) forceAbsentObservation = false;
+				return readOriginal(agentDir, ttl);
+			});
+			const observationSpy = vi.spyOn(processIncarnation, "observeProcessIncarnation").mockImplementation(pid => {
+				if (forceAbsentObservation && pid !== winnerDiscovery.pid) {
+					forceAbsentObservation = false;
+					return { status: "absent" };
+				}
+				return observeOriginal(pid);
+			});
+			try {
+				await expect(ensureBroker({ agentDir: dir })).resolves.toMatchObject({
+					pid: winnerDiscovery.pid,
+					ownerId: winnerDiscovery.ownerId,
+				});
+				expect(hiddenReads).toBe(2);
+			} finally {
+				observationSpy.mockRestore();
+				readSpy.mockRestore();
+			}
+		} finally {
+			await brokerOwnerForTest(dir)?.stop();
+			await winner.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 	it("leaves exactly one live detached broker after concurrent process startup", async () => {
 		const dir = await temp();
@@ -2488,6 +2856,595 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("public session.lookup recovers a recorded create for the identical target and conflicts for a different one", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-create-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const otherCwd = path.join(root, "other-workspace");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(otherCwd, { recursive: true });
+		const broker = new Broker({ agentDir });
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(broker, () => {
+			launchAttempts += 1;
+			return { file: path.join(root, "missing-gjc"), args: [] };
+		});
+		const key = "lost-create-ack";
+		const target = { cwd, readinessTimeoutMs: 10_000 };
+		try {
+			await broker.start();
+			const created = await broker.handleRequest("session.create", { ...target }, key);
+			expect(created).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+			expect(launchAttempts).toBe(1);
+
+			expect(
+				await broker.handleRequest("session.lookup", { operation: "session.create", target: { ...target } }, key),
+			).toEqual(created);
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target, cwd: otherCwd } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target, readinessTimeoutMs: 20_000 } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target, stateRoot: path.join(otherCwd, ".gjc", "state") } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "invalid_input", message: "stateRoot must be the default .gjc/state for cwd." },
+			});
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("public session.lookup recovers a legacy v3 create row fingerprinted over the raw target", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-legacy-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const broker = new Broker({ agentDir });
+		const key = "legacy-v3-create";
+		const target = { cwd };
+		const rawFingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.digest("hex");
+		const response = { ok: true, result: { sessionId: "legacy-created", cwd } } as const;
+		try {
+			await broker.start();
+			// Shape written before e2909ee69: v3 identity plus a raw-target fingerprint.
+			const identity = await deriveLegacyIdentity(agentDir, "session.create", key);
+			const begun = await broker.ledger.begin(identity, "legacy-v3-create-request", {
+				operationKey: `session.create\0${key}`,
+				fingerprint: rawFingerprint,
+			});
+			expect(begun.kind).toBe("new");
+			await broker.ledger.transition(identity, "terminal_ok", { response });
+
+			expect(
+				await broker.handleRequest("session.lookup", { operation: "session.create", target: { ...target } }, key),
+			).toEqual(response);
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { cwd: path.join(root, "other-workspace") } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target } },
+					"legacy-v3-create-other-key",
+				),
+			).toEqual({ ok: false, error: { code: "not_found", message: "lifecycle operation was not found" } });
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("public session.lookup does not accept a raw-target fingerprint for a current create row", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-current-raw-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const broker = new Broker({ agentDir });
+		const key = "current-create-raw-fingerprint";
+		const target = { cwd };
+		const rawFingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.digest("hex");
+		try {
+			await broker.start();
+			// A current (v4) row must only match its normalized fingerprint; a raw one is a conflict.
+			const identity = await deriveIdempotencyIdentity(agentDir, "session.create", key);
+			await broker.ledger.begin(identity, "current-create-request", {
+				operationKey: `session.create\0${key}`,
+				fingerprint: rawFingerprint,
+			});
+			await broker.ledger.transition(identity, "terminal_ok", {
+				response: { ok: true, result: { sessionId: "current-created", cwd } },
+			});
+			expect(
+				await broker.handleRequest("session.lookup", { operation: "session.create", target: { ...target } }, key),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("ignores unrelated final legacy rows but keeps reused keys and live creates fenced", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
+		const agentDir = path.join(root, "agent");
+		const legacyLedger = await new LifecycleLedger(agentDir).open();
+		for (const [identity, state] of [
+			["legacy-terminal-ok", "terminal_ok"],
+			["legacy-terminal-error", "terminal_error"],
+		] as const) {
+			await legacyLedger.begin(identity, `legacy-request-${identity}`);
+			await legacyLedger.transition(identity, state, {
+				response:
+					state === "terminal_ok"
+						? { ok: true, result: { sessionId: identity } }
+						: { ok: false, error: { code: "fixture_error", message: "legacy terminal error" } },
+			});
+			expect(legacyLedger.get(identity)?.operationKey).toBeUndefined();
+		}
+		const reusedCreateKey = "reused-terminal-create-key";
+		const reusedCreateIdentity = await deriveLegacyIdentity(agentDir, "session.create", reusedCreateKey);
+		await legacyLedger.begin(reusedCreateIdentity, "legacy-terminal-create-request");
+		await legacyLedger.transition(reusedCreateIdentity, "terminal_error", {
+			response: { ok: false, error: { code: "fixture_error", message: "legacy create completed" } },
+		});
+		expect(legacyLedger.get(reusedCreateIdentity)?.operationKey).toBeUndefined();
+		let broker = new Broker({ agentDir });
+		let launchAttempts = 0;
+		const lifecycleCommandResolver = () => {
+			launchAttempts += 1;
+			return { file: path.join(root, "missing-gjc"), args: [] };
+		};
+		setLifecycleCommandResolverForTest(broker, lifecycleCommandResolver);
+		try {
+			await broker.start();
+			expect(broker.ledger.get("legacy-terminal-ok")?.operationKey).toBeUndefined();
+			expect(broker.ledger.get("legacy-terminal-error")?.operationKey).toBeUndefined();
+			await expect(broker.handleRequest("session.create", { cwd: root }, reusedCreateKey)).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+			});
+			expect(launchAttempts).toBe(0);
+
+			await expect(
+				broker.handleRequest("session.create", { cwd: root }, "fresh-after-upgrade"),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(1);
+
+			const liveIdentity = "legacy-in-flight";
+			await broker.ledger.begin(liveIdentity, "legacy-request-in-flight");
+			const assertLegacyIdentityFenced = async (key: string): Promise<void> => {
+				await expect(broker.handleRequest("session.create", { cwd: root }, key)).resolves.toEqual({
+					ok: false,
+					error: {
+						code: "legacy_lifecycle_ambiguous",
+						message: "legacy lifecycle request has an ambiguous target",
+					},
+				});
+				expect(launchAttempts).toBe(1);
+			};
+			await assertLegacyIdentityFenced("fresh-with-accepted-legacy");
+			await broker.ledger.transition(liveIdentity, "effect_started");
+			await assertLegacyIdentityFenced("fresh-with-effect-started-legacy");
+			await broker.ledger.transition(liveIdentity, "awaiting_ready");
+			await assertLegacyIdentityFenced("fresh-with-awaiting-ready-legacy");
+
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			broker = new Broker({ agentDir });
+			setLifecycleCommandResolverForTest(broker, lifecycleCommandResolver);
+			await broker.start();
+			expect(broker.ledger.get(liveIdentity)?.state).toBe("terminal_uncertain");
+			expect(broker.ledger.get(liveIdentity)?.operationKey).toBeUndefined();
+			const recoveredWorkspace = path.join(root, "recovered-workspace");
+			await fs.mkdir(recoveredWorkspace);
+			await expect(
+				broker.handleRequest(
+					"session.create",
+					{ cwd: recoveredWorkspace },
+					"fresh-after-recovered-uncertain-legacy",
+				),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(2);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	describe("non-create lifecycle requests past final legacy rows", () => {
+		const ambiguousTarget = {
+			ok: false,
+			error: { code: "legacy_lifecycle_ambiguous", message: "legacy lifecycle request has an ambiguous target" },
+		} as const;
+		const withLegacyLedger = async (
+			seed: (ledger: LifecycleLedger, agentDir: string) => Promise<void>,
+			run: (broker: Broker, root: string) => Promise<void>,
+		): Promise<void> => {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-noncreate-"));
+			const agentDir = path.join(root, "agent");
+			const legacyLedger = await new LifecycleLedger(agentDir).open();
+			await seed(legacyLedger, agentDir);
+			const broker = new Broker({ agentDir });
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(root, "missing-gjc"), args: [] }));
+			try {
+				await broker.start();
+				await run(broker, root);
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		};
+		const seedFinalRowsForSessionA = async (ledger: LifecycleLedger): Promise<void> => {
+			await ledger.begin("legacy-close-a-ok", "legacy-close-a-ok-request", { intendedSessionId: "session-a" });
+			await ledger.transition("legacy-close-a-ok", "terminal_ok", {
+				resultSessionId: "session-a",
+				response: { ok: true, result: { sessionId: "session-a" } },
+			});
+			await ledger.begin("legacy-resume-a-error", "legacy-resume-a-error-request", {
+				intendedSessionId: "session-a",
+			});
+			await ledger.transition("legacy-resume-a-error", "terminal_error", {
+				response: { ok: false, error: { code: "fixture_error", message: "legacy resume failed" } },
+			});
+			expect(ledger.get("legacy-close-a-ok")?.operationKey).toBeUndefined();
+			expect(ledger.get("legacy-resume-a-error")?.operationKey).toBeUndefined();
+		};
+		const requestFor = (operation: string, sessionId: string, root: string): Record<string, unknown> =>
+			operation === "session.close"
+				? { sessionId }
+				: { sessionId, cwd: root, sessionPath: path.join(root, `${sessionId}.jsonl`) };
+		const nonCreateOperations = ["session.close", "session.resume", "session.delete"];
+
+		it("admits close, resume, and delete for a different session with a fresh key", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async (broker, root) => {
+				const responses: Record<string, BrokerResponse> = {};
+				for (const operation of nonCreateOperations)
+					responses[operation] = await broker.handleRequest(
+						operation,
+						requestFor(operation, "session-b", root),
+						`fresh-${operation}-b`,
+					);
+				// Admitted past the legacy fence; each fails later only because session-b has no fixture.
+				expect(responses).toEqual({
+					"session.close": { ok: false, error: { code: "not_found", message: "session is not indexed" } },
+					"session.resume": {
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message: "Saved saved session does not match the requested workspace and session id.",
+						},
+					},
+					"session.delete": {
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message: "session.delete path is not an owned managed session for the configured cwd.",
+						},
+					},
+				});
+			});
+		});
+		it("admits session.reconcile_uncertain for a different session with a fresh key", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async broker => {
+				// The request passes legacy admission and then fails because session-b is not indexed.
+				await expect(
+					broker.handleRequest(
+						"session.reconcile_uncertain",
+						{ sessionId: "session-b", remoteCreateKey: "remote-create-b" },
+						"fresh-reconcile-b",
+					),
+				).resolves.toEqual({
+					ok: false,
+					error: { code: "not_found", message: "session is not indexed" },
+				});
+			});
+		});
+		it("admits past a final legacy row whose only session evidence is resultSessionId", async () => {
+			await withLegacyLedger(
+				async ledger => {
+					await ledger.begin("legacy-result-only", "legacy-result-only-request");
+					await ledger.transition("legacy-result-only", "terminal_ok", {
+						resultSessionId: "session-a",
+						response: { ok: true, result: { sessionId: "session-a" } },
+					});
+					expect(ledger.get("legacy-result-only")?.intendedSessionId).toBeUndefined();
+					expect(ledger.get("legacy-result-only")?.resultSessionId).toBe("session-a");
+				},
+				async broker => {
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-result-only-b"),
+					).resolves.toEqual({
+						ok: false,
+						error: { code: "not_found", message: "session is not indexed" },
+					});
+				},
+			);
+		});
+		it("uses the input.id alias when admitting a different session past final legacy rows", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async broker => {
+				await expect(
+					broker.handleRequest("session.close", { id: "session-b" }, "fresh-close-id-alias-b"),
+				).resolves.toEqual({
+					ok: false,
+					error: { code: "not_found", message: "session is not indexed" },
+				});
+			});
+		});
+		it("keeps final legacy rows fenced for their recorded session", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async (broker, root) => {
+				for (const operation of nonCreateOperations)
+					await expect(
+						broker.handleRequest(operation, requestFor(operation, "session-a", root), `fresh-${operation}-a`),
+					).resolves.toEqual(ambiguousTarget);
+			});
+		});
+		it("keeps live legacy rows fenced for any target", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async broker => {
+				await broker.ledger.begin("legacy-live", "legacy-live-request", { intendedSessionId: "session-c" });
+				for (const state of ["accepted", "effect_started", "awaiting_ready"] as const) {
+					if (state !== "accepted") await broker.ledger.transition("legacy-live", state);
+					for (const operation of ["session.close", "session.resume"])
+						await expect(
+							broker.handleRequest(operation, { sessionId: "session-b" }, `fresh-${operation}-${state}`),
+						).resolves.toEqual(ambiguousTarget);
+				}
+			});
+		});
+		it("keeps a final legacy key fenced when reused against another session", async () => {
+			for (const operation of nonCreateOperations) {
+				const reusedKey = `reused-${operation}-key`;
+				await withLegacyLedger(
+					async (ledger, agentDir) => {
+						const targetHash = createHash("sha256")
+							.update(JSON.stringify(lifecycleTargetForTest(operation, { sessionId: "session-a" })))
+							.digest("hex");
+						const identity = await deriveLegacyTargetIdentity(agentDir, operation, reusedKey, targetHash);
+						await ledger.begin(identity, `legacy-${operation}-request`, { intendedSessionId: "session-a" });
+						await ledger.transition(identity, "terminal_ok", {
+							resultSessionId: "session-a",
+							response: { ok: true, result: { sessionId: "session-a" } },
+						});
+					},
+					async (broker, root) => {
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), reusedKey),
+						).resolves.toEqual(ambiguousTarget);
+						if (operation === "session.close")
+							await expect(
+								broker.handleRequest(
+									operation,
+									{ sessionId: "session-b", endpointGeneration: 1, endpointIncarnation: "a".repeat(64) },
+									reusedKey,
+								),
+							).resolves.toEqual(ambiguousTarget);
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}`),
+						).resolves.not.toEqual(ambiguousTarget);
+					},
+				);
+			}
+		});
+		it("fences every session a final legacy row records and keeps uncertain rows fenced", async () => {
+			await withLegacyLedger(
+				async ledger => {
+					await ledger.begin("legacy-two-sessions", "legacy-two-sessions-request", {
+						intendedSessionId: "session-a",
+					});
+					await ledger.transition("legacy-two-sessions", "terminal_ok", {
+						resultSessionId: "session-c",
+						response: { ok: true, result: { sessionId: "session-c" } },
+					});
+				},
+				async broker => {
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-c" }, "fresh-close-c"),
+					).resolves.toEqual(ambiguousTarget);
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-b"),
+					).resolves.not.toEqual(ambiguousTarget);
+					await broker.ledger.begin("legacy-uncertain", "legacy-uncertain-request", {
+						intendedSessionId: "session-a",
+					});
+					await broker.ledger.transition("legacy-uncertain", "terminal_uncertain");
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-b-uncertain"),
+					).resolves.toEqual(ambiguousTarget);
+				},
+			);
+		});
+		it("keeps final legacy rows without a recorded session fenced", async () => {
+			await withLegacyLedger(
+				async ledger => {
+					await ledger.begin("legacy-unbound", "legacy-unbound-request");
+					await ledger.transition("legacy-unbound", "terminal_ok", { response: { ok: true, result: {} } });
+				},
+				async (broker, root) => {
+					for (const operation of nonCreateOperations)
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}`),
+						).resolves.toEqual(ambiguousTarget);
+				},
+			);
+		});
+	});
+	it("replays exact-target terminal legacy creates and expires opaque cross-target key history", async () => {
+		const normalizedCreateInput = (input: Record<string, unknown>): Record<string, unknown> => {
+			const normalized = normalizeBrokerInput("session.create", input);
+			if (!("input" in normalized)) throw new Error("Expected valid legacy create fixture input");
+			return normalized.input;
+		};
+		const requestHashFor = (input: Record<string, unknown>): string =>
+			createHash("sha256")
+				.update(JSON.stringify({ input, operation: "session.create" }))
+				.digest("hex");
+		const exactRoot = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-exact-"));
+		const exactAgentDir = path.join(exactRoot, "agent");
+		const exactInput = { cwd: path.join(exactRoot, "workspace") };
+		const exactNormalizedInput = normalizedCreateInput(exactInput);
+		await fs.mkdir(exactInput.cwd, { recursive: true });
+		const exactKey = "legacy-target-create-key";
+		const exactTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", exactNormalizedInput)))
+			.digest("hex");
+		const exactRequestHash = requestHashFor(exactNormalizedInput);
+		const exactIdentity = await deriveLegacyTargetIdentity(
+			exactAgentDir,
+			"session.create",
+			exactKey,
+			exactTargetHash,
+		);
+		const exactLedger = await new LifecycleLedger(exactAgentDir).open();
+		const exactResponse = {
+			ok: false,
+			error: { code: "spawn_failed", message: "legacy create did not start" },
+		} as const;
+		await exactLedger.begin(exactIdentity, exactRequestHash);
+		await exactLedger.transition(exactIdentity, "terminal_error", { response: exactResponse });
+		const exactBroker = new Broker({ agentDir: exactAgentDir });
+		await exactBroker.start();
+		try {
+			await expect(exactBroker.handleRequest("session.create", exactInput, exactKey)).resolves.toEqual(
+				exactResponse,
+			);
+			expect(exactBroker.ledger.findByOperationKey(`session.create\0${exactKey}`)?.state).toBe("terminal_error");
+		} finally {
+			await exactBroker.stop();
+			await fs.rm(exactRoot, { recursive: true, force: true });
+		}
+
+		const changedRoot = await fs.mkdtemp(
+			path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-changed-"),
+		);
+		const changedAgentDir = path.join(changedRoot, "agent");
+		const priorInput = { cwd: path.join(changedRoot, "prior-workspace") };
+		const changedInput = { cwd: path.join(changedRoot, "new-workspace") };
+		const normalizedPriorInput = normalizedCreateInput(priorInput);
+		await fs.mkdir(priorInput.cwd, { recursive: true });
+		await fs.mkdir(changedInput.cwd, { recursive: true });
+		const changedKey = "legacy-target-create-key";
+		const priorTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", normalizedPriorInput)))
+			.digest("hex");
+		const priorRequestHash = requestHashFor(normalizedPriorInput);
+		const priorIdentity = await deriveLegacyTargetIdentity(
+			changedAgentDir,
+			"session.create",
+			changedKey,
+			priorTargetHash,
+		);
+		const changedLedger = await new LifecycleLedger(changedAgentDir).open();
+		await changedLedger.begin(priorIdentity, priorRequestHash);
+		await changedLedger.transition(priorIdentity, "terminal_error", { response: exactResponse });
+		const changedBroker = new Broker({ agentDir: changedAgentDir });
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(changedBroker, () => {
+			launchAttempts += 1;
+			return { file: path.join(changedRoot, "missing-gjc"), args: [] };
+		});
+		try {
+			await changedBroker.start();
+			await expect(changedBroker.handleRequest("session.create", changedInput, changedKey)).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(1);
+			await expect(changedBroker.handleRequest("session.create", priorInput, changedKey)).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+			});
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(changedBroker, undefined);
+			await changedBroker.stop();
+			await fs.rm(changedRoot, { recursive: true, force: true });
+		}
+	});
+	it("keeps terminal target-inclusive legacy delete keys fenced across target reuse", async () => {
+		for (const state of ["terminal_ok", "terminal_error"] as const) {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-delete-key-"));
+			const agentDir = path.join(root, "agent");
+			const idempotencyKey = `reused-${state}-delete-key`;
+			const priorTarget = { sessionId: `legacy-delete-a-${state}` };
+			const priorTargetHash = createHash("sha256")
+				.update(JSON.stringify(lifecycleTargetForTest("session.delete", priorTarget)))
+				.digest("hex");
+			const legacyIdentity = await deriveLegacyTargetIdentity(
+				agentDir,
+				"session.delete",
+				idempotencyKey,
+				priorTargetHash,
+			);
+			const legacyLedger = await new LifecycleLedger(agentDir).open();
+			await legacyLedger.begin(legacyIdentity, `legacy-${state}-delete-request`);
+			await legacyLedger.transition(legacyIdentity, state, {
+				response:
+					state === "terminal_ok"
+						? { ok: true, result: { sessionId: priorTarget.sessionId } }
+						: { ok: false, error: { code: "fixture_error", message: "legacy delete completed" } },
+			});
+			expect(legacyLedger.get(legacyIdentity)?.operationKey).toBeUndefined();
+
+			const broker = new Broker({ agentDir });
+			await broker.start();
+			try {
+				await expect(
+					broker.handleRequest(
+						"session.delete",
+						{ sessionId: `legacy-delete-b-${state}`, sessionPath: path.join(root, "missing.json") },
+						idempotencyKey,
+					),
+				).resolves.toEqual({
+					ok: false,
+					error: {
+						code: "legacy_lifecycle_ambiguous",
+						message: "legacy lifecycle request has an ambiguous target",
+					},
+				});
+			} finally {
+				await broker.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		}
+	});
 	it("binds session.delete to the requested session header and configured storage root", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "repo");
@@ -2851,7 +3808,8 @@ describe("SDK broker identity and discovery", () => {
 		await broker.start();
 		const transitionSpy = vi.spyOn(broker.ledger, "transition").mockImplementation(async (...args) => {
 			const result = await transition(...args);
-			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts were removed")) {
+			// #6339 reworded the durable artifact-completion response to "artifacts are removed".
+			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts are removed")) {
 				canonicalInjected = true;
 				await fs.mkdir(artifactsDir);
 				await fs.writeFile(path.join(artifactsDir, ".reappeared"), "reappeared");
@@ -3445,7 +4403,8 @@ describe("SDK broker identity and discovery", () => {
 			const transcriptParent = path.dirname(sessionPath);
 			const renamedTranscriptParent = `${transcriptParent}.renamed`;
 			await fs.rename(transcriptParent, renamedTranscriptParent);
-			await fs.mkdir(transcriptParent);
+			// The replacement must still pass managed-scope security (#6339) so replay reaches receipt validation.
+			await fs.mkdir(transcriptParent, { mode: 0o700 });
 			const replacedParentReplay = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },
@@ -3756,7 +4715,9 @@ describe("SDK broker identity and discovery", () => {
 					token: "replacement-token",
 				}),
 			);
-			await broker.index.append({
+			// A TUI or direct CLI host has no lifecycle request: its own registration
+			// publishes the operator-abort marker, and the broker echoes exactly that.
+			const directRow = await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
@@ -3764,6 +4725,53 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
+			expect(directRow.abortCapability).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+			expect(directRow.abortCapability).toBe(publishedRuntimeAbortCapability());
+			expect(
+				await broker.handleRequest(
+					"session.control",
+					{
+						sessionId,
+						operation: "turn.abort",
+						input: { mode: "terminal", operator: true },
+						confirm: true,
+					},
+					"direct-abort-key",
+				),
+			).toEqual({ ok: true, result: { turn: "stopped", ownedWork: "stopped" } });
+			expect(requests).toHaveLength(2);
+			expect(requests[1]).toMatchObject({
+				input: {
+					mode: "terminal",
+					operator: true,
+					[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: directRow.abortCapability,
+				},
+				confirm: true,
+				idempotencyKey: "direct-abort-key",
+			});
+			expect(hasBrokerRuntimeAbortCapability(requests[1]?.input)).toBe(true);
+			const listed = await broker.handleRequest("session.list", {}, "direct-list-key");
+			expect(listed).toMatchObject({ ok: true, result: { sessions: [{ sessionId }] } });
+			expect(JSON.stringify(listed)).not.toContain(directRow.abortCapability!);
+
+			// A host that published neither marker (a gjc predating the operator route)
+			// is refused before the endpoint is opened, with a code distinct from a
+			// stale endpoint because retrying cannot succeed.
+			const previousLifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+			process.env.GJC_LIFECYCLE_REQUEST_ID = "legacy-host-without-published-authority";
+			try {
+				await broker.index.append({
+					type: "host_registered",
+					sessionId,
+					locator: { cwd: dir, worktreeRoot: null, stateRoot },
+					endpointGeneration: 3,
+					pid: process.pid,
+					endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				});
+			} finally {
+				if (previousLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+				else process.env.GJC_LIFECYCLE_REQUEST_ID = previousLifecycleRequestId;
+			}
 			expect(
 				await broker.handleRequest(
 					"session.control",
@@ -3777,15 +4785,18 @@ describe("SDK broker identity and discovery", () => {
 				),
 			).toEqual({
 				ok: false,
-				error: { code: "endpoint_stale", message: "session endpoint authority is incomplete" },
+				error: {
+					code: "operator_control_unsupported",
+					message: "session host does not publish operator control authority",
+				},
 			});
-			expect(requests).toHaveLength(1);
+			expect(requests).toHaveLength(2);
 
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
-				endpointGeneration: 3,
+				endpointGeneration: 4,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 				lifecycleRequestId,
@@ -3806,7 +4817,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: { code: "unavailable", message: "broker publication is unavailable" },
 			});
-			expect(requests).toHaveLength(1);
+			expect(requests).toHaveLength(2);
 		} finally {
 			setPublicationObservationForTest(broker, undefined);
 			server.stop(true);

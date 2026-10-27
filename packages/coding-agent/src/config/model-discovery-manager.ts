@@ -100,6 +100,16 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		const state = this.#states.get(provider);
 		return state === undefined ? undefined : this.#snapshot(state);
 	}
+
+	/** Retain accepted discovery evidence for unchanged providers during a local reload. */
+	retainStatesFrom(source: ModelDiscoveryManager<TProvider>, providers: ReadonlySet<string>): void {
+		for (const provider of this.#providers) {
+			if (!providers.has(provider.provider)) continue;
+			const state = source.#states.get(provider.provider);
+			if (state) this.#states.set(provider.provider, this.#snapshot(state));
+		}
+	}
+
 	invalidate(provider: string): void {
 		this.#invalidate(provider);
 		this.#states.delete(provider);
@@ -222,11 +232,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 					? result.stale
 						? "cached"
 						: "ok"
-					: result.fetched
+					: result.fetched ||
+							(result.cacheFresh && result.cacheAuthoritative && result.dynamicModelIds?.length === 0)
 						? "empty"
-						: // No fetch happened (non-authoritative retry backoff, or an
-							// ineligible cache) and no eligible row served models: the
-							// provider is unvalidated, not authoritatively empty.
+						: // No fetch happened and no fresh authoritative empty row
+							// attested to this result, so the provider is unvalidated.
 							"unavailable";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,

@@ -23,6 +23,7 @@
  * massage shapes the LLM almost got right.
  */
 import { structuredCloneJSON } from "@gajae-code/utils";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import type { ZodType } from "zod/v4";
 import type { $ZodIssue as ZodIssue } from "zod/v4/core";
 import type { RawArgumentRejectionCode, RawArgumentRejectionDetail, Tool, ToolCall } from "../types";
@@ -953,12 +954,17 @@ const MAX_COERCION_PASSES = 5;
 export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["arguments"] {
 	const tool = tools.find(t => t.name === toolCall.name);
 	if (!tool) {
-		throw new Error(`Tool "${toolCall.name}" not found`);
+		throw markDesignedError(new Error(`Tool "${toolCall.name}" not found`));
 	}
 	return validateToolArguments(tool, toolCall);
 }
 
 const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> = {
+	"ask-question-body-required": "ask question bodies must contain non-whitespace text; remove empty extra questions",
+	"ask-deep-interview-metadata-required":
+		"active deep-interview questions require structured deepInterview metadata; question prose and workflowGate do not record an answer",
+	"ask-deep-interview-single-question-required":
+		"active deep-interview asks require exactly one question; include metadata on that question, never as an extra question",
 	"ask-deep-interview-question-body-required":
 		"deep-interview question bodies must contain a specific question, not a placeholder",
 	"ask-intent-review-requires-positive-round":
@@ -1021,11 +1027,11 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 			typeof code === "string" && Object.hasOwn(RAW_ARGUMENT_REJECTION_MESSAGES, code)
 				? RAW_ARGUMENT_REJECTION_MESSAGES[code as RawArgumentRejectionCode]
 				: undefined;
-		if (!correction) throw new Error(base);
+		if (!correction) throw markDesignedError(new Error(base));
 		// Detail is only echoed alongside authority-controlled guidance, and only
 		// after clamping — the keys themselves come from the rejected payload.
 		const detail = rawValidation.detail ? formatRejectionDetail(rawValidation.detail) : undefined;
-		throw new Error(detail ? `${base}; ${correction}; ${detail}` : `${base}; ${correction}`);
+		throw markDesignedError(new Error(detail ? `${base}; ${correction}; ${detail}` : `${base}; ${correction}`));
 	}
 	const rawArgs = rawValidation?.outcome === "accept" ? rawValidation.arguments : originalArgs;
 	const ctx = getValidationContext(tool);
@@ -1076,5 +1082,5 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 		toolCall.name
 	}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(receivedArgs, null, 2)}`;
 
-	throw new Error(errorMessage);
+	throw markDesignedError(new Error(errorMessage));
 }

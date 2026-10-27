@@ -1,4 +1,4 @@
-import { getMCPConfigPath } from "@gajae-code/utils";
+import { getMCPConfigPath, sanitizeDisplayLine } from "@gajae-code/utils";
 import { listPrompts, listResources, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
@@ -9,6 +9,7 @@ import {
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
 import { MCPManager } from "../../runtime-mcp/manager";
+import { nativeMcpSource } from "../../runtime-mcp/project-host-values";
 import { getSmitheryApiKey } from "../../runtime-mcp/smithery-auth";
 import { searchSmitheryRegistry } from "../../runtime-mcp/smithery-registry";
 import type { MCPServerConfig, MCPServerConnection } from "../../runtime-mcp/types";
@@ -17,6 +18,14 @@ import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from
 import { commandConsumed, errorMessage, parseNamedScopeArgs, parseSubcommand, usage } from "./parse";
 
 type AcpMcpScope = "user" | "project";
+
+/**
+ * One terminal row for an untrusted MCP server or tool name.
+ * Ordinary names are unchanged. Controls, OSC, and line breaks are not.
+ */
+export function mcpTerminalLabel(value: string): string {
+	return sanitizeDisplayLine(value);
+}
 
 interface ParsedMcpAddArgs {
 	name?: string;
@@ -199,6 +208,7 @@ async function withPreparedMcpConnection<T>(
 	runtime: SlashCommandRuntime,
 	name: string,
 	config: MCPServerConfig,
+	scope: AcpMcpScope,
 	fn: (connection: MCPServerConnection) => Promise<T>,
 ): Promise<T> {
 	const manager = new MCPManager(runtime.cwd, null, {
@@ -207,7 +217,9 @@ async function withPreparedMcpConnection<T>(
 	// Auth storage must be wired in before the prepared lease so OAuth-backed
 	// servers can refresh credentials and inject Authorization headers.
 	manager.setAuthStorage(runtime.session.modelRegistry.authStorage);
-	return manager.withPreparedLease(name, config, lease => fn(lease.connectionForLease()));
+	return manager.withPreparedLease(name, config, lease => fn(lease.connectionForLease()), {
+		source: nativeMcpSource(scope, getMCPConfigPath(scope, runtime.cwd)),
+	});
 }
 
 async function collectConnectedMcpLines(
@@ -218,9 +230,9 @@ async function collectConnectedMcpLines(
 	if (servers.length === 0) return undefined;
 
 	const lines: string[] = [];
-	for (const { name, config } of servers) {
+	for (const { name, config, scope } of servers) {
 		try {
-			const collected = await withPreparedMcpConnection(runtime, name, config, connection =>
+			const collected = await withPreparedMcpConnection(runtime, name, config, scope, connection =>
 				collect(name, connection),
 			);
 			lines.push(...collected);
@@ -265,10 +277,10 @@ async function handleTestCommand(rest: string, runtime: SlashCommandRuntime): Pr
 	if (!server) return usage(`Server "${name}" not found. Run /mcp list to see configured servers.`, runtime);
 
 	try {
-		return await withPreparedMcpConnection(runtime, name, server.config, async connection => {
+		return await withPreparedMcpConnection(runtime, name, server.config, server.scope, async connection => {
 			const tools = await listTools(connection);
 			const lines = [`Server "${name}" connected (${tools.length} tools).`];
-			for (const tool of tools) lines.push(`  - ${tool.name}`);
+			for (const tool of tools) lines.push(`  - ${mcpTerminalLabel(tool.name)}`);
 			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		});
@@ -394,7 +406,7 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 					} else {
 						location = (config as { command: string }).command;
 					}
-					return `${name} | ${type} | ${status} | ${location ?? "(unknown)"} [${scope}]`;
+					return `${mcpTerminalLabel(name)} | ${type} | ${status} | ${location ?? "(unknown)"} [${scope}]`;
 				})
 				.join("\n"),
 		);

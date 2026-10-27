@@ -9,7 +9,27 @@ export {
 	type UnknownModelProfileDetails,
 	UnknownModelProfileError,
 } from "../config/model-profile-contract";
+export {
+	PROJECT_PROGRESS_SNAPSHOT_SCHEMA,
+	type ProgressSnapshotAttention,
+	type ProgressSnapshotStory,
+	type ProgressSnapshotTodo,
+	type ProgressSnapshotWorkflow,
+	type ProjectProgressSnapshot,
+} from "../progress/progress-contract";
+export type {
+	QueuedInputAdmission,
+	QueuedInputDelivery,
+	QueuedInputExecution,
+	QueuedInputQueuePolicy,
+	QueuedInputRemovalReason,
+	QueuedInputSubmission,
+	QueuedInputTerminal,
+	SendUserMessageOptions,
+	TrackedSendUserMessageOptions,
+} from "../session/agent-session";
 export * as bus from "./bus";
+export * from "./diagnostics/observe-broker";
 export * as host from "./host";
 export * as lifecycle from "./lifecycle";
 export * as mcp from "./mcp";

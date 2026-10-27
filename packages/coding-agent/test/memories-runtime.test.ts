@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { estimateTextTokensHeuristic } from "@gajae-code/agent-core/compaction";
 import type { Model } from "@gajae-code/ai";
 import * as ai from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -13,6 +14,7 @@ import {
 import * as memoryStorage from "@gajae-code/coding-agent/memories/storage";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend";
 import { getAgentDbPath, Snowflake } from "@gajae-code/utils";
+import fc from "fast-check";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 interface SessionFixture {
@@ -34,13 +36,123 @@ async function makeTempDir(prefix: string): Promise<string> {
 	return dir;
 }
 
-function createModel(id = "test-model"): Model {
+function createModel(
+	id = "test-model",
+	reasoning = false,
+	limits: { maxTokens?: number; contextWindow?: number } = { contextWindow: 32_000 },
+): Model {
 	return {
 		provider: "openai",
 		id,
 		name: id,
-		contextWindow: 32_000,
+		reasoning,
+		...(reasoning ? { thinking: { mode: "effort", minLevel: ai.Effort.Low, maxLevel: ai.Effort.High } } : {}),
+		...(limits.contextWindow !== undefined ? { contextWindow: limits.contextWindow } : {}),
+		...(limits.maxTokens !== undefined ? { maxTokens: limits.maxTokens } : {}),
 	} as Model;
+}
+
+function consolidatedResponse(): ai.AssistantMessage {
+	return createAssistantMessage(JSON.stringify({ memory_md: "# Memory", memory_summary: "Summary", skills: [] }));
+}
+
+/** Run phase 1 + phase 2 for one rollout and return the phase 2 request. */
+async function runPhase2(
+	fx: SessionFixture,
+	threadId: string,
+	phase2Response: ai.AssistantMessage,
+	rawMemory?: string,
+): Promise<{ input: string; options: ai.SimpleStreamOptions | undefined }> {
+	await writeRollout(fx, threadId);
+	const stage1 = rawMemory
+		? createAssistantMessage(
+				JSON.stringify({ rollout_summary: `Summary ${threadId}`, rollout_slug: threadId, raw_memory: rawMemory }),
+			)
+		: stage1Response(threadId);
+	const completeSpy = vi
+		.spyOn(ai, "completeSimple")
+		.mockResolvedValueOnce(stage1)
+		.mockResolvedValueOnce(phase2Response);
+
+	startMemoryStartupTask({
+		session: fx.session,
+		settings: fx.settings,
+		modelRegistry: fx.modelRegistry,
+		agentDir: fx.agentDir,
+		taskDepth: 0,
+	});
+
+	await waitFor(() => expect(completeSpy).toHaveBeenCalledTimes(2));
+	const [, context, options] = completeSpy.mock.calls[1] ?? [];
+	const content = context?.messages[0]?.content;
+	const input = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
+	return { input, options };
+}
+
+async function seedPhase2Thread(
+	fx: SessionFixture,
+	threadId: string,
+	rolloutSlug: string | null,
+	summary: string,
+): Promise<void> {
+	const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+	memoryStorage.upsertThreads(db, [
+		{
+			id: threadId,
+			updatedAt: 100,
+			rolloutPath: path.join(fx.sessionDir, "seed.jsonl"),
+			cwd: fx.session.sessionManager.getCwd(),
+			sourceKind: "cli",
+		},
+	]);
+	db.prepare(
+		"INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, generated_at) VALUES (?, ?, ?, ?, ?, ?)",
+	).run(threadId, 100, `raw ${summary}`, summary, rolloutSlug, 100);
+	memoryStorage.enqueueGlobalWatermark(db, 100, fx.session.sessionManager.getCwd(), {
+		forceDirtyWhenNotAdvanced: true,
+	});
+	memoryStorage.closeMemoryDb(db);
+}
+
+function legacyRolloutStem(threadId: string, rolloutSlug: string | null): string {
+	if (!rolloutSlug) return threadId;
+	const normalized = rolloutSlug
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "_")
+		.replace(/_+$/g, "")
+		.slice(0, 20);
+	if (!normalized) return threadId;
+	return `${threadId}-${normalized}`;
+}
+
+async function writeRollout(fx: SessionFixture, threadId: string): Promise<void> {
+	const rows = [
+		{ type: "session", id: threadId, cwd: fx.agentDir },
+		{ type: "message", message: { role: "user", content: "summarize this rollout" } },
+	];
+	await fs.writeFile(
+		path.join(fx.sessionDir, `${threadId}.jsonl`),
+		`${rows.map(row => JSON.stringify(row)).join("\n")}\n`,
+	);
+}
+
+function stage1Response(slug: string): ai.AssistantMessage {
+	return createAssistantMessage(
+		JSON.stringify({ rollout_summary: `Summary ${slug}`, rollout_slug: slug, raw_memory: `Raw ${slug}` }),
+	);
+}
+
+function readGlobalJob(fx: SessionFixture): { status: string; last_error: string | null } | undefined {
+	const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+	try {
+		return db
+			.prepare("SELECT status, last_error FROM jobs WHERE kind = 'memory_consolidate_global' AND job_key = ?")
+			.get(`global:${fx.session.sessionManager.getCwd()}`) as
+			| { status: string; last_error: string | null }
+			| undefined;
+	} finally {
+		memoryStorage.closeMemoryDb(db);
+	}
 }
 
 function createModelRegistry(model: Model): any {
@@ -51,7 +163,10 @@ function createModelRegistry(model: Model): any {
 	};
 }
 
-async function createFixture(overrides?: Partial<Record<string, unknown>>): Promise<SessionFixture> {
+async function createFixture(
+	overrides?: Partial<Record<string, unknown>>,
+	model = createModel(),
+): Promise<SessionFixture> {
 	const agentDir = await makeTempDir("memories-runtime-agent");
 	const sessionDir = path.join(agentDir, "sessions");
 	await fs.mkdir(sessionDir, { recursive: true });
@@ -66,7 +181,6 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 		"memories.phase2HeartbeatSeconds": 1,
 		...(overrides ?? {}),
 	});
-	const model = createModel();
 	const modelRegistry = createModelRegistry(model);
 	const refreshBaseSystemPrompt = vi.fn(async () => undefined);
 	const session = {
@@ -176,25 +290,22 @@ describe("memories runtime", () => {
 		];
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
-		vi.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce(
-				createAssistantMessage(
-					JSON.stringify({
-						rollout_summary: "Rollout summary A",
-						rollout_slug: "thread-a-rollout",
-						raw_memory: "Raw memory A",
-					}),
-				),
-			)
-			.mockResolvedValueOnce(
-				createAssistantMessage(
-					JSON.stringify({
-						memory_md: "# Memory\n\nConsolidated body",
-						memory_summary: "Consolidated summary",
-						skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
-					}),
-				),
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			expect(options?.reasoning).toBeUndefined();
+			return createAssistantMessage(
+				completeSpy.mock.calls.length === 1
+					? JSON.stringify({
+							rollout_summary: "Rollout summary A",
+							rollout_slug: "thread-a-rollout",
+							raw_memory: "Raw memory A",
+						})
+					: JSON.stringify({
+							memory_md: "# Memory\n\nConsolidated body",
+							memory_summary: "Consolidated summary",
+							skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
+						}),
 			);
+		});
 
 		startMemoryStartupTask({
 			session: fx.session,
@@ -220,8 +331,144 @@ describe("memories runtime", () => {
 		await waitFor(() => {
 			expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		});
-		expect(ai.completeSimple).toHaveBeenCalled();
-		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
+		expect(completeSpy).toHaveBeenCalledTimes(2);
+	});
+
+	test("keeps supported reasoning efforts for thinking-capable memory models", async () => {
+		const fx = await createFixture(undefined, createModel("reasoning-model", true));
+		const rolloutPath = path.join(fx.sessionDir, "thread-reasoning.jsonl");
+		await fs.writeFile(
+			rolloutPath,
+			`${JSON.stringify({ type: "session", id: "thread-reasoning", cwd: fx.agentDir })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "summarize this rollout" } })}\n`,
+		);
+
+		const completeSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({ rollout_summary: "Summary", rollout_slug: "reasoning", raw_memory: "Raw" }),
+				),
+			)
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({ memory_md: "# Memory\n\nMerged", memory_summary: "Summary", skills: [] }),
+				),
+			);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => expect(completeSpy).toHaveBeenCalledTimes(2));
+		expect(completeSpy.mock.calls[0]?.[2]).toMatchObject({ reasoning: ai.Effort.Low });
+		expect(completeSpy.mock.calls[1]?.[2]).toMatchObject({ reasoning: ai.Effort.Low });
+	});
+
+	test.each([
+		{ maxTokens: 128_000, expected: 64_000 },
+		{ maxTokens: 16_000, expected: 16_000 },
+	])("phase2 response budget is the model limit capped at 64k on a large context (model $maxTokens)", async ({
+		maxTokens,
+		expected,
+	}) => {
+		const fx = await createFixture(
+			undefined,
+			createModel("budget-model", true, { maxTokens, contextWindow: 1_000_000 }),
+		);
+		const phase2 = await runPhase2(fx, "budget", consolidatedResponse());
+		expect(phase2.options?.maxTokens).toBe(expected);
+	});
+
+	test("phase2 leaves the response budget to the provider default when no limit is known", async () => {
+		const fx = await createFixture(undefined, createModel("unknown-model", false, { contextWindow: undefined }));
+		const phase2 = await runPhase2(fx, "unknown", consolidatedResponse());
+		expect(phase2.options?.maxTokens).toBeUndefined();
+	});
+
+	test("phase2 keeps input + response inside a context window shared with the output limit", async () => {
+		// groq/mistral-saba-24b shape: maxTokens === contextWindow.
+		const fx = await createFixture(
+			undefined,
+			createModel("small-model", false, { maxTokens: 32_768, contextWindow: 32_768 }),
+		);
+		const phase2 = await runPhase2(fx, "small", consolidatedResponse());
+		const maxTokens = phase2.options?.maxTokens ?? 0;
+		expect(estimateTextTokensHeuristic(phase2.input) + maxTokens).toBeLessThanOrEqual(32_768);
+		expect(maxTokens).toBeGreaterThan(8_192);
+	});
+
+	test.each([
+		{ mode: "effort" as const, thinkingReserve: 0 },
+		{ mode: "budget" as const, thinkingReserve: ai.ANTHROPIC_THINKING[ai.Effort.Low] },
+	])("phase2 shrinks oversized inputs to fit a small context window ($mode thinking)", async ({
+		mode,
+		thinkingReserve,
+	}) => {
+		const model = createModel("small-reasoning-model", true, { maxTokens: 32_768, contextWindow: 32_768 });
+		model.thinking = { mode, minLevel: ai.Effort.Low, maxLevel: ai.Effort.High };
+		const fx = await createFixture(undefined, model);
+		const phase2 = await runPhase2(fx, "oversized", consolidatedResponse(), "x".repeat(200_000));
+
+		const maxTokens = phase2.options?.maxTokens ?? 0;
+		expect(phase2.input).toContain("...[truncated]...");
+		expect(estimateTextTokensHeuristic(phase2.input) + maxTokens + thinkingReserve).toBeLessThanOrEqual(32_768);
+		expect(maxTokens).toBeGreaterThanOrEqual(8_192);
+	});
+
+	test("phase2 reports a reasoning-only response as empty text instead of a JSON parse failure", async () => {
+		const fx = await createFixture(
+			undefined,
+			createModel("thinking-only-model", true, { maxTokens: 128_000, contextWindow: 1_000_000 }),
+		);
+		const thinkingOnly = createAssistantMessage("");
+		thinkingOnly.content = [{ type: "thinking", thinking: "planning the rewrite" }];
+		thinkingOnly.usage.output = 1_200;
+		await runPhase2(fx, "thinking-only", thinkingOnly);
+
+		await waitFor(() => {
+			expect(readGlobalJob(fx)?.last_error).toBe(
+				"Error: phase2 returned no text (stopReason=stop, 1200 output tokens, 1 thinking blocks)",
+			);
+		});
+	});
+
+	test("phase2 reports a length-truncated response as truncation and keeps prior memory", async () => {
+		const fx = await createFixture(
+			undefined,
+			createModel("truncating-model", true, { maxTokens: 128_000, contextWindow: 1_000_000 }),
+		);
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await fs.mkdir(memoryRoot, { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "MEMORY.md"), "prior memory");
+		await writeRollout(fx, "thread-truncated");
+
+		const truncated = createAssistantMessage('{"memory_md": "# Memory\\n\\nhalf-writ');
+		truncated.stopReason = "length";
+		truncated.usage.output = 64_000;
+		vi.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(stage1Response("truncated"))
+			.mockResolvedValueOnce(truncated);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => {
+			const job = readGlobalJob(fx);
+			expect(job?.status).toBe("error");
+			expect(job?.last_error).toBe(
+				"Error: phase2 output truncated at the max output token limit (64000 output tokens)",
+			);
+		});
+		expect(await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).toBe("prior memory");
 	});
 
 	test("falls back to the most recently used model instead of registry order when no role or session model is set", async () => {
@@ -397,6 +644,178 @@ describe("memories runtime", () => {
 			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
 			expect(raw.indexOf("## thread-b")).toBeLessThan(raw.indexOf("## thread-a"));
 		});
+	});
+
+	test("phase2 rollout summary thread id cannot write outside summaries", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		const summariesDir = path.join(memoryRoot, "rollout_summaries");
+		const outsideDir = path.join(fx.agentDir, "outside-sink");
+		await fs.mkdir(outsideDir, { recursive: true });
+		const sentinel = path.join(outsideDir, "do-not-delete.md");
+		await fs.writeFile(sentinel, "keep");
+		const threadId = path.relative(summariesDir, path.join(outsideDir, "evil"));
+		expect(threadId.includes("..")).toBe(true);
+		expect(path.isAbsolute(threadId)).toBe(false);
+
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
+		await seedPhase2Thread(fx, threadId, null, "escaped-summary");
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(async () => {
+			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+			expect(raw).toContain("escaped-summary");
+		});
+		expect(await Bun.file(path.join(outsideDir, "evil.md")).exists()).toBe(false);
+		expect(await fs.readFile(sentinel, "utf8")).toBe("keep");
+		const written = await fs.readdir(summariesDir).catch(() => [] as string[]);
+		expect(written.every(name => !name.includes("/") && !name.includes("\\"))).toBe(true);
+	});
+
+	test("phase2 still allows a plain thread id rollout summary", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		const summariesDir = path.join(memoryRoot, "rollout_summaries");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
+		await seedPhase2Thread(fx, "thread-ok", null, "plain-summary");
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(async () => {
+			const text = await fs.readFile(path.join(summariesDir, "thread-ok.md"), "utf8");
+			expect(text).toContain("thread_id: thread-ok");
+			expect(text).toContain("plain-summary");
+		});
+	});
+
+	test.skipIf(path.sep === "\\")(
+		"phase2 prunes an existing in-directory summary name that contains a backslash",
+		async () => {
+			const fx = await createFixture();
+			const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+			const summariesDir = path.join(memoryRoot, "rollout_summaries");
+			await fs.mkdir(summariesDir, { recursive: true });
+			const backslashName = "stale\\name.md";
+			await fs.writeFile(path.join(summariesDir, backslashName), "stale-backslash");
+			await fs.writeFile(path.join(summariesDir, "old.md"), "stale-plain");
+			vi.spyOn(ai, "completeSimple").mockResolvedValue(
+				createAssistantMessage(
+					JSON.stringify({
+						memory_md: "# Memory\n\nMerged",
+						memory_summary: "Merged summary",
+						skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+					}),
+				),
+			);
+			await seedPhase2Thread(fx, "thread-ok", null, "plain-summary");
+			startMemoryStartupTask({
+				session: fx.session,
+				settings: fx.settings,
+				modelRegistry: fx.modelRegistry,
+				agentDir: fx.agentDir,
+				taskDepth: 0,
+			});
+
+			await waitFor(async () => {
+				const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+				expect(raw).toContain("plain-summary");
+				const names = await fs.readdir(summariesDir);
+				expect(names.includes("thread-ok.md")).toBe(true);
+				expect(names.includes("old.md")).toBe(false);
+				expect(names.includes(backslashName)).toBe(false);
+			});
+		},
+	);
+
+	test("property: rollout summary filename containment seed 468", async () => {
+		const memories = await import("@gajae-code/coding-agent/memories");
+		const destination = (
+			memories as {
+				rolloutSummaryDestinationForTesting?: (
+					summariesDir: string,
+					threadId: string,
+					rolloutSlug: string | null,
+				) => string | undefined;
+			}
+		).rolloutSummaryDestinationForTesting;
+		if (typeof destination !== "function") {
+			throw new Error("rollout summary destination seam missing");
+		}
+		const summariesDir = path.join(path.sep, "rollout-summaries-root");
+		const root = path.resolve(summariesDir);
+		const fixed: Array<[string, string | null]> = [
+			["../../../../outside/evil", null],
+			["../outside/evil", "Hello"],
+			["/outside/evil", null],
+			["foo/bar", null],
+			["foo\\bar", null],
+			["a\0b", null],
+			["..\\outside\\evil", "slug"],
+			["thread/../../outside", null],
+		];
+		const assertContained = (threadId: string, rolloutSlug: string | null): void => {
+			const target = destination(summariesDir, threadId, rolloutSlug);
+			const again = destination(summariesDir, threadId, rolloutSlug);
+			const stem = legacyRolloutStem(threadId, rolloutSlug);
+			const filename = `${stem}.md`;
+			const safe =
+				!filename.includes("/") &&
+				!filename.includes("\\") &&
+				!filename.includes("\0") &&
+				filename !== "." &&
+				filename !== ".." &&
+				path.basename(filename) === filename;
+			expect(target).toBe(again);
+			if (!safe) {
+				expect(target).toBeUndefined();
+				return;
+			}
+			const expected = path.resolve(root, filename);
+			expect(target).toBe(expected);
+			expect(path.basename(expected)).toBe(filename);
+			const relative = path.relative(root, expected);
+			expect(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(false);
+			expect(relative).toBe(filename);
+		};
+		expect(fixed.length).toBe(8);
+		for (const [threadId, rolloutSlug] of fixed) assertContained(threadId, rolloutSlug);
+		fc.assert(
+			fc.property(
+				fc.string({ maxLength: 32 }),
+				fc.option(fc.string({ maxLength: 24 }), { nil: null }),
+				(threadId, rolloutSlug) => {
+					assertContained(threadId, rolloutSlug);
+				},
+			),
+			{ seed: 468, numRuns: 64 },
+		);
 	});
 
 	test("phase2 empty-input cleanup removes consolidated files and skills dir", async () => {

@@ -27,7 +27,9 @@ const OK_RESULT: KernelExecuteResult = {
 };
 
 class FakeKernel {
+	id = `fake-kernel-${Math.random().toString(36).slice(2, 9)}`;
 	alive = true;
+	exitCode: number | null = null;
 	executeCalls: string[] = [];
 	shutdownCalls = 0;
 	shutdownResult: KernelShutdownResult = { confirmed: true };
@@ -45,11 +47,20 @@ class FakeKernel {
 	async shutdown(): Promise<KernelShutdownResult> {
 		this.shutdownCalls += 1;
 		this.alive = false;
+		// If shutdown is confirmed, set exitCode to 0 to indicate process exited.
+		// This matches the behavior of a real kernel where exitCode is set when process exits.
+		if (this.shutdownResult.confirmed && this.exitCode === null) {
+			this.exitCode = 0;
+		}
 		return this.shutdownResult;
 	}
 
 	isAlive(): boolean {
 		return this.alive;
+	}
+
+	getExitCode(): number | null {
+		return this.exitCode;
 	}
 }
 
@@ -102,7 +113,12 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
 	]);
 }
 
-function countAbortListeners(signal: AbortSignal): { readonly count: () => number; readonly restore: () => void } {
+type AbortListenerCounter = {
+	readonly count: () => number;
+	readonly restore: () => void;
+};
+
+function countAbortListeners(signal: AbortSignal): AbortListenerCounter {
 	let count = 0;
 	const originalAdd = signal.addEventListener.bind(signal);
 	const originalRemove = signal.removeEventListener.bind(signal);
@@ -357,20 +373,27 @@ describe("python eval lifecycle red-team", () => {
 	);
 
 	it(
-		"settles an in-flight cell during shutdown without leaked abort listeners",
+		"settles an in-flight cell during shutdown and isolates a replacement from late cancellation",
 		async () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 			const controller = new AbortController();
-			const listeners = countAbortListeners(controller.signal);
+			let listeners: AbortListenerCounter | undefined;
 			const kernelStarted = Promise.withResolvers<void>();
+			let stoppedKernel: PythonKernel | undefined;
 			let shutdown: (() => Promise<KernelShutdownResult>) | undefined;
 			let execution: Promise<PythonResult> | undefined;
 			try {
 				PythonKernel.start = async () => {
 					try {
 						const kernel = await originalStart({ cwd: tempDir.path() });
+						stoppedKernel ??= kernel;
 						shutdown = () => kernel.shutdown({ timeoutMs: 100 });
+						const execute = kernel.execute.bind(kernel);
+						kernel.execute = (code, options) => {
+							if (!listeners && options?.signal) listeners = countAbortListeners(options.signal);
+							return execute(code, options);
+						};
 						kernelStarted.resolve();
 						return kernel;
 					} catch (error) {
@@ -392,16 +415,37 @@ describe("python eval lifecycle red-team", () => {
 				);
 				await kernelStarted.promise;
 				await waitForFile(executionReadyFile);
-				expect(listeners.count()).toBe(1);
-				if (!shutdown) throw new Error("Python kernel did not expose shutdown after startup");
+				expect(listeners?.count()).toBe(1);
+				if (!shutdown || !stoppedKernel) throw new Error("Python kernel did not expose shutdown after startup");
 
-				await shutdown();
-				await execution;
-				expect(listeners.count()).toBe(0);
+				expect(await shutdown()).toEqual({ confirmed: true });
+				expect(await settlesWithin(execution, CLEANUP_TIMEOUT_MS)).toBe(true);
+				const result = await execution;
+				expect(result.cancelled).toBe(true);
+				expect(result.exitCode).toBeUndefined();
+				expect(stoppedKernel.isAlive()).toBe(false);
+				expect(stoppedKernel.getExitCode()).not.toBeNull();
+				expect(listeners?.count()).toBe(0);
+
+				// A completed caller's composite signal must not cancel the replacement session.
+				const successorReadyFile = `${tempDir.path()}/successor-executing`;
+				const successorReleaseFile = `${tempDir.path()}/successor-release`;
+				execution = executePython(
+					`from pathlib import Path\nPath(${JSON.stringify(successorReadyFile)}).touch()\nimport time\nwhile not Path(${JSON.stringify(successorReleaseFile)}).exists():\n    time.sleep(0.01)\nprint('successor completed')`,
+					{ cwd: tempDir.path(), sessionId: "redteam-inflight-shutdown", kernelMode: "session" },
+				);
+				await waitForFile(successorReadyFile);
+				controller.abort();
+				await Bun.write(successorReleaseFile, "");
+				expect(await settlesWithin(execution, CLEANUP_TIMEOUT_MS)).toBe(true);
+				const successorResult = await execution;
+				expect(successorResult.cancelled).toBe(false);
+				expect(successorResult.exitCode).toBe(0);
+				expect(successorResult.output).toContain("successor completed");
 			} finally {
 				await shutdown?.().catch(() => undefined);
 				await execution?.catch(() => undefined);
-				listeners.restore();
+				listeners?.restore();
 			}
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
@@ -416,7 +460,9 @@ describe("python eval lifecycle red-team", () => {
 			const startup = Promise.withResolvers<void>();
 			const startupCalled = Promise.withResolvers<void>();
 			const kernel = new FakeKernel();
+			// Simulate a kernel that fails to shutdown cleanly (process still running)
 			kernel.shutdownResult = { confirmed: false };
+			kernel.exitCode = null; // No positive evidence process exited
 			let startupFinished = false;
 			let executionSettled = false;
 			PythonKernel.start = async () => {
@@ -453,7 +499,9 @@ describe("python eval lifecycle red-team", () => {
 			}
 			expect(startupFinished).toBe(true);
 			expect(kernel.shutdownCalls).toBe(1);
-			await disposeAllKernelSessions();
+			await expect(disposeAllKernelSessions()).rejects.toMatchObject({
+				name: "PythonKernelShutdownUnconfirmedError",
+			});
 			expect(kernel.shutdownCalls).toBe(2);
 			kernel.shutdownResult = { confirmed: true };
 			await disposeAllKernelSessions();
@@ -462,7 +510,7 @@ describe("python eval lifecycle red-team", () => {
 		LIFECYCLE_TEST_TIMEOUT_MS,
 	);
 
-	it("treats clean exit code 0 as confirmed and starts a fresh session instead of reinserting", async () => {
+	it("starts a fresh session after disposal instead of reusing the old kernel", async () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const firstKernel = new FakeKernel();
@@ -489,4 +537,20 @@ describe("python eval lifecycle red-team", () => {
 		expect(startCalls).toBe(2);
 		expect(secondKernel.executeCalls).toEqual(["print('after clean shutdown')"]);
 	});
+
+	it(
+		"confirms clean exit code zero from the real Python kernel process",
+		async () => {
+			using tempDir = TempDir.createSync("@gjc-python-kernel-exit-zero-");
+			const kernel = await originalStart({ cwd: tempDir.path() });
+			try {
+				expect(kernel.getExitCode()).toBeNull();
+				expect(await kernel.shutdown()).toEqual({ confirmed: true });
+				expect(kernel.getExitCode()).toBe(0);
+			} finally {
+				await kernel.shutdown();
+			}
+		},
+		LIFECYCLE_TEST_TIMEOUT_MS,
+	);
 });

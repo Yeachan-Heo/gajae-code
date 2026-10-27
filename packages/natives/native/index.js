@@ -18,31 +18,44 @@ nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
 export const ComputerController = nativeBindings.ComputerController;
+export const DiffStream = nativeBindings.DiffStream;
 export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
-export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
+export const NativeDiagnosticSnapshot = nativeBindings.NativeDiagnosticSnapshot;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
 export const NotificationServer = nativeBindings.NotificationServer;
+export const PowerAssertion = nativeBindings.PowerAssertion;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
 export const RecoveryFsFile = nativeBindings.RecoveryFsFile;
 export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
 export const Shell = nativeBindings.Shell;
+export const TtyWriter = nativeBindings.TtyWriter;
 
 // functions
+export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_17_2 = nativeBindings.__piNativesV0_17_2;
+export const __piNativesV0_19_0 = nativeBindings.__piNativesV0_19_0;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
+export const astMatch = nativeBindings.astMatch;
 export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExistingDirectoryIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const currentExecutablePath = nativeBindings.currentExecutablePath;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
+export const diagnosticSnapshotOpen = nativeBindings.diagnosticSnapshotOpen;
+export const diffLineRuns = nativeBindings.diffLineRuns;
 export const diffLines = nativeBindings.diffLines;
+export const diffWords = nativeBindings.diffWords;
+export const directoryCaseSensitive = nativeBindings.directoryCaseSensitive;
+export const editFindMatch = nativeBindings.editFindMatch;
+export const editParseApplyPatch = nativeBindings.editParseApplyPatch;
+export const editPatchApplyText = nativeBindings.editPatchApplyText;
+export const editSeekSequence = nativeBindings.editSeekSequence;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactReplacePath = nativeBindings.exactReplacePath;
@@ -52,6 +65,7 @@ export const exactSwapManagedLink = nativeBindings.exactSwapManagedLink;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const exactUnlinkDirect = nativeBindings.exactUnlinkDirect;
 export const exactUnlinkDirectDetached = nativeBindings.exactUnlinkDirectDetached;
+export const exactUnlinkOpenFile = nativeBindings.exactUnlinkOpenFile;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;
@@ -60,8 +74,6 @@ export const getSupportedLanguages = nativeBindings.getSupportedLanguages;
 export const getWorkProfile = nativeBindings.getWorkProfile;
 export const glob = nativeBindings.glob;
 export const grep = nativeBindings.grep;
-export const h01FindBestFuzzyMatch = nativeBindings.h01FindBestFuzzyMatch;
-export const h02ScoreSequenceFuzzy = nativeBindings.h02ScoreSequenceFuzzy;
 export const h06FormatHashLines = nativeBindings.h06FormatHashLines;
 export const hasMatch = nativeBindings.hasMatch;
 export const highlightCode = nativeBindings.highlightCode;
@@ -86,19 +98,25 @@ export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
 export const openRecoveryFsRoot = nativeBindings.openRecoveryFsRoot;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
+export const pdfToMarkdown = nativeBindings.pdfToMarkdown;
 export const probeWindowsJobMemory = nativeBindings.probeWindowsJobMemory;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
+export const rasterizeSvg = nativeBindings.rasterizeSvg;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
 export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoReplacePath;
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;
 export const renameNoReplacePath = nativeBindings.renameNoReplacePath;
 export const renameNoReplacePathAsync = nativeBindings.renameNoReplacePathAsync;
+export const renderMermaidAscii = nativeBindings.renderMermaidAscii;
 export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermissions;
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;
+export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
 export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
+export const snapshotEmptyDirectory = nativeBindings.snapshotEmptyDirectory;
+export const structuredPatchHunks = nativeBindings.structuredPatchHunks;
 export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
 export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;
@@ -108,6 +126,8 @@ export const verifyOwnerOnlyPathSecurity = nativeBindings.verifyOwnerOnlyPathSec
 export const verifyOwnerOnlyPathSecurityExpected = nativeBindings.verifyOwnerOnlyPathSecurityExpected;
 export const visibleWidth = nativeBindings.visibleWidth;
 export const visibleWidths = nativeBindings.visibleWidths;
+export const walkerPoolStatus = nativeBindings.walkerPoolStatus;
+export const windowsOrdinalCaseFold = nativeBindings.windowsOrdinalCaseFold;
 export const wrapTextWithAnsi = nativeBindings.wrapTextWithAnsi;
 
 // string/numeric enums (napi-rs string_enum produces TS-only const enum)
@@ -118,6 +138,10 @@ export const AstMatchStrictness = {
 	Relaxed: "relaxed",
 	Signature: "signature",
 	Template: "template",
+};
+export const DiffSide = {
+	Old: "Old",
+	New: "New",
 };
 export const Ellipsis = {
 	Unicode: 0,

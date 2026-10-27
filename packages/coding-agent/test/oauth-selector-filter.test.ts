@@ -221,10 +221,94 @@ describe("OAuth selector filtering", () => {
 				},
 			);
 
+			// Login defaults to the first selectable recovery action; move back to
+			// the disabled account to verify it still cannot be selected.
+			selector.handleInput("\x1b[A");
 			selector.handleInput("\n");
 
 			expect(selected).toEqual([]);
 			expect(renderedText(selector)).toContain("This account is not selectable.");
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
+	test("a disabled OAuth account triggers re-login when selected", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const relogins: number[] = [];
+		let selector: OAuthSelectorComponent | undefined;
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "expired-refresh",
+					expires: Date.now() - 60_000,
+					accountId: "expired-account",
+					email: "expired@example.com",
+				},
+			]);
+			const credential = authStorage.listCredentialInventory("anthropic")[0];
+			if (!credential) throw new Error("Expected OAuth credential fixture");
+			expect(authStorage.disableCredentialById(credential.id, "oauth refresh failed: invalid_grant")).toBe(true);
+
+			selector = new OAuthSelectorComponent(
+				"login",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onReloginAccount: (id: number) => {
+						relogins.push(id);
+					},
+				},
+			);
+
+			selector.handleInput("\n");
+
+			expect(relogins).toEqual([credential.id]);
+			expect(renderedText(selector)).toContain(`disabled: oauth refresh failed: invalid_grant`);
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
+	test("a selectable OAuth account remains the default login choice", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const selected: unknown[] = [];
+		let selector: OAuthSelectorComponent | undefined;
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "active-access",
+					refresh: "active-refresh",
+					expires: Date.now() + 60_000,
+					accountId: "active-account",
+					email: "active@example.com",
+				},
+			]);
+			const credential = authStorage.listCredentialInventory("anthropic")[0];
+			if (!credential) throw new Error("Expected OAuth credential fixture");
+
+			selector = new OAuthSelectorComponent(
+				"login",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAccountSelect: value => {
+						selected.push(value);
+					},
+					onAddAccount: () => {},
+				},
+			);
+
+			selector.handleInput("\n");
+
+			expect(selected).toEqual([{ kind: "id", value: String(credential.id) }]);
 		} finally {
 			selector?.dispose();
 			authStorage.close();
@@ -272,5 +356,61 @@ describe("OAuth selector filtering", () => {
 		selector.handleInput("\n");
 
 		expect(selected).toEqual(["bizrouter"]);
+	});
+
+	test("logout can select and remove a disabled OAuth account", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const removed: unknown[][] = [];
+		let selector: OAuthSelectorComponent | undefined;
+
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "disabled-access",
+					refresh: "disabled-refresh",
+					expires: Date.now() - 60_000,
+					accountId: "disabled-account",
+					email: "disabled@example.com",
+				},
+			]);
+			const credential = authStorage.listCredentialInventory("anthropic")[0];
+			if (!credential) throw new Error("Expected OAuth credential fixture");
+			expect(authStorage.disableCredentialById(credential.id, "oauth refresh failed: invalid_grant")).toBe(true);
+
+			selector = new OAuthSelectorComponent(
+				"logout",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAccountRemove: targets => {
+						removed.push([...targets]);
+					},
+				},
+			);
+
+			// Disabled account should be listed and selectable for removal in logout mode
+			const rendered = renderedText(selector);
+			expect(rendered).toContain("disabled@example.com");
+
+			// Select the disabled account and request removal
+			selector.handleInput("\n");
+
+			expect(removed).toHaveLength(0); // Not removed yet, waiting for confirmation
+			expect(renderedText(selector)).toContain("Remove this account? Enter to confirm, Esc to cancel");
+
+			// Confirm removal
+			selector.handleInput("\n");
+
+			expect(removed).toHaveLength(1);
+			const [targets] = removed;
+			expect(targets).toHaveLength(1);
+			expect(String(JSON.stringify(targets))).toContain(`"id":${credential.id}`);
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
 	});
 });

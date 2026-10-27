@@ -11,6 +11,12 @@ import {
 	validateDeferredAskArguments,
 	validateDeferredTodoArguments,
 } from "./descriptor-validation";
+import {
+	evalToolDescriptionForSession,
+	renderTaskDescription,
+	searchToolDescriptionForSession,
+	taskParametersForSession,
+} from "./session-descriptions";
 import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
 import { ToolError } from "./tool-errors";
 
@@ -33,6 +39,11 @@ export interface ToolDescriptorMetadata {
 	readonly intent?: AgentTool<any, any, any>["intent"];
 	readonly parametersForSession?: (session?: ToolSession) => TSchema;
 	readonly parameters?: TSchema;
+	/**
+	 * Renders the description the loaded tool will report for this session. Tools whose prompt text
+	 * depends on session settings need it, or the advertised text changes on first load (#5992).
+	 */
+	readonly descriptionForSession?: (session: ToolSession) => string;
 	readonly description?: string;
 	readonly label?: string;
 	readonly customWireName?: string;
@@ -73,6 +84,9 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	#loader?: () => ToolDescriptorLoadResult;
 	#session?: ToolSession;
 	#loadPromise?: Promise<AgentTool<any, any, any>>;
+	#loadGeneration = 0;
+	#loadToken?: object;
+	#expectedCwd?: string;
 
 	constructor(
 		descriptor: ToolDescriptor,
@@ -86,9 +100,31 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		this.#session = session;
 	}
 
+	/** Clear a session-bound materialization after its owning session moves. */
+	invalidateForSessionMove(expectedCwd?: string): void {
+		this.#loadGeneration++;
+		this.#tool = undefined;
+		this.#loadPromise = undefined;
+		this.#loadToken = undefined;
+		this.#expectedCwd = expectedCwd;
+		if (!this.#loader && this.#session) {
+			const session = this.#session;
+			this.#loader = () => this.descriptor.load(session);
+		}
+	}
+
 	async #get(): Promise<AgentTool<any, any, any>> {
+		const sessionCwd = this.#session?.cwd;
+		if (this.#expectedCwd !== undefined && sessionCwd !== this.#expectedCwd) {
+			throw new ToolError(
+				`Tool "${this.descriptor.metadata.name}" session cwd changed outside a committed move (expected ${this.#expectedCwd}, got ${sessionCwd ?? "unknown"})`,
+			);
+		}
 		if (this.#tool) return this.#tool;
 		if (!this.#loadPromise) {
+			const generation = this.#loadGeneration;
+			const token = {};
+			this.#loadToken = token;
 			const load = this.#loader;
 			this.#loadPromise = Promise.resolve()
 				.then(() => {
@@ -97,11 +133,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 				})
 				.then(tool => {
 					if (!tool) throw new ToolError(`Tool "${this.descriptor.metadata.name}" failed to load`);
-					this.#tool = tool;
+					if (generation === this.#loadGeneration && this.#loadToken === token) this.#tool = tool;
 					return tool;
 				})
 				.catch(error => {
-					this.#loadPromise = undefined;
+					if (generation === this.#loadGeneration && this.#loadToken === token) {
+						this.#loadPromise = undefined;
+						this.#loadToken = undefined;
+					}
 					if (error instanceof ToolError) throw error;
 					throw new ToolError(
 						`Tool "${this.descriptor.metadata.name}" failed to load implementation: ${error instanceof Error ? error.message : String(error)}`,
@@ -112,17 +151,23 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		return this.#loadPromise;
 	}
 
-	/** Materialize this facade for contract tests without exposing it in production dispatch. */
-	async materializeForTests(): Promise<AgentTool<any, any, any>> {
-		return await this.#get();
-	}
+	/**
+	 * Resolve the underlying implementation. Pre-dispatch hooks (TTSR `astCondition`
+	 * matching) call this to read implementation-only members such as the matcher
+	 * hooks before the first `execute` would otherwise load the tool.
+	 * An arrow property (like `execute`) so session guard proxies can forward it
+	 * without losing access to the private loader state.
+	 */
+	readonly materialize = async (): Promise<AgentTool<any, any, any>> => await this.#get();
 
 	get name(): string {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
 	}
 	get description(): string {
+		const session = this.#session;
 		return (
 			this.#tool?.description ??
+			(session ? this.descriptor.metadata.descriptionForSession?.(session) : undefined) ??
 			this.descriptor.metadata.description ??
 			this.descriptor.presentation.summary ??
 			this.descriptor.metadata.summary ??
@@ -206,6 +251,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	get mode() {
 		return (this.#tool as any)?.mode;
 	}
+	get matcherDigest() {
+		const digest = this.#tool?.matcherDigest;
+		return digest ? digest.bind(this.#tool) : undefined;
+	}
+	get matcherEntries() {
+		const entries = this.#tool?.matcherEntries;
+		return entries ? entries.bind(this.#tool) : undefined;
+	}
 
 	readonly execute: AgentTool<any, any, any>["execute"] = async (...args) => {
 		const tool = await this.#get();
@@ -257,6 +310,7 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "ast_grep") return Boolean(session.settings.get("astGrep.enabled"));
 	if (name === "ast_edit") return Boolean(session.settings.get("astEdit.enabled"));
 	if (name === "render_mermaid") return Boolean(session.settings.get("renderMermaid.enabled"));
+	if (name === "report_issue") return Boolean(session.settings.get("reportIssue.enabled"));
 	if (name === "web_search") return Boolean(session.settings.get("web_search.enabled"));
 	if (name === "search_tool_bm25") return context.discoveryActive ?? resolveDiscoveryActive(session);
 	if (name === "calc") return Boolean(session.settings.get("calc.enabled"));
@@ -338,10 +392,14 @@ const loaders: Record<string, Loader> = {
 				cwd: session.cwd,
 				settings: session.settings,
 				getCwd: () => session.cwd,
+				getSessionFile: () => session.getSessionFile(),
 				getSessionId: () => session.getSessionId?.() ?? null,
 				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
-					session.registerSessionCleanup?.(cleanup);
+					return session.registerSessionCleanup?.(cleanup);
 				},
+				assertEvalExecutionAllowed: () => session.assertEvalExecutionAllowed?.(),
+				trackEvalExecution: <T>(execution: Promise<T>, abortController: AbortController) =>
+					session.trackEvalExecution?.(execution, abortController) ?? execution,
 			}),
 		),
 	job: session => cached("job", () => import("./job")).then(module => module.JobTool.createIf(session)),
@@ -372,6 +430,8 @@ const loaders: Record<string, Loader> = {
 		cached("goal", () => import("../goals/tools/goal-tool")).then(module => new module.GoalTool(session)),
 	move_session: session =>
 		cached("move_session", () => import("./move-session")).then(module => new module.MoveSessionTool(session)),
+	report_issue: session =>
+		cached("report_issue", () => import("./report-issue")).then(module => new module.ReportIssueTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
@@ -393,6 +453,7 @@ function descriptor(spec: DescriptorSpec): ToolDescriptor {
 		inline: catalog?.inline ?? spec.inline,
 		rawArgumentValidation: spec.rawArgumentValidation,
 		parametersForSession: spec.parametersForSession,
+		descriptionForSession: spec.descriptionForSession,
 		intent: catalog?.intent ?? spec.intent,
 		description: catalog?.description ?? spec.description,
 		parameters: spec.parameters ?? (catalog?.parameters as TSchema | undefined),
@@ -463,8 +524,18 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		["skill", "Skill", "Chain into another available skill", "essential"],
 		["goal", "Goal", undefined, "essential"],
 		["move_session", "Move Session", undefined, "essential"],
+		["report_issue", "Report Issue", "Record a tool that behaved inconsistently with its description", "essential"],
 	];
 
+const sessionDescriptions: Readonly<Record<string, ToolDescriptorMetadata["descriptionForSession"]>> = {
+	eval: evalToolDescriptionForSession,
+	search: searchToolDescriptionForSession,
+	task: renderTaskDescription,
+};
+
+const sessionParameters: Readonly<Record<string, ToolDescriptorMetadata["parametersForSession"]>> = {
+	task: taskParametersForSession,
+};
 const descriptorRawArgumentValidations: Readonly<Record<string, ToolDescriptorMetadata["rawArgumentValidation"]>> = {
 	ask: validateDeferredAskArguments,
 	todo_write: validateDeferredTodoArguments,
@@ -487,7 +558,10 @@ const builtins = names
 					: undefined,
 			parameters: name === "ask" ? deferredAskParameters : undefined,
 			parametersForSession:
-				name === "ask" ? session => selectAskParameters(session?.getDeepInterviewAskStage?.()) : undefined,
+				name === "ask"
+					? session => selectAskParameters(session?.getDeepInterviewAskStage?.())
+					: sessionParameters[name],
+			descriptionForSession: sessionDescriptions[name],
 			rawArgumentValidation: descriptorRawArgumentValidations[name],
 			intent: deferredIntentPolicies[name],
 			loader: loaders[name],

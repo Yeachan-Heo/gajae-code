@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import * as Diff from "diff";
+import { getNativeDiffBindings } from "../../../internal/native-diff";
+
 import { ToolError } from "../../../tools/tool-errors";
 import type { JsStatusEvent } from "./types";
 
@@ -137,7 +138,18 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 			const fileA = resolvePath(ctx, rawA);
 			const fileB = resolvePath(ctx, rawB);
 			const [a, b] = await Promise.all([Bun.file(fileA).text(), Bun.file(fileB).text()]);
-			const result = Diff.createTwoFilesPatch(fileA, fileB, a, b, "", "", { context: 3 });
+			const hunks = getNativeDiffBindings().structuredPatchHunks(a, b, 3);
+			const lines = [
+				...(fileA === fileB ? [`Index: ${fileA}`] : []),
+				"===================================================================",
+				`--- ${fileA}`,
+				`+++ ${fileB}`,
+				...hunks.flatMap(hunk => [
+					`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`,
+					...hunk.lines,
+				]),
+			];
+			const result = `${lines.join("\n")}\n`;
 			ctx.emitStatus({
 				op: "diff",
 				file_a: fileA,

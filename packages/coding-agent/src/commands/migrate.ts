@@ -1,11 +1,11 @@
 /**
- * Import MCP servers and skills from other coding agents into GJC.
+ * Import MCP servers, skills, slash commands, and instructions from other coding agents into GJC.
  */
 import { Command, Flags } from "@gajae-code/utils/cli";
 import { type MigrateCommandArgs, runMigrateCommand } from "../cli/migrate-cli";
 
 export default class Migrate extends Command {
-	static description = "Import MCP servers and skills from Claude Code, Codex, or OpenCode";
+	static description = "Import MCP servers, skills, slash commands, and instructions from other coding agents";
 
 	static examples = [
 		"gjc migrate --from claude-code",
@@ -25,7 +25,7 @@ export default class Migrate extends Command {
 			default: false,
 		}),
 		force: Flags.boolean({
-			description: "Overwrite existing skills/MCP servers instead of skipping them",
+			description: "Overwrite existing skills, commands, MCP servers, or instruction files instead of skipping them",
 			default: false,
 		}),
 		"dry-run": Flags.boolean({ description: "Preview the migration without writing anything", default: false }),

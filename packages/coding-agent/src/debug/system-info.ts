@@ -3,7 +3,7 @@
  */
 
 import * as os from "node:os";
-import { APP_NAME, formatBytes, getProjectDir, VERSION } from "@gajae-code/utils";
+import { APP_NAME, formatBytes, getProjectDir, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 
 export interface SystemInfo {
 	os: string;
@@ -97,15 +97,32 @@ export function formatSystemInfo(info: SystemInfo): string {
 	return lines.join("\n");
 }
 
-/** Sanitize environment variables by redacting sensitive values */
+/**
+ * Sanitize environment variables for a debug report.
+ * Sensitive names stay fully replaced. Other values keep their text, with the
+ * same credential shapes removed that crash records already scrub before they
+ * are written to disk.
+ */
 export function sanitizeEnv(env: Record<string, string | undefined>): Record<string, string> {
-	const SENSITIVE_PATTERNS = [/key/i, /secret/i, /token/i, /pass/i, /auth/i, /credential/i, /api/i, /private/i];
+	const SENSITIVE_PATTERNS = [
+		/key/i,
+		/secret/i,
+		/token/i,
+		/pass/i,
+		/auth/i,
+		/credential/i,
+		/api/i,
+		/private/i,
+		/cookie/i,
+		/dsn/i,
+		/url$/i,
+	];
 
 	const result: Record<string, string> = {};
 	for (const [k, v] of Object.entries(env)) {
 		if (v === undefined) continue;
 		const isSensitive = SENSITIVE_PATTERNS.some(p => p.test(k));
-		result[k] = isSensitive ? "[REDACTED]" : v;
+		result[k] = isSensitive ? "[REDACTED]" : redactCrashSecrets(v);
 	}
 	return result;
 }

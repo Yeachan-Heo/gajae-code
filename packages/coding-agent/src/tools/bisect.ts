@@ -5,6 +5,7 @@ import bisectDescription from "../prompts/tools/bisect.md" with { type: "text" }
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
 import type { OutputMeta } from "./output-meta";
+import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -168,6 +169,9 @@ async function evaluatePredicate(
 	const onExternalAbort = () => controller.abort();
 	signal?.addEventListener("abort", onExternalAbort, { once: true });
 	try {
+		// Re-check at the checked-out candidate. The pre-start check reads scripts
+		// from the starting tree; bisect then checks out another commit.
+		await assertPredicateDoesNotInjectTmux(run, cwd, signal);
 		const child = Bun.spawn(["sh", "-c", run], {
 			cwd,
 			stdin: "ignore",
@@ -182,10 +186,39 @@ async function evaluatePredicate(
 	} catch (error) {
 		if (timedOut) return SKIP_EXIT_CODE;
 		if (signal?.aborted) throw new ToolAbortError();
+		if (error instanceof ToolError || error instanceof ToolAbortError) throw error;
 		throw new ToolError(`Failed to run bisect predicate: ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", onExternalAbort);
+	}
+}
+
+/**
+ * Refuse a predicate that would type into this agent pane. The bash tool already
+ * applies `checkTmuxSelfInjection` to the string it spawns; bisect checks that
+ * same string before `sh -c`, including after each checkout.
+ *
+ * Contract: that helper fail-closes when a shell runner's PATH override still
+ * contains an unresolved expansion, because it cannot tell which program would
+ * run. A safe predicate script is refused in that case. A static PATH with no
+ * expansion, an ordinary predicate, and tmux aimed at another pane stay allowed.
+ * With no pane identity the helper does not run, so those predicates are unchanged.
+ */
+async function assertPredicateDoesNotInjectTmux(
+	run: string,
+	cwd: string,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	throwIfAborted(signal);
+	const injection = await checkTmuxSelfInjection(run, {
+		env: process.env,
+		cwd,
+		executionEnv: process.env,
+	});
+	throwIfAborted(signal);
+	if (injection.block) {
+		throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
 	}
 }
 
@@ -270,6 +303,8 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 		// Defensive reset in case a previous aborted bisect left state behind; a
 		// no-op when not bisecting (reset never throws).
 		await git.bisect.reset(cwd, signal);
+		// Starting tree only. evaluatePredicate checks again after each checkout.
+		await assertPredicateDoesNotInjectTmux(params.run, cwd, signal);
 		try {
 			await git.bisect.start(cwd, signal);
 			const badMark = await git.bisect.bad(cwd, badSha, signal);

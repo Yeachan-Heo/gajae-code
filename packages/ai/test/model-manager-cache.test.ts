@@ -49,6 +49,131 @@ describe("online-if-uncached model refresh", () => {
 		rmSync(cacheDir, { recursive: true, force: true });
 	});
 
+	// #489: the bundled catalog owns the provider's transport and endpoint.
+	test("bundled catalog routes qwen3.7-max over anthropic-messages", () => {
+		const bundled = getBundledModels("opencode-go");
+		const qwen = bundled.find(m => m.id === "qwen3.7-max");
+		expect(qwen?.api).toBe("anthropic-messages");
+		expect(qwen?.baseUrl).toBe("https://opencode.ai/zen/go");
+	});
+
+	// #489: dynamic discovery cannot replace a catalog-owned transport.
+	test("dynamic openai-completions discovery does not downgrade qwen3.7-max", async () => {
+		// Mimic fetchOpenAICompatibleModels: every discovered id is tagged with a
+		// single hardcoded openai-completions transport at the /v1 base.
+		const discovered: Model<Api>[] = [
+			{
+				id: "qwen3.7-max",
+				name: "Qwen3.7 Max",
+				api: "openai-completions",
+				provider: "opencode-go",
+				baseUrl: "https://opencode.ai/zen/go/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1000000,
+				maxTokens: 65536,
+			},
+		];
+
+		const { models } = await resolveProviderModels<Api>(
+			{
+				providerId: "opencode-go",
+				cacheDbPath,
+				fetchDynamicModels: async () => discovered,
+			},
+			"online",
+		);
+
+		const qwen = models.find(m => m.id === "qwen3.7-max");
+		expect(qwen).toBeDefined();
+		expect(qwen?.api).toBe("anthropic-messages");
+		expect(qwen?.baseUrl).toBe("https://opencode.ai/zen/go");
+	});
+
+	// #489: even an authoritative fast-path cache must retain the static transport.
+	test("fresh authoritative cache with stale transport is repaired before fast-path return", async () => {
+		const staticModels: Model<Api>[] = [
+			{
+				id: "qwen3.7-max",
+				name: "Qwen3.7 Max",
+				api: "anthropic-messages",
+				provider: "opencode-go",
+				baseUrl: "https://opencode.ai/zen/go",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 2.5, output: 7.5, cacheRead: 0.5, cacheWrite: 3.125 },
+				contextWindow: 1000000,
+				maxTokens: 65536,
+			},
+		];
+		const poisonedCache: Model<Api>[] = [
+			{
+				...staticModels[0],
+				api: "openai-completions",
+				baseUrl: "https://opencode.ai/zen/go/v1",
+			},
+		];
+		const now = () => 1_800_000_000_000;
+		const staticFingerprint = Bun.hash(JSON.stringify(staticModels)).toString(36);
+		writeModelCache("opencode-go", now(), poisonedCache, true, staticFingerprint, cacheDbPath);
+
+		const { models, stale } = await resolveProviderModels<Api>(
+			{
+				providerId: "opencode-go",
+				staticModels,
+				cacheDbPath,
+				now,
+				fetchDynamicModels: async () => {
+					throw new Error("fast path should not fetch");
+				},
+			},
+			"online-if-uncached",
+		);
+
+		const qwen = models.find(m => m.id === "qwen3.7-max");
+		expect(stale).toBe(false);
+		expect(qwen?.api).toBe("anthropic-messages");
+		expect(qwen?.baseUrl).toBe("https://opencode.ai/zen/go");
+		expect(qwen?.contextWindow).toBe(1000000);
+	});
+
+	// #489: preserving transport must not discard compatible dynamic metadata.
+	test("dynamic discovery still enriches matching-transport models", async () => {
+		// A genuinely openai-completions opencode-go model should still pick up
+		// dynamic metadata (pricing/limits) without transport regressions.
+		// Qwen Plus/Max rows are now Anthropic Messages on the official Go contract,
+		// so use a chat-completions row here.
+		const discovered: Model<"openai-completions">[] = [
+			{
+				id: "glm-5.2",
+				name: "GLM-5.2",
+				api: "openai-completions",
+				provider: "opencode-go",
+				baseUrl: "https://opencode.ai/zen/go/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 9, output: 9, cacheRead: 9, cacheWrite: 9 },
+				contextWindow: 1000000,
+				maxTokens: 131072,
+			},
+		];
+
+		const { models } = await resolveProviderModels<"openai-completions">(
+			{
+				providerId: "opencode-go",
+				cacheDbPath,
+				fetchDynamicModels: async () => discovered,
+			},
+			"online",
+		);
+
+		const glm = models.find(m => m.id === "glm-5.2");
+		expect(glm?.api).toBe("openai-completions");
+		expect(glm?.baseUrl).toBe("https://opencode.ai/zen/go/v1");
+		expect(glm?.cost.input).toBe(9);
+	});
+
 	test("preserves Muse 1.3 metadata through ID-only discovery and cache reuse", async () => {
 		const id = "muse-spark-1.3-contributor";
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [{ id }] }));
@@ -840,6 +965,74 @@ describe("online-if-uncached model refresh", () => {
 			dynamicModelProvenance: provenanceB,
 		});
 		expect(cache?.models.map(entry => entry.id)).toEqual(["static", "dynamic-b"]);
+	});
+
+	test("does not serve or relabel a legacy row from another discovery User-Agent after a failed fetch", async () => {
+		for (const [context, provenance] of [
+			["unbound", undefined],
+			["bound", "credential-a\u0000https://provider-a.example.test"],
+		] as const) {
+			const providerId = `cache-failed-fetch-old-user-agent-${context}`;
+			const staticModels = [model(providerId, "static")];
+			const oldUserAgent = "antigravity-ide";
+			const currentUserAgent = "antigravity/cli/1.3.4";
+			const now = 1_700_000_000_000;
+			const oldCatalog = [...staticModels, model(providerId, "old-dynamic")];
+			writeModelCache(
+				providerId,
+				now,
+				oldCatalog,
+				true,
+				fingerprint(staticModels),
+				cacheDbPath,
+				undefined,
+				undefined,
+				oldUserAgent,
+			);
+
+			let discoveryCalls = 0;
+			const options = {
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				discoveryUserAgent: currentUserAgent,
+				...(provenance === undefined ? {} : { cacheDynamicModelProvenance: provenance }),
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return null;
+				},
+			};
+
+			const failedRefresh = await resolveProviderModels<Api>(options, "online");
+			expect(
+				failedRefresh.models.map(entry => entry.id),
+				context,
+			).toEqual(["static"]);
+			expect(discoveryCalls, context).toBe(1);
+			expect(
+				readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath, currentUserAgent),
+				context,
+			).toBe(null);
+			expect(
+				readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath),
+				context,
+			).toMatchObject({
+				authoritative: true,
+				discoveryUserAgent: oldUserAgent,
+				models: oldCatalog,
+			});
+
+			await resolveProviderModels<Api>(options, "online-if-uncached");
+			expect(discoveryCalls, `${context} context retries under the new User-Agent`).toBe(2);
+			expect(
+				readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath),
+				context,
+			).toMatchObject({
+				discoveryUserAgent: oldUserAgent,
+				models: oldCatalog,
+			});
+		}
 	});
 
 	test("inserts a non-authoritative tombstone when a failed fetch has no cache row", async () => {

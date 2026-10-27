@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { createSdkSessionRuntimeExtension, type SessionSdkTransport } from "../src/sdk/host/session-runtime";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 interface Harness {
 	emit(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -90,7 +91,11 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 			);
 		},
 	} as unknown as ExtensionAPI;
-	createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: () => transport });
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
+		createTransport: () => transport,
+	});
 	const base = {
 		cwd,
 		sessionMetadata: { kind: "main" },

@@ -1,4 +1,5 @@
 import type { AssistantMessage, ServiceTier, StopReason, Usage } from "@gajae-code/ai";
+import type { AgentRole, PromptPrefixChange } from "./shared-types";
 
 export * from "./shared-types";
 
@@ -14,6 +15,8 @@ export interface MessageStats {
 	entryId: string;
 	/** Folder/project path (extracted from session filename) */
 	folder: string;
+	/** Agent role inferred from the persisted session identity. */
+	agent: AgentRole;
 	/** Model ID */
 	model: string;
 	/** Provider name */
@@ -27,11 +30,13 @@ export interface MessageStats {
 	/** Time to first token in milliseconds */
 	ttft: number | null;
 	/** Stop reason */
-	stopReason: StopReason;
+	stopReason: StopReason | "unknown";
 	/** Error message if stopReason is error */
 	errorMessage: string | null;
 	/** Token usage */
 	usage: Usage;
+	/** Prompt-prefix change recorded for the request, when the session captured it. */
+	promptPrefix?: { change: PromptPrefixChange; divergedRole: string | null };
 }
 
 /**
@@ -56,12 +61,20 @@ export interface SessionHeader {
 	title?: string;
 }
 
+/** Historical JSONL may contain missing, partial, or malformed cost payloads. */
+export type SessionAssistantMessage = Omit<AssistantMessage, "usage"> & {
+	usage: Omit<Usage, "cost"> & { cost?: unknown };
+};
+
+/** Parser output retains untrusted costs until the database insertion boundary. */
+export type ParsedMessageStats = Omit<MessageStats, "usage"> & { usage: SessionAssistantMessage["usage"] };
+
 export interface SessionMessageEntry {
 	type: "message";
 	id: string;
 	parentId: string | null;
 	timestamp: string;
-	message: AssistantMessage | { role: "user" | "toolResult" };
+	message: SessionAssistantMessage | { role: "user" | "toolResult" };
 }
 
 export interface SessionServiceTierChangeEntry {

@@ -158,6 +158,34 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 export const PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES = 4096;
 export const PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES = 4096;
 
+/**
+ * Keep an authenticated `#GJC1_` placeholder whole when the byte cut lands
+ * inside it. Short inputs whose head and tail already overlap stay on the
+ * original byte limits.
+ */
+function retainStraddlingPlaceholders(text: string, head: string, tail: string): { head: string; tail: string } {
+	const headEnd = head.length;
+	const tailStart = text.length - tail.length;
+	if (headEnd > tailStart) return { head, tail };
+
+	let nextHeadEnd = headEnd;
+	let nextTailStart = tailStart;
+	const placeholder = /#GJC1_[A-Za-z0-9_-]{22}#/g;
+	for (;;) {
+		const match = placeholder.exec(text);
+		if (match === null) break;
+		const start = match.index;
+		const stop = start + match[0].length;
+		if (start < headEnd && stop > headEnd) nextHeadEnd = Math.max(nextHeadEnd, stop);
+		if (start < tailStart && stop > tailStart) nextTailStart = Math.min(nextTailStart, start);
+	}
+	if (nextHeadEnd > nextTailStart) return { head, tail };
+	return {
+		head: nextHeadEnd === headEnd ? head : text.slice(0, nextHeadEnd),
+		tail: nextTailStart === tailStart ? tail : text.slice(nextTailStart),
+	};
+}
+
 function utf8Prefix(text: string, maxBytes: number): string {
 	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
 	let bytes = 0;
@@ -193,15 +221,28 @@ function utf8Suffix(text: string, maxBytes: number): string {
  * Build the deterministic inline receipt for a tool result saved before the
  * next provider context is constructed. Byte boundaries never split UTF-8
  * code points, so head/tail recovery remains readable for emoji and CJK text.
+ *
+ * `redact` runs on the complete text before the cut. The digest stays the
+ * caller's hash of the stored artifact; the omitted count is the redacted
+ * preview's omitted bytes.
  */
-export function createPreAdmissionArtifactSpillPreview(fullText: string, artifactId: string, digest: string): string {
-	const totalBytes = Buffer.byteLength(fullText, "utf-8");
-	const head = utf8Prefix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES);
-	const tail = utf8Suffix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES);
-	const retainedBytes = Buffer.byteLength(head, "utf-8") + Buffer.byteLength(tail, "utf-8");
+export function createPreAdmissionArtifactSpillPreview(
+	fullText: string,
+	artifactId: string,
+	digest: string,
+	redact?: (text: string) => string,
+): string {
+	const source = redact ? redact(fullText) : fullText;
+	const totalBytes = Buffer.byteLength(source, "utf-8");
+	const head = utf8Prefix(source, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES);
+	const tail = utf8Suffix(source, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES);
+	// Without redaction the cut stays on the historical byte limits, including
+	// when the tool text itself contains a placeholder-shaped string.
+	const retained = redact ? retainStraddlingPlaceholders(source, head, tail) : { head, tail };
+	const retainedBytes = Buffer.byteLength(retained.head, "utf-8") + Buffer.byteLength(retained.tail, "utf-8");
 	const omittedBytes = Math.max(0, totalBytes - retainedBytes);
 	const receipt = `[${omittedBytes} bytes omitted; sha256:${digest}; full output: artifact://${artifactId}]`;
-	return `${head}\n\n${receipt}\n\n${tail}`;
+	return `${retained.head}\n\n${receipt}\n\n${retained.tail}`;
 }
 
 /**
@@ -391,6 +432,63 @@ export function createCustomMessage(
 }
 
 /**
+ * Same closer escape as URL and tool framing: whitespace between the tag name
+ * and ">" still closes the element, so those spellings are neutralized too.
+ */
+export function escapeUntrustedContent(content: string): string {
+	return content
+		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>");
+}
+
+export function wrapUntrustedContent(content: string): string {
+	return `<untrusted-content>\n${escapeUntrustedContent(content)}\n</untrusted-content>`;
+}
+
+/**
+ * Break reserved prompt tags in workspace rule text so a rule file cannot close
+ * `<system-interrupt>` or `<system-reminder>`. Ordinary markup such as `<Button>`
+ * stays intact.
+ */
+export function neutralizeReservedPromptTag(value: string): string {
+	return value.replace(
+		/<\/?\s*(?:system-interrupt|system-reminder|untrusted-content|rules)(?=[\s>/]|$)/gi,
+		tag => `&lt;${tag.slice(1)}`,
+	);
+}
+
+/** Attribute-encode a TTSR name or path, and neutralize reserved tags in the body. */
+export function ttsrPromptFields(rule: { name: string; path: string; content: string }): {
+	name: string;
+	path: string;
+	content: string;
+} {
+	return {
+		name: escapePromptMetadata(rule.name),
+		path: escapePromptMetadata(rule.path),
+		content: neutralizeReservedPromptTag(rule.content),
+	};
+}
+
+/**
+ * Frame stored `!` / `$` text at the model boundary. The command runner already
+ * cut the excerpt that was recorded; do not slice this string again.
+ */
+function frameStoredLocalExecution(text: string): string {
+	return wrapUntrustedContent(text);
+}
+
+/**
+ * Frame debug tool text at the model boundary. Output capture and pre-admission
+ * spill already cut the excerpt; do not slice this string again.
+ */
+function frameDebugToolResult(message: ToolResultMessage): (TextContent | ImageContent)[] {
+	const content = getPrunedToolResultContent(message);
+	if (message.toolName !== "debug") return content;
+	return content.map(block => (block.type === "text" ? { ...block, text: wrapUntrustedContent(block.text) } : block));
+}
+
+/**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
@@ -408,7 +506,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
-						content: [{ type: "text", text: bashExecutionToText(m) }],
+						content: [{ type: "text", text: frameStoredLocalExecution(bashExecutionToText(m)) }],
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
@@ -418,7 +516,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
-						content: [{ type: "text", text: pythonExecutionToText(m) }],
+						content: [{ type: "text", text: frameStoredLocalExecution(pythonExecutionToText(m)) }],
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
@@ -492,7 +590,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "toolResult":
 					return {
 						...m,
-						content: getPrunedToolResultContent(m as ToolResultMessage),
+						content: frameDebugToolResult(m as ToolResultMessage),
 						attribution: m.attribution ?? "agent",
 					};
 				default:

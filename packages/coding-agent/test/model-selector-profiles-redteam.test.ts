@@ -58,6 +58,7 @@ function createRegistry(options: { profiles?: ModelProfileDefinition[]; missingC
 		getAvailableModelProfileNames: () => [...profiles.keys()],
 		getApiKeyForProvider: async () => (options.missingCredentials ? undefined : "key"),
 		getApiKey: async () => "key",
+		isSelectorCircuitOpen: (_selector: string) => false,
 	};
 }
 
@@ -108,6 +109,10 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		scopedModels: [],
+		markUserModelSelection: vi.fn(),
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		modelRegistry: createRegistry(options),
 		configuredChains: {} as Record<string, readonly string[]>,
 		getConfiguredModelChain(role: string): readonly string[] | undefined {
@@ -387,4 +392,26 @@ test("delete action restores the profile when post-delete notification fails", a
 	expect(registry.saveCustomModelProfile).toHaveBeenCalledWith("profile-a", deletedConfigs["profile-a"]);
 	expect(profiles.has("profile-a")).toBe(true);
 	expect(ctx.showError).toHaveBeenCalledWith("Preset delete failed: notify failed");
+});
+
+test("active session ownership requires an explicit replacement before deleting its profile", async () => {
+	const registry = createRegistry();
+	const deleteSpy = vi.fn(async () => {
+		throw new Error("deletion must be blocked by the session owner");
+	});
+	Object.assign(registry, { deleteCustomModelProfile: deleteSpy });
+	const { ctx, session } = createControllerContext();
+	const ownedSession = Object.assign(session, { getActiveModelProfile: () => "profile-a" });
+	ownedSession.modelRegistry = registry;
+	const runtime = Object.assign(ctx, { session: ownedSession, showHookConfirm: vi.fn(async () => true) });
+	const controller = new SelectorController(runtime as never);
+
+	controller.showModelSelector();
+	const selector = runtime.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+	await selector.__testSelectPresetAction("profile-a", "delete");
+
+	expect(deleteSpy).not.toHaveBeenCalled();
+	expect(runtime.showError).toHaveBeenCalledWith(
+		'Preset delete failed: Choose a replacement profile before deleting the active profile "profile-a".',
+	);
 });

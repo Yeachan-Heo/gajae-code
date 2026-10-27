@@ -1,6 +1,6 @@
 import { scheduler } from "node:timers/promises";
 import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
-import OpenAI, { APIConnectionTimeoutError } from "openai";
+import OpenAI, { APIConnectionTimeoutError, type ClientOptions as OpenAIClientOptions } from "openai";
 import type {
 	ChatCompletionAssistantMessageParam,
 	ChatCompletionChunk,
@@ -8,6 +8,7 @@ import type {
 	ChatCompletionContentPartImage,
 	ChatCompletionContentPartText,
 	ChatCompletionMessageParam,
+	ChatCompletionToolChoiceOption,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
@@ -32,8 +33,10 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
+	modelSupportsUltrafastTier,
 	type OpenAICompat,
 	type ProviderSessionState,
+	parseResolvedServiceTier,
 	type RepetitionGuardOptions,
 	resolveServiceTier,
 	type ServiceTier,
@@ -659,7 +662,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.provider, model.id);
+			const idleTimeoutMs =
+				options?.streamIdleTimeoutMs ??
+				getOpenAIStreamIdleTimeoutMs(model.provider, model.id, model.streamIdleTimeoutMs);
 			const {
 				client,
 				copilotPremiumRequests,
@@ -684,6 +689,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.providerSessionId,
 				options?.maxRetryDelayMs,
 				options?.attemptScope,
+				options?.streamIdleTimeoutMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;
@@ -695,6 +701,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			);
 			let disableStrictTools = providerSessionState?.strictToolsDisabled ?? false;
 			let strictFallbackErrorMessage: string | undefined;
+			let effectiveServiceTier: ServiceTier | undefined;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
@@ -716,6 +723,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (replacementPayload !== undefined) {
 					params = replacementPayload as typeof params;
 				}
+				// Capture the service tier for use in cost calculations
+				effectiveServiceTier = (params as Record<string, unknown>).service_tier as ServiceTier | undefined;
+				output.serviceTier = parseResolvedServiceTier(effectiveServiceTier);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1148,7 +1158,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let hasExplicitUsageReport = false;
 			let hasNonzeroUsageEvidence = false;
 			const applyUsage = (rawUsage: object): void => {
-				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal);
+				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal, effectiveServiceTier);
 				const hasExplicitTotal = getOptionalNumberProperty(rawUsage, "total_tokens") !== undefined;
 				const hasExplicitComponents =
 					getOptionalNumberProperty(rawUsage, "prompt_tokens") !== undefined &&
@@ -1186,6 +1196,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				// `choices`-less or malformed chunks after a trip never spends the
 				// budget and the request hangs open (#5627 review r5).
 				if (chunk && typeof chunk === "object") {
+					const responseServiceTier = parseResolvedServiceTier(Reflect.get(chunk, "service_tier"));
+					if (responseServiceTier !== undefined) {
+						effectiveServiceTier = responseServiceTier;
+						output.serviceTier = responseServiceTier;
+					}
 					// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
 					// and each chunk in a streamed completion carries the same id.
 					output.responseId ||= chunk.id;
@@ -1508,6 +1523,22 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	return stream;
 };
 
+/**
+ * The OpenAI SDK retries pre-header timeouts and connection failures silently
+ * (its retry lines log at `info`, below the default `warn`, and go to console,
+ * which corrupts the TUI). Route them into the gjc log so a request stuck
+ * before response headers — where our stream watchdogs are not armed yet —
+ * leaves a trace instead of looking like a hung turn.
+ */
+const OPENAI_SDK_LOGGER: NonNullable<OpenAIClientOptions["logger"]> = {
+	error: message => logger.warn(`openai-sdk: ${message}`),
+	warn: message => logger.warn(`openai-sdk: ${message}`),
+	info: message => {
+		if (/retrying|timed out|connection failed/.test(message)) logger.warn(`openai-sdk: ${message}`);
+	},
+	debug: () => {},
+};
+
 async function createClient(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -1523,6 +1554,7 @@ async function createClient(
 	providerSessionId?: string,
 	maxRetryDelayMs?: number,
 	attemptScope?: import("../types.js").AttemptScopeRef,
+	effectiveIdleTimeoutOverride?: number,
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -1669,7 +1701,13 @@ async function createClient(
 	// The OpenAI SDK's default is 10 minutes per attempt × `maxRetries`, which
 	// turns a stalled-before-headers fetch into a multi-minute hang invisible
 	// to the agent loop (the iterator watchdog only arms AFTER `create()` returns).
-	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride, model.id);
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(
+		model.provider,
+		streamFirstEventTimeoutOverride,
+		model.id,
+		model.streamIdleTimeoutMs,
+		effectiveIdleTimeoutOverride,
+	);
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -1679,6 +1717,8 @@ async function createClient(
 			defaultHeaders: headers,
 			fetch: debugFetch,
 			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
+			logLevel: "info",
+			logger: OPENAI_SDK_LOGGER,
 		}),
 		copilotPremiumRequests,
 		baseUrl,
@@ -1773,10 +1813,23 @@ function buildParams(
 	if (options?.frequencyPenalty !== undefined) {
 		params.frequency_penalty = options.frequencyPenalty;
 	}
-	if (shouldSendServiceTier(options?.serviceTier, model.provider, compat.supportsServiceTier === true)) {
+	if (
+		shouldSendServiceTier(
+			options?.serviceTier,
+			model.provider,
+			compat.supportsServiceTier === true,
+			modelSupportsUltrafastTier(model),
+		)
+	) {
 		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;
+		} else if (resolved === "ultrafast") {
+			// Gate ultrafast to models that explicitly support it
+			if (modelSupportsUltrafastTier(model)) {
+				(params as Record<string, unknown>).service_tier = "ultrafast";
+			}
+			// else: silently omit ultrafast if model doesn't support it (fail-closed)
 		}
 	}
 
@@ -1884,25 +1937,6 @@ function buildParams(
 		params.reasoning_effort = mapReasoningEffort(minEffort, compat.reasoningEffortMap) as Effort;
 	}
 
-	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
-		// DeepSeek reasoning models accept tools/tool_choice, but reject that
-		// control field while thinking is enabled. Keep the tool-selection
-		// contract and suppress reasoning for this single request.
-		delete params.reasoning_effort;
-		delete params.reasoning;
-	}
-
-	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
-		// Backends like Kimi 400 with `tool_choice 'specified' is incompatible
-		// with thinking enabled`. Suppress thinking for this single forced-tool
-		// turn while keeping the tool-selection contract intact.
-		delete params.reasoning_effort;
-		delete params.reasoning;
-		if (compat.thinkingFormat === "zai") {
-			params.thinking = { type: "disabled" };
-		}
-	}
-
 	// OpenRouter provider routing preferences
 	if (model.baseUrl.includes("openrouter.ai") && compat.openRouterRouting) {
 		params.provider = compat.openRouterRouting;
@@ -1922,13 +1956,46 @@ function buildParams(
 	if (compat.extraBody) {
 		// The resolved output limit owns the selected wire field; extraBody is a
 		// free-form compatibility escape hatch and must not add a competing
-		// max-token field or overwrite the resolved budget.
-		const { max_tokens, max_completion_tokens, max_output_tokens, ...restExtra } = compat.extraBody as Record<
-			string,
-			unknown
-		>;
+		// max-token field or overwrite the resolved budget. tool_choice follows
+		// the same discipline on both sides: an injected default (an endpoint
+		// whose tool_choice default is "none", like IO Intelligence, would
+		// otherwise stop tool calls) may only fill the gap on an ordinary turn
+		// that offers tools but resolved no directive of its own. Explicit
+		// directives — forced tools, retry reminders — stay untouched, and
+		// turns that deliberately carry no tools keep their stripped shape
+		// instead of re-adding tool_choice with an empty tools list.
+		const { max_tokens, max_completion_tokens, max_output_tokens, tool_choice, ...restExtra } =
+			compat.extraBody as Record<string, unknown>;
+		if (
+			tool_choice !== undefined &&
+			params.tool_choice === undefined &&
+			Array.isArray(params.tools) &&
+			params.tools.length > 0
+		) {
+			params.tool_choice = tool_choice as ChatCompletionToolChoiceOption;
+		}
 		Object.assign(params, restExtra);
 	}
+
+	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
+		// DeepSeek reasoning models accept tools/tool_choice, but reject that
+		// control field while thinking is enabled. Keep the tool-selection
+		// contract and suppress reasoning for this single request.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+	}
+
+	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
+		// Backends like Kimi 400 with `tool_choice 'specified' is incompatible
+		// with thinking enabled`. Suppress thinking for this single forced-tool
+		// turn while keeping the tool-selection contract intact.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+		if (compat.thinkingFormat === "zai") {
+			params.thinking = { type: "disabled" };
+		}
+	}
+
 	applyOpenAIRequestTransformBody(params, model.requestTransform);
 	if (!supportsReasoningParams) {
 		delete params.reasoning;
@@ -1955,10 +2022,28 @@ function getChoiceUsage(choice: ChatCompletionChunk.Choice): object | undefined 
 	return getOptionalObjectProperty(choice, "usage");
 }
 
+/**
+ * Get the service tier cost multiplier for Completions API.
+ * Completions API applies the same multipliers as Codex for consistency.
+ */
+function getCompletionsServiceTierCostMultiplier(serviceTier: ServiceTier | undefined): number {
+	switch (serviceTier) {
+		case "flex":
+			return 0.5;
+		case "priority":
+			return 2;
+		case "ultrafast":
+			return 6;
+		default:
+			return 1;
+	}
+}
+
 export function parseChunkUsage(
 	rawUsage: object,
 	model: Model<"openai-completions">,
 	premiumRequests: number | undefined,
+	serviceTier?: ServiceTier,
 ): AssistantMessage["usage"] {
 	const promptTokenDetails = getOptionalObjectProperty(rawUsage, "prompt_tokens_details");
 	const completionTokenDetails = getOptionalObjectProperty(rawUsage, "completion_tokens_details");
@@ -1997,6 +2082,15 @@ export function parseChunkUsage(
 		...(premiumRequests !== undefined ? { premiumRequests } : {}),
 	};
 	calculateCost(model, usage);
+	// Apply service tier cost multiplier (ultrafast = 6x, priority = 2x, flex = 0.5x)
+	const multiplier = getCompletionsServiceTierCostMultiplier(serviceTier);
+	if (multiplier !== 1) {
+		usage.cost.input *= multiplier;
+		usage.cost.output *= multiplier;
+		usage.cost.cacheRead *= multiplier;
+		usage.cost.cacheWrite *= multiplier;
+		usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	}
 	return usage;
 }
 

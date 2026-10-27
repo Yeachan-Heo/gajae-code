@@ -285,6 +285,14 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 			bind,
 			providerScope: { provider },
 			bearerTokens: gatewayToken ? [gatewayToken] : [],
+			currentBearerTokens: gatewayToken
+				? async signal => {
+						if (signal.aborted) return new Set<string>();
+						const current = await readToken();
+						if (signal.aborted) return new Set<string>();
+						return new Set(current ? [current] : []);
+					}
+				: undefined,
 			version: VERSION,
 			resolveModel: (id: string) => modelById.get(id),
 			listModels: () => catalog.models,

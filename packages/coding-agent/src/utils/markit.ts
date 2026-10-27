@@ -1,7 +1,8 @@
+import * as fs from "node:fs/promises";
 import { untilAborted } from "@gajae-code/utils";
-import type { Markit, StreamInfo } from "markit-ai";
+import type { Markit, StreamInfo } from "../../vendor/markit-ai/dist/index.js";
 import { ToolAbortError } from "../tools/tool-errors";
-import { ensureMupdfWasmResolution } from "./mupdf-wasm";
+import { type PdfMarkdownResult, pdfToMarkdown } from "./pdf";
 
 export interface MarkitConversionResult {
 	content: string;
@@ -9,20 +10,23 @@ export interface MarkitConversionResult {
 	error?: string;
 }
 
-let markit: () => Markit | Promise<Markit> = async () => {
-	const promise = import("markit-ai").then(({ Markit }) => {
-		const instance = new Markit();
-		markit = () => instance;
-		return instance;
-	});
-	markit = () => promise;
-	return promise;
-};
+let instance: Markit | undefined;
+let instancePromise: Promise<Markit> | undefined;
 
-// #5433: mupdf's wasm asset is not reachable at the Emscripten loader's
-// default bunfs path in compiled binaries. Seed the embedded-asset hook
-// before any markit conversion (and therefore before any mupdf import).
-ensureMupdfWasmResolution();
+async function loadMarkit(): Promise<Markit> {
+	if (instancePromise === undefined) {
+		instancePromise = import("../../vendor/markit-ai/dist/index.js")
+			.then(({ Markit: MarkitConstructor }) => {
+				instance = new MarkitConstructor();
+				return instance;
+			})
+			.catch(error => {
+				instancePromise = undefined;
+				throw error;
+			});
+	}
+	return instancePromise;
+}
 
 function normalizeExtension(extension: string): string {
 	const trimmed = extension.trim().toLowerCase();
@@ -31,60 +35,96 @@ function normalizeExtension(extension: string): string {
 }
 
 function normalizeError(error: unknown): string {
-	if (error instanceof Error && error.message.trim().length > 0) {
-		return error.message.trim();
+	const messages: string[] = [];
+	const seen = new Set<unknown>();
+	while (error !== undefined && !seen.has(error)) {
+		seen.add(error);
+		if (error instanceof Error) {
+			messages.push(`${error.name}: ${error.message}`);
+			error = error.cause;
+		} else {
+			messages.push(String(error));
+			break;
+		}
 	}
-	return "Conversion failed";
-}
-
-/**
- * markit-ai's PDF converter swallows the real mupdf import failure behind a
- * generic "Install it" message (#5433). Re-run the import here so release
- * diagnostics carry the actual module/asset/initialization error.
- */
-async function describeConversionError(error: unknown): Promise<string> {
-	const base = normalizeError(error);
-	if (!base.includes("PDF support requires 'mupdf'")) return base;
-	try {
-		await import("mupdf");
-	} catch (cause) {
-		return `${base} (mupdf import failed: ${normalizeError(cause)})`;
-	}
-	return base;
+	return messages.join("; caused by: ") || "Conversion failed";
 }
 
 async function runMarkitConversion<T>(task: (markit: Markit) => Promise<T>, signal?: AbortSignal): Promise<T> {
 	try {
-		const instance = await markit();
-		return signal ? await untilAborted(signal, () => task(instance)) : await task(instance);
+		const markit = instance ?? (await loadMarkit());
+		return signal ? await untilAborted(signal, () => task(markit)) : await task(markit);
 	} catch (error) {
-		if (error instanceof ToolAbortError) {
-			throw error;
-		}
-		if (error instanceof Error && error.name === "AbortError") {
-			throw new ToolAbortError();
-		}
+		if (error instanceof ToolAbortError) throw error;
+		if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
 		throw error;
 	}
 }
 
 function finalizeConversion(markdown?: string): MarkitConversionResult {
-	if (typeof markdown === "string" && markdown.length > 0) {
-		return { content: markdown, ok: true };
-	}
-
+	if (typeof markdown === "string" && markdown.length > 0) return { content: markdown, ok: true };
 	return { content: "", ok: false, error: "Conversion produced no output" };
 }
 
+function pdfExtractionWarnings(result: PdfMarkdownResult): string[] {
+	const warnings: string[] = [];
+	if (result.pagesNeedingOcr.length > 0) {
+		warnings.push(
+			`page${result.pagesNeedingOcr.length === 1 ? "" : "s"} ${result.pagesNeedingOcr.join(", ")} contain no extractable text (scanned; OCR required) and are missing from this output`,
+		);
+	}
+	if (result.hasEncodingIssues) warnings.push("some text may be garbled (font encoding issues detected)");
+	return warnings;
+}
+
+export function finalizePdfConversion(result: PdfMarkdownResult): MarkitConversionResult {
+	if (result.markdown.trim().length > 0) {
+		const warnings = pdfExtractionWarnings(result);
+		const content =
+			warnings.length === 0
+				? result.markdown
+				: `> [!WARNING]\n> Incomplete PDF extraction: ${warnings.join("; ")}.\n\n${result.markdown}`;
+		return { content, ok: true };
+	}
+	if (result.pagesNeedingOcr.length > 0) {
+		return {
+			content: "",
+			ok: false,
+			error: `PDF inspection produced no text; OCR is required for page${result.pagesNeedingOcr.length === 1 ? "" : "s"} ${result.pagesNeedingOcr.join(", ")}`,
+		};
+	}
+	return { content: "", ok: false, error: "PDF inspection produced no Markdown output" };
+}
+
+function pdfFailure(error: unknown): MarkitConversionResult {
+	if (error instanceof ToolAbortError) throw error;
+	if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
+	return { content: "", ok: false, error: normalizeError(error) };
+}
+
 export async function convertFileWithMarkit(filePath: string, signal?: AbortSignal): Promise<MarkitConversionResult> {
+	if (filePath.toLowerCase().endsWith(".pdf")) {
+		let buffer: Buffer;
+		try {
+			buffer = await fs.readFile(filePath, { signal });
+		} catch (error) {
+			if (error instanceof ToolAbortError) throw error;
+			if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
+			return { content: "", ok: false, error: "PDF file could not be read" };
+		}
+		try {
+			return finalizePdfConversion(await pdfToMarkdown(buffer, signal));
+		} catch (error) {
+			return pdfFailure(error);
+		}
+	}
+
 	try {
 		const result = await runMarkitConversion(markit => markit.convertFile(filePath), signal);
 		return finalizeConversion(result.markdown);
 	} catch (error) {
-		if (error instanceof ToolAbortError) {
-			throw error;
-		}
-		return { content: "", ok: false, error: await describeConversionError(error) };
+		if (error instanceof ToolAbortError) throw error;
+		return { content: "", ok: false, error: normalizeError(error) };
 	}
 }
 
@@ -94,18 +134,23 @@ export async function convertBufferWithMarkit(
 	signal?: AbortSignal,
 ): Promise<MarkitConversionResult> {
 	const normalizedExtension = normalizeExtension(extension);
+	if (normalizedExtension === ".pdf") {
+		try {
+			return finalizePdfConversion(await pdfToMarkdown(buffer, signal));
+		} catch (error) {
+			return pdfFailure(error);
+		}
+	}
+
 	const streamInfo: StreamInfo = {
 		extension: normalizedExtension,
 		filename: `input${normalizedExtension}`,
 	};
-
 	try {
 		const result = await runMarkitConversion(markit => markit.convert(Buffer.from(buffer), streamInfo), signal);
 		return finalizeConversion(result.markdown);
 	} catch (error) {
-		if (error instanceof ToolAbortError) {
-			throw error;
-		}
-		return { content: "", ok: false, error: await describeConversionError(error) };
+		if (error instanceof ToolAbortError) throw error;
+		return { content: "", ok: false, error: normalizeError(error) };
 	}
 }

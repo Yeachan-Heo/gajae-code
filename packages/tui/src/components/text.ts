@@ -6,6 +6,7 @@ import {
 	extractViewportAnchorRows,
 	padding,
 	replaceTabs,
+	sliceByColumn,
 	type ViewportAnchorSpan,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -101,8 +102,14 @@ export class Text implements Component {
 		const contentLines: string[] = [];
 		for (const line of wrappedLines) {
 			const lineWithMargins = leftMargin + line + rightMargin;
-			if (this.#customBgFn) contentLines.push(applyBackgroundToLine(lineWithMargins, width, this.#customBgFn));
-			else contentLines.push(lineWithMargins + padding(Math.max(0, width - visibleWidth(lineWithMargins))));
+			// A wrapped grapheme can still be wider than the viewport. Measure once,
+			// then slice instead of padding. Background functions do not change width.
+			const measured = visibleWidth(lineWithMargins);
+			const fitted =
+				measured > width
+					? sliceByColumn(lineWithMargins, 0, width, true)
+					: lineWithMargins + padding(width - measured);
+			contentLines.push(this.#customBgFn ? this.#customBgFn(fitted) : fitted);
 		}
 		const emptyLine = padding(width);
 		const emptyLines = Array.from({ length: this.#paddingY }, () =>

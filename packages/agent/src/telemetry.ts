@@ -30,6 +30,8 @@ import {
 	completeSimple,
 	type Message,
 	type Model,
+	modelSupportsServiceTier,
+	modelSupportsUltrafastTier,
 	type ServiceTier,
 	type SimpleStreamOptions,
 	type StopReason,
@@ -37,6 +39,9 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
+import { $credentialEnv, startupProjectEnvSnapshot } from "@gajae-code/utils";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
+import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
 	type Attributes,
@@ -344,9 +349,11 @@ export interface AgentTelemetryConfig {
 	 * truncated to bounded snippets, not removed. `"full"` emits both summaries
 	 * and full OTEL message payloads.
 	 *
-	 * Defaults to the value of the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
-	 * env var (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
-	 * `"full"` => `"full"`). Env-driven `"full"` capture emits a
+	 * Defaults to the trusted value of
+	 * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
+	 * (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
+	 * `"full"` => `"full"`). A project `.env` cannot select this default.
+	 * Env-driven `"full"` capture emits a
 	 * `full_content_capture_env_active` telemetry warning once per process.
 	 */
 	readonly captureMessageContent?: TelemetryContentCapture;
@@ -456,9 +463,34 @@ export function resolveTelemetry(
 
 let contentCaptureEnvCache: ResolvedTelemetryContentCapture | undefined;
 let hasWarnedFullContentCaptureEnv = false;
+
+/** `full` > `summary` > anything else. Matches the parser below. */
+function contentCaptureRank(raw: string | undefined): 0 | 1 | 2 {
+	if (!raw) return 0;
+	const normalized = raw.trim().toLowerCase();
+	if (normalized === "full") return 2;
+	if (normalized === "summary" || normalized === "true" || normalized === "1" || normalized === "yes") return 1;
+	return 0;
+}
+
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
-	const raw = process.env[CONTENT_CAPTURE_ENV];
+	// `$credentialEnv` ignores a project `.env`, pins an inherited value, and
+	// falls back to trusted files. A missing current key is off, so that
+	// fallback cannot restore a deleted value. A lower live rank is a downgrade.
+	// A present higher rank cannot raise the pin.
+	const trusted = $credentialEnv(CONTENT_CAPTURE_ENV);
+	const live = Bun.env[CONTENT_CAPTURE_ENV];
+	const key = canonicalEnvKey(CONTENT_CAPTURE_ENV);
+	const project = startupProjectEnvSnapshot();
+	const projectDeclaration = project.values[key];
+	const liveIsProjectValue =
+		projectDeclaration !== undefined && (project.dynamic.has(key) || live === projectDeclaration);
+	let raw: string | undefined;
+	if (live === undefined) raw = undefined;
+	else if (liveIsProjectValue) raw = trusted;
+	else if (contentCaptureRank(live) < contentCaptureRank(trusted)) raw = live;
+	else raw = trusted;
 	if (!raw) {
 		contentCaptureEnvCache = "none";
 		return "none";
@@ -752,7 +784,7 @@ export function startChatSpan(
 		model,
 		parent: options.parent,
 		stepNumber: options.stepNumber,
-		attributes: buildChatRequestAttributes(options.stepNumber, options.request, model.provider),
+		attributes: buildChatRequestAttributes(options.stepNumber, options.request, model),
 	});
 	if (span) {
 		telemetry.collector.beginChat(span, {
@@ -786,7 +818,7 @@ export interface ChatRequestSnapshot {
 	readonly messages?: readonly Message[];
 }
 
-function buildChatRequestAttributes(stepNumber: number, request: ChatRequestSnapshot, provider: string): Attributes {
+function buildChatRequestAttributes(stepNumber: number, request: ChatRequestSnapshot, model: Model): Attributes {
 	const attrs: Attributes = {
 		[PiGenAIAttr.AgentStepNumber]: stepNumber,
 		[GenAIAttr.OutputType]: "text",
@@ -802,7 +834,16 @@ function buildChatRequestAttributes(stepNumber: number, request: ChatRequestSnap
 	if (request.stopSequences && request.stopSequences.length > 0) {
 		attrs[GenAIAttr.RequestStopSequences] = [...request.stopSequences];
 	}
-	if (request.serviceTier && shouldSendServiceTier(request.serviceTier, provider)) {
+	if (
+		request.serviceTier &&
+		shouldSendServiceTier(
+			request.serviceTier,
+			model.provider,
+			modelSupportsServiceTier(model),
+			modelSupportsUltrafastTier(model),
+		) &&
+		(request.serviceTier !== "ultrafast" || modelSupportsUltrafastTier(model))
+	) {
 		attrs[OpenAIAttr.RequestServiceTier] = request.serviceTier;
 	}
 	if (request.reasoningEffort) attrs[PiGenAIAttr.RequestReasoningEffort] = request.reasoningEffort;
@@ -1166,17 +1207,18 @@ export async function finishChatSpan(
 		readonly baseUrl?: string;
 	},
 ): Promise<void> {
+	const serviceTier = resolveCompletedServiceTier(message, options.serviceTier);
 	// Usage-only mode (spans disabled): the chat span is absent but usage/cost
 	// hooks must still fire per contract C3. Cost estimation and the usage
 	// event run against a non-recording placeholder span.
 	if (!span) {
 		if (!telemetry || telemetry.spansEnabled) return;
 		const placeholder = trace.wrapSpanContext(INVALID_SPAN_CONTEXT);
-		const usageCost = applyCostEstimate(telemetry, placeholder, message, options.serviceTier, options.stepNumber);
+		const usageCost = applyCostEstimate(telemetry, placeholder, message, serviceTier, options.stepNumber);
 		await emitChatUsage(telemetry, placeholder, {
 			model: message.model,
 			provider: message.provider,
-			serviceTier: options.serviceTier,
+			serviceTier,
 			stepNumber: options.stepNumber,
 			usage: message.usage,
 			applied: usageCost,
@@ -1194,12 +1236,12 @@ export async function finishChatSpan(
 	applyChatResponseAttributes(span, message);
 	applyUsageAttributes(span, message.usage);
 	applyGatewayAttributes(span, options.responseHeaders, options.baseUrl);
-	const cost = applyCostEstimate(telemetry, span, message, options.serviceTier, options.stepNumber);
+	const cost = applyCostEstimate(telemetry, span, message, serviceTier, options.stepNumber);
 	if (telemetry) {
 		await emitChatUsage(telemetry, span, {
 			model: message.model,
 			provider: message.provider,
-			serviceTier: options.serviceTier,
+			serviceTier,
 			stepNumber: options.stepNumber,
 			usage: message.usage,
 			applied: cost,
@@ -1264,6 +1306,15 @@ export function failChatSpan(
 	}
 	telemetry?.collector.failChat(span, { errorType });
 	span.end();
+}
+
+function resolveCompletedServiceTier(
+	message: AssistantMessage,
+	requestedServiceTier: ServiceTier | undefined,
+): ServiceTier | undefined {
+	if (message.serviceTier !== undefined) return message.serviceTier;
+	// Ultrafast is sent only for opted-in models, so an absent completion tier means it was not applied.
+	return requestedServiceTier === "ultrafast" ? undefined : requestedServiceTier;
 }
 
 function applyChatResponseAttributes(span: Span, message: AssistantMessage): void {
@@ -1878,7 +1929,7 @@ export function finishExecuteToolSpan(
 				? options.errorObject.name || "Error"
 				: STATUS_ERROR_TYPE[status];
 	}
-	if (status === "error" && options.errorObject instanceof Error) {
+	if (status === "error" && options.errorObject instanceof Error && !isDesignedError(options.errorObject)) {
 		try {
 			recordHandledError(`Tool ${options.toolName}`, options.errorObject);
 		} catch {}

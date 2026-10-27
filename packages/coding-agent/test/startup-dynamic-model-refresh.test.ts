@@ -57,6 +57,19 @@ describe("startup dynamic model refresh", () => {
 		expect(fixture.refreshCalls).toEqual([["glm-zcode", "online-if-uncached"]]);
 	});
 
+	test("refreshes with the owning SDK credential session", async () => {
+		const fixture = setup();
+		const refreshSpy = vi.spyOn(fixture.modelRegistry, "refreshProvider");
+
+		await refreshMissingQualifiedModelProviders(
+			"dynamic-provider/new-model",
+			fixture.modelRegistry as never,
+			"sdk-session",
+		);
+
+		expect(refreshSpy).toHaveBeenCalledWith("dynamic-provider", "online-if-uncached", "sdk-session");
+	});
+
 	test("does not refresh when the startup model is already available", async () => {
 		const fixture = setup({
 			models: [model("glm-zcode", "glm-5.3")],

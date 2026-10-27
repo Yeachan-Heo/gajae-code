@@ -15,7 +15,7 @@
   - `packages/coding-agent/src/utils/file-display-mode.ts` — decide hashline vs line-number vs raw display.
   - `packages/coding-agent/src/workspace-tree.ts` — render directory trees.
   - `packages/coding-agent/src/edit/file-read-cache.ts` — cache read lines for later hashline edit recovery.
-  - `packages/coding-agent/src/tools/index.ts` — registers `read: s => new ReadTool(s)`.
+  - `packages/coding-agent/src/tools/descriptors.ts` — registers `read: s => new ReadTool(s)`.
 
 ## Inputs
 
@@ -203,6 +203,7 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
 ### Internal URLs
 - `read` does not resolve these itself; it delegates to `session.internalRouter.resolve()`.
 - Registered public protocols include `agent://`, `artifact://`, `issue://`, `local://`, `gjc://`, `pr://`, and `rule://`. Non-public compatibility handlers may exist in the router for legacy persisted guidance, but they are not part of the public coding-harness URI contract and must not be documented as user/model-facing read targets.
+- Managed `ArtifactManager` byte-range and stream reads bind data to one captured file identity and metadata generation. Symlink, inode, metadata, or root replacement is refused rather than followed. Native streams retain a read-only file capability; path-backed chunks use bounded no-follow descriptor checks. Streams close their read handles on completion, error, or cancellation. Existing tree discovery budgets still apply; text ranges preserve Blob UTF-8 decoding, including BOM handling. This does not certify broader local-URL, owner/GC, or admission authority.
 - `#handleInternalUrl()` behavior:
   - parses the URL with `parseInternalUrl()` so colons inside the host segment are legal
   - for `agent://`, treats non-root path extraction or `?q=` extraction as a special no-pagination mode

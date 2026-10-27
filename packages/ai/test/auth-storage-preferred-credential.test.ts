@@ -50,9 +50,14 @@ describe("runtime preferred credential selector", () => {
 		storage.setRuntimePreferredCredentialSelector(provider, { kind: "id", value: String(rows[0]!.id) });
 
 		expect(await storage.getApiKey(provider, "provider-neutral-session")).toBe("token-test-primary");
-		expect(await storage.markUsageLimitReached(provider, "provider-neutral-session", { retryAfterMs: 60_000 })).toBe(
-			true,
-		);
+		expect(
+			await storage.markUsageLimitReached(provider, "provider-neutral-session", { retryAfterMs: 60_000 }),
+		).toEqual({
+			state: "marked",
+			failedRowId: rows[0]!.id,
+			credentialKind: "oauth",
+			remainingCredentialIds: [rows[1]!.id],
+		});
 		expect(await storage.getApiKey(provider, "provider-neutral-session")).toBe("token-test-fallback");
 	});
 
@@ -62,7 +67,12 @@ describe("runtime preferred credential selector", () => {
 		storage.setRuntimePreferredCredentialSelector("anthropic", { kind: "id", value: String(preferred.id) });
 
 		expect(await storage.getApiKey("anthropic", "session-a")).toBe("token-test-primary");
-		expect(await storage.markUsageLimitReached("anthropic", "session-a", { retryAfterMs: 60_000 })).toBe(true);
+		expect(await storage.markUsageLimitReached("anthropic", "session-a", { retryAfterMs: 60_000 })).toMatchObject({
+			state: "marked",
+			failedRowId: preferred.id,
+			credentialKind: "oauth",
+			remainingCredentialIds: [rows[1]!.id],
+		});
 		expect(await storage.getApiKey("anthropic", "session-a")).toBe("token-test-fallback");
 		expect(await storage.getApiKey("anthropic", "session-a")).toBe("token-test-fallback");
 	});
@@ -71,18 +81,40 @@ describe("runtime preferred credential selector", () => {
 		const { storage, rows } = await createStorage();
 		storage.setRuntimePreferredCredentialSelector("anthropic", { kind: "id", value: String(rows[0]!.id) });
 		await storage.getApiKey("anthropic", "session-b");
-		expect(await storage.markUsageLimitReached("anthropic", "session-b", { retryAfterMs: 60_000 })).toBe(true);
+		expect(await storage.markUsageLimitReached("anthropic", "session-b", { retryAfterMs: 60_000 })).toMatchObject({
+			state: "marked",
+			failedRowId: rows[0]!.id,
+			credentialKind: "oauth",
+			remainingCredentialIds: [rows[1]!.id],
+		});
 		expect(await storage.getApiKey("anthropic", "session-b")).toBe("token-test-fallback");
-		expect(await storage.markUsageLimitReached("anthropic", "session-b", { retryAfterMs: 60_000 })).toBe(false);
+		expect(await storage.markUsageLimitReached("anthropic", "session-b", { retryAfterMs: 60_000 })).toMatchObject({
+			state: "marked",
+			failedRowId: rows[1]!.id,
+			credentialKind: "oauth",
+			remainingCredentialIds: [],
+		});
 	});
 
 	test("all-row quota exhaustion exposes the earliest unblock instant", async () => {
-		const { storage } = await createStorage();
+		const { storage, rows } = await createStorage();
 		await storage.getApiKey("anthropic", "session-c");
+		const firstRowId = storage.getSessionCredentialRowId("anthropic", "session-c")!;
+		const remainingRowId = rows.find(row => row.id !== firstRowId)!.id;
 		const before = Date.now();
-		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 45_000 })).toBe(true);
+		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 45_000 })).toEqual({
+			state: "marked",
+			failedRowId: firstRowId,
+			credentialKind: "oauth",
+			remainingCredentialIds: [remainingRowId],
+		});
 		expect(await storage.getApiKey("anthropic", "session-c")).toBe("token-test-fallback");
-		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 90_000 })).toBe(false);
+		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 90_000 })).toEqual({
+			state: "marked",
+			failedRowId: remainingRowId,
+			credentialKind: "oauth",
+			remainingCredentialIds: [],
+		});
 		const retryableAt = storage.getEarliestUnblockAt("anthropic", "session-c");
 		expect(retryableAt).toBeDefined();
 		expect(retryableAt!).toBeGreaterThanOrEqual(before + 45_000 - 250);

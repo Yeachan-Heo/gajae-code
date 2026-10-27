@@ -16,6 +16,8 @@ import {
 import { APP_NAME, adjustHsv, getAgentDir, getProjectDir, logger, postmortem, sanitizeText } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
+import { ConfigHotReloadWatcher } from "../config/config-hot-reload";
+import { isConfigHotReloadSupported, isConfigHotReloadTrusted } from "../config/config-hot-reload-trust";
 import {
 	type AppKeybinding,
 	defaultMessageQueueKeysForPlatform,
@@ -37,7 +39,11 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
-import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	getBuiltinSlashCommandsForSession,
+	loadSlashCommands,
+} from "../extensibility/slash-commands";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import {
 	createStarReminderBeforeAgentStartContributor,
@@ -471,6 +477,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#baseSlashCommands: SlashCommand[] = [];
 	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
+	#sessionBuiltinMcpVisible = false;
+	#slashCommandRefreshVersion = 0;
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
 
@@ -565,7 +573,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	#suspendedActivityIndicator?: Loader;
 	#stopped = false;
 	#initPromise?: Promise<void>;
+	// Until startup's first paint renders the session transcript, chatContainer holds
+	// only pre-paint notices. A transcript rebuild before then (e.g. an extension
+	// session_start message with display:true) would wipe those notices and leave
+	// session components that the first paint preserves and renders again, so every
+	// session-derived block would show twice. Rebuilds are no-ops until the first
+	// paint, which renders the full session anyway.
+	#initialTranscriptPainted = false;
 	#stopListeners = new Set<() => void>();
+	#configHotReload?: ConfigHotReloadWatcher;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#welcomeComponent?: WelcomeComponent;
@@ -672,7 +688,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			startPendingSubmission: input => thisMode.startPendingSubmission(input),
 			addChatChild: child => addChatChild(thisMode, child),
 			requestRender: full => thisMode.ui.requestRender(full),
-			stopUi: () => thisMode.ui.stop(),
+			stopUi: () => thisMode.ui.suspend(),
 			startUi: () => thisMode.ui.start(),
 			showStatus: message => thisMode.showStatus(message),
 			showWarning: message => thisMode.showWarning(message),
@@ -761,6 +777,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
+		this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;
+		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.#sessionBuiltinMcpVisible);
 		const activeProvider = this.session.model?.provider;
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
@@ -778,8 +796,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			description: `${loaded.command.description} (${loaded.source})`,
 		}));
 
-		this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];
-		this.#baseReservedSlashCommandNames = new Set(this.#baseSlashCommands.map(command => command.name));
+		this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];
+		// Hidden builtin metadata must still reserve its name from extensions and skills.
+		this.#baseReservedSlashCommandNames = new Set([
+			...builtinCommandNames,
+			...hookCommands.map(command => command.name),
+			...customCommands.map(command => command.name),
+		]);
 		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...this.#rebuildSkillSlashCommands()];
 
 		this.#uiHelpers = new UiHelpers(this);
@@ -992,6 +1015,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
+		await this.#startConfigHotReload();
+		if (this.#stopped) return;
 		this.syncActivityIndicator();
 		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
@@ -1144,6 +1169,20 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Subscribe to agent events
 		this.#subscribeToAgent();
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribeSessionIdentityChanges(async () => {
+				// Any committed identity change (extension tree navigation, reload, ...) stales the suggestion.
+				this.promptSuggestion.clear();
+				try {
+					await this.refreshSlashCommandState();
+				} catch (error) {
+					if (this.#stopped) return;
+					logger.warn("Failed to refresh slash-command state after extension session transition", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}),
+		);
 
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribe(event => {
@@ -1208,9 +1247,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		if (this.#stopped) return;
+		const refreshVersion = ++this.#slashCommandRefreshVersion;
 		const basePath = cwd ?? this.sessionManager.getCwd();
+		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
-		if (this.#stopped) return;
+		if (this.#stopped || refreshVersion !== this.#slashCommandRefreshVersion) return;
+		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
@@ -1225,6 +1267,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
 		this.session.setSlashCommands(fileCommands);
+	}
+
+	#refreshSessionBuiltinSlashCommandVisibility(cwd: string): void {
+		const hasExactMcpControls = this.session.hasExactMcpControls;
+		if (hasExactMcpControls === this.#sessionBuiltinMcpVisible) return;
+
+		const previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);
+		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(command => command.name));
+		this.#baseSlashCommands = [
+			...getBuiltinSlashCommandsForSession(hasExactMcpControls),
+			...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),
+		];
+		this.#sessionBuiltinMcpVisible = hasExactMcpControls;
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...previousSlashCommandTail];
+		this.editor.setAutocompleteProvider(
+			this.#inputController.createAutocompleteProvider(this.#resolvedSlashCommands, cwd),
+		);
 	}
 
 	#rebuildSkillSlashCommands(fileCommandNames: ReadonlySet<string> = new Set()): SlashCommand[] {
@@ -1468,6 +1527,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.editor.setPlaceholder(this.#getComposerPlaceholder());
 		this.#setComposerTopBorder();
+		// Every live model switch (/model, profiles, cycling, fallback) refreshes the
+		// editor chrome; keep the welcome model/provider pills on the same signal.
+		this.#welcomeComponent?.setModel(
+			this.session.model?.name ?? "Unknown",
+			this.session.model?.provider ?? "Unknown",
+		);
 		this.ui.requestRender();
 	}
 
@@ -1561,6 +1626,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
+		if (!this.#initialTranscriptPainted) return;
 		prepareTranscriptRebuild(this.ui, policy);
 		this.resetAssistantTextPresentation();
 		this.chatContainer.clear();
@@ -1683,6 +1749,65 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#stopped;
 	}
 
+	async #startConfigHotReload(): Promise<void> {
+		const paths = this.session.getConfigurationPaths();
+		if (!paths) return;
+		if (!isConfigHotReloadSupported()) {
+			logger.debug("Configuration hot reload is unsupported on this platform", { platform: process.platform });
+			return;
+		}
+		const trusted = await isConfigHotReloadTrusted(paths);
+		if (this.#stopped || this.#isShuttingDown) return;
+		if (!trusted) {
+			this.showWarning(
+				"Configuration watching could not start because directory ownership and privacy could not be verified.",
+			);
+			return;
+		}
+		const assertTrustedPaths = async (): Promise<void> => {
+			if (await isConfigHotReloadTrusted(paths)) return;
+			const error = new Error("Configuration directory ownership and privacy could not be verified");
+			Object.assign(error, { code: "EACCES" });
+			throw error;
+		};
+		const watcher = new ConfigHotReloadWatcher({
+			onValidate: async candidate => {
+				await assertTrustedPaths();
+				await this.session.validateConfiguration(candidate);
+			},
+			onCandidate: async (candidate, signal) => {
+				if (signal.aborted || this.#stopped || this.#isShuttingDown) return;
+				await assertTrustedPaths();
+				if (signal.aborted || this.#stopped || this.#isShuttingDown) return;
+				const result = await this.session.reloadConfiguration(candidate, signal);
+				if (signal.aborted || this.#stopped || this.#isShuttingDown || !result.applied) return;
+				this.#selectorController.refreshConfiguration();
+				this.#syncEditorMaxHeight();
+				this.#syncIrcSidebarAvailabilityFromSettings();
+				this.updateEditorChrome();
+				this.showStatus(
+					result.settingsChanged
+						? "Configuration reloaded. Startup-only services require a restart."
+						: "Model configuration reloaded.",
+				);
+				this.ui.requestRender();
+			},
+			onError: error => {
+				if (!this.#stopped && !this.#isShuttingDown) {
+					this.showWarning(`${error.message}. Repair the configuration file and save again.`);
+				}
+			},
+		});
+		this.#configHotReload = watcher;
+		try {
+			await watcher.start(paths);
+		} catch {
+			watcher.dispose();
+			this.#configHotReload = undefined;
+			this.showWarning("Configuration watching could not start. Restart after repairing file access.");
+		}
+	}
+
 	onStop(callback: () => void): () => void {
 		if (this.#stopped) {
 			callback();
@@ -1695,6 +1820,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		const wasInitialized = this.isInitialized;
 		this.#stopped = true;
+		this.#configHotReload?.dispose();
+		this.#configHotReload = undefined;
 		this.ui.setRenderPreparationLifecycleCallbacks(undefined);
 		this.#inputController.discardDeferredSubmission();
 		for (const listener of this.#stopListeners) {
@@ -1768,6 +1895,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#isShuttingDown = true;
+		this.#configHotReload?.dispose();
+		this.#configHotReload = undefined;
 
 		// `/btw` owns the shared composer while its panel is open. Never persist a
 		// side-chat draft or pending side-chat images into the main-session draft.
@@ -1784,6 +1913,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const draftText = selectShutdownDraft(this.editor.getText(), hadActiveBtw);
 		if (hadActiveBtw) this.pendingImages = [];
+		this.promptSuggestion.clear();
 		this.#btwController.dispose();
 
 		// Flush pending session writes before shutdown.
@@ -2184,11 +2314,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		prebuiltContext?: SessionContext,
 		options?: { preserveExistingChat?: boolean },
 	): void {
+		if (!this.#initialTranscriptPainted) return;
 		prepareTranscriptRebuild(this.ui, policy);
 		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
 	}
 	renderInitialMessages(prebuiltContext?: SessionContext, options?: { preserveExistingChat?: boolean }): void {
 		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
+		this.#initialTranscriptPainted = true;
 	}
 
 	getUserMessageText(message: Message): string {
@@ -2266,6 +2398,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#prepareSessionSwitch(cleanupPreviousSessionUi?: () => void): void {
 		const errors: unknown[] = [];
+		this.promptSuggestion.clear();
 		try {
 			this.#btwController.dispose();
 		} catch (error) {
@@ -2630,6 +2763,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	handleBackgroundCommand(): void {
 		this.#inputController.handleBackgroundCommand();
+	}
+
+	maybeGenerateSessionTitle(text: string): void {
+		this.#inputController.maybeGenerateSessionTitle(text);
 	}
 
 	handleImagePaste(): Promise<boolean> {

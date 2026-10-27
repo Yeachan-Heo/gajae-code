@@ -68,5 +68,12 @@ const output = [
 	"",
 ].join("\n");
 
-await Bun.write(outputPath, output);
+// Workspace checks run concurrently; publish only complete modules to readers.
+const temporaryPath = `${outputPath}.${process.pid}.tmp`;
+try {
+	await Bun.write(temporaryPath, output);
+	await fs.rename(temporaryPath, outputPath);
+} finally {
+	await fs.rm(temporaryPath, { force: true });
+}
 process.stderr.write(`Generated ${path.relative(process.cwd(), outputPath)} (${entries.length} docs)\n`);

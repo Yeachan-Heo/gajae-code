@@ -16,6 +16,10 @@ export function matchesAppInterrupt(data: string): boolean {
 	return matchesKey(data, "escape") || matchesKey(data, "esc");
 }
 
+export function matchesAppClear(data: string): boolean {
+	return getKeybindings().matches(data, "app.clear");
+}
+
 export function matchesSelectCancel(data: string): boolean {
 	return getKeybindings().matches(data, "tui.select.cancel");
 }

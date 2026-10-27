@@ -80,6 +80,7 @@ const query = queryIndex === -1 ? undefined : args[queryIndex + 1];
 if (query === "session.stats") {
 	process.stderr.write("private=" + secret + "\\n");
 	process.exitCode = 1;
+	process.stdout.write(JSON.stringify({ schema: "gjc.command-error", version: 1, ok: false, command: ["sdk", "session", "raw", "query"], error: { code: "uncertain_after_send", outcomeCertainty: "unknown", retryability: "unknown", references: [{ kind: "idempotencyKey", value: "exact-reconciliation-key" }] }, complete: false, evidence: { status: "unavailable", warning: "Do not blindly retry." }, continuation: null }) + "\\n");
 } else {
 	process.stdout.write(JSON.stringify({ ok: true, result: { query: query ?? "control", token: secret } }) + "\\n");
 }
@@ -346,7 +347,11 @@ describe("generated external GJC SDK skills", () => {
 			expect(source).not.toContain("coordinator-mcp");
 		}
 		expect(typescript).toContain('Bun.spawn(["gjc", "sdk", "session"');
-		expect(python).toContain('["gjc", "sdk", "session", *arguments]');
+		expect(python).toContain('["gjc", "sdk", "session", *arguments, "--json"]');
+		expect(typescript).toContain('["gjc", "sdk", "session", ...arguments_, "--json"]');
+		expect(typescript).not.toContain('...args, "--repo", repo');
+		expect(typescript).toContain("cwd: repo");
+		expect(python).toContain("cwd=repo");
 		expect(typescript).toContain("ALLOWED_CONTROLS.has");
 		expect(python).toContain("operation not in ALLOWED_CONTROLS");
 		expect(python).toContain("file=sys.stderr");
@@ -378,11 +383,17 @@ describe("generated external GJC SDK skills", () => {
 		const calls = await cliCalls(fixture);
 		expect(calls).toHaveLength(CORE_QUERIES.length);
 		expect(calls.map(call => call.args)).toEqual(
-			CORE_QUERIES.map(query => ["sdk", "session", "raw", "query", "session-1", "--query", query]),
+			CORE_QUERIES.map(query => ["sdk", "session", "raw", "query", "session-1", "--query", query, "--json"]),
 		);
 		expect(calls.every(call => call.cwd === fixture.repo)).toBe(true);
 		expect(result.stdout).toContain('"status": "confirmed"');
 		expect(result.stdout).toContain('"status": "unavailable"');
+		const snapshot = JSON.parse(result.stdout).result;
+		expect(snapshot["session.stats"].failure).toMatchObject({
+			schema: "gjc.command-error", version: 1,
+			error: { code: "uncertain_after_send", outcomeCertainty: "unknown", references: [{ kind: "idempotencyKey", value: "exact-reconciliation-key" }] },
+			complete: false, evidence: { status: "unavailable" }, continuation: null,
+		});
 		expect(result.stdout).toContain("[REDACTED]");
 		expect(result.stdout + result.stderr).not.toContain(fixture.secret);
 	});
@@ -421,6 +432,7 @@ describe("generated external GJC SDK skills", () => {
 			"--json-input",
 			'{"prompt":"hello"}',
 			"--confirm",
+			"--json",
 		]);
 		expect(approved.stdout + approved.stderr).not.toContain(fixture.secret);
 		const acceptedChallenge = approved.stderr.match(/Approval required: (APPROVE [^\n]+)/)?.[1];

@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { getAgentDbPath } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
+import { discoverAuthStorage } from "../src/sdk/session";
 import {
 	isValidPersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -78,6 +80,7 @@ describe("startup auth config", () => {
 			credentialStoreIdentity: `local:${getAgentDbPath(absentDir)}`,
 			credentialRankingMode: "balanced",
 			credentialPins: {},
+			credentialPreferences: {},
 		});
 
 		const emptyDir = await makeAgentDir("");
@@ -86,6 +89,7 @@ describe("startup auth config", () => {
 			credentialStoreIdentity: `local:${getAgentDbPath(emptyDir)}`,
 			credentialRankingMode: "balanced",
 			credentialPins: {},
+			credentialPreferences: {},
 		});
 	});
 
@@ -163,7 +167,99 @@ describe("startup auth config", () => {
 			credentialPinStoreIdentity: "broker:https://broker.example",
 			credentialRankingMode: "earliest-reset",
 			credentialPins: { anthropic: "email:operator@example.com" },
+			credentialPreferences: {},
 		});
+	});
+
+	it("reads ordered credential preferences with per-account usage caps", async () => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			[
+				"auth:",
+				"  credentialPreferences:",
+				"    anthropic:",
+				"      - cheap@example.com",
+				"      - shared@example.com: 75",
+				"      - email:prefixed@example.com: 40.5",
+				"      - account:acct-9: 100",
+				"    openai-codex: account:acct-1",
+				"    kimi-code: solo@example.com",
+			].join("\n"),
+		);
+
+		const resolved = await resolveStartupAuthConfig(agentDir);
+		expect(resolved.credentialPreferences).toEqual({
+			anthropic: [
+				{ selector: { kind: "email", value: "cheap@example.com" } },
+				{ selector: { kind: "email", value: "shared@example.com" }, maxUsedFraction: 0.75 },
+				{ selector: { kind: "email", value: "prefixed@example.com" }, maxUsedFraction: 0.405 },
+				// A 100 percent cap is the same as no cap: only blocking moves past the account.
+				{ selector: { kind: "account", value: "acct-9" } },
+			],
+			"openai-codex": [{ selector: { kind: "account", value: "acct-1" } }],
+			"kimi-code": [{ selector: { kind: "email", value: "solo@example.com" } }],
+		});
+	});
+
+	it.each([
+		["a numeric row id", "    anthropic: id:42\n"],
+		["a non-mapping section", null],
+		["a value that is not an account", "    anthropic: cheap\n"],
+		["an empty list", "    anthropic: []\n"],
+		["a numeric id inside a list", "    anthropic:\n      - cheap@example.com\n      - id:42\n"],
+		["the same account twice", "    anthropic:\n      - cheap@example.com\n      - Cheap@Example.com: 50\n"],
+		["two accounts in one entry", "    anthropic:\n      - cheap@example.com: 50\n        other@example.com: 50\n"],
+		["a zero cap", "    anthropic:\n      - cheap@example.com: 0\n"],
+		["a cap over 100", "    anthropic:\n      - cheap@example.com: 101\n"],
+		["a string cap", '    anthropic:\n      - cheap@example.com: "75%"\n'],
+		["a nested list", "    anthropic:\n      - - cheap@example.com\n"],
+	])("fails closed for credential preferences with %s", async (_label, body) => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			body === null
+				? "auth:\n  credentialPreferences: preference-section-secret\n"
+				: `auth:\n  credentialPreferences:\n${body}`,
+		);
+		await expectStartupAuthConfigError(
+			resolveStartupAuthConfig(agentDir),
+			"invalid-credential-preferences",
+			"preference-section-secret",
+		);
+	});
+
+	it.each([
+		["fails closed when two entries name one stored account", "acct-cheap", true],
+		["opens the store when the entries name different stored accounts", "acct-other", false],
+	])("%s through different selectors", async (_label, cheapAccountId, rejected) => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - cheap@example.com: 50\n      - account:acct-cheap\n",
+		);
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath(agentDir));
+		try {
+			store.upsertAuthCredentialForProvider("anthropic", {
+				type: "oauth",
+				access: "access-cheap",
+				refresh: "refresh-cheap",
+				expires: Date.now() + 3_600_000,
+				email: "cheap@example.com",
+				accountId: cheapAccountId,
+			});
+		} finally {
+			store.close();
+		}
+
+		const discovery = discoverAuthStorage(agentDir);
+		if (rejected) {
+			await expectStartupAuthConfigError(discovery, "invalid-credential-preferences", "cheap@example.com");
+			return;
+		}
+		const storage = await discovery;
+		try {
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+		} finally {
+			storage.close();
+		}
 	});
 
 	it("keeps malformed or absent pin-store metadata from authorizing numeric pins", async () => {
@@ -265,5 +361,45 @@ describe("startup auth config", () => {
 		expect(validateSettingPatch({ "auth.credentialPins": { anthropic: "operator@example.com" } })).toEqual([
 			{ path: "auth.credentialPins.anthropic", detail: "Expected credential-selector." },
 		]);
+	});
+
+	it("validates preference records with the startup parser grammar", () => {
+		for (const value of [
+			"email:cheap@example.com",
+			"cheap@example.com",
+			["cheap@example.com", { "account:acct-1": 75 }],
+		]) {
+			expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: value } })).toEqual([]);
+		}
+		for (const value of [
+			"id:27",
+			[],
+			[{ "cheap@example.com": 0 }],
+			[{ "cheap@example.com": 50, "other@example.com": 50 }],
+			["cheap@example.com", "cheap@example.com"],
+		]) {
+			expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: value } })).toEqual([
+				{ path: "auth.credentialPreferences.anthropic", detail: "Expected credential-preference-list." },
+			]);
+		}
+	});
+
+	it("ignores project-scoped credential preferences", async () => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - global@example.com: 80\n",
+		);
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-auth-project-"));
+		tempDirs.push(projectDir);
+		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(projectDir, ".gjc", "config.yml"),
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - project@example.com: 10\n",
+		);
+
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		expect(settings.get("auth.credentialPreferences")).toEqual({
+			anthropic: [{ "global@example.com": 80 }],
+		});
 	});
 });

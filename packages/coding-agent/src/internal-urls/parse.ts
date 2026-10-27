@@ -13,6 +13,25 @@ import type { InternalUrl } from "./types";
 
 const SCHEME_HOST_RE = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)/i;
 const PATHNAME_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*(\/[^?#]*)?/i;
+// Schemes whose canonical spelling omits the authority slashes. `embedded:` is
+// the identifier tools print for bundled (non-filesystem) resources, so both
+// `embedded:gjc/...` and `embedded://gjc/...` must route to the same handler.
+const SLASHLESS_SCHEMES = new Set(["embedded"]);
+const SLASHLESS_SCHEME_RE = /^([a-z][a-z0-9+.-]*):(?!\/\/)(.*)$/is;
+
+/**
+ * Canonicalize an internal URL so slashless schemes carry an authority.
+ *
+ * Every entry point that inspects or routes an internal URL (router,
+ * read/write tools, selector splitting) MUST normalize first, so handlers only
+ * ever see the `scheme://authority/path` form.
+ */
+export function normalizeInternalUrlInput(input: string): string {
+	const match = input.match(SLASHLESS_SCHEME_RE);
+	if (!match) return input;
+	if (!SLASHLESS_SCHEMES.has(match[1].toLowerCase())) return input;
+	return `${match[1].toLowerCase()}://${match[2]}`;
+}
 
 /**
  * Parse an internal URL into an InternalUrl.
@@ -20,7 +39,8 @@ const PATHNAME_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*(\/[^?#]*)?/i;
  * Handles URLs where `new URL()` would fail (e.g., `skill://plugin:name`
  * where the colon is not a port separator).
  */
-export function parseInternalUrl(input: string): InternalUrl {
+export function parseInternalUrl(rawInput: string): InternalUrl {
+	const input = normalizeInternalUrlInput(rawInput);
 	const hostMatch = input.match(SCHEME_HOST_RE);
 	const pathMatch = input.match(PATHNAME_RE);
 

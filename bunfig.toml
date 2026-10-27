@@ -13,11 +13,23 @@ saveTextLockfile = true
 ".lark" = "text"
 
 [test]
-preload = ["./scripts/test-preload.ts"]
+preload = ["./scripts/test-preload-after-all.ts"]
 pathIgnorePatterns = [
   "**/node_modules/**",
   ".wt/**",
   ".worktrees/**",
+  # Untracked test working space (AGENTS.md, issue #4420). Debugging and
+  # red-team runs leave full repository checkouts here, and `bun test <path>`
+  # resolves through the whole tree: without this, a targeted run silently
+  # collects every nested copy and reports foreign failures under
+  # `artifacts/<name>/scripts/...`.
+  "artifacts/**",
+  # Cargo build output. A targeted `bun test packages/...` (no `./` prefix) is a
+  # filter that walks the whole tree, and Bun 1.4.0 keeps a directory fd open
+  # for every directory it visits. A dev `target/` holds tens of thousands of
+  # directories, so the walk pushes the test process past macOS OPEN_MAX and
+  # every later `posix_spawn` in that process fails with EBADF.
+  "target/**",
 ]
 
 [run]

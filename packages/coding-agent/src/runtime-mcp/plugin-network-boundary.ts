@@ -19,6 +19,10 @@ export function bindPluginMcpToPublicNetwork<T extends MCPHttpServerConfig | MCP
 }
 
 /** The marker is an internal symbol, so persisted user MCP configs cannot opt into or forge this path. */
+export function usesPublicNetworkMcpFetch(config: MCPHttpServerConfig | MCPSseServerConfig): boolean {
+	return ("publicNetwork" in config && config.publicNetwork === true) || isPluginMcpPublicNetworkBound(config);
+}
+
 export function isPluginMcpPublicNetworkBound(config: MCPHttpServerConfig | MCPSseServerConfig): boolean {
 	return (
 		(config as MCPHttpServerConfig & { [PLUGIN_MCP_PUBLIC_NETWORK_BOUNDARY]?: boolean })[

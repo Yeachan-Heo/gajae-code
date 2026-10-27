@@ -13,10 +13,19 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
-import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
+import {
+	DeferredMCPTool,
+	loadAllMCPConfigs,
+	type MCPLoadResult,
+	MCPManager,
+	MCPTool,
+	MCPToolCache,
+} from "../src/runtime-mcp";
+import * as mcpClient from "../src/runtime-mcp/client";
+import { AgentStorage } from "../src/session/agent-storage";
 
 const DEMO_MCP_SERVER_SCRIPT = `
 const readline = require('node:readline');
@@ -27,6 +36,25 @@ rl.on('line', line => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'demo', version: '1' } } }) + '\\n');
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
+const MULTI_TOOL_DEMO_MCP_SERVER_SCRIPT = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'demo', version: '1' } } }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [
+      { name: 'hello', description: 'Demo hello tool', inputSchema: { type: 'object', properties: {} } },
+      { name: 'goodbye', description: 'Demo goodbye tool', inputSchema: { type: 'object', properties: {} } }
+    ] } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }
@@ -45,6 +73,24 @@ rl.on('line', line => {
     }, 4200);
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'late_hello', description: 'Late demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
+const LATE_DEFAULT_MCP_SERVER_SCRIPT = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-default', version: '1' } } }) + '\\n');
+    }, 8000);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'late_default', description: 'Late default demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }
@@ -91,7 +137,8 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			agentDir,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({}),
+			// Project stdio autoload requires an explicit user opt-in.
+			settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -126,6 +173,635 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
 		} finally {
 			await session.dispose();
+		}
+	}, 30_000);
+
+	async function addDemoServer(): Promise<void> {
+		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+	}
+
+	it("keeps autoloaded MCP tools discoverable but inactive when mcp.discoveryDeferAutoload is set", async () => {
+		await addDemoServer();
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__demo_hello");
+			await session.activateDiscoveredTools(["mcp__demo_hello"]);
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps automatic discovery-default selection non-persisting across catalog refreshes", async () => {
+		await addDemoServer();
+		let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+		const originalSetOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+		vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+			publishToolsChanged = handler;
+			return originalSetOnToolsChanged.call(this, handler);
+		});
+
+		const { session, mcpManager } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			if (!mcpManager) throw new Error("Expected the session-owned MCP manager");
+			const initialToolName = "mcp__demo_hello";
+			const [lateDefaultTool] = MCPTool.fromTools(
+				{ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[
+					{
+						name: "late_default",
+						description: "Late default tool",
+						inputSchema: { type: "object", properties: {} },
+					},
+				],
+			);
+			if (!lateDefaultTool) throw new Error("Default MCP regression tool was not created");
+			if (!publishToolsChanged) throw new Error("Expected the MCP catalog callback");
+			expect(session.getActiveToolNames()).toContain(initialToolName);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+
+			publishToolsChanged([]);
+			const removalDeadline = Date.now() + 5_000;
+			while (session.getAllToolNames().includes(initialToolName)) {
+				if (Date.now() > removalDeadline) throw new Error(`MCP catalog tool was not removed: ${initialToolName}`);
+				await Bun.sleep(20);
+			}
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+
+			const pendingAuthority = vi.spyOn(session, "hasMCPToolSelectionAuthority").mockReturnValue(true);
+			const committedAuthority = vi.spyOn(session, "hasCommittedMCPToolSelectionAuthority").mockReturnValue(false);
+			publishToolsChanged([lateDefaultTool]);
+			const activationDeadline = Date.now() + 5_000;
+			while (!session.getActiveToolNames().includes(lateDefaultTool.name)) {
+				if (Date.now() > activationDeadline)
+					throw new Error(`Discovery-default MCP tool was not activated: ${lateDefaultTool.name}`);
+				await Bun.sleep(20);
+			}
+			expect(committedAuthority).toHaveBeenCalled();
+			pendingAuthority.mockRestore();
+			committedAuthority.mockRestore();
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("re-evaluates discovery defaults after a catalog callback resumes from /new", async () => {
+		await addDemoServer();
+		const [defaultTool] = MCPTool.fromTools({ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0], [
+			{
+				name: "late_default",
+				description: "Late default tool",
+				inputSchema: { type: "object", properties: {} },
+			},
+		]);
+		if (!defaultTool) throw new Error("Default MCP regression tool was not created");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue({
+			tools: [],
+			errors: new Map(),
+			connectedServers: ["demo"],
+			exaApiKeys: [],
+		});
+		let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+		const originalSetOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+		vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+			publishToolsChanged = handler;
+			return originalSetOnToolsChanged.call(this, handler);
+		});
+		const beforeSwitchStarted = Promise.withResolvers<void>();
+		const releaseSwitchHook = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		let session: AgentSession | undefined;
+		const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+		vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+			this: AgentSession,
+			previousNames,
+			nextTools,
+			options,
+		) {
+			if (this === session && nextTools.some(tool => tool.name === defaultTool.name)) {
+				replacementStarted.resolve();
+			}
+			await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
+		});
+
+		const created = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => {
+						beforeSwitchStarted.resolve();
+						await releaseSwitchHook.promise;
+					});
+				},
+			],
+		});
+		session = created.session;
+		try {
+			if (!created.mcpManager) throw new Error("Expected the session-owned MCP manager");
+			if (!publishToolsChanged) throw new Error("Expected the MCP catalog callback");
+			expect(session.getAllToolNames()).not.toContain(defaultTool.name);
+			await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+
+			const transition = session.newSession();
+			await beforeSwitchStarted.promise;
+			publishToolsChanged([defaultTool]);
+			await Promise.race([
+				replacementStarted.promise,
+				Bun.sleep(5_000).then(() => {
+					throw new Error("Catalog replacement did not start during the session transition");
+				}),
+			]);
+			releaseSwitchHook.resolve();
+			expect(await transition).toBe(true);
+
+			const activationDeadline = Date.now() + 5_000;
+			while (!session.getActiveToolNames().includes(defaultTool.name)) {
+				if (Date.now() > activationDeadline)
+					throw new Error(`Discovery-default MCP tool was not activated: ${defaultTool.name}`);
+				await Bun.sleep(20);
+			}
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+		} finally {
+			releaseSwitchHook.resolve();
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps deferred-startup autoload tools inactive unless their server is a discovery default", async () => {
+		await addDemoServer();
+		for (const [defaults, expectActive] of [
+			[[], false],
+			[["demo"], true],
+		] as const) {
+			MCPManager.resetForTests();
+			const { session, startDeferredMcpConfig } = await createAgentSession({
+				...isolatedSessionOptions(),
+				toolNames: undefined,
+				settings: Settings.isolated({
+					"mcp.discoveryMode": true,
+					"mcp.discoveryDeferAutoload": true,
+					"mcp.discoveryDefaultServers": [...defaults],
+					"mcp.enableProjectConfig": true,
+				}),
+				deferMcpConfigStartup: true,
+			});
+			try {
+				await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+				expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+				expect(session.getActiveToolNames().includes("mcp__demo_hello")).toBe(expectActive);
+			} finally {
+				await session.dispose();
+			}
+		}
+	}, 45_000);
+
+	it("preserves an explicit empty MCP selection during deferred startup", async () => {
+		await addDemoServer();
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: [],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__demo_hello");
+			expect(session.getSelectedMCPToolNames()).not.toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
+	it("preserves an explicit deferred MCP subset when its default server connects", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					demo: {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", MULTI_TOOL_DEMO_MCP_SERVER_SCRIPT],
+						timeout: 5_000,
+					},
+				},
+			}),
+		);
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: ["mcp__demo_hello"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 2, hasErrors: false });
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getAllToolNames()).toContain("mcp__demo_goodbye");
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__demo_goodbye");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__demo_hello"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
+	it("activates late defaults for inherited sessions unless tools were explicitly deselected", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		const fastDefaultServerConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+			timeout: 15_000,
+		};
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					"fast-default": fastDefaultServerConfig,
+					"slow-default": {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", LATE_DEFAULT_MCP_SERVER_SCRIPT],
+						timeout: 15_000,
+					},
+				},
+			}),
+		);
+
+		const lateToolName = "mcp__slow_default_late_default";
+		const inheritedToolChangeHandlers: Parameters<MCPManager["subscribeToToolsChanged"]>[0][] = [];
+		const originalSubscribeToToolsChanged = MCPManager.prototype.subscribeToToolsChanged;
+		vi.spyOn(MCPManager.prototype, "subscribeToToolsChanged").mockImplementation(function (
+			this: MCPManager,
+			handler,
+		) {
+			inheritedToolChangeHandlers.push(handler);
+			return originalSubscribeToToolsChanged.call(this, handler);
+		});
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["fast-default", "slow-default"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		let inheritedSession: AgentSession | undefined;
+		let explicitlyDeselectedSession: AgentSession | undefined;
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			if (!mcpManager) throw new Error("Expected the deferred session-owned manager");
+			expect(mcpManager?.getConnectionStatus("slow-default")).toBe("connecting");
+			expect(session.getAllToolNames()).toContain("mcp__fast_default_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__fast_default_hello");
+			expect(session.getAllToolNames()).not.toContain(lateToolName);
+			expect(session.getActiveToolNames()).not.toContain(lateToolName);
+			const inheritedSettings = () =>
+				Settings.isolated({
+					"mcp.discoveryMode": true,
+					"mcp.discoveryDeferAutoload": true,
+					"mcp.discoveryDefaultServers": ["fast-default", "slow-default"],
+					"mcp.enableProjectConfig": true,
+				});
+			inheritedSession = (
+				await createAgentSession({
+					...isolatedSessionOptions(),
+					toolNames: ["read", "todo_write"],
+					settings: inheritedSettings(),
+					inheritedMcpManager: mcpManager,
+					parentTaskPrefix: "0-Inherited",
+				})
+			).session;
+			expect(inheritedSession.getActiveToolNames()).toContain("todo_write");
+			await inheritedSession.setActiveToolsByName(
+				inheritedSession.getActiveToolNames().filter(name => name !== "todo_write"),
+				{ explicit: false, persistMCPSelection: false },
+			);
+			expect(inheritedSession.getActiveToolNames()).not.toContain("todo_write");
+			expect(inheritedSession.hasMCPToolSelectionAuthority()).toBe(false);
+			explicitlyDeselectedSession = (
+				await createAgentSession({
+					...isolatedSessionOptions(),
+					toolNames: undefined,
+					settings: inheritedSettings(),
+					inheritedMcpManager: mcpManager,
+					parentTaskPrefix: "1-Deselected",
+				})
+			).session;
+			expect(inheritedSession.getActiveToolNames()).toContain("mcp__fast_default_hello");
+			expect(explicitlyDeselectedSession.getActiveToolNames()).toContain("mcp__fast_default_hello");
+			await explicitlyDeselectedSession.setActiveToolsByName(["read"]);
+			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
+
+			const pendingAuthority = vi.spyOn(inheritedSession, "hasMCPToolSelectionAuthority").mockReturnValue(true);
+			if (inheritedToolChangeHandlers.length === 0) {
+				throw new Error("Expected an inherited MCP catalog callback");
+			}
+			for (const handler of inheritedToolChangeHandlers) handler(mcpManager.getTools());
+			const activationDeadline = Date.now() + 15_000;
+			while (
+				!session.getActiveToolNames().includes(lateToolName) ||
+				!inheritedSession.getAllToolNames().includes(lateToolName) ||
+				!inheritedSession.getActiveToolNames().includes(lateToolName) ||
+				!explicitlyDeselectedSession.getAllToolNames().includes(lateToolName)
+			) {
+				if (Date.now() > activationDeadline) {
+					throw new Error(`Discovery-default MCP tool was not published and activated: ${lateToolName}`);
+				}
+				await Bun.sleep(20);
+			}
+			pendingAuthority.mockRestore();
+			expect(session.getAllToolNames()).toContain(lateToolName);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(inheritedSession.getActiveToolNames()).toContain(lateToolName);
+			expect(inheritedSession.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
+			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain(lateToolName);
+			expect(explicitlyDeselectedSession.getSelectedMCPToolNames()).toEqual([]);
+		} finally {
+			await explicitlyDeselectedSession?.dispose();
+			await inheritedSession?.dispose();
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("reevaluates discovery-default authority after starting a new session", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					"slow-default": {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", LATE_DEFAULT_MCP_SERVER_SCRIPT],
+						timeout: 15_000,
+					},
+				},
+			}),
+		);
+		const sessionManager = SessionManager.inMemory(projectDir);
+		sessionManager.appendMCPToolSelection([]);
+		const lateToolName = "mcp__slow_default_late_default";
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			sessionManager,
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["slow-default"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: false });
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(true);
+			expect(mcpManager?.getConnectionStatus("slow-default")).toBe("connecting");
+			await expect(session.newSession()).resolves.toBe(true);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+
+			const activationDeadline = Date.now() + 15_000;
+			while (!session.getActiveToolNames().includes(lateToolName)) {
+				if (Date.now() > activationDeadline) {
+					throw new Error(`New session did not apply its configured MCP default: ${lateToolName}`);
+				}
+				await Bun.sleep(20);
+			}
+			expect(session.getAllToolNames()).toContain(lateToolName);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
+	it("loads persisted cached conventional tools through the session-owned manager", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow-demo",
+			commandArgs: [process.execPath, "-e", DELAYED_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 1_000 },
+			cwd: projectDir,
+		});
+
+		const configPath = path.join(projectDir, ".gjc", "mcp.json");
+		const configDocument = JSON.parse(await fs.promises.readFile(configPath, "utf8")) as {
+			mcpServers: Record<string, Record<string, unknown>>;
+		};
+		delete configDocument.mcpServers["slow-demo"]?.timeout;
+		await fs.promises.writeFile(configPath, JSON.stringify(configDocument, null, 2));
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
+
+		const sessionAgentDir = path.join(tempHome, ".gjc", "session-profile");
+		await fs.promises.mkdir(sessionAgentDir, { recursive: true });
+		const options = { ...isolatedSessionOptions(), agentDir: sessionAgentDir };
+		const loaded = await loadAllMCPConfigs(projectDir, {
+			agentDir: sessionAgentDir,
+			enableProjectConfig: true,
+			autoloadOnly: true,
+			nativeOnly: true,
+			settings: options.settings,
+		});
+		const config = loaded.configs["slow-demo"];
+		if (!config) throw new Error("slow-demo config was not loaded");
+
+		const storage = await AgentStorage.open(getAgentDbPath(sessionAgentDir), { isolated: true });
+		try {
+			await new MCPToolCache(storage).set("slow-demo", config, [
+				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },
+			]);
+
+			const { session, mcpManager } = await createAgentSession(options);
+			try {
+				expect(connectSpy).toHaveBeenCalledTimes(1);
+				expect(mcpManager).toBeDefined();
+				const cachedTool = mcpManager?.getTools().find(tool => tool.name === "mcp__slow_demo_cached_hello");
+				expect(cachedTool).toBeInstanceOf(DeferredMCPTool);
+				expect(session.getAllToolNames()).toContain("mcp__slow_demo_cached_hello");
+				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_cached_hello");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			storage.close();
+		}
+	}, 30_000);
+
+	it("uses the session cache when rebuilding conventional MCP authority after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(sourceCwd, { recursive: true });
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { "slow-target": { type: "http", url: "http://127.0.0.1:1" } } }),
+		);
+
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const options = { ...isolatedSessionOptions(), cwd: sourceCwd, sessionManager, toolNames: ["move_session"] };
+		const loaded = await loadAllMCPConfigs(targetCwd, {
+			agentDir,
+			enableProjectConfig: true,
+			autoloadOnly: true,
+			nativeOnly: true,
+			settings: options.settings,
+		});
+		const config = loaded.configs["slow-target"];
+		if (!config) throw new Error("slow-target config was not loaded");
+		const storage = await AgentStorage.open(getAgentDbPath(agentDir));
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
+		try {
+			await new MCPToolCache(storage).set("slow-target", config, [
+				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },
+			]);
+			const { session } = await createAgentSession(options);
+			try {
+				await session.getToolByName("move_session")!.execute("move-with-cache", { path: "move-target" });
+				expect(connectSpy).toHaveBeenCalledTimes(1);
+				const cachedTool = session.getToolByName("mcp__slow_target_cached_hello");
+				expect(cachedTool).toBeDefined();
+				expect(session.getAllToolNames()).toContain("mcp__slow_target_cached_hello");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			storage.close();
+		}
+	}, 30_000);
+
+	it("keeps conventional autoload tools deferred when rebuilding MCP authority after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		const serverConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+			timeout: 5_000,
+		};
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { autoload: serverConfig, default: serverConfig } }),
+		);
+
+		const originalProcessCwd = process.cwd();
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			cwd: sourceCwd,
+			sessionManager,
+			toolNames: ["move_session"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["default"],
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			await session.getToolByName("move_session")!.execute("move-with-deferred-autoload", { path: "move-target" });
+			expect(session.getAllToolNames()).toContain("mcp__autoload_hello");
+			expect(session.getAllToolNames()).toContain("mcp__default_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__default_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__autoload_hello");
+		} finally {
+			await session.dispose();
+			process.chdir(originalProcessCwd);
+		}
+	}, 30_000);
+
+	it("reselects the current conventional catalog on /new after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		const serverConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+			timeout: 5_000,
+		};
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { autoload: serverConfig } }),
+		);
+
+		const originalProcessCwd = process.cwd();
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			cwd: sourceCwd,
+			sessionManager,
+			toolNames: ["move_session"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": false,
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			await session.getToolByName("move_session")!.execute("move-with-autoload", { path: "move-target" });
+			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+
+			await expect(session.newSession()).resolves.toBe(true);
+
+			expect(session.getAllToolNames()).toContain("mcp__autoload_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+			process.chdir(originalProcessCwd);
 		}
 	}, 30_000);
 
@@ -235,6 +911,85 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 45_000);
 
+	it("reconciles the current conventional catalog after deferred registration yields", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+		stdout.mockRestore();
+
+		const [startupTool] = MCPTool.fromTools({ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0], [
+			{ name: "hello", inputSchema: { type: "object", properties: {} } },
+		]);
+		const [lateTool] = MCPTool.fromTools({ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0], [
+			{ name: "late_lookup", inputSchema: { type: "object", properties: {} } },
+		]);
+		if (!startupTool || !lateTool) throw new Error("MCP regression tools were not created");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [startupTool],
+			errors: new Map(),
+			connectedServers: ["demo"],
+			exaApiKeys: [],
+		});
+
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: ["mcp__demo_late_lookup"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": [],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			if (!mcpManager) throw new Error("Expected the deferred session-owned manager");
+			if (!startDeferredMcpConfig) throw new Error("Expected a deferred startup handle");
+			let lateCatalogPublished = false;
+			vi.spyOn(mcpManager, "getToolCatalogSnapshot").mockImplementation(() => ({
+				tools: lateCatalogPublished ? [startupTool, lateTool] : [startupTool],
+				publication: "published",
+				generation: lateCatalogPublished ? 2 : 1,
+			}));
+			const originalRefreshMCPTools = AgentSession.prototype.refreshMCPTools;
+			vi.spyOn(AgentSession.prototype, "refreshMCPTools").mockImplementation(async function (
+				this: AgentSession,
+				tools,
+				options,
+			) {
+				await originalRefreshMCPTools.call(this, tools, options);
+				if (this === session) lateCatalogPublished = true;
+			});
+			const lateToolReconciled = Promise.withResolvers<void>();
+			const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+				options,
+			) {
+				await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
+				if (this === session && nextTools.some(tool => tool.name === lateTool.name)) {
+					lateToolReconciled.resolve();
+				}
+			});
+
+			await expect(startDeferredMcpConfig()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			await lateToolReconciled.promise;
+			expect(session.getAllToolNames()).toContain(lateTool.name);
+			expect(session.getActiveToolNames()).toContain(lateTool.name);
+			expect(session.getSelectedMCPToolNames()).toEqual([lateTool.name]);
+			expect(session.buildDisplaySessionContext().selectedMCPToolNames).toEqual([lateTool.name]);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("holds the first prompt until deferred conventional startup completes", async () => {
 		// The gated prompt passes model-credential preflight once the barrier
 		// releases; mirror the sdk deferred-MCP harness's throwaway key.
@@ -308,7 +1063,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...isolatedSessionOptions(),
 			sessionManager: seededManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "mcp.enableProjectConfig": true }),
 			deferMcpConfigStartup: true,
 		});
 		try {
@@ -354,6 +1109,108 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
 			await session.dispose();
+		}
+	}, 30_000);
+
+	it("retains the manager that owns cached tools after startup timeout", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { cached: { type: "stdio", command: process.execPath } } }),
+		);
+		const [cachedTool] = DeferredMCPTool.fromTools(
+			"cached",
+			[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			async () => {
+				throw new Error("cached server is disconnected");
+			},
+		);
+		if (!cachedTool) throw new Error("cached MCP tool was not created");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [cachedTool],
+			errors: new Map([["cached", "MCP server connection timed out during startup: cached"]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		});
+		vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(mcpManager).toBeDefined();
+			expect(session.getAllToolNames()).toContain("mcp__cached_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__cached_hello");
+			expect(disconnectAll).not.toHaveBeenCalled();
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("does not warn again for an MCP startup timeout already returned as an error", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					stuck: { type: "stdio", command: process.execPath },
+				},
+			}),
+		);
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [],
+			errors: new Map([["stuck", "MCP server connection timed out during startup: stuck"]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		});
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(warnSpy.mock.calls.some(([message]) => String(message).includes("GJC plugin MCP connect failed"))).toBe(
+				false,
+			);
+		} finally {
+			await session.dispose();
+			warnSpy.mockRestore();
+		}
+	}, 30_000);
+
+	it("keeps remote MCP error details out of conventional startup logs", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					upstream: { type: "stdio", command: process.execPath },
+				},
+			}),
+		);
+		const remoteSecret = "remote-secret-502-response";
+		const remoteError = `HTTP 502: upstream response contains ${remoteSecret}`;
+		const startupResult: MCPLoadResult = {
+			tools: [],
+			errors: new Map([["upstream", remoteError]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		};
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue(startupResult);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			const startupWarning = warnSpy.mock.calls.find(([message]) =>
+				String(message).includes("MCP server connection failed"),
+			);
+			if (!startupWarning) throw new Error("conventional MCP startup warning was not logged");
+			expect(startupWarning[1]).toMatchObject({ path: "mcp:upstream", error: "transport-error" });
+			expect(JSON.stringify(startupWarning)).not.toContain(remoteSecret);
+			// The session logger does not rewrite the manager result's details.
+			expect(startupResult.errors.get("upstream")).toBe(remoteError);
+		} finally {
+			await session.dispose();
+			warnSpy.mockRestore();
 		}
 	}, 30_000);
 

@@ -49,7 +49,8 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
-import type { AgentSessionEventListener } from "../../session/agent-session";
+import type { ProjectProgressSnapshot } from "../../progress/progress-contract";
+import type { AgentSessionEventListener, QueuedRunStartFailure } from "../../session/agent-session";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOption,
@@ -58,6 +59,7 @@ import type {
 } from "../../session/client-bridge";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { SessionWorkLease } from "../../session/session-work-lease";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -482,6 +484,8 @@ export interface ExtensionContext {
 	isIdle(): boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle(): string | undefined;
+	/** The session's authoritative host-liveness lease. */
+	getSessionWorkLease?(): SessionWorkLease | undefined;
 	/** Abort the current agent operation */
 	abort(): void | Promise<void>;
 	/** Abort and prove whether resources for a specific prompt settled. */
@@ -535,9 +539,11 @@ export interface ExtensionContext {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown;
+	/** Read-only project progress snapshot (`session.progress`), derived from durable session state. */
+	getProjectProgress?(): Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
-	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
+	/** Observe live session events synchronously in producer order, without consuming queued startup fallback notices. */
 	onSessionEvent?(listener: AgentSessionEventListener): () => void;
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(
@@ -761,6 +767,8 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 	sdkRunToken?: string;
 	/** Complete set of SDK queue owners consumed together by this run. */
 	sdkRunTokens?: string[];
+	/** Internal public lifecycle boundary; accepted retries with a suppressed predecessor end retain it. */
+	lifecycleScope?: AttemptScope;
 }
 
 /** Fired when an agent run fails before emitting agent_end. The error is the
@@ -1339,6 +1347,8 @@ export interface ExtensionAPI {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			/** Internal positive refusal before an exact queued invocation can start. */
+			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
@@ -1569,6 +1579,13 @@ export type SendUserMessageHandler = (
 		 * grants root abort ownership.
 		 */
 		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		/** Internal positive refusal, not an inference from a dispatch error or missing event. */
+		onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
+		/**
+		 * Fired synchronously when a plain prompt's dispatch resolves at queue
+		 * time instead of run end (diverted into an in-flight run's steering).
+		 */
+		onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
 	},
@@ -1660,6 +1677,8 @@ export interface ExtensionContextActions {
 	isIdle: () => boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;
+	/** The session's authoritative host-liveness lease. */
+	getSessionWorkLease?: () => SessionWorkLease | undefined;
 	abort: () => void | Promise<void>;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 
@@ -1713,6 +1732,8 @@ export interface ExtensionContextActions {
 		| undefined
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 	getJobs?: () => unknown;
+	/** Read-only project progress snapshot backing the `session.progress` SDK query. */
+	getProjectProgress?: () => Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds so the SDK host can publish `bash_folded`. Returns an unsubscribe. */
 	onJobFold?: (listener: (event: JobFoldEvent) => void) => () => void;
 	/** Ordered, synchronous AgentSession subscription, independent of async extension hooks. */

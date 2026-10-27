@@ -56,12 +56,13 @@ import type { StatusLinePreviewParts, StatusLineSegmentOptions } from "./tool-st
  */
 class TextInputSubmenu extends Container {
 	#input: Input;
+	#edited = false;
 
 	constructor(
 		label: string,
 		description: string,
 		currentValue: string,
-		private readonly onSubmit: (value: string) => void,
+		private readonly onSubmit: (value: string, edited: boolean) => void,
 		private readonly onCancel: () => void,
 	) {
 		super();
@@ -77,8 +78,9 @@ class TextInputSubmenu extends Container {
 		if (currentValue) {
 			this.#input.setValue(currentValue);
 		}
+		this.#input.onEdit = () => (this.#edited = true);
 		this.#input.onSubmit = value => {
-			this.onSubmit(value); // empty string clears the setting
+			this.onSubmit(value, this.#edited); // empty string clears the setting
 		};
 		this.addChild(this.#input);
 		this.addChild(new Spacer(1));
@@ -90,7 +92,7 @@ class TextInputSubmenu extends Container {
 	}
 
 	submit(): void {
-		this.onSubmit(this.#input.getValue());
+		this.onSubmit(this.#input.getValue(), this.#edited);
 	}
 
 	cancel(): void {
@@ -108,9 +110,9 @@ class SelectSubmenu extends Container {
 		description: string,
 		options: ReadonlyArray<SelectItem>,
 		currentValue: string,
-		onSelect: (value: string) => void,
-		onCancel: () => void,
-		onSelectionChange?: (value: string) => void | Promise<void>,
+		private readonly onSelect: (value: string) => void,
+		private readonly onCancel: () => void,
+		private readonly onSelectionChange?: (value: string) => void | Promise<void>,
 		private readonly getPreview?: () => string,
 	) {
 		super();
@@ -137,39 +139,7 @@ class SelectSubmenu extends Container {
 		// Spacer
 		this.addChild(new Spacer(1));
 
-		// Select list
-		this.#selectList = new SelectList(options, Math.min(options.length, 10), () => getSelectListTheme());
-
-		// Pre-select current value
-		const currentIndex = options.findIndex(o => o.value === currentValue);
-		if (currentIndex !== -1) {
-			this.#selectList.setSelectedIndex(currentIndex);
-		}
-
-		this.#selectList.onSelect = item => {
-			onSelect(item.value);
-		};
-
-		this.#selectList.onCancel = onCancel;
-
-		if (onSelectionChange) {
-			this.#selectList.onSelectionChange = item => {
-				const requestId = ++this.#previewUpdateRequestId;
-				const result = onSelectionChange(item.value);
-				if (result && typeof (result as Promise<void>).then === "function") {
-					void (result as Promise<void>).finally(() => {
-						if (requestId === this.#previewUpdateRequestId) {
-							this.#updatePreview();
-						}
-					});
-					return;
-				}
-				if (requestId === this.#previewUpdateRequestId) {
-					this.#updatePreview();
-				}
-			};
-		}
-
+		this.#selectList = this.#createSelectList(options, currentValue);
 		this.addChild(this.#selectList);
 
 		// Hint
@@ -177,6 +147,46 @@ class SelectSubmenu extends Container {
 		this.addChild(
 			new DynamicThemeText(() => theme.fg("dim", uiString(settings.get("ui.language"), "settings.selectHint"))),
 		);
+	}
+
+	#createSelectList(options: ReadonlyArray<SelectItem>, selectedValue?: string): SelectList {
+		const selectList = new SelectList(options, Math.min(options.length, 10), () => getSelectListTheme());
+		const selectedIndex = options.findIndex(option => option.value === selectedValue);
+		if (selectedIndex !== -1) selectList.setSelectedIndex(selectedIndex);
+		selectList.onSelect = item => this.onSelect(item.value);
+		selectList.onCancel = this.onCancel;
+		if (this.onSelectionChange) {
+			selectList.onSelectionChange = item => {
+				const requestId = ++this.#previewUpdateRequestId;
+				const result = this.onSelectionChange?.(item.value);
+				if (result && typeof (result as Promise<void>).then === "function") {
+					void (result as Promise<void>).finally(() => {
+						if (requestId === this.#previewUpdateRequestId) this.#updatePreview();
+					});
+					return;
+				}
+				if (requestId === this.#previewUpdateRequestId) this.#updatePreview();
+			};
+		}
+		return selectList;
+	}
+
+	refreshOptions(options: ReadonlyArray<SelectItem>, retainMissingSelection = false): void {
+		const previous = this.#selectList;
+		const selectedItem = previous.getSelectedItem();
+		if (retainMissingSelection && selectedItem && !options.some(option => option.value === selectedItem.value)) {
+			const label = selectedItem.label.endsWith(" (unavailable)")
+				? selectedItem.label
+				: `${selectedItem.label} (unavailable)`;
+			options = [...options, { ...selectedItem, label }];
+		}
+		const selectedValue = selectedItem?.value;
+		this.#selectList = this.#createSelectList(options, selectedValue);
+		this.replaceChildren(this.children.map(child => (child === previous ? this.#selectList : child)));
+	}
+
+	refreshPreview(): void {
+		this.#updatePreview();
 	}
 
 	#updatePreview(): void {
@@ -1528,6 +1538,10 @@ export interface SettingsCallbacks {
 	onPetCommit?: (mode: string) => boolean;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
+	/** Called when a status-line submenu begins an uncommitted preview. */
+	onStatusLinePreviewStart?: () => void;
+	/** Called when a status-line preview is committed, cancelled, or disposed. */
+	onStatusLinePreviewEnd?: () => void;
 	/** Get current rendered status line for inline preview */
 	getStatusLinePreview?: (width?: number) => string;
 	/** Render a status-line preview for supplied draft settings without mutating the live status line. */
@@ -1582,6 +1596,8 @@ export class SettingsSelectorComponent extends Container {
 	#currentTabId: SettingTab | "plugins" | "gjc-bundles" = "appearance";
 	#textInputActive = false;
 	#activeProviderOrderEditor: Container | null = null;
+	#activeSelectSubmenu: SelectSubmenu | null = null;
+	#activeModelProfileSubmenu: SelectSubmenu | null = null;
 
 	constructor(
 		private readonly context: SettingsRuntimeContext,
@@ -1634,9 +1650,15 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	#switchToTab(tabId: SettingTab | "plugins" | "gjc-bundles"): void {
+		if (this.#currentTabId === "appearance" && tabId !== "appearance") {
+			this.callbacks.onStatusLinePreviewEnd?.();
+		}
 		if (this.#currentTabId === "notifications" && tabId !== "notifications" && !this.#disposeNotificationsEditor()) {
 			return;
 		}
+		this.#activeSelectSubmenu?.dispose();
+		this.#activeSelectSubmenu = null;
+		this.#activeModelProfileSubmenu = null;
 		// Release an open provider-order editor (and its context subscriptions)
 		// before switching tabs; the submenu's done() never runs on tab change,
 		// so without this the abandoned editor's listeners would survive.
@@ -1732,7 +1754,7 @@ export class SettingsSelectorComponent extends Container {
 					label,
 					description,
 					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
-					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
+					submenu: (cv, done, stored) => this.#createSubmenu(def, stored ?? cv, done),
 				};
 
 			case "providerOrder": {
@@ -1833,6 +1855,18 @@ export class SettingsSelectorComponent extends Container {
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
 		let onPreviewCancel: (() => void) | undefined;
+		let onPreviewEnd: (() => void) | undefined;
+		let statusLinePreviewStarted = false;
+		const startStatusLinePreview = (): void => {
+			if (statusLinePreviewStarted) return;
+			statusLinePreviewStarted = true;
+			this.callbacks.onStatusLinePreviewStart?.();
+		};
+		const endStatusLinePreview = (): void => {
+			if (!statusLinePreviewStarted) return;
+			statusLinePreviewStarted = false;
+			this.callbacks.onStatusLinePreviewEnd?.();
+		};
 
 		if (def.path === "theme.dark" || def.path === "theme.light") {
 			const activeThemeBeforePreview = getCurrentThemeName() ?? currentValue;
@@ -1844,6 +1878,7 @@ export class SettingsSelectorComponent extends Container {
 			};
 		} else if (def.path === "statusLine.preset") {
 			onPreview = value => {
+				startStatusLinePreview();
 				const presetDef = getPreset(value as StatusLinePreset);
 				this.callbacks.onStatusLinePreview?.({
 					preset: value as StatusLinePreset,
@@ -1854,6 +1889,7 @@ export class SettingsSelectorComponent extends Container {
 				});
 				this.#updateStatusPreview();
 			};
+			onPreviewEnd = endStatusLinePreview;
 			onPreviewCancel = () => {
 				const currentPreset = settings.get("statusLine.preset");
 				const presetDef = getPreset(currentPreset);
@@ -1880,9 +1916,11 @@ export class SettingsSelectorComponent extends Container {
 			};
 		} else if (def.path === "statusLine.separator") {
 			onPreview = value => {
+				startStatusLinePreview();
 				this.callbacks.onStatusLinePreview?.({ separator: value as StatusLineSeparatorStyle });
 				this.#updateStatusPreview();
 			};
+			onPreviewEnd = endStatusLinePreview;
 			onPreviewCancel = () => {
 				const separator = settings.get("statusLine.separator");
 				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
@@ -1890,9 +1928,11 @@ export class SettingsSelectorComponent extends Container {
 			};
 		} else if (def.path === "statusLine.maxRows") {
 			onPreview = value => {
+				startStatusLinePreview();
 				this.callbacks.onStatusLinePreview?.({ maxRows: Number(value) });
 				this.#updateStatusPreview();
 			};
+			onPreviewEnd = endStatusLinePreview;
 			onPreviewCancel = () => {
 				this.callbacks.onStatusLinePreview?.({
 					maxRows: settings.get("statusLine.maxRows"),
@@ -1914,7 +1954,14 @@ export class SettingsSelectorComponent extends Container {
 		const isThemeSetting = def.path === "theme.dark" || def.path === "theme.light";
 		const getPreview = isThemeSetting ? this.callbacks.getStatusLinePreview : undefined;
 
-		return new SelectSubmenu(
+		let submenu: SelectSubmenu;
+		const finish = (value?: string): void => {
+			if (this.#activeSelectSubmenu === submenu) this.#activeSelectSubmenu = null;
+			if (this.#activeModelProfileSubmenu === submenu) this.#activeModelProfileSubmenu = null;
+			submenu.dispose();
+			done(value);
+		};
+		submenu = new SelectSubmenu(
 			title,
 			description,
 			options,
@@ -1922,7 +1969,7 @@ export class SettingsSelectorComponent extends Container {
 			value => {
 				if (def.path === "modelProfile.default") {
 					this.callbacks.onChange(def.path, value);
-					done(value);
+					finish(value);
 					return;
 				}
 				if (def.path === "theme.dark" || def.path === "theme.light") {
@@ -1937,7 +1984,7 @@ export class SettingsSelectorComponent extends Container {
 					}
 					if (!this.callbacks.onThemeCommit) return;
 					void this.callbacks.onThemeCommit(def.path, value, currentValue).then(accepted => {
-						if (accepted) done(value);
+						if (accepted) finish(value);
 					});
 					return;
 				}
@@ -1953,21 +2000,26 @@ export class SettingsSelectorComponent extends Container {
 					) {
 						return;
 					}
-					done(accepted ? value : undefined);
+					finish(accepted ? value : undefined);
 					return;
 				}
 				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
 				this.callbacks.onChange(def.path, value);
 				if (def.path === "ui.language") this.#refreshTabBarLanguage();
-				done(value);
+				onPreviewEnd?.();
+				finish(value);
 			},
 			() => {
 				onPreviewCancel?.();
-				done();
+				onPreviewEnd?.();
+				finish();
 			},
 			onPreview,
 			getPreview,
 		);
+		this.#activeSelectSubmenu = submenu;
+		if (def.path === "modelProfile.default") this.#activeModelProfileSubmenu = submenu;
+		return submenu;
 	}
 
 	/**
@@ -1976,23 +2028,26 @@ export class SettingsSelectorComponent extends Container {
 	#createTextInput(
 		def: SettingDef & { type: "text" },
 		currentValue: string,
-		done: (value?: string) => void,
+		done: (value?: string, edited?: boolean) => void,
 	): Container {
 		this.#textInputActive = true;
-		const wrappedDone = (value?: string) => {
+		const wrappedDone = (value?: string, edited?: boolean) => {
 			this.#textInputActive = false;
-			done(value);
+			done(value, edited);
 		};
 		return new TextInputSubmenu(
 			def.label,
 			def.description,
 			currentValue,
-			value => {
+			(value, edited) => {
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
-				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
-				this.callbacks.onChange(def.path, value);
-				wrappedDone(value);
+				// Keep the stored string only when this field was never edited.
+				const stored = settings.get(def.path);
+				const committed = !edited && (typeof stored === "string" || typeof stored === "number") ? stored : value;
+				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, committed))) return;
+				this.callbacks.onChange(def.path, committed);
+				wrappedDone(committed, edited);
 			},
 			() => wrappedDone(),
 		);
@@ -2277,8 +2332,24 @@ export class SettingsSelectorComponent extends Container {
 		return (this.#currentList || this.#pluginComponent || this.#gjcBundleComponent || this.#notificationsEditor)!;
 	}
 
+	/** Refresh saved rows and model-profile choices without replacing active editors. */
+	refreshFromConfiguration(availableModelProfiles: readonly string[]): void {
+		this.context.availableModelProfiles = [...availableModelProfiles];
+		this.#refreshCurrentTabItems();
+		this.#activeModelProfileSubmenu?.refreshOptions(
+			this.context.availableModelProfiles.map(profile => ({ value: profile, label: profile })),
+			true,
+		);
+		this.#activeSelectSubmenu?.refreshPreview();
+		this.#updateStatusPreview();
+	}
+
 	override dispose(): void {
 		if (this.#notificationsEditor?.navigationLocked) return;
+		this.callbacks.onStatusLinePreviewEnd?.();
+		this.#activeSelectSubmenu?.dispose();
+		this.#activeSelectSubmenu = null;
+		this.#activeModelProfileSubmenu = null;
 		// Release an open provider-order editor (and its context subscriptions)
 		// when the whole selector is torn down without a normal close.
 		this.#activeProviderOrderEditor?.dispose();

@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "source": "executeShell from integration-wave1 at b61218470f before the Phase 3.6 shell re-sync",
+  "normalization": "Exact callback text and ShellRunResult status; command outputs are platform-independent.",
+  "cases": [
+    {
+      "id": "plain",
+      "command": "printf 'shell-golden:plain\\n'",
+      "result": {
+        "output": "shell-golden:plain\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "unicode",
+      "command": "printf 'shell-golden:中文 雪🙂\\n'",
+      "result": {
+        "output": "shell-golden:中文 雪🙂\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "split-utf8",
+      "command": "printf 'shell-golden: \\344'; printf '\\270\\255\\n'",
+      "result": {
+        "output": "shell-golden: 中\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "read-e-redirected-input",
+      "command": "printf '' | read -e value",
+      "result": {
+        "output": "error: read: not yet implemented: read -e\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "read-i-redirected-input",
+      "command": "printf '' | read -i seed value",
+      "result": {
+        "output": "error: read: not yet implemented: read -i\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "jobs-list-changed",
+      "command": "jobs -n",
+      "result": {
+        "output": "error: jobs: not yet implemented: jobs -n\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "jobs-list-pids",
+      "command": "jobs -l",
+      "result": {
+        "output": "error: jobs: not yet implemented: jobs -l\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "jobs-missing-spec",
+      "command": "jobs %99999",
+      "result": {
+        "output": "error: jobs: not yet implemented: jobs with job specs\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "enable-shared-object-unsupported",
+      "command": "enable -f missing.so",
+      "result": {
+        "output": "error: enable: not yet implemented: enable -f\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "enable-remove-built-in",
+      "command": "enable -d echo",
+      "result": {
+        "output": "error: enable: not yet implemented: enable -d\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "enable-remove-missing-built-in",
+      "command": "enable -d missing",
+      "result": {
+        "output": "error: enable: not yet implemented: enable -d\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "command-v-multiple",
+      "command": "command -v true echo",
+      "result": {
+        "output": "true\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "command-V-found-and-missing",
+      "command": "command -V true nonexistent",
+      "result": {
+        "output": "true is a shell builtin\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "declare-local-inherit",
+      "command": "x=outer; f() { local -I x; printf '%s' \"$x\"; }; f",
+      "result": {
+        "output": "error: local: not yet implemented: declare -I\nouter",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "complete-default-missing",
+      "command": "complete -p -D",
+      "result": {
+        "output": "error: complete: not yet implemented: special spec not found\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "complete-action-needs-command",
+      "command": "complete -A file",
+      "result": {
+        "output": "",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "mapfile-callbacks",
+      "command": "callback() { printf 'cb:%s:%s\\n' $1 $2; }; mapfile -t -C callback -c 1 arr < packages/natives/test/fixtures/goldens/shell/mapfile-input.txt; printf 'values:%s,%s' ${arr[0]} ${arr[1]}",
+      "result": {
+        "output": "error: mapfile: not yet implemented: mapfile -C/-c is not yet implemented\nvalues:,",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    }
+  ]
+}

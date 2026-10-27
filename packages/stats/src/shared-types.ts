@@ -6,7 +6,7 @@
  */
 
 /**
- * Aggregated stats for a model or folder.
+ * Aggregated stats for a model, folder, or agent role.
  */
 export interface AggregatedStats {
 	/** Total number of requests */
@@ -55,6 +55,14 @@ export interface ModelStats extends AggregatedStats {
  */
 export interface FolderStats extends AggregatedStats {
 	folder: string;
+}
+
+/** Agent role attributed from the session transcript. */
+export type AgentRole = "default" | "executor" | "planner" | "architect" | "critic" | "other" | "unknown";
+
+/** Stats grouped by the agent role that produced the assistant request. */
+export interface AgentStats extends AggregatedStats {
+	agent: AgentRole;
 }
 
 /**
@@ -126,17 +134,75 @@ export interface CostTimeSeriesPoint {
 	requests: number;
 }
 
+/** First prompt-prefix layer the client changed relative to the previous request (mirrors `PromptPrefixChange`). */
+export type PromptPrefixChange = "initial" | "append" | "model" | "tools" | "system" | "messages" | "options";
+
+/** Prefix-miss count for one client-side cause. */
+export interface CacheMissCause {
+	change: PromptPrefixChange;
+	/** Role of the rewritten or removed message when `change` is `messages`. */
+	divergedRole: string | null;
+	misses: number;
+}
+
+/**
+ * Attribution of prompt-cache prefix misses for requests that carry prompt-prefix
+ * telemetry. A prefix miss is a follow-up request whose cache read covers under
+ * 10% of a prompt of at least 4096 tokens. Only provider/model pairs that have
+ * reported a cache read at least once are tracked.
+ */
+export interface CacheMissAttribution {
+	/** Follow-up requests (not the first of an agent) with prompt-prefix telemetry. */
+	trackedRequests: number;
+	prefixMisses: number;
+	/** Misses where tools, the system prompt, already-sent messages, or serialization options changed. */
+	clientCausedMisses: number;
+	/** Misses on a pure append: the prefix was intact, so the provider evicted or rerouted. */
+	providerSideMisses: number;
+	/** Misses caused by switching provider/model, which never share a cache. */
+	modelSwitchMisses: number;
+	/** `clientCausedMisses / prefixMisses` (0 when there are no misses). */
+	clientCausedShare: number;
+	byCause: CacheMissCause[];
+}
+
+/**
+ * Provider-failure cost over a window: how often requests fail or abort, and
+ * how many prompt tokens the request right after a failure re-paid because it
+ * missed the prompt cache entirely.
+ */
+export interface FailureReport {
+	totalRequests: number;
+	/** Requests with stop_reason `error` */
+	erroredRequests: number;
+	/** Requests with stop_reason `aborted` */
+	abortedRequests: number;
+	/** (errored + aborted) / total (0-1) */
+	failureShare: number;
+	/** Summed duration of errored and aborted requests, in ms */
+	failedDurationMs: number;
+	/** Non-failed requests that directly follow a failed one in the same session */
+	postFailureRequests: number;
+	/** Of those, requests that read nothing from cache on a cacheable prompt */
+	postFailureFullMissRequests: number;
+	/** Input tokens re-paid by those full-miss requests */
+	postFailureFullMissTokens: number;
+}
+
 /**
  * Overall dashboard stats.
  */
 export interface DashboardStats {
 	overall: AggregatedStats;
+	failures: FailureReport;
 	byModel: ModelStats[];
 	byFolder: FolderStats[];
+	byAgent: AgentStats[];
 	timeSeries: TimeSeriesPoint[];
 	modelSeries: ModelTimeSeriesPoint[];
 	modelPerformanceSeries: ModelPerformancePoint[];
 	costSeries: CostTimeSeriesPoint[];
+	cacheMissAttribution: CacheMissAttribution;
 }
 
 /**

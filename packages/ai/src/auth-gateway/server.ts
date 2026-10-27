@@ -39,7 +39,7 @@ import type {
 	SimpleStreamOptions,
 } from "../types";
 import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
-import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, hostHeaderMatchesBind, parseBind } from "../utils/parse-bind";
 import { REPETITION_GUARD_ERROR_CODE } from "../utils/stream-repetition-guard";
 import {
 	captureRequestHeaders,
@@ -82,6 +82,13 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	resolveModel: ModelResolver;
 	/** Supplier for the source-backed model catalog used by `/v1/models`. */
 	listModels: () => Iterable<Model<Api>>;
+	/**
+	 * Live inbound bearer allow-list. When omitted, `bearerTokens` stays the
+	 * process snapshot. A non-empty result replaces that snapshot for later
+	 * requests, so a rotated token stops matching. An empty result or a thrown
+	 * read keeps the last non-empty set and does not open no-auth mode.
+	 */
+	currentBearerTokens?: (signal: AbortSignal) => ReadonlySet<string> | Promise<ReadonlySet<string>>;
 }
 
 export interface AuthGatewayModelCatalog {
@@ -589,8 +596,9 @@ export function redactGatewayStream(events: AssistantMessageEventStream): Assist
 	async function* redactedEvents(): AsyncGenerator<AssistantMessageEvent> {
 		try {
 			for await (const event of events) {
-				if (event.type === "error") yield { ...event, error: redactGatewayMessage(event.error) };
-				else yield event;
+				if (event.type === "error") {
+					yield { type: "error", reason: event.reason, error: redactGatewayMessage(event.error) };
+				} else yield event;
 			}
 		} catch (error) {
 			throw redactGatewayError(error);
@@ -1277,14 +1285,32 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	if (catalog.models.length === 0) {
 		throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
 	}
-	const tokens = new Set<string>(opts.bearerTokens);
-	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
+	const bootTokens = new Set<string>(opts.bearerTokens);
+	assertAuthenticatedOrLoopback(bind, bootTokens.size, "auth-gateway");
+	let acceptedTokens: ReadonlySet<string> = bootTokens;
+	const tokensFor = async (signal: AbortSignal): Promise<ReadonlySet<string>> => {
+		const load = opts.currentBearerTokens;
+		if (!load || signal.aborted) return acceptedTokens;
+		try {
+			const live = await load(signal);
+			if (!signal.aborted && live.size > 0) acceptedTokens = new Set(live);
+		} catch (error) {
+			if (!signal.aborted) {
+				logger.warn("auth-gateway bearer reload failed", {
+					error: cleanReason(error) ?? "bearer reload failed",
+				});
+			}
+		}
+		return acceptedTokens;
+	};
 	const version = opts.version;
 
+	let listenPort = bind.port;
 	const server = Bun.serve({
 		hostname: bind.hostname,
 		port: bind.port,
 		fetch: async (req): Promise<Response> => {
+			const tokens = await tokensFor(req.signal);
 			const url = new URL(req.url);
 			const pathname = url.pathname;
 			const peer = resolvePeer(req);
@@ -1296,6 +1322,19 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					origin: req.headers.get("origin"),
 				});
 				return json(403, { error: "no-auth rejects requests carrying Origin" });
+			}
+			if (
+				tokens.size === 0 &&
+				!(req.method === "GET" && pathname === "/healthz") &&
+				!hostHeaderMatchesBind(req.headers.get("host"), { hostname: bind.hostname, port: listenPort })
+			) {
+				logger.info("auth-gateway no-auth host rejected", {
+					method: req.method,
+					path: pathname,
+					peer,
+					hostPresent: req.headers.has("host"),
+				});
+				return json(403, { error: "no-auth rejects a host that is not the loopback bind" });
 			}
 			// CORS preflight is always answered without auth — browsers send
 			// preflights pre-authentication and a 401 here breaks the actual
@@ -1391,8 +1430,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		idleTimeout: 255,
 	});
 
+	listenPort = server.port ?? listenPort;
 	const boundHost = server.hostname ?? bind.hostname;
-	const boundPort = server.port ?? bind.port;
+	const boundPort = server.port ?? listenPort;
 	return {
 		url: `http://${boundHost}:${boundPort}`,
 		port: boundPort,

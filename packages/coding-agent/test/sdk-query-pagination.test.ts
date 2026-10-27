@@ -757,3 +757,40 @@ it("reconstructs Q12 workflow gate state after a client restart without reviving
 	});
 	await store.close();
 });
+
+it("reports an accepted gate answer and its originating turn through Q12", async () => {
+	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-q12-accepted-"));
+	const storePath = join(stateRoot, "workflow-gates.json");
+	const emitter = new BrokerWorkflowGateEmitter("q12-accepted", new FileGateStore(storePath));
+	emitter.setRuntimeTurnProvider?.(() => "runtime-turn-5599");
+	const continuation = emitter.emitGate({
+		stage: "ralplan",
+		kind: "approval",
+		schema: { type: "string", enum: ["approve"] },
+	});
+	const gate = emitter.listWorkflowGateQueryRecords!().find(record => record.tag === "pending");
+	if (!gate) throw new Error("Q12 did not expose the pending gate");
+	emitter.prepareTerminalization!(gate.gate_id, "not_published");
+	await emitter.resolveGate!({ gate_id: gate.gate_id, answer: "approve", idempotency_key: "q12-accepted-5599" });
+	expect(await continuation).toBe("approve");
+
+	const store = new RevisionStore("q12-accepted");
+	const query = new QueryHandlers(
+		{ ...surface([]), getGates: () => emitter.listWorkflowGateQueryRecords!() },
+		"q12-accepted",
+		store,
+		new CursorRegistry("token", store),
+	);
+	const response = await query.dispatch({ query: "Q12", connectionId: "q12-client" });
+	if (!response.page) throw new Error("Q12 did not return a page");
+	expect(response.page.items).toEqual([
+		expect.objectContaining({
+			gate_id: gate.gate_id,
+			tag: "accepted",
+			runtime_turn_id: "runtime-turn-5599",
+			answer_recorded: true,
+			post_accept_disposition: "advanced",
+		}),
+	]);
+	await store.close();
+});

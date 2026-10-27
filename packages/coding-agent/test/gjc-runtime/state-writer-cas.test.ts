@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,6 +6,7 @@ import { sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-la
 import {
 	updateJsonAtomic,
 	withWorkflowStateLock,
+	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
@@ -31,6 +32,145 @@ function sleep(ms: number): Promise<void> {
 }
 
 describe("state-writer concurrency (issue #646)", () => {
+	it("rejects a group/world-writable cwd before creating private durable descendants", async () => {
+		if (process.platform !== "linux") return;
+		const root = await tempDir();
+		await fs.chmod(root, 0o777);
+		const target = path.join(".gjc", "private-durable", "state.json");
+		const filePath = path.join(root, target);
+
+		const rootStat = await fs.stat(root);
+		const uid = process.getuid?.();
+		if (uid === undefined) throw new Error("Linux test requires a POSIX uid");
+		expect(rootStat.uid).toBe(uid);
+		expect(rootStat.mode & 0o022).not.toBe(0);
+		await expect(
+			writeGuardedJsonAtomic(
+				target,
+				{ marker: "must-not-publish" },
+				{
+					cwd: root,
+					policy: "source",
+					expectedRevision: 0,
+					privateDurable: { directory: path.dirname(target) },
+				},
+			),
+		).rejects.toThrow("publication parent is not exclusively owned");
+		await expect(fs.lstat(path.join(root, ".gjc"))).rejects.toThrow();
+		await expect(fs.lstat(filePath)).rejects.toThrow();
+	});
+
+	it("preserves exact private modes when umask removes owner permissions", async () => {
+		if (process.platform !== "linux") return;
+		const root = await tempDir();
+		const target = path.join(".gjc", "private-durable", "state.json");
+		const realMkdir = fs.mkdir.bind(fs);
+		const realOpen = fs.open.bind(fs);
+		const mkdirImplementation = async (...args: Parameters<typeof fs.mkdir>) => {
+			const [directory, options] = args;
+			const parent = await fs.realpath(path.dirname(String(directory))).catch(() => undefined);
+			const relative = parent === undefined ? ".." : path.relative(root, parent);
+			const withinRoot =
+				relative === "" ||
+				(!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+			if (withinRoot && typeof options === "object" && options !== null && options.mode === 0o700)
+				return realMkdir(directory, { ...options, mode: 0 });
+			return realMkdir(...args);
+		};
+		const mkdirSpy = spyOn(fs, "mkdir").mockImplementation(mkdirImplementation as typeof fs.mkdir);
+		const openImplementation = async (...args: Parameters<typeof fs.open>) => {
+			const [file, flags, mode] = args;
+			const parent = await fs.realpath(path.dirname(String(file))).catch(() => undefined);
+			const relative = parent === undefined ? ".." : path.relative(root, parent);
+			const withinRoot =
+				relative === "" ||
+				(!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+			if (withinRoot && String(file).includes(".tmp.") && flags === "wx" && mode === 0o600)
+				return realOpen(file, flags, 0);
+			return realOpen(...args);
+		};
+		const openSpy = spyOn(fs, "open").mockImplementation(openImplementation as typeof fs.open);
+		try {
+			await writeGuardedJsonAtomic(
+				target,
+				{ marker: "exact-modes" },
+				{
+					cwd: root,
+					policy: "source",
+					expectedRevision: 0,
+					lockHeld: true,
+					privateDurable: { directory: path.dirname(target) },
+				},
+			);
+		} finally {
+			openSpy.mockRestore();
+			mkdirSpy.mockRestore();
+		}
+
+		expect((await fs.stat(path.join(root, ".gjc"))).mode & 0o777).toBe(0o700);
+		expect((await fs.stat(path.join(root, ".gjc", "private-durable"))).mode & 0o777).toBe(0o700);
+		expect((await fs.stat(path.join(root, target))).mode & 0o777).toBe(0o600);
+	});
+
+	it("anchors publication to the opened parent when its pathname is swapped before rename", async () => {
+		if (process.platform !== "linux") return;
+		const root = await tempDir();
+		const target = path.join(".gjc", "private-durable", "state.json");
+		const parent = path.join(root, ".gjc", "private-durable");
+		const movedParent = path.join(root, ".gjc", "moved-private-durable");
+		const originalRename = fs.rename.bind(fs);
+		let swapped = false;
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			if (!swapped && String(source).includes(".tmp.") && path.basename(String(destination)) === "state.json") {
+				swapped = true;
+				await originalRename(parent, movedParent);
+				await fs.mkdir(parent, { mode: 0o700 });
+			}
+			return originalRename(source, destination);
+		});
+		try {
+			await expect(
+				writeGuardedJsonAtomic(
+					target,
+					{ marker: "descriptor-anchored" },
+					{
+						cwd: root,
+						policy: "source",
+						expectedRevision: 0,
+						lockHeld: true,
+						privateDurable: { directory: path.dirname(target) },
+					},
+				),
+			).rejects.toThrow("state publication requires authoritative reload");
+		} finally {
+			renameSpy.mockRestore();
+		}
+
+		expect(swapped).toBe(true);
+		expect(await readJson(path.join(movedParent, "state.json"))).toMatchObject({ marker: "descriptor-anchored" });
+		await expect(fs.lstat(path.join(parent, "state.json"))).rejects.toThrow();
+	});
+
+	it("serializes private durable CAS calls through one stable target lock", async () => {
+		if (process.platform !== "linux") return;
+		const root = await tempDir();
+		const target = path.join(".gjc", "private-durable", "state.json");
+		const options = {
+			cwd: root,
+			policy: "source" as const,
+			expectedRevision: 0,
+			privateDurable: { directory: path.dirname(target) },
+		};
+		const results = await Promise.allSettled([
+			writeGuardedJsonAtomic(target, { marker: "first" }, options),
+			writeGuardedJsonAtomic(target, { marker: "second" }, options),
+		]);
+
+		expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+		expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+		expect((await readJson(path.join(root, target))).state_revision).toBe(1);
+	});
+
 	it("updateJsonAtomic does not lose concurrent read-modify-write updates", async () => {
 		const root = await tempDir();
 		const target = path.relative(root, path.join(sessionStateDir(root, "test-session"), "cas-probe.json"));

@@ -15,6 +15,7 @@ import {
 import {
 	countUltragoalNudges,
 	createUltragoalPlan,
+	getUltragoalRunCompletionState,
 	getUltragoalStatus,
 	readUltragoalLedger,
 	readUltragoalPlan,
@@ -24,7 +25,13 @@ import {
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
 	type UltragoalNudgeSurface,
+	type UltragoalNudgeTarget,
+	type UltragoalPlan,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import {
+	ULTRAGOAL_SUCCESSION_FENCE_SCHEMA,
+	ultragoalSuccessionFencePath,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-succession";
 import { assertUltragoalAskAllowed } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
 import { YAML } from "bun";
 
@@ -55,6 +62,53 @@ const DEFAULT_OBJECTIVE_GOAL = {
 	objective: DEFAULT_ULTRAGOAL_OBJECTIVE,
 	status: "active",
 };
+const NUDGE_TARGET_STATUSES = ["active", "pending", "failed"] as const;
+const NUDGE_TARGET_STATUS_SET = new Set<string>(NUDGE_TARGET_STATUSES);
+const GENERATED_GOAL_STATUSES = [
+	"pending",
+	"active",
+	"complete",
+	"failed",
+	"blocked",
+	"review_blocked",
+	"superseded",
+] as const;
+
+function mulberry32(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let value = state;
+		value = Math.imul(value ^ (value >>> 15), value | 1);
+		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+		return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+	};
+}
+
+/** Hand off `goalIds` to a successor run by planting the source's ownership fence on disk. */
+async function plantFence(cwd: string, goalIds: string[]): Promise<void> {
+	const fencePath = ultragoalSuccessionFencePath(cwd, TEST_SESSION_ID);
+	await fs.mkdir(path.dirname(fencePath), { recursive: true });
+	await Bun.write(
+		fencePath,
+		`${JSON.stringify({
+			schema: ULTRAGOAL_SUCCESSION_FENCE_SCHEMA,
+			operationId: "f".repeat(64),
+			createdAt: new Date().toISOString(),
+			sourceSessionId: TEST_SESSION_ID,
+			sourceRepository: { schema: "gjc.repository_binding.v1", worktreeRoot: cwd, commonDir: null },
+			targetRepository: {
+				schema: "gjc.repository_binding.v1",
+				worktreeRoot: path.join(cwd, "..", "elsewhere"),
+				commonDir: null,
+			},
+			selectedGoalIds: goalIds,
+			sourceArtifacts: { briefSha256: "", goalsSha256: "", ledgerSha256: "" },
+			offerPath: path.join(cwd, "offer.json"),
+			offerSha256: "0".repeat(64),
+		})}\n`,
+	);
+}
 
 afterEach(async () => {
 	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
@@ -62,6 +116,128 @@ afterEach(async () => {
 	if (ORIGINAL_GJC_CONFIG_DIR === undefined) delete process.env.GJC_CONFIG_DIR;
 	else process.env.GJC_CONFIG_DIR = ORIGINAL_GJC_CONFIG_DIR;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("selectUltragoalNudgeTarget seeded properties", () => {
+	it("excludes fenced targets and preserves objective, status, and final-receipt priority", () => {
+		const seed = 0x6807_2026;
+		const random = mulberry32(seed);
+		let sawStoryTarget = false;
+		let sawFinalAggregateTarget = false;
+		let sawObjectivePriority = false;
+		let sawStatusPriority = false;
+
+		for (let caseIndex = 0; caseIndex < 128; caseIndex += 1) {
+			const forcedPriorityCase = caseIndex === 1 || caseIndex === 2 || caseIndex === 4;
+			const goalCount = forcedPriorityCase ? 3 : 1 + Math.floor(random() * 5);
+			const forcedStatuses =
+				caseIndex === 0 || caseIndex === 3
+					? Array.from({ length: goalCount }, () => "complete" as const)
+					: caseIndex === 1 || caseIndex === 2
+						? (["active", "pending", "failed"] as const)
+						: caseIndex === 4
+							? (["pending", "active", "failed"] as const)
+							: undefined;
+			const goals = Array.from({ length: goalCount }, (_, index) => ({
+				id: `G${String(index + 1).padStart(3, "0")}`,
+				title: `Generated goal ${index + 1}`,
+				objective: `Generated objective ${index + 1}`,
+				status:
+					forcedStatuses?.[index] ??
+					GENERATED_GOAL_STATUSES[Math.floor(random() * GENERATED_GOAL_STATUSES.length)] ??
+					"pending",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			}));
+			const plan: UltragoalPlan = {
+				version: 1,
+				brief: `Seeded generated plan ${caseIndex}`,
+				gjcGoalMode: "aggregate",
+				gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
+				goals,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			};
+			const lastGoal = goals[goals.length - 1];
+			const excludedGoalIds =
+				caseIndex === 0 || caseIndex === 2 || caseIndex === 4
+					? []
+					: caseIndex === 1
+						? [goals[0]?.id ?? ""]
+						: caseIndex === 3
+							? lastGoal
+								? [lastGoal.id]
+								: []
+							: goals.filter(() => random() < 0.35).map(goal => goal.id);
+			const excluded = new Set(excludedGoalIds);
+			const currentGoalObjective =
+				caseIndex === 2
+					? `${goals[1]?.objective ?? ""} `
+					: caseIndex === 1 || caseIndex === 4 || caseIndex === 0 || caseIndex === 3
+						? undefined
+						: random() < 0.5
+							? goals[Math.floor(random() * goals.length)]?.objective
+							: undefined;
+			const retryFailed = caseIndex === 1 || caseIndex === 2 || caseIndex === 4 ? false : random() < 0.5;
+			const target = selectUltragoalNudgeTarget(plan, {
+				currentGoalObjective,
+				retryFailed,
+				excludedGoalIds,
+			});
+
+			expect(target === null || !excluded.has(target.goalId)).toBe(true);
+			expect(selectUltragoalNudgeTarget(plan, { currentGoalObjective, retryFailed, excludedGoalIds: [] })).toEqual(
+				selectUltragoalNudgeTarget(plan, { currentGoalObjective, retryFailed }),
+			);
+
+			const matchingObjectiveGoal = goals.find(
+				goal =>
+					goal.objective.trim() === currentGoalObjective?.trim() &&
+					NUDGE_TARGET_STATUS_SET.has(goal.status) &&
+					!excluded.has(goal.id),
+			);
+			const eligibleStatuses = retryFailed ? NUDGE_TARGET_STATUSES : NUDGE_TARGET_STATUSES.slice(0, 2);
+			const firstEligibleStatus = eligibleStatuses.find(status =>
+				goals.some(goal => goal.status === status && !excluded.has(goal.id)),
+			);
+			const firstEligibleGoal = firstEligibleStatus
+				? goals.find(goal => goal.status === firstEligibleStatus && !excluded.has(goal.id))
+				: undefined;
+			let expected: UltragoalNudgeTarget | null = null;
+			if (matchingObjectiveGoal) {
+				expected = { goalId: matchingObjectiveGoal.id, targetKind: "story" };
+				if (
+					goals.some(
+						goal => goal.status === "active" && goal.id !== matchingObjectiveGoal.id && !excluded.has(goal.id),
+					)
+				) {
+					sawObjectivePriority = true;
+				}
+			} else if (firstEligibleGoal) {
+				expected = { goalId: firstEligibleGoal.id, targetKind: "story" };
+				if (
+					firstEligibleStatus === "active" &&
+					goals.some(goal => goal.status === "pending" && !excluded.has(goal.id))
+				) {
+					sawStatusPriority = true;
+				}
+			} else {
+				const completion = getUltragoalRunCompletionState(plan, { retryFailed });
+				const finalGoal = completion.needsFinalAggregateReceipt ? completion.requiredGoals.at(-1) : undefined;
+				if (finalGoal && !excluded.has(finalGoal.id)) {
+					expected = { goalId: finalGoal.id, targetKind: "final_aggregate_receipt" };
+				}
+			}
+			expect(target).toEqual(expected);
+			if (target?.targetKind === "story") sawStoryTarget = true;
+			if (target?.targetKind === "final_aggregate_receipt") sawFinalAggregateTarget = true;
+		}
+
+		expect(sawStoryTarget).toBe(true);
+		expect(sawFinalAggregateTarget).toBe(true);
+		expect(sawObjectivePriority).toBe(true);
+		expect(sawStatusPriority).toBe(true);
+	});
 });
 
 describe("ultragoal nudge guard", () => {
@@ -146,6 +322,42 @@ describe("ultragoal nudge guard", () => {
 	});
 
 	// AC2: after the budget is spent, pause falls back to today's gate (blocked, no infinite loop).
+	// #6807: the nudge target was handed off, so the source has no resolvable work to be
+	// nudged toward; the attempt goes straight to the normal gate and spends no budget.
+	it("does not nudge a pause toward a goal handed off to a successor run", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await plantFence(cwd, ["G001"]);
+
+		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/human_blocked/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.filter(event => event.event === "nudge")).toEqual([]);
+
+		const classification = await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "Committing the successor's initial tree needs owner authorization",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms only the human-only authorization remains",
+			classificationEventId: classification.eventId,
+		});
+		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();
+	});
+
+	it("still nudges toward a goal the source kept when another goal was handed off", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: MULTI_BRIEF });
+		await plantFence(cwd, ["G002"]);
+
+		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/try-harder nudge \(1\/10\) for G001/);
+	});
+
 	it("AC2: exhausted pause falls back to today's gate and appends no further nudges", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
@@ -293,6 +505,45 @@ describe("ultragoal nudge guard", () => {
 				sessionId: TEST_SESSION_ID,
 			}),
 		).resolves.toBeUndefined();
+	});
+
+	it("keeps aggregate drop guarded by nudging a retained goal when the first target was handed off", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await setProjectBudget(cwd, 1);
+		await createUltragoalPlan({ cwd, brief: MULTI_BRIEF });
+		await plantFence(cwd, ["G001"]);
+
+		await expect(
+			assertUltragoalDropAllowed({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
+		).rejects.toThrow(/try-harder nudge \(1\/1\) for G002/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		const nudges = ledger.filter(event => event.event === "nudge");
+		expect(nudges).toHaveLength(1);
+		expect(nudges[0]).toMatchObject({ goalId: "G002", surface: "drop", attempt: 1 });
+
+		const status = await getUltragoalStatus(cwd, TEST_SESSION_ID);
+		expect(status).toMatchObject({ nudgeGoalId: "G002", nudgeCount: 1, nudgeRemaining: 0 });
+
+		// The existing drop path remains available after the retained goal's budget is exhausted.
+		await expect(
+			assertUltragoalDropAllowed({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
+		).resolves.toBeUndefined();
+		expect((await readUltragoalLedger(cwd, TEST_SESSION_ID)).filter(event => event.event === "nudge")).toHaveLength(
+			1,
+		);
+	});
+
+	it("allows aggregate drop when all unfinished stories were handed off", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await plantFence(cwd, ["G001"]);
+
+		await expect(
+			assertUltragoalDropAllowed({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
+		).resolves.toBeUndefined();
+		expect((await readUltragoalLedger(cwd, TEST_SESSION_ID)).filter(event => event.event === "nudge")).toEqual([]);
 	});
 
 	// AC7: an unreadable durable state cannot be classified, so the drop fails closed.

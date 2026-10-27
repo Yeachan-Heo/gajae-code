@@ -13,6 +13,7 @@ class FakeKernel {
 	shutdownCalls = 0;
 	alive = true;
 	readonly id: string;
+	#exitCode: number | null = null;
 
 	constructor(id: string) {
 		this.id = id;
@@ -37,6 +38,14 @@ class FakeKernel {
 	async ping(): Promise<boolean> {
 		return this.alive;
 	}
+
+	getExitCode(): number | null {
+		return this.#exitCode;
+	}
+
+	setExitCode(code: number | null): void {
+		this.#exitCode = code;
+	}
 }
 
 describe("executePython kernel reuse", () => {
@@ -48,10 +57,11 @@ describe("executePython kernel reuse", () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		startCalls = 0;
 		kernels = [];
-		PythonKernel.start = (async () => {
+		PythonKernel.start = (async (options: Parameters<typeof PythonKernel.start>[0]) => {
 			startCalls += 1;
 			const kernel = new FakeKernel(`kernel-${startCalls}`);
 			kernels.push(kernel);
+			options.onKernelCreated?.(kernel as unknown as PythonKernel);
 			return kernel as unknown as PythonKernel;
 		}) as typeof PythonKernel.start;
 	});

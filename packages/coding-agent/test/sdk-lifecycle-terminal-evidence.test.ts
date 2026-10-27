@@ -1,6 +1,7 @@
 import { expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import fc from "fast-check";
 
 import { Broker } from "../src/sdk/broker/broker";
 import { LifecycleLedger, type LifecycleLedgerEntry } from "../src/sdk/broker/lifecycle-ledger";
@@ -108,6 +109,118 @@ it("withholds proof when a row follows a proven terminal outcome", async () => {
 	}
 });
 
+it("reads its own terminal row when another identity's row exceeds the JSON bounds", async () => {
+	const agentDir = await temp();
+	try {
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin("target", "request-hash");
+		const response = { ok: true, result: { sessionId: "s" } };
+		await ledger.transition("target", "terminal_ok", { response });
+
+		// A cleanup receipt GJC itself writes can carry an artifact snapshot over the
+		// 1024-element JSON bound. It must not make this identity's proof unreadable.
+		const rows = await ledgerRows(agentDir);
+		const foreign = {
+			version: rows[0]!.version,
+			identity: "foreign",
+			requestHash: "foreign-request",
+			state: "effect_started",
+			ts: rows[0]!.ts,
+			operationKey: "session.delete\u0000foreign",
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					cleanup: {
+						sessionId: "s",
+						artifactTree: {
+							snapshot: { entries: Array.from({ length: 1066 }, (_, index) => ({ index })) },
+						},
+					},
+				},
+			},
+		};
+		await fs.appendFile(ledgerFile(agentDir), `${JSON.stringify(foreign)}\n`);
+
+		expect(await new LifecycleLedger(agentDir).readTerminal("target", "request-hash")).toMatchObject({
+			kind: "terminal",
+			entry: { state: "terminal_ok", response },
+		});
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+it("withholds proof when the requested identity's own row exceeds the JSON bounds", async () => {
+	const agentDir = await temp();
+	try {
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin("target", "request-hash");
+		await ledger.transition("target", "terminal_ok", { response: { ok: true } });
+
+		const rows = await ledgerRows(agentDir);
+		await fs.appendFile(
+			ledgerFile(agentDir),
+			`${JSON.stringify({
+				...rows[rows.length - 1],
+				state: "terminal_error",
+				ts: rows[rows.length - 1]!.ts + 1,
+				response: { entries: Array.from({ length: 1066 }, (_, index) => ({ index })) },
+				responseDigest: undefined,
+			})}\n`,
+		);
+
+		expect(await new LifecycleLedger(agentDir).readTerminal("target", "request-hash")).toEqual({
+			kind: "rejected",
+			reason: "shape",
+		});
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+it("scopes read-back to the requested identity for arbitrary decodable rows", async () => {
+	await fc.assert(
+		fc.asyncProperty(
+			fc.constantFrom("foreign" as const, "target" as const),
+			fc.boolean(),
+			fc.jsonValue(),
+			async (rowIdentity, oversized, payload) => {
+				const agentDir = await temp();
+				try {
+					const ledger = await new LifecycleLedger(agentDir).open();
+					await ledger.begin("target", "request-hash");
+					const response = { ok: true, result: { sessionId: "s" } };
+					await ledger.transition("target", "terminal_ok", { response });
+					const rows = await ledgerRows(agentDir);
+					const row = {
+						version: rows[0]!.version,
+						identity: rowIdentity,
+						requestHash: rowIdentity === "target" ? "request-hash" : "foreign-hash",
+						state: "effect_started",
+						ts: Date.now(),
+						response: oversized ? { entries: Array.from({ length: 1066 }, (_, index) => ({ index })) } : payload,
+					};
+					await fs.appendFile(ledgerFile(agentDir), `${JSON.stringify(row)}\n`);
+
+					const read = await new LifecycleLedger(agentDir).readTerminal("target", "request-hash");
+					if (rowIdentity === "foreign") {
+						// An unrelated decodable row cannot withhold the target's proof, even
+						// when its payload exceeds the ledger JSON bounds.
+						expect(read).toMatchObject({ kind: "terminal", entry: { state: "terminal_ok", response } });
+					} else {
+						// The proven terminal row admits no successor: the same identity stays strict.
+						expect(read).toMatchObject({ kind: "rejected" });
+					}
+				} finally {
+					await fs.rm(agentDir, { recursive: true, force: true });
+				}
+			},
+		),
+		{ numRuns: 24 },
+	);
+}, 20_000);
+
 it("returns the real terminal outcome when a slow spawn is stamped by a concurrent recovery", async () => {
 	const agentDir = await temp();
 	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
@@ -134,12 +247,23 @@ it("returns the real terminal outcome when a slow spawn is stamped by a concurre
 		const recovery = await new LifecycleLedger(agentDir).open();
 		expect(recovery.get(inFlight.identity)?.state).toBe("terminal_uncertain");
 
-		expect(await lifecycle).toMatchObject({
+		const response = await lifecycle;
+		expect(structuredClone(response)).toMatchObject({
 			ok: false,
 			error: {
 				code: "terminal_uncertain",
-				message: "Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+				message: expect.stringContaining(
+					"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation. Original launch failure: Session ",
+				),
 			},
+		});
+		if (response.ok) throw new Error("Expected uncertain startup cleanup");
+		expect(response.error.message).toContain(
+			"did not become ready and its spawned process could not be verified dead. [lifecycle-diagnostic-v1] stage=readiness waiting_for=session_ready",
+		);
+		expect(await recovery.readTerminal(inFlight.identity, inFlight.requestHash)).toMatchObject({
+			kind: "terminal",
+			entry: { state: "terminal_uncertain", response },
 		});
 		const rows = await ledgerRows(agentDir);
 		expect(

@@ -213,8 +213,8 @@ describe("managed session Windows durability", () => {
 		temporaryDirectories.push(root);
 		const retainedPath = path.join(root, "retained");
 		await fs.mkdir(retainedPath);
-		const originalSnapshotDirectoryTree = native.snapshotDirectoryTree;
-		const observed = originalSnapshotDirectoryTree(retainedPath);
+		const originalSnapshotEmptyDirectory = native.snapshotEmptyDirectory;
+		const observed = originalSnapshotEmptyDirectory(retainedPath);
 		if (!observed.ok || !observed.snapshot) throw new Error("Native snapshot unavailable");
 		const nativeRoot = observed.snapshot.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
@@ -226,9 +226,19 @@ describe("managed session Windows durability", () => {
 				entry.relativePath === "" && entry.kind === "directory" ? { ...entry, size: "4096" } : entry,
 			),
 		};
-		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname =>
-			pathname === retainedPath ? { ok: true, snapshot: expectedTree } : originalSnapshotDirectoryTree(pathname),
-		);
+		vi.spyOn(native, "snapshotEmptyDirectory").mockImplementation(pathname => {
+			const actual = originalSnapshotEmptyDirectory(pathname);
+			if (pathname !== retainedPath || !actual.ok || !actual.snapshot) return actual;
+			return {
+				...actual,
+				snapshot: {
+					...actual.snapshot,
+					entries: actual.snapshot.entries.map(entry =>
+						entry.relativePath === "" && entry.kind === "directory" ? { ...entry, size: "4096" } : entry,
+					),
+				},
+			};
+		});
 		const stat = syncFs.lstatSync(retainedPath, { bigint: true });
 		stat.dev = BigInt(nativeRoot.dev);
 		stat.ino = BigInt(nativeRoot.ino);
@@ -295,14 +305,14 @@ describe("managed session Windows durability", () => {
 		// can only pass if the producer reads the mocked native root. Hardcoding
 		// 4096 is not hermetic: Linux directory sizes can already be 4096.
 		// Reverting the win32 branch makes this test fail.
-		const originalSnapshot = native.snapshotDirectoryTree;
+		const originalSnapshot = native.snapshotEmptyDirectory;
 		const divergentSize = (BigInt(treeRoot.size) + 1n).toString();
 		expect(divergentSize).not.toBe(treeRoot.size);
 		// Scope the divergence to the retained placeholder only; the detached
 		// original is validated by a separate upstream check that must see real
 		// values.
 		const placeholderPrefix = ".gjc-exact-unlink-placeholder-";
-		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname => {
+		vi.spyOn(native, "snapshotEmptyDirectory").mockImplementation(pathname => {
 			const actual = originalSnapshot(pathname);
 			if (!path.basename(String(pathname)).startsWith(placeholderPrefix)) return actual;
 			if (!actual.ok || !actual.snapshot) return actual;

@@ -9,14 +9,22 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
+import { wrapUntrustedContent } from "../session/messages";
 import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-mutation-guard";
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
+import {
+	AST_EDIT_OUTSIDE_ROOT_MESSAGE,
+	astEditSingleFileOutsideReferenceRoot,
+	resolveAstEditPreviewWritePaths,
+} from "./ast-edit-write-path";
+import { assertEditableFile } from "./auto-generated-guard";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope } from "./path-utils";
+import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -217,6 +225,18 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
+			const assertSingleFileReferenceRoot = async (flowSignal?: AbortSignal): Promise<void> => {
+				const nativeWritePaths = multiTargets ? multiTargets.map(target => target.basePath) : [resolvedSearchPath];
+				const outsideRoot = await astEditSingleFileOutsideReferenceRoot(
+					this.session.cwd,
+					nativeWritePaths,
+					flowSignal,
+				);
+				if (outsideRoot) {
+					throw new ToolError(`${AST_EDIT_OUTSIDE_ROOT_MESSAGE}: ${outsideRoot}`);
+				}
+			};
+
 			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
 				dryRun: true,
@@ -263,7 +283,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				const parseMessage = cappedParseErrors.length
 					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`No replacements made${parseMessage}`).done();
+				return toolResult(baseDetails)
+					.text(wrapUntrustedContent(`No replacements made${parseMessage}`))
+					.done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -337,11 +359,18 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
+						for (const filePath of previewedFiles) {
+							enforcePlanModeWrite(this.session, filePath, { op: "update" });
+						}
 						await assertWorkflowMutationRawPathsAllowed({
 							cwd: this.session.cwd,
 							sessionId: this.session.getSessionId?.() ?? undefined,
-							rawPaths: previewedFiles,
+							rawPaths: await resolveAstEditPreviewWritePaths(this.session.cwd, previewedFiles),
 						});
+						for (const filePath of previewedFiles) {
+							await assertEditableFile(resolvePlanPath(this.session, filePath), filePath, this.session.settings);
+						}
+						await assertSingleFileReferenceRoot();
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,
@@ -412,7 +441,10 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				fileReplacements,
 				displayContent: displayLines.join("\n"),
 			};
-			return toolResult(details).text(outputLines.join("\n")).done();
+			// Line clips (120 chars) are already applied. Frame the joined preview once.
+			return toolResult(details)
+				.text(wrapUntrustedContent(outputLines.join("\n")))
+				.done();
 		});
 	}
 }

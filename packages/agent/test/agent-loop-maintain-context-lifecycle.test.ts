@@ -52,7 +52,7 @@ it("provides a non-optional cancellation-aware maintenance lifecycle without a r
 	const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [tool] };
 	let maintenanceCalls = 0;
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		maintainContext: async (_context, lifecycle) => {
 			maintenanceCalls += 1;
@@ -77,7 +77,7 @@ it("settles a reserved provider lease when stream creation throws synchronously"
 	const model = createMockModel();
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "factory-throw",
@@ -103,7 +103,7 @@ it("settles a provider that resolves after cancellation wins the factory race", 
 	const factoryStarted = Promise.withResolvers<void>();
 	const factory = Promise.withResolvers<AssistantMessageEventStream>();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "late-factory",
@@ -126,7 +126,12 @@ it("settles a provider that resolves after cancellation wins the factory race", 
 	await factoryStarted.promise;
 	controller.abort();
 	await drain;
-	await stream.result();
+	const messages = await stream.result();
+	const terminal = messages.at(-1);
+	expect(terminal).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	if (terminal?.role === "assistant") {
+		expect(terminal.transportFailure?.providerCode).not.toBe("empty_response");
+	}
 
 	const lateStream = new AssistantMessageEventStream();
 	const lateMessage = createAssistantMessage([{ type: "text", text: "late" }]);
@@ -147,7 +152,7 @@ it("settles a late provider even when iterator acquisition throws synchronously"
 		[createUserMessage("cancel")],
 		{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
 		{
-			model: model.model,
+			model: model,
 			convertToLlm: identityConverter,
 			resourceLedger: ledger,
 			resourceRunId: "late-broken-factory",
@@ -166,7 +171,12 @@ it("settles a late provider even when iterator acquisition throws synchronously"
 	await factoryStarted.promise;
 	controller.abort();
 	await drain;
-	await stream.result();
+	const messages = await stream.result();
+	const terminal = messages.at(-1);
+	expect(terminal).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	if (terminal?.role === "assistant") {
+		expect(terminal.transportFailure?.providerCode).not.toBe("empty_response");
+	}
 
 	const lateStream = new AssistantMessageEventStream();
 	const lateMessage = createAssistantMessage([{ type: "text", text: "late" }]);
@@ -220,7 +230,7 @@ it("ends as aborted when cancellation lands while maintenance resolves", async (
 	const events: Array<{ type: string; stopReason?: string; maintenanceOutcome?: string }> = [];
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "maintenance-abort",
@@ -279,7 +289,7 @@ it("requires claimed standalone maintenance ownership and installs its domain be
 	};
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "standalone-maintenance",
@@ -349,7 +359,7 @@ it("rejects reuse of a consumed standalone continuation claim before provider wo
 	};
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "standalone-duplicate",
@@ -426,7 +436,7 @@ it("keeps one Agent logical resource domain across single-model maintenance cont
 	};
 	let maintenanceCalls = 0;
 	const agent = new Agent({
-		initialState: { model: model.model, systemPrompt: ["You are helpful."], tools: [tool], messages: [] },
+		initialState: { model: model, systemPrompt: ["You are helpful."], tools: [tool], messages: [] },
 		streamFn,
 	});
 	agent.setMaintainContext(async () => {
@@ -476,7 +486,7 @@ it("rejects an unclaimed fresh-config standalone continuation", async () => {
 			tools: [],
 		},
 		{
-			model: model.model,
+			model: model,
 			convertToLlm: identityConverter,
 			resourceLedger: ledger,
 			resourceRunId: "standalone-bypass",

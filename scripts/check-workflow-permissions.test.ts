@@ -9,8 +9,9 @@ import {
 
 const CI_WORKFLOW = ".github/workflows/ci.yml";
 const DEV_CI_WORKFLOW = ".github/workflows/dev-ci.yml";
-const PR_VALIDATION_WORKFLOW = ".github/workflows/pr-validation.yml";
 const SPOOFED_VERSION_WORKFLOW = ".github/workflows/spoofed-version-sync.yml";
+const RE_REVIEW_WORKFLOW = ".github/workflows/re-review.yml";
+
 const repoRoot = `${import.meta.dir}/..`;
 
 async function parsedWorkflow(file: string): Promise<Record<string, unknown>> {
@@ -39,8 +40,9 @@ describe("workflow permission policy", () => {
 		expect(workflows.map(workflow => workflow.file)).toEqual([
 			".github/workflows/ci.yml",
 			".github/workflows/dev-ci.yml",
-			".github/workflows/pr-validation.yml",
+			".github/workflows/native-bench-ab.yml",
 			".github/workflows/public-site-sync.yml",
+			".github/workflows/re-review.yml",
 			".github/workflows/spoofed-version-sync.yml",
 		]);
 	});
@@ -53,15 +55,12 @@ describe("workflow permission policy", () => {
 
 		expect(REQUIRED_READ_DEFAULT).toContain(CI_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read" });
-		// Exactly two jobs may escalate, with disjoint capabilities:
-		// release_finalize holds contents for the GitHub Release (no OIDC), and
-		// publish holds id-token for npm trusted publishing (no repository
-		// scope) — which keeps a long-lived registry credential out of the
-		// release path.
+		// The full allowlist is exact so no additional write scope can be silently approved.
 		expect(JOB_WRITE_ALLOWLIST).toEqual([
 			{ workflow: CI_WORKFLOW, job: "release_finalize", scope: "contents" },
 			{ workflow: CI_WORKFLOW, job: "publish", scope: "id-token" },
-			{ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" },
+			{ workflow: RE_REVIEW_WORKFLOW, job: "request-review-on-comment", scope: "pull-requests" },
+			{ workflow: RE_REVIEW_WORKFLOW, job: "request-review-on-comment", scope: "issues" },
 		]);
 		expect(jobWriteScopes(document)).toEqual(["publish.id-token", "release_finalize.contents"]);
 	});
@@ -77,21 +76,6 @@ describe("workflow permission policy", () => {
 		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
-	test("pr-validation.yml has an exact read-scoped workflow default and only the allowlisted checks write job", async () => {
-		const workflows = await readWorkflowDocuments();
-		const prValidation = workflows.find(workflow => workflow.file === PR_VALIDATION_WORKFLOW);
-		expect(prValidation).toBeDefined();
-		const document = documentRecord(prValidation!.document);
-
-		expect(REQUIRED_READ_DEFAULT).toContain(PR_VALIDATION_WORKFLOW);
-		expect(document.permissions).toEqual({ contents: "read", "pull-requests": "read" });
-		// The validate job publishes a head-bound check run under the required
-		// context name for issue_comment runs (issue #4703); it is the only
-		// allowlisted write scope in this workflow.
-		expect(jobWriteScopes(document)).toEqual(["validate.checks"]);
-		expect(JOB_WRITE_ALLOWLIST).toContainEqual({ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" });
-	});
-
 	test("spoofed-version-sync.yml detects drift with no write scope anywhere", async () => {
 		const workflows = await readWorkflowDocuments();
 		const spoofedVersion = workflows.find(workflow => workflow.file === SPOOFED_VERSION_WORKFLOW);
@@ -99,12 +83,22 @@ describe("workflow permission policy", () => {
 		const document = documentRecord(spoofedVersion!.document);
 
 		// The scheduled drift check reports; it never pushes a branch or opens a
-		// pull request. dev requires the signed exact-head PR contract, so write
+		// pull request. dev requires an approving maintainer review, so write
 		// scopes here could not remove the human step they would be bought for.
 		expect(REQUIRED_READ_DEFAULT).toContain(SPOOFED_VERSION_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read" });
 		expect(jobWriteScopes(document)).toEqual([]);
 		expect(JOB_WRITE_ALLOWLIST.some(entry => entry.workflow === SPOOFED_VERSION_WORKFLOW)).toBe(false);
+	});
+
+	test("native-bench-ab.yml has an exact read-scoped workflow default and no write job scope", async () => {
+		const workflows = await readWorkflowDocuments();
+		const nativeBench = workflows.find(workflow => workflow.file === ".github/workflows/native-bench-ab.yml");
+		expect(nativeBench).toBeDefined();
+		const document = documentRecord(nativeBench!.document);
+
+		expect(document.permissions).toEqual({ contents: "read" });
+		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
 	test("detects a ci.yml workflow contents write mutation", async () => {
@@ -260,5 +254,304 @@ describe("workflow permission policy", () => {
 		delete documentRecord(documentRecord(document.jobs).publish).permissions;
 
 		expect(evaluateWorkflowPermissions([{ file: CI_WORKFLOW, document }])).toEqual([]);
+	});
+
+	test("re-review.yml has workflow-level default-deny and job-level write permissions", async () => {
+		const workflows = await readWorkflowDocuments();
+		const reReview = workflows.find(workflow => workflow.file === RE_REVIEW_WORKFLOW);
+		expect(reReview).toBeDefined();
+		const document = documentRecord(reReview!.document);
+
+		// Workflow-level permissions must be default-deny (empty permissions object)
+		expect(document.permissions).toEqual({});
+
+		// Job must have the required write permissions
+		const jobs = documentRecord(document.jobs);
+		const requestReviewOnComment = documentRecord(jobs["request-review-on-comment"]);
+		const jobPermissions = documentRecord(requestReviewOnComment.permissions);
+		expect(jobPermissions["pull-requests"]).toBe("write");
+		expect(jobPermissions.issues).toBe("write");
+
+		// Verify the workflow is NOT in the required read default list
+		// (it uses job-level permissions instead of workflow-level)
+		expect(!REQUIRED_READ_DEFAULT.includes(RE_REVIEW_WORKFLOW)).toBe(true);
+	});
+
+	test("skips deleted-author and PR-author reviews while discovering other reviewers", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const getReviewers = steps.map(documentRecord).find(step => step.id === "get-reviewers");
+		const reviewerScript = documentRecord(documentRecord(getReviewers).with).script as string;
+		const helper = reviewerScript.match(/function latestReviewByUser\(reviews, prAuthor\) \{[\s\S]*?^\}/m);
+		expect(helper).not.toBeNull();
+
+		type Review = {
+			user: { login: string; type: string } | null;
+			state: string;
+			submitted_at: string;
+		};
+		const createLatestReviewByUser = new Function(
+			`${helper?.[0]}\nreturn latestReviewByUser;`,
+		) as () => (reviews: Review[], prAuthor: string | undefined) => Map<string, Review>;
+		const latestReviewByUser = createLatestReviewByUser();
+
+		const selected = latestReviewByUser([
+			{ user: null, state: "COMMENTED", submitted_at: "2026-10-13T00:00:00Z" },
+			{
+				user: { login: "pr-author", type: "User" },
+				state: "COMMENTED",
+				submitted_at: "2026-10-13T00:00:30Z",
+			},
+			{
+				user: { login: "eligible-reviewer", type: "User" },
+				state: "COMMENTED",
+				submitted_at: "2026-10-13T00:01:00Z",
+			},
+		], "pr-author");
+
+		expect([...selected.keys()]).toEqual(["eligible-reviewer"]);
+	});
+
+	test("uses chronological API order when review timestamps tie", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const getReviewers = steps.map(documentRecord).find(step => step.id === "get-reviewers");
+		const reviewerScript = documentRecord(documentRecord(getReviewers).with).script as string;
+		const helper = reviewerScript.match(/function latestReviewByUser\(reviews, prAuthor\) \{[\s\S]*?^\}/m);
+		expect(helper).not.toBeNull();
+
+		type Review = {
+			user: { login: string; type: string } | null;
+			state: string;
+			submitted_at: string;
+		};
+		const createLatestReviewByUser = new Function(
+			`${helper?.[0]}\nreturn latestReviewByUser;`,
+		) as () => (reviews: Review[], prAuthor: string | undefined) => Map<string, Review>;
+		const latestReviewByUser = createLatestReviewByUser();
+		const submittedAt = "2026-10-13T00:00:00Z";
+		const cases: Array<{ reviews: Review[]; expectedState: string }> = [
+			{
+				reviews: [
+					{ user: { login: "reviewer", type: "User" }, state: "COMMENTED", submitted_at: submittedAt },
+					{ user: { login: "reviewer", type: "User" }, state: "APPROVED", submitted_at: submittedAt },
+				],
+				expectedState: "APPROVED",
+			},
+			{
+				reviews: [
+					{ user: { login: "reviewer", type: "User" }, state: "APPROVED", submitted_at: submittedAt },
+					{ user: { login: "reviewer", type: "User" }, state: "CHANGES_REQUESTED", submitted_at: submittedAt },
+				],
+				expectedState: "CHANGES_REQUESTED",
+			},
+		];
+
+		for (const { reviews, expectedState } of cases) {
+			expect(latestReviewByUser(reviews, undefined).get("reviewer")?.state).toBe(expectedState);
+		}
+	});
+
+	test("requires the exact command and allows maintainers when the PR author is deleted", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const authorizeStep = steps.map(documentRecord).find(step => step.id === "authorize");
+		const authorizeScript = documentRecord(documentRecord(authorizeStep).with).script as string;
+
+		type GithubStub = {
+			rest: {
+				pulls: {
+					get: (params: { owner: string; repo: string; pull_number: number }) => Promise<{ data: { user: null } }>;
+				};
+				repos: {
+					getCollaboratorPermissionLevel: (params: { owner: string; repo: string; username: string }) => Promise<{ data: { permission: string } }>;
+				};
+			};
+		};
+		let pullRequestLookups = 0;
+		let collaboratorError: (Error & { status: number }) | null = null;
+		const github: GithubStub = {
+			rest: {
+				pulls: {
+					get: async () => {
+						pullRequestLookups += 1;
+						return { data: { user: null } };
+			},
+			},
+				repos: {
+					getCollaboratorPermissionLevel: async () => {
+						if (collaboratorError) {
+							throw collaboratorError;
+						}
+						return { data: { permission: "write" } };
+					},
+				},
+			},
+		};
+		const context = {
+			payload: {
+				comment: { user: { login: "maintainer" }, body: "/re-review" },
+				issue: { pull_request: { url: "https://api.github.com/repos/Yeachan-Heo/gajae-code/pulls/6599" } },
+			},
+			repo: { owner: "Yeachan-Heo", repo: "gajae-code" },
+			issue: { number: 6599 },
+		};
+		const executeAuthorizationStep = new Function(
+			"github",
+			"context",
+			`return (async () => { ${authorizeScript} })();`,
+		) as (github: GithubStub, ctx: typeof context) => Promise<string>;
+
+		expect(await executeAuthorizationStep(github, context)).toBe("authorized");
+		const unrelatedPrefixContext = {
+			...context,
+			payload: {
+				...context.payload,
+				comment: { ...context.payload.comment, body: "/re-reviewplease" },
+			},
+		};
+		expect(await executeAuthorizationStep(github, unrelatedPrefixContext)).toBe("no-match");
+		expect(pullRequestLookups).toBe(1);
+
+		collaboratorError = Object.assign(new Error("Not Found"), { status: 404 });
+		expect(await executeAuthorizationStep(github, context)).toBe("unauthorized");
+		collaboratorError = Object.assign(new Error("Internal Server Error"), { status: 500 });
+		await expect(executeAuthorizationStep(github, context)).rejects.toBe(collaboratorError);
+	});
+
+	test("re-review filters to requestable reviewers and passes reviewer data through the environment", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const stepWithId = (id: string) => steps.map(documentRecord).find(step => step.id === id);
+		const authorizationStep = documentRecord(stepWithId("authorize"));
+		const reviewerSelectionStep = documentRecord(stepWithId("get-reviewers"));
+		const reviewerScript = documentRecord(documentRecord(stepWithId("get-reviewers")).with).script as string;
+		const requestStep = documentRecord(stepWithId("request-reviewers"));
+		const requestScript = documentRecord(requestStep.with).script as string;
+
+		expect(documentRecord(authorizationStep.with)["result-encoding"]).toBe("string");
+		expect(documentRecord(reviewerSelectionStep.with)["result-encoding"]).toBe("string");
+		expect(reviewerScript).toContain("getCollaboratorPermissionLevel");
+		expect(reviewerScript).toContain("canRequestReviewer(collaborator.data.permission)");
+		expect(reviewerScript).toContain("eligibleReviewers.push(reviewer)");
+		expect(reviewerScript).toContain("return JSON.stringify(eligibleReviewers)");
+		expect(requestStep.env).toEqual({ REVIEWERS_JSON: "${{ steps.get-reviewers.outputs.result }}" });
+		expect(requestScript).toContain("JSON.parse(process.env.REVIEWERS_JSON)");
+		expect(requestScript).not.toContain("${{");
+		expect(requestScript).toContain("github.rest.pulls.requestReviewers");
+		expect(requestScript).not.toContain("requested_reviewers/rerequest");
+	});
+
+	test("documents the default-branch activation point for issue_comment workflows", async () => {
+		const contributing = await Bun.file(`${repoRoot}/CONTRIBUTING.md`).text();
+		expect(contributing).toContain("default branch, `main`");
+		expect(contributing).toContain("Merging this PR to `dev` alone does not activate `/re-review`");
+	});
+
+	test("allows re-requesting reviewers with read and triage access", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const getReviewers = steps.map(documentRecord).find(step => step.id === "get-reviewers");
+		const reviewerScript = documentRecord(documentRecord(getReviewers).with).script as string;
+		const helper = reviewerScript.match(/function canRequestReviewer\(permission\) \{[\s\S]*?^\}/m);
+		expect(helper).not.toBeNull();
+
+		const createCanRequestReviewer = new Function(
+			`${helper?.[0]}\nreturn canRequestReviewer;`,
+		) as () => (permission: string) => boolean;
+		const canRequestReviewer = createCanRequestReviewer();
+
+		expect(canRequestReviewer("read")).toBe(true);
+		expect(canRequestReviewer("triage")).toBe(true);
+		expect(canRequestReviewer("none")).toBe(false);
+	});
+
+	type ReviewRequestParams = { owner: string; repo: string; pull_number: number; reviewers: string[] };
+	type ReviewCommentParams = { owner: string; repo: string; issue_number: number; body: string };
+	async function loadRequestStep() {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const requestStep = steps.map(documentRecord).find(step => step.id === "request-reviewers");
+		const requestScript = documentRecord(documentRecord(requestStep).with).script as string;
+		return new Function("github", "context", "process", `return (async () => { ${requestScript} })();`) as (
+			github: unknown,
+			ctx: unknown,
+			proc: unknown,
+		) => Promise<void>;
+	}
+	const requestContext = { repo: { owner: "Yeachan-Heo", repo: "gajae-code" }, issue: { number: 6599 } };
+	const requestProcess = { env: { REVIEWERS_JSON: '["previous-reviewer"]' } };
+
+	test("re-requests previous reviewers through the standard review-request endpoint", async () => {
+		const executeRequestStep = await loadRequestStep();
+		const requests: ReviewRequestParams[] = [];
+		const rawRoutes: string[] = [];
+		const github = {
+			rest: {
+				pulls: {
+					get: async ({ pull_number }: { pull_number: number }) => ({ data: { number: pull_number } }),
+					requestReviewers: async (params: ReviewRequestParams) => {
+						requests.push(params);
+						return { status: 201 };
+					},
+				},
+				issues: { createComment: async () => ({ status: 201 }) },
+			},
+			request: async (route: string) => {
+				rawRoutes.push(route);
+				return { status: 201 };
+			},
+		};
+
+		await executeRequestStep(github, requestContext, requestProcess);
+
+		expect(requests).toEqual([
+			{ owner: "Yeachan-Heo", repo: "gajae-code", pull_number: 6599, reviewers: ["previous-reviewer"] },
+		]);
+		expect(rawRoutes).toEqual([]);
+	});
+
+	test("tells the commenter and fails the step when the review request is rejected", async () => {
+		const executeRequestStep = await loadRequestStep();
+		const comments: ReviewCommentParams[] = [];
+		const rejection = Object.assign(new Error("Reviews may only be requested from collaborators"), { status: 422 });
+		const github = {
+			rest: {
+				pulls: {
+					get: async ({ pull_number }: { pull_number: number }) => ({ data: { number: pull_number } }),
+					requestReviewers: async () => {
+						throw rejection;
+					},
+				},
+				issues: {
+					createComment: async (params: ReviewCommentParams) => {
+						comments.push(params);
+						return { status: 201 };
+					},
+				},
+			},
+		};
+
+		await expect(executeRequestStep(github, requestContext, requestProcess)).rejects.toBe(rejection);
+		expect(comments).toHaveLength(1);
+		expect(comments[0].issue_number).toBe(6599);
+		expect(comments[0].body).toContain("Failed to re-request reviews");
+		expect(comments[0].body).toContain("Reviews may only be requested from collaborators");
+	});
+
+	test("detects if re-review.yml has workflow-level write permissions instead of job-level", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const document = structuredClone(source);
+		document.permissions = { "pull-requests": "write", issues: "write" };
+
+		const violations = evaluateWorkflowPermissions([{ file: RE_REVIEW_WORKFLOW, document }]);
+		expect(violations.length).toBeGreaterThan(0);
+		expect(violations.some(violation => violation.path.includes("permissions"))).toBe(true);
 	});
 });

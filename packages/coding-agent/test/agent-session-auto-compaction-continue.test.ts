@@ -149,10 +149,35 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(promptSpy.mock.calls[0]?.[0]).toEqual(
 			expect.arrayContaining([expect.objectContaining({ role: "developer", attribution: "agent" })]),
 		);
+		expect(JSON.stringify(promptSpy.mock.calls[0]?.[0])).toContain("Resume work on the user's most recent intent");
 		expect(getRuntimeSignals().filter(signal => signal === "compaction:start:threshold")).toHaveLength(1);
 		const endIndex = events.indexOf("auto_compaction_end");
 		expect(events.slice(endIndex + 1)).not.toContain("agent_end");
 		expect(promptSpy.mock.invocationCallOrder[0]).toBeGreaterThan(0);
+	});
+
+	it("uses the 300K default threshold for a 1M model", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected an active model");
+		session.agent.setModel({ ...model, contextWindow: 1_000_000 });
+		session.settings.set("compaction.autoContinue", false);
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		const usageAt = (tokens: number) => ({
+			input: tokens,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: tokens,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+
+		await driveCompaction(assistantMessage({ usage: usageAt(299_000) }));
+		expect(events.some(event => event.type === "auto_compaction_start")).toBe(false);
+
+		await driveCompaction(assistantMessage({ usage: usageAt(300_001) }));
+		expect(events.some(event => event.type === "auto_compaction_start" && event.reason === "threshold")).toBe(true);
+		expect(getRuntimeSignals().filter(signal => signal === "compaction:start:threshold")).toHaveLength(1);
 	});
 
 	it("appends canonical work state to hook-provided compaction summaries", async () => {
@@ -176,16 +201,28 @@ describe("AgentSession auto-compaction continuation", () => {
 				timestamp: Date.now() + index,
 			});
 		}
+		const messageCountBeforeCompaction =
+			sessionManager.getBranch().filter(entry => entry.type === "message").length + 1;
+		const triggeringMessage = assistantMessage();
 		vi.spyOn(session.agent, "prompt").mockResolvedValue();
-		await driveCompaction();
+		await driveCompaction(triggeringMessage);
 		await advancePostPrompt(50);
 		await session.waitForIdle();
-		const compactionEntry = sessionManager.getBranch().findLast(entry => entry.type === "compaction");
+		const branch = sessionManager.getBranch();
+		const compactionEntry = branch.findLast(entry => entry.type === "compaction");
 		if (compactionEntry?.type !== "compaction") throw new Error("Expected compaction entry");
 		expect(compactionEntry.summary).toContain("compacted");
 		expect(compactionEntry.summary).toContain("<compaction-state>");
 		expect(compactionEntry.summary).toContain("Active goal: Preserve hook compaction state");
 		expect(compactionEntry.summary).toContain("Open todos: Keep working");
+		const firstKeptIndex = branch.findIndex(entry => entry.id === compactionEntry.firstKeptEntryId);
+		const compactionIndex = branch.findIndex(entry => entry.id === compactionEntry.id);
+		expect(firstKeptIndex).toBeGreaterThan(0);
+		expect(firstKeptIndex).toBeLessThan(compactionIndex);
+		const compactedContext = session.buildDisplaySessionContext().messages;
+		expect(compactedContext.length).toBeLessThan(messageCountBeforeCompaction);
+		expect(compactedContext[0]?.role).toBe("compactionSummary");
+		expect(JSON.stringify(compactedContext[0])).toContain("compacted");
 	});
 
 	it.skipIf(process.platform !== "darwin")(
@@ -595,13 +632,15 @@ describe("AgentSession auto-compaction continuation", () => {
 		const warnSpy = vi.spyOn(logger, "warn");
 		const resetAttemptBudgetSpy = vi.spyOn(FallbackChainController.prototype, "resetAttemptBudget");
 		const continueSpy = vi.spyOn(session.agent, "continue");
+		const events: string[] = [];
+		const agentEndCountsAtDelivery: number[] = [];
 		const continueQueuedMessagesSpy = vi
 			.spyOn(session.agent, "continueQueuedMessages")
 			.mockImplementation(async options => {
+				agentEndCountsAtDelivery.push(events.filter(type => type === "agent_end").length);
 				options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 			});
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
-		const events: string[] = [];
 		session.subscribe(event => events.push(event.type));
 
 		await driveCompaction();
@@ -611,7 +650,9 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
 		expect(resetAttemptBudgetSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).not.toHaveBeenCalled();
-		expect(events.filter(type => type === "agent_end")).toHaveLength(0);
+		expect(agentEndCountsAtDelivery).toEqual([0]);
+		expect(events.filter(type => type === "agent_end")).toHaveLength(1);
+		expect(events.indexOf("agent_end")).toBeGreaterThan(events.indexOf("auto_compaction_end"));
 		expect(warnSpy.mock.calls.some(call => JSON.stringify(call).includes("AgentBusyError"))).toBe(false);
 	});
 
@@ -918,16 +959,19 @@ describe("AgentSession auto-compaction continuation", () => {
 		const debugSpy = vi.spyOn(logger, "debug");
 		const resetAttemptBudgetSpy = vi.spyOn(FallbackChainController.prototype, "resetAttemptBudget");
 		const continueSpy = vi.spyOn(session.agent, "continue");
+		const events: string[] = [];
+		const agentEndCountsAtDelivery: number[] = [];
 		const continueQueuedMessagesSpy = vi
 			.spyOn(session.agent, "continueQueuedMessages")
 			.mockImplementationOnce(async () => {
+				agentEndCountsAtDelivery.push(events.filter(type => type === "agent_end").length);
 				throw new AgentBusyError();
 			});
 		continueQueuedMessagesSpy.mockImplementationOnce(async options => {
+			agentEndCountsAtDelivery.push(events.filter(type => type === "agent_end").length);
 			options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 		});
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
-		const events: string[] = [];
 		session.subscribe(event => events.push(event.type));
 
 		await driveCompaction();
@@ -938,7 +982,9 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(2);
 		expect(resetAttemptBudgetSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).not.toHaveBeenCalled();
-		expect(events.filter(type => type === "agent_end")).toHaveLength(0);
+		expect(agentEndCountsAtDelivery).toEqual([0, 0]);
+		expect(events.filter(type => type === "agent_end")).toHaveLength(1);
+		expect(events.indexOf("agent_end")).toBeGreaterThan(events.indexOf("auto_compaction_end"));
 		expect(warnSpy.mock.calls.some(call => JSON.stringify(call).includes("AgentBusyError"))).toBe(false);
 		expect(debugSpy.mock.calls.some(call => call[0] === "agent.continue busy after scheduling; rescheduling")).toBe(
 			true,
@@ -1038,5 +1084,48 @@ describe("AgentSession auto-compaction continuation", () => {
 					call[0] === "Auto-compaction continuation failed" && JSON.stringify(call[1]).includes("spoofed busy"),
 			),
 		).toBe(true);
+	});
+
+	it("allows prompting after overflow compaction completes", async () => {
+		// Verify that prompts can be submitted after overflow auto-compaction completes.
+		// This test exercises the overflow path to ensure that compaction transitions
+		// are handled correctly and don't block subsequent prompt admission.
+
+		// First, fill the message history to trigger overflow (threshold + some buffer)
+		const largeMessage = assistantMessage({
+			usage: {
+				input: 350_000, // Exceeds the default threshold of 300K
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 350_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+
+		// Trigger overflow auto-compaction by emitting agent_end
+		sessionManager.appendMessage(largeMessage);
+		session.agent.emitExternalEvent({ type: "message_end", message: largeMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [largeMessage] });
+
+		// Wait for compaction to complete
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+
+		// Now try to prompt - this should succeed without timing out
+		let promptError: Error | undefined;
+		try {
+			await Promise.race([
+				session.prompt("message after overflow compaction"),
+				new Promise<void>((_, reject) =>
+					setTimeout(() => reject(new Error("Timed out waiting for prompt after compaction")), 3000),
+				),
+			]);
+			// The prompt should have been queued without timing out
+		} catch (error) {
+			promptError = error instanceof Error ? error : new Error(String(error));
+		}
+
+		expect(promptError, "prompt should succeed after overflow compaction").toBeUndefined();
 	});
 });

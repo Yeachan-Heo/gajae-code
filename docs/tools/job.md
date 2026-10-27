@@ -20,6 +20,7 @@
 | `poll` | `string[]` | No | Job ids to watch. Cannot be combined with `list`. If omitted (and `cancel` is also omitted), the tool watches all running jobs. If provided, missing ids are silently filtered out before waiting. |
 | `cancel` | `string[]` | No | Job ids to cancel before any polling. Missing ids are reported as `not_found`; non-running ids as `already_completed`. |
 | `list` | `boolean` | No | Return an immediate snapshot of every job spawned by the calling agent (running + completed within retention) without waiting. Read-only — cannot be combined with `poll` or `cancel`. |
+| `tail` | `string[]` | No | Job ids whose retained output is included in the result without waiting on them. Alone (no `poll`/`cancel`) it returns immediately with just those jobs; it can also be combined with `list`, `poll`, or `cancel`. |
 
 ## Outputs
 The tool returns one text block plus `details`.
@@ -72,6 +73,8 @@ Read-only snapshot path:
 12. `#buildResult(...)` deduplicates jobs, snapshots current manager state, then calls `manager.acknowledgeDeliveries(...)` for every terminal job (`completed`, `failed`, `cancelled`) in the result. That suppresses later automatic follow-up delivery for the same completions and removes queued deliveries for those ids; a `paused` job is left unsuppressed and resumable.
 13. The final text partitions jobs by terminal (`## Completed`), still-running (`## Still Running`), and non-terminal non-running (`## Waiting`) state. A timeout is not an error path; it simply returns the current snapshot.
 
+Delivery draining enrolls the original in-flight record and its completion future before notifying change listeners or invoking `onJobComplete`. Drains join that future; bounded disposal returns its existing timeout result while retaining the unsettled future until the callback operation finishes. This is delivery-future enrollment only, not proof of the entire task lifecycle or closure. It does not settle the initial parked artifact save, preserve the original publication capability across ordinary retries, or certify queue acknowledgement, private claims, eviction, or pinning.
+
 ## Modes / Variants
 - Poll all running jobs: call with neither `poll` nor `cancel`.
 - Poll explicit ids: call with `poll` only.
@@ -96,6 +99,8 @@ Lifecycle and exact state names:
 - Conceptual scheduling path: `pending` (only task-progress bookkeeping before work starts) → `running` → `completed` / `failed`; cancellation changes a running async job to `cancelled`; a run that returns `{ kind: "paused" }` (subagent safe-boundary pause, folded work awaiting resume) leaves the job non-terminal and resumable as `paused`.
 - Exact `AsyncJob.status` values in `packages/coding-agent/src/async/job-manager.ts`: `"running" | "paused" | "completed" | "failed" | "cancelled"`.
 - Exact per-task progress values in `packages/coding-agent/src/task/types.ts`: `"pending" | "running" | "completed" | "failed" | "aborted"`.
+- Lifecycle hooks, settlement bookkeeping, and retention timers belong to the original job object. Reusing an evicted job ID does not transfer an older job's cleanup or eviction deadline to its replacement; monitor tombstones retain their original cleanup owner.
+- Owner shutdown, `waitForAll`, and manager disposal track the original runner until it physically unwinds, even after its visible row is evicted. A captured shutdown lease cannot cancel a same-ID replacement. Cancellation or row absence alone is not settlement proof; deadlines preserve uncertainty, and physical-dependent eviction cleanup runs only after the original runner finishes.
 
 ## Side Effects
 - Filesystem

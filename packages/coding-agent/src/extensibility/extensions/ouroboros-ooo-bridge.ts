@@ -1,9 +1,14 @@
+import { ptree } from "@gajae-code/utils";
+import { $credentialEnv, startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
+import type { ExecResult } from "../../exec/exec";
 import type { MCPServerConnection, MCPToolCallResult } from "../../runtime-mcp";
 import { callTool, connectToServer, disconnectServer } from "../../runtime-mcp";
 import { createExactPrefixCommandBridge } from "./prefix-command-bridge";
 import type { ExtensionContext, InputEvent, InputEventResult } from "./types";
 
 const OUROBOROS_CLI_ENV = "OUROBOROS_CLI";
+const DEFAULT_OUROBOROS_COMMAND = "ouroboros";
 const INTERVIEW_COMMAND = "ooo interview";
 const INTERVIEW_TOOL = "ouroboros_interview";
 const INTERVIEW_SESSION_PATTERN = /^interview_[A-Za-z0-9_-]+$/;
@@ -23,8 +28,64 @@ interface OuroborosOooBridgeHandler {
 	reset(): Promise<void>;
 }
 
+function projectSuppliedOuroborosCli(): boolean {
+	const snapshot = startupProjectEnvSnapshot();
+	const key = canonicalEnvKey(OUROBOROS_CLI_ENV);
+	return Object.hasOwn(snapshot.values, key) || snapshot.dynamic.has(key);
+}
+
+/**
+ * Executable for `ooo` dispatch and the interview MCP server.
+ *
+ * The string is spawned directly, so a repository `.env` must not choose it.
+ * `$credentialEnv` keeps a launching-shell or user-owned setting and ignores
+ * the project dotenv, including a dynamic declaration. Anything else stays the
+ * default command name. A rejected project value is removed from `process.env`
+ * before either spawn. Prefix dispatch also passes that cleaned object: Bun
+ * keeps the startup environment for a spawn that omits `env`, so deleting the
+ * key alone would still hand the project value to the child.
+ */
 function resolveOuroborosCommand(): string {
-	return process.env[OUROBOROS_CLI_ENV]?.trim() || "ouroboros";
+	const trusted = $credentialEnv(OUROBOROS_CLI_ENV)?.trim();
+	if (trusted) {
+		const live = process.env[OUROBOROS_CLI_ENV];
+		if (live !== undefined && live.trim() !== trusted) process.env[OUROBOROS_CLI_ENV] = trusted;
+		return trusted;
+	}
+	if (projectSuppliedOuroborosCli()) delete process.env[OUROBOROS_CLI_ENV];
+	return DEFAULT_OUROBOROS_COMMAND;
+}
+
+function ouroborosSpawnEnv(): Record<string, string> {
+	resolveOuroborosCommand();
+	const env: Record<string, string> = {};
+	for (const key of Object.keys(process.env)) {
+		const value = process.env[key];
+		if (typeof value === "string") env[key] = value;
+	}
+	return env;
+}
+
+async function dispatchOuroborosCommand(
+	command: string,
+	args: string[],
+	ctx: ExtensionContext,
+	execOptions: { timeout?: number },
+): Promise<ExecResult> {
+	const result = await ptree.exec([command, ...args], {
+		cwd: ctx.cwd,
+		timeout: execOptions.timeout,
+		allowNonZero: true,
+		allowAbort: true,
+		stderr: "full",
+		env: ouroborosSpawnEnv(),
+	});
+	return {
+		stdout: result.stdout,
+		stderr: result.stderr,
+		code: result.exitCode ?? 0,
+		killed: Boolean(result.exitError?.aborted),
+	};
 }
 
 function interviewArgument(text: string): string | undefined {
@@ -89,6 +150,7 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 		prefix: "ooo",
 		command: resolveOuroborosCommand(),
 		args: ["dispatch", "--runtime", "gjc"],
+		dispatch: dispatchOuroborosCommand,
 	});
 
 	function assertCurrent(generation: number, signal: AbortSignal | undefined): void {

@@ -3,6 +3,8 @@
  * Provider error text is retained only in the local diagnostic log; wire and
  * persisted reconciliation details expose a fixed redacted message.
  */
+import type { ProviderDiagnostic } from "@gajae-code/ai/core";
+import { sanitizeProviderDiagnostic } from "@gajae-code/ai/core";
 import type {
 	SdkPromptFailureCategory,
 	SdkPromptFailurePhase,
@@ -147,8 +149,18 @@ export function rephaseFailedOutcome(
 	const category = promptFailureCategory(outcome.providerCode ?? outcome.code, outcome.provenance);
 	const phase = promptFailurePhase(evidence);
 	const message = promptFailureMessage(phase, category);
-	if (category === outcome.category && phase === outcome.phase && message === outcome.message) return outcome;
-	return { ...outcome, category, phase, message };
+	// A decoded durable outcome may carry a malformed diagnostic, or a valid core
+	// with extra keys the sanitizer would drop. Replace it with the canonical
+	// object either way: comparing only presence let a valid-core value keep
+	// arbitrary extras (and their bytes) all the way to the public result.
+	const diagnostic = sanitizeProviderDiagnostic(outcome.providerDiagnostic);
+	const diagnosticChanged = !isCanonicalDiagnostic(outcome.providerDiagnostic, diagnostic);
+	if (category === outcome.category && phase === outcome.phase && message === outcome.message && !diagnosticChanged)
+		return outcome;
+	const rephased = { ...outcome, category, phase, message };
+	if (diagnostic === undefined) delete rephased.providerDiagnostic;
+	else rephased.providerDiagnostic = diagnostic;
+	return rephased;
 }
 
 /** Build a complete failed outcome from a bounded classifier and evidence. */
@@ -158,6 +170,8 @@ export function failedPromptOutcome(input: {
 	providerCode?: string;
 	phase?: SdkPromptFailurePhase;
 	evidence: PromptFailureEvidence;
+	/** Revalidated here; a malformed value is dropped, never partially kept. */
+	providerDiagnostic?: ProviderDiagnostic;
 }): Extract<SdkPromptTerminalOutcome, { kind: "failed" }> {
 	const category = promptFailureCategory(input.providerCode ?? input.code, input.provenance);
 	const phase = input.phase ?? promptFailurePhase(input.evidence);
@@ -169,7 +183,74 @@ export function failedPromptOutcome(input: {
 		phase,
 		category,
 		...(input.providerCode !== undefined ? { providerCode: input.providerCode } : {}),
+		...providerDiagnosticField(input.providerDiagnostic),
 	};
+}
+
+/**
+ * Whether the stored value is already exactly the canonical diagnostic: same
+ * presence, same own keys, same values. An extra key, a changed value or a
+ * non-record makes it non-canonical, so callers rewrite it.
+ */
+function isCanonicalDiagnostic(stored: unknown, canonical: ProviderDiagnostic | undefined): boolean {
+	if (canonical === undefined) return stored === undefined;
+	if (stored === null || typeof stored !== "object") return false;
+	try {
+		// Fail closed on anything that is not a plain own-data record: an inherited
+		// `toJSON`, a getter, a symbol key or a non-enumerable property can carry a
+		// payload that matching keys and values never reveal, and returning the
+		// original would publish it verbatim.
+		if (Object.getPrototypeOf(stored) !== Object.prototype) return false;
+		if (Object.getOwnPropertySymbols(stored).length > 0) return false;
+		const storedNames = Object.getOwnPropertyNames(stored);
+		const canonicalNames = Object.getOwnPropertyNames(canonical);
+		if (storedNames.length !== canonicalNames.length) return false;
+		return canonicalNames.every(name => {
+			const descriptor = Object.getOwnPropertyDescriptor(stored, name);
+			if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+			return descriptor.value === (canonical as unknown as Record<string, unknown>)[name];
+		});
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Public projection of a terminal outcome: a fresh object whose optional
+ * diagnostic is re-validated and rebuilt, so a caller that mutates the returned
+ * DTO cannot reach stored reconciliation state.
+ */
+export function publicTerminalOutcome<T extends SdkPromptTerminalOutcome | undefined>(outcome: T): T {
+	if (outcome === undefined || outcome.kind !== "failed") return outcome;
+	// Remove the stored value FIRST, then re-add only a validated canonical
+	// snapshot: spreading an empty validation result over the original left a
+	// rejected diagnostic in place, which is exactly the value that must not ship.
+	const failed = outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+	const projected: Extract<SdkPromptTerminalOutcome, { kind: "failed" }> = { ...failed };
+	delete projected.providerDiagnostic;
+	const validated = providerDiagnosticField(failed.providerDiagnostic);
+	if (validated.providerDiagnostic !== undefined) projected.providerDiagnostic = validated.providerDiagnostic;
+	return projected as T;
+}
+
+/** `{ providerDiagnostic }` only when the value survives closed revalidation. */
+export function providerDiagnosticField(value: unknown): { providerDiagnostic?: ProviderDiagnostic } {
+	const providerDiagnostic = sanitizeProviderDiagnostic(value);
+	return providerDiagnostic === undefined ? {} : { providerDiagnostic };
+}
+
+/**
+ * Bounded provider diagnostic carried by an `agent_failed` diagnostic. The
+ * value is revalidated here, so neither a legacy record nor a hostile payload
+ * can inject an unchecked classification.
+ */
+export function failureProviderDiagnostic(failure: unknown): ProviderDiagnostic | undefined {
+	try {
+		const candidate = failure as { providerDiagnostic?: unknown } | undefined;
+		return sanitizeProviderDiagnostic(candidate?.providerDiagnostic);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -207,6 +288,23 @@ export function sanitizePromptFailure(error: unknown): { code: string; message: 
 	}
 	const code = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode) ? rawCode : "internal";
 	return { code, message: "Prompt submission failed." };
+}
+
+/**
+ * Publication/recovery projection of a failure cause: the existing bounded
+ * `code`/`message` exactly as before, plus the validated optional diagnostic
+ * when the cause carried one.
+ *
+ * Kept separate from `sanitizePromptFailure` on purpose: that result is what
+ * durable records store as `error`, and widening the persisted failure shape is
+ * not part of this contract.
+ */
+export function publishedPromptFailure(error: unknown): {
+	code: string;
+	message: string;
+	providerDiagnostic?: ProviderDiagnostic;
+} {
+	return { ...sanitizePromptFailure(error), ...providerDiagnosticField(failureProviderDiagnostic(error)) };
 }
 
 /** Best-effort local diagnostic text that never crosses the SDK boundary. */

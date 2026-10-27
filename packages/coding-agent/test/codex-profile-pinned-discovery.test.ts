@@ -4,7 +4,7 @@ import { AuthStorage, closeModelCache, SqliteAuthCredentialStore } from "@gajae-
 import { getAgentDir, hookFetch, setAgentDir, TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 
-test("a paid Codex pin replaces a cached free catalog before profile activation", async () => {
+test("Codex discovery follows the pinned account without plan-hiding bundled models", async () => {
 	using tempDir = TempDir.createSync("@gjc-codex-pin-catalog-");
 	const previousAgentDir = getAgentDir();
 	closeModelCache();
@@ -48,13 +48,15 @@ test("a paid Codex pin replaces a cached free catalog before profile activation"
 	const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	const availableIds = () =>
 		registry
-			.getAvailableForProfileActivation()
+			.getAvailable()
 			.filter(model => model.provider === "openai-codex")
 			.map(model => model.id);
 	try {
 		await registry.refreshProvider("openai-codex", "online", "free-session");
-		expect(availableIds()).not.toContain("gpt-6-astra");
-		expect(availableIds()).not.toContain("gpt-5.6-sol");
+		// A free account's plan-scoped catalog omits these ids, but GJC never deletes
+		// a bundled entry because the signed-in plan lacks it.
+		expect(availableIds()).toContain("gpt-6-astra");
+		expect(availableIds()).toContain("gpt-5.6-sol");
 
 		await registry.refreshProvider("openai-codex", "online-if-uncached", "paid-session");
 		expect(requests).toEqual(["free", "paid"]);

@@ -61,12 +61,12 @@ Memory extraction and consolidation behavior is driven by static prompt files in
 
 Memory piggybacks on the model role system.
 
-| Phase                   | Role                                                                | Purpose                          |
-| ----------------------- | ------------------------------------------------------------------- | -------------------------------- |
-| Phase 1 (extraction)    | `default`                                                           | Per-session knowledge extraction |
-| Phase 2 (consolidation) | `smol` (falls back to `default`, then current/first registry model) | Cross-session synthesis          |
+| Phase                   | Role      | Purpose                          |
+| ----------------------- | --------- | -------------------------------- |
+| Phase 1 (extraction)    | `default` | Per-session knowledge extraction |
+| Phase 2 (consolidation) | `default` | Cross-session synthesis          |
 
-If the requested memory role is not configured, memory model resolution falls back to the `default` role, then the active session model, then the first model in the registry.
+If the `default` role is not configured or does not resolve, memory model resolution falls back to the active session model, then the most recently used model, then the first model in the registry.
 
 ## Configuration
 

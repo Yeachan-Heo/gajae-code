@@ -5,7 +5,7 @@ This document covers the execution/process/terminal primitives in `@gajae-code/n
 ## Implementation files
 
 - `crates/pi-natives/src/shell.rs`
-- `crates/pi-natives/src/shell/windows.rs` (Windows-only PATH enrichment)
+- `crates/pi-shell/src/windows.rs` (Windows-only PATH enrichment)
 - `crates/pi-natives/src/pty.rs`
 - `crates/pi-natives/src/ps.rs`
 - `crates/pi-natives/src/keys.rs`

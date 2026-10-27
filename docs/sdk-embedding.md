@@ -253,15 +253,42 @@ one accepted submission with one model call or one `agent_end` event.
 
 For generic embedders, prefer an application-owned queue of bounded full turns
 submitted through `session.prompt()`, and use `steer`/`followUp` only for live
-conversational controls. The `sendUserMessage` promise has delivery-mode
-dependent completion semantics:
+conversational controls. When a queued control must remain pending until its
+exact ownership is known, use `submitUserMessage()`:
+
+```ts
+const submission = await session.submitUserMessage("refresh the status", {
+  deliverAs: "followUp",
+  queuePolicy: "sequential",
+  trackSubmission: true,
+});
+
+await submission.admitted;
+const execution = await submission.execution;
+// execution.disposition is "joined-current-run", "promoted-to-run", or "removed".
+// For execution, attemptScope identifies the run that owns the terminal boundary.
+await submission.terminal;
+```
+
+`submissionId` is generated per call, so identical message text remains
+independently correlatable. `admitted` resolves only after the exact queue
+entry exists. `execution` resolves at same-run consumption, successor-run
+promotion, or exact removal. `terminal` resolves at the owning run's
+`agent_end` boundary, or immediately for removal. `submission.cancel()` removes
+the entry when it is still queued; it returns `false` after execution or
+removal. `queuePolicy: "sequential"` preserves FIFO delivery one queued input
+at a time, including when the session's configured follow-up/steering mode is
+`"all"`.
+
+The ordinary `sendUserMessage` promise retains its delivery-mode-dependent
+completion semantics:
 
 - An ordinary idle submission with no `deliverAs` queues nothing and awaits the
   prompt turn, including its terminal completion.
 - An explicit queued `steer`/`followUp`, or a submission diverted into a queue
   because a live turn is active, resolves when the submission is admitted to
-  that delivery path. Use supported session events to correlate its later
-  consumption, completion, and cancellation.
+  that delivery path. Use `submitUserMessage` when later consumption,
+  completion, and cancellation must be correlated to one exact submission.
 
 Neither promise is a generic queue-drained receipt. Do not build a generic
 embedder contract around internal dispatch or promotion-correlation hooks.
@@ -342,7 +369,7 @@ Use `setToolUIContext(...)` only if your embedder provides UI capabilities that 
 
 `createAgentSession()` runs two background optimizations to overlap I/O with the rest of session setup:
 
-- **Model-host preconnect.** As soon as the model is resolved, the SDK fires a best-effort `fetch.preconnect(model.baseUrl)` so DNS + TCP + TLS + HTTP/2 to the provider's host happens in parallel with tool registry build, and system-prompt assembly. The first real `fetch(...)` then reuses the warm connection, saving 100–300 ms on transcontinental hops (e.g. residential IP → `api.anthropic.com`). Implementation lives in `preconnectModelHost()` in `packages/coding-agent/src/sdk/session.ts`. If `fetch.preconnect` is unavailable (non-Bun runtime) or the call throws, the optimization is silently skipped — never a hard dependency. Applies to interactive, print, and ACP modes.
+- **Model-host preconnect.** As soon as the model is resolved, the SDK fires a best-effort `fetch.preconnect(model.baseUrl)` so DNS + TCP + TLS + HTTP/2 to the provider's host happens in parallel with tool registry build, and system-prompt assembly. The first real `fetch(...)` then reuses the warm connection, saving 100–300 ms on transcontinental hops (e.g. residential IP → `api.anthropic.com`). `packages/coding-agent/src/sdk/session.ts` triggers it through the `startup.networkPrewarm` runtime service (`packages/coding-agent/src/runtime/network-prewarm-service.ts`); setting `startup.networkPrewarm: false` skips it. If `fetch.preconnect` is unavailable (non-Bun runtime) or the call throws, the optimization is skipped (failures are logged at debug level) — never a hard dependency. Applies to interactive, print, and ACP modes.
 - **Conditional LSP warmup.** Startup LSP servers (those returned by `discoverStartupLspServers(cwd)`) are only warmed when **all** of these hold:
   - `enableLsp !== false` on the session options, **and**
   - `options.hasUI === true` (interactive TUI), **and**

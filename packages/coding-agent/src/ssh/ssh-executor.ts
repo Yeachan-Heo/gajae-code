@@ -1,6 +1,6 @@
 import { logger, ptree } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
-import { OutputSink } from "../session/streaming-output";
+import { OutputSink, type TerminalArtifactPublisher } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { buildRemoteCommand, ensureConnection, ensureHostInfo, type SSHConnectionTarget } from "./connection-manager";
 import { hasSshfs, mountRemote } from "./sshfs-mount";
@@ -21,6 +21,8 @@ export interface SSHExecutorOptions {
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
+	/** Session-owned publisher for managed sessions without a writable artifact path. */
+	artifactPublisher?: TerminalArtifactPublisher;
 }
 
 export interface SSHResult {
@@ -40,8 +42,12 @@ export interface SSHResult {
 	outputLines: number;
 	/** Number of bytes included in the output text */
 	outputBytes: number;
-	/** Artifact ID if full output was saved to artifact storage */
+	/** Artifact ID if output was saved to artifact storage. */
 	artifactId?: string;
+	/** Bytes omitted from artifact storage after its hard cap was reached. */
+	artifactTruncatedBytes?: number;
+	/** Bounded diagnostic when artifact storage failed. */
+	artifactFailureDiagnostic?: string;
 }
 
 function quoteForCompatShell(command: string): string {
@@ -92,6 +98,7 @@ export async function executeSSH(
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
+		artifactPublisher: options?.artifactPublisher,
 		headBytes: resolveOutputSinkHeadBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 	});

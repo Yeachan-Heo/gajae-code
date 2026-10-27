@@ -1,7 +1,12 @@
 /**
  * Tool wrappers for extensions.
  */
-import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import {
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolUpdateCallback,
+	ToolCallBlockedError,
+} from "@gajae-code/agent-core";
 import {
 	type ImageContent,
 	type Static,
@@ -10,10 +15,11 @@ import {
 	type TSchema,
 	validateToolArguments,
 } from "@gajae-code/ai/core";
+import { isDesignedError, markDesignedError } from "@gajae-code/utils/error-classification";
 import type { Theme } from "../../modes/theme/theme";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { applyToolProxy } from "../tool-proxy";
-import type { ExtensionRunner } from "./runner";
+import { type ExtensionRunner, isFailedToolResultMediation } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
 
 function toolAbortReason(signal: AbortSignal | undefined, fallback: string): Error {
@@ -142,8 +148,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 				if (signal?.aborted) throw toolAbortReason(signal, "Tool call aborted during Function Hook mediation");
 				if (callResult?.block) {
-					const reason = callResult.reason || "Tool execution was blocked by an extension";
-					throw new Error(reason);
+					throw new ToolCallBlockedError(callResult.reason || "Tool execution was blocked by an extension");
 				}
 			} catch (err) {
 				if (err instanceof Error) {
@@ -152,13 +157,21 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
-		if (toolCallEvent.input !== params || !this.tool.lenientArgValidation) {
-			params = validateToolArguments(this.tool, {
-				type: "toolCall",
-				id: toolCallId,
-				name: this.tool.name,
-				arguments: toolCallEvent.input,
-			} satisfies ToolCall) as Static<TParameters>;
+		const extensionRewroteInput = toolCallEvent.input !== params;
+		if (extensionRewroteInput || !this.tool.lenientArgValidation) {
+			try {
+				params = validateToolArguments(this.tool, {
+					type: "toolCall",
+					id: toolCallId,
+					name: this.tool.name,
+					arguments: toolCallEvent.input,
+				} satisfies ToolCall) as Static<TParameters>;
+			} catch (err) {
+				// Invalid model arguments are designed; arguments an extension rewrote into an
+				// invalid shape are an extension defect and must stay visible as a fault.
+				if (!extensionRewroteInput || !(err instanceof Error)) throw err;
+				throw new Error(`Extension rewrote tool input into invalid arguments: ${err.message}`, { cause: err });
+			}
 		}
 
 		// Execute the actual tool
@@ -212,7 +225,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					// Extension marks a successful result as error
 					const textBlocks = (modifiedContent ?? []).filter((c): c is TextContent => c.type === "text");
 					const errorText = textBlocks.map(t => t.text).join("\n") || "Tool result marked as error by extension";
-					throw new Error(errorText);
+					const verdictError = new Error(errorText);
+					// A deliberate extension verdict on a successful result, like a block, is not a fault;
+					// a verdict the runner synthesized from a failing or malformed hook is.
+					throw isFailedToolResultMediation(resultResult) ? verdictError : markDesignedError(verdictError);
 				}
 				if (resultResult.isError === false && executionError) {
 					// Extension clears the error - return success
@@ -222,7 +238,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				// Error status unchanged, but content/details may be modified
 				if (executionError) {
 					const textBlocks = modifiedContent.filter((content): content is TextContent => content.type === "text");
-					throw new Error(textBlocks.map(content => content.text).join("\n") || "Tool execution failed");
+					const mediatedError = new Error(
+						textBlocks.map(content => content.text).join("\n") || "Tool execution failed",
+					);
+					// Rewording the text does not change what failed: keep the original classification,
+					// unless the mediation itself failed, which is an extension fault.
+					throw isDesignedError(executionError) && !isFailedToolResultMediation(resultResult)
+						? markDesignedError(mediatedError)
+						: mediatedError;
 				}
 				return { content: modifiedContent, details: modifiedDetails };
 			}

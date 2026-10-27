@@ -5,19 +5,41 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { LoadedSubskillActivation } from "@gajae-code/coding-agent/extensibility/gjc-plugins/types";
+import { createDeepInterviewIntentManifest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import * as skillState from "@gajae-code/coding-agent/hooks/skill-state";
 import { ensureWorkflowSkillActivationState } from "@gajae-code/coding-agent/hooks/skill-state";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
+import { readVisibleSkillActiveState, syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { logger, TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 const REMINDER_MARKER = "deep-interview workflow is still active";
+
+function helperSubskillActivation(parent: string, phase: string): LoadedSubskillActivation {
+	return {
+		activationArg: "assistant-helpers",
+		plugin: "test-plugin",
+		subskillName: "workflow-helper",
+		parent,
+		bindsTo: parent,
+		phase,
+		scope: "project",
+		extensionId: "test-extension",
+		expectedDigest: "a".repeat(64),
+		filePath: "/test/workflow-helper.md",
+		toolPaths: [],
+	};
+}
 
 beforeAll(async () => {
 	await initTheme(false);
@@ -61,6 +83,27 @@ describe("AgentSession deep-interview continuation", () => {
 			skill,
 			sessionId: sessionManager.getSessionId(),
 		});
+	}
+
+	function startSkillPrompt(skill: string, subskillActivation?: LoadedSubskillActivation): void {
+		session.agent.emitExternalEvent({
+			type: "message_start",
+			message: {
+				role: "custom",
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: `Run the ${skill} workflow.`,
+				display: false,
+				timestamp: Date.now(),
+				details: { name: skill, ...(subskillActivation ? { subskillActivation } : {}) },
+				attribution: "agent",
+			},
+		});
+	}
+
+	async function emitSkillPromptStart(skill: string, subskillActivation?: LoadedSubskillActivation): Promise<void> {
+		startSkillPrompt(skill, subskillActivation);
+		await Bun.sleep(50);
+		await session.waitForIdle();
 	}
 
 	async function emitAssistantStop(timestamp: number, assistantMessage?: AssistantMessage): Promise<void> {
@@ -214,6 +257,271 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(reminder).toContain("score and persist the answered round");
 		expect(reminder).toContain("use the ask tool for the next question");
 	});
+	it("preserves effective interview identity after the skill prompt ends", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		await emitSkillPromptStart("deep-interview");
+
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getActiveSkillState()?.skill).toBe("deep-interview");
+
+		await emitAssistantStop(100);
+
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		const statePath = modeStatePath(tempDir.path(), sessionManager.getSessionId(), "deep-interview");
+		const modeState = JSON.parse(await Bun.file(statePath).text());
+		modeState.state = {
+			...modeState.state,
+			intent_contract: createDeepInterviewIntentManifest(
+				[{ id: "artifact:report", category: "artifact", statement: "Produce a report" }],
+				{ round: 0, answer_hash: "a".repeat(64) },
+			),
+		};
+		await Bun.write(statePath, JSON.stringify(modeState));
+		expect(session.getDeepInterviewAskStage()).toBe("post-topology");
+
+		await emitAssistantStop(200);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("post-topology");
+		expect(continueSpy).toHaveBeenCalledTimes(2);
+
+		await emitSkillPromptStart("deep-interview");
+		await emitAssistantStop(300);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+
+		await syncSkillActiveState({
+			cwd: tempDir.path(),
+			skill: "deep-interview",
+			active: false,
+			sessionId: sessionManager.getSessionId(),
+		});
+		// This cache is intentionally still stale until the next terminal refresh.
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		await emitAssistantStop(400);
+		expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+		expect(session.getDeepInterviewAskStage()).toBeUndefined();
+	});
+	it("does not expose Deep Interview ask metadata after durable deactivation", async () => {
+		await emitSkillPromptStart("deep-interview");
+		await emitAssistantStop(100);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		const result = await runNativeStateCommand(
+			[
+				"write",
+				"--mode",
+				"deep-interview",
+				"--session-id",
+				sessionManager.getSessionId(),
+				"--input",
+				JSON.stringify({ active: false }),
+			],
+			tempDir.path(),
+		);
+		expect(result.status).toBe(0);
+
+		const persisted = JSON.parse(
+			await Bun.file(modeStatePath(tempDir.path(), sessionManager.getSessionId(), "deep-interview")).text(),
+		) as { active?: unknown; current_phase?: unknown };
+		expect(persisted).toMatchObject({ active: false, current_phase: "interviewing" });
+		// The session cache is stale until its next refresh, but inactive persisted state
+		// must not continue selecting stage-specific Ask metadata.
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBeUndefined();
+	});
+	it("does not force Deep Interview metadata for another active workflow", async () => {
+		await emitSkillPromptStart("ralplan");
+
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("ralplan");
+		expect(session.getDeepInterviewAskStage()).toBeUndefined();
+
+		await emitAssistantStop(100);
+
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("ralplan");
+		expect(session.getDeepInterviewAskStage()).toBeUndefined();
+	});
+	it(
+		"restores the current workflow when direct skill prompts overlap",
+		async () => {
+			await emitSkillPromptStart("deep-interview");
+			await emitAssistantStop(50);
+			await Bun.sleep(5);
+			await emitSkillPromptStart("autoresearch");
+
+			const activeState = await readVisibleSkillActiveState(tempDir.path(), sessionManager.getSessionId(), {
+				bypassCache: true,
+			});
+			const activeSkills = activeState?.active_skills ?? [];
+			expect(activeSkills.map(entry => entry.skill)).toEqual(["deep-interview", "autoresearch"]);
+			const deepInterview = activeSkills.find(entry => entry.skill === "deep-interview");
+			const autoresearch = activeSkills.find(entry => entry.skill === "autoresearch");
+			expect(Date.parse(autoresearch?.updated_at ?? "")).toBeGreaterThan(
+				Date.parse(deepInterview?.updated_at ?? ""),
+			);
+
+			await emitAssistantStop(100);
+
+			expect(session.getActiveSkillState()).toBeUndefined();
+			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+		},
+		{ timeout: 15_000 },
+	);
+	it("preserves durable interview identity during a helper skill prompt", async () => {
+		await emitSkillPromptStart("deep-interview");
+		await emitAssistantStop(50);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+
+		await emitSkillPromptStart("assistant-helpers");
+		expect(session.getActiveSkillState()?.skill).toBe("assistant-helpers");
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		await session.refreshEffectiveActiveWorkflowSkillState();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		await emitAssistantStop(100);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+	});
+	it("skips a more-recent helper subskill row when restoring autoresearch identity", async () => {
+		await emitSkillPromptStart("autoresearch");
+		await emitAssistantStop(50);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+
+		await Bun.sleep(5);
+		await emitSkillPromptStart("assistant-helpers", helperSubskillActivation("autoresearch", "research"));
+		const activeState = await readVisibleSkillActiveState(tempDir.path(), sessionManager.getSessionId(), {
+			bypassCache: true,
+		});
+		expect(activeState?.active_skills?.map(entry => entry.skill)).toEqual(["assistant-helpers", "autoresearch"]);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+
+		await emitAssistantStop(100);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+	});
+	it(
+		"does not restore a workflow from a helper read that finishes after durable clear",
+		async () => {
+			await emitSkillPromptStart("deep-interview");
+			await emitAssistantStop(50);
+			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+
+			const releaseStateRead = Promise.withResolvers<void>();
+			const originalRead = activeStateModule.readVisibleSkillActiveStateWithStatus;
+			let staleStateReadPending = false;
+			vi.spyOn(activeStateModule, "readVisibleSkillActiveStateWithStatus").mockImplementation(async (...args) => {
+				const result = await originalRead(...args);
+				const activeState = result.state;
+				if (
+					activeState?.active_skills?.some(entry => entry.skill === "assistant-helpers") &&
+					activeState.active_skills.some(entry => entry.skill === "deep-interview")
+				) {
+					staleStateReadPending = true;
+					await releaseStateRead.promise;
+				}
+				return result;
+			});
+
+			try {
+				startSkillPrompt("assistant-helpers", helperSubskillActivation("deep-interview", "interview"));
+				for (let attempt = 0; attempt < 200 && !staleStateReadPending; attempt++) await Bun.sleep(10);
+				expect(staleStateReadPending).toBe(true);
+				await syncSkillActiveState({
+					cwd: tempDir.path(),
+					skill: "deep-interview",
+					active: false,
+					sessionId: sessionManager.getSessionId(),
+				});
+
+				const assistant = { ...createAssistantMessage("Round recorded."), timestamp: 100 };
+				session.agent.emitExternalEvent({ type: "turn_start" });
+				session.agent.emitExternalEvent({ type: "message_end", message: assistant });
+				session.agent.emitExternalEvent({ type: "agent_end", messages: [assistant] });
+				let terminalClearedIdentity = false;
+				for (let attempt = 0; attempt < 200 && !terminalClearedIdentity; attempt++) {
+					terminalClearedIdentity = session.getEffectiveActiveWorkflowSkillState() === undefined;
+					if (!terminalClearedIdentity) await Bun.sleep(10);
+				}
+				expect(terminalClearedIdentity).toBe(true);
+				expect(session.getActiveSkillState()).toBeUndefined();
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				expect(session.getDeepInterviewAskStage()).toBeUndefined();
+
+				releaseStateRead.resolve();
+				await session.waitForIdle();
+				await Bun.sleep(50);
+				await session.waitForIdle();
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			} finally {
+				releaseStateRead.resolve();
+			}
+		},
+		{ timeout: 15_000 },
+	);
+	it(
+		"restores the same active interview identity after an actual session reopen",
+		async () => {
+			await session.dispose();
+			sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+			sessionManager.appendMessage({
+				role: "user",
+				content: "Persist this fixture session.",
+				timestamp: Date.now(),
+			});
+			await sessionManager.flush();
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model");
+			const createSession = (manager: SessionManager) =>
+				new AgentSession({
+					agent: new Agent({
+						getApiKey: provider => `${provider}-test-key`,
+						initialState: {
+							model,
+							systemPrompt: ["Test"],
+							tools: [],
+							messages: [],
+						},
+					}),
+					sessionManager: manager,
+					settings: Settings.isolated(),
+					modelRegistry: new ModelRegistry(authStorage),
+				});
+
+			session = createSession(sessionManager);
+			await session.workflowGateToolRestoration;
+			await emitSkillPromptStart("deep-interview");
+			await emitAssistantStop(100);
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
+			expect(session.getActiveSkillState()).toBeUndefined();
+
+			const originalSessionId = sessionManager.getSessionId();
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			await session.dispose();
+
+			sessionManager = await SessionManager.open(sessionFile, tempDir.path());
+			expect(sessionManager.getSessionId()).toBe(originalSessionId);
+			session = createSession(sessionManager);
+			await session.workflowGateToolRestoration;
+			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+			await emitAssistantStop(200);
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
+		},
+		{ timeout: 15_000 },
+	);
 	it("contains a scheduled continuation persistence failure and allows the next continuation", async () => {
 		await activateWorkflow("deep-interview");
 		const persistenceFailure = new Error("managed_replace_exact_unavailable");

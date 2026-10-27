@@ -1,5 +1,6 @@
 import { getIndentation, sanitizeText } from "@gajae-code/utils";
-import * as Diff from "diff";
+import { getNativeDiffBindings } from "../../internal/native-diff";
+
 import { getLanguageFromPath, highlightCode, theme } from "../../modes/theme/theme";
 import { type CodeFrameMarker, formatCodeFrameLine, replaceTabs } from "../../tools/render-utils";
 
@@ -65,7 +66,7 @@ function renderIntraLineDiffWithDiffWords(
 	oldContent: string,
 	newContent: string,
 ): { removedLine: string; addedLine: string } {
-	const wordDiff = Diff.diffWords(oldContent, newContent);
+	const wordDiff = getNativeDiffBindings().diffWords(oldContent, newContent);
 
 	let removedLine = "";
 	let addedLine = "";

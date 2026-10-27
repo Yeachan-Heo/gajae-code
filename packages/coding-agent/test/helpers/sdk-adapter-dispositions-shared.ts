@@ -9,9 +9,11 @@
  */
 import { expect } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
+import { PublicCommandFailure, renderPublicCommandFailure } from "../../src/cli/public-command-errors";
 import { AcpSdkAdapter } from "../../src/sdk/acp";
 import { Broker } from "../../src/sdk/broker";
 import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
@@ -106,6 +108,12 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	// The generic disposition probe intentionally supplies no upload payload.
+	// Machine routing reaches the real store, which rejects that invalid input.
+	"turn.image.begin": "invalid_input",
+	"turn.image.append": "invalid_input",
+	"turn.image.finish": "invalid_input",
+	"turn.image.discard": "invalid_input",
 	"ask.answer": "resource_gone",
 	"workflow.gate_answer": "resource_gone",
 	"workflow.plan_approve": "resource_gone",
@@ -119,7 +127,9 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	// goal.list/get is intentionally absent: on a goal-less session it now
 	// succeeds with an explicit no_active_goal diagnostic payload instead of
 	// resource_gone (#4668), so adapters must observe ok: true.
-	"session.last_assistant": "resource_gone",
+	// session.last_assistant is intentionally absent: when there is no readable
+	// assistant text, it now returns an empty observation (ok: true with page.items: [null])
+	// instead of resource_gone (#5821), so adapters must observe ok: true.
 	"resource.body": "resource_gone",
 	"artifact.read": "resource_gone",
 	"retry.last": "nothing_to_retry",
@@ -167,6 +177,22 @@ export function expectSemanticResult(operation: Operation, result: unknown): voi
 		expect(
 			typeof msg === "string" && (msg as string).length > 0,
 			"goal.list/get diagnostic message must be non-empty",
+		).toBe(true);
+	} else if (operation.sdkId === "session.last_assistant") {
+		// Q17 returns an empty observation (ok: true with page.items: [null])
+		// when there is no readable assistant text (#5821).
+		const envelope = result as { ok?: unknown } | null;
+		if (envelope !== null && typeof envelope === "object" && "ok" in envelope)
+			expect(result).toMatchObject({ ok: true });
+		const page =
+			(result as { page?: { items?: unknown[] } } | null)?.page ??
+			(result as { result?: { page?: { items?: unknown[] } } } | null)?.result?.page ??
+			(result as { data?: { page?: { items?: unknown[] } } } | null)?.data?.page;
+		// Empty observation must have page with items:[null]
+		if (page == null) throw new Error("session.last_assistant empty observation page must be present");
+		expect(
+			Array.isArray(page.items) && page.items.length === 1 && page.items[0] === null,
+			"session.last_assistant empty observation must have page.items: [null]",
 		).toBe(true);
 	} else expect(result).toMatchObject({ ok: true });
 }
@@ -336,11 +362,12 @@ export async function fixture(): Promise<AdapterFixture> {
 	};
 	const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${sessionId}.json`)).mtimeMs;
 	const hostIncarnation = currentHostIncarnation();
+	const endpointGeneration = await productionHost.readGeneration();
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
 		locator: { cwd: repo, worktreeRoot: null, stateRoot },
-		endpointGeneration: 1,
+		endpointGeneration,
 		pid: process.pid,
 		processIncarnation: hostIncarnation,
 		hostIncarnation,
@@ -349,7 +376,7 @@ export async function fixture(): Promise<AdapterFixture> {
 	await broker.heartbeatSessions();
 	const acpAttachment: SessionAttachment = {
 		sessionId,
-		generation: 1,
+		generation: endpointGeneration,
 		isCurrent: () => true,
 		send: async () => undefined,
 		sendMaintenance: () => {},
@@ -394,6 +421,19 @@ export async function fixture(): Promise<AdapterFixture> {
 										"No goal is active in this session: goal mode has not created or resumed a goal, so no goal snapshot exists yet.",
 								},
 							],
+							complete: true,
+						},
+					},
+				};
+			// ACP translated contract for session.last_assistant (#5821): when there is
+			// no readable assistant text, it returns an empty observation with
+			// page.items: [null].
+			if (operation === "session.last_assistant")
+				return {
+					ok: true,
+					result: {
+						page: {
+							items: [null],
 							complete: true,
 						},
 					},
@@ -499,6 +539,11 @@ export async function assertMcpRow(operation: Operation, secret: boolean): Promi
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;
 		const input = inputFor(operation, secret);
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			await fsPromises.mkdir(target);
+			input.path = target;
+		}
 		mcp = createSdkMcpServer({ agentDir: host.agentDir });
 		const tool =
 			operation.kind === "global"
@@ -529,15 +574,28 @@ export async function runDaemonCli(
 ): Promise<{ output: unknown; exitCode: number | undefined }> {
 	let output: unknown;
 	let exitCode: number | undefined;
-	await runSdkSessionCli(
-		args,
-		value => {
-			output = value;
-		},
-		code => {
-			exitCode = code;
-		},
-	);
+	try {
+		await runSdkSessionCli(
+			args,
+			value => {
+				output = value;
+			},
+			code => {
+				exitCode = code;
+			},
+		);
+	} catch (error) {
+		expect(error).toBeInstanceOf(PublicCommandFailure);
+		if (!(error instanceof PublicCommandFailure)) throw error;
+		expect(output).toBeUndefined();
+		const rendered = await renderPublicCommandFailure(error, {
+			command: ["sdk", "session", "raw"],
+			json: true,
+			agentDir: args.agentDir,
+		});
+		output = JSON.parse(rendered.stdout);
+		exitCode = rendered.exitCode;
+	}
 	return { output, exitCode };
 }
 
@@ -550,6 +608,11 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		const input =
 			lifecycleInput ??
 			(operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret));
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			await fsPromises.mkdir(target);
+			input.path = target;
+		}
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,
@@ -563,13 +626,56 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		};
 		const result = await runDaemonCli(args);
 		if (expected === "forwarded") {
-			if (action === "global") {
-				if (operation.sdkId === "session.close")
-					expect(result.output).toMatchObject({ ok: false, error: { code: "not_found" } });
-				else expectGlobalSemanticResult(operation, result.output);
-			} else expectSemanticResult(operation, result.output);
+			const domainCode =
+				action === "global"
+					? operation.sdkId === "session.close"
+						? "not_found"
+						: expectedGlobalErrors[operation.sdkId]
+					: expectedDomainErrors[operation.sdkId];
+			if (domainCode) {
+				// The public boundary deliberately replaces private domain codes with safe categories.
+				const publicCode =
+					domainCode === "invalid_input" && action !== "global"
+						? "usage"
+						: domainCode === "unavailable"
+							? "unavailable"
+							: "operation_failed";
+				expect(result.output).toMatchObject({
+					schema: "gjc.command-error",
+					ok: false,
+					error: { code: publicCode },
+				});
+				expect(result.exitCode).toBe(publicCode === "usage" ? 2 : 1);
+				if (action === "global") {
+					const error = (
+						result.output as {
+							error: { outcomeCertainty: string; references: { kind: string; value: string }[] };
+						}
+					).error;
+					expect(error.outcomeCertainty).toBe("unknown");
+					expect(Array.isArray(error.references)).toBe(true);
+					expect(
+						error.references.some(
+							reference => reference.kind === "idempotencyKey" && reference.value === `parity-${operation.id}`,
+						),
+					).toBe(true);
+					if (typeof input.sessionId === "string")
+						expect(
+							error.references.some(
+								reference => reference.kind === "sessionId" && reference.value === input.sessionId,
+							),
+						).toBe(true);
+				}
+			} else {
+				if (action === "global") expectGlobalSemanticResult(operation, result.output);
+				else expectSemanticResult(operation, result.output);
+				if (action === "global" && operation.sdkId === "session.lookup") expect(result.exitCode).toBe(1);
+				else expect(result.exitCode).toBeUndefined();
+			}
 		} else expect(result.output).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
+		expect(JSON.stringify(result.output)).not.toContain("capability-shaped-probe");
+		expect(JSON.stringify(result.output)).not.toContain(host.endpoint.token);
 	} finally {
 		await stopFixture(host, operation);
 	}

@@ -151,6 +151,7 @@ describe("model cache migrations", () => {
 			["dynamic-a"],
 			"provenance-a",
 			[createModel("dynamic-a", "Dynamic A")],
+			undefined,
 			observedAt + 2,
 			[createModel("fallback-a", "Fallback A")],
 			false,
@@ -198,6 +199,7 @@ describe("model cache migrations", () => {
 			ids,
 			"provenance-a",
 			observed?.models ?? [],
+			undefined,
 			observedAt + 1,
 			[createModel("dynamic-a", "Failed Fetch")],
 			false,
@@ -209,6 +211,56 @@ describe("model cache migrations", () => {
 		expect(
 			readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => observedAt, dbPath)?.models[0]?.name,
 		).toBe("Concurrent B");
+	});
+
+	it("does not conditionally replace a row whose discovery User-Agent changed after observation", () => {
+		const observedAt = 1_700_000_000_000;
+		const observedModels = [createModel("dynamic-a", "Dynamic A")];
+		writeModelCache(
+			"ollama-cloud",
+			observedAt,
+			observedModels,
+			true,
+			"static",
+			dbPath,
+			["dynamic-a"],
+			"provenance-a",
+			"antigravity-ide",
+		);
+		const observed = readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => observedAt, dbPath);
+		writeModelCache(
+			"ollama-cloud",
+			observedAt,
+			observedModels,
+			true,
+			"static",
+			dbPath,
+			["dynamic-a"],
+			"provenance-a",
+			"antigravity/cli/1.3.4",
+		);
+
+		const updated = updateModelCacheIfUnchanged(
+			"ollama-cloud",
+			observedAt,
+			["dynamic-a"],
+			"provenance-a",
+			observed?.models ?? [],
+			observed?.discoveryUserAgent,
+			observedAt + 1,
+			[createModel("fallback-a", "Fallback A")],
+			false,
+			"static",
+			dbPath,
+			[],
+			"provenance-a",
+			"antigravity/cli/1.3.4",
+		);
+
+		expect(updated).toBe(false);
+		expect(readModelCache("ollama-cloud", TTL_MS, () => observedAt, dbPath)?.discoveryUserAgent).toBe(
+			"antigravity/cli/1.3.4",
+		);
 	});
 
 	it("inserts a cache row only when the provider is absent", () => {
@@ -257,5 +309,60 @@ describe("model cache migrations", () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
 		tempDir = "";
 		dbPath = "";
+	});
+
+	it("finalizes cached read statements before releasing the database file", async () => {
+		writeModelCache("ollama-cloud", Date.now(), [createModel("cached", "Cached")], true, "static", dbPath);
+		expect(readModelCache("ollama-cloud", TTL_MS, Date.now, dbPath)).not.toBeNull();
+		expect(closeModelCache(dbPath)).toBe(true);
+		await fs.rm(tempDir, { recursive: true, force: true });
+		tempDir = "";
+		dbPath = "";
+	});
+
+	it("removes the owned directory immediately after migrating and reading through the public API", async () => {
+		const legacyModel = createModel("legacy", "Legacy");
+		const legacyDb = new Database(dbPath, { create: true });
+		legacyDb.run(`
+			CREATE TABLE model_cache (
+				provider_id TEXT PRIMARY KEY,
+				version INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				authoritative INTEGER NOT NULL DEFAULT 0,
+				models TEXT NOT NULL
+			)
+		`);
+		legacyDb.run(
+			"INSERT INTO model_cache (provider_id, version, updated_at, authoritative, models) VALUES (?, ?, ?, ?, ?)",
+			["ollama-cloud", 2, Date.now(), 1, JSON.stringify([legacyModel])],
+		);
+		legacyDb.close();
+
+		expect(readModelCache("ollama-cloud", TTL_MS, Date.now, dbPath)?.models.map(model => model.id)).toEqual([
+			"legacy",
+		]);
+		expect(closeModelCache(dbPath)).toBe(true);
+		expect(closeModelCache(dbPath)).toBe(false);
+		await fs.rm(tempDir, { recursive: true });
+		tempDir = "";
+		dbPath = "";
+	});
+
+	it("fully releases a database it switches away from", async () => {
+		const otherPath = path.join(tempDir, "other-models.db");
+		readModelCache("ollama-cloud", TTL_MS, Date.now, dbPath);
+		readModelCache("ollama-cloud", TTL_MS, Date.now, otherPath);
+		try {
+			// Leaving WAL mode needs exclusive access; a zombie connection to dbPath keeps it locked
+			// (and keeps the files open, which blocks temp-dir removal on Windows).
+			const probe = new Database(dbPath);
+			try {
+				expect(probe.query("PRAGMA journal_mode=DELETE").get()).toEqual({ journal_mode: "delete" });
+			} finally {
+				probe.close();
+			}
+		} finally {
+			closeModelCache(otherPath);
+		}
 	});
 });

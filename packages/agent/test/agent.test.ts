@@ -1,11 +1,134 @@
-import { describe, expect, it } from "bun:test";
-import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
+import { describe, expect, it, spyOn } from "bun:test";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentQueuedRunStartDecision,
+	type AgentTool,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { ImageContent, SimpleStreamOptions } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { logger } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("preserves a real missing-model refusal when the start-decision observer throws", async () => {
+		const observerError = new Error("start observer failed");
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		let providerCalls = 0;
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const agent = new Agent({
+				initialState: { model: undefined, messages: [createAssistantMessage([])] },
+				streamFn: () => {
+					providerCalls += 1;
+					throw new Error("unexpected provider call");
+				},
+				onQueuedRunStartDecision: decision => {
+					decisions.push(decision);
+					throw observerError;
+				},
+			});
+			agent.followUp({ role: "user", content: "queued", timestamp: 1 });
+			let refusal: unknown;
+			try {
+				await agent.continue();
+			} catch (error) {
+				refusal = error;
+			}
+			expect(refusal).toBeInstanceOf(Error);
+			expect(refusal).toMatchObject({ message: "No model configured" });
+			expect(decisions).toEqual([expect.objectContaining({ disposition: "not-started", error: refusal })]);
+			expect(refusal).not.toBe(observerError);
+			expect(providerCalls).toBe(0);
+			expect(warn).toHaveBeenCalledWith("Queued run start decision callback failed", { error: observerError });
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("reports the exact consumed batch and original missing-model refusal after asynchronous promotion", async () => {
+		const promoted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage([])] },
+			followUpMode: "all",
+			streamFn: () => {
+				providerCalls += 1;
+				throw new Error("unexpected provider call");
+			},
+			onFollowUpConsumed: async () => {
+				promoted.resolve();
+				await release.promise;
+			},
+			onQueuedRunStartDecision: decision => decisions.push(decision),
+		});
+		const first: AgentMessage = { role: "user", content: "same text", timestamp: 1 };
+		const second: AgentMessage = { role: "user", content: "same text", timestamp: 2 };
+		agent.followUp(first);
+		agent.followUp(second);
+		const continuing = agent.continue();
+		await promoted.promise;
+		expect(decisions).toEqual([]);
+		agent.setModel(undefined);
+		release.resolve();
+		let refusal: unknown;
+		try {
+			await continuing;
+		} catch (error) {
+			refusal = error;
+		}
+		if (!(refusal instanceof Error)) throw new Error("Expected queued model-guard refusal", { cause: refusal });
+		expect(decisions).toEqual([
+			{ disposition: "not-started", consumedQueuedMessages: [first, second], error: refusal },
+		]);
+		expect(decisions[0]?.consumedQueuedMessages[0]).toBe(first);
+		expect(decisions[0]?.consumedQueuedMessages[1]).toBe(second);
+		expect(providerCalls).toBe(0);
+	});
+
+	it("acceptance closes the queued failure channel even for identical post-start error text", async () => {
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage([])] },
+			onQueuedRunStartDecision: decision => decisions.push(decision),
+			streamFn: () => {
+				providerCalls += 1;
+				throw new Error("No model configured");
+			},
+		});
+		const queued: AgentMessage = { role: "user", content: "queued", timestamp: 1 };
+		agent.followUp(queued);
+		await agent.continue({ fallbackManaged: true });
+		expect(providerCalls).toBe(1);
+		expect(decisions).toEqual([{ disposition: "accepted", consumedQueuedMessages: [queued] }]);
+		await agent.prompt("unrelated", { fallbackManaged: true });
+		expect(decisions).toHaveLength(1);
+	});
+
+	it("reports positive resource-domain refusal without accepting the queued batch", async () => {
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage([])] },
+			onQueuedRunStartDecision: decision => decisions.push(decision),
+		});
+		const queued: AgentMessage = { role: "user", content: "queued", timestamp: 1 };
+		agent.followUp(queued);
+		const open = spyOn(agent.resourceLedger, "open").mockReturnValue(undefined);
+		try {
+			await expect(agent.continue()).rejects.toThrow("Prompt resource cancellation domain is unavailable");
+			expect(decisions).toHaveLength(1);
+			expect(decisions[0]?.disposition).toBe("not-started");
+			expect(decisions[0]?.consumedQueuedMessages).toEqual([queued]);
+		} finally {
+			open.mockRestore();
+		}
+	});
+
 	it("sanitizes provider details before publishing agent_failed", async () => {
 		const secret = "provider-token=super-secret request-body-password=hunter2";
 		const agent = new Agent({
@@ -97,6 +220,31 @@ describe("Agent", () => {
 		// The run still terminalized on error despite the throwing subscriber.
 		const last = agent.state.messages.at(-1) as { stopReason?: string } | undefined;
 		expect(last?.stopReason).toBe("error");
+	});
+
+	it("logs the redacted underlying cause of a generic run failure", async () => {
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const agent = new Agent({
+				streamFn: () => {
+					throw new Error("OAuth token refresh ownership remained ambiguous", {
+						cause: new Error("refresh_token=rt-live-secret-value-123 rejected"),
+					});
+				},
+			});
+			await agent.prompt("trigger logged failure", { fallbackManaged: true });
+			const call = warnSpy.mock.calls.find(([message]) => message === "Agent run failed");
+			expect(call).toBeDefined();
+			const context = call?.[1] as { cause?: string; code?: string };
+			expect(context.code).toBe("agent_failed");
+			expect(context.cause).toContain("OAuth token refresh ownership remained ambiguous");
+			expect(context.cause).toContain("caused by Error: refresh_token=");
+			expect(JSON.stringify(call)).not.toContain("rt-live-secret-value-123");
+			// The transcript still carries only the generic message.
+			expect(JSON.stringify(agent.state.messages)).not.toContain("ambiguous");
+		} finally {
+			warnSpy.mockRestore();
+		}
 	});
 
 	it("terminal state and history never contain raw provider error text", async () => {
@@ -340,7 +488,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				systemPrompt: ["prompt-one"],
 				tools: [alphaTool],
 				messages: [],
@@ -400,7 +548,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				tools: [alphaTool],
 				messages: [],
 			},
@@ -448,7 +596,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				thinkingLevel: ThinkingLevel.Low,
 				tools: [alphaTool],
 				messages: [],
@@ -535,7 +683,7 @@ describe("Agent", () => {
 			const streamFn = async () => {
 				throw Object.assign(new Error("transport failed"), { [property]: status });
 			};
-			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+			const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 			await agent.prompt("hello");
 
@@ -551,7 +699,7 @@ describe("Agent", () => {
 		const streamFn = async () => {
 			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
 		};
-		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+		const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 		await agent.prompt("hello");
 

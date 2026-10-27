@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Stats } from "node:fs";
+import type * as nodeFs from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
@@ -88,6 +90,7 @@ export interface WorkflowTransactionJournal {
 	callee?: CanonicalGjcWorkflowSkill;
 	paths: string[];
 	steps: string[];
+	approval_audit_offset?: number;
 }
 
 export type StateWritePolicy = "source" | "cache";
@@ -114,6 +117,12 @@ export function guardedStateWriteReceipt(result: GuardedWriteResult): GuardedSta
 
 export interface StateWriterOptions {
 	cwd?: string;
+	/**
+	 * Linux-only private durable source publication. The supplied directory is
+	 * the exact private subtree containing the target; existing paths are never
+	 * chmodded or repaired.
+	 */
+	privateDurable?: { directory: string };
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
@@ -147,6 +156,16 @@ export class StateWriteConflictError extends Error {
 
 export interface DeleteIfOwnedOptions extends StateWriterOptions {
 	predicate?: (current: unknown) => boolean | Promise<boolean>;
+}
+
+export class StatePublicationUncertainError extends Error {
+	constructor(
+		public readonly path: string,
+		public readonly cause: unknown,
+	) {
+		super(`state publication requires authoritative reload: ${path}`);
+		this.name = "StatePublicationUncertainError";
+	}
 }
 
 export interface DeleteResult {
@@ -291,19 +310,33 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 	return envelope as T;
 }
 
-export async function detectWorkflowEnvelopeIntegrityMismatch(
-	filePath: string,
-): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
-	const current = await readJsonIfPresent(filePath);
-	if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
-	const receipt = (current as Record<string, unknown>).receipt;
+export type WorkflowEnvelopeChecksumStatus = "absent" | "match" | "mismatch";
+
+/** Compare a parsed envelope to its writer-stamped `content_sha256`, when one is present. */
+export function workflowEnvelopeChecksumStatus(value: unknown): WorkflowEnvelopeChecksumStatus {
+	const checksum = workflowEnvelopeChecksumPair(value);
+	if (!checksum) return "absent";
+	return checksum.actual === checksum.expected ? "match" : "mismatch";
+}
+
+function workflowEnvelopeChecksumPair(value: unknown): { expected: string; actual: string } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const receipt = (value as Record<string, unknown>).receipt;
 	if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return undefined;
 	const checksum = (receipt as Record<string, unknown>).content_sha256;
 	if (!checksum || typeof checksum !== "object" || Array.isArray(checksum)) return undefined;
 	const expected = (checksum as Record<string, unknown>).value;
 	if (typeof expected !== "string" || !expected) return undefined;
-	const actual = workflowEnvelopeContentSha256(current);
-	return actual === expected ? undefined : { path: filePath, expected, actual };
+	return { expected, actual: workflowEnvelopeContentSha256(value) };
+}
+
+export async function detectWorkflowEnvelopeIntegrityMismatch(
+	filePath: string,
+): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
+	const current = await readJsonIfPresent(filePath);
+	const checksum = workflowEnvelopeChecksumPair(current);
+	if (!checksum || checksum.actual === checksum.expected) return undefined;
+	return { path: filePath, expected: checksum.expected, actual: checksum.actual };
 }
 
 function safeString(value: unknown): string {
@@ -528,13 +561,293 @@ async function atomicWrite(filePath: string, content: string): Promise<string> {
 	return filePath;
 }
 
+function currentUid(): number {
+	const uid = process.getuid?.();
+	if (uid === undefined) throw new Error("private durable publication requires a POSIX uid");
+	return uid;
+}
+
+interface PrivatePublicationDirectory {
+	handle: FileHandle;
+	parent?: PrivatePublicationDirectory;
+	name?: string;
+	dev: number;
+	ino: number;
+	privateSubtree: boolean;
+}
+
+interface PrivatePublicationContext {
+	root: string;
+	directories: PrivatePublicationDirectory[];
+	targetParent: PrivatePublicationDirectory;
+	anchoredTarget: string;
+}
+
+function assertSafePublicationDirectory(stat: Stats, directory: string, privateSubtree: boolean): void {
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe publication directory");
+	if ((stat.mode & 0o022) !== 0 || stat.uid !== currentUid()) {
+		const mode = (stat.mode & 0o777).toString(8);
+		throw new Error(
+			`publication parent is not exclusively owned (uid=${stat.uid}, mode=${mode}, directory=${path.basename(directory)})`,
+		);
+	}
+	if (privateSubtree && (stat.mode & 0o777) !== 0o700)
+		throw new Error("private publication directory is not owned mode 0700");
+}
+
+function procPath(handle: FileHandle): string {
+	return `/proc/self/fd/${handle.fd}`;
+}
+
+function directoryPath(directory: PrivatePublicationDirectory): string {
+	return procPath(directory.handle);
+}
+
+const LINUX_O_PATH = 0o10000000;
+
+async function readPrivateExistingStateForMutation(filePath: string): Promise<StrictMutationReadResult> {
+	let handle: FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.uid !== currentUid())
+			throw new Error("unsafe private publication file");
+		const parsed = JSON.parse(await handle.readFile("utf-8"));
+		if (isPlainObject(parsed)) return { kind: "valid", value: parsed };
+		return { kind: "corrupt", error: "state file must contain a JSON object" };
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return { kind: "absent" };
+		return { kind: "corrupt", error: error instanceof Error ? error.message : String(error) };
+	} finally {
+		await handle?.close();
+	}
+}
+
+async function assertPrivatePublicationDirectories(context: PrivatePublicationContext): Promise<void> {
+	for (const expected of context.directories) {
+		const current = await expected.handle.stat();
+		const directory =
+			expected.parent && expected.name ? path.join(directoryPath(expected.parent), expected.name) : context.root;
+		assertSafePublicationDirectory(current, directory, expected.privateSubtree);
+		if (current.dev !== expected.dev || current.ino !== expected.ino)
+			throw new Error("private publication directory changed during publication");
+		if (expected.parent && expected.name) {
+			const linked = await fs.lstat(path.join(directoryPath(expected.parent), expected.name));
+			if (
+				!linked.isDirectory() ||
+				linked.isSymbolicLink() ||
+				linked.dev !== expected.dev ||
+				linked.ino !== expected.ino
+			)
+				throw new Error("private publication directory changed during publication");
+		}
+	}
+	const namedRoot = await fs.lstat(context.root);
+	const root = context.directories[0];
+	if (
+		!root ||
+		!namedRoot.isDirectory() ||
+		namedRoot.isSymbolicLink() ||
+		namedRoot.dev !== root.dev ||
+		namedRoot.ino !== root.ino
+	)
+		throw new Error("private publication root changed during publication");
+}
+
+async function closePrivatePublicationContext(context: PrivatePublicationContext): Promise<void> {
+	await Promise.all(
+		context.directories
+			.splice(0)
+			.reverse()
+			.map(directory => directory.handle.close()),
+	);
+}
+
+async function preparePrivateDirectory(
+	filePath: string,
+	options: StateWriterOptions,
+): Promise<PrivatePublicationContext> {
+	if (process.platform !== "linux") throw new Error("private durable publication requires Linux");
+	const boundary = resolveGjcTarget(options.privateDurable!.directory, cwdForOptions(options));
+	if (boundary !== path.dirname(filePath)) throw new Error("private publication directory must be the target parent");
+	const root = cwdForOptions(options);
+	if ((await fs.realpath(root)) !== root) throw new Error("private publication requires canonical cwd");
+	const directories: PrivatePublicationDirectory[] = [];
+	const openFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+	try {
+		const rootHandle = await fs.open(root, openFlags);
+		let rootStat: Stats;
+		try {
+			rootStat = await rootHandle.stat();
+		} catch (error) {
+			await rootHandle.close();
+			throw error;
+		}
+		directories.push({
+			handle: rootHandle,
+			dev: rootStat.dev,
+			ino: rootStat.ino,
+			privateSubtree: false,
+		});
+		assertSafePublicationDirectory(rootStat, root, false);
+		const namedRoot = await fs.lstat(root);
+		if (namedRoot.isSymbolicLink() || namedRoot.dev !== rootStat.dev || namedRoot.ino !== rootStat.ino)
+			throw new Error("private publication root changed during publication");
+
+		let parent = directories[0];
+		if (!parent) throw new Error("private publication root was not opened");
+		let directory = root;
+		for (const segment of path.relative(root, path.dirname(filePath)).split(path.sep)) {
+			const childPath = path.join(directoryPath(parent), segment);
+			directory = path.join(directory, segment);
+			let created = false;
+			try {
+				await fs.mkdir(childPath, { mode: 0o700 });
+				created = true;
+			} catch (error) {
+				if (!isErrno(error, "EEXIST")) throw error;
+			}
+			let createdIdentity: { dev: number; ino: number } | undefined;
+			if (created) {
+				const pathHandle = await fs.open(
+					childPath,
+					LINUX_O_PATH | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+				);
+				try {
+					const beforeChmod = await pathHandle.stat();
+					if (!beforeChmod.isDirectory() || beforeChmod.uid !== currentUid() || (beforeChmod.mode & 0o022) !== 0)
+						throw new Error("unsafe newly created private publication directory");
+					await fs.chmod(procPath(pathHandle), 0o700);
+					const afterChmod = await pathHandle.stat();
+					if ((afterChmod.mode & 0o777) !== 0o700)
+						throw new Error("private publication directory is not owned mode 0700");
+					createdIdentity = { dev: afterChmod.dev, ino: afterChmod.ino };
+				} finally {
+					await pathHandle.close();
+				}
+			}
+			const childHandle = await fs.open(childPath, openFlags);
+			let childStat: Stats;
+			try {
+				childStat = await childHandle.stat();
+			} catch (error) {
+				await childHandle.close();
+				throw error;
+			}
+			if (createdIdentity && (childStat.dev !== createdIdentity.dev || childStat.ino !== createdIdentity.ino)) {
+				await childHandle.close();
+				throw new Error("private publication directory changed during creation");
+			}
+			const privateSubtree = directory === boundary || directory.startsWith(`${boundary}${path.sep}`);
+			const child: PrivatePublicationDirectory = {
+				handle: childHandle,
+				parent,
+				name: segment,
+				dev: childStat.dev,
+				ino: childStat.ino,
+				privateSubtree,
+			};
+			directories.push(child);
+			assertSafePublicationDirectory(childStat, directory, privateSubtree);
+			if (created || directory === boundary) {
+				// The newly linked entry is durable only after both the child and its
+				// parent have been synced. Newly created directories are chmodded first
+				// so umask cannot weaken their required mode.
+				await childHandle.sync();
+				await parent.handle.sync();
+			}
+			parent = child;
+		}
+		const targetParent = directories[directories.length - 1];
+		if (!targetParent) throw new Error("private publication target parent was not opened");
+		const context: PrivatePublicationContext = {
+			root,
+			directories,
+			targetParent,
+			anchoredTarget: path.join(directoryPath(targetParent), path.basename(filePath)),
+		};
+		await assertPrivatePublicationDirectories(context);
+		try {
+			const stat = await fs.lstat(context.anchoredTarget);
+			if (
+				!stat.isFile() ||
+				stat.isSymbolicLink() ||
+				stat.nlink !== 1 ||
+				(stat.mode & 0o777) !== 0o600 ||
+				stat.uid !== currentUid()
+			)
+				throw new Error("unsafe private publication file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		return context;
+	} catch (error) {
+		await Promise.all(directories.reverse().map(directory => directory.handle.close().catch(() => undefined)));
+		throw error;
+	}
+}
+
+async function privateAtomicWrite(
+	filePath: string,
+	content: string,
+	options: StateWriterOptions,
+	context: PrivatePublicationContext,
+): Promise<void> {
+	await assertPrivatePublicationDirectories(context);
+	const temporary = tempPathFor(filePath);
+	const anchoredTemporary = path.join(directoryPath(context.targetParent), path.basename(temporary));
+	let renameAttempted = false;
+	try {
+		const handle = await fs.open(anchoredTemporary, "wx", 0o600);
+		try {
+			await handle.chmod(0o600);
+			const created = await handle.stat();
+			if (!created.isFile() || created.uid !== currentUid() || (created.mode & 0o777) !== 0o600)
+				throw new Error("unsafe private publication temporary file");
+			await handle.writeFile(content, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await assertPrivatePublicationDirectories(context);
+		renameAttempted = true;
+		await fs.rename(anchoredTemporary, context.anchoredTarget);
+		await context.targetParent.handle.sync();
+		await assertPrivatePublicationDirectories(context);
+		await maybeAudit(filePath, options);
+	} catch (error) {
+		// A rename call or anything after it can have committed the replacement
+		// before returning an error. The caller must reload instead of retrying
+		// with a new authority record.
+		if (renameAttempted) throw new StatePublicationUncertainError(filePath, error);
+		await fs.rm(anchoredTemporary, { force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
 async function writeGuardedResolvedJsonAtomic(
 	filePath: string,
 	value: unknown,
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
+	let privateContext: PrivatePublicationContext | undefined;
+	if (options.privateDurable) {
+		if (options.policy !== "source" || options.expectedRevision === undefined)
+			throw new Error("private durable publication requires source CAS");
+		privateContext = await preparePrivateDirectory(filePath, options);
+	}
 	const write = async (): Promise<GuardedWriteResult> => {
-		const current = await readJsonIfPresentTolerant(filePath);
+		if (privateContext) await assertPrivatePublicationDirectories(privateContext);
+		const strict = privateContext
+			? await readPrivateExistingStateForMutation(privateContext.anchoredTarget)
+			: undefined;
+		if (strict?.kind === "corrupt") throw new Error(strict.error);
+		if (strict?.kind === "absent" && options.expectedRevision !== 0) throw new Error("established state missing");
+		const current = strict
+			? strict.kind === "valid"
+				? strict.value
+				: undefined
+			: await readJsonIfPresentTolerant(filePath);
 		const currentRevision = persistedStateRevision(current);
 
 		if (options.policy === "source") {
@@ -542,8 +855,13 @@ async function writeGuardedResolvedJsonAtomic(
 				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
 			const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
-			await atomicWrite(filePath, jsonText(next));
-			await maybeAudit(filePath, options);
+			if (options.privateDurable) {
+				if (!privateContext) throw new Error("private publication directories were not prepared");
+				await privateAtomicWrite(filePath, jsonText(next), options, privateContext);
+			} else {
+				await atomicWrite(filePath, jsonText(next));
+				await maybeAudit(filePath, options);
+			}
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		}
 
@@ -567,7 +885,11 @@ async function writeGuardedResolvedJsonAtomic(
 	// that already holds this target's lock (via `withWorkflowStateLock`) must say
 	// so rather than deadlocking against itself — the same `lockHeld` contract the
 	// envelope writers already use.
-	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
+	try {
+		return options.lockHeld ? await write() : await lockResolvedWorkflowTarget(filePath, write, options.lock);
+	} finally {
+		if (privateContext) await closePrivatePublicationContext(privateContext);
+	}
 }
 
 export async function writeGuardedJsonAtomic(
@@ -798,7 +1120,12 @@ export async function withWorkflowStateLock<T>(
 	options?: StateWriterOptions,
 ): Promise<T> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	return lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+	const privateContext = options?.privateDurable ? await preparePrivateDirectory(filePath, options) : undefined;
+	try {
+		return await lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+	} finally {
+		if (privateContext) await closePrivatePublicationContext(privateContext);
+	}
 }
 
 async function lockResolvedWorkflowTarget<T>(
@@ -831,10 +1158,113 @@ export async function updateJsonAtomic<T = unknown>(
 	);
 }
 
+async function assertAppendRegularFile(filePath: string): Promise<void> {
+	try {
+		const stat = await fs.lstat(filePath);
+		if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("state append path is not a regular file");
+	} catch (error) {
+		if (!isErrno(error, "ENOENT")) throw error;
+	}
+}
+
+/**
+ * Append bytes the same way `appendAuditEntry` opens its log: mode 0600, `O_NOFOLLOW`
+ * when the path already exists, and `O_EXCL` when it does not. An existing mode 0666
+ * file, and any other group or other permission bits, is tightened to 0600 before the write.
+ */
+async function tightenReadOnlyAppendMode(filePath: string): Promise<void> {
+	if (process.platform === "win32") return;
+	const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+	const initialStat = await fs.lstat(filePath, { bigint: true });
+	if (initialStat.isSymbolicLink() || !initialStat.isFile())
+		throw new Error("state append path is not a regular file");
+	// A duplicate idempotent append must not require a writable file. Owner-only
+	// modes such as 0400 stay as they are; only group or other bits are tightened.
+	const handle = await fs.open(filePath, fsConstants.O_RDONLY | noFollow);
+	try {
+		const openedStat = await handle.stat({ bigint: true });
+		const pathStat = await fs.lstat(filePath, { bigint: true });
+		const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+			left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+		if (
+			openedStat.isSymbolicLink() ||
+			!openedStat.isFile() ||
+			pathStat.isSymbolicLink() ||
+			!pathStat.isFile() ||
+			!sameObject(initialStat, openedStat) ||
+			!sameObject(openedStat, pathStat)
+		)
+			throw new Error("state append path identity changed before append");
+		if ((Number(openedStat.mode) & 0o077) === 0) return;
+		await handle.chmod(0o600);
+		const tightened = await handle.stat({ bigint: true });
+		if ((Number(tightened.mode) & 0o777) !== 0o600)
+			throw new Error("state append path could not be tightened to mode 0600");
+	} finally {
+		await handle.close();
+	}
+}
+
+async function appendOwnerOnlyText(filePath: string, text: string): Promise<void> {
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await assertAppendRegularFile(filePath);
+	const noFollow = process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0);
+	let handle: fs.FileHandle | undefined;
+	let initialStat: nodeFs.BigIntStats | undefined;
+	// O_EXCL matches appendAuditEntry for a missing path. Concurrent appends can
+	// create the same file together, so an EEXIST loser retries the existing-file
+	// open, which carries O_NOFOLLOW and will not follow a symlink.
+	for (let attempt = 0; attempt < 2; attempt++) {
+		initialStat = undefined;
+		try {
+			initialStat = await fs.lstat(filePath, { bigint: true });
+			if (initialStat.isSymbolicLink() || !initialStat.isFile())
+				throw new Error("state append path is not a regular file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		const flags = initialStat
+			? fsConstants.O_WRONLY | fsConstants.O_APPEND | noFollow
+			: fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_EXCL;
+		try {
+			handle = await fs.open(filePath, flags, 0o600);
+			break;
+		} catch (error) {
+			if (isErrno(error, "ELOOP")) throw new Error("state append path is not a regular file");
+			if (initialStat === undefined && isErrno(error, "EEXIST") && attempt === 0) continue;
+			throw error;
+		}
+	}
+	if (!handle) throw new Error("state append path identity changed before append");
+	try {
+		const openedStat = await handle.stat({ bigint: true });
+		const pathStat = await fs.lstat(filePath, { bigint: true });
+		const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+			left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+		if (
+			openedStat.isSymbolicLink() ||
+			!openedStat.isFile() ||
+			pathStat.isSymbolicLink() ||
+			!pathStat.isFile() ||
+			(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
+			!sameObject(openedStat, pathStat)
+		)
+			throw new Error("state append path identity changed before append");
+		if (process.platform !== "win32" && (Number(openedStat.mode) & 0o077) !== 0) {
+			await handle.chmod(0o600);
+			const tightened = await handle.stat({ bigint: true });
+			if ((Number(tightened.mode) & 0o777) !== 0o600)
+				throw new Error("state append path could not be tightened to mode 0600");
+		}
+		await handle.writeFile(text, "utf-8");
+	} finally {
+		await handle?.close();
+	}
+}
+
 export async function appendJsonl(targetPath: string, entry: unknown, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	await appendOwnerOnlyText(filePath, `${JSON.stringify(entry)}\n`);
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -932,12 +1362,14 @@ export async function appendJsonlIdempotent(
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
+			await assertAppendRegularFile(filePath);
 			const existing = await readJsonlEntries(filePath);
 			const duplicate = findJsonlDuplicate(existing, entry, options);
 			if (duplicate !== undefined) {
+				await tightenReadOnlyAppendMode(filePath);
 				return { path: filePath, appended: false, duplicate };
 			}
-			await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+			await appendOwnerOnlyText(filePath, `${JSON.stringify(entry)}\n`);
 			await maybeAudit(filePath, options);
 			return { path: filePath, appended: true };
 		},
@@ -947,8 +1379,7 @@ export async function appendJsonlIdempotent(
 
 export async function appendText(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, text, "utf-8");
+	await appendOwnerOnlyText(filePath, text);
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -1057,9 +1488,16 @@ export async function removeActiveEntry(
 	);
 }
 
-export async function readActiveEntries(
+/**
+ * Read every per-skill active entry. Unreadable JSON propagates; a parsed record
+ * that is not a skill entry (not an object, or without a `skill`) is skipped, or
+ * rejected when `strict` is set so status-bearing readers can tell an existing
+ * but unusable authoritative entry apart from a deleted one.
+ */
+async function readActiveEntriesFromDir(
 	cwd: string,
-	sessionScope?: string | ActiveSessionScope,
+	sessionScope: string | ActiveSessionScope | undefined,
+	strict: boolean,
 ): Promise<SkillActiveEntry[]> {
 	const dir = activeStateDir(path.resolve(cwd), sessionScope);
 	let names: string[];
@@ -1072,13 +1510,36 @@ export async function readActiveEntries(
 	const entries: SkillActiveEntry[] = [];
 	for (const name of names.sort()) {
 		if (!name.endsWith(".json")) continue;
-		const raw = await readJsonIfPresent(path.join(dir, name));
-		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-		const skill = safeString((raw as SkillActiveEntry).skill).trim();
-		if (!skill) continue;
+		const filePath = path.join(dir, name);
+		const raw = await readJsonIfPresent(filePath);
+		if (raw === undefined) continue;
+		const skill = isPlainObject(raw) ? safeString(raw.skill).trim() : "";
+		if (!skill) {
+			if (strict) throw new Error(`active entry at ${filePath} is not a skill entry record`);
+			continue;
+		}
 		entries.push(raw as SkillActiveEntry);
 	}
 	return entries;
+}
+
+export async function readActiveEntries(
+	cwd: string,
+	sessionScope?: string | ActiveSessionScope,
+): Promise<SkillActiveEntry[]> {
+	return readActiveEntriesFromDir(cwd, sessionScope, false);
+}
+
+/**
+ * Failure-observable counterpart of `readActiveEntries`: an entry file that exists
+ * but holds no usable skill entry throws instead of being skipped, so its absence
+ * from the result always means the entry does not exist.
+ */
+export async function readActiveEntriesStrict(
+	cwd: string,
+	sessionScope?: string | ActiveSessionScope,
+): Promise<SkillActiveEntry[]> {
+	return readActiveEntriesFromDir(cwd, sessionScope, true);
 }
 
 export async function rebuildActiveSnapshot(
@@ -1248,6 +1709,7 @@ export async function appendAuditEntry(
 	cwd: string,
 	sessionIdOrEntry: string | AuditEntry,
 	maybeEntry?: AuditEntry,
+	options: { lockHeld?: boolean; beforeAppend?: (offset: number) => Promise<unknown> } = {},
 ): Promise<string> {
 	const sessionId =
 		typeof sessionIdOrEntry === "string"
@@ -1257,8 +1719,50 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	const append = async () => {
+		await fs.mkdir(path.dirname(filePath), { recursive: true });
+		let initialStat: nodeFs.BigIntStats | undefined;
+		try {
+			initialStat = await fs.lstat(filePath, { bigint: true });
+			if (initialStat.isSymbolicLink() || !initialStat.isFile()) throw new Error("audit path is not a regular file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		const flags = initialStat
+			? fsConstants.O_WRONLY |
+				fsConstants.O_APPEND |
+				(process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0))
+			: fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_EXCL;
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(filePath, flags, 0o600);
+			const openedStat = await handle.stat({ bigint: true });
+			const pathStat = await fs.lstat(filePath, { bigint: true });
+			const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+				left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+			if (
+				openedStat.isSymbolicLink() ||
+				!openedStat.isFile() ||
+				pathStat.isSymbolicLink() ||
+				!pathStat.isFile() ||
+				(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
+				!sameObject(openedStat, pathStat)
+			)
+				throw new Error("audit path identity changed before append");
+			if (openedStat.size > BigInt(Number.MAX_SAFE_INTEGER))
+				throw new Error("audit path is too large to append safely");
+			await options.beforeAppend?.(Number(openedStat.size));
+			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
+			await handle.sync();
+			const afterPathStat = await fs.lstat(filePath, { bigint: true });
+			if (afterPathStat.isSymbolicLink() || !sameObject(openedStat, afterPathStat))
+				throw new Error("audit path identity changed during append");
+		} finally {
+			await handle?.close();
+		}
+	};
+	if (options.lockHeld) await append();
+	else await withWorkflowStateLock(filePath, append, { cwd });
 	return filePath;
 }
 

@@ -20,27 +20,126 @@ export interface RecallResultLike {
 	mentioned_at?: string | null;
 }
 
-const MEMORIES_REGEX = /<memories>[\s\S]*?<\/memories>/g;
-const LEGACY_HINDSIGHT_MEMORIES_REGEX = /<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g;
-const LEGACY_RELEVANT_MEMORIES_REGEX = /<relevant_memories>[\s\S]*?<\/relevant_memories>/g;
-const MENTAL_MODELS_REGEX = /<mental_models>[\s\S]*?<\/mental_models>/g;
+const MEMORY_TAG_NAMES = ["memories", "hindsight_memories", "relevant_memories", "mental_models"] as const;
+
+function memoryTagExpression(name: string): RegExp {
+	return new RegExp(`<\\s*\\/?\\s*${name}\\s*>`, "gi");
+}
+
+interface MemoryTagSpan {
+	start: number;
+	end: number;
+	close: boolean;
+	paired: boolean;
+	absorbed: boolean;
+}
+
+function findMemoryTagSpans(content: string, name: string): MemoryTagSpan[] {
+	const spans: MemoryTagSpan[] = [];
+	for (const match of content.matchAll(memoryTagExpression(name))) {
+		const raw = match[0];
+		const start = match.index ?? 0;
+		spans.push({
+			start,
+			end: start + raw.length,
+			close: raw.includes("/"),
+			paired: false,
+			absorbed: false,
+		});
+	}
+	return spans;
+}
+
+function mergeSpans(ranges: Array<[number, number]>): Array<[number, number]> {
+	const sorted = ranges.filter(([start, end]) => end > start).sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+	const merged: Array<[number, number]> = [];
+	for (const [start, end] of sorted) {
+		const last = merged[merged.length - 1];
+		if (!last || start > last[1]) merged.push([start, end]);
+		else last[1] = Math.max(last[1], end);
+	}
+	return merged;
+}
+
+/**
+ * Remove one memory-tag family.
+ *
+ * A matched block is removed whole. An extra closer after that block is the
+ * recall frame ending early: the escaped text through that closer is removed
+ * so it is not retained as instructions. A closer or opener with no block
+ * before it is removed as a token only, and the surrounding prose stays.
+ */
+function stripMemoryTagFamily(content: string, name: string): string {
+	const tags = findMemoryTagSpans(content, name);
+	if (tags.length === 0) return content;
+
+	const ranges: Array<[number, number]> = [];
+	const stack: MemoryTagSpan[] = [];
+	for (const tag of tags) {
+		if (!tag.close) {
+			stack.push(tag);
+			continue;
+		}
+		const open = stack.pop();
+		if (!open) continue;
+		open.paired = true;
+		tag.paired = true;
+		ranges.push([open.start, tag.end]);
+	}
+
+	for (const tag of tags) {
+		if (!tag.close || tag.paired) continue;
+		let previous: MemoryTagSpan | undefined;
+		for (const candidate of tags) {
+			if (candidate.end <= tag.start) previous = candidate;
+			else break;
+		}
+		const followsClosedBlock = Boolean(previous?.close && (previous.paired || previous.absorbed));
+		if (followsClosedBlock && previous) {
+			ranges.push([previous.end, tag.end]);
+			tag.absorbed = true;
+		} else {
+			ranges.push([tag.start, tag.end]);
+		}
+	}
+
+	for (const tag of tags) {
+		if (!tag.close && !tag.paired) ranges.push([tag.start, tag.end]);
+	}
+
+	let out = content;
+	for (const [start, end] of mergeSpans(ranges).reverse()) {
+		out = out.slice(0, start) + out.slice(end);
+	}
+	return out;
+}
+
+/** Escape recognized tag delimiters so recalled text cannot close the outer frame. */
+function stripMemoryTagTokens(text: string): string {
+	let out = text;
+	for (const name of MEMORY_TAG_NAMES) {
+		out = out.replace(memoryTagExpression(name), tag => tag.replace("<", "&lt;"));
+	}
+	return out;
+}
 
 /**
  * Strip `<memories>`, `<mental_models>`, and legacy memory blocks.
  *
- * Both `<memories>` (per-turn recall) and `<mental_models>` (curated semantic
- * memory) are injected into the system prompt. If either leaks into the
- * retention transcript, every retain becomes a tighter feedback loop —
- * paraphrased memories feed the next consolidation, which feeds the next
- * mental-model refresh, which feeds the next retain. Always strip before
- * retaining.
+ * Matching is case-insensitive and allows whitespace inside the tag.
+ * Both per-turn recall and curated mental models are injected around the
+ * prompt. If a closer, a case variant, or an early-ended frame leaks into
+ * the retention transcript, the next retain stores the breakout as a new
+ * memory. Always strip before retaining.
  */
 export function stripMemoryTags(content: string): string {
-	return content
-		.replace(MEMORIES_REGEX, "")
-		.replace(MENTAL_MODELS_REGEX, "")
-		.replace(LEGACY_HINDSIGHT_MEMORIES_REGEX, "")
-		.replace(LEGACY_RELEVANT_MEMORIES_REGEX, "");
+	let out = content;
+	while (true) {
+		let stripped = out;
+		for (const name of MEMORY_TAG_NAMES) stripped = stripMemoryTagFamily(stripped, name);
+		if (stripped === out) return out;
+		out = stripped;
+	}
 }
 
 /** Format recall results into a bullet list for context injection. */
@@ -50,7 +149,8 @@ export function formatMemories(results: RecallResultLike[]): string {
 		.map(r => {
 			const typeStr = r.type ? ` [${r.type}]` : "";
 			const dateStr = r.mentioned_at ? ` (${r.mentioned_at})` : "";
-			return `- ${r.text}${typeStr}${dateStr}`;
+			const text = stripMemoryTagTokens(r.text);
+			return `- ${text}${typeStr}${dateStr}`;
 		})
 		.join("\n\n");
 }

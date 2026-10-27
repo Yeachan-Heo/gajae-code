@@ -14,7 +14,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isCompiledBinary, VERSION } from "@gajae-code/utils";
+import { isCompiledBinary, logger, VERSION } from "@gajae-code/utils";
 import { isUpdateChannel } from "../../config/update-channel";
 import {
 	activationRecordPath,
@@ -27,8 +27,10 @@ import {
 	snapshotRegularFile,
 } from "../install-activation";
 import {
+	ActivationRetryCandidateRepointError,
 	acquireBinaryUpdateLock,
 	fetchAndVerifyOfficialPinnedCandidate,
+	InstallationAccessDeniedError,
 	isProtectedSourcePathForInstall,
 	replaceBinaryForUpdate,
 	smokeTestPinnedCandidate,
@@ -111,8 +113,10 @@ export interface InstallRepairResult {
 	readonly reason?: string;
 	readonly recordPath?: string;
 	readonly sideEffectStarted: boolean;
-	/** Present only for a pre-mutation Windows sharing violation (nothing was renamed). */
+	/** Native Windows status returned by exact replacement. */
 	readonly windowsErrorCode?: string;
+	readonly stagingCleanupWarning?: string;
+	readonly retainedPaths?: InstallationAccessDeniedError["retainedPaths"];
 	readonly before?: { readonly identity?: FileIdentity; readonly digest?: string };
 	readonly after?: { readonly identity?: FileIdentity; readonly digest?: string; readonly version?: string };
 }
@@ -317,17 +321,43 @@ export async function repairStandaloneBinary(
 		};
 	} catch (error) {
 		const pendingActivation = error instanceof Error && error.message === "installation_pending_activation";
+		const accessDeniedError = error instanceof InstallationAccessDeniedError ? error : undefined;
+		const repointError = error instanceof ActivationRetryCandidateRepointError ? error : undefined;
 		const reason = pendingActivation
 			? "sharing_violation"
-			: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
-				? error.message
-				: "installation_execution_unverified";
+			: accessDeniedError
+				? accessDeniedError.code
+				: repointError
+					? repointError.reasonCode
+					: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
+						? error.message
+						: "installation_execution_unverified";
+		if (accessDeniedError)
+			logger.warn("Doctor standalone binary restore failed with access denied", {
+				targetPath,
+				code: accessDeniedError.code,
+				...(accessDeniedError.windowsErrorCode ? { windowsErrorCode: accessDeniedError.windowsErrorCode } : {}),
+				...(accessDeniedError.stagingCleanupWarning
+					? { stagingCleanupWarning: accessDeniedError.stagingCleanupWarning }
+					: {}),
+				...(accessDeniedError.retainedPaths ? { retainedPaths: accessDeniedError.retainedPaths } : {}),
+			});
+		if (repointError)
+			logger.warn("Doctor standalone binary restore retained a retry candidate after record repoint failed", {
+				path: repointError.candidatePath,
+				reason: repointError.reasonCode,
+			});
 		return {
 			state: pendingActivation ? "pending_activation" : started ? "failed" : "blocked",
 			reason,
 			sideEffectStarted: started,
 			before,
 			recordPath,
+			...(accessDeniedError?.windowsErrorCode ? { windowsErrorCode: accessDeniedError.windowsErrorCode } : {}),
+			...(accessDeniedError?.stagingCleanupWarning
+				? { stagingCleanupWarning: accessDeniedError.stagingCleanupWarning }
+				: {}),
+			...(accessDeniedError?.retainedPaths ? { retainedPaths: accessDeniedError.retainedPaths } : {}),
 		};
 	} finally {
 		await release();

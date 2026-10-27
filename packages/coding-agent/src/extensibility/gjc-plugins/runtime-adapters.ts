@@ -3,6 +3,7 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { redactCrashSecrets, safeErrorDescription } from "@gajae-code/utils";
 import { bindPluginMcpToPublicNetwork } from "../../runtime-mcp/plugin-network-boundary";
 import type { MCPStdioPreparedLaunch, MCPStdioSpawnLaunch } from "../../runtime-mcp/types";
 import { loadCustomTools } from "../custom-tools/loader";
@@ -20,7 +21,13 @@ import { isV2Tool } from "./migration";
 import { gjcPluginInstallRoot, resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope, registryRootForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
-import type { GjcPluginRegistryEntry, GjcPluginScope, JsonSchema202012, NormalizedToolSurfaceV2 } from "./types";
+import type {
+	GjcBundleIdentity,
+	GjcPluginRegistryEntry,
+	GjcPluginScope,
+	JsonSchema202012,
+	NormalizedToolSurfaceV2,
+} from "./types";
 
 export interface AlwaysOnPluginTools {
 	tools: CustomTool[];
@@ -30,6 +37,23 @@ export interface AlwaysOnPluginTools {
 export interface GjcPluginToolDeclaration extends NormalizedToolSurfaceV2 {
 	plugin: string;
 	scope: GjcPluginScope;
+}
+
+export interface GjcPluginMcpServerProvenance {
+	identity: GjcBundleIdentity;
+	surfaceId: string;
+}
+
+// Plugin MCP manifests reject per-server timeout controls; generated transports
+// share one bounded window so startup evidence reaches a terminal result.
+const PLUGIN_MCP_STARTUP_TIMEOUT_MS = 5_000;
+const MAX_PLUGIN_MCP_DIAGNOSTIC_LENGTH = 1_024;
+
+/** Bound and scrub plugin-controlled MCP causes before they enter logs or runtime findings. */
+export function safePluginMcpDiagnostic(value: unknown): string {
+	const message = safeErrorDescription(value).replace(/[\u0000-\u001f\u007f-\u009f]/gu, "");
+	const normalized = message.replace(/\b(Bearer|Basic|Token)(?=[A-Za-z0-9._~+/=-]{8,})/giu, "$1 ");
+	return redactCrashSecrets(normalized).slice(0, MAX_PLUGIN_MCP_DIAGNOSTIC_LENGTH);
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -125,22 +149,81 @@ const initialTemporaryRoots = initialProcessEnvironment.then(async environment =
 	}
 	return [...roots];
 });
-const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
-	const authorities = new Map<string, string>();
+
+/** Startup identity of a file: the object `hashStableFile` must still be reading. */
+export interface StableFileIdentity {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
+/**
+ * Startup identity of every canonical `node` on PATH, keyed by realpath. Only
+ * `stat` runs at startup; the digest is computed on first use from a descriptor
+ * whose identity must still match this snapshot, so a later replacement cannot
+ * become launch authority.
+ */
+const initialNodeIdentities = initialProcessEnvironment.then(async environment => {
+	const identities = new Map<string, StableFileIdentity>();
 	const temporaryRoots = await initialTemporaryRoots;
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
+			// A temporary root is writable by other local users and by checkouts the user
+			// never vetted, so a `node` resolved there never becomes launch authority.
 			if (temporaryRoots.some(root => isWithin(root, real))) continue;
-			const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
-			authorities.set(real, sha256(bytes));
+			if (identities.has(real)) continue;
+			const stat = await fs.stat(real);
+			identities.set(real, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeMs: stat.mtimeMs,
+				ctimeMs: stat.ctimeMs,
+			});
 		} catch {
-			// Missing or unstable startup candidates do not become authority.
+			// Missing startup candidates do not become authority.
 		}
 	}
-	return authorities;
+	return identities;
 });
+
+/**
+ * First-use digests of startup Node candidates, keyed by realpath. Successful and
+ * in-flight digests stay memoized; a failed attempt is evicted so a transient error
+ * (e.g. EMFILE) can be retried against the same startup identity.
+ */
+const initialNodeHashes = new Map<string, Promise<string | undefined>>();
+
+/**
+ * Digest of a `node` that was on PATH at startup, or `undefined` when the path
+ * was not a startup candidate or no longer is the startup file object.
+ */
+export function getInitialNodeHash(realPath: string): Promise<string | undefined> {
+	const cached = initialNodeHashes.get(realPath);
+	if (cached) return cached;
+
+	const attempt = initialNodeIdentities.then(async identities => {
+		const identity = identities.get(realPath);
+		if (!identity) return undefined;
+		try {
+			return await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
+		} catch {
+			// Do not memoize failed attempts to allow retries on transient errors
+			// (e.g., EMFILE on file open/read). Remove the pending entry so the next
+			// call can retry the operation with the same startup identity.
+			initialNodeHashes.delete(realPath);
+			return undefined;
+		}
+	});
+	// Memoize the in-flight attempt so only one concurrent operation runs, but
+	// the entry may be deleted if the operation fails (to allow retry).
+	initialNodeHashes.set(realPath, attempt);
+	return attempt;
+}
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
@@ -384,6 +467,66 @@ async function readStableFile(
 	}
 }
 
+const STABLE_HASH_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * SHA-256 of a regular file with the same stability contract as `readStableFile`
+ * (follows symlinks, bounded size, rejects a file that changes while it is read),
+ * streamed through one reusable chunk. Startup Node authority hashes every `node`
+ * on PATH; buffering each interpreter (~120 MiB) held its full bytes in the
+ * session process until exit.
+ */
+export async function hashStableFile(
+	filePath: string,
+	label: string,
+	maxBytes: number,
+	expected?: StableFileIdentity,
+): Promise<string> {
+	const handle = await fs.open(filePath, fs.constants.O_RDONLY);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile()) throw new Error(`${label} is not a regular file`);
+		// Checked on the opened descriptor, so the digest belongs to the expected
+		// file object even if the path is swapped around the open.
+		if (
+			expected &&
+			(before.dev !== expected.dev ||
+				before.ino !== expected.ino ||
+				before.size !== expected.size ||
+				before.mtimeMs !== expected.mtimeMs ||
+				before.ctimeMs !== expected.ctimeMs)
+		) {
+			throw new Error(`${label} is not the expected file`);
+		}
+		if (before.size > maxBytes) throw new Error(`${label} exceeds its byte limit`);
+		const hash = createHash("sha256");
+		const chunk = Buffer.allocUnsafe(STABLE_HASH_CHUNK_BYTES);
+		let offset = 0;
+		for (;;) {
+			const remaining = maxBytes + 1 - offset;
+			if (remaining <= 0) throw new Error(`${label} exceeds its byte limit`);
+			const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.byteLength, remaining), offset);
+			if (bytesRead === 0) break;
+			hash.update(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		const after = await handle.stat();
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeMs !== after.mtimeMs ||
+			before.ctimeMs !== after.ctimeMs ||
+			offset !== after.size
+		) {
+			throw new Error(`${label} changed while reading`);
+		}
+		return hash.digest("hex");
+	} finally {
+		await handle.close();
+	}
+}
+
 /**
  * Resolve host launchers through absolute PATH entries outside the workspace
  * and installed plugin. Relative entries such as `.` and absolute workspace
@@ -449,10 +592,9 @@ async function isInitialManagedNodeLauncherPath(
 	const real = await fs.realpath(executablePath);
 	if (untrustedRoots.some(root => isWithin(root, real))) return false;
 	if ((await initialTemporaryRoots).some(root => isWithin(root, real))) return false;
-	const expected = (await initialNodeAuthorities).get(real);
+	const expected = await getInitialNodeHash(real);
 	if (!expected) return false;
-	const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
-	return sha256(bytes) === expected;
+	return (await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES)) === expected;
 }
 
 async function resolveTrustedSnapshotBase(
@@ -557,7 +699,9 @@ async function prepareVerifiedStdioLaunch(input: {
 		throw new Error("Authenticated plugin MCP stdio launch capsules are available only on Linux");
 	}
 	if (input.launcher === "bun") {
-		throw new Error("Authenticated plugin MCP Bun launch capsules are unavailable");
+		throw new Error(
+			"Authenticated plugin MCP Bun launch capsules are unavailable: Bun's clearable runtime plugin hooks cannot enforce the authenticated module-loading boundary required to restrict plugin imports to verified capsule bytes",
+		);
 	}
 	const registerCleanup = input.registerCleanup;
 	if (!registerCleanup) {
@@ -604,7 +748,7 @@ async function prepareVerifiedStdioLaunch(input: {
 		true,
 	);
 	const launcherReal = await fs.realpath(input.launcherPath);
-	const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+	const expectedLauncherHash = await getInitialNodeHash(launcherReal);
 	if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
 		throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 	}
@@ -1045,18 +1189,22 @@ export async function renderSkillAdvertisement(input: {
  * Convert active plugin-bundle MCP surfaces into runtime MCPServerConfig entries,
  * applying install + runtime MCP policy (URL scheme/private-range deny, DNS
  * re-resolution for http/sse, stdio root-confinement) before connection. Servers
- * failing policy are quarantined and excluded. Returns {} when none.
+ * failing policy are quarantined and excluded. The provenance map contains
+ * only servers present in `configs`, so connection errors can be attributed to
+ * the authenticated bundle and stable surface that supplied each server.
  */
 export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 	configs: Record<string, any>;
 	quarantine: SessionQuarantine[];
+	serverProvenance: ReadonlyMap<string, GjcPluginMcpServerProvenance>;
 }> {
 	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd, true);
-	if (effective.length === 0) return { configs: {}, quarantine: [] };
+	if (effective.length === 0) return { configs: {}, quarantine: [], serverProvenance: new Map() };
 
 	// A manifest-controlled MCP name such as "constructor" or "toString" must
 	// remain an ordinary own key rather than interacting with Object.prototype.
 	const configs: Record<string, any> = Object.create(null) as Record<string, any>;
+	const serverProvenance = new Map<string, GjcPluginMcpServerProvenance>();
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		let compiledMcps: Map<string, (typeof entry.surfaces.mcps)[number]> | undefined;
@@ -1119,7 +1267,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 						command,
 						args: initialArgs,
 						cwd: invocation.cwd,
-						timeout: 5_000,
+						timeout: PLUGIN_MCP_STARTUP_TIMEOUT_MS,
 						// Third-party plugin MCP processes must not inherit host secrets;
 						// only a minimal OS allowlist (PATH/HOME/temp/locale) is provided.
 						noInheritEnv: true,
@@ -1207,18 +1355,26 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 					// resolution path expands ${env:...}/shell templates, which would let
 					// a third-party bundle exfiltrate host secrets. Plugin-bundle MCP
 					// servers connect without bundle-declared headers.
-					configs[m.name] = bindPluginMcpToPublicNetwork({ type: cfg.transport, url: url.toString() });
+					configs[m.name] = bindPluginMcpToPublicNetwork({
+						type: cfg.transport,
+						url: url.toString(),
+						timeout: PLUGIN_MCP_STARTUP_TIMEOUT_MS,
+					});
 				}
+				serverProvenance.set(m.name, {
+					identity: bundleIdentity(entry.scope, entry.name),
+					surfaceId: `mcp:${m.name}`,
+				});
 			} catch (error) {
 				quarantine.push({
 					identity: bundleIdentity(entry.scope, entry.name),
 					plugin: entry.name,
 					surfaceId: m.extensionId,
 					code: "security_policy",
-					message: error instanceof Error ? error.message : String(error),
+					message: safePluginMcpDiagnostic(error),
 				});
 			}
 		}
 	}
-	return { configs, quarantine };
+	return { configs, quarantine, serverProvenance };
 }

@@ -13,6 +13,20 @@ import {
 } from "../config/update-channel";
 import { initTheme } from "../modes/theme/theme";
 
+export async function runUpdateRecoveryCommand(
+	recover: () => Promise<void> = () => runManagedNotifyRecovery({}),
+): Promise<void> {
+	try {
+		await recover();
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		process.stderr.write(
+			`Post-update recovery failed: ${reason}. For each configured notification daemon (telegram, discord, or slack), manually run 'gjc daemon stop <kind> --force' and then 'gjc daemon reload <kind>', then run 'gjc notify recovery'.\n`,
+		);
+		process.exitCode = 1;
+	}
+}
+
 export default class Update extends Command {
 	static description = "Check for and install updates";
 
@@ -35,7 +49,7 @@ export default class Update extends Command {
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Update);
 		if (args.action === "update-recovery") {
-			await runManagedNotifyRecovery({});
+			await runUpdateRecoveryCommand();
 			return;
 		}
 		let channel: UpdateChannel | undefined;

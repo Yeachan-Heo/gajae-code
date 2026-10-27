@@ -30,7 +30,7 @@ const PROVIDER_ONBOARDING_OPTIONS: ProviderOnboardingOption[] = [
 	},
 	{
 		label: "Import existing credentials",
-		description: "Detect and import Claude Code / Codex CLI logins already on this machine.",
+		description: "Detect and import Claude Code / Codex CLI / Kiro CLI logins already on this machine.",
 		action: "import-credentials",
 	},
 ];

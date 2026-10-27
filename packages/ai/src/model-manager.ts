@@ -60,6 +60,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 	canPublishCache?: () => boolean;
 	/** Credential-and-endpoint identity required to reuse dynamic catalog IDs. */
 	cacheDynamicModelProvenance?: string;
+	/** Discovery User-Agent (e.g., for Antigravity): cache invalidates on change. */
+	discoveryUserAgent?: string;
 }
 
 /**
@@ -146,7 +148,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const provenance = options.cacheDynamicModelProvenance;
 	const now = options.now ?? Date.now;
 	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
-	const legacyCache = readModelCache<TApi>(options.providerId, ttlMs, now, options.cacheDbPath);
+	const legacyCache = readModelCache<TApi>(
+		options.providerId,
+		ttlMs,
+		now,
+		options.cacheDbPath,
+		options.discoveryUserAgent,
+	);
 	if (
 		strategy !== "online-if-uncached" ||
 		typeof options.fetchDynamicModels !== "function" ||
@@ -185,7 +193,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 	const staticModels = passModelList<TApi>(
 		options.staticModels ?? getBundledModels(options.providerId as GeneratedProvider),
 	);
-	const cache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
+	const cache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath, options.discoveryUserAgent);
 	const dynamicFetcher = options.fetchDynamicModels;
 	const hasDynamicFetcher = typeof dynamicFetcher === "function";
 	const cacheDynamicModelIdsCurrent =
@@ -262,6 +270,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				dbPath,
 				cache.dynamicModelIds,
 				cache.dynamicModelProvenance,
+				options.discoveryUserAgent,
 			);
 		}
 		return {
@@ -315,6 +324,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 					dbPath,
 					dynamicModels.map(model => model.id),
 					options.cacheDynamicModelProvenance,
+					options.discoveryUserAgent,
 				);
 			}
 		} else {
@@ -322,10 +332,9 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			// stale state remains visible while retry backoff still applies. Re-read
 			// the current row and trust only that row's provenance and dynamic IDs,
 			// not the initial cacheProvenanceMismatch snapshot. A concurrent writer
-			// may have replaced the provider row; if the latest row is unbound or
-			// belongs to another context, use no latest fallback and do not
-			// overwrite or downgrade it.
-			const latestCache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
+			// may have replaced the provider row. This reread filters mismatched
+			// discovery User-Agents, while the checks below enforce dynamic provenance.
+			const latestCache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath, options.discoveryUserAgent);
 			const latestCacheMatchesCurrentContext =
 				options.cacheDynamicModelProvenance === undefined
 					? latestCache !== null && latestCache.dynamicModelIds === undefined
@@ -353,6 +362,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						latestCache.dynamicModelIds,
 						latestCache.dynamicModelProvenance,
 						latestCache.models,
+						latestCache.discoveryUserAgent,
 						now(),
 						snapshotModels,
 						false,
@@ -360,6 +370,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						dbPath,
 						options.cacheDynamicModelProvenance === undefined ? undefined : [],
 						options.cacheDynamicModelProvenance,
+						options.discoveryUserAgent,
 					);
 					if (!updated) cacheModels = [];
 				} else if (latestCache == null) {
@@ -372,6 +383,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						dbPath,
 						options.cacheDynamicModelProvenance === undefined ? undefined : [],
 						options.cacheDynamicModelProvenance,
+						options.discoveryUserAgent,
 					);
 					if (!inserted) cacheModels = [];
 				}

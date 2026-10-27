@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "experiment": {
+    "rfc": "#6247",
+    "phase": "A",
+    "scope": "bench-only isolation-model memory experiment",
+    "arms": ["standalone", "worker"],
+    "comparisonConcurrency": 5,
+    "brokerFreeArms": true
+  },
+  "thresholds": {
+    "minimumValidRepsPerArm": 5,
+    "memory": {
+      "workerToStandaloneMeanMaximum": 0.5,
+      "sampledPeakRegressionAllowed": false,
+      "concurrency": 5
+    },
+    "turnLatency": {
+      "maximumRelativeIncrease": 0.1,
+      "percentile": 0.95
+    },
+    "throughput": {
+      "minimumRelativeChange": -0.1
+    },
+    "eventLoopLag": {
+      "maximumP95Ms": 50,
+      "percentile": 0.95,
+      "aggregation": "maximum of each thread's p95"
+    },
+    "coldReadiness": {
+      "maximumRelativeIncrease": 0
+    },
+    "teardown": {
+      "workerHostFootprintMultiplierOfBrokerBaseline": 1.15,
+      "sampleDelayAfterFifthCloseMs": 10000
+    },
+    "churn": {
+      "cycles": 20,
+      "maximumCycle20GrowthOverCycle1": 0.1
+    },
+    "orphans": {
+      "maximumOwned": 0,
+      "maximumUnresolvedOwnership": 0
+    },
+    "fidelity": {
+      "required": "equal"
+    }
+  },
+  "definitions": {
+    "steadyStateWindow": "Every scheduled 1Hz sample tick from 2000ms after the last session is ready until the first session starts disposing; this spans the active workload phases and the scripted idle between them, because mock-provider turns complete in milliseconds and a 1Hz sampler cannot isolate them. The window denominator is all scheduled ticks.",
+    "sampleRateHz": 1,
+    "sampledPeak": "Maximum cohort total at a scheduled sample instant within the steady-state window.",
+    "p95TurnLatency": "Per repetition, nearest-rank p95 of endedAt - startedAt over all RunnerEvent turn events from all sessions; the gate compares medians of per-repetition p95 values.",
+    "throughput": "Per-repetition count of completed ok turns whose timing is within the active window, divided by active-window seconds; the active window starts at the first active:* phase and ends at idle or disposing after the last active phase.",
+    "eventLoopLag": "Per repetition, compute nearest-rank p95 of 100ms setInterval drift samples separately for every runner thread/session, then use the maximum thread p95; the gate requires both arm medians to be at most 50ms.",
+    "coldReadiness": "Per-repetition median of session coldReadyMs; the gate compares arm medians. Worker first-session readiness includes host process spawn.",
+    "warmWorkerAdmission": "Reported separately and is not a gate.",
+    "teardown": "Worker host process footprint from the complete sample taken 10000ms after the fifth close, compared with 1.15 times B. Standalone uses the same post-close sample time for residue evidence.",
+    "churn": "One resident host completes 20 cycles of create×5, full workload with idle 0, and close×5; each footprint is sampled 10000ms after the fifth close. Worker host footprint at cycle 20 must be no more than 1.10 times cycle 1. Standalone uses the protocol for orphan/residue comparison only.",
+    "armTotal": "Sum of physFootprint over owned incarnations present at the tick, including the driver incarnation exactly once. The driver's own footprint remains a separate diagnostic; no Broker is an arm member.",
+    "gatedTotal": "armTotal + B, adding the isolated Broker-only baseline exactly once to each arm.",
+    "memoryComparison": "At N=5, median Worker gated-window mean must be at most 50% of median standalone gated-window mean, and median Worker sampled peak must not exceed median standalone sampled peak.",
+    "memoryFormula": "For each arm, gatedTotal(t) = armTotal(t) + B, where armTotal already includes the driver exactly once; pass the 50% mean threshold only when W + B ≤ 0.5 × (S + B), with no sampled-peak regression.",
+    "contractDigest": "SHA-256 hex of canonical JSON for this file; the digest is external and is not embedded in the immutable contract.",
+    "postingReceipt": "Store contractDigest, discussionCommentUrl, and postedAt separately in preregistration-receipt.json before preflight or Worker admission.",
+    "brokerBaselineB": "Median across at least five complete repetitions of each repetition's mean 1Hz footprint samples over 30 seconds (shorter diagnostic baselines are never eligible), after trampoline exit and idle readiness; acquired from the isolated ensureBroker discovery pid and incarnation, then the exact owned Broker is stopped and verified dead.",
+    "statistics": "Each gate uses the median of per-repetition measurements from valid N=5 repetitions; an arm with fewer than five valid repetitions makes that gate insufficient-evidence.",
+    "percentileEstimator": "Nearest rank: sorted[ceil(p × count) - 1].",
+    "repEligibility": "A rep is valid only when every scheduled gated-window tick has exactly one complete sample with a resolved total; its 10000ms post-close teardown sample is complete; visibility self-check passed; every session has all REQUIRED_WORKLOAD_EVENTS; and invalidReason is absent. Zero-tolerance completeness applies: missing ticks are never zero-filled or omitted.",
+    "sampleCompleteness": "Complete only if every owned member has a resolved footprint read, no owned read is unresolved or raced, no unresolved-ownership process exists, and the driver read is resolved. A non-driver member the OS confirms exited between the ownership scan and its read holds no memory and contributes nothing without making the sample incomplete. Incomplete samples remain in raw output but their partial totals are never used.",
+    "churnEligibility": "All 20 Worker cycles must complete with no session failure, and every cycle post-close sample must be complete; otherwise churn is insufficient evidence.",
+    "orphanEligibility": "Both owned-process and unresolved-ownership orphan counts must be zero; a surviving process whose identity cannot be read or whose ownership cannot be proven counts as unresolved. Every orphan receipt must be complete (process enumeration and ownership scan succeeded); an incomplete receipt is insufficient evidence.",
+    "fidelity": "Normalized runner evidence of every Worker session must equal the same (N, repetition, session index) standalone session; a missing repetition or session on either side is a difference. Real-host characterization is separate and only caps the claim label (capabilityLabelRule)."
+  },
+  "environment": {
+    "platform": "darwin-arm64",
+    "bunVersion": "record Bun.version in run and preflight provenance; Worker admission is bound to the current Bun version",
+    "osVersion": "record the macOS version in run environment pins",
+    "bunConfiguration": "default configuration",
+    "smol": false,
+    "deviationFromRfcA3": "The experiment uses default Bun configuration and does not use --smol; this is the recorded deviation from RFC A.3.",
+    "configurationBinding": "The bootstrap digest binds the effective runner/bootstrap configuration and is checked against preflight provenance."
+  },
+  "bindings": {
+    "workloadDigest": {
+      "runtimeValue": "computed by workloadDigest() outside this contract",
+      "checkedAgainst": "current run inputs and passing preflight provenance",
+      "digestValueStoredHere": false
+    },
+    "bootstrapDigest": {
+      "runtimeValue": "computed by bootstrapDigest() outside this contract",
+      "checkedAgainst": "current run inputs and passing preflight provenance",
+      "digestValueStoredHere": false
+    }
+  },
+  "cohort": {
+    "ownership": "Unique GJC_BENCH_COHORT environment marker is primary evidence; retained Darwin ancestry is a cross-check and detects marker-scrubbing descendants.",
+    "visibility": "Only a complete KERN_PROCARGS2 environment read without the run marker proves marker-free status. Unproven visibility without independent exclusion is unresolved ownership and incomplete evidence.",
+    "limitations": "A descendant that scrubs its environment and is born from an unobserved intermediate that has already exited cannot be detected; the fixed workload forbids env -i-style commands and bootstrap rejects scripts containing them.",
+    "cleanup": "Supervision records pid and incarnation for each root and terminates by exact identity on timeout or abort."
+  },
+  "broker": {
+    "membership": "Broker is not a member of either arm cohort.",
+    "charge": "Add B exactly once to each armTotal; do not add the driver separately because it is already included in armTotal."
+  },
+  "workerPolicyException": "This is a bench-only Worker exception. No production Worker-policy or compile-entrypoint registration is changed; the Worker entrypoint remains bench-local, and the experiment makes no compiled-binary Worker-entrypoint claim.",
+  "capabilityLabelRule": {
+    "equal": "full-capability",
+    "differsOrUnavailable": "isolation-model opportunity evidence",
+    "claimRule": "Only an equal characterization permits a full-capability or all-gates-pass claim; differs or unavailable caps the report label at isolation-model opportunity evidence."
+  }
+}

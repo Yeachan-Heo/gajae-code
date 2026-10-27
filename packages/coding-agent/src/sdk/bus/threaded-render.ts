@@ -2,7 +2,7 @@
  * Pure rendering of threaded-session frames into Telegram send specs.
  *
  * The daemon receives the additive `ServerMessage` frames (identity_header,
- * context_update, turn_stream, image_attachment, config_update) over the session
+ * context_update, turn_stream, image_attachment, config_update, awaiting_input) over the session
  * WS and must turn each into a Bot API call scoped to the session's forum topic
  * (`message_thread_id`), throttled through the shared rate-limit pool. This
  * module is the pure frame→send mapping (including the priority lane and live-
@@ -80,6 +80,7 @@ interface ThreadedFrame {
 	// tool_activity
 	toolCallId?: unknown;
 	toolName?: unknown;
+	kind?: unknown;
 	argsSummary?: unknown;
 	resultSummary?: unknown;
 	isError?: unknown;
@@ -260,6 +261,24 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 				editable: true,
 				terminal: phase !== "started",
 			};
+		}
+		case "awaiting_input": {
+			const toolCallId = str(frame.toolCallId);
+			if (!toolCallId) return undefined;
+			let text: string;
+			switch (frame.kind) {
+				case "browser_auth":
+					text =
+						"⏳ A running command is waiting for browser sign-in. Finish it on the host; the agent continues when the command does.";
+					break;
+				case "device_code":
+					text =
+						"⏳ A running command is waiting for a device-code sign-in. Finish it on the host; the agent continues when the command does.";
+					break;
+				default:
+					return undefined;
+			}
+			return { method: "sendMessage", lane: "ask", text, coalesceKey: `awaiting:${toolCallId}` };
 		}
 		case "reasoning_summary": {
 			const text = str(frame.text);

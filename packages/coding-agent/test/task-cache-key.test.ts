@@ -1,11 +1,15 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { closeModelCache } from "@gajae-code/ai/core";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
-import { resolveEquivalentPath, Snowflake } from "@gajae-code/utils";
-import { AsyncJobManager, asyncJobEndpointId } from "../src/async";
+import { Snowflake } from "@gajae-code/utils";
+import { stablePathKey } from "@gajae-code/utils/path-identity";
+import { AsyncJobManager } from "../src/async";
+import { asyncJobEndpointId } from "../src/async/endpoint-id";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
 import type { AgentSession, ForkContextSeed } from "../src/session/agent-session";
@@ -14,6 +18,17 @@ import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore, managedDirectoryRoot } from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { createManagedTaskPersistence } from "../src/task/executor";
+
+/**
+ * Default budget for every test in this file.
+ *
+ * Building a session touches SQLite, the model registry and the filesystem. On
+ * a cold Windows runner that comfortably exceeds Bun's implicit 5s default, and
+ * a test that overruns is aborted mid-flight: the abort skips the rest of the
+ * body, so a credential store opened before the build would stay locked and the
+ * temp tree could no longer be removed.
+ */
+setDefaultTimeout(15_000);
 
 function createHandBuiltSeed(): ForkContextSeed {
 	const message: Message = {
@@ -38,6 +53,30 @@ function createHandBuiltSeed(): ForkContextSeed {
 	};
 }
 
+/**
+ * Credential stores opened by {@link createSession}, tracked here so the
+ * cleanup always releases their SQLite handle.
+ *
+ * A store is registered the moment it is created, before the session build
+ * starts. A session build that never settles (a slow Windows CI runner, a
+ * wedged provider probe) aborts the test mid-flight, and an unregistered store
+ * keeps its database file open: the temp tree can then no longer be removed
+ * and Windows reports EBUSY on the still-open file, which masks the real
+ * failure behind a cleanup error.
+ */
+const openAuthStorages: AuthStorage[] = [];
+
+/**
+ * Release every tracked credential store.
+ *
+ * Bun aborts a test body when it exceeds its timeout, so a session build that
+ * never settles never runs the `catch` in {@link createSession}. The registry
+ * is the only thing that can still release the handle in that case.
+ */
+function releaseTrackedAuthStorages(): void {
+	while (openAuthStorages.length > 0) openAuthStorages.pop()?.close();
+}
+
 async function createSession(
 	tempDir: string,
 	options: {
@@ -48,28 +87,42 @@ async function createSession(
 	} = {},
 ) {
 	const authStorage = await AuthStorage.create(path.join(tempDir, `auth-${Snowflake.next()}.db`));
-	authStorage.setRuntimeApiKey("openai", "test-key");
-	const model = getBundledModel("openai", "gpt-5-mini");
-	if (!model) throw new Error("Expected bundled openai/gpt-5-mini model");
-	const result = await createAgentSession({
-		cwd: tempDir,
-		agentDir: tempDir,
-		authStorage,
-		sessionManager: options.sessionManager ?? SessionManager.create(tempDir, tempDir),
-		model,
-		settings: Settings.isolated(),
-		disableExtensionDiscovery: true,
-		skills: [],
-		contextFiles: [],
-		promptTemplates: [],
-		slashCommands: [],
-		enableMCP: false,
-		enableLsp: false,
-		forkContextSeed: options.forkContextSeed,
-		providerSessionId: options.providerSessionId,
-		providerSessionState: options.providerSessionState,
-	});
-	return { session: result.session, authStorage };
+	// Register before the build so an aborted build still leaves a handle the
+	// cleanup can release.
+	openAuthStorages.push(authStorage);
+	try {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const model = getBundledModel("openai", "gpt-5-mini");
+		if (!model) throw new Error("Expected bundled openai/gpt-5-mini model");
+		const result = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			sessionManager: options.sessionManager ?? SessionManager.create(tempDir, tempDir),
+			model,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			deferOptionalModelRefresh: true,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+			forkContextSeed: options.forkContextSeed,
+			providerSessionId: options.providerSessionId,
+			providerSessionState: options.providerSessionState,
+		});
+		return { session: result.session };
+	} catch (error) {
+		// The caller never receives the store, so release it here instead of
+		// leaving a live handle behind for the cleanup to trip over. Closing
+		// twice is a no-op, so the registry entry can stay.
+		authStorage.close();
+		throw error;
+	}
 }
 async function withLifecycleIdentity<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
 	const previousRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
@@ -89,10 +142,10 @@ async function withLifecycleIdentity<T>(sessionId: string, run: () => Promise<T>
 describe("async job endpoint id derivation", () => {
 	const tempDirs: string[] = [];
 
-	afterEach(() => {
+	afterEach(async () => {
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
-			if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+			if (tempDir && fs.existsSync(tempDir)) await fsPromises.rm(tempDir, { recursive: true, force: true });
 		}
 	});
 
@@ -101,16 +154,32 @@ describe("async job endpoint id derivation", () => {
 		expect(asyncJobEndpointId("provider", "logical-id", undefined)).toBe("logical-id");
 	});
 
-	it("collapses symlink and dot-segment transcript aliases onto one endpoint key", () => {
+	it("keeps endpoint keys stable as a transcript is created and replaced", async () => {
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-endpoint-persist-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const sessionFile = path.join(tempDir, "session.jsonl");
+		const beforeCreate = asyncJobEndpointId("provider", "logical-id", sessionFile);
+
+		await Bun.write(sessionFile, "first");
+		expect(asyncJobEndpointId("provider", "logical-id", sessionFile)).toBe(beforeCreate);
+
+		await fsPromises.rm(sessionFile);
+		await Bun.write(sessionFile, "replacement");
+		expect(asyncJobEndpointId("provider", "logical-id", sessionFile)).toBe(beforeCreate);
+	});
+
+	it("collapses symlink and dot-segment transcript aliases onto one endpoint key", async () => {
 		if (process.platform === "win32") return;
-		const tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-alias-${Snowflake.next()}-`)));
+		const tempDir = await fsPromises.realpath(
+			await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-endpoint-alias-${Snowflake.next()}-`)),
+		);
 		tempDirs.push(tempDir);
 		const realDir = path.join(tempDir, "real");
-		fs.mkdirSync(realDir);
+		await fsPromises.mkdir(realDir);
 		const realFile = path.join(realDir, "session.jsonl");
-		fs.writeFileSync(realFile, "");
-		fs.symlinkSync(realDir, path.join(tempDir, "alias-dir"), "dir");
-		fs.symlinkSync(realFile, path.join(tempDir, "alias-file.jsonl"));
+		await Bun.write(realFile, "");
+		await fsPromises.symlink(realDir, path.join(tempDir, "alias-dir"), "dir");
+		await fsPromises.symlink(realFile, path.join(tempDir, "alias-file.jsonl"));
 
 		const canonical = asyncJobEndpointId("provider", "logical-id", realFile);
 		expect(canonical).toBe(JSON.stringify(["async-job-endpoint", "provider", realFile]));
@@ -125,10 +194,8 @@ describe("async job endpoint id derivation", () => {
 		);
 	});
 
-	it("keeps distinct transcripts and distinct provider scopes on distinct keys", () => {
-		const tempDir = fs.realpathSync(
-			fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-distinct-${Snowflake.next()}-`)),
-		);
+	it("keeps distinct transcripts and distinct provider scopes on distinct keys", async () => {
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-endpoint-distinct-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const first = path.join(tempDir, "a.jsonl");
 		const second = path.join(tempDir, "b.jsonl");
@@ -139,42 +206,177 @@ describe("async job endpoint id derivation", () => {
 			asyncJobEndpointId("provider-b", "logical-id", first),
 		);
 	});
+
+	it("keys Windows path aliases stably without merging case-sensitive files", async () => {
+		if (process.platform !== "win32") return;
+
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-endpoint-case-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const sessionFile1 = path.join(tempDir, "Session.jsonl");
+		const sessionFile2 = path.join(tempDir, "session.jsonl");
+		await Bun.write(sessionFile1, "first");
+		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
+
+		await Bun.write(sessionFile2, "second");
+		const distinctCaseSensitiveFiles = (await Bun.file(sessionFile1).text()) === "first";
+
+		const endpoint2 = asyncJobEndpointId("provider", "logical-id", sessionFile2);
+
+		// Case-insensitive Windows directories resolve aliases to the recorded
+		// entry spelling; case-sensitive directories allow distinct files and keys.
+		expect(endpoint1 === endpoint2).toBe(!distinctCaseSensitiveFiles);
+	});
 });
 
 describe("task fork-context provider identity", () => {
 	const sessions: AgentSession[] = [];
-	const authStorages: AuthStorage[] = [];
+	const artifactStores: ManagedSessionDescendantStore[] = [];
 	const tempDirs: string[] = [];
+	async function listTempTree(dir: string, prefix = ""): Promise<string[]> {
+		const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+		const paths: string[] = [];
+		for (const entry of entries) {
+			const relativePath = path.join(prefix, entry.name);
+			if (entry.isDirectory() && !entry.isSymbolicLink()) {
+				paths.push(`${relativePath}/`, ...(await listTempTree(path.join(dir, entry.name), relativePath)));
+			} else {
+				paths.push(relativePath);
+			}
+		}
+		return paths;
+	}
+	async function removeTempTree(dir: string): Promise<void> {
+		for (const entry of await fsPromises.readdir(dir, { withFileTypes: true })) {
+			const entryPath = path.join(dir, entry.name);
+			if (entry.isDirectory() && !entry.isSymbolicLink()) {
+				await removeTempTree(entryPath);
+			} else {
+				try {
+					await fsPromises.rm(entryPath, { force: true });
+				} catch (error) {
+					throw new Error(`Failed to remove entry ${entryPath}`, { cause: error });
+				}
+			}
+		}
+		try {
+			await fsPromises.rmdir(dir);
+		} catch (error) {
+			throw new Error(`Failed to remove directory ${dir}`, { cause: error });
+		}
+	}
 
 	afterEach(async () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
-		while (authStorages.length > 0) authStorages.pop()?.close();
+		releaseTrackedAuthStorages();
+		while (artifactStores.length > 0) artifactStores.pop()?.close();
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
-			if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+			if (!tempDir) continue;
+			const modelCacheClosed = closeModelCache(path.join(tempDir, "models.db"));
+			if (!fs.existsSync(tempDir)) continue;
+			try {
+				await removeTempTree(tempDir);
+			} catch (error) {
+				let remaining: string[];
+				try {
+					remaining = await listTempTree(tempDir);
+				} catch {
+					remaining = ["<unreadable>"];
+				}
+				const failure = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`Failed to remove ${tempDir}; failure=${failure}; cwd=${process.cwd()}; modelCacheClosed=${modelCacheClosed}; remaining=${JSON.stringify(remaining)}`,
+					{ cause: error },
+				);
+			}
+		}
+	}, 15_000);
+
+	it("canonicalizes an existing root alias before creating a missing managed descendant", async () => {
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-managed-root-alias-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const configuredRoot = path.join(tempDir, "managed-root");
+		await fsPromises.mkdir(configuredRoot);
+		const root = managedDirectoryRoot(configuredRoot);
+		const rootAlias = path.join(tempDir, "managed-root-alias");
+		await fsPromises.symlink(configuredRoot, rootAlias, process.platform === "win32" ? "junction" : "dir");
+
+		const store = new ManagedSessionDescendantStore(root, path.join(rootAlias, "artifacts"));
+		try {
+			expect(store.dir).toBe(path.join(root.canonicalPath, "artifacts"));
+		} finally {
+			store.close();
+		}
+	});
+
+	it("rejects a managed child replaced with a sibling-scope symlink", async () => {
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-managed-child-symlink-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const root = managedDirectoryRoot(tempDir);
+		const siblingPath = path.join(root.canonicalPath, "sibling-scope");
+		const preparedPath = path.join(root.canonicalPath, "prepared-scope");
+		await fsPromises.mkdir(siblingPath, { mode: 0o700 });
+		await fsPromises.mkdir(preparedPath, { mode: 0o700 });
+		await fsPromises.rmdir(preparedPath);
+		await fsPromises.symlink(siblingPath, preparedPath, process.platform === "win32" ? "junction" : "dir");
+
+		expect(() => new ManagedSessionDescendantStore(root, preparedPath)).toThrow(/symlink/i);
+	});
+
+	it("canonicalizes a retained authority base before deriving a descendant path", async () => {
+		if (process.platform !== "linux") return;
+
+		const tempDir = await fsPromises.mkdtemp(
+			path.join(os.tmpdir(), `pi-managed-retained-alias-${Snowflake.next()}-`),
+		);
+		tempDirs.push(tempDir);
+		const configuredRoot = path.join(tempDir, "managed-root");
+		await fsPromises.mkdir(configuredRoot, { mode: 0o700 });
+		const root = managedDirectoryRoot(configuredRoot);
+		const rootAlias = path.join(tempDir, "managed-root-alias");
+		await fsPromises.symlink(configuredRoot, rootAlias, "dir");
+		const artifactsDir = path.join(root.canonicalPath, "artifacts");
+		await fsPromises.mkdir(artifactsDir, { mode: 0o700 });
+
+		const parentStore = new ManagedSessionDescendantStore(root, root.canonicalPath);
+		const retainedAuthority = parentStore.retainAuthority();
+		if (!retainedAuthority) throw new Error("Expected the Linux managed store to retain its authority");
+		try {
+			const childStore = new ManagedSessionDescendantStore(root, path.join(rootAlias, "artifacts"), {
+				authority: retainedAuthority,
+				authorityBaseDir: rootAlias,
+			});
+			try {
+				expect(childStore.dir).toBe(artifactsDir);
+			} finally {
+				childStore.close();
+			}
+		} finally {
+			retainedAuthority.close();
+			parentStore.close();
 		}
 	});
 
 	it("gives nested managed children distinct provider identities without rewriting logical headers", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-cache-key-${Snowflake.next()}-`));
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-cache-key-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
-		const { session: parent, authStorage: parentAuth } = await createSession(tempDir);
+		const { session: parent } = await createSession(tempDir);
 		sessions.push(parent);
-		authStorages.push(parentAuth);
 		parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
 		const seedA = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
 		const seedB = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
 		expect(seedA.metadata.includedMessages).toBeGreaterThan(0);
 
-		const artifactsDir = path.join(tempDir, "artifacts");
-		const artifacts = new ArtifactManager(
-			new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
-		);
+		const root = managedDirectoryRoot(tempDir);
+		const artifactsDir = path.join(root.canonicalPath, "artifacts");
+		const artifactStore = new ManagedSessionDescendantStore(root, artifactsDir);
+		artifactStores.push(artifactStore);
+		const artifacts = new ArtifactManager(artifactStore);
 		const childAProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-child-a"]);
 		const childBProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "1-child-b"]);
 		const childAPersistence = createManagedTaskPersistence(artifacts, "0-child-a");
 		const childBPersistence = createManagedTaskPersistence(artifacts, "1-child-b");
-		const [{ session: childA, authStorage: authA }, { session: childB, authStorage: authB }] = await Promise.all([
+		const [{ session: childA }, { session: childB }] = await Promise.all([
 			createSession(tempDir, {
 				forkContextSeed: seedA,
 				providerSessionId: childAProviderSessionId,
@@ -187,7 +389,6 @@ describe("task fork-context provider identity", () => {
 			}),
 		]);
 		sessions.push(childA, childB);
-		authStorages.push(authA, authB);
 
 		expect(childA.messages.slice(0, seedA.agentMessages.length)).toEqual(seedA.agentMessages);
 		expect(childA.sessionManager.getSessionFile()).toBe(path.join(artifactsDir, "0-child-a.jsonl"));
@@ -202,26 +403,25 @@ describe("task fork-context provider identity", () => {
 	}, 15_000);
 
 	it("keeps a nested managed child provider identity across detached resume", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-detached-resume-${Snowflake.next()}-`));
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-detached-resume-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
-		const { session: parent, authStorage: parentAuth } = await createSession(tempDir);
+		const { session: parent } = await createSession(tempDir);
 		sessions.push(parent);
-		authStorages.push(parentAuth);
 		parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
 		const seed = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
-		const artifactsDir = path.join(tempDir, "artifacts");
-		const artifacts = new ArtifactManager(
-			new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
-		);
+		const root = managedDirectoryRoot(tempDir);
+		const artifactsDir = path.join(root.canonicalPath, "artifacts");
+		const artifactStore = new ManagedSessionDescendantStore(root, artifactsDir);
+		artifactStores.push(artifactStore);
+		const artifacts = new ArtifactManager(artifactStore);
 		const persistence = createManagedTaskPersistence(artifacts, "0-resumable-child");
 		const childProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-resumable-child"]);
-		const { session: child, authStorage: childAuth } = await createSession(tempDir, {
+		const { session: child } = await createSession(tempDir, {
 			forkContextSeed: seed,
 			providerSessionId: childProviderSessionId,
 			sessionManager: await withLifecycleIdentity(parent.sessionId, () => persistence.openSession(tempDir)),
 		});
 		sessions.push(child);
-		authStorages.push(childAuth);
 		expect(child.agent.providerSessionId).toBe(childProviderSessionId);
 		const persistedTurn: Message = {
 			role: "user",
@@ -234,13 +434,12 @@ describe("task fork-context provider identity", () => {
 		await child.sessionManager.flush();
 		await child.dispose();
 
-		const { session: resumed, authStorage: resumedAuth } = await createSession(tempDir, {
+		const { session: resumed } = await createSession(tempDir, {
 			forkContextSeed: seed,
 			providerSessionId: childProviderSessionId,
 			sessionManager: await withLifecycleIdentity(parent.sessionId, () => persistence.openSession(tempDir)),
 		});
 		sessions.push(resumed);
-		authStorages.push(resumedAuth);
 
 		expect(resumed.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
 		expect(resumed.agent.providerSessionId).toBe(childProviderSessionId);
@@ -251,53 +450,70 @@ describe("task fork-context provider identity", () => {
 	}, 15_000);
 
 	it("honors an explicit providerSessionId over the fork seed and logical id", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-explicit-id-${Snowflake.next()}-`));
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-explicit-id-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
-		const { session, authStorage } = await createSession(tempDir, {
+		const { session } = await createSession(tempDir, {
 			forkContextSeed: createHandBuiltSeed(),
 			providerSessionId: "explicit-provider-session",
 		});
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		expect(session.agent.providerSessionId).toBe("explicit-provider-session");
-	});
+	}, 15_000);
 
 	it("keeps top-level async ownership isolated when provider affinity is shared", async () => {
-		const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-shared-provider-a-${Snowflake.next()}-`));
-		const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-shared-provider-b-${Snowflake.next()}-`));
+		const firstDir = await fsPromises.mkdtemp(
+			path.join(os.tmpdir(), `pi-task-shared-provider-a-${Snowflake.next()}-`),
+		);
+		const secondDir = await fsPromises.mkdtemp(
+			path.join(os.tmpdir(), `pi-task-shared-provider-b-${Snowflake.next()}-`),
+		);
 		tempDirs.push(firstDir, secondDir);
-		const [{ session: first, authStorage: firstAuth }, { session: second, authStorage: secondAuth }] =
-			await Promise.all([
-				createSession(firstDir, { providerSessionId: "shared-provider-affinity" }),
-				createSession(secondDir, { providerSessionId: "shared-provider-affinity" }),
-			]);
+		const [{ session: first }, { session: second }] = await Promise.all([
+			createSession(firstDir, { providerSessionId: "shared-provider-affinity" }),
+			createSession(secondDir, { providerSessionId: "shared-provider-affinity" }),
+		]);
 		sessions.push(first, second);
-		authStorages.push(firstAuth, secondAuth);
 
 		expect(first.agent.providerSessionId).toBe("shared-provider-affinity");
 		expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
 		expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
-	});
+	}, 15_000);
 
 	it("rekeys explicit provider ownership to the successor transcript and frees the predecessor", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`));
+		const tempDir = await fsPromises.mkdtemp(
+			path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const providerSessionId = "shared-provider-affinity";
-		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+		const { session } = await createSession(tempDir, { providerSessionId });
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const previousSessionId = session.sessionManager.getSessionId();
 		const previousSessionFile = session.sessionManager.getSessionFile();
 		expect(previousSessionFile).toBeDefined();
+		expect(fs.existsSync(previousSessionFile!)).toBe(false);
 		const previousEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
-			resolveEquivalentPath(path.resolve(previousSessionFile!)),
+			stablePathKey(path.resolve(previousSessionFile!)),
 		]);
 		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
 		expect(manager).toBeDefined();
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: "persist endpoint identity",
+			timestamp: Date.now(),
+		});
+		await session.sessionManager.ensureOnDisk();
+		await session.sessionManager.flush();
+		expect(fs.existsSync(previousSessionFile!)).toBe(true);
+		expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
+		await session.sessionManager.rewriteEntries();
+		expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
 
 		expect(await session.newSession()).toBe(true);
 		const successorSessionFile = session.sessionManager.getSessionFile();
@@ -306,7 +522,7 @@ describe("task fork-context provider identity", () => {
 		const successorEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
-			resolveEquivalentPath(path.resolve(successorSessionFile!)),
+			stablePathKey(path.resolve(successorSessionFile!)),
 		]);
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
@@ -315,22 +531,20 @@ describe("task fork-context provider identity", () => {
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
 
-		const { session: reopened, authStorage: reopenedAuth } = await createSession(tempDir, {
+		const { session: reopened } = await createSession(tempDir, {
 			providerSessionId,
 			sessionManager: await SessionManager.open(successorSessionFile!),
 		});
 		sessions.push(reopened);
-		authStorages.push(reopenedAuth);
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeDefined();
 	}, 15_000);
 
 	it("registers construction-time ownership under the shared canonical endpoint key", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`));
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const providerSessionId = "aliased-provider-affinity";
-		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+		const { session } = await createSession(tempDir, { providerSessionId });
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		// The constructor must register under exactly the key the transition path
 		// recomputes; any divergence strands ownership on the first transition.
@@ -357,15 +571,82 @@ describe("task fork-context provider identity", () => {
 	}, 15_000);
 
 	it("does not share mutable provider state unless explicitly supplied", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-state-${Snowflake.next()}-`));
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-provider-state-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const parentState = new Map<string, ProviderSessionState>();
 		parentState.set("openai-responses:openai", { close: () => {} });
-		const { session, authStorage } = await createSession(tempDir, { forkContextSeed: createHandBuiltSeed() });
+		const { session } = await createSession(tempDir, { forkContextSeed: createHandBuiltSeed() });
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		expect(session.providerSessionState).not.toBe(parentState);
 		expect(session.providerSessionState.size).toBe(0);
-	});
+	}, 15_000);
+
+	it("registers the credential store before the session build so an aborted build still releases it", async () => {
+		const tempDir = await fsPromises.mkdtemp(
+			path.join(os.tmpdir(), `pi-task-store-registration-${Snowflake.next()}-`),
+		);
+		tempDirs.push(tempDir);
+		const before = openAuthStorages.length;
+		const manager = SessionManager.create(tempDir, tempDir);
+		let observedDuringBuild = -1;
+		const observed = new Proxy(manager, {
+			get(target, property) {
+				const value = Reflect.get(target, property);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					if (observedDuringBuild < 0) observedDuringBuild = openAuthStorages.length;
+					return (value as (...a: unknown[]) => unknown).apply(target, args);
+				};
+			},
+		});
+		const { session } = await createSession(tempDir, { sessionManager: observed });
+		sessions.push(session);
+
+		// The store must already be tracked while the build runs: a build that
+		// never settles is aborted by the runner, so the cleanup is the only
+		// thing that can still release the SQLite handle.
+		expect(observedDuringBuild).toBe(before + 1);
+	}, 15_000);
+
+	it("releases every tracked credential store on cleanup", async () => {
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-store-release-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const authStorage = await AuthStorage.create(path.join(tempDir, `auth-${Snowflake.next()}.db`));
+		openAuthStorages.push(authStorage);
+
+		releaseTrackedAuthStorages();
+
+		// A released store refuses further work on its closed database.
+		expect(() => authStorage.allocateMonotonicSequence("probe", 60)).toThrow(/closed database/i);
+	}, 15_000);
+
+	it("releases the credential store when the session build fails", async () => {
+		const tempDir = await fsPromises.mkdtemp(
+			path.join(os.tmpdir(), `pi-task-store-build-failure-${Snowflake.next()}-`),
+		);
+		tempDirs.push(tempDir);
+		const manager = SessionManager.create(tempDir, tempDir);
+		const failing = new Proxy(manager, {
+			get(target, property) {
+				if (property === "getSessionId") {
+					return () => {
+						throw new Error("forced session build failure");
+					};
+				}
+				const value = Reflect.get(target, property);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => (value as (...a: unknown[]) => unknown).apply(target, args);
+			},
+		});
+
+		await expect(createSession(tempDir, { sessionManager: failing })).rejects.toThrow("forced session build failure");
+
+		// The caller never receives the store, so the failure path has to
+		// release it: an open handle keeps the database file locked and the
+		// temp tree can no longer be removed.
+		const store = openAuthStorages[openAuthStorages.length - 1];
+		expect(store).toBeDefined();
+		expect(() => store?.allocateMonotonicSequence("probe", 60)).toThrow(/closed database/i);
+	}, 15_000);
 });

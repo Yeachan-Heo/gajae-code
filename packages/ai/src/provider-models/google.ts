@@ -1,5 +1,5 @@
 import type { ModelManagerOptions } from "../model-manager";
-import { fetchAntigravityDiscoveryModels } from "../utils/discovery/antigravity";
+import { fetchAntigravityDiscoveryModels, getDefaultAntigravityUserAgent } from "../utils/discovery/antigravity";
 import { fetchGeminiModels } from "../utils/discovery/gemini";
 
 export interface GoogleModelManagerConfig {
@@ -14,11 +14,13 @@ export interface GoogleVertexModelManagerConfig {
 export interface GoogleAntigravityModelManagerConfig {
 	oauthToken?: string;
 	endpoint?: string;
+	project?: string;
 }
 
 export interface GoogleGeminiCliModelManagerConfig {
 	oauthToken?: string;
 	endpoint?: string;
+	project?: string;
 }
 
 const CLOUD_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
@@ -48,14 +50,18 @@ export function googleAntigravityModelManagerOptions(
 	config?: GoogleAntigravityModelManagerConfig,
 ): ModelManagerOptions<"google-gemini-cli"> {
 	const token = config?.oauthToken;
+	const ua = getDefaultAntigravityUserAgent();
 	return {
 		providerId: "google-antigravity",
+		discoveryUserAgent: ua,
 		...(token
 			? {
 					fetchDynamicModels: () =>
 						fetchAntigravityDiscoveryModels({
 							token,
 							endpoint: config?.endpoint,
+							project: config?.project,
+							userAgent: ua,
 						}),
 				}
 			: undefined),
@@ -67,15 +73,19 @@ export function googleGeminiCliModelManagerOptions(
 ): ModelManagerOptions<"google-gemini-cli"> {
 	const token = config?.oauthToken;
 	const endpoint = config?.endpoint ?? CLOUD_CODE_ASSIST_ENDPOINT;
+	const ua = getDefaultAntigravityUserAgent();
 	return {
 		providerId: "google-gemini-cli",
+		discoveryUserAgent: ua,
 		...(token
 			? {
 					fetchDynamicModels: async () => {
 						const models = await fetchAntigravityDiscoveryModels({
 							token,
 							endpoint,
+							project: config?.project,
 							targetProvider: "google-gemini-cli",
+							userAgent: ua,
 						});
 						if (models === null) {
 							return null;

@@ -121,6 +121,19 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
+	it("does not timer-fold a timed-out command when auto-background is disabled", async () => {
+		harness = createSteerHarness(cwd, { autoBackgroundEnabled: false });
+		const startedAt = Date.now();
+		await expect(
+			new BashTool(harness.session).execute("timeout-without-auto-background", {
+				command: "trap '' TERM; sleep 4; echo done",
+				timeout: 1,
+			}),
+		).rejects.toThrow("Command timed out after 1 seconds");
+		expect(Date.now() - startedAt).toBeLessThan(2_500);
+		expect(harness.folds).toHaveLength(0);
+	}, 10_000);
+
 	it("parity 2: an early steer does not blind the watcher to a later qualifying steer", async () => {
 		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);

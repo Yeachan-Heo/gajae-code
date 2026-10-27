@@ -51,6 +51,8 @@ import {
 import {
 	getExtensionHandlerRegistrationOrder,
 	getFunctionHookRegistration,
+	getProviderRequestHandlerProvider,
+	isSdkLifecycleObserver,
 	readConstrainedFunctionHookFile,
 } from "./function-hooks-internal";
 import type {
@@ -192,11 +194,24 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 type Handler = Extension["handlers"] extends Map<string, Array<infer T>> ? T : never;
 type IndexedHandler = { ext: Extension; handler: Handler; registrationOrder: number };
 type IndexedFunctionHook = IndexedHandler & { registration: FunctionHookRegistration };
+type CommandAliasTarget = { extensionPath: string; commandName: string };
 
 export type FunctionHookDispatchResult<TEvent extends ExtensionEvent> =
 	| { action: "continue"; event: TEvent; transformed?: boolean }
-	| { action: "deny"; reason: string }
+	| { action: "deny"; reason: string; failed?: true }
 	| { action: "return"; value: unknown };
+
+/**
+ * `tool_result` mediation outcomes the runner synthesized from a failing or
+ * malformed hook rather than from an extension's own decision. Callers use
+ * {@link isFailedToolResultMediation} to keep those classified as faults.
+ */
+const failedToolResultMediations = new WeakSet<ToolResultEventResult>();
+
+/** True when a `tool_result` mediation result reports a hook failure, not an extension verdict. */
+export function isFailedToolResultMediation(result: ToolResultEventResult): boolean {
+	return failedToolResultMediations.has(result);
+}
 
 export type FunctionHookAuditSink = (record: FunctionHookAuditRecord) => void;
 
@@ -272,6 +287,7 @@ export class ExtensionRunner {
 	#getCredentialSessionId: () => string = () => "";
 	#isIdleFn: () => boolean = () => true;
 	#getActivePromptHandleFn: () => string | undefined = () => undefined;
+	#getSessionWorkLeaseFn: ExtensionContextActions["getSessionWorkLease"] = undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void | Promise<void> = () => {};
 	#abortPromptAndWaitFn: NonNullable<ExtensionContextActions["abortPromptAndWait"]> = async () => {
@@ -311,6 +327,7 @@ export class ExtensionRunner {
 	#getArtifactRangeFn: ExtensionContextActions["getArtifactRange"] = undefined;
 
 	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
+	#getProjectProgressFn: ExtensionContextActions["getProjectProgress"] = undefined;
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
@@ -328,6 +345,9 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	#commandAliases = new Map<string, RegisteredCommand>();
+	#commandAliasAssignments = new Map<string, string>();
+	#commandAliasTargets = new Map<string, CommandAliasTarget>();
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -424,6 +444,7 @@ export class ExtensionRunner {
 		this.#getCredentialSessionId = contextActions.getCredentialSessionId ?? (() => "");
 		this.#isIdleFn = contextActions.isIdle;
 		this.#getActivePromptHandleFn = contextActions.getActivePromptHandle ?? (() => undefined);
+		this.#getSessionWorkLeaseFn = contextActions.getSessionWorkLease;
 		this.#abortFn = contextActions.abort;
 		this.#abortPromptAndWaitFn =
 			contextActions.abortPromptAndWait ??
@@ -464,6 +485,7 @@ export class ExtensionRunner {
 		this.#getArtifactRangeFn = contextActions.getArtifactRange;
 
 		this.#getJobsFn = contextActions.getJobs;
+		this.#getProjectProgressFn = contextActions.getProjectProgress;
 		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#onSessionEventFn = contextActions.onSessionEvent;
 		this.#sdkControlFn = contextActions.sdkControl;
@@ -701,16 +723,49 @@ export class ExtensionRunner {
 
 	getRegisteredCommands(reserved?: Set<string>): RegisteredCommand[] {
 		this.#commandDiagnostics = [];
+		this.#commandAliases.clear();
 
 		const commands = new Map<string, RegisteredCommand>();
 		for (const ext of this.extensions) {
 			for (const command of ext.commands.values()) {
 				if (reserved?.has(command.name)) {
-					const message = `Extension command '${command.name}' from ${ext.path} conflicts with built-in commands. Skipping.`;
-					this.#commandDiagnostics.push({ type: "warning", message, path: ext.path });
-					if (!this.hasUI()) {
-						logger.warn(message);
+					const assignmentKey = `${ext.path}\u0000${command.name}`;
+					let alias = this.#commandAliasAssignments.get(assignmentKey);
+					const aliasTarget = alias ? this.#commandAliasTargets.get(alias) : undefined;
+					const aliasOwnedByCommand =
+						aliasTarget?.extensionPath === ext.path && aliasTarget.commandName === command.name;
+					if (
+						!alias ||
+						reserved.has(alias) ||
+						commands.has(alias) ||
+						(aliasTarget !== undefined && !aliasOwnedByCommand)
+					) {
+						let candidate = alias ?? `extension:${command.name}`;
+						while (
+							reserved.has(candidate) ||
+							commands.has(candidate) ||
+							this.#commandAliases.has(candidate) ||
+							(this.#commandAliasTargets.has(candidate) &&
+								(this.#commandAliasTargets.get(candidate)?.extensionPath !== ext.path ||
+									this.#commandAliasTargets.get(candidate)?.commandName !== command.name))
+						)
+							candidate = `extension:${candidate}`;
+						if (
+							alias &&
+							this.#commandAliasTargets.get(alias)?.extensionPath === ext.path &&
+							this.#commandAliasTargets.get(alias)?.commandName === command.name
+						) {
+							this.#commandAliasTargets.delete(alias);
+						}
+						alias = candidate;
+						this.#commandAliasAssignments.set(assignmentKey, alias);
 					}
+					this.#commandAliasTargets.set(alias, { extensionPath: ext.path, commandName: command.name });
+					const namespaced = { ...command, name: alias };
+					this.#commandAliases.set(alias, namespaced);
+					commands.set(alias, namespaced);
+					const message = `Extension command '${command.name}' from ${ext.path} was renamed to '${alias}' to avoid a built-in command collision.`;
+					this.#commandDiagnostics.push({ type: "info", message, path: ext.path });
 					continue;
 				}
 
@@ -725,6 +780,14 @@ export class ExtensionRunner {
 	}
 
 	getCommand(name: string): RegisteredCommand | undefined {
+		const aliased = this.#commandAliases.get(name);
+		if (aliased) return aliased;
+		const aliasTarget = this.#commandAliasTargets.get(name);
+		if (aliasTarget) {
+			const extension = this.extensions.find(ext => ext.path === aliasTarget.extensionPath);
+			const command = extension?.commands.get(aliasTarget.commandName);
+			if (command) return { ...command, name };
+		}
 		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
 			const command = this.extensions[index]?.commands.get(name);
 			if (command) {
@@ -754,6 +817,7 @@ export class ExtensionRunner {
 				return getModel();
 			},
 			getActivePromptHandle: () => this.#getActivePromptHandleFn(),
+			getSessionWorkLease: () => this.#getSessionWorkLeaseFn?.(),
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
 			abortPromptAndWait: (handle, options) => this.#abortPromptAndWaitFn(handle, options),
@@ -788,6 +852,7 @@ export class ExtensionRunner {
 			getArtifactRange: (id, offset, length) => this.#getArtifactRangeFn?.(id, offset, length),
 
 			getJobs: () => this.#getJobsFn?.(),
+			...(this.#getProjectProgressFn ? { getProjectProgress: this.#getProjectProgressFn } : {}),
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
@@ -807,6 +872,7 @@ export class ExtensionRunner {
 				...(this.#getExtensionsFn ? ["getExtensions"] : []),
 				...(this.#getArtifactRangeFn ? ["getArtifactRange"] : []),
 				...(this.#getJobsFn ? ["getJobs"] : []),
+				...(this.#getProjectProgressFn ? ["getProjectProgress"] : []),
 				...(this.#onJobFoldFn ? ["onJobFold"] : []),
 				...(this.#sdkControlFn ? ["sdkControl"] : []),
 				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
@@ -854,6 +920,13 @@ export class ExtensionRunner {
 		const wildcard = this.#handlersByEvent.get("*") ?? [];
 		const matches: IndexedHandler[] = [];
 		for (const indexed of [...exact, ...wildcard]) {
+			const provider = getProviderRequestHandlerProvider(indexed.handler);
+			if (
+				event.type === "before_provider_request" &&
+				provider !== undefined &&
+				this.createContext().model?.provider !== provider
+			)
+				continue;
 			const registration = getFunctionHookRegistration(indexed.handler);
 			if (!registration) {
 				if (includeLegacyToolHandlers && indexed.registrationOrder >= 0 && exact.includes(indexed))
@@ -932,7 +1005,7 @@ export class ExtensionRunner {
 			event.type === "before_provider_request" ||
 			event.type.startsWith("session_before_")
 		) {
-			return { action: "deny", reason };
+			return { action: "deny", reason, failed: true };
 		}
 		return { action: "continue", event };
 	}
@@ -1012,7 +1085,8 @@ export class ExtensionRunner {
 		if (handlers.length === 0) return { action: "continue", event };
 		const includesLegacy = handlers.some(indexed => getFunctionHookRegistration(indexed.handler) === undefined);
 		if (includesLegacy) this.#requireScopeOrFailClosed(options.scope, event.type);
-		this.#markAttemptExecuted(options.scope);
+		if (handlers.some(indexed => event.type !== "agent_start" || !isSdkLifecycleObserver(indexed.handler)))
+			this.#markAttemptExecuted(options.scope);
 		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
 		if (functionHookDepth >= 16) {
 			const reason = "Function hook re-entry depth exceeded";
@@ -1056,7 +1130,8 @@ export class ExtensionRunner {
 				let nextPromise: Promise<FunctionHookDispatchResult<TEvent>> | undefined;
 				let nextReturnValue: FunctionHookResult | undefined;
 				const failureResult = async (reason: string): Promise<FunctionHookDispatchResult<TEvent>> => {
-					if (functionHookDenyAllowed(currentEvent, effectiveGrant)) return { action: "deny", reason };
+					if (functionHookDenyAllowed(currentEvent, effectiveGrant))
+						return { action: "deny", reason, failed: true };
 					if (wildcard) {
 						if (nextPromise) return await nextPromise;
 						return await invoke(index + 1, currentEvent, downstreamRemoved, chainSignal);
@@ -1473,11 +1548,13 @@ export class ExtensionRunner {
 			},
 		);
 		if (functionDispatch.action === "deny") {
-			return {
+			const denied: ToolResultEventResult = {
 				content: [{ type: "text", text: functionDispatch.reason }],
 				details: event.details,
 				isError: true,
 			};
+			if (functionDispatch.failed) failedToolResultMediations.add(denied);
+			return denied;
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolResultEventResult;
 		if (functionDispatch.transformed !== true) return undefined;

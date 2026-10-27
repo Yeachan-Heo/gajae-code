@@ -2,6 +2,201 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- `astMatch` runs ast-grep patterns against an in-memory source string with an explicit language (a language alias, or a file extension resolved like a path's, e.g. `scss` as CSS), returning paged matches, the total match count, and non-fatal parse diagnostics.
+
+### Fixed
+
+- Expose Windows `access_denied` in canonical-directory identity and owner-only security result types so callers represent ACL-denied operations and classify them accurately (issue #6618).
+- Add handle-derived exact unlink for empty staged files whose host-side identity capture fails, preserving replacement files installed at the original pathname.
+
+- Native builds reject `CROSS_TARGET`, `TARGET_PLATFORM`, and `TARGET_ARCH` values that would place the addon or the temporary build directory outside the package `native` directory.
+
+- Report a denied staged-source or destination-parent open in Windows `renameNoReplacePath` as a pre-mutation `access_denied` instead of `owner_mismatch`, so file-lock publication retries the transient denial rather than failing with `Failed to publish file lock: owner_mismatch` (for example `terminal_persistence` notices on cloud-synced or Administrators-owned `.gjc` directories).
+
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Keep local native builds from rewriting the checked-in diagnostic artifact manifest; CI and distribution builds continue updating the trusted record. Local-only embedding verifies the ignored digest without requiring a fresh release manifest, omits stale unused local variants, and keeps mixed/release builds strict. Compiled binaries carry the verified digest and refresh same-sized stale addon caches on rebuild.
+
+- Report Windows retained-replacement `STATUS_ACCESS_DENIED` as `access_denied` and retry transient access-denied or sharing-violation renames within the bounded pre-mutation retry window.
+
+- Reject encodeSixel requests above 4096 pixels on a side or 8000000 pixels in total before the image is resized.
+
+- Reject SVG image elements and bound SVG/SVGZ source size, element count, attributes, and nesting before native rasterization.
+
+- The native loader accepts Windows ARM64 and looks for `pi_natives.win32-arm64.node`.
+- On Windows, `libunwind.dll` beside the installed addon is loaded after the `.node` file is copied into the versioned cache.
+
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- Export a Windows ordinal case-folding primitive for filesystem-aware path identity.
+
+### Fixed
+
+- Use volume capabilities as a conservative fallback when per-directory case flags are unsupported.
+
+## [0.18.8] - 2026-10-08
+
+### Added
+
+- Add a no-follow native empty-directory snapshot that stops at the first child and revalidates root and parent identities without recursive traversal or payload hashing.
+
+### Changed
+
+- Hash the file descriptor already exclusively owned by exact regular-file matching rather than duplicating it, preserving no-follow, byte, identity and post-hash pathname validation with deterministic descriptor cleanup.
+
+### Fixed
+
+- Avoid redundant ancestor metadata probes during POSIX exact deletion while retaining a fresh no-follow directory open for every ancestor, exact parent and file validation, and quarantine safeguards. Failed opens remain failures; symlink diagnostics never authorize retries or deletion.
+
+- Refresh the Darwin ARM64 diagnostic artifact descriptor from a genuine current-source native build after the strict native prerequisite changes. Digest and version validation remain enforced.
+
+- Accept Windows managed roots owned by the built-in Administrators group after elevated setup, while continuing to reject other owner SIDs and validate the root DACL.
+
+## [0.18.7] - 2026-10-04
+
+### Fixed
+
+- Keep owner-only native acquisition policy checks compatible with strict macOS Clippy and regenerate matching diagnostic-artifact provenance without relaxing readonly security or loader validation.
+
+## [0.18.6] - 2026-10-03
+
+### Fixed
+
+- `embed-native --reset` restores the constant null stub before the provenance gate runs, so an untrusted artifact in the directory can no longer block unembedding. Normal embedding still verifies the trusted record before any `require` or output mutation.
+- The non-Darwin diagnostic snapshot stubs are lint-clean opaque types with `const` unsupported answers instead of uninhabited enums, and `NativeDiagnosticSnapshot.close` releases the lease without an explicit drop of a non-`Drop` value.
+- The unsupported lease stubs keep their method receivers, with the `unused_self` suppression scoped to those two methods so the lease API stays identical on every target.
+- Diagnostic loader, provenance and CI-shell test fixtures create their workspaces under the canonical absolute `os.tmpdir()`, so an unset `TMPDIR` no longer produces a relative path that the deletion guard refuses.
+
+- Restored whole-block fuzzy `findMatch` speed after the pi-edit integration: content lines are normalized once per search and each target line is scored with a bit-parallel UTF-16 Levenshtein, so scores stay byte-identical while the scan is about 4x faster.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+### Fixed
+
+- Fixed flaky thread count assertion in walker pool unavailability test by moving the before-measurement snapshot to immediately before the glob operation, minimizing the time window for unrelated Bun/Tokio background workers to spawn and ensuring the measurement reflects only thread changes caused by the glob itself.
+
+- Restored TypeScript/TSX highlighting speed: `ts`/`tsx` go back to syntect's JavaScript grammar instead of the pinned upstream TypeScript grammars, which made first-use syntax loading ~60x slower (~600ms) and each TypeScript highlight ~3x slower (diff rendering 48ms → 160ms on an 86-hunk edit). Astro frontmatter and expressions now embed the JavaScript grammar.
+
+## [0.18.1] - 2026-09-29
+
+### Fixed
+
+- `MacAppearanceObserver.stop()` no longer hangs forever when called right after `start()`: a stop that arrived before the observer thread entered its run loop was lost.
+- `detectMacOSAppearance()` is no longer wrapped in a work-profile region, whose bookkeeping added ~7% to the sub-microsecond query.
+
+- Restored `glob`/`find` speed on large trees: the walker's collect path re-summed every retained path on each new entry, so a 40k-entry scan took ~1.5s (even from the scan cache) instead of ~0.2s.
+
+- macOS directory scans use `getattrlistbulk` again: the attribute request lacked `ATTR_CMN_RETURNED_ATTRS`, so the kernel rejected it and every directory fell back to `std::fs::read_dir`.
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Added the native Mermaid-to-ASCII renderer for flowcharts, sequence, class, ER, state, and XY chart diagrams.
+
+- Add the asynchronous `pdfToMarkdown` native binding backed by the MIT `pdf-inspector` dependency's default features, returning Markdown, document metadata, and pages needing OCR without bundling OCR engines.
+
+- The native power assertion is now exported as `PowerAssertion` and prevents sleep through macOS IOKit, Linux login1/desktop ScreenSaver, and Windows execution-state APIs, using a GJC identity and `power.start`/`power.stop` profile regions.
+
+- Full-language native AST support now includes Emacs Lisp and Fortran; default-language builds keep their existing language set and Perl remains gated by `full-langs`.
+- AST search/edit now accepts multi-node JSON pair patterns and collapses byte-identical rewrite edits, avoiding false overlap errors when patterns produce the same replacement.
+
+- Added lazy native diff exports for line runs, line changes, word changes, structured-patch hunks, and streaming diffs, backed by the pinned MIT-licensed `pi-diff` crate.
+
+- Add native SVG/SVGZ-to-PNG rasterization for bounded image previews.
+
+- Added the Unix-only `TtyWriter` N-API class, which queues UTF-8 output to a dedicated thread, tracks pending bytes, detects dead terminal fds, and supports bounded exit flushing.
+
+### Changed
+
+- Re-synced pi-shell output decoding with the pinned upstream implementation. UTF-8 remains preferred; Windows output switches to the system ANSI code page after invalid UTF-8. Local output budgets, truncation reporting, process cancellation, minimizer captures, and shell callbacks remain in place. Recorded shell-output goldens are checked in `phase3-shell-golden.test.ts`; shell builtin divergences are explicitly listed in `fixtures/goldens/accepted-divergences.json`.
+- Reconciled brush base builtins change-by-change while keeping `brush-builtins-vendored` as the shell's provider: `cd -P -e`, non-terminal `read -e`/`read -i`, symbolic umasks, `unset -n`, local `declare -I`, `jobs`, `enable`, multi-operand `command -v`/`-V`, completion diagnostics, and `mapfile -C`/`-c`. `true`, `false`, and `:` now have manual pages.
+- Deliberately not adopted: `history`, `pwd`, `hash`, `type`, `pushd`, `popd`, and `test` changes require a pi-vfs-backed async filesystem API that the local brush-core fork does not expose; pi-vfs remains internal to pi-shell. `fc` editor mode remains unavailable because the local pi-shell does not materialize brush history. The `exec` subshell-spawn change and upstream `kill`/`wait` expansions are not adopted because their newer process/job APIs do not preserve GJC's process-observation and cancellation contracts. Utility builtins remain excluded under the accepted D3 dependency decision.
+
+- Build the native addon with Rust `nightly-2026-08-12` and align shared Cargo dependencies with the pinned upstream tracked in `docs/rust-porting-inventory.md` (html-to-markdown-rs 3.x, icy_sixel 0.7, brush-parser 0.4, phf 0.14, similar 3.2, smallvec 1.16, dashmap 6.2, tree-sitter-cmake 0.7.5, tree-sitter-r 1.3, syntect with bundled themes and YAML syntax loading).
+- `htmlToMarkdown` now uses html-to-markdown-rs 3.x and fails with `Conversion error` when the document exceeds the converter's nesting depth, instead of returning truncated markdown.
+- `encodeSixel` output now starts with a SIXEL raster-attributes header (`"1;1;<width>;<height>`), so terminals size the image before drawing it.
+
+- Native isolation now exposes selective copy-on-write tree cloning for APFS, Linux FICLONE, and Windows block-clone backends. Unsupported backends report an explicit unavailable error; local Windows dependency features and secure plain-tree diff traversal remain intact.
+
+- `glob` now uses the shared native filesystem walker and its bounded scan/cache policy, preserving stable sorted results across ignore rules, symlinks, and large directories.
+- Walker Rayon pool initialization now fails closed to serial work; `walkerPoolStatus()` exposes a non-forcing diagnostic, and native load failures during discovery no longer become empty results.
+
+- `fuzzyFind` and `listWorkspace` now use the shared filesystem walker while retaining their existing result shapes and pinned pre-sync behavior for hidden, ignored, symlinked, and large directory trees.
+
+- Re-synced native `grep`, `search`, and `hasMatch` with the pinned walker-based implementation. Regex lookarounds and backreferences use a statically bundled PCRE2 build (`PCRE2_SYS_STATIC=1`), so the addon has no dynamic PCRE2 runtime dependency. The existing grep result shape and cached serial fallback are retained; the upstream-only injectable shell filesystem option is omitted because GJC has no caller for it.
+
+- Appearance detection, observer start, and observer stop now publish stable work-profile region tags; the existing dark/light/undefined native result and lazy theme consumer are unchanged.
+
+- Re-synced the HTML-to-Markdown N-API boundary to consume JavaScript strings directly. Recorded native goldens cover headings, links, clean-content preprocessing, skipped images, and the depth-limit error; conversion behavior and exported TypeScript shape remain unchanged.
+
+- Work-profile folded stacks retain the upstream region format, and the `profile_region` helper now has a nested-stack regression guard for module instrumentation.
+
+- Re-synced the existing SIXEL encoder and added its `sixel.encode` profile region. The upstream bounded SIXEL decoder was not adopted because GJC has no consumer for it.
+
+- Add the pinned upstream Julia, Nix, Mermaid, TypeScript, TSX, and Astro syntax grammars. Existing semantic theme colors and GJC highlight caches remain unchanged; accepted output differences for newly covered languages are recorded with the differential goldens.
+
+- Re-synced the process binding to the pinned upstream baseline while preserving identity-aware observations and pinned-root signaling through the local pi-shell process implementation.
+
+- Re-synced the PTY binding to the pinned upstream baseline while retaining GJC's bounded loss-reporting queue, ConPTY single-flight guard, and post-spawn child cleanup.
+
+### Fixed
+
+- Prevent the synthetic N-API UTF-16 terminator from leaking into padded truncation output for non-ASCII text. Preserve the GJC two-cell width contract for Hangul compatibility jamo and U+3164.
+- Re-sync key handling with pinned upstream: keep Alt+B/F navigation aliases in legacy mode while treating them as literal Alt keys in Kitty mixed mode, recognize keypad digits when NumLock metadata is omitted, avoid mapping unmodified non-Latin text to its physical base-layout shortcut, and accept the legacy Ctrl+- encoding.
+
+- Windows native loading now installs a bounded Tokio runtime and probed Rayon pool before async or parallel work starts. If no safe Rayon workers can be created, cached grep uses its serial path rather than initializing Rayon’s default global pool.
+
+- Native clipboard reads now decode Windows CF_DIB/CF_DIBV5 images that arboard rejects, and Linux retains its X11 clipboard owner so copied text remains available after the call returns.
+
+- Native panic diagnostics remain opt-in through `GJC_NATIVE_CRASH_DIAGNOSTICS`. When enabled, allocation failures also write a structured report under `~/.gjc/logs`; no panic or allocation hook is installed when the setting is absent.
+
+## [0.17.7] - 2026-09-25
+
+### Changed
+
+- Build the native addon with Rust `nightly-2026-08-12` and align shared Cargo dependencies with the pinned upstream tracked in `docs/rust-porting-inventory.md` (html-to-markdown-rs 3.x, icy_sixel 0.7, brush-parser 0.4, phf 0.14, similar 3.2, smallvec 1.16, dashmap 6.2, tree-sitter-cmake 0.7.5, tree-sitter-r 1.3, syntect with bundled themes and YAML syntax loading).
+- `htmlToMarkdown` now uses html-to-markdown-rs 3.x and fails with `Conversion error` when the document exceeds the converter's nesting depth, instead of returning truncated markdown.
+- `encodeSixel` output now starts with a SIXEL raster-attributes header (`"1;1;<width>;<height>`), so terminals size the image before drawing it.
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Fixed
+
+- Bounded managed-recovery cleanup now reaps dead-process replacement evidence after a 2-hour grace and detached regular-file removal evidence after 7 days (plus 5 minutes of clock-skew margin); that seven-day TTL does not apply to quarantined directory trees. New replacement candidates record publisher PID-namespace and boot-scoped generation identities so a recycled or cross-namespace PID cannot reap a live publisher. The link fallback rolls back its new candidate link after a failed source unlink when identity checks prove that rollback safe. Legacy replacement names without namespace identity are conservatively retained, while legacy file evidence uses durable, inode-keyed first-seen markers. A descriptor-relative persistent cursor lets bounded sweeps continue across fresh reaper instances. `RecoveryFsRoot.recoveryReaperMetrics()` exposes per-sweep and cumulative file/byte counters.
+
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Fixed
+
+- Split directed SDK delivery drops into bounded, per-cause diagnostics without parsing oversized frames before the response ceiling check.
+
+### Performance
+
+- Reuse completed-line syntax checkpoints when a fenced code block grows by appending, keeping the existing synchronous colored output. Prefix edits, language/theme changes, and first-time large blocks still fully parse.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

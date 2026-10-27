@@ -44,7 +44,7 @@
 	},
 	"debugpy": {
 		"command": "python",
-		"args": ["-m", "debugpy.adapter"],
+		"args": ["-I", "-m", "debugpy.adapter"],
 		"languages": ["python"],
 		"fileTypes": [".py"],
 		"rootMarkers": ["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"],

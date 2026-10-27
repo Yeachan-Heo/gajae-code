@@ -31,7 +31,7 @@ type Variant = "hl" | "plain";
 
 const EXPECTED_MANIFEST_COUNTS: Record<Bucket, number> = {
 	invariant: 29,
-	changed: 8,
+	changed: 10,
 	surface: 4,
 };
 const EXPECTED_MANIFEST_NAMES: Record<Bucket, readonly string[]> = {
@@ -74,11 +74,13 @@ const EXPECTED_MANIFEST_NAMES: Record<Bucket, readonly string[]> = {
 		"giant-single-line",
 		"local-bare-both",
 		"giant-last-partial",
+		"prompt-read-default",
+		"prompt-read-head",
 		"range-tail",
 	],
-	surface: ["prompt-read-default", "prompt-read-head", "docs-read-flow-line", "cli-read-help"],
+	surface: ["docs-read-flow-line", "cli-read-help", "prompt-read-default-surface", "prompt-read-head-surface"],
 };
-const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 58;
+const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 58; // phase 0 only has invariant (29 * 2 variants)
 type Request = { path: string; [key: string]: unknown };
 type Entry = {
 	bucket: Bucket;
@@ -474,6 +476,8 @@ async function captureSurface(entry: Entry, tool: { description: string }): Prom
 	switch (entry.name) {
 		case "prompt-read-default":
 		case "prompt-read-head":
+		case "prompt-read-default-surface":
+		case "prompt-read-head-surface":
 			return surfaceCaptured(tool.description);
 		case "docs-read-flow-line": {
 			const repoRoot = path.resolve(import.meta.dir, "../../../..");
@@ -509,6 +513,10 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 		for (const hashLines of entry.hashLines) {
 			const variant = variantFor(hashLines);
 			const settings = Settings.isolated({
+				// Goldens pin the read tool's own rendering. The universal inline-result
+				// backstop is a separate wrapper layer with its own tests
+				// (inline-result-backstop.test.ts); entries opt in via entry.settings.
+				"tools.maxInlineResultBytes": 0,
 				...(entry.settings ?? {}),
 				...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
 				readHashLines: hashLines,
@@ -597,7 +605,7 @@ describe("read truncation golden harness", () => {
 			expect([...names].sort()).toEqual([...EXPECTED_MANIFEST_NAMES[bucket]].sort());
 		}
 
-		expect(manifest).toHaveLength(41);
+		expect(manifest).toHaveLength(43);
 		const phaseZeroGoldenFiles = manifest
 			.filter(entry => entry.phase === 0)
 			.reduce((total, entry) => total + entry.hashLines.length, 0);

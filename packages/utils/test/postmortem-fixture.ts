@@ -344,6 +344,17 @@ async function runCleanupDeadlineFatal(): Promise<void> {
 	await throwFromTimer(new Error("fixture: fatal with hung cleanup"));
 }
 
+async function runCleanupDeadlineAboveTimerMax(): Promise<void> {
+	// One past the 32-bit setTimeout limit, which setTimeout would treat as 1 ms.
+	process.env.GJC_CLEANUP_DEADLINE_MS = String(2 ** 31);
+	postmortem.register("fixture-deadline-above-timer-max", async () => {
+		await Bun.sleep(200);
+		writeResult({ count: 1 });
+	});
+
+	await postmortem.quit(7);
+}
+
 async function runQuitDrainsBackpressuredStderr(): Promise<void> {
 	setInterval(() => {}, 1_000);
 	const diagnosticLine = "timing-diagnostic\n";
@@ -370,6 +381,9 @@ switch (scenario) {
 		break;
 	case "cleanup-deadline-fatal":
 		await runCleanupDeadlineFatal();
+		break;
+	case "cleanup-deadline-above-timer-max":
+		await runCleanupDeadlineAboveTimerMax();
 		break;
 	case "quit-drains-backpressured-stderr":
 		await runQuitDrainsBackpressuredStderr();

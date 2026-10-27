@@ -3,14 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
-import { clampThinkingLevelForModel, Effort } from "@gajae-code/ai";
+import { clampThinkingLevelForModel, Effort, getBundledModel } from "@gajae-code/ai";
 import {
 	applyClaudeToolPrefix,
 	buildAnthropicClientOptions,
 	buildAnthropicHeaders,
 	buildAnthropicSystemBlocks,
 	claudeCodeEntrypoint,
-	claudeCodeVersion,
 	generateClaudeCloakingUserId,
 	isClaudeCloakingUserId,
 	mapStainlessArch,
@@ -18,6 +17,7 @@ import {
 	streamAnthropic,
 	stripClaudeToolPrefix,
 } from "@gajae-code/ai/providers/anthropic";
+import { getClaudeCodeVersion } from "@gajae-code/ai/providers/claude-code-version";
 import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
@@ -120,7 +120,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		const billingHeader = blocks?.[0]?.text;
 		expect(billingHeader).toMatch(
 			new RegExp(
-				`^x-anthropic-billing-header: cc_version=${claudeCodeVersion}\\.[0-9a-f]{3}; cc_entrypoint=${claudeCodeEntrypoint}; cch=[0-9a-f]{5};$`,
+				`^x-anthropic-billing-header: cc_version=${getClaudeCodeVersion()}\\.[0-9a-f]{3}; cc_entrypoint=${claudeCodeEntrypoint}; cch=[0-9a-f]{5};$`,
 			),
 		);
 
@@ -137,7 +137,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 	});
 
-	it("places canonical automatic cache control at the request level", async () => {
+	it("places canonical automatic cache control at the request level and last system block", async () => {
 		const payload = (await captureAnthropicPayload(
 			ANTHROPIC_MODEL,
 			{
@@ -153,7 +153,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(payload.system).toEqual([
 			{ type: "text", text: "stable system" },
-			{ type: "text", text: "stable durable context" },
+			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral", ttl: "1h" } },
 		]);
 	});
 
@@ -177,6 +177,44 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 
 		expect(headers["User-Agent"]).toBe("curl/8.7.1");
+	});
+
+	it("sends the Claude Code X-App marker only with OAuth credentials", () => {
+		const oauthHeaders = buildAnthropicHeaders({ apiKey: "sk-ant-oat-test", isOAuth: true, stream: true });
+		expect(oauthHeaders["X-App"]).toBe("cli");
+
+		// API-key requests carrying Claude Code markers are billed as Claude Code usage
+		// and excluded from API credit grants ("credit balance too low").
+		const apiKeyVariants = [
+			{ baseUrl: undefined },
+			{ baseUrl: "https://proxy.example.com" },
+			{ isCloudflareAiGateway: true },
+		];
+		for (const variant of apiKeyVariants) {
+			const apiKeyHeaders = buildAnthropicHeaders({
+				apiKey: "sk-ant-api-test",
+				isOAuth: false,
+				stream: true,
+				modelHeaders: { "X-App": "cli" },
+				...variant,
+			});
+			const headerNames = Object.keys(apiKeyHeaders).map(name => name.toLowerCase());
+			expect(headerNames).not.toContain("x-app");
+		}
+	});
+
+	it("keeps Claude Code markers off api-key custom anthropic-messages client options", () => {
+		const options = buildAnthropicClientOptions({
+			model: { ...ANTHROPIC_MODEL, provider: "anthropic-api" },
+			apiKey: "sk-ant-api03-test",
+			isOAuth: false,
+		});
+		const headers = new Headers(options.defaultHeaders);
+		expect(options.isOAuthToken).toBe(false);
+		expect(options.apiKey).toBe("sk-ant-api03-test");
+		expect(headers.get("anthropic-beta")).not.toContain("claude-code-20250219");
+		expect(headers.get("anthropic-beta")).not.toContain("oauth-2025-04-20");
+		expect(headers.has("x-app")).toBe(false);
 	});
 
 	it("forwards only prefix-matching Claude Code User-Agent values", () => {
@@ -203,7 +241,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			stream: true,
 			modelHeaders: { "User-Agent": "curl/8.7.1" },
 		});
-		expect(normalizedHeaders["User-Agent"]).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
+		expect(normalizedHeaders["User-Agent"]).toBe(`claude-cli/${getClaudeCodeVersion()} (external, cli)`);
 
 		const embeddedClaudeCliHeaders = buildAnthropicHeaders({
 			apiKey: "sk-ant-oat-test",
@@ -211,7 +249,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			stream: true,
 			modelHeaders: { "User-Agent": "my-client claude-cli/2.1.63" },
 		});
-		expect(embeddedClaudeCliHeaders["User-Agent"]).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
+		expect(embeddedClaudeCliHeaders["User-Agent"]).toBe(`claude-cli/${getClaudeCodeVersion()} (external, cli)`);
 	});
 
 	it("skips Claude Code instruction injection for claude-3-5-haiku models", async () => {
@@ -1173,6 +1211,115 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.output_config).toEqual({ effort: "high" });
 	});
 
+	it("drops sampling params for Haiku 5.5 when thinking is Off", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false, temperature: 0.2, topP: 0.3, topK: 4 },
+		)) as {
+			temperature?: number;
+			top_p?: number;
+			top_k?: number;
+			thinking?: { type?: string };
+		};
+
+		expect(payload.temperature).toBeUndefined();
+		expect(payload.top_p).toBeUndefined();
+		expect(payload.top_k).toBeUndefined();
+		expect(payload.thinking).toEqual({ type: "disabled" });
+	});
+
+	it("drops sampling params for Haiku 5.5 with adaptive thinking enabled", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		for (const [reasoning, effort] of [
+			[Effort.XHigh, "xhigh"],
+			[Effort.Max, "max"],
+		] as const) {
+			const payload = (await captureAnthropicPayload(
+				model,
+				{
+					systemPrompt: ["Stay concise."],
+					messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				},
+				{ thinkingEnabled: true, reasoning, temperature: 0.2, topP: 0.3, topK: 4 },
+			)) as {
+				temperature?: number;
+				top_p?: number;
+				top_k?: number;
+				thinking?: { type?: string; display?: string };
+				output_config?: { effort?: string };
+			};
+
+			expect(payload.temperature).toBeUndefined();
+			expect(payload.top_p).toBeUndefined();
+			expect(payload.top_k).toBeUndefined();
+			expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+			expect(payload.output_config).toEqual({ effort });
+		}
+	});
+
+	it("keeps the selected effort on forced-tool Haiku 5.5 requests with thinking disabled", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		const context: Context = {
+			systemPrompt: ["Stay concise."],
+			messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			tools: [{ name: "resolve", description: "Resolve", parameters: { type: "object", properties: {} } as never }],
+		};
+		type Forced = {
+			tool_choice?: { type?: string };
+			thinking?: { type?: string };
+			output_config?: { effort?: string };
+		};
+		for (const [reasoning, expected] of [
+			[Effort.Medium, "medium"],
+			[Effort.High, "high"],
+			[Effort.XHigh, "high"],
+			[Effort.Max, "high"],
+		] as const) {
+			const payload = (await captureAnthropicPayload(model, context, {
+				thinkingEnabled: true,
+				reasoning,
+				toolChoice: { type: "tool", name: "resolve" },
+			})) as Forced;
+			expect(payload.tool_choice?.type).toBe("tool");
+			expect(payload.thinking).toEqual({ type: "disabled" });
+			expect(payload.output_config).toEqual({ effort: expected });
+		}
+		const off = (await captureAnthropicPayload(model, context, {
+			thinkingEnabled: false,
+			toolChoice: { type: "tool", name: "resolve" },
+		})) as Forced;
+		expect(off.thinking).toEqual({ type: "disabled" });
+	});
+
+	it("preserves sampling params for Haiku 4.5", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 4.5 model");
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false, temperature: 0.2, topP: 0.3, topK: 4 },
+		)) as {
+			temperature?: number;
+			top_p?: number;
+			top_k?: number;
+		};
+
+		expect(payload.temperature).toBe(0.2);
+		expect(payload.top_p).toBe(0.3);
+		expect(payload.top_k).toBe(4);
+	});
+
 	// A single-component alias (`claude-opus-5`) and its dated snapshot describe the
 	// same API generation. The provider-local `claude-opus-(\d+)-(\d+)` regex matched
 	// only the dated form, so the alias silently sent adaptive thinking WITHOUT
@@ -1273,5 +1420,131 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(applyClaudeToolPrefix("proxy_Read", "proxy_")).toBe("proxy_proxy_Read");
 		expect(stripClaudeToolPrefix("proxy_Read", "proxy_")).toBe("Read");
 		expect(stripClaudeToolPrefix(applyClaudeToolPrefix("proxy_Read", "proxy_"), "proxy_")).toBe("proxy_Read");
+	});
+});
+
+// #826
+describe("Anthropic strict-tool and adaptive-thinking compatibility opt-outs for Vertex-style proxies", () => {
+	const baseModel: Model<"anthropic-messages"> = {
+		id: "claude-sonnet-4-5",
+		name: "Claude Sonnet 4.5",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl:
+			"https://us-east5-aiplatform.googleapis.com/v1/projects/example/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 8_192,
+	};
+
+	const bashTool: Tool = {
+		name: "bash",
+		description: "run a bash command",
+		parameters: {
+			type: "object",
+			properties: { command: { type: "string" } },
+			required: ["command"],
+		} as unknown as Tool["parameters"],
+	};
+
+	const baseContext: Context = {
+		systemPrompt: ["Stay concise."],
+		messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+		tools: [bashTool],
+	};
+
+	function abortedSignal(): AbortSignal {
+		const controller = new AbortController();
+		controller.abort();
+		return controller.signal;
+	}
+
+	function captureParams(
+		model: Model<"anthropic-messages">,
+	): Promise<{ tools?: Array<{ name: string; strict?: unknown }> }> {
+		const { promise, resolve } = Promise.withResolvers<{ tools?: Array<{ name: string; strict?: unknown }> }>();
+		void streamAnthropic(model, baseContext, {
+			apiKey: "sk-ant-api-test",
+			isOAuth: false,
+			signal: abortedSignal(),
+			onPayload: payload => {
+				resolve(payload as { tools?: Array<{ name: string; strict?: unknown }> });
+				return undefined;
+			},
+		});
+		return promise;
+	}
+
+	it("preserves strict:true on allowlisted tools by default (api.anthropic.com baseline)", async () => {
+		const params = await captureParams(baseModel);
+		const bash = params.tools?.find(t => t.name === "bash");
+		expect(bash).toBeDefined();
+		expect(bash?.strict).toBe(true);
+	});
+
+	it("omits strict on tool defs when compat.disableStrictTools is set", async () => {
+		const params = await captureParams({
+			...baseModel,
+			compat: { disableStrictTools: true },
+		});
+		const bash = params.tools?.find(t => t.name === "bash");
+		expect(bash).toBeDefined();
+		expect(bash?.strict).toBeUndefined();
+	});
+
+	it("preserves adaptive thinking by default", async () => {
+		const adaptiveModel: Model<"anthropic-messages"> = {
+			...baseModel,
+			id: "claude-opus-4-7",
+			reasoning: true,
+			thinking: {
+				mode: "anthropic-adaptive",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.XHigh,
+			},
+		};
+		const { promise, resolve } = Promise.withResolvers<{ thinking?: { type?: string } }>();
+		void streamAnthropic(adaptiveModel, baseContext, {
+			apiKey: "sk-ant-api-test",
+			isOAuth: false,
+			signal: abortedSignal(),
+			thinkingEnabled: true,
+			onPayload: payload => {
+				resolve(payload as { thinking?: { type?: string } });
+				return undefined;
+			},
+		});
+		const params = await promise;
+		expect(params.thinking?.type).toBe("adaptive");
+	});
+
+	it("maps adaptive thinking to enabled when compat.disableAdaptiveThinking is set", async () => {
+		const adaptiveModel: Model<"anthropic-messages"> = {
+			...baseModel,
+			id: "claude-opus-4-7",
+			reasoning: true,
+			thinking: {
+				mode: "anthropic-adaptive",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.XHigh,
+			},
+			compat: { disableAdaptiveThinking: true },
+		};
+		const { promise, resolve } = Promise.withResolvers<{ thinking?: { type?: string; budget_tokens?: number } }>();
+		void streamAnthropic(adaptiveModel, baseContext, {
+			apiKey: "sk-ant-api-test",
+			isOAuth: false,
+			signal: abortedSignal(),
+			thinkingEnabled: true,
+			onPayload: payload => {
+				resolve(payload as { thinking?: { type?: string; budget_tokens?: number } });
+				return undefined;
+			},
+		});
+		const params = await promise;
+		expect(params.thinking?.type).toBe("enabled");
+		expect(typeof params.thinking?.budget_tokens).toBe("number");
 	});
 });

@@ -1,4 +1,6 @@
 import type { ZodType, z } from "zod/v4";
+import type { CustomApiRegistry } from "./api-registry";
+import type { ProviderDiagnostic } from "./provider-diagnostic";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -235,6 +237,8 @@ export interface ToolChoiceCompat {
 	supportsToolChoice?: boolean;
 	/** Legacy flag for forced tool_choice support. */
 	supportsForcedToolChoice?: boolean;
+	/** Whether the provider supports OpenAI ultrafast service tier. Default: false. */
+	supportsUltrafastTier?: boolean;
 }
 
 // Base options all providers share
@@ -256,10 +260,33 @@ export type CacheRetention = "none" | "short" | "long";
  * - `"openai-only"` → `"priority"` on `openai` and `OpenAI code provider`; ignored elsewhere.
  * - `"Anthropic model-only"` → `"priority"` on direct `anthropic` (not Bedrock/Vertex Anthropic model).
  */
-export type ServiceTier = "auto" | "default" | "flex" | "scale" | "priority" | "openai-only" | "claude-only";
+export type ServiceTier =
+	| "auto"
+	| "default"
+	| "flex"
+	| "scale"
+	| "priority"
+	| "ultrafast"
+	| "openai-only"
+	| "claude-only";
 
 /** Resolved tier — one of the values that providers actually consume on the wire. */
 export type ResolvedServiceTier = Exclude<ServiceTier, "openai-only" | "claude-only">;
+
+/** Parse a provider-reported service tier, leaving unknown response values for request fallback. */
+export function parseResolvedServiceTier(value: unknown): ResolvedServiceTier | undefined {
+	switch (value) {
+		case "auto":
+		case "default":
+		case "flex":
+		case "scale":
+		case "priority":
+		case "ultrafast":
+			return value;
+		default:
+			return undefined;
+	}
+}
 
 /**
  * Resolves a possibly scoped `ServiceTier` to the effective tier for the
@@ -284,15 +311,23 @@ export function resolveServiceTier(
 /**
  * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
  * `service_tier` request field. Custom providers must explicitly opt in through
- * `compat.supportsServiceTier`; unknown providers remain fail-closed.
+ * `compat.supportsServiceTier` for the existing tiers or a model-specific
+ * `supportsUltrafastTier` capability for ultrafast; unknown providers remain fail-closed.
+ *
+ * Note: ultrafast has an additional gating requirement via `modelSupportsUltrafastTier`
+ * to ensure it is only sent to models that explicitly support it.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 	supportsServiceTier = false,
+	supportsUltrafastTier = false,
 ): boolean {
 	const resolved = resolveServiceTier(serviceTier, provider);
 	if (provider === "deepinfra") return resolved === "priority";
+	if (resolved === "ultrafast") {
+		return provider === "openai" || provider === "openai-codex" || supportsUltrafastTier;
+	}
 	if (provider !== "openai" && provider !== "openai-codex" && !supportsServiceTier) return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
 }
@@ -301,6 +336,8 @@ export function shouldSendServiceTier(
  * True when a priority tier is realized as a fast-mode request on the provider's
  * wire protocol. Custom OpenAI-compatible proxies opt in explicitly rather than
  * inheriting support merely because their API shape resembles OpenAI.
+ *
+ * Note: ultrafast is distinct from priority and is not considered fast-mode.
  */
 export function isFastModeEffectiveForProvider(
 	serviceTier: ServiceTier | null | undefined,
@@ -391,6 +428,8 @@ export interface StreamOptions {
 	 */
 	frequencyPenalty?: number;
 	maxTokens?: number;
+	/** Explicit custom API handler scope for this execution; never inferred from model metadata. */
+	customApiRegistry?: CustomApiRegistry;
 	signal?: AbortSignal;
 	apiKey?: string;
 	/** Disables all transport-level replay; the fallback controller owns retries. */
@@ -757,7 +796,11 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
-export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure" | "local_buffer_overflow";
+export type AssistantErrorKind =
+	| "provider_safety_stop"
+	| "local_empty_response"
+	| "local_snapshot_failure"
+	| "local_buffer_overflow";
 /**
  * Structured, shape-only staging-buffer overflow diagnostic carried on the
  * terminal `AssistantMessage`. Attached only by the agent runtime from its own
@@ -810,6 +853,37 @@ export interface DeveloperMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/**
+ * First cached-prefix layer the client changed relative to the previous request
+ * from the same agent, in provider cache order (tools → system → messages).
+ *
+ * - `initial`: first request observed by this agent; nothing to compare.
+ * - `append`: the previous request is an exact prefix; any cache miss is provider-side.
+ * - `model`: a different provider/model, which never shares a prompt cache.
+ * - `tools`: tool specs changed.
+ * - `system`: the system prompt changed.
+ * - `messages`: a previously sent message was rewritten or removed.
+ * - `options`: prompt bytes were unchanged but a serialization-affecting request
+ *   option (tool choice, reasoning, service tier) changed, which adapters may
+ *   use to rewrite the provider payload.
+ */
+export type PromptPrefixChange = "initial" | "append" | "model" | "tools" | "system" | "messages" | "options";
+
+/** Per-request prompt-prefix fingerprint that separates client prefix mutation from provider cache eviction. */
+export interface PromptPrefixTelemetry {
+	/** xxHash64 (hex) over the model, serialization-affecting options, system prompt, tool specs, and every message. */
+	hash: string;
+	/** Messages sent in this request. */
+	messages: number;
+	/** Leading messages byte-identical to the previous request's messages. */
+	reusedMessages: number;
+	/** Messages in the previous request (0 on the initial request). */
+	previousMessages: number;
+	change: PromptPrefixChange;
+	/** Role of the previously sent message that was rewritten or removed (only for `messages`). */
+	divergedRole?: Message["role"];
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | RedactedThinkingContent | ToolCall)[];
@@ -817,6 +891,8 @@ export interface AssistantMessage {
 	provider: Provider;
 	model: string;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	/** Effective service tier reported by the provider, or the sent tier when the provider omits it. */
+	serviceTier?: ResolvedServiceTier;
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
@@ -840,6 +916,17 @@ export interface AssistantMessage {
 	bufferOverflow?: AssistantBufferOverflowDiagnostic;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/**
+	 * Bounded, redaction-safe provider failure family, minted ONLY by a provider
+	 * adapter from structured provider metadata (SDK error fields or an explicit
+	 * SSE protocol error envelope). It is additive diagnostics: it never changes
+	 * the terminal outcome, the fixed error message, retry admission, or the
+	 * legacy heuristic `errorStatus`, and it is absent whenever the provider
+	 * supplied no trustworthy structured evidence.
+	 */
+	providerDiagnostic?: ProviderDiagnostic;
+	/** Redacted first-event transport timing and chunk-shape diagnostics for Google Gemini CLI. */
+	googleGeminiCliDiagnostics?: GoogleGeminiCliDiagnostics;
 	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
 	transportFailure?: TransportFailureFacts;
 	/**
@@ -855,6 +942,22 @@ export interface AssistantMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 	duration?: number; // Request duration in milliseconds
 	ttft?: number; // Time to first token in milliseconds
+	/** Prompt-prefix fingerprint of the request that produced this message. */
+	promptPrefix?: PromptPrefixTelemetry;
+}
+
+export interface GoogleGeminiCliDiagnostics {
+	responseAtMs?: number;
+	firstRawSseAtMs?: number;
+	chunkCounts: {
+		content: number;
+		thinking: number;
+		functionCall: number;
+		usageOnly: number;
+		other: number;
+	};
+	firstEventTimeoutMs?: number;
+	firstEventTimeoutSource?: "stream-option" | "env" | "idle-timeout" | "provider-fallback" | "default";
 }
 
 export interface ToolResultMessage<TDetails = any> {
@@ -976,6 +1079,9 @@ export type TSchema = ZodType | TJsonSchema;
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
 export type RawArgumentRejectionCode =
+	| "ask-question-body-required"
+	| "ask-deep-interview-metadata-required"
+	| "ask-deep-interview-single-question-required"
 	| "ask-deep-interview-question-body-required"
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"
@@ -1074,6 +1180,7 @@ export type AssistantMessageEvent =
 			contentIndex?: undefined;
 			reason: Extract<StopReason, "aborted" | "error">;
 			error: AssistantMessage;
+			partial?: AssistantMessage;
 	  }
 	| {
 			type: "toolChoiceIncapability";
@@ -1120,6 +1227,12 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 * preserves or intentionally realizes OpenAI priority processing.
 	 */
 	supportsServiceTier?: boolean;
+	/**
+	 * Whether the model explicitly supports the ultrafast service tier.
+	 * Only models that set this flag will send ultrafast tier to the API.
+	 * Models: gpt-6-astra and gpt-6.1-sol.
+	 */
+	supportsUltrafastTier?: boolean;
 	/**
 	 * Tool names the provider reserves for its own built-ins and refuses to
 	 * accept as custom function declarations. A colliding tool is **dropped**
@@ -1351,6 +1464,8 @@ export interface Model<TApi extends Api = any> {
 	requestTransform?: ModelRequestTransform;
 	/** Default prompt-cache retention preference for this model when the request omits one. */
 	cacheRetention?: CacheRetention;
+	/** Configured inter-event idle timeout for this model, in milliseconds. */
+	streamIdleTimeoutMs?: number;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */
@@ -1390,4 +1505,11 @@ export interface Model<TApi extends Api = any> {
 /** True when a model explicitly opts into OpenAI-compatible `service_tier` forwarding. */
 export function modelSupportsServiceTier(model: Pick<Model, "compat"> | undefined): boolean {
 	return Boolean(model?.compat && "supportsServiceTier" in model.compat && model.compat.supportsServiceTier === true);
+}
+
+/** True when a model explicitly opts into OpenAI ultrafast service tier support. */
+export function modelSupportsUltrafastTier(model: Pick<Model, "compat"> | undefined): boolean {
+	return Boolean(
+		model?.compat && "supportsUltrafastTier" in model.compat && model.compat.supportsUltrafastTier === true,
+	);
 }

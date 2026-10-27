@@ -1046,30 +1046,119 @@ describe("resident-store transition seam", () => {
 		}
 	});
 
-	it("T5c keeps resident-store and entry installation inside the transition seams", () => {
-		const source = fs.readFileSync(path.join(import.meta.dir, "../src/session/session-manager.ts"), "utf8");
-		const commitStart = source.indexOf("\t#commitResidentTextStoreTransition(");
-		const releaseStart = source.indexOf("\t#releaseResidentTextStore(): void {");
-		const demoteStart = source.indexOf("\t#demoteResidentTextStoreAfterTrustReject(");
-		const setSessionFileStart = source.indexOf("\tasync setSessionFile(");
-		const setSessionFileEnd = source.indexOf("\n\t/** Start a new session.", setSessionFileStart);
-		expect(commitStart).toBeGreaterThanOrEqual(0);
-		expect(releaseStart).toBeGreaterThan(commitStart);
-		expect(demoteStart).toBeGreaterThan(releaseStart);
-		expect(setSessionFileStart).toBeGreaterThanOrEqual(0);
-		expect(setSessionFileEnd).toBeGreaterThan(setSessionFileStart);
-
-		const residentStoreAssignments = [...source.matchAll(/this\.#residentTextBlobStore\s*=(?!=)/g)];
-		expect(residentStoreAssignments).toHaveLength(2);
-		for (const assignment of residentStoreAssignments) {
-			const offset = assignment.index!;
-			expect(
-				(offset >= commitStart && offset < releaseStart) || (offset >= releaseStart && offset < demoteStart),
-			).toBe(true);
-		}
-
-		expect(source.slice(setSessionFileStart, setSessionFileEnd)).not.toMatch(/this\.#fileEntries\s*=(?!=)/);
-	});
+	it.skipIf(process.platform === "win32")(
+		"T5c retains the live store on rejected cold rollback and transfers candidate ownership through close",
+		async () => {
+			const targetText = `rollback live target ${"t".repeat(4096)}`;
+			const target = await createPersistedSession(targetText);
+			const targetId = target.sm.getSessionId();
+			const targetLeaf = target.sm.getLeafId();
+			await target.sm.close();
+			const oldText = `rollback cold prefix ${"o".repeat(4096)}`;
+			const source = await createPersistedSession(oldText);
+			const oldId = source.sm.getLeafId();
+			const keptText = `rollback retained payload ${"k".repeat(4096)}`;
+			const keptMessage = assistantMessage(keptText);
+			const previousHook = SessionManagerTestHooks.beforeColdRollbackCommit;
+			try {
+				const keptId = source.sm.appendMessage(keptMessage);
+				const compactId = source.sm.appendCompaction("rollback summary", undefined, keptId, 1);
+				await source.sm.flush();
+				source.sm.setSessionMemoryMode("enabled");
+				expect(source.sm.getSessionMemoryStats().coldRetirementActive).toBe(true);
+				const snapshot = await source.sm.captureRollbackState();
+				expect(snapshot.coldRestoreFile).toBe(source.sessionFile);
+				expect(snapshot.fileEntries).toEqual([]);
+				expect(snapshot.materializedFileEntries).toEqual([]);
+				const sourceCache = source.sm.residentTextCacheDirForTests();
+				if (!sourceCache) throw new Error("Expected file-backed source resident store");
+				const sourceBytes = fs.readFileSync(source.sessionFile, "utf8");
+				const targetBytes = fs.readFileSync(target.sessionFile, "utf8");
+				await source.sm.setSessionFile(target.sessionFile);
+				const liveCache = source.sm.residentTextCacheDirForTests();
+				if (!liveCache) throw new Error("Expected file-backed live resident store");
+				expect(fs.existsSync(sourceCache)).toBe(false);
+				const rejected = new Error("reject prepared cold rollback");
+				let adoptedCache: string | undefined;
+				for (const reject of [true, false]) {
+					let candidateCache: string | undefined;
+					SessionManagerTestHooks.beforeColdRollbackCommit = file => {
+						expect(file).toBe(source.sessionFile);
+						expect(source.sm.getSessionId()).toBe(targetId);
+						expect(source.sm.getHeader()).toMatchObject({ id: targetId, cwd: target.cwd });
+						expect(source.sm.getSessionFile()).toBe(target.sessionFile);
+						expect(source.sm.getLeafId()).toBe(targetLeaf);
+						expect(source.sm.residentTextCacheDirForTests()).toBe(liveCache);
+						expect(source.sm.getEntry(targetLeaf!)).toMatchObject({
+							message: { content: [{ text: targetText }] },
+						});
+						const candidates = residentDataCacheDirs().filter(dir => dir !== liveCache);
+						expect(candidates).toHaveLength(1);
+						candidateCache = candidates[0]!;
+						expect(
+							fs
+								.readdirSync(candidateCache)
+								.some(
+									name =>
+										/^[0-9a-f]{64}$/.test(name) &&
+										fs.readFileSync(path.join(candidateCache!, name), "utf8") === keptText,
+								),
+						).toBe(true);
+						if (reject) throw rejected;
+					};
+					if (reject) await expect(source.sm.restoreRollbackState(snapshot)).rejects.toThrow(rejected.message);
+					else await source.sm.restoreRollbackState(snapshot);
+					if (!candidateCache) throw new Error("Expected a prepared cold rollback candidate");
+					if (reject) {
+						expect(fs.existsSync(candidateCache)).toBe(false);
+						expect(residentDataCacheDirs()).toEqual([liveCache]);
+						expect(source.sm.getSessionId()).toBe(targetId);
+						expect(source.sm.getHeader()).toMatchObject({ id: targetId, cwd: target.cwd });
+						expect(source.sm.getSessionFile()).toBe(target.sessionFile);
+						expect(source.sm.getLeafId()).toBe(targetLeaf);
+						expectReadable(source.sm, targetText);
+					} else {
+						adoptedCache = candidateCache;
+						expect(source.sm.residentTextCacheDirForTests()).toBe(candidateCache);
+						expect(residentDataCacheDirs()).toEqual([candidateCache]);
+						expect(fs.existsSync(liveCache)).toBe(false);
+						expect(source.sm.getSessionId()).toBe(snapshot.sessionId);
+						// Lifecycle-preallocated IDs can be shared; cwd distinguishes the installed header.
+						expect(source.sm.getHeader()).toMatchObject({ id: snapshot.sessionId, cwd: source.cwd });
+						expect(source.sm.getSessionFile()).toBe(source.sessionFile);
+						expect(source.sm.getLeafId()).toBe(compactId);
+						const beforeRead = source.sm.getSessionMemoryStats();
+						expect(beforeRead).toMatchObject({
+							coldRetirementActive: true,
+							lazyReopenSucceeded: true,
+						});
+						expect(source.sm.getEntry(keptId)).toMatchObject({ id: keptId, message: keptMessage });
+						const context = JSON.stringify(source.sm.buildSessionContext());
+						expect(context).toContain(keptText);
+						expect(context).not.toContain(targetText);
+						expect(source.sm.getSessionMemoryStats().coldEntriesReloaded).toBe(beforeRead.coldEntriesReloaded);
+						expect(source.sm.getEntry(oldId!)).toMatchObject({ message: { content: [{ text: oldText }] } });
+					}
+					expect(fs.readFileSync(source.sessionFile, "utf8")).toBe(sourceBytes);
+					expect(fs.readFileSync(target.sessionFile, "utf8")).toBe(targetBytes);
+				}
+				const appended = `rollback continued writing ${"w".repeat(4096)}`;
+				source.sm.appendMessage(assistantMessage(appended));
+				await source.sm.flush();
+				expect(fs.readFileSync(source.sessionFile, "utf8")).toContain(appended);
+				expect(fs.readFileSync(target.sessionFile, "utf8")).toBe(targetBytes);
+				expect(source.sm.getSessionMemoryStats().coldRetirementActive).toBe(true);
+				expect(source.sm.residentTextCacheDirForTests()).toBe(adoptedCache);
+				expect(fs.existsSync(adoptedCache!)).toBe(true);
+				await source.sm.close();
+				expect(fs.existsSync(adoptedCache!)).toBe(false);
+			} finally {
+				SessionManagerTestHooks.beforeColdRollbackCommit = previousHook;
+				await source.sm.close();
+			}
+			expect(residentCacheDirs()).toEqual([]);
+		},
+	);
 
 	it("T6 aborts recovery promotion before staging removal when candidate preparation cannot trust the cache root", async () => {
 		const root = makeTempDir("gjc-resident-transition-recovery-prepare-");

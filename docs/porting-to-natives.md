@@ -129,7 +129,7 @@ Keep N-API signatures simple and owned. Avoid borrowed references like `&str` in
 
 ### 4) Enum runtime exports
 
-napi-rs declarations alone are not enough for JS callers that use enum objects at runtime. `scripts/gen-enums.ts` appends enum objects to `native/index.js`. If you add or change a native enum, verify both `native/index.d.ts` and the generated enum export block in `native/index.js`.
+napi-rs declarations alone are not enough for JS callers that use enum objects at runtime. `packages/natives/scripts/gen-enums.ts` appends enum objects to `native/index.js`. If you add or change a native enum, verify both `native/index.d.ts` and the generated enum export block in `native/index.js`.
 
 ### 5) Benchmarking mistakes
 

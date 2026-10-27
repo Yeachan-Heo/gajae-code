@@ -20,6 +20,7 @@
  */
 import { Container, matchesKey, type SelectItem, SelectList, Text } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import { resolveGlobalUserSkillLinkTrust } from "../../../config/skill-settings-defaults";
 import { type CustomizationInventory, loadCustomizationInventory } from "../../../customization/inventory";
 import {
 	removeHookFile,
@@ -47,6 +48,7 @@ import { ImportWizard } from "./import-wizard";
 /** Minimal settings slice the dashboard reads and writes. */
 export interface CustomizationSettingsSlice {
 	get(key: string): unknown;
+	getGlobal?(key: string): unknown;
 	set?(key: string, value: unknown): void;
 }
 
@@ -57,6 +59,7 @@ function safe(text: string): string {
 
 const STATUS_COLORS: Record<InventoryRow["status"], (text: string) => string> = {
 	enabled: text => theme.fg("success", text),
+	"stored-only": text => theme.fg("warning", text),
 	disabled: text => theme.fg("muted", text),
 	invalid: text => theme.fg("error", text),
 	shadowed: text => theme.fg("warning", text),
@@ -150,6 +153,16 @@ export class CustomizationDashboard extends Container {
 			cwd: this.#cwd,
 			home: this.#homeDir,
 			policy: this.#skillPolicy(),
+			allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+				trustUserSkills:
+					typeof this.#settings?.getGlobal === "function"
+						? (this.#settings.getGlobal("skills.trustUserSkills") as boolean | undefined)
+						: undefined,
+				enablePiUser:
+					typeof this.#settings?.getGlobal === "function"
+						? (this.#settings.getGlobal("skills.enablePiUser") as boolean | undefined)
+						: undefined,
+			}),
 			disabledExtensions: this.#getStringArray("disabledExtensions"),
 		});
 	}
@@ -269,6 +282,12 @@ export class CustomizationDashboard extends Container {
 	async #toggleSelected(): Promise<void> {
 		const row = this.#selectedRow();
 		if (!row || !this.#guardScope(row)) return;
+		if (row.status === "stored-only") {
+			this.#flashStatus(
+				"project hooks are stored-only; import into Global .gjc or configure an explicit hook path to load them",
+			);
+			return;
+		}
 		if (row.status === "invalid" || row.status === "shadowed" || row.status === "quarantined") {
 			this.#flashStatus(`cannot toggle a ${row.status} entry; resolve its diagnostics first`);
 			return;

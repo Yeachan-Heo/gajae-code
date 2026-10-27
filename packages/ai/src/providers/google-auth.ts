@@ -3,8 +3,10 @@
  *
  * Replaces `google-auth-library` with a direct WebCrypto + REST implementation.
  * Sources, in priority order:
- *   1. `GOOGLE_APPLICATION_CREDENTIALS` env → file with `type: "service_account"` (RS256 JWT exchange)
- *     or `type: "authorized_user"` (refresh-token exchange).
+ *   1. `GOOGLE_APPLICATION_CREDENTIALS` env → file with `type: "service_account"` (RS256 JWT exchange),
+ *     `type: "authorized_user"` (refresh-token exchange), or `type: "external_account"` (Workload Identity
+ *     Federation: subject token from `credential_source` → STS token exchange → optional service-account
+ *     impersonation).
  *   2. `~/.config/gcloud/application_default_credentials.json` (user ADC, same authorized_user flow).
  *   3. GCE / Cloud Run metadata server (`metadata.google.internal`).
  *
@@ -13,19 +15,34 @@
  */
 
 import { Buffer } from "node:buffer";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $credentialEnv, $envpos, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import type { FetchImpl } from "../types";
 
 const OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const STS_TOKEN_URL = "https://sts.googleapis.com/v1/token";
 const METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+const METADATA_PROJECT_ID_URL = "http://metadata.google.internal/computeMetadata/v1/project/project-id";
+const METADATA_SERVICE_ACCOUNT_EMAIL_URL =
+	"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
+const VERTEX_LOCATION_RE = /^[a-z0-9-]+$/;
 const CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
+const ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+const ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token";
+const JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt";
+const SAML_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:saml2";
+const DEFAULT_IMPERSONATION_LIFETIME_SEC = 3600;
+const DEFAULT_EXECUTABLE_TIMEOUT_MS = 30_000;
 
 interface CachedToken {
 	token: string;
 	expiresAtMs: number;
 }
+
+export type VertexCredentialSource = "explicit-file" | "default-file" | "metadata-server";
 
 interface ServiceAccountCredentials {
 	type: "service_account";
@@ -41,7 +58,60 @@ interface AuthorizedUserCredentials {
 	refresh_token: string;
 }
 
-type AdcFileCredentials = ServiceAccountCredentials | AuthorizedUserCredentials;
+/** `credential_source.format` for file/url sources: plain text (default) or a JSON field. */
+interface SubjectTokenFormat {
+	type?: "text" | "json";
+	subject_token_field_name?: string;
+}
+
+interface FileCredentialSource {
+	file: string;
+	format?: SubjectTokenFormat;
+}
+
+interface UrlCredentialSource {
+	url: string;
+	headers?: Record<string, string>;
+	format?: SubjectTokenFormat;
+}
+
+interface ExecutableCredentialSource {
+	executable: {
+		command: string;
+		timeout_millis?: number;
+		output_file?: string;
+	};
+}
+
+type CredentialSource = FileCredentialSource | UrlCredentialSource | ExecutableCredentialSource;
+
+/**
+ * Workload Identity Federation configuration, as written by `gcloud iam workload-identity-pools
+ * create-cred-config` and `google-github-actions/auth`.
+ */
+interface ExternalAccountCredentials {
+	type: "external_account";
+	audience: string;
+	subject_token_type: string;
+	token_url?: string;
+	service_account_impersonation_url?: string;
+	service_account_impersonation?: { token_lifetime_seconds?: number };
+	credential_source: CredentialSource;
+}
+
+type AdcFileCredentials = ServiceAccountCredentials | AuthorizedUserCredentials | ExternalAccountCredentials;
+
+/** Response of the executable credential source, per the external-account spec (version 1). */
+interface ExecutableResponse {
+	version: number;
+	success: boolean;
+	token_type?: string;
+	id_token?: string;
+	saml_response?: string;
+	expiration_time?: number;
+	code?: string;
+	message?: string;
+}
 
 interface TokenResponse {
 	access_token: string;
@@ -51,6 +121,11 @@ interface TokenResponse {
 
 const tokenCache = new Map<string, CachedToken>();
 const inflight = new Map<string, Promise<string>>();
+
+/** Match the region-label constraint used before Vertex interpolates a location into the request host. */
+export function isValidVertexLocation(location: string): boolean {
+	return VERTEX_LOCATION_RE.test(location);
+}
 
 function getRefreshSkewMs(): number {
 	return $envpos("GOOGLE_VERTEX_REFRESH_SKEW_MS", 60_000);
@@ -69,6 +144,82 @@ async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
 	}
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function isSubjectTokenFormat(value: unknown): value is SubjectTokenFormat {
+	if (!isRecord(value)) return false;
+	if (value.type !== undefined && value.type !== "text" && value.type !== "json") return false;
+	if (value.subject_token_field_name !== undefined && !isNonEmptyString(value.subject_token_field_name)) return false;
+	return value.type !== "json" || isNonEmptyString(value.subject_token_field_name);
+}
+
+function isCredentialSource(value: unknown): value is CredentialSource {
+	if (!isRecord(value)) return false;
+	if ("file" in value) {
+		return isNonEmptyString(value.file) && (value.format === undefined || isSubjectTokenFormat(value.format));
+	}
+	if ("url" in value) {
+		if (!isNonEmptyString(value.url) || (value.format !== undefined && !isSubjectTokenFormat(value.format)))
+			return false;
+		if (value.headers === undefined) return true;
+		return isRecord(value.headers) && Object.values(value.headers).every(header => typeof header === "string");
+	}
+	if ("executable" in value) {
+		const executable = value.executable;
+		if (!isRecord(executable) || !isNonEmptyString(executable.command)) return false;
+		if (executable.timeout_millis !== undefined && typeof executable.timeout_millis !== "number") {
+			return false;
+		}
+		return executable.output_file === undefined || typeof executable.output_file === "string";
+	}
+	return false;
+}
+
+/** Validate the credential fields required by the ADC resolvers supported here. */
+function isSupportedAdcFileCredentials(value: unknown): value is AdcFileCredentials {
+	if (!isRecord(value)) return false;
+	switch (value.type) {
+		case "service_account":
+			return isNonEmptyString(value.client_email) && isNonEmptyString(value.private_key);
+		case "authorized_user":
+			return (
+				isNonEmptyString(value.client_id) &&
+				isNonEmptyString(value.client_secret) &&
+				isNonEmptyString(value.refresh_token)
+			);
+		case "external_account":
+			return (
+				isNonEmptyString(value.audience) &&
+				isNonEmptyString(value.subject_token_type) &&
+				isCredentialSource(value.credential_source)
+			);
+		default:
+			return false;
+	}
+}
+
+async function isAvailableAdcFileCredentialSource(credentials: AdcFileCredentials): Promise<boolean> {
+	if (credentials.type !== "external_account") return true;
+	const source = credentials.credential_source;
+	if ("executable" in source) return $credentialEnv("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES") === "1";
+	if ("file" in source) {
+		try {
+			if (!(await fs.stat(source.file)).isFile()) return false;
+			extractSubjectToken(await fs.readFile(source.file, "utf8"), source.format, `file ${source.file}`);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+	return true;
+}
+
 /** Test seam: the ADC credentials file path as resolved from trusted env. */
 export function resolveAdcCredentialsPathForTest(): string | undefined {
 	return $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
@@ -83,15 +234,25 @@ async function loadAdcCredentials(): Promise<{ source: string; creds: AdcFileCre
 	// `stream.ts` already resolves the same variable through `$credentialEnv`.
 	const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
 	if (gacPath) {
-		const creds = await readJsonFile<AdcFileCredentials>(gacPath);
+		const value = await readJsonFile<unknown>(gacPath);
+		const creds = isSupportedAdcFileCredentials(value) ? value : undefined;
 		if (!creds) {
-			throw new Error(`GOOGLE_APPLICATION_CREDENTIALS points to a missing file: ${gacPath}`);
+			if (
+				isRecord(value) &&
+				typeof value.type === "string" &&
+				value.type !== "service_account" &&
+				value.type !== "authorized_user" &&
+				value.type !== "external_account"
+			) {
+				throw new Error(`Unsupported Google credential type "${value.type}"`);
+			}
+			throw new Error(`GOOGLE_APPLICATION_CREDENTIALS does not contain supported credentials: ${gacPath}`);
 		}
 		return { source: `gac:${gacPath}`, creds };
 	}
 	const userPath = userAdcPath();
-	const creds = await readJsonFile<AdcFileCredentials>(userPath);
-	if (creds) return { source: `user:${userPath}`, creds };
+	const value = await readJsonFile<unknown>(userPath);
+	if (isSupportedAdcFileCredentials(value)) return { source: `user:${userPath}`, creds: value };
 	return undefined;
 }
 
@@ -181,6 +342,69 @@ async function fetchMetadataToken(
 	}
 }
 
+async function hasMetadataServer(fetchImpl: FetchImpl): Promise<boolean> {
+	const timeout = AbortSignal.timeout(1000);
+	try {
+		const projectResponse = await fetchImpl(METADATA_PROJECT_ID_URL, {
+			method: "GET",
+			headers: { "Metadata-Flavor": "Google" },
+			redirect: "error",
+			signal: timeout,
+		});
+		if (
+			!projectResponse.ok ||
+			projectResponse.headers.get("Metadata-Flavor")?.toLowerCase() !== "google" ||
+			!(await projectResponse.text()).trim()
+		) {
+			return false;
+		}
+		const identityResponse = await fetchImpl(METADATA_SERVICE_ACCOUNT_EMAIL_URL, {
+			method: "GET",
+			headers: { "Metadata-Flavor": "Google" },
+			redirect: "error",
+			signal: timeout,
+		});
+		return (
+			identityResponse.ok &&
+			identityResponse.headers.get("Metadata-Flavor")?.toLowerCase() === "google" &&
+			Boolean((await identityResponse.text()).trim())
+		);
+	} catch {
+		return false;
+	}
+}
+
+function classifyCredentialSource(source: string): VertexCredentialSource | undefined {
+	if (source === "metadata") return "metadata-server";
+	if (source.startsWith("gac:")) return "explicit-file";
+	if (source.startsWith("user:")) return "default-file";
+	return undefined;
+}
+
+/** Resolve the source of a currently usable ADC credential without acquiring an access token. */
+export async function getVertexCredentialSource(options?: {
+	fetch?: FetchImpl;
+}): Promise<VertexCredentialSource | undefined> {
+	const now = Date.now();
+	const skew = getRefreshSkewMs();
+	for (const [source, cached] of tokenCache) {
+		if (cached.expiresAtMs - skew > now) return classifyCredentialSource(source);
+	}
+
+	let adc: { source: string; creds: AdcFileCredentials } | undefined;
+	try {
+		adc = await loadAdcCredentials();
+	} catch {
+		return undefined;
+	}
+	if (adc) {
+		return (await isAvailableAdcFileCredentialSource(adc.creds)) ? classifyCredentialSource(adc.source) : undefined;
+	}
+
+	const fetchImpl = options?.fetch ?? globalThis.fetch.bind(globalThis);
+	return (await hasMetadataServer(fetchImpl)) ? "metadata-server" : undefined;
+}
+
 async function postForToken(
 	url: string,
 	body: URLSearchParams,
@@ -200,16 +424,217 @@ async function postForToken(
 	return (await response.json()) as TokenResponse;
 }
 
+/** Pulls the subject token out of a file/url source body according to its declared format. */
+function extractSubjectToken(raw: string, format: SubjectTokenFormat | undefined, origin: string): string {
+	let token: unknown;
+	if (format?.type === "json") {
+		const field = format.subject_token_field_name;
+		if (!field)
+			throw new Error(`external_account credential_source ${origin}: json format requires subject_token_field_name`);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			throw new Error(`external_account credential_source ${origin}: subject token is not valid JSON`);
+		}
+		token = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>)[field] : undefined;
+	} else {
+		token = raw.trim();
+	}
+	if (typeof token !== "string" || token.length === 0) {
+		throw new Error(`external_account credential_source ${origin}: subject token is empty`);
+	}
+	return token;
+}
+
+async function readSubjectTokenFromExecutable(
+	creds: ExternalAccountCredentials,
+	source: ExecutableCredentialSource,
+): Promise<string> {
+	// Same opt-in the official client libraries require: the credential file names a
+	// command to run, so the operator must explicitly allow it.
+	if ($credentialEnv("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES") !== "1") {
+		throw new Error(
+			"external_account executable credential_source requires GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1",
+		);
+	}
+	const { command, timeout_millis, output_file } = source.executable;
+	const argv = command.trim().split(/\s+/);
+	if (!argv[0]) throw new Error("external_account executable credential_source: command is empty");
+	const env: Record<string, string | undefined> = {
+		...process.env,
+		GOOGLE_EXTERNAL_ACCOUNT_AUDIENCE: creds.audience,
+		GOOGLE_EXTERNAL_ACCOUNT_TOKEN_TYPE: creds.subject_token_type,
+		GOOGLE_EXTERNAL_ACCOUNT_INTERACTIVE: "0",
+	};
+	const impersonated = creds.service_account_impersonation_url?.match(/serviceAccounts\/([^/:]+)/)?.[1];
+	if (impersonated) env.GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATED_EMAIL = impersonated;
+	if (output_file) env.GOOGLE_EXTERNAL_ACCOUNT_OUTPUT_FILE = output_file;
+
+	const proc = Bun.spawn(argv, { env, stdout: "pipe", stderr: "ignore", stdin: "ignore" });
+	const timeout = setTimeout(() => proc.kill(), timeout_millis ?? DEFAULT_EXECUTABLE_TIMEOUT_MS);
+	let stdout: string;
+	try {
+		stdout = await new Response(proc.stdout).text();
+		const exitCode = await proc.exited;
+		if (exitCode !== 0) {
+			throw new Error(`external_account executable credential_source exited with code ${exitCode}`);
+		}
+	} finally {
+		clearTimeout(timeout);
+	}
+	// The spec allows the executable to write its response to output_file instead of stdout.
+	const raw = stdout.trim() || (output_file ? await Bun.file(output_file).text() : "");
+	let response: ExecutableResponse;
+	try {
+		response = JSON.parse(raw) as ExecutableResponse;
+	} catch {
+		throw new Error("external_account executable credential_source returned invalid JSON");
+	}
+	if (response.version !== 1) {
+		throw new Error(`external_account executable response version ${response.version} is not supported`);
+	}
+	if (!response.success) {
+		throw new Error(
+			`external_account executable credential_source failed (${response.code ?? "unknown"}): ${response.message ?? ""}`,
+		);
+	}
+	if (response.expiration_time !== undefined && response.expiration_time * 1000 <= Date.now()) {
+		throw new Error("external_account executable credential_source returned an expired subject token");
+	}
+	const token =
+		response.token_type === SAML_TOKEN_TYPE
+			? response.saml_response
+			: response.token_type === ID_TOKEN_TYPE || response.token_type === JWT_TOKEN_TYPE
+				? response.id_token
+				: undefined;
+	if (!token) {
+		throw new Error(
+			`external_account executable credential_source returned unsupported token_type ${response.token_type}`,
+		);
+	}
+	return token;
+}
+
+async function readSubjectToken(
+	creds: ExternalAccountCredentials,
+	signal: AbortSignal | undefined,
+	fetchImpl: FetchImpl,
+): Promise<string> {
+	const source = creds.credential_source;
+	if (!source || typeof source !== "object") {
+		throw new Error("external_account credentials are missing credential_source");
+	}
+	if ("file" in source) {
+		let raw: string;
+		try {
+			raw = await Bun.file(source.file).text();
+		} catch (err) {
+			if (isEnoent(err)) throw new Error(`external_account credential_source file is missing: ${source.file}`);
+			throw err;
+		}
+		return extractSubjectToken(raw, source.format, `file ${source.file}`);
+	}
+	if ("url" in source) {
+		const response = await fetchImpl(source.url, { method: "GET", headers: source.headers ?? {}, signal });
+		if (!response.ok) {
+			throw new Error(`external_account credential_source url returned ${response.status}`);
+		}
+		return extractSubjectToken(await response.text(), source.format, "url");
+	}
+	if ("executable" in source) return readSubjectTokenFromExecutable(creds, source);
+	throw new Error(
+		"external_account credential_source must be one of file, url, or executable (AWS environment_id sources are not supported)",
+	);
+}
+
+/** STS token exchange (RFC 8693) of the federated subject token for a Google access token. */
+async function exchangeSubjectToken(
+	creds: ExternalAccountCredentials,
+	subjectToken: string,
+	signal: AbortSignal | undefined,
+	fetchImpl: FetchImpl,
+): Promise<TokenResponse> {
+	const body = new URLSearchParams({
+		grant_type: TOKEN_EXCHANGE_GRANT,
+		audience: creds.audience,
+		scope: CLOUD_PLATFORM_SCOPE,
+		requested_token_type: ACCESS_TOKEN_TYPE,
+		subject_token: subjectToken,
+		subject_token_type: creds.subject_token_type,
+	});
+	return postForToken(creds.token_url ?? STS_TOKEN_URL, body, signal, fetchImpl);
+}
+
+/** IAM Credentials `generateAccessToken` with the federated token as bearer. */
+async function impersonateServiceAccount(
+	creds: ExternalAccountCredentials,
+	url: string,
+	federatedToken: string,
+	signal: AbortSignal | undefined,
+	fetchImpl: FetchImpl,
+): Promise<TokenResponse> {
+	const lifetime = creds.service_account_impersonation?.token_lifetime_seconds ?? DEFAULT_IMPERSONATION_LIFETIME_SEC;
+	const response = await fetchImpl(url, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Authorization: `Bearer ${federatedToken}` },
+		body: JSON.stringify({ scope: [CLOUD_PLATFORM_SCOPE], lifetime: `${lifetime}s` }),
+		signal,
+	});
+	if (!response.ok) {
+		const detail = await response.text().catch(() => "");
+		throw new Error(`Google service account impersonation failed (${response.status}): ${detail}`);
+	}
+	const payload = (await response.json()) as { accessToken?: string; expireTime?: string };
+	if (!payload.accessToken) throw new Error("Google service account impersonation returned no accessToken");
+	const expiresAtMs = payload.expireTime ? Date.parse(payload.expireTime) : Number.NaN;
+	const expiresIn = Number.isFinite(expiresAtMs)
+		? Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000))
+		: lifetime;
+	return { access_token: payload.accessToken, expires_in: expiresIn };
+}
+
+async function exchangeExternalAccount(
+	creds: ExternalAccountCredentials,
+	signal: AbortSignal | undefined,
+	fetchImpl: FetchImpl,
+): Promise<TokenResponse> {
+	if (!creds.audience || !creds.subject_token_type) {
+		throw new Error("external_account credentials require audience and subject_token_type");
+	}
+	const subjectToken = await readSubjectToken(creds, signal, fetchImpl);
+	const federated = await exchangeSubjectToken(creds, subjectToken, signal, fetchImpl);
+	const impersonationUrl = creds.service_account_impersonation_url;
+	if (!impersonationUrl) return federated;
+	return impersonateServiceAccount(creds, impersonationUrl, federated.access_token, signal, fetchImpl);
+}
+
+async function exchangeAdcCredentials(
+	creds: AdcFileCredentials,
+	signal: AbortSignal | undefined,
+	fetchImpl: FetchImpl,
+): Promise<TokenResponse> {
+	switch (creds.type) {
+		case "service_account":
+			return exchangeJwtForToken(creds, signal, fetchImpl);
+		case "authorized_user":
+			return exchangeRefreshToken(creds, signal, fetchImpl);
+		case "external_account":
+			return exchangeExternalAccount(creds, signal, fetchImpl);
+		default:
+			throw new Error(
+				`Unsupported Google credential type ${JSON.stringify((creds as { type?: unknown }).type)}; expected service_account, authorized_user, or external_account`,
+			);
+	}
+}
+
 async function resolveAccessTokenUncached(
 	signal: AbortSignal | undefined,
 	fetchImpl: FetchImpl,
 ): Promise<{ source: string; token: TokenResponse }> {
 	const adc = await loadAdcCredentials();
 	if (adc) {
-		const token =
-			adc.creds.type === "service_account"
-				? await exchangeJwtForToken(adc.creds, signal, fetchImpl)
-				: await exchangeRefreshToken(adc.creds, signal, fetchImpl);
+		const token = await exchangeAdcCredentials(adc.creds, signal, fetchImpl);
 		return { source: adc.source, token };
 	}
 	const metadata = await fetchMetadataToken(signal, fetchImpl);

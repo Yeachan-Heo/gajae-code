@@ -1,5 +1,6 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
 import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
+import { type CredentialPreferenceEntryValue, parseCredentialPreferenceList } from "../session/startup-auth-config";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
@@ -16,6 +17,7 @@ import {
 	validateAutoroutingProvenance,
 	validateAutoroutingSetup,
 } from "./autorouting-contract";
+import { type DurableModelProfileOwnership, validateDurableModelProfileOwnership } from "./model-profile-ownership";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
 
@@ -213,7 +215,11 @@ interface ArrayDef<T> {
 type RecordValueDef =
 	| { type: "model-selector-value" }
 	| { type: "string-enum"; values: readonly string[] }
-	| { type: "credential-selector" };
+	| { type: "credential-selector" }
+	| { type: "credential-preference-list" };
+
+/** A provider's `auth.credentialPreferences` value: one account or a non-empty ordered list of entries. */
+export type CredentialPreferenceSettingValue = string | CredentialPreferenceEntryValue[];
 
 interface ConstrainedRecordValueDef {
 	type: "autorouting-selector-value";
@@ -369,6 +375,42 @@ const AUTOROUTING_PROVENANCE_JSON_SCHEMA: JsonSchemaObject = {
 	required: ["schema", "source", "declarationFingerprint", "tiersFingerprint"],
 };
 
+const MODEL_PROFILE_OWNERSHIP_JSON_SCHEMA: JsonSchemaObject = {
+	type: "object",
+	properties: {
+		schemaVersion: { type: "integer", const: 1 },
+		version: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+		marker: {
+			type: "object",
+			oneOf: [
+				{
+					type: "object",
+					properties: { kind: { type: "string", const: "inherit" } },
+					required: ["kind"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: { kind: { type: "string", const: "cleared" } },
+					required: ["kind"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: {
+						kind: { type: "string", const: "profile" },
+						profile: { type: "string", minLength: 1 },
+					},
+					required: ["kind", "profile"],
+					additionalProperties: false,
+				},
+			],
+		},
+	},
+	required: ["schemaVersion", "version", "marker"],
+	additionalProperties: false,
+};
+
 // SDK prompt deadline defaults. The `sdk.promptDeadlineMs` /
 // `sdk.promptMaxRuntimeMs` schema entries below and the SDK bus/host lease
 // fallbacks read these same constants, so a Settings lookup that misses — no
@@ -415,6 +457,13 @@ export const SETTINGS_SCHEMA = {
 		valueSchema: { type: "credential-selector" } as const,
 	},
 	"auth.credentialPinStoreIdentity": { type: "string", default: undefined },
+	// Ordered soft per-provider OAuth account preferences with optional per-entry usage caps. Global-only, like pins;
+	// read at startup.
+	"auth.credentialPreferences": {
+		type: "record",
+		default: {} as Record<string, CredentialPreferenceSettingValue>,
+		valueSchema: { type: "credential-preference-list" } as const,
+	},
 	"session.directoryMigration": {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
@@ -444,10 +493,23 @@ export const SETTINGS_SCHEMA = {
 		description: "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},
+	"sdk.flushWorktreeOnDeadline": {
+		type: "boolean",
+		default: true,
+		description:
+			"Autosave uncommitted changes in the session's linked worktree by default as a WIP commit when a prompt deadline retires a prompt; primary checkouts require an explicit true opt-in.",
+	},
 	"sdk.masterOrphanGraceMs": {
 		type: "number",
 		default: 120_000,
 		description: "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
+	},
+	"sdk.brokerAbandonedGraceMs": {
+		type: "number",
+		default: 120_000,
+		description:
+			"Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
 	},
 
@@ -677,6 +739,23 @@ export const SETTINGS_SCHEMA = {
 			description: "Model profile applied automatically at startup",
 			options: "runtime",
 		},
+	},
+	"modelProfile.ownership": {
+		type: "optional-object",
+		default: undefined,
+		jsonSchema: MODEL_PROFILE_OWNERSHIP_JSON_SCHEMA,
+		validate: (value: unknown) =>
+			validateDurableModelProfileOwnership(value)
+				? []
+				: [
+						{
+							path: "modelProfile.ownership",
+							code: "config_invalid",
+							reason: "config_invalid",
+							detail: "Expected a versioned ownership record with a valid inherit, cleared, or profile marker.",
+						},
+					],
+		_value: undefined as unknown as DurableModelProfileOwnership,
 	},
 	"modelProfile.proxyProvider": {
 		type: "string",
@@ -1105,14 +1184,16 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.maxInlineResultBytes": {
 		type: "number",
-		default: 0,
+		default: 12,
 		ui: {
 			tab: "tools",
 			label: "Max inline tool-result size (KB)",
 			description:
-				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. Default 12 KB (live A/B, #5945); 0 disables.",
 			options: [
 				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "8", label: "8 KB", description: "~2K tokens" },
+				{ value: "12", label: "12 KB", description: "Default; ~3K tokens" },
 				{ value: "20", label: "20 KB", description: "~5K tokens" },
 				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
@@ -1408,19 +1489,30 @@ export const SETTINGS_SCHEMA = {
 
 	serviceTier: {
 		type: "enum",
-		values: ["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"] as const,
+		values: [
+			"none",
+			"auto",
+			"default",
+			"flex",
+			"scale",
+			"priority",
+			"ultrafast",
+			"openai-only",
+			"claude-only",
+		] as const,
 		default: "none",
 		ui: {
 			tab: "model",
 			label: "Service Tier",
 			description:
-				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
+				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; ultrafast is a 6x premium tier. Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
 			options: [
 				{ value: "none", label: "None", description: "Omit service_tier parameter" },
 				{ value: "auto", label: "Auto", description: "Use provider default tier selection (OpenAI)" },
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
 				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{ value: "ultrafast", label: "Ultrafast", description: "Ultrafast processing at a 6x premium (OpenAI)" },
 				{
 					value: "priority",
 					label: "Priority",
@@ -1450,6 +1542,7 @@ export const SETTINGS_SCHEMA = {
 			"flex",
 			"scale",
 			"priority",
+			"ultrafast",
 			"openai-only",
 			"claude-only",
 		] as const,
@@ -1470,6 +1563,7 @@ export const SETTINGS_SCHEMA = {
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
 				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{ value: "ultrafast", label: "Ultrafast", description: "Ultrafast processing at a 6x premium (OpenAI)" },
 				{
 					value: "priority",
 					label: "Priority",
@@ -1493,6 +1587,19 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 3,
 		validate: (value: number) => Number.isInteger(value) && value > 0,
+	},
+	// Circuit breaker: an entry that fails out of a managed fallback chain is
+	// skipped by later turns and sibling sessions until its cooldown elapses.
+	// Consecutive opens double the cooldown up to the max. 0 disables the breaker.
+	"fallback.circuitCooldownMs": {
+		type: "number",
+		default: 60_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"fallback.circuitMaxCooldownMs": {
+		type: "number",
+		default: 30 * 60 * 1000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
 	},
 
 	// Retries
@@ -1703,7 +1810,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Prompt Suggestions",
 			description:
-				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+				"Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 		},
 	},
 
@@ -1975,9 +2082,15 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "Compaction Threshold",
-			description: "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+			description:
+				"Percent threshold for context maintenance; the 300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
 			options: [
-				{ value: "default", label: "Default", description: "Legacy reserve-based threshold" },
+				{
+					value: "default",
+					label: "Default",
+					description:
+						"300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
+				},
 				{ value: "10", label: "10%", description: "Extremely early maintenance" },
 				{ value: "20", label: "20%", description: "Very early maintenance" },
 				{ value: "30", label: "30%", description: "Early maintenance" },
@@ -2740,6 +2853,12 @@ export const SETTINGS_SCHEMA = {
 		type: "string",
 		default: undefined,
 	},
+	// xxHash64 hex pin for settingsPath. Only the user/global value is a pin;
+	// a project file cannot authorize the TOML path it names.
+	"shellMinimizer.settingsHash": {
+		type: "string",
+		default: undefined,
+	},
 	"shellMinimizer.only": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.except": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.maxCaptureBytes": {
@@ -2920,6 +3039,17 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Render Mermaid",
 			description: "Enable the render_mermaid tool for Mermaid-to-ASCII rendering",
+		},
+	},
+
+	"reportIssue.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Tool issue reporting",
+			description:
+				"Enable the report_issue tool: the model records tool behavior that contradicts the tool's description into the local ~/.gjc/tool-issues.db. Nothing is sent anywhere.",
 		},
 	},
 
@@ -3473,6 +3603,11 @@ export const SETTINGS_SCHEMA = {
 		default: [] as string[],
 	},
 
+	"mcp.discoveryDeferAutoload": {
+		type: "boolean",
+		default: false,
+	},
+
 	"mcp.notifications": {
 		type: "boolean",
 		default: false,
@@ -3630,6 +3765,25 @@ export const SETTINGS_SCHEMA = {
 				"Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 		},
 	},
+	"task.delegationHint.mode": {
+		type: "enum",
+		values: ["off", "hint"] as const,
+		default: "off",
+		ui: {
+			tab: "tasks",
+			label: "Delegation Decision Hint",
+			description:
+				"Opt in to transient local-only Kev advice after observable edit activity. Notices never alter prompts, task arguments, or saved sessions.",
+			options: [
+				{ value: "off", label: "Off", description: "Do not request decision hints (default)" },
+				{
+					value: "hint",
+					label: "Hint",
+					description: "Show ephemeral user-facing advice from the local Kev service",
+				},
+			],
+		},
+	},
 
 	"task.simple": {
 		type: "enum",
@@ -3677,6 +3831,17 @@ export const SETTINGS_SCHEMA = {
 				{ value: "32", label: "32 tasks" },
 				{ value: "64", label: "64 tasks" },
 			],
+		},
+	},
+
+	"task.compactSubagentPanel": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Compact Subagent Panel",
+			description:
+				"Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
 		},
 	},
 
@@ -4258,6 +4423,9 @@ function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean 
 				/^account:\S+$/.test(value))
 		);
 	}
+	if (valueSchema.type === "credential-preference-list") {
+		return parseCredentialPreferenceList(value) !== undefined;
+	}
 	return typeof value === "string" && valueSchema.values.includes(value);
 }
 
@@ -4287,6 +4455,20 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 }
 
 /**
+ * Identity and destination fields adopted from the notification config file.
+ * `config.patch` must not rewrite them; local provider commands still do.
+ */
+const NOTIFICATION_BINDING_PATCH_PATHS = new Set<SettingPath>([
+	"notifications.telegram.chatId",
+	"notifications.discord.applicationId",
+	"notifications.discord.guildId",
+	"notifications.discord.parentChannelId",
+	"notifications.slack.workspaceId",
+	"notifications.slack.channelId",
+	"notifications.slack.authorizedUserId",
+]);
+
+/**
  * Validate an external (SDK `config.patch`) path/value set against the
  * settings schema before any durable write. Dotted sub-paths of record
  * settings (e.g. `modelRoles.default`) are validated against the record's
@@ -4297,6 +4479,21 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 	const issues: Array<{ path: string; detail: string }> = [];
 	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
 	for (const [path, value] of Object.entries(patch)) {
+		// Keep the legacy projection writable until every durable writer uses ownership CAS.
+		if (path === "modelProfile.ownership") {
+			issues.push({
+				path,
+				detail: "The versioned model-profile ownership record is internal and cannot be patched generically.",
+			});
+			continue;
+		}
+		if (NOTIFICATION_BINDING_PATCH_PATHS.has(path as SettingPath)) {
+			issues.push({
+				path,
+				detail: "Notification binding fields cannot be changed through config.patch.",
+			});
+			continue;
+		}
 		const definition = SETTINGS_SCHEMA[path as SettingPath];
 		if (!definition) {
 			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));
@@ -4592,6 +4789,7 @@ export interface BashInterceptorRule {
 export interface ShellMinimizerSettings {
 	enabled: boolean;
 	settingsPath: string | undefined;
+	settingsHash: string | undefined;
 	only: string[];
 	except: string[];
 	maxCaptureBytes: number;

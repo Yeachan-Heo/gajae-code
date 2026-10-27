@@ -15,11 +15,13 @@ const LM_STUDIO_FIRST_EVENT_TIMEOUT_MS = 300_000;
 // the first streamed token; 300s matches kimi-code's floor for long-reasoning silence.
 const OLLAMA_CLOUD_FIRST_EVENT_TIMEOUT_MS = 300_000;
 
-const ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 300_000;
+const ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 600_000;
+const LONG_REASONING_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 export function getProviderStreamIdleTimeoutFallbackMs(provider: string): number | undefined {
-	if (provider === "anthropic" || provider === "xai" || provider === "grok-build") {
-		return ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
+	if (provider === "anthropic") return ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
+	if (provider === "xai" || provider === "grok-build") {
+		return LONG_REASONING_STREAM_IDLE_TIMEOUT_MS;
 	}
 	return undefined;
 }
@@ -44,7 +46,7 @@ export function getProviderFirstEventTimeoutFallbackMs(provider: string): number
 	return provider === "kimi-code" ? KIMI_CODE_FIRST_EVENT_TIMEOUT_MS : undefined;
 }
 
-function normalizeIdleTimeoutMs(value: string | undefined, fallback: number): number | undefined {
+function normalizeIdleTimeoutMs(value: string | undefined, fallback: number | undefined): number | undefined {
 	if (value === undefined) return fallback;
 	const parsed = Number(value);
 	if (!Number.isFinite(parsed)) return fallback;
@@ -70,19 +72,43 @@ export function getStreamIdleTimeoutMs(fallbackMs: number = DEFAULT_STREAM_IDLE_
 }
 
 /**
+ * Returns the `PI_STREAM_IDLE_TIMEOUT_MS` value to suggest after a stream idle
+ * watchdog fired. The suggestion must exceed the window that just elapsed, so it
+ * doubles the larger of the configured override and the longest built-in
+ * provider fallback; suggesting a provider's own default changes nothing.
+ */
+export function getStreamIdleTimeoutRemediationMs(): number {
+	const configuredMs = getStreamIdleTimeoutMs(ANTHROPIC_STREAM_IDLE_TIMEOUT_MS) ?? 0;
+	return 2 * Math.max(configuredMs, ANTHROPIC_STREAM_IDLE_TIMEOUT_MS);
+}
+
+/**
  * Returns the idle timeout used for OpenAI-family streaming transports.
  *
  * Honors `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` first (`PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` is the legacy alias). Set `=0` to disable.
+ * A configured model timeout takes precedence over the built-in provider/model floors; environment overrides win over it.
  * When `provider` is given, long-reasoning hosts (xAI Grok and Grok Build) use that floor instead of the 120s default.
  * Grok models reached through other OpenAI-compatible hosts (`openrouter/x-ai/grok-*`, kilo, litellm, …) get the
  * same floor keyed on the model id, because long-reasoning silence is a property of the model (#4797).
  */
-export function getOpenAIStreamIdleTimeoutMs(provider?: string, modelId?: string): number | undefined {
+export function getOpenAIStreamIdleTimeoutMs(
+	provider?: string,
+	modelId?: string,
+	configuredTimeoutMs?: number,
+): number | undefined {
+	const builtInFallback =
+		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ??
+		(isGrokModelId(modelId) ? LONG_REASONING_STREAM_IDLE_TIMEOUT_MS : undefined) ??
+		DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+	let configuredFallback: number | undefined = builtInFallback;
+	if (configuredTimeoutMs === 0) {
+		configuredFallback = undefined;
+	} else if (configuredTimeoutMs !== undefined && Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0) {
+		configuredFallback = Math.max(1, Math.trunc(configuredTimeoutMs));
+	}
 	return normalizeIdleTimeoutMs(
 		$env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS,
-		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ??
-			(isGrokModelId(modelId) ? ANTHROPIC_STREAM_IDLE_TIMEOUT_MS : undefined) ??
-			DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+		configuredFallback,
 	);
 }
 
@@ -126,19 +152,26 @@ export function resolveOpenAISdkRequestTimeoutMs(
 	provider: string,
 	streamFirstEventTimeoutOverride?: number,
 	modelId?: string,
+	configuredIdleTimeoutMs?: number,
+	effectiveIdleTimeoutOverride?: number,
 ): number | undefined {
 	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(provider);
 	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
-		getOpenAIStreamIdleTimeoutMs(provider, modelId),
+		effectiveIdleTimeoutOverride ?? getOpenAIStreamIdleTimeoutMs(provider, modelId, configuredIdleTimeoutMs),
 		providerFirstEventFallbackMs,
 	);
 	if (streamFirstEventTimeoutOverride === 0) return undefined;
+	let sdkTimeoutMs: number | undefined;
 	if (streamFirstEventTimeoutOverride !== undefined) {
-		return providerFirstEventFallbackMs !== undefined
-			? streamFirstEventTimeoutOverride
-			: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+		sdkTimeoutMs =
+			providerFirstEventFallbackMs !== undefined
+				? streamFirstEventTimeoutOverride
+				: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+	} else {
+		sdkTimeoutMs = envSdkTimeoutMs;
 	}
-	return envSdkTimeoutMs;
+	if (sdkTimeoutMs === undefined || !Number.isFinite(sdkTimeoutMs) || sdkTimeoutMs <= 0) return undefined;
+	return Math.min(Math.trunc(sdkTimeoutMs), MAX_TIMER_DELAY_MS);
 }
 
 /**
@@ -179,6 +212,7 @@ export interface FirstEventTimeoutFacts {
 	requestBytes?: number;
 	firstEventElapsedMs?: number;
 	firstEventTimeoutMs?: number;
+	firstEventTimeoutSource?: "stream-option" | "env" | "idle-timeout" | "provider-fallback" | "default";
 	endpointClass?: "canonical" | "custom";
 	retryMaxAttempts?: number;
 }
@@ -188,6 +222,7 @@ export class FirstEventTimeoutError extends Error {
 	readonly requestBytes?: number;
 	readonly firstEventElapsedMs?: number;
 	readonly firstEventTimeoutMs?: number;
+	readonly firstEventTimeoutSource?: FirstEventTimeoutFacts["firstEventTimeoutSource"];
 	readonly endpointClass?: "canonical" | "custom";
 	readonly retryMaxAttempts?: number;
 
@@ -197,10 +232,18 @@ export class FirstEventTimeoutError extends Error {
 		this.requestBytes = facts.requestBytes;
 		this.firstEventElapsedMs = facts.firstEventElapsedMs;
 		this.firstEventTimeoutMs = facts.firstEventTimeoutMs;
+		this.firstEventTimeoutSource = facts.firstEventTimeoutSource;
 		this.endpointClass = facts.endpointClass;
 		this.retryMaxAttempts = facts.retryMaxAttempts;
 	}
 }
+
+/**
+ * Longest delay setTimeout honors. Bun, like Node, fires any larger delay after 1 ms,
+ * so a very long timeout (for example an env value meant as "effectively never")
+ * would otherwise abort the stream immediately.
+ */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 const dummyWatchdog = setTimeout(() => {}, 1);
 clearTimeout(dummyWatchdog);
@@ -211,7 +254,7 @@ clearTimeout(dummyWatchdog);
  */
 export function createWatchdog(timeoutMs: number | undefined, onTimeout: () => void): Watchdog {
 	if (timeoutMs !== undefined && timeoutMs > 0) {
-		return setTimeout(onTimeout, timeoutMs);
+		return setTimeout(onTimeout, Math.min(timeoutMs, MAX_TIMER_DELAY_MS));
 	}
 	return undefined;
 }
@@ -335,10 +378,10 @@ export async function* iterateWithIdleTimeout<T>(
 			let timer: NodeJS.Timeout | undefined;
 			let resolveTimeout: ((value: { kind: "timeout" }) => void) | undefined;
 			const enforceTimeout = !noTimeoutEnforced && activeTimeoutMs !== undefined && activeTimeoutMs >= 0;
-			if (enforceTimeout) {
+			if (enforceTimeout && activeTimeoutMs !== undefined) {
 				const { promise, resolve } = Promise.withResolvers<{ kind: "timeout" }>();
 				resolveTimeout = resolve;
-				timer = setTimeout(() => resolve({ kind: "timeout" }), activeTimeoutMs);
+				timer = setTimeout(() => resolve({ kind: "timeout" }), Math.min(activeTimeoutMs, MAX_TIMER_DELAY_MS));
 				racers.push(promise);
 			}
 

@@ -1,8 +1,37 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as dns from "node:dns/promises";
+import * as net from "node:net";
 import { hookFetch } from "../../utils/src/hook-fetch";
 import { canonicalMCPResourceUri, MCPOAuthFlow } from "../src/runtime-mcp/oauth-flow";
+import { assertPublicOAuthUrl } from "../src/runtime-mcp/oauth-public-url";
+
+/** Logical URL after guardedPublicFetch pins the dial to a resolved address. */
+function observedUrl(input: string | URL | Request, init?: RequestInit): URL {
+	const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+	const wire = new URL(raw);
+	const hostHeader = init?.headers === undefined ? null : new Headers(init.headers).get("host");
+	const wireHost = wire.hostname.replace(/^\[|\]$/g, "");
+	if (hostHeader && net.isIP(wireHost) !== 0) {
+		const logical = new URL(wire.href);
+		logical.host = hostHeader;
+		return logical;
+	}
+	return wire;
+}
 
 const originalFetch = global.fetch;
+
+beforeEach(() => {
+	// Token URLs in this file are fictional. The public-URL check resolves them
+	// before fetch, and these tests already mock that fetch.
+	vi.spyOn(dns, "lookup").mockImplementation(((...args: unknown[]) => {
+		const options = args[1];
+		if (options && typeof options === "object" && "all" in options && options.all === true) {
+			return Promise.resolve([{ address: "1.1.1.1", family: 4 }]);
+		}
+		return Promise.resolve({ address: "1.1.1.1", family: 4 });
+	}) as typeof dns.lookup);
+});
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -51,8 +80,8 @@ function allocateCallbackPort(): number {
 
 function mockProviderTokenEndpoint(onBody: (body: string) => void) {
 	return hookFetch((input, init) => {
-		const url = String(input);
-		if (url === "https://provider.example/token") {
+		const url = observedUrl(input, init);
+		if (url.origin === "https://provider.example" && url.pathname === "/token") {
 			onBody(String(init?.body ?? ""));
 			return new Response(
 				JSON.stringify({
@@ -64,7 +93,18 @@ function mockProviderTokenEndpoint(onBody: (body: string) => void) {
 			);
 		}
 
-		throw new Error(`Unexpected fetch: ${url}`);
+		throw new Error(`Unexpected fetch: ${url.href}`);
+	});
+}
+
+function routeProviderRequests(origin: string): Disposable {
+	return hookFetch((input, init, next) => {
+		const url = observedUrl(input, init);
+		if (url.hostname !== "provider.example") return next(input, init);
+		const forwarded = new URL(`${url.pathname}${url.search}`, origin);
+		const rest: RequestInit = { ...init };
+		delete (rest as { tls?: unknown }).tls;
+		return next(forwarded, rest);
 	});
 }
 
@@ -73,15 +113,15 @@ describe("mcp oauth flow", () => {
 		let registrationPayload: Record<string, unknown> | null = null;
 
 		using _hook = hookFetch((input, init) => {
-			const url = String(input);
-			if (url === "https://www.figma.com/.well-known/oauth-authorization-server") {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://www.figma.com" && url.pathname === "/.well-known/oauth-authorization-server") {
 				return new Response(
 					JSON.stringify({ registration_endpoint: "https://api.figma.com/v1/oauth/mcp/register" }),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
 			}
 
-			if (url === "https://api.figma.com/v1/oauth/mcp/register") {
+			if (url.origin === "https://api.figma.com" && url.pathname === "/v1/oauth/mcp/register") {
 				registrationPayload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
 				return new Response(
 					JSON.stringify({
@@ -110,6 +150,365 @@ describe("mcp oauth flow", () => {
 		expect((registrationPayload as { client_name?: string } | null)?.client_name).toBe("Codex");
 		expect(authUrl.searchParams.get("client_id")).toBe("registered-client-id");
 		expect(authUrl.searchParams.get("state")).toBe("test-state");
+	});
+
+	it("does not fetch registration metadata from a non-public authorization origin", async () => {
+		const urls: string[] = [];
+		using _hook = hookFetch(input => {
+			urls.push(String(input));
+			return new Response("{}", { status: 200 });
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "http://127.0.0.1/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+		expect(urls.some(url => url.includes("oauth-authorization-server"))).toBe(false);
+		expect(urls.some(url => new URL(url).pathname === "/authorize")).toBe(false);
+	});
+
+	it("does not GET a loopback authorization URL while probing for client_id", async () => {
+		const hits: { method: string; path: string; accept: string | null }[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				const url = new URL(request.url);
+				hits.push({
+					method: request.method,
+					path: url.pathname,
+					accept: request.headers.get("accept"),
+				});
+				return new Response("ok", { status: 200 });
+			},
+		});
+		const port = server.port;
+		if (port === undefined) {
+			server.stop(true);
+			throw new Error("Expected authorize server port");
+		}
+		const authorizationUrl = `http://127.0.0.1:${port}/authorize`;
+		try {
+			await expect(assertPublicOAuthUrl(authorizationUrl)).rejects.toThrow(/Refusing non-public OAuth endpoint/);
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl,
+					tokenUrl: "https://provider.example/token",
+				},
+				{},
+			);
+			const { url } = await flow.generateAuthUrl("state-probe", "http://127.0.0.1:9/callback");
+			expect(hits).toEqual([]);
+			const parsed = new URL(url);
+			expect(parsed.origin).toBe(`http://127.0.0.1:${port}`);
+			expect(parsed.pathname).toBe("/authorize");
+			expect(parsed.searchParams.get("client_id")).toBeNull();
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("login does not GET a loopback authorization URL before opening the browser", async () => {
+		const hits: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				hits.push(new URL(request.url).pathname);
+				return new Response("ok", { status: 200 });
+			},
+		});
+		const port = server.port;
+		if (port === undefined) {
+			server.stop(true);
+			throw new Error("Expected authorize server port");
+		}
+		const controller = new AbortController();
+		const callbackPort = allocateCallbackPort();
+		try {
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: `http://127.0.0.1:${port}/authorize`,
+					tokenUrl: "https://provider.example/token",
+					callbackPort,
+				},
+				{
+					signal: controller.signal,
+					onAuth: () => {
+						controller.abort(new Error("stop after auth url"));
+					},
+				},
+			);
+			await expect(flow.login()).rejects.toThrow(/OAuth callback cancelled/);
+			expect(hits).toEqual([]);
+		} finally {
+			controller.abort();
+			server.stop(true);
+		}
+	});
+
+	it("does not GET an authorization host that resolves to a private address", async () => {
+		const lookup = vi.spyOn(dns, "lookup");
+		lookup.mockImplementation((async (hostname: string, options?: unknown) => {
+			const address = hostname === "rebind.example" ? "10.1.2.3" : "1.1.1.1";
+			if (options && typeof options === "object" && "all" in options && options.all === true) {
+				return [{ address, family: 4 }];
+			}
+			return { address, family: 4 };
+		}) as typeof dns.lookup);
+		const urls: string[] = [];
+		using _hook = hookFetch(input => {
+			urls.push(String(input));
+			return new Response("ok", { status: 200 });
+		});
+		const authorizationUrl = "https://rebind.example/authorize";
+		await expect(assertPublicOAuthUrl(authorizationUrl)).rejects.toThrow(/private or reserved address/);
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl,
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		const { url } = await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+		expect(urls.filter(seen => seen.includes("rebind.example"))).toEqual([]);
+		expect(new URL(url).hostname).toBe("rebind.example");
+		expect(new URL(url).searchParams.get("client_id")).toBeNull();
+	});
+
+	it("does not GET link-local, private, IPv6 loopback, or 6to4 anycast authorization URLs", async () => {
+		const targets = [
+			"http://10.0.0.8/authorize",
+			"http://169.254.169.254/latest/meta-data",
+			"http://[::1]/authorize",
+			"http://192.88.99.2/authorize",
+		];
+		for (const authorizationUrl of targets) {
+			const urls: string[] = [];
+			const hook = hookFetch(input => {
+				urls.push(String(input));
+				return new Response("client_id is required", { status: 400 });
+			});
+			try {
+				await expect(assertPublicOAuthUrl(authorizationUrl)).rejects.toThrow(/Refusing non-public OAuth endpoint/);
+				const flow = new MCPOAuthFlow(
+					{
+						authorizationUrl,
+						tokenUrl: "https://provider.example/token",
+					},
+					{},
+				);
+				const { url } = await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+				const host = new URL(authorizationUrl).host;
+				expect(urls.filter(seen => seen.includes(host))).toEqual([]);
+				expect(new URL(url).host).toBe(host);
+			} finally {
+				hook[Symbol.dispose]();
+			}
+		}
+	});
+
+	it("still probes a public authorization URL that requires client_id", async () => {
+		let probed = false;
+		using _hook = hookFetch((input, init) => {
+			const wire = new URL(String(input));
+			const url = observedUrl(input, init);
+			if (url.pathname === "/authorize") {
+				probed = true;
+				expect(wire.hostname).toBe("1.1.1.1");
+				expect(new Headers(init?.headers).get("host")).toBe("provider.example");
+				return new Response("error: client_id is required", { status: 400 });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/.well-known/oauth-authorization-server") {
+				return new Response("{}", { status: 404 });
+			}
+			throw new Error(`Unexpected fetch: ${url.href}`);
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		await expect(flow.generateAuthUrl("state", "http://127.0.0.1:9/callback")).rejects.toThrow(
+			"OAuth provider requires client_id",
+		);
+		expect(probed).toBe(true);
+	});
+
+	it("pins the client_id probe GET to the address that passed validation", async () => {
+		let allLookups = 0;
+		vi.spyOn(dns, "lookup").mockImplementation((async (hostname: string, options?: unknown) => {
+			const all = options && typeof options === "object" && "all" in options && options.all === true;
+			if (hostname === "rebind.example" && all) {
+				allLookups += 1;
+				if (allLookups === 1) return [{ address: "1.1.1.1", family: 4 }];
+				if (allLookups === 2) return [{ address: "9.9.9.9", family: 4 }];
+				if (allLookups === 3) return [{ address: "8.8.8.8", family: 4 }];
+				return [{ address: "10.9.8.7", family: 4 }];
+			}
+			if (all) return [{ address: "1.1.1.1", family: 4 }];
+			return { address: "1.1.1.1", family: 4 };
+		}) as typeof dns.lookup);
+		const seen: { href: string; host: string | null }[] = [];
+		using _hook = hookFetch((input, init) => {
+			const href = String(input);
+			seen.push({ href, host: new Headers(init?.headers).get("host") });
+			if (href.includes("/.well-known/oauth-authorization-server")) {
+				return new Response("{}", { status: 404 });
+			}
+			if (new URL(href).pathname === "/authorize") {
+				return new Response("ok", { status: 200 });
+			}
+			throw new Error(`Unexpected fetch: ${href}`);
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://rebind.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		const { url } = await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+		const probe = seen.filter(item => new URL(item.href).pathname === "/authorize");
+		expect(probe).toHaveLength(1);
+		expect(new URL(probe[0]?.href ?? "http://invalid").hostname).toBe("8.8.8.8");
+		expect(probe[0]?.host).toBe("rebind.example");
+		expect(allLookups).toBe(3);
+		expect(new URL(url).hostname).toBe("rebind.example");
+		expect(new URL(url).searchParams.get("client_id")).toBeNull();
+	});
+
+	it("login aborts a pending authorization probe lookup and stops the callback server", async () => {
+		let allLookups = 0;
+		const releaseLookup = Promise.withResolvers<void>();
+		vi.spyOn(dns, "lookup").mockImplementation((async (hostname: string, options?: unknown) => {
+			const all = options && typeof options === "object" && "all" in options && options.all === true;
+			if (hostname === "slow.example" && all) {
+				allLookups += 1;
+				if (allLookups < 3) return [{ address: "1.1.1.1", family: 4 }];
+				await releaseLookup.promise;
+				return [{ address: "1.1.1.1", family: 4 }];
+			}
+			if (all) return [{ address: "1.1.1.1", family: 4 }];
+			return { address: "1.1.1.1", family: 4 };
+		}) as typeof dns.lookup);
+		const urls: string[] = [];
+		using _hook = hookFetch(input => {
+			const href = String(input);
+			urls.push(href);
+			if (href.includes("/.well-known/oauth-authorization-server")) {
+				return new Response("{}", { status: 404 });
+			}
+			return new Response("ok", { status: 200 });
+		});
+		const controller = new AbortController();
+		const callbackPort = allocateCallbackPort();
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://slow.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				callbackPort,
+			},
+			{ signal: controller.signal },
+		);
+		const pending = flow.login();
+		try {
+			const deadline = Date.now() + 2000;
+			while (allLookups < 3 && Date.now() < deadline) {
+				await Bun.sleep(10);
+			}
+			expect(allLookups).toBeGreaterThanOrEqual(3);
+			controller.abort(new Error("stop during dns"));
+			const outcome = await Promise.race([
+				pending.then(
+					() => "resolved",
+					() => "rejected",
+				),
+				Bun.sleep(1000).then(() => "timeout"),
+			]);
+			expect(outcome).toBe("rejected");
+			expect(urls.some(href => new URL(href).pathname === "/authorize")).toBe(false);
+			const rebound = Bun.serve({
+				hostname: "127.0.0.1",
+				port: callbackPort,
+				fetch() {
+					return new Response("rebound");
+				},
+			});
+			expect(rebound.port).toBe(callbackPort);
+			rebound.stop(true);
+		} finally {
+			releaseLookup.resolve();
+			controller.abort();
+			await pending.catch(() => undefined);
+		}
+	});
+
+	it("does not probe a non-public authorization URL that already has a client_id", async () => {
+		const hits: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				hits.push(new URL(request.url).pathname);
+				return new Response("ok", { status: 200 });
+			},
+		});
+		const port = server.port;
+		if (port === undefined) {
+			server.stop(true);
+			throw new Error("Expected authorize server port");
+		}
+		try {
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: `http://127.0.0.1:${port}/authorize`,
+					tokenUrl: "https://provider.example/token",
+					clientId: "client-id",
+				},
+				{},
+			);
+			const { url } = await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+			expect(hits).toEqual([]);
+			expect(new URL(url).searchParams.get("client_id")).toBe("client-id");
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("does not follow redirects when fetching public registration metadata", async () => {
+		let metadataRedirect: string | undefined;
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://provider.example" && url.pathname === "/.well-known/oauth-authorization-server") {
+				metadataRedirect = init?.redirect;
+				return new Response(JSON.stringify({ registration_endpoint: "https://provider.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/register") {
+				return new Response(JSON.stringify({ client_id: "cid" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+		expect(metadataRedirect).toBe("manual");
 	});
 
 	it("uses configured callbackPath for the local redirect URI", async () => {
@@ -372,15 +771,15 @@ describe("mcp oauth flow", () => {
 	});
 
 	it("exposes the dynamically registered client_id and client_secret after generateAuthUrl", async () => {
-		using _hook = hookFetch(input => {
-			const url = String(input);
-			if (url === "https://www.figma.com/.well-known/oauth-authorization-server") {
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://www.figma.com" && url.pathname === "/.well-known/oauth-authorization-server") {
 				return new Response(
 					JSON.stringify({ registration_endpoint: "https://api.figma.com/v1/oauth/mcp/register" }),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
 			}
-			if (url === "https://api.figma.com/v1/oauth/mcp/register") {
+			if (url.origin === "https://api.figma.com" && url.pathname === "/v1/oauth/mcp/register") {
 				return new Response(
 					JSON.stringify({
 						client_id: "registered-client-id",
@@ -451,8 +850,8 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 
 	function mockTokenEndpoint(onBody: (body: string) => void) {
 		return hookFetch((input, init) => {
-			const url = String(input);
-			if (url === "https://provider.example/token") {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://provider.example" && url.pathname === "/token") {
 				onBody(String(init?.body ?? ""));
 				return new Response(
 					JSON.stringify({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 3600 }),
@@ -462,6 +861,232 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 			return new Response("not found", { status: 404 });
 		});
 	}
+
+	for (const status of [307, 308] as const) {
+		it(`rejects a ${status} token redirect without forwarding the form body`, async () => {
+			let tokenBody = "";
+			let redirectedRequests = 0;
+			const tokenReceived = Promise.withResolvers<void>();
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					const url = new URL(request.url);
+					if (url.pathname === "/token") {
+						tokenBody = await request.text();
+						tokenReceived.resolve();
+						return new Response(null, {
+							status,
+							headers: { Location: new URL("/token-redirected", request.url).href },
+						});
+					}
+					if (url.pathname === "/token-redirected") {
+						redirectedRequests++;
+						return new Response("redirected");
+					}
+					return new Response("not found", { status: 404 });
+				},
+			});
+
+			try {
+				using _route = routeProviderRequests(`http://127.0.0.1:${server.port}`);
+				const flow = new MCPOAuthFlow(
+					{ ...baseConfig, clientSecret: "client-secret", resource: "https://mcp.example/mcp" },
+					{},
+				);
+
+				await expect(
+					flow.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback"),
+				).rejects.toThrow(/Refusing non-public OAuth endpoint/);
+				await tokenReceived.promise;
+
+				expect(Object.fromEntries(new URLSearchParams(tokenBody))).toEqual({
+					grant_type: "authorization_code",
+					code: "authorization-code",
+					redirect_uri: "https://client.example/oauth/callback",
+					client_id: "client-id",
+					resource: "https://mcp.example/mcp",
+					client_secret: "client-secret",
+				});
+				expect(redirectedRequests).toBe(0);
+			} finally {
+				server.stop(true);
+			}
+		});
+
+		it(`rejects a ${status} registration redirect without forwarding the JSON body`, async () => {
+			let registrationBody = "";
+			let redirectedRequests = 0;
+			const registrationReceived = Promise.withResolvers<void>();
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					const url = new URL(request.url);
+					if (url.pathname === "/.well-known/oauth-authorization-server") {
+						return Response.json({ registration_endpoint: "https://provider.example/register" });
+					}
+					if (url.pathname === "/register") {
+						registrationBody = await request.text();
+						registrationReceived.resolve();
+						return new Response(null, {
+							status,
+							headers: { Location: new URL("/register-redirected", request.url).href },
+						});
+					}
+					if (url.pathname === "/register-redirected") {
+						redirectedRequests++;
+						return Response.json({ client_id: "redirected-client-id" });
+					}
+					if (url.pathname === "/authorize") return new Response("authorization page");
+					return new Response("not found", { status: 404 });
+				},
+			});
+
+			try {
+				using _route = routeProviderRequests(`http://127.0.0.1:${server.port}`);
+				const flow = new MCPOAuthFlow({ ...baseConfig, clientId: undefined }, {});
+				const { url } = await flow.generateAuthUrl("test-state", "https://client.example/oauth/callback");
+				await registrationReceived.promise;
+
+				expect(JSON.parse(registrationBody)).toEqual({
+					client_name: "Codex",
+					redirect_uris: ["https://client.example/oauth/callback"],
+					grant_types: ["authorization_code", "refresh_token"],
+					response_types: ["code"],
+					token_endpoint_auth_method: "none",
+					application_type: "native",
+				});
+				expect(new URL(url).searchParams.get("client_id")).toBeNull();
+				expect(flow.resolvedClientId).toBeUndefined();
+				expect(redirectedRequests).toBe(0);
+			} finally {
+				server.stop(true);
+			}
+		});
+	}
+
+	it("ignores a late registration response after cancellation", async () => {
+		const controller = new AbortController();
+		const registrationReceived = Promise.withResolvers<string>();
+		const releaseRegistration = Promise.withResolvers<void>();
+		const responseProduced = Promise.withResolvers<void>();
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const url = new URL(request.url);
+				if (url.pathname === "/.well-known/oauth-authorization-server") {
+					return Response.json({ registration_endpoint: "https://provider.example/register" });
+				}
+				if (url.pathname === "/register") {
+					registrationReceived.resolve(await request.text());
+					await releaseRegistration.promise;
+					responseProduced.resolve();
+					return Response.json({ client_id: "late-client-id", client_secret: "late-client-secret" });
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+
+		try {
+			using _route = routeProviderRequests(`http://127.0.0.1:${server.port}`);
+			const flow = new MCPOAuthFlow({ ...baseConfig, clientId: undefined }, { signal: controller.signal });
+			const operation = flow.generateAuthUrl("test-state", "https://client.example/oauth/callback");
+
+			const registrationBody = await registrationReceived.promise;
+			controller.abort(new Error("registration cancelled"));
+			await expect(operation).rejects.toThrow("registration cancelled");
+			releaseRegistration.resolve();
+			await responseProduced.promise;
+
+			expect(JSON.parse(registrationBody)).toMatchObject({
+				client_name: "Codex",
+				redirect_uris: ["https://client.example/oauth/callback"],
+			});
+			expect(flow.resolvedClientId).toBeUndefined();
+			expect(flow.registeredClientSecret).toBeUndefined();
+		} finally {
+			releaseRegistration.resolve();
+			server.stop(true);
+		}
+	});
+
+	it("rejects private token endpoints before the first fetch", async () => {
+		const lookup = vi.spyOn(dns, "lookup");
+		lookup.mockImplementation((async (hostname: string, options?: unknown) => {
+			const address = hostname === "private.example" ? "127.0.0.1" : "1.1.1.1";
+			if (options && typeof options === "object" && "all" in options && options.all === true) {
+				return [{ address, family: 4 }];
+			}
+			return { address, family: 4 };
+		}) as typeof dns.lookup);
+		let fetchCalled = false;
+		using _hook = hookFetch(() => {
+			fetchCalled = true;
+			return new Response("unexpected", { status: 500 });
+		});
+
+		const flow = new MCPOAuthFlow({ ...baseConfig, tokenUrl: "https://private.example/token" }, {});
+		await expect(flow.exchangeToken("test-code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			/Refusing non-public OAuth endpoint/,
+		);
+		expect(fetchCalled).toBe(false);
+	});
+
+	it("rejects private registration endpoints before the registration POST", async () => {
+		const lookup = vi.spyOn(dns, "lookup");
+		lookup.mockImplementation((async (hostname: string, options?: unknown) => {
+			const address = hostname === "private.example" ? "127.0.0.1" : "1.1.1.1";
+			if (options && typeof options === "object" && "all" in options && options.all === true) {
+				return [{ address, family: 4 }];
+			}
+			return { address, family: 4 };
+		}) as typeof dns.lookup);
+		let registrationCalled = false;
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://provider.example" && url.pathname === "/.well-known/oauth-authorization-server") {
+				return new Response(JSON.stringify({ registration_endpoint: "https://private.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url.origin === "https://private.example" && url.pathname === "/register") {
+				registrationCalled = true;
+				return new Response(JSON.stringify({ client_id: "unexpected" }), { status: 200 });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/authorize") {
+				return new Response("ok", { status: 200 });
+			}
+			throw new Error(`Unexpected fetch: ${url.href} ${String(init?.method ?? "GET")}`);
+		});
+
+		const flow = new MCPOAuthFlow({ ...baseConfig, clientId: undefined }, {});
+		await flow.generateAuthUrl("state", "http://127.0.0.1/callback");
+		expect(registrationCalled).toBe(false);
+		expect(flow.resolvedClientId).toBeUndefined();
+	});
+
+	it("propagates abort and network failures from direct token exchange", async () => {
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled"));
+		let fetchCalled = false;
+		using _hook = hookFetch(() => {
+			fetchCalled = true;
+			throw new Error("network failure");
+		});
+		const abortedFlow = new MCPOAuthFlow(baseConfig, { signal: controller.signal });
+		await expect(abortedFlow.exchangeToken("code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			"cancelled",
+		);
+		expect(fetchCalled).toBe(false);
+
+		const networkFlow = new MCPOAuthFlow(baseConfig, {});
+		await expect(networkFlow.exchangeToken("code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			"network failure",
+		);
+	});
 
 	function driveCallback(onAuthUrl: (authUrl: URL) => Record<string, string>) {
 		return (info: { url: string; instructions?: string }) => {
@@ -560,42 +1185,94 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 		expect(credentials.access).toBe("access-token");
 	});
 
-	it("passes cancellation through token exchange fetch", async () => {
-		const callbackPort = allocateCallbackPort();
+	it("ignores a late token response after cancellation", async () => {
 		const controller = new AbortController();
-		const tokenStarted = Promise.withResolvers<void>();
-		using _hook = hookFetch(async (input, init) => {
-			if (String(input) !== "https://provider.example/token") return new Response("not found", { status: 404 });
-			tokenStarted.resolve();
-			const { promise: aborted, reject } = Promise.withResolvers<never>();
-			init?.signal?.addEventListener("abort", () => reject(new Error("token exchange aborted")), { once: true });
-			await aborted;
-			throw new Error("unreachable");
+		const tokenReceived = Promise.withResolvers<string>();
+		const releaseToken = Promise.withResolvers<void>();
+		const responseProduced = Promise.withResolvers<void>();
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (new URL(request.url).pathname !== "/token") return new Response("not found", { status: 404 });
+				tokenReceived.resolve(await request.text());
+				await releaseToken.promise;
+				responseProduced.resolve();
+				return Response.json({ access_token: "late-access-token", refresh_token: "late-refresh-token" });
+			},
 		});
-		const flow = new MCPOAuthFlow(
-			{
-				authorizationUrl: "https://provider.example/authorize",
-				tokenUrl: "https://provider.example/token",
-				clientId: "client-id",
-				callbackPort,
-			},
-			{
-				onAuth: info => {
-					const authUrl = new URL(info.url);
-					queueMicrotask(() => {
-						void dispatchLocalCallback(
-							`${authUrl.searchParams.get("redirect_uri")}?code=test-code&state=${authUrl.searchParams.get("state")}`,
-						);
-					});
-				},
-				signal: controller.signal,
-			},
-		);
 
-		const operation = flow.login();
-		await tokenStarted.promise;
-		controller.abort(new Error("cancelled"));
-		await expect(operation).rejects.toThrow("token exchange aborted");
+		try {
+			using _route = routeProviderRequests(`http://127.0.0.1:${server.port}`);
+			const flow = new MCPOAuthFlow({ ...baseConfig, clientSecret: "client-secret" }, { signal: controller.signal });
+			const operation = flow.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback");
+
+			const tokenBody = await tokenReceived.promise;
+			controller.abort(new Error("token exchange cancelled"));
+			await expect(operation).rejects.toThrow("token exchange cancelled");
+			releaseToken.resolve();
+			await responseProduced.promise;
+
+			expect(Object.fromEntries(new URLSearchParams(tokenBody))).toEqual({
+				grant_type: "authorization_code",
+				code: "authorization-code",
+				redirect_uri: "https://client.example/oauth/callback",
+				client_id: "client-id",
+				client_secret: "client-secret",
+			});
+		} finally {
+			releaseToken.resolve();
+			server.stop(true);
+		}
+	});
+
+	it("aborts a token POST on timeout without following a redirect", async () => {
+		const tokenReceived = Promise.withResolvers<string>();
+		const releaseToken = Promise.withResolvers<void>();
+		const responseProduced = Promise.withResolvers<void>();
+		let redirectedRequests = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const url = new URL(request.url);
+				if (url.pathname === "/token") {
+					tokenReceived.resolve(await request.text());
+					await releaseToken.promise;
+					responseProduced.resolve();
+					return new Response(null, {
+						status: 307,
+						headers: { Location: new URL("/token-redirected", request.url).href },
+					});
+				}
+				if (url.pathname === "/token-redirected") redirectedRequests++;
+				return new Response("not found", { status: 404 });
+			},
+		});
+
+		try {
+			using _route = routeProviderRequests(`http://127.0.0.1:${server.port}`);
+			const flow = new MCPOAuthFlow(
+				{ ...baseConfig, clientSecret: "client-secret" },
+				{ signal: AbortSignal.timeout(25) },
+			);
+			const operation = flow.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback");
+			const tokenBody = await tokenReceived.promise;
+
+			await expect(operation).rejects.toThrow();
+			expect(Object.fromEntries(new URLSearchParams(tokenBody))).toEqual({
+				grant_type: "authorization_code",
+				code: "authorization-code",
+				redirect_uri: "https://client.example/oauth/callback",
+				client_id: "client-id",
+				client_secret: "client-secret",
+			});
+			expect(redirectedRequests).toBe(0);
+		} finally {
+			releaseToken.resolve();
+			await responseProduced.promise.catch(() => undefined);
+			server.stop(true);
+		}
 	});
 
 	it("canonicalizes MCP resource URIs per RFC 8707", () => {
@@ -605,5 +1282,363 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 			"https://mcp.example.com:8443/server/mcp",
 		);
 		expect(canonicalMCPResourceUri("not a url")).toBeUndefined();
+	});
+});
+
+describe("pinned public OAuth fetches", () => {
+	function mockLookup(resolveAddress: (hostname: string, lookupIndex: number) => string) {
+		const counts = new Map<string, number>();
+		vi.spyOn(dns, "lookup").mockImplementation((async (hostname: string, options?: unknown) => {
+			const lookupIndex = (counts.get(hostname) ?? 0) + 1;
+			counts.set(hostname, lookupIndex);
+			const address = resolveAddress(hostname, lookupIndex);
+			if (options && typeof options === "object" && "all" in options && options.all === true) {
+				return [{ address, family: 4 }];
+			}
+			return { address, family: 4 };
+		}) as typeof dns.lookup);
+		return counts;
+	}
+
+	function listenForPrivateHits() {
+		const hits: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				hits.push(await request.text());
+				return Response.json({
+					access_token: "stolen",
+					refresh_token: "stolen",
+					expires_in: 60,
+					client_id: "stolen-client",
+					client_secret: "stolen-secret",
+				});
+			},
+		});
+		const port = server.port;
+		if (port === undefined) {
+			server.stop(true);
+			throw new Error("Expected private mock port");
+		}
+		return { server, hits, port };
+	}
+
+	it("does not dial a private mock when the token host rebinds after a public lookup", async () => {
+		const { server, hits, port } = listenForPrivateHits();
+		const wire: string[] = [];
+		try {
+			mockLookup((hostname, lookupIndex) =>
+				hostname === "token.example" && lookupIndex >= 2 ? "127.0.0.1" : "8.8.8.8",
+			);
+			using _hook = hookFetch((input, init, next) => {
+				const href = String(input);
+				wire.push(href);
+				if (new URL(href).hostname === "127.0.0.1") return next(input, init);
+				return Response.json({ access_token: "should-not-issue", refresh_token: "no", expires_in: 60 });
+			});
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: "https://provider.example/authorize",
+					tokenUrl: `http://token.example:${port}/token`,
+					clientId: "client-id",
+					clientSecret: "client-secret",
+				},
+				{},
+			);
+			await expect(
+				flow.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback"),
+			).rejects.toThrow(/Refusing non-public OAuth endpoint/);
+			expect(hits).toEqual([]);
+			expect(wire.some(href => new URL(href).hostname === "127.0.0.1")).toBe(false);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("exchanges a code with a public token endpoint pinned to the validated address", async () => {
+		const { server, hits, port } = listenForPrivateHits();
+		try {
+			mockLookup(() => "8.8.8.8");
+			let body = "";
+			using _hook = hookFetch((input, init, next) => {
+				const wire = new URL(String(input));
+				if (wire.hostname === "127.0.0.1") return next(input, init);
+				expect(wire.hostname).toBe("8.8.8.8");
+				expect(wire.pathname).toBe("/token");
+				expect(wire.port).toBe(String(port));
+				expect(new Headers(init?.headers).get("host")).toBe(`token.example:${port}`);
+				expect(init?.redirect).toBe("manual");
+				body = String(init?.body ?? "");
+				return Response.json({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 60 });
+			});
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: "https://provider.example/authorize",
+					tokenUrl: `http://token.example:${port}/token`,
+					clientId: "client-id",
+					clientSecret: "client-secret",
+				},
+				{},
+			);
+			const credentials = await flow.exchangeToken(
+				"authorization-code",
+				"state",
+				"https://client.example/oauth/callback",
+			);
+			expect(credentials).toMatchObject({ access: "access-token", refresh: "refresh-token" });
+			expect(new URLSearchParams(body).get("code")).toBe("authorization-code");
+			expect(new URLSearchParams(body).get("client_secret")).toBe("client-secret");
+			expect(hits).toEqual([]);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("fails a redirected token exchange instead of returning tokens", async () => {
+		let followed = 0;
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.pathname === "/token") {
+				expect(init?.redirect).toBe("manual");
+				expect(String(init?.body ?? "")).toContain("client_secret=client-secret");
+				return new Response("go", { status: 302, headers: { Location: "http://127.0.0.1/steal" } });
+			}
+			followed += 1;
+			return Response.json({ access_token: "stolen", refresh_token: "stolen", expires_in: 60 });
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://token.example/token",
+				clientId: "client-id",
+				clientSecret: "client-secret",
+			},
+			{},
+		);
+		await expect(
+			flow.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback"),
+		).rejects.toThrow(/Refusing non-public OAuth endpoint/);
+		expect(followed).toBe(0);
+	});
+
+	it("does not fetch registration metadata from a private address after a public lookup", async () => {
+		const { server, hits, port } = listenForPrivateHits();
+		const wire: string[] = [];
+		try {
+			mockLookup((hostname, lookupIndex) =>
+				hostname === "auth.example" && lookupIndex >= 2 ? "127.0.0.1" : "8.8.8.8",
+			);
+			using _hook = hookFetch((input, init, next) => {
+				const href = String(input);
+				wire.push(href);
+				if (new URL(href).hostname === "127.0.0.1") return next(input, init);
+				return Response.json({
+					registration_endpoint: `http://auth.example:${port}/register`,
+					client_id: "should-not-register",
+				});
+			});
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: `http://auth.example:${port}/authorize`,
+					tokenUrl: "https://provider.example/token",
+				},
+				{},
+			);
+			const { url } = await flow.generateAuthUrl("state", "https://client.example/oauth/callback");
+			expect(flow.resolvedClientId).toBeUndefined();
+			expect(new URL(url).searchParams.get("client_id")).toBeNull();
+			expect(hits).toEqual([]);
+			expect(wire.some(href => new URL(href).hostname === "127.0.0.1")).toBe(false);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("does not post dynamic registration to a private address after metadata was public", async () => {
+		const { server, hits, port } = listenForPrivateHits();
+		try {
+			mockLookup((hostname, lookupIndex) =>
+				hostname === "register.example" && lookupIndex >= 2 ? "127.0.0.1" : "8.8.8.8",
+			);
+			using _hook = hookFetch((input, _init, next) => {
+				const href = String(input);
+				if (new URL(href).hostname === "127.0.0.1") return next(input, _init);
+				const url = observedUrl(input, _init);
+				if (url.pathname === "/.well-known/oauth-authorization-server") {
+					return Response.json({ registration_endpoint: `http://register.example:${port}/register` });
+				}
+				if (url.pathname === "/register") {
+					return Response.json({ client_id: "should-not-register", client_secret: "should-not-keep" });
+				}
+				return new Response("ok", { status: 200 });
+			});
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: "https://auth.example/authorize",
+					tokenUrl: "https://provider.example/token",
+				},
+				{},
+			);
+			const { url } = await flow.generateAuthUrl("state", "https://client.example/oauth/callback");
+			expect(flow.resolvedClientId).toBeUndefined();
+			expect(flow.registeredClientSecret).toBeUndefined();
+			expect(new URL(url).searchParams.get("client_id")).toBeNull();
+			expect(hits).toEqual([]);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("ignores a metadata redirect and still returns the authorization URL", async () => {
+		let followed = 0;
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.pathname === "/authorize") return new Response("ok", { status: 200 });
+			if (url.pathname === "/.well-known/oauth-authorization-server") {
+				expect(init?.redirect).toBe("manual");
+				return new Response(null, { status: 302, headers: { Location: "http://127.0.0.1/register" } });
+			}
+			followed += 1;
+			return Response.json({ client_id: "redirected-client", registration_endpoint: "http://127.0.0.1/register" });
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://auth.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		const { url } = await flow.generateAuthUrl("state", "https://client.example/oauth/callback");
+		expect(flow.resolvedClientId).toBeUndefined();
+		expect(new URL(url).pathname).toBe("/authorize");
+		expect(followed).toBe(0);
+	});
+
+	const PROXY_ENV_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
+
+	async function withProxyEnv(values: Record<string, string | undefined>, run: () => Promise<void>): Promise<void> {
+		const previous = new Map<string, string | undefined>();
+		for (const key of PROXY_ENV_KEYS) {
+			previous.set(key, process.env[key]);
+			const next = values[key];
+			if (next === undefined) delete process.env[key];
+			else process.env[key] = next;
+		}
+		try {
+			await run();
+		} finally {
+			for (const key of PROXY_ENV_KEYS) {
+				const prior = previous.get(key);
+				if (prior === undefined) delete process.env[key];
+				else process.env[key] = prior;
+			}
+		}
+	}
+
+	function onlyProxy(key: (typeof PROXY_ENV_KEYS)[number]): Record<string, string | undefined> {
+		const values: Record<string, string | undefined> = {};
+		for (const name of PROXY_ENV_KEYS) values[name] = name === key ? "http://127.0.0.1:9" : undefined;
+		return values;
+	}
+
+	async function expectPublicExchangeAndRegistration(): Promise<void> {
+		let registered = false;
+		let tokenCalls = 0;
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://provider.example" && url.pathname === "/.well-known/oauth-authorization-server") {
+				return Response.json({ registration_endpoint: "https://provider.example/register" });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/register") {
+				registered = true;
+				return Response.json({ client_id: "registered-client", client_secret: "registered-secret" });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/authorize") {
+				return new Response("ok", { status: 200 });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/token") {
+				tokenCalls += 1;
+				expect(new URLSearchParams(String(init?.body ?? "")).get("client_secret")).toBe("client-secret");
+				return Response.json({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 60 });
+			}
+			throw new Error(`Unexpected fetch: ${url.href}`);
+		});
+		const registration = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		const auth = await registration.generateAuthUrl("state", "https://client.example/oauth/callback");
+		expect(new URL(auth.url).searchParams.get("client_id")).toBe("registered-client");
+		expect(registration.resolvedClientId).toBe("registered-client");
+		expect(registered).toBe(true);
+
+		const token = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				clientId: "client-id",
+				clientSecret: "client-secret",
+			},
+			{},
+		);
+		const credentials = await token.exchangeToken(
+			"authorization-code",
+			"state",
+			"https://client.example/oauth/callback",
+		);
+		expect(credentials.access).toBe("access-token");
+		expect(tokenCalls).toBe(1);
+	}
+
+	for (const key of PROXY_ENV_KEYS) {
+		it(`refuses the authorization-code exchange and skips registration when ${key} is set`, async () => {
+			let fetches = 0;
+			using _hook = hookFetch(() => {
+				fetches += 1;
+				return Response.json({ access_token: "should-not-issue", client_id: "should-not-register" });
+			});
+			await withProxyEnv(onlyProxy(key), async () => {
+				const token = new MCPOAuthFlow(
+					{
+						authorizationUrl: "https://provider.example/authorize",
+						tokenUrl: "https://provider.example/token",
+						clientId: "client-id",
+						clientSecret: "client-secret",
+					},
+					{},
+				);
+				await expect(
+					token.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback"),
+				).rejects.toThrow(/Refusing non-public OAuth endpoint: proxy/);
+				const registration = new MCPOAuthFlow(
+					{
+						authorizationUrl: "https://provider.example/authorize",
+						tokenUrl: "https://provider.example/token",
+					},
+					{},
+				);
+				const auth = await registration.generateAuthUrl("state", "https://client.example/oauth/callback");
+				expect(registration.resolvedClientId).toBeUndefined();
+				expect(registration.registeredClientSecret).toBeUndefined();
+				expect(new URL(auth.url).searchParams.get("client_id")).toBeNull();
+			});
+			expect(fetches).toBe(0);
+		});
+	}
+
+	it("exchanges and registers when no proxy variable is set", async () => {
+		const values: Record<string, string | undefined> = {};
+		for (const key of PROXY_ENV_KEYS) values[key] = undefined;
+		await withProxyEnv(values, () => expectPublicExchangeAndRegistration());
+	});
+
+	it("exchanges and registers when proxy variables are empty", async () => {
+		const values: Record<string, string | undefined> = {};
+		for (const key of PROXY_ENV_KEYS) values[key] = "";
+		await withProxyEnv(values, () => expectPublicExchangeAndRegistration());
 	});
 });

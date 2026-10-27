@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -23,6 +24,16 @@ import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/s
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
+
+/** Darwin and Windows broker startup shells out for a machine id. Linux reads a file. */
+function hardwareIdToolOnPath(): boolean {
+	const name = process.platform === "win32" ? "reg.exe" : process.platform === "darwin" ? "ioreg" : "";
+	if (!name) return true;
+	return (process.env.PATH ?? "")
+		.split(path.delimiter)
+		.filter(Boolean)
+		.some(dir => existsSync(path.join(dir, name)));
+}
 
 async function withStageTimeout<T>(label: string, promise: Promise<T>, timeoutMs = 15_000): Promise<T> {
 	const timeout = Promise.withResolvers<T>();
@@ -265,7 +276,97 @@ class FakeSdkClient implements SessionRouterClient {
 	}
 }
 
-describe("chat daemon worker", () => {
+/**
+ * Drives one lean final answer through the production host into a real chat
+ * runtime and returns how many provider posts carry it. The host emits every
+ * turn_stream on a positioned leg and a raw native leg, excluding from the raw
+ * leg only connections that negotiated positioned-only notification effects. A
+ * lean final carries no messageRef, so a daemon that receives both legs has no
+ * shared identity to collapse them into one post.
+ */
+async function deliverLeanFinalThroughProductionHost(
+	root: string,
+	kind: "slack" | "discord",
+	finalText: string,
+): Promise<number> {
+	const agentDir = path.join(root, ".gjc", "agent");
+	const host = await startProductionSdkHost(root);
+	const index = await new SessionIndex(agentDir).open();
+	const slackProvider = new FakeSlackProvider();
+	const discordProvider = new FakeDiscordProvider();
+	const notifications =
+		kind === "slack"
+			? {
+					slack: {
+						botToken: "bot-token",
+						appToken: "app-token",
+						workspaceId: "team",
+						channelId: "channel",
+						authorizedUserId: "human",
+					},
+				}
+			: {
+					discord: {
+						botToken: "discord-token",
+						applicationId: discordProvider.applicationId,
+						guildId: "guild",
+						parentChannelId: "parent",
+					},
+				};
+	const runtime = new ChatDaemonRuntime(
+		{
+			kind,
+			agentDir,
+			config: { identity: "fingerprint-only", presentation: { redact: false, verbosity: "lean" }, notifications },
+		},
+		{
+			createSlackProvider: () => slackProvider,
+			createDiscordProvider: () => discordProvider,
+			routerDeps: {
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
+			},
+		},
+	);
+	const count = (): number =>
+		kind === "slack"
+			? slackProvider.posts.filter(post => post.text.includes(finalText)).length
+			: discordProvider.messages.filter(message => message.content.includes(finalText)).length;
+	try {
+		await index.append({
+			type: "host_registered",
+			sessionId: host.sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: host.endpoint.pid,
+			endpointMtimeMs: host.endpointMtimeMs,
+		});
+		await withStageTimeout(`${kind} runtime start`, runtime.start());
+		await withStageTimeout(`${kind} runtime admission`, runtime.reconcile({ waitForReplay: true }));
+		const runner = host.session.extensionRunner;
+		const assistant = { role: "assistant", content: finalText };
+		await runner?.emit({ type: "agent_start" });
+		await runner?.emit({ type: "message_end", message: assistant } as never);
+		await runner?.emit({ type: "turn_end", turnIndex: 0, message: assistant } as never);
+		await runner?.emit({
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop" }],
+		} as never);
+		const deadline = Date.now() + 10_000;
+		while (count() < 1 && Date.now() < deadline) await Bun.sleep(10);
+		// Both host legs land within milliseconds; leave room for a second
+		// representation to arrive before asserting that it never does.
+		await Bun.sleep(500);
+		await withStageTimeout(`${kind} runtime stop`, runtime.stop());
+	} finally {
+		await withStageTimeout("production SDK host stop", host.stop());
+	}
+	return count();
+}
+
+describe.skipIf(!hardwareIdToolOnPath())("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
 		if (root) await fs.rm(root, { recursive: true, force: true });
@@ -395,6 +496,11 @@ describe("chat daemon worker", () => {
 			},
 		);
 
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			'notifications:\n  discord:\n    authorizedUserId: "human"\n',
+		);
 		const replayedThread = provider.waitForThreadCount(1);
 		await runtime.start();
 		await client.waitForRequest(frame => frame.type === "event_replay");
@@ -1525,6 +1631,11 @@ describe("chat daemon worker", () => {
 					},
 				},
 			);
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				'notifications:\n  discord:\n    authorizedUserId: "human"\n',
+			);
 			const replayedThread = provider.waitForThreadCount(1);
 			await runtime.start();
 			expect(provider.started).toBe(true);
@@ -1584,6 +1695,7 @@ describe("chat daemon worker", () => {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
+			const endpointGeneration = await host.readGeneration();
 			const endpointIdentity = await fs.stat(path.join(root, ".gjc", "state", "sdk", `${host.sessionId}.json`), {
 				bigint: true,
 			});
@@ -1635,7 +1747,7 @@ describe("chat daemon worker", () => {
 					type: "host_registered",
 					sessionId: host.sessionId,
 					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
-					endpointGeneration: 1,
+					endpointGeneration,
 					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
 				});
@@ -1648,12 +1760,12 @@ describe("chat daemon worker", () => {
 					channelId: "channel",
 					rootTs: "root",
 					sessionId: host.sessionId,
-					endpointGeneration: 1,
+					endpointGeneration,
 					// Derive through the Router's identity helper using the exact host
 					// process tuple; hand-rolled or test-runner pids create stale roots.
 					attachmentAuthorityId: sessionAttachmentAuthorityId({
 						sessionId: host.sessionId,
-						generation: 1,
+						generation: endpointGeneration,
 						pid: host.endpoint.pid,
 						endpointMtimeMs: host.endpointMtimeMs,
 						url: host.endpoint.url,
@@ -1706,6 +1818,26 @@ describe("chat daemon worker", () => {
 			} finally {
 				await withStageTimeout("production SDK host stop", host.stop());
 			}
+		},
+		60_000,
+	);
+
+	it.skipIf(skipProductionSessionHost)(
+		"posts a lean final answer from the production host to Slack exactly once",
+		async () => {
+			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-lean-final-"));
+			const posts = await deliverLeanFinalThroughProductionHost(root, "slack", "Lean Slack final answer.");
+			expect(posts).toBe(1);
+		},
+		60_000,
+	);
+
+	it.skipIf(skipProductionSessionHost)(
+		"posts a lean final answer from the production host to Discord exactly once",
+		async () => {
+			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-discord-lean-final-"));
+			const posts = await deliverLeanFinalThroughProductionHost(root, "discord", "Lean Discord final answer.");
+			expect(posts).toBe(1);
 		},
 		60_000,
 	);

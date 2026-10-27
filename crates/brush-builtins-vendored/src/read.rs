@@ -1,27 +1,35 @@
+// Vendored from can1357/oh-my-pi@68fb9863b377af566d3b56aa882a964654b5760a:crates/pi-builtins/src/read.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, preserves cancellation, timeout, and readiness guards; reads one byte at a time with no read-ahead, taking held input before polling a stream for every other byte; counts -n/-N characters as the line decodes, counting an incomplete character at EOF, and holds the input read past the limit with the open file description for the next read.
 use std::{
 	collections::VecDeque,
-	io::{Read, Write},
+	io::Write,
+	sync::MutexGuard,
 	time::{Duration, Instant},
 };
 
-use brush_core::{ErrorKind, builtins, env, error, variables};
+use brush_core::{
+	ErrorKind,
+	builtins,
+	env,
+	error,
+	openfiles::{HeldInput, OpenFile},
+	output_decode::OutputDecoderState,
+	variables,
+};
 use clap::Parser;
 use itertools::Itertools;
+
+use crate::line_input::{CTRL_C, CTRL_D, LineInput};
 
 /// Exit code returned when `read` times out.
 /// This is 128 + SIGALRM (14) = 142, matching bash behavior.
 const TIMEOUT_EXIT_CODE: u8 = 142;
 
-/// ASCII control character for Ctrl+C (ETX - End of Text).
-const CTRL_C: char = '\x03';
-/// ASCII control character for Ctrl+D (EOT - End of Transmission).
-const CTRL_D: char = '\x04';
 /// Backslash character used for escape processing.
-const BACKSLASH: char = '\\';
+const BACKSLASH: u8 = b'\\';
 /// Default line delimiter (newline).
-const DEFAULT_DELIMITER: char = '\n';
+const DEFAULT_DELIMITER: u8 = b'\n';
 /// NUL character used as delimiter when `-d ''` is specified.
-const NUL_DELIMITER: char = '\0';
+const NUL_DELIMITER: u8 = b'\0';
 
 /// Parse standard input.
 #[derive(Parser)]
@@ -84,12 +92,6 @@ impl builtins::Command for ReadCommand {
 		&self,
 		context: brush_core::ExecutionContext<'_, SE>,
 	) -> Result<brush_core::ExecutionResult, Self::Error> {
-		if self.use_readline {
-			return error::unimp("read -e");
-		}
-		if self.initial_text.is_some() {
-			return error::unimp("read -i");
-		}
 
 		// Validate timeout value if provided.
 		if let Some(result) = self.validate_timeout(&context)? {
@@ -105,6 +107,16 @@ impl builtins::Command for ReadCommand {
 		let input_stream = context
 			.try_fd(fd_num)
 			.ok_or_else(|| ErrorKind::BadFileDescriptor(fd_num))?;
+		// Readline flags are accepted for redirected input, where there is no
+		// terminal line editor to activate. Initial text is only meaningful with
+		// `-e`; on a terminal that combination remains unsupported.
+		if self.use_readline && input_stream.is_terminal() {
+			return error::unimp(if self.initial_text.is_some() {
+				"read -e -i"
+			} else {
+				"read -e"
+			});
+		}
 
 		// Retrieve effective value of IFS for splitting.
 		// We convert to owned String to release the borrow before the mutable borrow
@@ -272,6 +284,7 @@ fn build_variable_fields(
 ///
 /// This enum clearly represents all possible outcomes of `read_line()`,
 /// making the contract with callers explicit.
+#[derive(Debug)]
 enum ReadResult {
 	/// Successfully read a complete line (delimiter or char limit reached).
 	Line(String),
@@ -288,25 +301,18 @@ enum ReadResult {
 	InputNotReady,
 }
 
-/// Helper struct that encapsulates the state for reading input character by
-/// character.
+/// Low-level input reader that handles timeouts and control characters.
 ///
-/// This separates the concerns of character-level I/O with timeout handling
+/// This separates the concerns of byte-level I/O with timeout handling
 /// from the higher-level logic of line building and escape processing.
 struct InputReader {
-	/// The input source.
-	input:      brush_core::openfiles::OpenFile,
+	/// The input source, read one byte at a time; input read past a
+	/// `-n`/`-N` limit is held for the next read.
+	source:     LineInput,
 	/// Optional deadline for timeout.
 	deadline:   Option<Instant>,
-	/// Single-byte read buffer.
-	///
-	/// TODO(utf-8): This only handles ASCII correctly. Multi-byte UTF-8
-	/// characters will be read as separate bytes and incorrectly interpreted.
-	/// To fix this, we would need to buffer up to 4 bytes and decode
-	/// incrementally using `std::str::from_utf8`. Note that bash's `-n` counts
-	/// bytes, not Unicode codepoints, so the fix needs to preserve that
-	/// behavior.
-	buffer:     [u8; 1],
+	/// Terminal input: Ctrl-C and Ctrl-D bytes are keys, not data.
+	terminal:   bool,
 	/// Terminal mode guard - kept alive for RAII cleanup on drop.
 	/// The guard restores original terminal settings when dropped, even though
 	/// we don't access the field directly after construction.
@@ -318,8 +324,8 @@ struct InputReader {
 
 /// Events that can occur when reading input.
 enum InputEvent {
-	/// A regular character was read.
-	Char(char),
+	/// A data byte was read.
+	Byte(u8),
 	/// End of file was reached.
 	Eof,
 	/// The read operation timed out.
@@ -341,25 +347,62 @@ where
 	Ok(())
 }
 
+fn acquire_read_lock<'a, F>(
+	held_input: &'a HeldInput,
+	deadline: Option<Instant>,
+	is_cancelled: &F,
+) -> Result<Option<MutexGuard<'a, ()>>, brush_core::Error>
+where
+	F: Fn() -> bool,
+{
+	const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+	loop {
+		ensure_not_cancelled(is_cancelled)?;
+		if let Some(guard) = held_input.try_lock_reader() {
+			if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+				drop(guard);
+				return Ok(None);
+			}
+			return Ok(Some(guard));
+		}
+
+		let sleep_for = if let Some(deadline) = deadline {
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				return Ok(None);
+			}
+			remaining.min(RETRY_INTERVAL)
+		} else {
+			RETRY_INTERVAL
+		};
+		std::thread::sleep(sleep_for);
+	}
+}
+
 impl InputReader {
-	/// Creates a new input reader with optional timeout.
+	/// Creates a new input reader with an absolute timeout deadline.
 	fn new(
-		input: brush_core::openfiles::OpenFile,
-		timeout: Option<Duration>,
+		input: OpenFile,
+		deadline: Option<Instant>,
 		term_mode: Option<brush_core::terminal::AutoModeGuard>,
 	) -> Self {
+		let terminal = input.is_terminal();
 		Self {
-			input,
-			deadline: timeout.map(|t| Instant::now() + t),
-			buffer: [0; 1],
+			source: LineInput::new(input),
+			deadline,
+			terminal,
 			_term_mode: term_mode,
 		}
 	}
 
-	/// Checks if input is immediately available (for `-t 0`). Returns `false` if
-	/// an error occurs while checking for available input.
+	/// Checks if input is immediately available (for `-t 0`), held input
+	/// included, without consuming it. Returns `false` if an error occurs
+	/// while checking for available input.
 	fn check_input_available(&self) -> bool {
-		brush_core::sys::poll::poll_for_input(&self.input, Duration::ZERO).unwrap_or(false)
+		self.source.has_held()
+			|| brush_core::sys::poll::poll_for_input(self.source.input(), Duration::ZERO)
+				.unwrap_or(false)
 	}
 
 	#[cfg(unix)]
@@ -369,7 +412,7 @@ impl InputReader {
 	{
 		const INPUT_POLL_INTERVAL_MS: u64 = 100;
 
-		if self.deadline.is_none() && self.input.try_borrow_as_fd().is_err() {
+		if self.deadline.is_none() && self.source.input().try_borrow_as_fd().is_err() {
 			ensure_not_cancelled(is_cancelled)?;
 			return Ok(None);
 		}
@@ -388,7 +431,7 @@ impl InputReader {
 				Duration::from_millis(INPUT_POLL_INTERVAL_MS)
 			};
 
-			match brush_core::sys::poll::poll_for_input(&self.input, timeout) {
+			match brush_core::sys::poll::poll_for_input(self.source.input(), timeout) {
 				Ok(true) => return Ok(None),
 				Ok(false) => continue,
 				Err(e) => return Err(e.into()),
@@ -409,7 +452,7 @@ impl InputReader {
 				return Ok(Some(InputEvent::Timeout));
 			}
 
-			match brush_core::sys::poll::poll_for_input(&self.input, remaining) {
+			match brush_core::sys::poll::poll_for_input(self.source.input(), remaining) {
 				Ok(true) => {},
 				Ok(false) => return Ok(Some(InputEvent::Timeout)),
 				Err(e) => return Err(e.into()),
@@ -419,41 +462,203 @@ impl InputReader {
 		Ok(None)
 	}
 
+	/// The text of a `-n`/`-N` read whose limit fell before trailing bytes in
+	/// `line`. Each line byte records the input bytes that produced it, so
+	/// escaped bytes can be returned intact to the next read.
+	fn line_before_trailing_bytes(
+		&self,
+		mut line: Vec<u8>,
+		raw_backslashes: Vec<bool>,
+		trailing_bytes: usize,
+	) -> String {
+		let keep = line.len().saturating_sub(trailing_bytes);
+		let mut unread = Vec::with_capacity(trailing_bytes * 2);
+		for (&byte, &escaped) in line.iter().zip(&raw_backslashes).skip(keep) {
+			if escaped {
+				unread.push(BACKSLASH);
+			}
+			unread.push(byte);
+		}
+		line.truncate(keep);
+		self.source.unread(&unread);
+		self.source.decode_line(line)
+	}
+
 	/// Reads the next input event, handling timeout and control characters.
 	fn read_event<F>(&mut self, is_cancelled: &F) -> Result<InputEvent, brush_core::Error>
 	where
 		F: Fn() -> bool,
 	{
-		if let Some(event) = self.wait_for_input(is_cancelled)? {
-			return Ok(event);
-		}
-
 		ensure_not_cancelled(is_cancelled)?;
-
-		let n = self.input.read(&mut self.buffer)?;
-		if n == 0 {
-			return Ok(InputEvent::Eof);
+		if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+			return Ok(InputEvent::Timeout);
 		}
+		// Held input is taken by one atomic pop and never waits. Any other byte
+		// is polled first: a ready count goes stale when another reader of a
+		// shared pipe drains it, and the read would then block where neither
+		// `-t` nor cancellation is checked. Never test for held input and then
+		// read.
+		let byte = if let Some(byte) = self.source.take_held() {
+			byte
+		} else {
+			if let Some(event) = self.wait_for_input(is_cancelled)? {
+				return Ok(event);
+			}
+			ensure_not_cancelled(is_cancelled)?;
+			let Some(byte) = self.source.read_byte()? else {
+				return Ok(InputEvent::Eof);
+			};
+			byte
+		};
 
-		let ch = self.buffer[0] as char;
-
-		// Map control characters to events.
-		Ok(match ch {
-			CTRL_C => InputEvent::CtrlC,
-			CTRL_D => InputEvent::CtrlD,
-			_ => InputEvent::Char(ch),
+		// Control keys only mean something on a terminal; in a file or pipe
+		// they are data.
+		Ok(match byte {
+			CTRL_C if self.terminal => InputEvent::CtrlC,
+			CTRL_D if self.terminal => InputEvent::CtrlD,
+			_ => InputEvent::Byte(byte),
 		})
 	}
 }
 
 /// Configuration for line reading behavior.
 struct LineReaderConfig {
-	/// Character that terminates input (None for -N mode).
-	delimiter:       Option<char>,
+	/// Byte that terminates input (None for -N mode).
+	delimiter:       Option<u8>,
 	/// Maximum characters to read (for -n or -N).
 	char_limit:      Option<usize>,
 	/// Whether to process backslash escapes (false for -r mode).
 	process_escapes: bool,
+}
+
+/// Characters read toward a `-n`/`-N` limit, using the same active encoding as
+/// the line decoder. UTF-8 malformed sequences become one replacement
+/// character; valid ACP multibyte sequences count as one character.
+struct CharCount {
+	chars:   usize,
+	pending: [u8; 4],
+	len:     usize,
+	state:   OutputDecoderState,
+}
+
+enum Utf8Character {
+	Valid(usize),
+	Invalid(usize),
+}
+
+/// Where a byte leaves a [`CharCount`] relative to its limit.
+enum Limit {
+	/// Below the limit, or inside a character not yet complete.
+	NotReached,
+	/// Reached by the character this byte completes.
+	Reached,
+	/// Reached before these trailing bytes, which must be returned to input.
+	Passed(usize),
+}
+
+impl CharCount {
+	fn new(state: OutputDecoderState) -> Self {
+		Self { chars: 0, pending: [0; 4], len: 0, state }
+	}
+
+	fn push(&mut self, byte: u8, limit: Option<usize>) -> Limit {
+		self.pending[self.len] = byte;
+		self.len += 1;
+		if self.state.uses_acp() {
+			return self.process_acp(false, limit);
+		}
+
+		while let Some(character) = self.next_utf8_character() {
+			match character {
+				Utf8Character::Valid(char_len) => {
+					self.consume_pending(char_len);
+					self.chars += 1;
+				},
+				Utf8Character::Invalid(char_len) => {
+					if self.state.select_acp_fallback() {
+						return self.process_acp(false, limit);
+					}
+					self.consume_pending(char_len);
+					self.chars += 1;
+				},
+			}
+			if limit.is_some_and(|limit| self.chars >= limit) {
+				return self.limit_result(self.len);
+			}
+		}
+		Limit::NotReached
+	}
+
+	/// At EOF, flush the last incomplete UTF-8 or ACP character.
+	fn finish(&mut self, limit: Option<usize>) -> Limit {
+		if self.len == 0 {
+			return Limit::NotReached;
+		}
+		if !self.state.uses_acp() && self.state.select_acp_fallback() {
+			return self.process_acp(true, limit);
+		}
+		if self.state.uses_acp() {
+			return self.process_acp(true, limit);
+		}
+		self.len = 0;
+		self.chars += 1;
+		if limit.is_some_and(|limit| self.chars >= limit) {
+			Limit::Reached
+		} else {
+			Limit::NotReached
+		}
+	}
+
+	fn next_utf8_character(&self) -> Option<Utf8Character> {
+		(1..=self.len).find_map(|end| match std::str::from_utf8(&self.pending[..end]) {
+			Ok(_) => Some(Utf8Character::Valid(end)),
+			Err(error) => error.error_len().map(Utf8Character::Invalid),
+		})
+	}
+
+	fn consume_pending(&mut self, consumed: usize) {
+		self.pending.copy_within(consumed..self.len, 0);
+		self.len -= consumed;
+	}
+
+	fn process_acp(&mut self, eof: bool, limit: Option<usize>) -> Limit {
+		let mut index = 0;
+		while index < self.len {
+			let Some(char_len) = self.state.acp_character_len(&self.pending[index..self.len], eof)
+			else {
+				break;
+			};
+			index += char_len;
+			self.chars += 1;
+			if limit.is_some_and(|limit| self.chars >= limit) {
+				let trailing = self.len - index;
+				self.consume_pending(index);
+				return self.limit_result(trailing);
+			}
+		}
+		self.consume_pending(index);
+		Limit::NotReached
+	}
+
+	fn limit_result(&self, trailing: usize) -> Limit {
+		if trailing == 0 { Limit::Reached } else { Limit::Passed(trailing) }
+	}
+
+	/// A backslash can be the trail byte of an ACP character, even before an
+	/// invalid UTF-8 byte has switched this stream to ACP mode.
+	fn is_acp_character_continuation(&self, byte: u8) -> bool {
+		if self.len == 0 || self.len == self.pending.len() {
+			return false;
+		}
+		let len = self.len + 1;
+		let mut candidate = [0; 4];
+		candidate[..self.len].copy_from_slice(&self.pending[..self.len]);
+		candidate[self.len] = byte;
+		matches!(
+			self.state.acp_character_len(&candidate[..len], false),
+			Some(character_len) if character_len == len && character_len > 1
+		)
+	}
 }
 
 /// Reads a complete line of input using the given reader and configuration.
@@ -474,27 +679,54 @@ fn read_line_with_reader<F>(
 where
 	F: Fn() -> bool,
 {
-	let mut line = String::new();
+	let mut line = Vec::new();
+	let mut raw_backslashes = Vec::new();
+	let mut count = CharCount::new(reader.source.decoder_state());
 	let mut pending_backslash = false;
 
 	loop {
-		let event = reader.read_event(is_cancelled)?;
+		let event = match reader.read_event(is_cancelled) {
+			Ok(event) => event,
+			Err(error) => {
+				// Bytes already consumed may have selected ACP for this stream.
+				reader.source.set_decoder_state(count.state);
+				return Err(error);
+			},
+		};
 
 		match event {
 			InputEvent::Eof => {
+				match count.finish(config.char_limit) {
+					Limit::Reached => return Ok(ReadResult::Line(reader.source.decode_line(line))),
+					Limit::Passed(past) => {
+						return Ok(ReadResult::Line(
+							reader.line_before_trailing_bytes(line, raw_backslashes, past),
+						));
+					},
+					Limit::NotReached => {},
+				}
 				// Bash discards pending backslash on EOF.
-				return Ok(ReadResult::Eof(if line.is_empty() { None } else { Some(line) }));
+				return Ok(ReadResult::Eof(
+					(!line.is_empty()).then(|| reader.source.decode_line(line)),
+				));
 			},
 
 			InputEvent::Timeout => {
 				// Include pending backslash on timeout (different from EOF).
 				if pending_backslash {
 					line.push(BACKSLASH);
+					raw_backslashes.push(false);
 				}
-				return Ok(ReadResult::TimedOut(if line.is_empty() { None } else { Some(line) }));
+				// Finalize consumed bytes into the partial value. The read has
+				// returned, so an incomplete character cannot remain pending for
+				// a later builtin-only read.
+				return Ok(ReadResult::TimedOut(
+					(!line.is_empty()).then(|| reader.source.decode_bytes_on_timeout(line)),
+				));
 			},
 
 			InputEvent::CtrlC => {
+				reader.source.set_decoder_state(count.state);
 				return Ok(ReadResult::Interrupted);
 			},
 
@@ -504,60 +736,112 @@ where
 				return Ok(if line.is_empty() && !pending_backslash {
 					ReadResult::Eof(None)
 				} else {
-					ReadResult::Line(line)
+					ReadResult::Line(reader.source.decode_line(line))
 				});
 			},
 
-			InputEvent::Char(ch) => {
+			InputEvent::Byte(byte) => {
 				// Handle backslash escape processing (when enabled).
-				if config.process_escapes {
+				if config.process_escapes && !count.is_acp_character_continuation(byte) {
 					if pending_backslash {
 						pending_backslash = false;
 
 						// Backslash-delimiter is line continuation.
-						if let Some(delim) = config.delimiter
-							&& ch == delim
-						{
+						if config.delimiter == Some(byte) {
 							continue; // Line continuation.
 						}
 
-						// For other chars, add char literally (backslash consumed).
-						line.push(ch);
+						// For other bytes, add the byte literally (backslash consumed).
+						line.push(byte);
+						raw_backslashes.push(true);
 
 						// Check character limit (based on output length).
-						if let Some(limit) = config.char_limit
-							&& line.len() >= limit
-						{
-							return Ok(ReadResult::Line(line));
+						match count.push(byte, config.char_limit) {
+							Limit::NotReached => continue,
+							Limit::Reached => return Ok(ReadResult::Line(reader.source.decode_line(line))),
+							Limit::Passed(past) => {
+								return Ok(ReadResult::Line(
+									reader.line_before_trailing_bytes(line, raw_backslashes, past),
+								));
+							},
 						}
-						continue;
 					}
 
-					if ch == BACKSLASH {
+					if byte == BACKSLASH {
 						pending_backslash = true;
 						continue;
 					}
 				}
 
-				// Check for delimiter.
-				if let Some(delim) = config.delimiter
-					&& ch == delim
-				{
-					return Ok(ReadResult::Line(line));
+				// When we have incomplete multibyte input, we must decide whether to
+				// consume this byte to complete it. The issue: if completing would exceed
+				// the limit, we'd need to unread the byte via HeldInput, which is hidden
+				// from native child processes. Instead, finalize incomplete input without
+				// consuming lookahead bytes: if we have pending at a limit boundary, return.
+				if count.len > 0 {
+					// A delimiter that cannot continue the pending multibyte
+					// character marks the record boundary. If that character reaches
+					// a limit, retain the delimiter for the next read.
+					if config.delimiter == Some(byte)
+						&& !count.is_acp_character_continuation(byte)
+					{
+						if matches!(count.finish(config.char_limit), Limit::Reached) {
+							reader.source.unread(&[byte]);
+						}
+						return Ok(ReadResult::Line(reader.source.decode_line(line)));
+					}
+
+					// Check if we're at the character limit already with pending input.
+					// If so, finalize the pending character(s) and return without consuming this byte.
+					if config.char_limit.is_some_and(|limit| count.chars >= limit) {
+						// We're at the limit with pending incomplete bytes.
+						// Finalize them without reading the current byte.
+						// This prevents the byte from being consumed and hidden in HeldInput.
+						match count.finish(None) {
+							Limit::NotReached => {},  // Pending finalized, but still under limit. Treat as complete.
+							Limit::Reached | Limit::Passed(_) => {},  // Already counted in finish().
+						}
+						return Ok(ReadResult::Line(reader.source.decode_line(line)));
+					}
+
+					// We have pending but haven't hit the limit yet.
+					// Try to complete the multibyte sequence with this byte.
+					line.push(byte);
+					raw_backslashes.push(false);
+
+					match count.push(byte, config.char_limit) {
+						Limit::NotReached => continue,  // Byte was consumed as part of multibyte character.
+						Limit::Reached => return Ok(ReadResult::Line(reader.source.decode_line(line))),
+						Limit::Passed(past) => {
+							return Ok(ReadResult::Line(
+								reader.line_before_trailing_bytes(line, raw_backslashes, past),
+							));
+						},
+					}
+				}
+
+				// Check for delimiter (only if not part of pending multibyte input).
+				if config.delimiter == Some(byte) {
+					return Ok(ReadResult::Line(reader.source.decode_line(line)));
 				}
 
 				// Ignore non-whitespace control characters.
-				if ch.is_ascii_control() && !ch.is_ascii_whitespace() {
+				if byte.is_ascii_control() && !byte.is_ascii_whitespace() {
 					continue;
 				}
 
-				line.push(ch);
+				line.push(byte);
+				raw_backslashes.push(false);
 
 				// Check character limit (based on output length).
-				if let Some(limit) = config.char_limit
-					&& line.len() >= limit
-				{
-					return Ok(ReadResult::Line(line));
+				match count.push(byte, config.char_limit) {
+					Limit::NotReached => {},
+					Limit::Reached => return Ok(ReadResult::Line(reader.source.decode_line(line))),
+					Limit::Passed(past) => {
+						return Ok(ReadResult::Line(
+							reader.line_before_trailing_bytes(line, raw_backslashes, past),
+						));
+					},
 				}
 			},
 		}
@@ -592,15 +876,12 @@ impl ReadCommand {
 			}
 		}
 
-		// Determine delimiter based on options.
+		// Determine delimiter based on options. Input is matched byte by byte,
+		// so a multi-byte `-d` delimiter splits at its first byte.
 		let delimiter = if self.return_after_n_chars_no_delimiter.is_some() {
 			None
 		} else if let Some(delimiter_str) = &self.delimiter {
-			if delimiter_str.is_empty() {
-				Some(NUL_DELIMITER)
-			} else {
-				delimiter_str.chars().next()
-			}
+			Some(delimiter_str.as_bytes().first().copied().unwrap_or(NUL_DELIMITER))
 		} else {
 			Some(DEFAULT_DELIMITER)
 		};
@@ -609,8 +890,10 @@ impl ReadCommand {
 			.return_after_n_chars_no_delimiter
 			.or(self.return_after_n_chars);
 
-		// Create the input reader.
-		let mut reader = InputReader::new(input_file, timeout, term_mode);
+		// Start the timeout before acquiring the shared reader guard so waiting
+		// behind another builtin does not extend `-t`.
+		let deadline = timeout.map(|duration| Instant::now() + duration);
+		let mut reader = InputReader::new(input_file, deadline, term_mode);
 
 		// Handle -t 0 special case: just check if input is available without reading.
 		if timeout == Some(Duration::ZERO) {
@@ -622,6 +905,19 @@ impl ReadCommand {
 			});
 		}
 
+		// Duplicated descriptors share this guard with other builtin readers.
+		// Keeping it through line assembly and any pushback prevents a second
+		// builtin from blocking on the descriptor while unread bytes are queued.
+		let held_input = reader.source.input().held_input().cloned();
+		let _read_guard = if let Some(held_input) = held_input.as_ref() {
+			let Some(guard) = acquire_read_lock(held_input, reader.deadline, &is_cancelled)? else {
+				return Ok(ReadResult::TimedOut(None));
+			};
+			Some(guard)
+		} else {
+			None
+		};
+
 		// Configure and perform the read.
 		let config = LineReaderConfig { delimiter, char_limit, process_escapes: !self.raw_mode };
 
@@ -632,6 +928,11 @@ impl ReadCommand {
 		&self,
 		file: &brush_core::openfiles::OpenFile,
 	) -> Result<Option<brush_core::terminal::AutoModeGuard>, brush_core::Error> {
+		// The guard dups the descriptor and reads its terminal attributes; a
+		// pipe or file has none, so skip it in every `while read` iteration.
+		if !file.is_terminal() {
+			return Ok(None);
+		}
 		let mode = brush_core::terminal::AutoModeGuard::new(file.to_owned()).ok();
 		if let Some(mode) = &mode {
 			let config = brush_core::terminal::Settings::builder()
@@ -921,6 +1222,219 @@ mod tests {
 		}
 	}
 
+	#[cfg(windows)]
+	#[derive(Clone)]
+	struct CursorStream(std::sync::Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>);
+
+	#[cfg(windows)]
+	impl std::io::Read for CursorStream {
+		fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+			std::io::Read::read(&mut *self.0.lock().expect("cursor lock"), buf)
+		}
+	}
+
+	#[cfg(windows)]
+	impl std::io::Write for CursorStream {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			std::io::Write::write(&mut *self.0.lock().expect("cursor lock"), buf)
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			std::io::Write::flush(&mut *self.0.lock().expect("cursor lock"))
+		}
+	}
+
+	#[cfg(windows)]
+	impl brush_core::openfiles::Stream for CursorStream {
+		fn clone_box(&self) -> Box<dyn brush_core::openfiles::Stream> {
+			Box::new(self.clone())
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn cancellation_after_acp_selection_persists_for_the_next_read() -> anyhow::Result<()> {
+		let cursor = std::sync::Arc::new(std::sync::Mutex::new(std::io::Cursor::new(vec![
+			0xff, 0xd2, 0xbb, b'\n',
+		])));
+		let input = OpenFile::Stream(
+			Box::new(CursorStream(std::sync::Arc::clone(&cursor))),
+			HeldInput::default(),
+		);
+		let held = input.held_input().expect("stream holds decoder state").clone();
+		held.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(936));
+
+		let interrupted = test_command().read_line(input.try_clone()?, Vec::<u8>::new(), None, || {
+			cursor.lock().expect("cursor lock").position() > 0
+		});
+		assert!(matches!(interrupted, Err(ref error) if error.to_string() == "interrupted"));
+		assert!(held.output_decoder_state().uses_acp());
+
+		assert!(matches!(
+			test_command().read_line(input, Vec::<u8>::new(), None, || false)?,
+			ReadResult::Line(ref text) if text == "一"
+		));
+		Ok(())
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn read_n_and_read_cap_count_gbk_pairs_after_acp_selection() -> anyhow::Result<()> {
+		for no_delimiter in [false, true] {
+			// D2 BB is CP936 一 and valid UTF-8 U+04BB. Only the retained ACP
+			// choice disambiguates it correctly after the first line.
+			let contents = vec![0xff, b'\n', 0xd2, 0xbb, b'X', b'\n'];
+			let stream = CursorStream(std::sync::Arc::new(std::sync::Mutex::new(
+				std::io::Cursor::new(contents),
+			)));
+			let input = OpenFile::Stream(Box::new(stream), HeldInput::default());
+			input
+				.held_input()
+				.expect("stream holds decoder state")
+				.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(936));
+
+			let first = test_command().read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(first, ReadResult::Line(_)));
+			assert!(input
+				.held_input()
+				.expect("stream holds decoder state")
+				.output_decoder_state()
+				.uses_acp());
+
+			let limited = ReadCommand {
+				raw_mode: true,
+				return_after_n_chars: (!no_delimiter).then_some(1),
+				return_after_n_chars_no_delimiter: no_delimiter.then_some(1),
+				..test_command()
+			};
+			assert!(matches!(
+				limited.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "一"
+			));
+
+			assert!(matches!(
+				test_command().read_line(input, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "X"
+			));
+		}
+		Ok(())
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn read_n_and_read_cap_count_gb18030_four_byte_characters() -> anyhow::Result<()> {
+		for no_delimiter in [false, true] {
+			let contents = vec![0xff, b'\n', 0x90, 0x30, 0x81, 0x30, b'X', b'\n'];
+			let stream = CursorStream(std::sync::Arc::new(std::sync::Mutex::new(
+				std::io::Cursor::new(contents),
+			)));
+			let input = OpenFile::Stream(Box::new(stream), HeldInput::default());
+			input
+				.held_input()
+				.expect("stream holds decoder state")
+				.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(54936));
+
+			let first = test_command().read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(first, ReadResult::Line(_)));
+			assert!(input
+				.held_input()
+				.expect("stream holds decoder state")
+				.output_decoder_state()
+				.uses_acp());
+
+			let limited = ReadCommand {
+				raw_mode: true,
+				return_after_n_chars: (!no_delimiter).then_some(1),
+				return_after_n_chars_no_delimiter: no_delimiter.then_some(1),
+				..test_command()
+			};
+			assert!(matches!(
+				limited.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "𐀀"
+			));
+
+			assert!(matches!(
+				test_command().read_line(input, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "X"
+			));
+		}
+		Ok(())
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn read_n_and_read_cap_leave_invalid_cp932_trail_for_the_next_read() -> anyhow::Result<()> {
+		for no_delimiter in [false, true] {
+			let contents = vec![0xff, b'\n', 0x81, 0x20, b'X', b'\n'];
+			let stream = CursorStream(std::sync::Arc::new(std::sync::Mutex::new(
+				std::io::Cursor::new(contents),
+			)));
+			let input = OpenFile::Stream(Box::new(stream), HeldInput::default());
+			input
+				.held_input()
+				.expect("stream holds decoder state")
+				.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(932));
+
+			let first = test_command().read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(first, ReadResult::Line(_)));
+
+			let limited = ReadCommand {
+				raw_mode: true,
+				return_after_n_chars: (!no_delimiter).then_some(1),
+				return_after_n_chars_no_delimiter: no_delimiter.then_some(1),
+				..test_command()
+			};
+			assert!(matches!(
+				limited.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "\u{FFFD}"
+			));
+
+			assert!(matches!(
+				test_command().read_line(input, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == " X"
+			));
+		}
+		Ok(())
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn read_n_and_read_cap_preserve_cp932_backslash_trail() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		for no_delimiter in [false, true] {
+			let (reader, mut writer) = std::io::pipe()?;
+			let input = OpenFile::from(reader);
+			let held = input.held_input().expect("pipe holds input").clone();
+			let mut decoder_state = OutputDecoderState::with_fallback_codepage(932);
+			assert!(decoder_state.select_acp_fallback());
+			held.set_output_decoder_state(decoder_state);
+			writer.write_all(&[0x83, 0x5c, b'A', b'\n'])?;
+			drop(writer);
+
+			let limited = ReadCommand {
+				return_after_n_chars: (!no_delimiter).then_some(1),
+				return_after_n_chars_no_delimiter: no_delimiter.then_some(1),
+				..test_command()
+			};
+			assert!(matches!(
+				limited.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "ソ"
+			));
+
+			assert!(matches!(
+				test_command().read_line(input, Vec::<u8>::new(), None, || false)?,
+				ReadResult::Line(ref text) if text == "A"
+			));
+		}
+		Ok(())
+	}
+
 	#[test]
 	fn test_ensure_not_cancelled_returns_interrupted() {
 		let is_cancelled = || true;
@@ -941,5 +1455,492 @@ mod tests {
 			.read_line(input_file, Vec::<u8>::new(), None, || true)
 			.expect_err("cancelled state must interrupt read builtin");
 		assert_eq!(err.to_string(), "interrupted");
+	}
+
+	/// A pipe reader that, right after handing out its first byte, lets a
+	/// second reader of the same pipe drain whatever else was ready.
+	#[cfg(unix)]
+	struct DrainedAfterFirstByte {
+		reader:  std::io::PipeReader,
+		other:   std::io::PipeReader,
+		drained: bool,
+	}
+
+	#[cfg(unix)]
+	impl std::io::Read for DrainedAfterFirstByte {
+		fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+			let n = self.reader.read(buf)?;
+			if !self.drained {
+				self.drained = true;
+				let mut rest = [0_u8; 1];
+				self.other.read_exact(&mut rest)?;
+			}
+			Ok(n)
+		}
+	}
+
+	#[cfg(unix)]
+	impl std::io::Write for DrainedAfterFirstByte {
+		fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	#[cfg(unix)]
+	impl brush_core::openfiles::Stream for DrainedAfterFirstByte {
+		fn clone_box(&self) -> Box<dyn brush_core::openfiles::Stream> {
+			unimplemented!("not cloned by read")
+		}
+
+		fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, brush_core::Error> {
+			Err(brush_core::ErrorKind::CannotConvertToNativeFd.into())
+		}
+
+		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, brush_core::Error> {
+			use std::os::fd::AsFd;
+			Ok(self.reader.as_fd())
+		}
+	}
+
+	/// Regression: another reader of a shared pipe can drain bytes this
+	/// `read` saw ready. Every byte must still wait through the poll, so the
+	/// read times out instead of blocking while the writer stays open.
+	#[cfg(unix)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_line_times_out_after_another_reader_drains_the_pipe() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let command = test_command();
+		let (reader, mut writer) = std::io::pipe()?;
+		let other = reader.try_clone()?;
+		writer.write_all(b"ab")?;
+		let input_file = brush_core::openfiles::OpenFile::Stream(
+			Box::new(DrainedAfterFirstByte { reader, other, drained: false }),
+			brush_core::openfiles::HeldInput::default(),
+		);
+
+		let result =
+			command.read_line(input_file, Vec::<u8>::new(), Some(Duration::from_millis(200)), || false)?;
+		assert!(matches!(result, ReadResult::TimedOut(Some(ref line)) if line == "a"));
+		drop(writer);
+		Ok(())
+	}
+
+	/// Contract: a `-n`/`-N` read of a pipe holds the byte read past its
+	/// limit, and the next read of the same pipe gets it first.
+	#[cfg(unix)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_line_count_holds_the_byte_past_the_limit() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		writer.write_all(b"\xC3AB\n\xC3AB\n")?;
+		drop(writer);
+		let pipe = OpenFile::from(reader);
+		let plain = ReadCommand { raw_mode: true, ..test_command() };
+		let count = ReadCommand { raw_mode: true, return_after_n_chars: Some(1), ..test_command() };
+		let exact =
+			ReadCommand { raw_mode: true, return_after_n_chars_no_delimiter: Some(1), ..test_command() };
+
+		for limited in [count, exact] {
+			let result = limited.read_line(pipe.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(result, ReadResult::Line(ref line) if line == "\u{FFFD}"));
+			let result = plain.read_line(pipe.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(result, ReadResult::Line(ref line) if line == "AB"));
+		}
+		Ok(())
+	}
+
+	/// Contract: concurrent reads of duplicated pipe descriptors serialize
+	/// around a character-limit pushback, so a waiting reader gets the byte
+	/// from the held queue instead of timing out on an empty pipe.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_concurrent_reads_see_character_limit_pushback() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		let first_input = brush_core::openfiles::OpenFile::from(reader);
+		let held = first_input.held_input().expect("pipe holds input").clone();
+		let second_input = first_input.try_clone()?;
+		let first_command = ReadCommand { raw_mode: true, return_after_n_chars: Some(1), ..test_command() };
+		let expected_first = brush_core::output_decode::decode_owned_bytes(vec![0xc3]);
+		let (first_sender, first_receiver) = std::sync::mpsc::channel();
+		let first = std::thread::spawn(move || {
+			let result = first_command.read_line(first_input, Vec::<u8>::new(), None, || false);
+			let _ = first_sender.send(matches!(result, Ok(ReadResult::Line(line)) if line == expected_first));
+		});
+
+		let lock_deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			if held.try_lock_reader().is_none() {
+				break;
+			}
+			assert!(Instant::now() < lock_deadline, "first read did not acquire the descriptor lock");
+			std::thread::sleep(Duration::from_millis(1));
+		}
+
+		let (second_waiting_sender, second_waiting_receiver) = std::sync::mpsc::channel();
+		let (second_sender, second_receiver) = std::sync::mpsc::channel();
+		let second = std::thread::spawn(move || {
+			let result = test_command().read_line(
+				second_input,
+				Vec::<u8>::new(),
+				Some(Duration::from_secs(2)),
+				move || {
+					let _ = second_waiting_sender.send(());
+					false
+				},
+			);
+			let _ = second_sender.send(matches!(result, Ok(ReadResult::Line(line)) if line == "A"));
+		});
+
+		second_waiting_receiver.recv_timeout(Duration::from_secs(5))?;
+		writer.write_all(b"\xC3A\nB\n")?;
+		drop(writer);
+		assert_eq!(first_receiver.recv_timeout(Duration::from_secs(5)), Ok(true));
+		assert_eq!(second_receiver.recv_timeout(Duration::from_secs(5)), Ok(true));
+		first.join().expect("first read thread");
+		second.join().expect("second read thread");
+		Ok(())
+	}
+
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_timeout_includes_waiting_for_the_shared_reader_lock() -> anyhow::Result<()> {
+		let (reader, _writer) = std::io::pipe()?;
+		let input = brush_core::openfiles::OpenFile::from(reader);
+		let held = input.held_input().expect("pipe holds input").clone();
+		let _guard = held.lock_reader();
+
+		let result = test_command().read_line(
+			input,
+			Vec::<u8>::new(),
+			Some(Duration::from_millis(50)),
+			|| false,
+		)?;
+		assert!(matches!(result, ReadResult::TimedOut(None)));
+		Ok(())
+	}
+
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_timeout_after_lock_wait_does_not_consume_held_input() -> anyhow::Result<()> {
+		let (reader, _writer) = std::io::pipe()?;
+		let input = brush_core::openfiles::OpenFile::from(reader);
+		let held = input.held_input().expect("pipe holds input").clone();
+		held.put_back(b"A");
+		let lock = std::cell::RefCell::new(Some(held.lock_reader()));
+		let cancellation_checks = std::cell::Cell::new(0);
+		let command = ReadCommand { delimiter: Some("A".to_owned()), ..test_command() };
+
+		let result = command.read_line(
+			input,
+			Vec::<u8>::new(),
+			Some(Duration::from_millis(20)),
+			|| {
+				let check = cancellation_checks.get();
+				cancellation_checks.set(check + 1);
+				if check == 1 {
+					// Release the other reader's lock only after this read's deadline.
+					std::thread::sleep(Duration::from_millis(40));
+					drop(lock.borrow_mut().take());
+				}
+				false
+			},
+		)?;
+
+		assert!(matches!(result, ReadResult::TimedOut(None)));
+		assert_eq!(held.pop(), Some(b'A'));
+		Ok(())
+	}
+
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_timeout_before_servicing_held_input_keeps_it_queued() -> anyhow::Result<()> {
+		let (reader, _writer) = std::io::pipe()?;
+		let input = brush_core::openfiles::OpenFile::from(reader);
+		let held = input.held_input().expect("pipe holds input").clone();
+		held.put_back(b"A");
+		let cancellation_checks = std::cell::Cell::new(0);
+		let command = ReadCommand { delimiter: Some("A".to_owned()), ..test_command() };
+
+		let result = command.read_line(
+			input,
+			Vec::<u8>::new(),
+			Some(Duration::from_millis(20)),
+			|| {
+				let check = cancellation_checks.get();
+				cancellation_checks.set(check + 1);
+				if check == 1 {
+					// The lock is acquired, but input is not serviced until the timeout.
+					std::thread::sleep(Duration::from_millis(40));
+				}
+				false
+			},
+		)?;
+
+		assert!(matches!(result, ReadResult::TimedOut(None)));
+		assert_eq!(held.pop(), Some(b'A'));
+		Ok(())
+	}
+
+	/// Contract: `-t 0` reports held input as ready without taking it.
+	#[cfg(unix)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_line_t_0_reports_held_input_ready() -> anyhow::Result<()> {
+		let command = test_command();
+		let (reader, _writer) = std::io::pipe()?;
+		let pipe = OpenFile::from(reader);
+		let held = pipe.held_input().expect("a pipe holds input").clone();
+
+		let result = command.read_line(pipe.try_clone()?, Vec::<u8>::new(), Some(Duration::ZERO), || false)?;
+		assert!(matches!(result, ReadResult::InputNotReady));
+		held.put_back(b"A");
+		let result = command.read_line(pipe, Vec::<u8>::new(), Some(Duration::ZERO), || false)?;
+		assert!(matches!(result, ReadResult::InputReady));
+		assert_eq!(held.pop(), Some(b'A'));
+		Ok(())
+	}
+
+	/// Contract: a read cancelled before it takes a byte leaves held input
+	/// in place.
+	#[cfg(unix)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_line_cancelled_leaves_held_input() -> anyhow::Result<()> {
+		let command = test_command();
+		let (reader, _writer) = std::io::pipe()?;
+		let pipe = OpenFile::from(reader);
+		let held = pipe.held_input().expect("a pipe holds input").clone();
+		held.put_back(b"A");
+
+		let err = command
+			.read_line(pipe, Vec::<u8>::new(), None, || true)
+			.expect_err("cancelled state must interrupt read builtin");
+		assert_eq!(err.to_string(), "interrupted");
+		assert_eq!(held.pop(), Some(b'A'));
+		Ok(())
+	}
+
+	/// Contract: held input is served without waiting on the descriptor;
+	/// the deadline applies once it runs out.
+	#[cfg(unix)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_line_serves_held_input_before_waiting() -> anyhow::Result<()> {
+		let command = test_command();
+		let (reader, _writer) = std::io::pipe()?;
+		let pipe = OpenFile::from(reader);
+		pipe.held_input().expect("a pipe holds input").put_back(b"A");
+
+		let result =
+			command.read_line(pipe, Vec::<u8>::new(), Some(Duration::from_millis(100)), || false)?;
+		assert!(matches!(result, ReadResult::TimedOut(Some(ref line)) if line == "A"));
+		Ok(())
+	}
+
+	/// A timed-out incomplete character is finalized into the partial result.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_timeout_returns_incomplete_utf8_in_partial_result() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		let input = OpenFile::from(reader);
+		let held = input.held_input().expect("pipe holds timed-out input").clone();
+		#[cfg(windows)]
+		held.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(65001));
+		writer.write_all(&[b'A', 0xc3])?;
+
+		let timed_out = test_command().read_line(
+			input.try_clone()?,
+			Vec::<u8>::new(),
+			Some(Duration::from_millis(100)),
+			|| false,
+		)?;
+		let partial = match timed_out {
+			ReadResult::TimedOut(Some(partial)) => partial,
+			other => panic!("expected partial input on timeout, got {other:?}"),
+		};
+		assert_eq!(partial, "A\u{FFFD}");
+		assert!(held.is_empty(), "timed-out bytes must not be hidden from non-builtin readers");
+		Ok(())
+	}
+
+	/// Regression: when another reader of the description takes the held
+	/// byte between this read's checks, the read must poll before reading,
+	/// so it times out instead of blocking while the writer stays open.
+	#[cfg(unix)]
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_line_times_out_when_another_reader_drains_held_input() -> anyhow::Result<()> {
+		let (reader, writer) = std::io::pipe()?;
+		let a = OpenFile::from(reader);
+		a.held_input().expect("a pipe holds input").put_back(b"A");
+		let b = a.try_clone()?;
+		let drain = b.held_input().expect("a pipe holds input").clone();
+
+		let (sender, receiver) = std::sync::mpsc::channel();
+		let thread = std::thread::spawn(move || {
+			// The cancellation check runs right before the pop, so the other
+			// reader drains the byte exactly there.
+			let result = test_command().read_line(
+				a,
+				Vec::<u8>::new(),
+				Some(Duration::from_millis(200)),
+				move || {
+					drain.pop();
+					false
+				},
+			);
+			let _ = sender.send(matches!(result, Ok(ReadResult::TimedOut(None))));
+		});
+
+		let outcome = receiver.recv_timeout(Duration::from_secs(5));
+		drop(writer);
+		let _ = thread.join();
+		assert_eq!(outcome, Ok(true), "read must time out, not block or take the drained byte");
+		assert!(b.held_input().expect("a pipe holds input").is_empty());
+		Ok(())
+	}
+
+	/// Regression: malformed UTF-8 lead byte followed by delimiter should not
+	/// consume the delimiter. When `0xC3\n` is read with `-n 1` and default
+	/// delimiter (newline), the 0x0A is used to classify the 0xC3 as invalid,
+	/// but should not be consumed as the delimiter terminator.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_n_preserves_delimiter_after_malformed_utf8() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		let input = OpenFile::from(reader);
+
+		// Write: malformed UTF-8 lead byte 0xC3, then newline, then 'X'
+		writer.write_all(&[0xc3, b'\n', b'X', b'\n'])?;
+		drop(writer);
+
+		let limited = ReadCommand {
+			raw_mode: true,
+			return_after_n_chars: Some(1),
+			..test_command()
+		};
+
+		// First read: -n 1 should read one character (the invalid UTF-8)
+		let first = limited.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(first, ReadResult::Line(ref text) if text == "\u{FFFD}"));
+
+		// Second read: should get the line with just the newline (empty after delimiter)
+		let second = test_command().read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(second, ReadResult::Line(ref text) if text == ""));
+
+		// Third read: should get 'X'
+		let third = test_command().read_line(input, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(third, ReadResult::Line(ref text) if text == "X"));
+		Ok(())
+	}
+
+	/// An unbounded raw read treats the delimiter after malformed UTF-8 as the
+	/// record boundary, for both the default newline and a custom delimiter.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_unbounded_read_preserves_delimiters_after_malformed_utf8() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		for (delimiter, delimiter_byte) in [(None, b'\n'), (Some("|".to_owned()), b'|')] {
+			let (reader, mut writer) = std::io::pipe()?;
+			let input = OpenFile::from(reader);
+			#[cfg(windows)]
+			input
+				.held_input()
+				.expect("pipe holds decoder state")
+				.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(65001));
+			writer.write_all(&[0xc3, delimiter_byte])?;
+			writer.write_all(b"next")?;
+			writer.write_all(&[delimiter_byte])?;
+			drop(writer);
+
+			let command = ReadCommand { raw_mode: true, delimiter, ..test_command() };
+			let first = command.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(first, ReadResult::Line(ref text) if !text.is_empty()));
+
+			let second = command.read_line(input, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(second, ReadResult::Line(ref text) if text == "next"));
+		}
+		Ok(())
+	}
+
+	/// `-N` ignores delimiters even when a delimiter byte resolves an incomplete
+	/// UTF-8 prefix; only a reached character limit pushes that byte back.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_cap_ignores_delimiter_after_malformed_utf8() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		let input = OpenFile::from(reader);
+		writer.write_all(&[0xc3, b'\n', b'X', b'\n'])?;
+		drop(writer);
+
+		let capped = ReadCommand {
+			raw_mode: true,
+			return_after_n_chars_no_delimiter: Some(1),
+			..test_command()
+		};
+		let first = capped.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(first, ReadResult::Line(ref text) if !text.is_empty()));
+
+		let second = capped.read_line(input, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(second, ReadResult::Line(ref text) if text == "\n"));
+		Ok(())
+	}
+
+	/// Native child reads after builtin read with malformed UTF-8 and lookahead.
+	/// When read -r -n 1 encounters malformed UTF-8 (0xC3 followed by 0x41),
+	/// it should not consume 0x41 in a way that hides it from external readers.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_native_child_sees_bytes_after_malformed_utf8_lookahead() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		let input = OpenFile::from(reader);
+
+		// Input: malformed UTF-8 lead byte, non-continuation byte, newline
+		writer.write_all(&[0xc3, b'A', b'\n'])?;
+		drop(writer);
+
+		let limited = ReadCommand {
+			raw_mode: true,
+			return_after_n_chars: Some(1),
+			..test_command()
+		};
+
+		// First read: -n 1 should read one character (the invalid UTF-8 byte 0xC3)
+		let first = limited.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+		let first_text = match first {
+			ReadResult::Line(text) => text,
+			_ => panic!("expected line"),
+		};
+		// The malformed 0xC3 becomes U+FFFD (replacement character)
+		assert_eq!(first_text, "\u{FFFD}");
+
+		// Second read: should get 'A' followed by newline delimiter
+		let second = test_command().read_line(input, Vec::<u8>::new(), None, || false)?;
+		let second_text = match second {
+			ReadResult::Line(text) => text,
+			_ => panic!("expected line"),
+		};
+		// The 0x41 ('A') should be available and processed
+		assert_eq!(second_text, "A");
+		Ok(())
 	}
 }

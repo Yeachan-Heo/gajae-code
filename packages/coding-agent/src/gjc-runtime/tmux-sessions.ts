@@ -4,6 +4,8 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Process } from "@gajae-code/natives";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
@@ -23,6 +25,7 @@ import {
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "./session-state-sidecar";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
 	assertGjcTmuxMutationAuthoritySync,
 	bindGjcTmuxProviderAuthority,
@@ -247,6 +250,81 @@ export function __setMutationServerProofForTests(
 	mutationServerProofTestDependency = dependency;
 }
 
+const TMUX_LAUNCH_IDENTITY_ENV_NAMES = [
+	"GJC_SESSION_ID",
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	"GJC_TMUX_SESSION",
+] as const;
+
+/**
+ * Drop project-dotenv copies of the tmux session name, coordinator id, and
+ * state-file path. A pin is kept only when every snapshot accepts it, so a
+ * declaration Bun loaded before `chdir` is refused even if the launch cwd no
+ * longer contains that file. Acceptance uses the shared helper, but the
+ * original string stays: callers trim at use, and a later check must see the
+ * same value that was accepted.
+ */
+export function trustedTmuxLaunchIdentityEnv(
+	env: NodeJS.ProcessEnv,
+	snapshots: readonly ProjectEnvSnapshot[],
+): NodeJS.ProcessEnv {
+	const denied: string[] = [];
+	for (const name of TMUX_LAUNCH_IDENTITY_ENV_NAMES) {
+		if (!env[name]) continue;
+		for (const snapshot of snapshots) {
+			if (trustedCoordinatorEnv(name, env, snapshot) === undefined) {
+				denied.push(name);
+				break;
+			}
+		}
+	}
+	if (denied.length === 0) return env;
+	const next: NodeJS.ProcessEnv = { ...env };
+	for (const name of denied) delete next[name];
+	return next;
+}
+
+export function tmuxLaunchIdentityEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv {
+	return trustedTmuxLaunchIdentityEnv(env, [projectEnvSnapshot(cwd), startupProjectEnvSnapshot()]);
+}
+
+/**
+ * Session id the launched child must see. A trusted pin is passed through.
+ * A rejected project pin is replaced by the same fallback the launch plan uses
+ * for the session root, which also stops Bun from reloading that dotenv value
+ * (`GJC_TMUX_LAUNCHED=1` skips the planner filter). An omitted id stays omitted.
+ */
+export function resolvedChildGjcSessionId(input: {
+	trusted: string | undefined;
+	inherited: string | undefined;
+	projectDeclared: boolean;
+	fallback: string;
+}): string | undefined {
+	const trusted = input.trusted?.trim();
+	if (trusted) return trusted;
+	if (!input.inherited?.trim() && !input.projectDeclared) return undefined;
+	const fallback = input.fallback.trim();
+	return fallback.length > 0 ? fallback : undefined;
+}
+
+export function childGjcSessionIdAssignment(
+	env: NodeJS.ProcessEnv,
+	identityEnv: NodeJS.ProcessEnv,
+	cwd: string,
+	fallbackSessionId: string,
+): Record<string, string> {
+	const snapshot = projectEnvSnapshot(cwd);
+	const key = canonicalEnvKey("GJC_SESSION_ID");
+	const value = resolvedChildGjcSessionId({
+		trusted: identityEnv.GJC_SESSION_ID,
+		inherited: env.GJC_SESSION_ID,
+		projectDeclared: snapshot.values[key] !== undefined || snapshot.dynamic.has(key),
+		fallback: fallbackSessionId,
+	});
+	return value === undefined ? {} : { GJC_SESSION_ID: value };
+}
+
 function psmuxAuthorityFromEnv(env: NodeJS.ProcessEnv): ProviderAuthority | null {
 	const stateDir = env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim();
 	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim();
@@ -269,6 +347,24 @@ function environmentForProviderAuthority(
 	};
 }
 
+/**
+ * tmux lets a client write UTF-8 only when it was started with `-u`, runs inside tmux
+ * (`$TMUX`), or the first set of LC_ALL/LC_CTYPE/LANG names UTF-8. Any other client gets
+ * every byte outside printable ASCII replaced with `_`, including the tab separators and
+ * non-ASCII names and paths parsed here. A detached Broker inherits its launcher's locale,
+ * and launchd or a service manager provides none, so every native tmux client this module
+ * runs for managed-session creation, inspection, and mutation requests UTF-8 output instead
+ * of depending on the caller's environment. The flag precedes the subcommand, so the Linux
+ * owner-isolation server proof inherits it from the new-session control prefix. psmux has
+ * its own client flags and never receives it. Interactive attach is deliberately excluded:
+ * its output goes to the user's terminal, whose locale is authoritative.
+ */
+const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
+
+function tmuxClientFlags(isPsmux: boolean): string[] {
+	return isPsmux ? [] : [NATIVE_TMUX_UTF8_CLIENT_FLAG];
+}
+
 function runTmux(
 	args: string[],
 	env: NodeJS.ProcessEnv = process.env,
@@ -283,7 +379,11 @@ function runTmux(
 	let result: Bun.SyncSubprocess<"pipe", "pipe">;
 	try {
 		result = Bun.spawnSync(
-			[tmuxCommand, ...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args)],
+			[
+				tmuxCommand,
+				...tmuxClientFlags(authority ? authority.kind !== "native-tmux" : binary.isPsmux),
+				...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args),
+			],
 			{
 				stdout: "pipe",
 				stderr: "pipe",
@@ -515,11 +615,14 @@ function canonicalProviderStateDirs(cwd: string): string[] {
 }
 
 function psmuxAuthorityEnvironments(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv[] {
-	const explicitAuthority = psmuxAuthorityFromEnv(env);
+	const identityEnv = tmuxLaunchIdentityEnv(env, process.cwd());
+	const explicitAuthority = psmuxAuthorityFromEnv(identityEnv);
 	if (explicitAuthority) return [environmentForProviderAuthority(env, explicitAuthority)];
 	const explicitStateDir =
-		env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
-		(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ? path.dirname(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]) : "");
+		identityEnv[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
+		(identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]
+			? path.dirname(identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV])
+			: "");
 	const ambient = resolveGjcTmuxBinary({ env });
 	if (gjcTmuxAuthorityPlatform() === "win32") {
 		const ambientAvailable = path.isAbsolute(ambient.command)
@@ -669,17 +772,15 @@ export function createGjcTmuxSession(
 	if (launch && !validManagedLaunchSpec(launch, platform)) throw new Error("gjc_tmux_managed_launch_spec_invalid");
 	const provider = resolveGjcTmuxProviderContext({ env, platform });
 	const tmuxCommand = provider.command;
-	const launchEnvironment = launch ? { ...env, GJC_TMUX_SESSION: launch.childSessionId } : env;
-	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
 	const cwd = launch?.cwd ?? process.cwd();
-	const sessionId = launch?.childSessionId ?? (env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
+	const identityEnv = tmuxLaunchIdentityEnv(env, cwd);
+	const launchEnvironment = launch ? { ...identityEnv, GJC_TMUX_SESSION: launch.childSessionId } : identityEnv;
+	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
+	const sessionId = launch?.childSessionId ?? (identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
+	const filteredGjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const stateFile =
-		(!launch ? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
-		tmuxRuntimeSessionPath(
-			cwd,
-			launch?.childSessionId ?? (env.GJC_SESSION_ID?.trim() || sessionId),
-			buildGjcTmuxSessionSlug(sessionName),
-		);
+		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
+		tmuxRuntimeSessionPath(cwd, launch?.childSessionId ?? filteredGjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
@@ -690,6 +791,7 @@ export function createGjcTmuxSession(
 		[GJC_TMUX_OWNER_SERVER_KEY_ENV]: tmuxCommand,
 		[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 		[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+		...childGjcSessionIdAssignment(env, identityEnv, cwd, filteredGjcSessionId),
 		...(launch
 			? {
 					[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),
@@ -699,7 +801,7 @@ export function createGjcTmuxSession(
 			: {}),
 	};
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
-	const executionEnv = { ...env, ...managedEnvironment };
+	const executionEnv = { ...identityEnv, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 	const command =
 		platform === "win32"
@@ -719,6 +821,7 @@ export function createGjcTmuxSession(
 				})();
 	const tmuxArgv = [
 		tmuxCommand,
+		...tmuxClientFlags(provider.kind !== "native-tmux"),
 		...buildTmuxProviderCommand(provider, "new-session", [
 			"-d",
 			"-s",
@@ -738,11 +841,14 @@ export function createGjcTmuxSession(
 				pidProven: false,
 			};
 		}
-		const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
-			stdout: "pipe",
-			stderr: "pipe",
-			env,
-		});
+		const result = Bun.spawnSync(
+			[tmuxCommand, ...tmuxClientFlags(provider.kind !== "native-tmux"), "display-message", "-p", "#{pid}"],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
 		if (result.exitCode !== 0) {
 			const diagnostic = result.stderr.toString();
 			return /no server running|failed to connect|error connecting/.test(diagnostic)
@@ -1245,11 +1351,14 @@ function requireSafeTmuxServerForMutation(
 		return { pid: 1, startTime: "test" };
 	}
 	if (process.platform !== "linux") return { pid: 1, startTime: "not-applicable", pidProven: false };
-	const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
-		stdout: "pipe",
-		stderr: "pipe",
-		env,
-	});
+	const result = Bun.spawnSync(
+		[tmuxCommand, ...tmuxClientFlags(resolveGjcTmuxBinary({ env }).isPsmux), "display-message", "-p", "#{pid}"],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+			env,
+		},
+	);
 	if (result.exitCode !== 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");
 	const pid = Number(result.stdout.toString().trim());
 	if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");

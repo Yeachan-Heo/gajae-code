@@ -1,4 +1,5 @@
 import { isEnoent, isKnownSinkPeerClosedError, logger, untilAborted } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -28,6 +29,12 @@ let shutdownGeneration = 0;
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
 let lspCleanupOwner: (() => void) | undefined;
+let signalExitOwnedByPostmortem = false;
+
+/** Leave process exit status to shared postmortem for broker-internal commands. */
+export function usePostmortemSignalExitAuthority(): void {
+	signalExitOwnedByPostmortem = true;
+}
 
 function ensureLspCleanup(): void {
 	if (lspCleanupOwner) return;
@@ -532,7 +539,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 		const owner = spawnOwnedProcess([command, ...args], {
 			cwd,
 			stdin: "pipe",
-			env: env ? { ...Bun.env, ...env } : undefined,
+			env: { ...projectSafeSpawnEnv(), ...env },
 			name: `lsp:${config.command}`,
 		});
 		const proc = owner.child;
@@ -1064,7 +1071,8 @@ export function getActiveClients(): LspServerStatus[] {
 // Process Cleanup
 // =============================================================================
 
-// Register cleanup on module unload
+// Register cleanup on module unload. Broker-internal commands delegate signal
+// exit status to shared postmortem; ordinary LSP hosts retain their graceful zero exit.
 if (typeof process !== "undefined") {
 	process.on("beforeExit", () => {
 		void shutdownAll();
@@ -1078,13 +1086,13 @@ if (typeof process !== "undefined") {
 	process.on("SIGINT", () => {
 		void (async () => {
 			await shutdownAll();
-			process.exit(0);
+			if (!signalExitOwnedByPostmortem) process.exit(0);
 		})();
 	});
 	process.on("SIGTERM", () => {
 		void (async () => {
 			await shutdownAll();
-			process.exit(0);
+			if (!signalExitOwnedByPostmortem) process.exit(0);
 		})();
 	});
 }

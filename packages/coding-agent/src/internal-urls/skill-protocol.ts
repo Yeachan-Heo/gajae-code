@@ -9,6 +9,7 @@
  */
 import * as path from "node:path";
 import { getActiveSkills } from "../extensibility/skills";
+import { realSkillPath } from "./skill-path";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
 function getContentType(filePath: string): InternalResource["contentType"] {
@@ -70,6 +71,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			if (!resolvedPath.startsWith(resolvedBaseDir + path.sep) && resolvedPath !== resolvedBaseDir) {
 				throw new Error("Path traversal is not allowed");
 			}
+			targetPath = await realSkillPath(skill.baseDir, targetPath);
 		} else {
 			targetPath = skill.filePath;
 		}

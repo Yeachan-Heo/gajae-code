@@ -112,25 +112,48 @@ interface BigIntPathStatReader {
 	lstat(file: string, options: { bigint: true }): Promise<BigIntStats>;
 }
 
-function interceptNextExactConfigOpen(afterOpen: (handle: fs.FileHandle) => Promise<void>): void {
+/**
+ * Run `intercept` in place of the next `fs.open` of `configPath` only. Opens of any other file pass
+ * through untouched: an unrelated descriptor opened first would otherwise consume the one-shot hook,
+ * run the swap before the loader starts, and let the loader legitimately read the replacement.
+ */
+/**
+ * Intercepts armed by the current test. A hook that never fires would let a fail-closed test pass
+ * without its swap ever running, so `afterEach` requires every armed hook to have fired.
+ */
+const armedOpenIntercepts: Array<{ configPath: string; fired: () => boolean }> = [];
+
+function interceptNextOpenOf(
+	configPath: string,
+	intercept: (open: () => Promise<fs.FileHandle>) => Promise<fs.FileHandle>,
+): void {
 	const openFile = fs.open;
-	vi.spyOn(fs, "open").mockImplementationOnce(async (file, flags, mode) => {
-		const handle = await openFile(file, flags, mode);
+	let armed = true;
+	armedOpenIntercepts.push({ configPath, fired: () => !armed });
+	vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+		if (!armed || file !== configPath) return openFile(file, flags, mode);
+		armed = false;
+		return intercept(() => openFile(file, flags, mode));
+	});
+}
+
+function interceptNextExactConfigOpen(configPath: string, afterOpen: (handle: fs.FileHandle) => Promise<void>): void {
+	interceptNextOpenOf(configPath, async open => {
+		const handle = await open();
 		await afterOpen(handle);
 		return handle;
 	});
 }
 
-function interceptNextExactConfigOpenAttempt(beforeOpen: () => Promise<void>): void {
-	const openFile = fs.open;
-	vi.spyOn(fs, "open").mockImplementationOnce(async (file, flags, mode) => {
+function interceptNextExactConfigOpenAttempt(configPath: string, beforeOpen: () => Promise<void>): void {
+	interceptNextOpenOf(configPath, async open => {
 		await beforeOpen();
-		return openFile(file, flags, mode);
+		return open();
 	});
 }
 
-function interceptNextExactConfigRead(afterRead: () => Promise<void>): void {
-	interceptNextExactConfigOpen(async handle => {
+function interceptNextExactConfigRead(configPath: string, afterRead: () => Promise<void>): void {
+	interceptNextExactConfigOpen(configPath, async handle => {
 		const reader = handle as unknown as ExactConfigDescriptorReader;
 		const readFile = reader.readFile.bind(reader);
 		vi.spyOn(reader, "readFile").mockImplementationOnce(async () => {
@@ -141,7 +164,7 @@ function interceptNextExactConfigRead(afterRead: () => Promise<void>): void {
 	});
 }
 
-describe("standalone mcp.json oauth env expansion", () => {
+describe("standalone mcp.json env expansion", () => {
 	let tempDir = "";
 	const originalEnv = {
 		PI_OAUTH_TOKEN_URL: process.env.PI_OAUTH_TOKEN_URL,
@@ -177,60 +200,72 @@ describe("standalone mcp.json oauth env expansion", () => {
 		}
 	});
 
-	test("expands standalone auth and oauth fields alongside existing env-expanded fields", async () => {
-		await fs.writeFile(
-			path.join(tempDir, "mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					figma: {
-						url: `${envPlaceholder("PI_MCP_URL")}/mcp`,
-						headers: { Authorization: envPlaceholder("PI_MCP_HEADER") },
-						env: { MCP_VALUE: envPlaceholder("PI_MCP_ENV") },
-						auth: {
-							type: "oauth",
-							tokenUrl: envPlaceholder("PI_OAUTH_TOKEN_URL"),
-							clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
-							clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
-						},
-						oauth: {
-							clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
-							clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
-							redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
-							callbackPort: 4317,
-							callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
-						},
+	test("leaves secret-named standalone fields literal and still expands ordinary names", async () => {
+		const config = {
+			mcpServers: {
+				figma: {
+					url: `${envPlaceholder("PI_MCP_URL")}/mcp`,
+					headers: { Authorization: envPlaceholder("PI_MCP_HEADER") },
+					env: { MCP_VALUE: envPlaceholder("PI_MCP_ENV") },
+					auth: {
+						type: "oauth",
+						tokenUrl: envPlaceholder("PI_OAUTH_TOKEN_URL"),
+						clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+						clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+					},
+					oauth: {
+						clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+						clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+						redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
+						callbackPort: 4317,
+						callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
 					},
 				},
-			}),
-		);
+			},
+		};
+		await fs.writeFile(path.join(tempDir, "mcp.json"), JSON.stringify(config));
 
 		const [server] = await loadStandaloneMcpConfig(tempDir);
 		expect(server).toBeDefined();
-		expect(server?.url).toBe("https://mcp.example.com/mcp");
+		expect(server?.url).toBe(`${envPlaceholder("PI_MCP_URL")}/mcp`);
+		expect(server?.url).not.toContain("mcp.example.com");
 		expect(server?.headers).toEqual({ Authorization: "Bearer test-token" });
 		expect(server?.env).toEqual({ MCP_VALUE: "env-value" });
 		expect(server?.auth).toEqual({
+			type: "oauth",
+			tokenUrl: envPlaceholder("PI_OAUTH_TOKEN_URL"),
+			clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+			clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+		});
+		expect(server?.oauth).toEqual({
+			clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+			clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+			redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
+			callbackPort: 4317,
+			callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
+		});
+		expect(JSON.stringify(server)).not.toContain("oauth-client-secret");
+
+		const exactPath = path.join(tempDir, "exact.json");
+		await fs.writeFile(exactPath, JSON.stringify(config));
+		const exact = await loadMCPJsonFile(exactPath, "project", { quiet: true, useCache: false });
+		expect(exact.items[0]?.url).toBe("https://mcp.example.com/mcp");
+		expect(exact.items[0]?.auth).toEqual({
 			type: "oauth",
 			tokenUrl: "https://provider.example/token",
 			clientId: "oauth-client-id",
 			clientSecret: "oauth-client-secret",
 		});
-		expect(server?.oauth).toEqual({
-			clientId: "oauth-client-id",
-			clientSecret: "oauth-client-secret",
-			redirectUri: "https://public.example/oauth/callback",
-			callbackPort: 4317,
-			callbackPath: "/oauth/callback",
-		});
 	});
 
-	test("expands only the standalone oauth fields that are present", async () => {
+	test("leaves only the present secret-named oauth fields literal", async () => {
 		await fs.writeFile(
 			path.join(tempDir, ".mcp.json"),
 			JSON.stringify({
 				mcpServers: {
 					slack: {
 						url: "https://slack.example.com/mcp",
+						headers: { Accept: envPlaceholder("PI_MCP_HEADER") },
 						oauth: {
 							redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
 							callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
@@ -242,11 +277,13 @@ describe("standalone mcp.json oauth env expansion", () => {
 
 		const [server] = await loadStandaloneMcpConfig(tempDir);
 		expect(server).toBeDefined();
+		expect(server?.headers).toEqual({ Accept: "Bearer test-token" });
 		expect(server?.oauth).toEqual({
-			redirectUri: "https://public.example/oauth/callback",
-			callbackPath: "/oauth/callback",
+			redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
+			callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
 		});
 		expect(server?.auth).toBeUndefined();
+		expect(JSON.stringify(server?.oauth)).not.toContain("public.example");
 	});
 
 	test("preserves noInheritEnv for explicit stdio runtime consumers", async () => {
@@ -278,8 +315,13 @@ describe("explicit MCP JSON exact-file trust", () => {
 	});
 
 	afterEach(async () => {
+		const unfiredIntercepts = armedOpenIntercepts
+			.splice(0)
+			.filter(intercept => !intercept.fired())
+			.map(intercept => intercept.configPath);
 		await fs.rm(tempDir, { recursive: true, force: true });
 		vi.restoreAllMocks();
+		expect(unfiredIntercepts).toEqual([]);
 	});
 
 	test("loads a regular exact config through the descriptor-bound reader", async () => {
@@ -417,7 +459,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		await fs.writeFile(configPath, exactConfigText("original"));
 		await fs.writeFile(replacementPath, exactConfigText("replacement"));
 
-		interceptNextExactConfigOpenAttempt(async () => {
+		interceptNextExactConfigOpenAttempt(configPath, async () => {
 			await fs.rename(replacementPath, configPath);
 		});
 		const result = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
@@ -438,7 +480,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		await fs.writeFile(configPath, exactConfigText("original"));
 		await fs.writeFile(path.join(replacementDirectory, "exact.json"), exactConfigText("replacement"));
 
-		interceptNextExactConfigOpenAttempt(async () => {
+		interceptNextExactConfigOpenAttempt(configPath, async () => {
 			await fs.rename(activeDirectory, retiredDirectory);
 			await fs.rename(replacementDirectory, activeDirectory);
 		});
@@ -457,7 +499,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		await fs.writeFile(configPath, exactConfigText("original"));
 		await fs.writeFile(replacementPath, exactConfigText("replacement"));
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			const reader = handle as unknown as ExactConfigDescriptorReader;
 			const readFile = reader.readFile.bind(reader);
 			vi.spyOn(reader, "readFile").mockImplementation(async () => {
@@ -486,7 +528,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		await fs.writeFile(configPath, exactConfigText("original"));
 		await fs.writeFile(path.join(replacementDirectory, "exact.json"), exactConfigText("replacement"));
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			const reader = handle as unknown as ExactConfigDescriptorReader;
 			const readFile = reader.readFile.bind(reader);
 			vi.spyOn(reader, "readFile").mockImplementation(async () => {
@@ -528,7 +570,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		let closeCalls = 0;
 		await fs.writeFile(configPath, exactConfigText("exact"));
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			closeOriginal = handle.close.bind(handle);
 			vi.spyOn(handle, "close").mockImplementation(async () => {
 				closeCalls += 1;
@@ -555,7 +597,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		let closeCalls = 0;
 		await fs.writeFile(configPath, exactConfigText("exact"));
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			const close = handle.close.bind(handle);
 			closeOriginal = close;
 			vi.spyOn(handle, "close").mockImplementation(async () => {
@@ -582,7 +624,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		let closeCalls = 0;
 		await fs.writeFile(configPath, exactConfigText("exact"));
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			const close = handle.close.bind(handle);
 			closeOriginal = close;
 			vi.spyOn(handle, "close").mockImplementation(async () => {
@@ -607,7 +649,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		let closeCalls = 0;
 		await fs.writeFile(configPath, exactConfigText("exact"));
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			closeOriginal = handle.close.bind(handle);
 			vi.spyOn(handle, "close").mockImplementation(async () => {
 				closeCalls += 1;
@@ -634,7 +676,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		const originalState = await fs.lstat(configPath, { bigint: true });
 		let concealMutation = false;
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			const reader = handle as unknown as ExactConfigDescriptorReader;
 			const statReader = handle as unknown as BigIntStatReader;
 			const pathStatReader = fs as unknown as BigIntPathStatReader;
@@ -679,7 +721,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		expect(Buffer.byteLength(mutatedConfig)).toBe(Buffer.byteLength(originalConfig));
 		await fs.writeFile(configPath, originalConfig);
 
-		interceptNextExactConfigRead(async () => {
+		interceptNextExactConfigRead(configPath, async () => {
 			await fs.writeFile(configPath, mutatedConfig);
 		});
 		const mutationResult = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
@@ -694,7 +736,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		const replacementPath = path.join(tempDir, "replacement.json");
 		await fs.writeFile(replacementPath, originalConfig);
 
-		interceptNextExactConfigRead(async () => {
+		interceptNextExactConfigRead(configPath, async () => {
 			await fs.rename(replacementPath, configPath);
 		});
 		const replacementResult = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
@@ -714,7 +756,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		await fs.writeFile(configPath, exactConfigText("original"));
 		await fs.writeFile(path.join(replacementDirectory, "exact.json"), exactConfigText("replacement"));
 
-		interceptNextExactConfigRead(async () => {
+		interceptNextExactConfigRead(configPath, async () => {
 			await fs.rename(activeDirectory, retiredDirectory);
 			await fs.rename(replacementDirectory, activeDirectory);
 		});
@@ -737,7 +779,7 @@ describe("explicit MCP JSON exact-file trust", () => {
 		const originalState = await fs.lstat(configPath, { bigint: true });
 		let concealLeafMutation = false;
 
-		interceptNextExactConfigOpen(async handle => {
+		interceptNextExactConfigOpen(configPath, async handle => {
 			const reader = handle as unknown as ExactConfigDescriptorReader;
 			const statReader = handle as unknown as BigIntStatReader;
 			const pathStatReader = fs as unknown as BigIntPathStatReader;

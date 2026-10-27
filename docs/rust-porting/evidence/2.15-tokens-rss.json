@@ -1,0 +1,135 @@
+{
+  "schema": "gjc.rust-porting.tokens-rss/1",
+  "rejection": {
+    "reason": "Rejected under D2: the S3 idle RSS median increased by 4,063,232 bytes (+9.4584%) in the first-use candidate build, and by 8,159,232 bytes (+18.9907%) in the pre-wire native-only build; idle must be unchanged. The S4 first-use median increased by 13,950,976 bytes (+2.7117%), within the +5% limit, but that does not override the idle failure.",
+    "measurements": {
+      "host": {
+        "os": "darwin",
+        "arch": "arm64",
+        "kernel": "25.5.0",
+        "bun": "1.4.0"
+      },
+      "baseGitCommit": "d84ec8697170486d822e17c064be15804857df3c",
+      "candidateGitCommit": "d84ec8697170486d822e17c064be15804857df3c",
+      "baseBinarySha256": "4142476233624f289fd07d6940ec0b91a367477239c456887cfdefe329ffece6",
+      "candidatePrewireBinarySha256": "1a1ef56d62e0f601b74ef32b42ae7541e9159c43d2a7ff83ea6b1203fc63dabb",
+      "candidateFirstUseBinarySha256": "d99940509284c70b99b81713c68ac305a776aed0a5f1e5b76531c629187128c0",
+      "thresholds": {
+        "idleMedianDeltaBytes": 0,
+        "firstUseMaxRegressionPercent": 5
+      },
+      "scenarioMapping": {
+        "S1": "--help; this is not the idle scenario in the current script",
+        "S3": "interactive idle: --no-session --no-tools",
+        "S4": "first-use workload: one 1 MiB read tool result"
+      },
+      "commands": [
+        "Base setup/build: bun run setup:worktree; bun --cwd=packages/coding-agent run build",
+        "Base captures, five each: bun scripts/verify-rss-checkpoints.ts --scenario S1,S4 --matrix token-gate-baseline --json; bun scripts/verify-rss-checkpoints.ts --scenario S3 --matrix token-gate-baseline --json",
+        "Candidate native build: bun run build:native; bun --cwd=packages/coding-agent run build",
+        "Candidate pre-wire captures, five each: bun scripts/verify-rss-checkpoints.ts --scenario S1,S3 --matrix token-gate-head-prewire --json",
+        "Candidate first-use captures, five each: bun scripts/verify-rss-checkpoints.ts --scenario S1,S3,S4 --matrix token-gate-head-wired --json"
+      ],
+      "captureProtocol": "Each capture contains 10 measured samples after 3 warmups. Per-side reported values are the median of the five capture-level stableTree medians; p95 is the median of the five capture-level stableTree p95 values. Base captures preceded candidate captures and were not interleaved.",
+      "base": {
+        "S1": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [27713536, 193642496, 196124672, 200007680, 200294400],
+          "medianBytes": 196124672,
+          "captureStableTreeP95Bytes": [204029952, 201654272, 203292672, 203259904, 206438400],
+          "p95Bytes": 203292672
+        },
+        "S3": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [43966464, 42958848, 42835968, 48537600, 42893312],
+          "medianBytes": 42958848,
+          "captureStableTreeP95Bytes": [51838976, 51576832, 51134464, 62013440, 51494912],
+          "p95Bytes": 51576832
+        },
+        "S4": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [507011072, 509812736, 532152320, 522412032, 514465792],
+          "medianBytes": 514465792,
+          "captureStableTreeP95Bytes": [535838720, 538099712, 542326784, 541392896, 519634944],
+          "p95Bytes": 538099712
+        }
+      },
+      "candidatePrewire": {
+        "S1": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [27303936, 107528192, 193224704, 198262784, 194641920],
+          "medianBytes": 193224704,
+          "captureStableTreeP95Bytes": [197804032, 204226560, 202096640, 202833920, 203636736],
+          "p95Bytes": 202833920
+        },
+        "S3": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [50225152, 47161344, 51683328, 51118080, 51453952],
+          "medianBytes": 51118080,
+          "captureStableTreeP95Bytes": [51871744, 53510144, 52166656, 52412416, 54444032],
+          "p95Bytes": 52412416
+        }
+      },
+      "candidateFirstUse": {
+        "temporaryCallsiteForMeasurement": "estimateTextTokensHeuristic synchronously required @gajae-code/natives and called countTokens; no TS implementation was deleted and the callsite edit was reverted after capture.",
+        "S1": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [199933952, 188227584, 188899328, 107765760, 192872448],
+          "medianBytes": 188899328,
+          "captureStableTreeP95Bytes": [203046912, 203276288, 203227136, 203636736, 203063296],
+          "p95Bytes": 203227136
+        },
+        "S3": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [43032576, 48685056, 43974656, 47022080, 51789824],
+          "medianBytes": 47022080,
+          "captureStableTreeP95Bytes": [53559296, 53559296, 52543488, 52379648, 52297728],
+          "p95Bytes": 52543488
+        },
+        "S4": {
+          "status": "measured",
+          "sampleCountPerCapture": 10,
+          "captureStableTreeMedianBytes": [524099584, 528416768, 522895360, 529596416, 531210240],
+          "medianBytes": 528416768,
+          "captureStableTreeP95Bytes": [548241408, 551485440, 556253184, 556761088, 551403520],
+          "p95Bytes": 551485440
+        }
+      },
+      "deltas": {
+        "S1Help": {
+          "baseMedianBytes": 196124672,
+          "candidateMedianBytes": 188899328,
+          "deltaBytes": -7225344,
+          "deltaPercent": -3.6844
+        },
+        "S3IdlePrewire": {
+          "baseMedianBytes": 42958848,
+          "candidateMedianBytes": 51118080,
+          "deltaBytes": 8159232,
+          "deltaPercent": 18.9907
+        },
+        "S3IdleFirstUseBuild": {
+          "baseMedianBytes": 42958848,
+          "candidateMedianBytes": 47022080,
+          "deltaBytes": 4063232,
+          "deltaPercent": 9.4584
+        },
+        "S4FirstUse": {
+          "baseMedianBytes": 514465792,
+          "candidateMedianBytes": 528416768,
+          "deltaBytes": 13950976,
+          "deltaPercent": 2.7117,
+          "maxAllowedCandidateMedianBytes": 540189081
+        }
+      },
+      "verdict": "rejected: S3 idle changed; S4 first-use is within +5%."
+    }
+  }
+}

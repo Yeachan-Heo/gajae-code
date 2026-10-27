@@ -274,8 +274,11 @@ describe("discoverExternalCredentials", () => {
 		expect(blob).not.toContain(CODEX_ACCESS);
 		expect(blob).not.toContain(CODEX_REFRESH);
 		expect(blob).not.toContain("sk-ant-env-key-1234567890");
-		// Redacted markers still present for traceability.
-		expect(blob).toContain("…");
+		// Display tokens are fully opaque, not secret prefixes or suffixes.
+		expect(result.importable.map(credential => credential.redactedToken)).toEqual(["***", "***"]);
+		expect(result.environment.map(hint => hint.redactedValue)).toEqual(["***"]);
+		expect(blob).toContain("token ***");
+		expect(blob).toContain("ANTHROPIC_API_KEY=***");
 	});
 
 	// Red-team regression (#654): JSON.parse errors echo the offending input

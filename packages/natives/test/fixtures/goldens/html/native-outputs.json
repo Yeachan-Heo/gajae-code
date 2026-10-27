@@ -1,0 +1,29 @@
+[
+	{
+		"name": "basic headings and paragraphs",
+		"html": "<h1>Hello World</h1><p>This is a paragraph.</p>",
+		"expectedLines": ["# Hello World", "", "This is a paragraph.", ""]
+	},
+	{
+		"name": "links",
+		"html": "<p>Visit <a href=\"https://example.com\">Example</a>.</p>",
+		"expectedLines": ["Visit [Example](https://example.com).", ""]
+	},
+	{
+		"name": "aggressive clean-content preprocessing",
+		"html": "<nav>Navigation</nav><main><p>Main content</p></main><footer>Footer</footer>",
+		"options": { "cleanContent": true },
+		"expectedLines": ["Main content", ""]
+	},
+	{
+		"name": "image skipping",
+		"html": "<p>Text <img src=\"image.png\" alt=\"sample\"> after.</p>",
+		"options": { "skipImages": true },
+		"expectedLines": ["Text  after.", ""]
+	},
+	{
+		"name": "depth-limit warning is an error",
+		"repeat": { "tag": "div", "depth": 128, "text": "x" },
+		"expectedError": "Conversion error: DOM traversal reached the effective depth limit of 64; deeper nodes were skipped."
+	}
+]

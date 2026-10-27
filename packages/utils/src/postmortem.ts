@@ -12,11 +12,18 @@ import inspector from "node:inspector";
 import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
-import { type CrashFingerprint, computeCrashFingerprint, formatCrashRecordMarker } from "./crash-fingerprint";
+import {
+	type CrashFingerprint,
+	type CrashFingerprintInput,
+	computeCrashFingerprint,
+	computeHandledErrorFingerprint,
+	formatCrashRecordMarker,
+} from "./crash-fingerprint";
 import type { CrashProvenance } from "./crash-journal";
 import { appendCrashEvent, appendFatalCrashEvent, detectCrashProvenance } from "./crash-journal";
 import { redactCrashSecrets } from "./crash-redaction";
 import { getCrashEventsPath, getCrashLogPath, getHandledErrorEventsPath, getHandledErrorLogPath } from "./dirs";
+import { isDesignedError } from "./error-classification";
 import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
@@ -122,16 +129,22 @@ function runCleanup(reason: Reason, options: CleanupOptions = {}): Promise<void>
  *
  * The deadline defaults to 5000 ms and can be overridden with
  * `GJC_CLEANUP_DEADLINE_MS` (finite values >= 0; anything else falls back to
- * the default).
+ * the default). Values above `MAX_CLEANUP_DEADLINE_MS` are lowered to it.
  */
 const DEFAULT_CLEANUP_DEADLINE_MS = 5_000;
+
+/**
+ * Longest delay setTimeout honors. Bun, like Node, treats any larger delay as 1 ms,
+ * so a very long deadline would otherwise expire before cleanup could run.
+ */
+const MAX_CLEANUP_DEADLINE_MS = 2 ** 31 - 1;
 
 function resolveCleanupDeadlineMs(): number {
 	const raw = process.env.GJC_CLEANUP_DEADLINE_MS;
 	if (raw === undefined || raw.trim() === "") return DEFAULT_CLEANUP_DEADLINE_MS;
 	const parsed = Number(raw);
 	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_CLEANUP_DEADLINE_MS;
-	return parsed;
+	return Math.min(parsed, MAX_CLEANUP_DEADLINE_MS);
 }
 
 async function awaitCleanupWithDeadline(reason: Reason, options: CleanupOptions = {}): Promise<void> {
@@ -512,9 +525,15 @@ export function recordHandledError(
 	options: HandledErrorRecordOptions = {},
 ): string | undefined {
 	try {
-		if (!(error instanceof Error) || typeof error.stack !== "string" || error.stack.length === 0) return undefined;
+		if (
+			!(error instanceof Error) ||
+			isDesignedError(error) ||
+			typeof error.stack !== "string" ||
+			error.stack.length === 0
+		)
+			return undefined;
 		const fatal = describeFatal(error);
-		const fingerprint = computeCrashFingerprint(fatal).fingerprint;
+		const fingerprint = computeHandledErrorFingerprint(persistedCrashInput(fatal)).fingerprint;
 		if (handledErrorFingerprints.has(fingerprint)) {
 			// Still hot: dedupe, but refresh recency so an actively failing class
 			// is not the one evicted under pressure.
@@ -530,6 +549,7 @@ export function recordHandledError(
 		const written = writeCrashRecord(label, fatal, {
 			path: options.path ?? getHandledErrorLogPath(),
 			now: options.now,
+			fingerprint: computeHandledErrorFingerprint(persistedCrashInput(fatal)),
 		});
 		if (!written) {
 			handledErrorFingerprints.delete(fingerprint);
@@ -562,6 +582,7 @@ interface CrashRecordOptions {
 	path?: string;
 	now?: Date;
 	provenance?: CrashProvenance;
+	fingerprint?: CrashFingerprint;
 }
 
 interface WrittenCrashRecord {
@@ -583,6 +604,64 @@ function getHandledErrorEventsTarget(target: string, configuredPath: string | un
 		: path.join(path.dirname(target), path.basename(getHandledErrorEventsPath()));
 }
 
+/**
+ * Redact the whole stack before splitting. Nothing is inserted into the text
+ * the redactor sees. When the stack starts with `name: message`, or with a
+ * name-only header for an empty message (`Error\n    at …`), and no credential
+ * replacement crosses that boundary, only the redacted header is flattened and
+ * frame newlines stay. A crossing replacement, or any other shape, flattens
+ * the whole redacted stack so the credential is still removed.
+ */
+function crashLogStack(name: string, message: string, stack: string): string {
+	const allControls = /[\u0000-\u001f\u007f-\u009f]/g;
+	const frameControls = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
+	const redacted = redactCrashSecrets(stack);
+	const preserved = preserveFrameBoundary(
+		stack,
+		redacted,
+		headerBoundary(name, message, stack),
+		allControls,
+		frameControls,
+	);
+	return preserved ?? redacted.replace(allControls, " ");
+}
+
+function headerBoundary(name: string, message: string, stack: string): number | undefined {
+	const rawHeader = `${name}: ${message}`;
+	if (rawHeader.length > 0 && stack.startsWith(rawHeader)) return rawHeader.length;
+	// Bun prints an empty-message Error as `Error\n    at …`, while the stored
+	// message is `(no message)`. That prefix is not `name: message`.
+	if (message !== "" && message !== "(no message)") return undefined;
+	if (name.length === 0) return undefined;
+	const newline = stack.indexOf("\n");
+	if (newline <= 0) return undefined;
+	const first = stack.slice(0, newline).replace(/\r$/, "");
+	return first === name ? newline : undefined;
+}
+
+function preserveFrameBoundary(
+	stack: string,
+	redacted: string,
+	boundary: number | undefined,
+	allControls: RegExp,
+	frameControls: RegExp,
+): string | undefined {
+	if (boundary === undefined || boundary <= 0 || boundary > stack.length) return undefined;
+	const head = redactCrashSecrets(stack.slice(0, boundary));
+	const tail = redactCrashSecrets(stack.slice(boundary));
+	if (head + tail !== redacted) return undefined;
+	return `${head.replace(allControls, " ")}${redacted.slice(head.length).replace(frameControls, " ")}`;
+}
+
+/** The name, message, and stack strings that the crash log actually stores. */
+function persistedCrashInput(fatal: FatalDiagnostic): CrashFingerprintInput {
+	return {
+		name: redactCrashSecrets(fatal.name).replace(/[\u0000-\u001f\u007f-\u009f]/g, " "),
+		message: redactCrashSecrets(fatal.message).replace(/[\u0000-\u001f\u007f-\u009f]/g, " "),
+		stack: fatal.stack ? crashLogStack(fatal.name, fatal.message, fatal.stack) : "",
+	};
+}
+
 function writeCrashRecord(
 	label: string,
 	fatal: FatalDiagnostic,
@@ -591,18 +670,18 @@ function writeCrashRecord(
 	try {
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
-		const stack = fatal.stack ? `${redactCrashSecrets(fatal.stack)}\n` : "";
+		const persisted = persistedCrashInput(fatal);
+		const stack = persisted.stack ? `${persisted.stack}\n` : "";
 		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
-		// Identity is computed from the already-captured diagnostic text only; the
-		// throwable is never read again here.
-		const fingerprint = computeCrashFingerprint(fatal);
+		// The marker must match the diagnostic a reader rebuilds from this text.
+		const fingerprint = options.fingerprint ?? computeCrashFingerprint(persisted);
 		const recordId = randomBytes(8).toString("hex");
 		const markerLine = `${formatCrashRecordMarker(fingerprint.fingerprint, fingerprint.version, recordId)}\n`;
 		// The marker is the record's identity, so it is budgeted first and appended
 		// after truncation: an oversized body can never evict it.
 		const body = boundCrashRecord(
 			`${now.toISOString()} pid=${process.pid} [${label}${options.provenance && options.provenance !== "product" ? `;provenance=${options.provenance}` : ""}] ` +
-				`${redactCrashSecrets(fatal.name)}: ${redactCrashSecrets(fatal.message)}\n` +
+				`${persisted.name}: ${persisted.message}\n` +
 				`${stack}${payload}`,
 			CRASH_RECORD_MAX_BYTES - Buffer.byteLength(markerLine, "utf8") - 1,
 		);

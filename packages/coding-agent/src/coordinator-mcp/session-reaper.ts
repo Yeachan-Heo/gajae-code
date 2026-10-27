@@ -22,6 +22,11 @@ export const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60_000; // 30 min idle → reap
 export const DEFAULT_SESSION_SWEEP_INTERVAL_MS = 5 * 60_000; // sweep every 5 min
 export const MIN_SESSION_IDLE_TTL_MS = 60_000; // never reap a <1min-idle session
 export const MIN_SESSION_SWEEP_INTERVAL_MS = 30_000;
+/**
+ * Longest delay setTimeout honors. Bun, like Node, treats any larger delay as 1 ms,
+ * so an operator's very long sweep interval would otherwise re-sweep back to back.
+ */
+export const MAX_SESSION_SWEEP_INTERVAL_MS = 2 ** 31 - 1;
 /** After this many consecutive reap failures the session is force-evicted from the index. */
 export const MAX_REAP_FAILURES = 3;
 
@@ -57,10 +62,12 @@ export function selectReapableSessions(
 /**
  * Only a stale/absent endpoint makes a session permanently unreapable, so it is
  * the sole failure that advances the force-eviction counter. Every other reap
- * failure (close_failed, broker unavailability, filesystem errors) is transient
- * and must keep retrying without ever escalating to force eviction. The server
- * wires `reapSession` to throw `new Error(reason)`, so the reason code is the
- * error message here.
+ * failure (a close_failed without a stale endpoint, broker unavailability,
+ * filesystem errors) is transient and must keep retrying without ever escalating
+ * to force eviction. The server wires `reapSession` to throw `new Error(reason)`,
+ * except that a close the broker answered with endpoint_stale (close_failed with
+ * that detail) is thrown as endpoint_stale, so the reason code is the error
+ * message here.
  */
 function isEndpointStaleReapError(err: unknown): boolean {
 	return (err instanceof Error ? err.message : String(err)) === "endpoint_stale";
@@ -90,7 +97,10 @@ export interface SessionReaper {
 
 export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReaperPolicy): SessionReaper {
 	const idleTtlMs = Math.max(MIN_SESSION_IDLE_TTL_MS, policy.idleTtlMs);
-	const sweepIntervalMs = Math.max(MIN_SESSION_SWEEP_INTERVAL_MS, policy.sweepIntervalMs);
+	const sweepIntervalMs = Math.min(
+		MAX_SESSION_SWEEP_INTERVAL_MS,
+		Math.max(MIN_SESSION_SWEEP_INTERVAL_MS, policy.sweepIntervalMs),
+	);
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let generation = 0;
 	let inProgress = false;

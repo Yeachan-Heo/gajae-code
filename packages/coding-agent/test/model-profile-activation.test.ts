@@ -5,6 +5,7 @@ import type { Model } from "@gajae-code/ai";
 import { hookFetch, TempDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
+	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
 	ModelProfileCredentialError,
@@ -13,15 +14,25 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	publishPreparedModelProfileActivation,
+	resolveMaterializationProfileIdentity,
+	resolveMaterializedDefaultSelector,
+	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
+	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
-import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionProfileInstalledOverrideState,
+	type DefaultFallbackRuntimeState,
+	type PreparedProfileModelSelection,
+} from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -38,6 +49,22 @@ const model = (provider: string, id: string, thinking?: Model["thinking"]): Mode
 		reasoning: thinking !== undefined,
 		compat: thinking ? { supportsReasoningEffort: true } : undefined,
 	}) as Model;
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state ^= state << 13;
+		state ^= state >>> 17;
+		state ^= state << 5;
+		return (state >>> 0) / 0x1_0000_0000;
+	};
+}
+
+function generatedSelector(random: () => number, label: string, index: number): string {
+	const provider = Math.floor(random() * 5);
+	const modelId = Math.floor(random() * 1000);
+	return `provider-${provider}/${label}-${index}-${modelId}`;
+}
 
 function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelProfileDefinition[] }) {
 	const profiles = new Map<string, ModelProfileDefinition>();
@@ -76,7 +103,12 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
-			model("openai-codex", "gpt-5.6-sol", {
+			model("openai-codex", "gpt-6-sol", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
+			model("openai-codex", "gpt-6.1-sol", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
@@ -86,13 +118,13 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
-			model("openai-codex", "gpt-5.6-luna", {
+			model("openai-codex", "gpt-6-luna", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
 			model("openai-codex", "gpt-5.3-codex-spark"),
-			model("anthropic", "claude-opus-5", {
+			model("anthropic", "claude-opus-5-5", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
@@ -108,6 +140,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				maxLevel: ThinkingLevel.XHigh,
 			}),
 			model("anthropic", "claude-sonnet-5"),
+			model("anthropic", "claude-sonnet-5-5"),
 			model("anthropic", "claude-opus-4-6", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
@@ -144,15 +177,18 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 
 function fakeSession(initial = model("provider-a", "initial")) {
 	let activeModelProfile: string | undefined;
+	let activatedModelProfile: string | undefined;
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
+		modelRegistry: undefined as ModelRegistry | undefined,
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		configuredModelChains: new Map<string, readonly string[]>(),
 		configuredModelChainStates: new Map<
@@ -183,7 +219,13 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
-		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
+		async setModelTemporary(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			options?: { shouldMutate?: () => boolean; onMutationStarted?: () => void },
+		) {
+			if (options?.shouldMutate && !options.shouldMutate()) return;
+			options?.onMutationStarted?.();
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
@@ -198,11 +240,15 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		getSessionDefaultModelSelector() {
 			return this.resumeDefaultSelectors.at(-1);
 		},
-		setActiveModelProfile(name: string | undefined) {
+		setActiveModelProfile(name: string | undefined, activatedByThisProcess = false) {
 			activeModelProfile = name;
+			activatedModelProfile = activatedByThisProcess ? name : undefined;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getActivatedModelProfile() {
+			return activatedModelProfile === activeModelProfile ? activeModelProfile : undefined;
 		},
 	};
 }
@@ -226,19 +272,373 @@ describe("model profile activation", () => {
 		});
 	});
 
-	test("built-in claude-opus falls back to Opus 4.6 when Opus 5 is absent", async () => {
+	it("does not restore a captured model over a newer user selection during rollback", async () => {
+		const session = fakeSession();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		const newerSelection = model("provider-c", "user-selection");
+		session.model = newerSelection;
+		prepared.defaultModelPublished = true;
+
+		await rollbackPreparedModelProfileActivation(prepared, { isCurrent: () => false });
+
+		expect(session.model).toBe(newerSelection);
+	});
+
+	test("does not restore fallback state after a newer selection during model rollback", async () => {
+		const restoreStarted = Promise.withResolvers<void>();
+		const allowRestore = Promise.withResolvers<void>();
+		let selectionRevision = 0;
+		let fallbackState = {
+			chain: {
+				role: "default",
+				entries: ["provider-c/default"],
+				origin: "model_selection",
+				explicitHead: true,
+			},
+			controller: {
+				activeIndex: 0,
+				attemptsUsed: 0,
+				totalAttemptsUsed: 0,
+				attemptStarted: false,
+				restoredEntryIndices: [],
+				tried: [],
+				skips: [],
+				exhaustedForTurn: false,
+			},
+			exhaustedLastTurn: false,
+		} satisfies DefaultFallbackRuntimeState;
+		const newerFallbackState = {
+			...fallbackState,
+			chain: { ...fallbackState.chain, entries: ["provider-b/executor"] },
+			controller: { ...fallbackState.controller, activeIndex: 1 },
+		};
+		const restoreFallback = vi.fn();
+		const session = Object.assign(fakeSession(), {
+			getUserModelSelectionRevision: () => selectionRevision,
+			getDefaultFallbackRuntimeState: () => fallbackState,
+			restoreDefaultFallbackRuntimeState: restoreFallback,
+			setModelTemporary: async (
+				_next: Model,
+				_thinkingLevel: ThinkingLevel | undefined,
+				options?: { shouldMutate?: () => boolean; onMutationStarted?: () => void },
+			) => {
+				if (options?.shouldMutate && !options.shouldMutate()) return;
+				options?.onMutationStarted?.();
+				throw new Error("profile model selection failed");
+			},
+			restoreModelSelectionForRollback: async (
+				_previousModel: Model | undefined,
+				_previousThinkingLevel: ThinkingLevel | undefined,
+			) => {
+				restoreStarted.resolve();
+				await allowRestore.promise;
+			},
+		});
+		const activation = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		let applying: Promise<void> | undefined;
+		try {
+			applying = applyPreparedModelProfileActivation(activation, {
+				isCurrent: () => selectionRevision === 0,
+			});
+			await restoreStarted.promise;
+			selectionRevision++;
+			fallbackState = newerFallbackState;
+			allowRestore.resolve();
+			await expect(applying).rejects.toThrow("profile model selection failed");
+
+			expect(restoreFallback).not.toHaveBeenCalled();
+			expect(fallbackState).toEqual(newerFallbackState);
+		} finally {
+			allowRestore.resolve();
+			if (applying) await Promise.allSettled([applying]);
+		}
+	});
+
+	test("keeps a same-model resume choice made during rollback model restoration", async () => {
+		const baseSession = fakeSession();
+		const restoreStarted = Promise.withResolvers<void>();
+		const allowRestore = Promise.withResolvers<void>();
+		const session = Object.assign(baseSession, {
+			prepareModelSelectionForProfileActivation: async (
+				nextModel: Model,
+				thinkingLevel: ThinkingLevel | undefined,
+				signal?: AbortSignal,
+			): Promise<PreparedProfileModelSelection> => ({
+				sessionId: baseSession.sessionId,
+				model: nextModel,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: baseSession.model,
+				previousThinkingLevel: baseSession.thinkingLevel,
+				previousEditMode: "default" as never,
+				signal,
+			}),
+			commitPreparedProfileModelSelection: (selection: PreparedProfileModelSelection) => {
+				baseSession.model = selection.model;
+				baseSession.thinkingLevel = selection.committedThinkingLevel;
+			},
+			restoreModelSelectionForRollback: async (
+				previousModel: Model | undefined,
+				previousThinkingLevel: ThinkingLevel | undefined,
+			) => {
+				baseSession.model = previousModel;
+				baseSession.thinkingLevel = previousThinkingLevel;
+				restoreStarted.resolve();
+				await allowRestore.promise;
+			},
+		});
+		baseSession.recordResumeDefaultModel("provider-c/previous-default");
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+			prepareSessionModelSelection: true,
+		});
+		const profileDefault = prepared.defaultModel;
+		if (!profileDefault) throw new Error("Expected a prepared profile default model");
+		publishPreparedModelProfileActivation(prepared);
+		const publishedDefault = `${profileDefault.provider}/${profileDefault.id}`;
+		let selectionIsCurrent = true;
+		let rollback: Promise<void> | undefined;
+		try {
+			rollback = rollbackPreparedModelProfileActivation(prepared, {
+				isCurrent: () => selectionIsCurrent,
+			});
+			await restoreStarted.promise;
+			selectionIsCurrent = false;
+			baseSession.model = profileDefault;
+			baseSession.thinkingLevel = ThinkingLevel.Low;
+			baseSession.recordResumeDefaultModel(publishedDefault);
+			allowRestore.resolve();
+			await rollback;
+
+			expect(baseSession.model).toBe(profileDefault);
+			expect(baseSession.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(baseSession.getSessionDefaultModelSelector()).toBe(publishedDefault);
+		} finally {
+			allowRestore.resolve();
+			if (rollback) await Promise.allSettled([rollback]);
+		}
+	});
+
+	test("skips profile preparation when the recovery fence is already stale", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const getProfiles = vi.spyOn(registry, "getModelProfiles");
+		const clearCanonicalVariant = vi.fn();
+		Object.assign(registry, { clearCanonicalVariant });
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry as never, settings: Settings.isolated(), profileName: "profile-a" },
+			{ isCurrent: () => false },
+		);
+
+		expect(getProfiles).not.toHaveBeenCalled();
+		expect(clearCanonicalVariant).not.toHaveBeenCalled();
+		expect(session.setModelTemporaryCalls).toEqual([]);
+	});
+
+	test("preserves a newer fallback chain selected during profile model activation", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const modelMutationStarted = Promise.withResolvers<void>();
+		const allowModelMutation = Promise.withResolvers<void>();
+		session.setModelTemporary = async (next, thinkingLevel, options) => {
+			modelMutationStarted.resolve();
+			await allowModelMutation.promise;
+			options?.onMutationStarted?.();
+			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
+			session.model = next;
+			session.thinkingLevel = thinkingLevel;
+		};
+		const activation = activateModelProfile({
+			session,
+			modelRegistry: registry as never,
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+
+		await modelMutationStarted.promise;
+		session.setConfiguredModelChain("default", ["provider-c/default"], "model-selection", "user-selection", true);
+		allowModelMutation.resolve();
+		await activation;
+
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			origin: "model-selection",
+			identity: "user-selection",
+			explicitHead: true,
+		});
+	});
+
+	test("rolls back a staged fallback chain when the guarded model mutation is skipped", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const modelMutationStarted = Promise.withResolvers<void>();
+		const allowModelMutation = Promise.withResolvers<void>();
+		const originalSetModelTemporary = session.setModelTemporary.bind(session);
+		session.setModelTemporary = async (next, thinkingLevel, options) => {
+			modelMutationStarted.resolve();
+			await allowModelMutation.promise;
+			await originalSetModelTemporary(next, thinkingLevel, options);
+		};
+		let selectionIsCurrent = true;
+		const activation = activateModelProfile(
+			{
+				session,
+				modelRegistry: registry as never,
+				settings: Settings.isolated(),
+				profileName: "profile-a",
+			},
+			{ isCurrent: () => selectionIsCurrent },
+		);
+
+		await modelMutationStarted.promise;
+		selectionIsCurrent = false;
+		session.setConfiguredModelChain("default", ["provider-c/selected"], "model-selection", "user-selection", true);
+		allowModelMutation.resolve();
+		await activation;
+
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/selected"]);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({ origin: "model-selection" });
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("cancels recovered runtime bindings when selection changes during preparation", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const apiProbeStarted = Promise.withResolvers<void>();
+		vi.spyOn(registry, "getApiKeyForProvider").mockImplementation(async provider => {
+			if (provider === "provider-a") {
+				apiProbeStarted.resolve();
+				return apiKey.promise;
+			}
+			return `key-${provider}`;
+		});
+		const settings = Settings.isolated({ modelRoles: { default: "provider-c/original" } });
+		let selectionIsCurrent = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry as never, settings, profileName: "profile-a" },
+			() => selectionIsCurrent,
+		);
+
+		await apiProbeStarted.promise;
+		selectionIsCurrent = false;
+		apiKey.resolve("key-provider-a");
+		await activation;
+
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(settings.getOverride("modelRoles")).toBeUndefined();
+		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+	});
+
+	test("records recovered role ownership baselines for later profile reloads", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const baselineModelRoles = { planner: "provider-c/manual-planner" };
+		const baselineAgentModelOverrides = { architect: "provider-c/manual-architect" };
+		settings.override("modelRoles", baselineModelRoles);
+		settings.override("task.agentModelOverrides", baselineAgentModelOverrides);
+		const noteProfileInstalledOverrides = vi.fn();
+		Object.assign(session, { noteProfileInstalledOverrides });
+
+		await applyModelProfileRuntimeBindings({
+			session,
+			modelRegistry: fakeRegistry() as never,
+			settings,
+			profileName: "profile-a",
+		});
+
+		expect(noteProfileInstalledOverrides).toHaveBeenCalledWith(
+			[],
+			["executor", "architect"],
+			session.model,
+			{ modelRoles: baselineModelRoles, agentModelOverrides: baselineAgentModelOverrides },
+			{
+				modelRoles: {},
+				agentModelOverrides: {
+					executor: "provider-b/executor",
+					architect: "provider-a/architect",
+				},
+			},
+			{ modelRoles: [], agentModelOverrides: [] },
+			["provider-a/default:high"],
+		);
+	});
+
+	test("restores recovered runtime bindings when selection changes during delegation sync", async () => {
+		const session = fakeSession();
+		session.setActiveModelProfile("previous-profile");
+		const registry = fakeRegistry();
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-c/global-default", critic: "provider-c/global-critic" },
+			"task.agentModelOverrides": { planner: "provider-c/global-planner" },
+		});
+		const previousModelRolesOverride = { default: "provider-c/old-default", critic: "provider-c/old-critic" };
+		const previousAgentModelOverridesOverride = { planner: "provider-c/old-planner" };
+		settings.override("modelRoles", previousModelRolesOverride);
+		settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
+		const syncStarted = Promise.withResolvers<void>();
+		const allowSync = Promise.withResolvers<void>();
+		let syncCalls = 0;
+		const syncEagerDelegation = vi.fn(async () => {
+			syncCalls += 1;
+			if (syncCalls === 1) {
+				syncStarted.resolve();
+				await allowSync.promise;
+			}
+		});
+		const noteProfileInstalledOverrides = vi.fn();
+		Object.assign(session, { syncEagerDelegation, noteProfileInstalledOverrides });
+		let selectionIsCurrent = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry as never, settings, profileName: "profile-a" },
+			() => selectionIsCurrent,
+		);
+
+		await syncStarted.promise;
+		selectionIsCurrent = false;
+		settings.setAgentModelOverride("executor", "provider-c/user-executor");
+		allowSync.resolve();
+		await activation;
+
+		expect(settings.getOverride("modelRoles")).toEqual(previousModelRolesOverride);
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual({
+			...previousAgentModelOverridesOverride,
+			executor: "provider-c/user-executor",
+		});
+		expect(session.getActiveModelProfile()).toBe("previous-profile");
+		expect(noteProfileInstalledOverrides).not.toHaveBeenCalled();
+		expect(syncEagerDelegation).toHaveBeenCalledTimes(2);
+	});
+
+	test("built-in claude-opus falls back to Opus 4.6 when Opus 5.5 is absent", async () => {
 		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
 		expect(profile).toBeDefined();
 		const baseRegistry = fakeRegistry({ profiles: [profile!] });
-		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5");
+		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5-5");
 		const session = fakeSession();
 
 		const prepared = await prepareModelProfileActivation({
 			session,
 			modelRegistry: {
 				...baseRegistry,
-				getAvailable: baseRegistry.getAll,
-				getAvailableForProfileActivation: () => available,
+				getAvailable: () => available,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",
@@ -246,16 +646,16 @@ describe("model profile activation", () => {
 
 		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
-		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"]);
+		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"]);
 		expect(prepared.agentModelOverrides).toEqual({
-			executor: "anthropic/claude-sonnet-5",
-			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+			executor: "anthropic/claude-sonnet-5-5",
+			planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
 		});
 	});
 
-	test("built-in claude-opus retains Opus 5 when the catalog exposes it", async () => {
+	test("built-in claude-opus retains Opus 5.5 when the catalog exposes it", async () => {
 		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
 		expect(profile).toBeDefined();
 
@@ -266,11 +666,11 @@ describe("model profile activation", () => {
 			profileName: "claude-opus",
 		});
 
-		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
-		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
 	});
 
-	test("built-in claude-opus skips a bundled Opus 5 absent from fresh live catalog evidence", async () => {
+	test("built-in claude-opus keeps a bundled Opus 5.5 omitted from fresh live catalog evidence", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		try {
@@ -298,31 +698,17 @@ describe("model profile activation", () => {
 			await registry.refreshProvider("anthropic", "online");
 
 			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
-			// Fresh, authoritative live evidence makes the live catalog the selectable
-			// list, so a bundled Opus 5 the provider did not enroll is not selectable
-			// either. The bundled catalog is only the fallback when that evidence is
-			// unavailable (#5720, #5746).
-			expect(
-				registry
-					.getAvailable()
-					.filter(candidate => candidate.provider === "anthropic")
-					.map(candidate => candidate.id)
-					.sort(),
-			).toEqual(["claude-opus-4-6", "claude-sonnet-5"]);
-			expect(
-				registry
-					.getAvailableForProfileActivation()
-					.filter(candidate => candidate.provider === "anthropic")
-					.map(candidate => candidate.id),
-			).not.toContain("claude-opus-5");
-			const expectedIds = new Set(["claude-opus-4-6", "claude-sonnet-5"]);
-			expect(
-				registry.getAvailableForProfileActivation().filter(candidate => candidate.provider === "anthropic"),
-			).toEqual(
-				registry
-					.getAvailable()
-					.filter(candidate => candidate.provider === "anthropic" && expectedIds.has(candidate.id)),
-			);
+			// Live discovery enriches the catalog but never removes a bundled entry:
+			// Opus 5.5 stays selectable even though the live response omitted it, and
+			// the provider reports its own error if the account cannot use it.
+			const anthropicIds = registry
+				.getAvailable()
+				.filter(candidate => candidate.provider === "anthropic")
+				.map(candidate => candidate.id)
+				.sort();
+			expect(anthropicIds).toContain("claude-opus-5-5");
+			expect(anthropicIds).toContain("claude-opus-4-6");
+			expect(anthropicIds).toContain("claude-sonnet-5");
 			const session = fakeSession();
 			session.model = undefined;
 			session.thinkingLevel = undefined;
@@ -334,20 +720,478 @@ describe("model profile activation", () => {
 				profileName: "claude-opus",
 			});
 
-			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
-			expect(prepared.defaultResolutionSkips).toEqual([
-				{ selector: "anthropic/claude-opus-5:xhigh", reason: "unknown_model" },
-			]);
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
+			expect(prepared.defaultResolutionSkips).toEqual([]);
 			expect(prepared.agentModelOverrides).toMatchObject({
-				executor: "anthropic/claude-sonnet-5",
-				planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-				critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-				architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:high"],
+				executor: "anthropic/claude-sonnet-5-5",
+				planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+				critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+				architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
 			});
 		} finally {
 			authStorage.close();
 			tempDir.removeSync();
 		}
+	});
+
+	test("materialization resolves a bare assignment against the available catalog, not the full catalog", () => {
+		const opus5 = model("anthropic", "claude-opus-5-5");
+		const opus46 = model("anthropic", "claude-opus-4-6");
+		const baseRegistry = fakeRegistry();
+		const registry = {
+			...baseRegistry,
+			getAll: () => [opus5, opus46, ...baseRegistry.getAll()],
+			// Only Opus 4.6 is usable; the full catalog still lists Opus 5.5.
+			getAvailable: () => [opus46],
+			lookupAliasExists: (alias: string) => alias === "opus",
+			resolveModelByLookupAlias: (alias: string, lookupOptions?: { candidates?: readonly Model[] }) =>
+				alias === "opus"
+					? (lookupOptions?.candidates ?? []).find(candidate => candidate.provider === "anthropic")
+					: undefined,
+		} as unknown as ModelRegistry;
+		const session = fakeSession();
+		session.modelRegistry = registry;
+		const settings = Settings.isolated({ "modelProfile.default": "live-narrow" });
+
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: new Map([["default", "opus"]]),
+		});
+
+		expect(materialized).toBe(true);
+		// The full catalog still lists Opus 5.5, but the assignment is persisted for
+		// later profile execution, so it must resolve against the usable catalog.
+		expect(settings.get("modelRoles")).toMatchObject({ default: "anthropic/claude-opus-4-6" });
+	});
+
+	test("durable default recovery excludes a bundled default absent from the available catalog", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "anthropic/claude-opus-5-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getAvailable: () => baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5-5"),
+		} as unknown as ModelRegistry;
+
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5-5")).toBe(false);
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery).toMatchObject({
+			profileName: profile.name,
+			entries: ["anthropic/claude-opus-5-5"],
+			activeIndex: 1,
+			skips: [{ selector: "anthropic/claude-opus-5-5", reason: "unknown_model" }],
+		});
+		expect(recovery.model).toBeUndefined();
+	});
+
+	test.each([
+		"user",
+		"registry",
+	] as const)("durable %s profile recovery rejects an unresolved qualified executor when its default resolves", async source => {
+		const profile: ModelProfileDefinition = {
+			name: `${source}-unresolved-executor`,
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/missing-executor" },
+			source,
+		};
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: fakeRegistry({ profiles: [profile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+	});
+
+	test("durable default recovery rejects unknown required providers before credential probing", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unknown-recovery-provider",
+			requiredProviders: ["future-provider"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async () => "key-provider-a");
+		const registry = {
+			...baseRegistry,
+			getConfiguredProviderIds: () => ["provider-a"],
+			isKnownProvider: (provider: string) => provider === "provider-a",
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toBeInstanceOf(ModelProfileUnknownProviderError);
+		expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	});
+
+	test("durable default recovery reports an unavailable session pin without probing another account", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-pin-recovery",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const getApiKeyForProvider = vi.fn(async () => "another-account-key");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider,
+			authStorage: {
+				hasRuntimeApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
+				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+					provider === "provider-a" && scope === "resume-session",
+			},
+		} as unknown as ModelRegistry;
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toMatchObject({ name: "ModelProfileCredentialError", providers: ["provider-a"] });
+		expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	});
+
+	test("durable default recovery respects runtime API key when OAuth pin is unavailable", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-pin-with-runtime-key",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const getApiKeyForProvider = vi.fn(async () => "runtime-key-value");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider,
+			authStorage: {
+				hasRuntimeApiKey: () => true,
+				hasLiteralConfigApiKey: () => false,
+				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+					provider === "provider-a" && scope === "resume-session",
+			},
+		} as unknown as ModelRegistry;
+		const result = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+		expect(result.model).toBeDefined();
+		expect(getApiKeyForProvider).toHaveBeenCalled();
+	});
+
+	test("profile activation reports a pin invalidated during credential probing", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "pin-invalidated-during-probe",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		let unavailable = false;
+		const failure = new Error("Selected credential for provider-a (id:13) is unavailable");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider: async () => {
+				unavailable = true;
+				throw failure;
+			},
+			authStorage: {
+				hasRuntimeApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
+				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+					provider === "provider-a" && scope === "session-1" && unavailable,
+			},
+		} as unknown as ModelRegistry;
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({ name: "ModelProfileCredentialError", providers: ["provider-a"] });
+	});
+
+	test("profile activation preserves unrelated credential lookup failures", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unrelated-auth-failure",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const failure = new Error("OAuth broker failed");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider: async () => {
+				throw failure;
+			},
+			authStorage: {
+				hasRuntimeApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
+				hasSessionCredentialUnavailable: () => false,
+			},
+		} as unknown as ModelRegistry;
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toBe(failure);
+	});
+
+	test("profile activation respects runtime API key precedence over unavailable OAuth pin", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "runtime-key-unavailable-pin",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider: async () => "runtime-key-value",
+			authStorage: {
+				hasRuntimeApiKey: (provider: string) => provider === "provider-a",
+				hasLiteralConfigApiKey: () => false,
+				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+					provider === "provider-a" && scope === "session-1",
+			},
+		} as unknown as ModelRegistry;
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+		expect(prepared.profileName).toBe(profile.name);
+	});
+
+	test("profile activation respects config API key precedence over unavailable OAuth pin", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "config-key-unavailable-pin",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const owner = {};
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getAuthStorageOwner: () => owner,
+			getApiKeyForProvider: async () => "config-key-value",
+			authStorage: {
+				hasRuntimeApiKey: () => false,
+				// The models.yml key is registered for this registry's owner only.
+				hasLiteralConfigApiKey: (provider: string, keyOwner?: object) =>
+					provider === "provider-a" && keyOwner === owner,
+				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+					provider === "provider-a" && scope === "session-1",
+			},
+		} as unknown as ModelRegistry;
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+		expect(prepared.profileName).toBe(profile.name);
+	});
+
+	test("profile activation fails when OAuth pin unavailable and no explicit credential exists", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-pin-no-explicit-key",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		let unavailable = false;
+		const failure = new Error("Selected credential for provider-a is unavailable");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider: async () => {
+				unavailable = true;
+				throw failure;
+			},
+			authStorage: {
+				hasRuntimeApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
+				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+					provider === "provider-a" && scope === "session-1" && unavailable,
+			},
+		} as unknown as ModelRegistry;
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({ name: "ModelProfileCredentialError", providers: ["provider-a"] });
+	});
+
+	test("durable default recovery accepts a credentialless OpenCodex proxy", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credentialless-opencodex-recovery",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "registry",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const proxyModel = model("opencodex", "provider-a/default");
+		const registry = {
+			...baseRegistry,
+			getAll: () => [...baseRegistry.getAll(), proxyModel],
+			getAvailable: () => [proxyModel],
+			getConfiguredProviderIds: () => [],
+			isKnownProvider: (provider: string) => provider === "provider-a" || provider === "opencodex",
+			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : "key-provider-a"),
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated({
+				"modelProfile.proxyProvider": "opencodex",
+				"modelProfile.proxyMode": "always",
+			}),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.model).toMatchObject({ provider: "opencodex", id: "provider-a/default" });
+	});
+
+	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "optional-mapped-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async (provider: string) => {
+				if (provider === "provider-b") throw new Error("optional provider lookup failed");
+				return "key-provider-a";
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toMatchObject({
+			profileName: profile.name,
+			entries: ["provider-a/default"],
+			model: expect.objectContaining({ provider: "provider-a", id: "default" }),
+			activeIndex: 0,
+			skips: [],
+		});
+	});
+
+	test("durable default recovery retains a Cursor head and applies managed fallback safety", async () => {
+		const cursor = { ...model("cursor", "agent"), api: "cursor-agent" } as Model;
+		const fallback = model("provider-a", "default");
+		const profile: ModelProfileDefinition = {
+			name: "cursor-recovery",
+			requiredProviders: [],
+			modelMapping: { default: ["cursor/agent", "provider-a/default"] },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = { ...baseRegistry, getAll: () => [cursor, fallback] } as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.entries).toEqual(["cursor/agent", "provider-a/default"]);
+		expect(recovery.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(recovery.activeIndex).toBe(1);
+		expect(recovery.skips[0]?.reason).toContain("requires provider-side tool execution");
+	});
+
+	test("durable default recovery does not probe a throwing fallback after a callable head", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "callable-head",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: ["provider-a/default", "provider-b/tail"] },
+			source: "user",
+		};
+		const head = model("provider-a", "default");
+		const tail = model("provider-b", "tail");
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async (provider: string) => {
+			if (provider === "provider-b") throw new Error("tail credential lookup must not run");
+			return "key-provider-a";
+		});
+		const registry = {
+			...baseRegistry,
+			getAll: () => [head, tail],
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.entries).toEqual(["provider-a/default", "provider-b/tail"]);
+		expect(recovery.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(recovery.activeIndex).toBe(0);
+	});
+
+	test("durable default recovery rejects a required provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "required-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async () => {
+				throw new Error("required provider lookup failed");
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow("required provider lookup failed");
 	});
 
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
@@ -365,7 +1209,7 @@ describe("model profile activation", () => {
 				}
 				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
 				discoveryCount += 1;
-				return new Response(JSON.stringify({ data: discoveryCount === 1 ? [{ id: "claude-opus-5" }] : [] }), {
+				return new Response(JSON.stringify({ data: discoveryCount === 1 ? [{ id: "claude-opus-5-5" }] : [] }), {
 					headers: { "Content-Type": "application/json" },
 				});
 			});
@@ -378,25 +1222,27 @@ describe("model profile activation", () => {
 			await registry.refreshProvider("anthropic", "online");
 			expect(
 				registry
-					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.getAvailable()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 			const notificationsAfterNonEmpty = catalogNotifications;
 
 			await registry.refreshProvider("anthropic", "online");
 			expect(catalogNotifications).toBeGreaterThan(notificationsAfterNonEmpty);
+			// The bundled Opus 5.5 survives the now-empty live catalog, and the
+			// catalog-change notification still fires on the evidence change.
 			expect(
 				registry
-					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
-			).toBe(false);
+					.getAvailable()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
+			).toBe(true);
 		} finally {
 			authStorage.close();
 			tempDir.removeSync();
 		}
 	});
 
-	test("built-in claude-opus retains bundled Opus 5 after live catalog discovery fails", async () => {
+	test("built-in claude-opus retains bundled Opus 5.5 after live catalog discovery fails", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-stale-catalog-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		try {
@@ -424,7 +1270,7 @@ describe("model profile activation", () => {
 				profileName: "claude-opus",
 			});
 
-			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
 			expect(prepared.defaultResolutionSkips).toEqual([]);
 		} finally {
 			authStorage.close();
@@ -445,7 +1291,7 @@ describe("model profile activation", () => {
 							baseUrl: "https://custom-anthropic.example.test/v1",
 							api: "anthropic-messages",
 							apiKey: "TEST_ANTHROPIC_KEY",
-							models: [{ id: "claude-opus-5" }],
+							models: [{ id: "claude-opus-5-5" }],
 						},
 					},
 				}),
@@ -467,11 +1313,13 @@ describe("model profile activation", () => {
 			const registry = new ModelRegistry(authStorage, modelsPath);
 			await registry.refreshProvider("anthropic", "online");
 
-			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://custom-anthropic.example.test/v1");
+			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe(
+				"https://custom-anthropic.example.test/v1",
+			);
 			expect(
 				registry
-					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.getAvailable()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 
 			registry.registerProvider("anthropic", {
@@ -480,8 +1328,8 @@ describe("model profile activation", () => {
 				apiKey: "TEST_RUNTIME_ANTHROPIC_KEY",
 				models: [
 					{
-						id: "claude-opus-5",
-						name: "Runtime Opus 5",
+						id: "claude-opus-5-5",
+						name: "Runtime Opus 5.5",
 						reasoning: true,
 						input: ["text"],
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -490,11 +1338,13 @@ describe("model profile activation", () => {
 					},
 				],
 			});
-			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://runtime-anthropic.example.test/v1");
+			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe(
+				"https://runtime-anthropic.example.test/v1",
+			);
 			expect(
 				registry
-					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.getAvailable()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 		} finally {
 			authStorage.close();
@@ -1002,6 +1852,37 @@ describe("model profile activation", () => {
 		).rejects.toThrow('Model profile "hard-required" requires credentials for: provider-a.');
 	});
 
+	test("preflight retains its original cause when sticky-variant restoration also fails", async () => {
+		const rollbackFailure = new Error("secret-sticky-variant");
+		const registry = {
+			...fakeRegistry({ missingProviders: ["provider-a"] }),
+			getSessionCanonicalVariant: () => "provider-c/default",
+			clearCanonicalVariant: () => true,
+			restoreSessionCanonicalVariant: () => {
+				throw rollbackFailure;
+			},
+		};
+		let failure: unknown;
+		try {
+			await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "profile-a",
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		const stages = aggregate.errors as Error[];
+		expect(stages[0]?.cause).toBeInstanceOf(ModelProfileCredentialError);
+		expect(stages[1]?.cause).toBe(rollbackFailure);
+		expect(aggregate.message).toContain("profile preflight (required credentials unavailable)");
+		expect(aggregate.message).toContain("restore canonical model variant (operation failed)");
+		expect(aggregate.message).not.toContain("secret-sticky-variant");
+	});
+
 	test("accepts the kNoAuth sentinel for required keyless providers", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "keyless-required",
@@ -1042,6 +1923,41 @@ describe("model profile activation", () => {
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
 	});
 
+	test("rollback restores the previous live model even when its credentials are unavailable", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-credential-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const previousModel = model("provider-c", "default");
+			const registry = {
+				...fakeRegistry(),
+				getApiKey: async (candidate: Model) => (candidate.provider === "provider-c" ? undefined : kNoAuth),
+			};
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: "profile-a",
+			});
+			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("forward flush failed"));
+
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"forward flush failed",
+			);
+			expect(session.model).toBe(previousModel);
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("rollback restores a model-less session without creating resume lineage", async () => {
 		const session = fakeSession();
 		session.model = undefined;
@@ -1059,6 +1975,169 @@ describe("model profile activation", () => {
 		);
 		expect(session.model).toBeUndefined();
 		expect(session.resumeDefaultSelectors).toEqual([]);
+	});
+
+	test("does not disturb the old session when target authentication fails before mutation", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-pre-mutation-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const previousModel = model("provider-c", "default");
+			const registry = {
+				...fakeRegistry(),
+				getApiKey: async () => undefined,
+			};
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const append = vi.spyOn(manager, "appendModelChange");
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: "profile-a",
+			});
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"No API key for provider-a/default",
+			);
+			expect(session.model).toBe(previousModel);
+			expect(append).not.toHaveBeenCalled();
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("model-less rollback disables forward append-only context", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-append-only-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const agent = new Agent({ initialState: { model: undefined, systemPrompt: [], tools: [], messages: [] } });
+			const targetModel = model("anthropic", "claude-test");
+			const profile: ModelProfileDefinition = {
+				name: "append-only-profile",
+				requiredProviders: ["anthropic"],
+				modelMapping: { default: "anthropic/claude-test" },
+				source: "user",
+			};
+			const base = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...base,
+				getAll: () => [...base.getAll(), targetModel],
+				getApiKey: async () => kNoAuth,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: profile.name,
+			});
+			vi.spyOn(settings, "flushOrThrow").mockImplementationOnce(async () => {
+				expect(agent.appendOnlyContext).toBeDefined();
+				throw new Error("forward flush failed");
+			});
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"forward flush failed",
+			);
+			expect(session.model).toBeUndefined();
+			expect(agent.appendOnlyContext).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("reports a second settings flush failure without claiming durable recovery", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const firstFailure = new Error("forward secret-settings-value");
+		const secondFailure = new Error("rollback secret-settings-value");
+		const flush = vi
+			.spyOn(settings, "flushOrThrow")
+			.mockRejectedValueOnce(firstFailure)
+			.mockRejectedValueOnce(secondFailure);
+
+		let failure: unknown;
+		try {
+			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		expect((aggregate.errors as Error[]).map(stage => stage.cause)).toEqual([firstFailure, secondFailure]);
+		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
+		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
+		expect(aggregate.message).toContain("Prior state may be unverified");
+		expect(aggregate.message).not.toContain("secret-settings-value");
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(session.model?.id).toBe("initial");
+	});
+
+	test("labels independent rollback failures without exposing error contents", async () => {
+		const session = fakeSession();
+		session.setConfiguredModelChain("default", ["provider-c/default"]);
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const original = new Error("forward flush token-secret-123");
+		const modelRollback = new Error("rollback model token-secret-123");
+		const rollbackFlush = new Error("rollback flush token-secret-123");
+		const flush = vi
+			.spyOn(settings, "flushOrThrow")
+			.mockRejectedValueOnce(original)
+			.mockRejectedValueOnce(rollbackFlush);
+		session.restoreModelSelectionForRollback = async () => {
+			throw modelRollback;
+		};
+
+		let failure: unknown;
+		try {
+			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		const stages = aggregate.errors as Error[];
+		expect(stages.map(stage => stage.cause)).toEqual([original, modelRollback, rollbackFlush]);
+		expect(stages.map(stage => stage.message)).toEqual([
+			"forward settings flush (settings write failed)",
+			"restore live model (operation failed)",
+			"restore settings flush (settings write failed)",
+		]);
+		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
+		expect(aggregate.message).toContain("restore live model (operation failed)");
+		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
+		expect(aggregate.message).toContain("Prior state may be unverified");
+		expect(aggregate.message).not.toContain("token-secret-123");
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		// The failed live-model restore leaves a different runtime model despite the restored settings.
+		expect(session.model?.id).toBe("default");
 	});
 
 	test("rolls back partial synchronous persistent writes before durable flush", async () => {
@@ -1152,6 +2231,8 @@ describe("model profile activation", () => {
 				modelRegistry: {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
+					isSelectorCircuitOpen: () => false,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			configuringSession.setConfiguredModelChain(
@@ -1174,6 +2255,8 @@ describe("model profile activation", () => {
 				modelRegistry: {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
+					isSelectorCircuitOpen: () => false,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -1221,71 +2304,71 @@ describe("model profile activation", () => {
 		[
 			"codex-eco",
 			{
-				default: "openai-codex/gpt-5.6-terra:low",
-				executor: "openai-codex/gpt-5.6-luna:low",
-				planner: "openai-codex/gpt-5.6-luna:high",
-				critic: "openai-codex/gpt-5.6-terra:xhigh",
-				architect: "openai-codex/gpt-5.6-terra:high",
+				default: "openai-codex/gpt-6-luna:low",
+				executor: "openai-codex/gpt-6-luna:low",
+				planner: "openai-codex/gpt-6-luna:high",
+				critic: "openai-codex/gpt-6-luna:xhigh",
+				architect: "openai-codex/gpt-6-luna:high",
 			},
 		],
 		[
 			"codex-medium",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
-				executor: "openai-codex/gpt-5.6-terra:low",
-				planner: "openai-codex/gpt-5.6-terra:high",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				default: "openai-codex/gpt-6.1-sol:low",
+				executor: "openai-codex/gpt-6.1-sol:low",
+				planner: "openai-codex/gpt-6.1-sol:high",
+				critic: "openai-codex/gpt-6.1-sol:xhigh",
+				architect: "openai-codex/gpt-6.1-sol:high",
 			},
 		],
 		[
 			"codex-pro",
 			{
-				default: "openai-codex/gpt-5.6-sol:medium",
-				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "openai-codex/gpt-5.6-sol:high",
-				critic: "openai-codex/gpt-5.6-sol:max",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				default: "openai-codex/gpt-6.1-sol:medium",
+				executor: "openai-codex/gpt-6.1-sol:medium",
+				planner: "openai-codex/gpt-6.1-sol:high",
+				critic: "openai-codex/gpt-6.1-sol:max",
+				architect: "openai-codex/gpt-6.1-sol:xhigh",
 			},
 		],
 		[
 			"opus-codex",
 			{
-				default: "anthropic/claude-opus-5:xhigh",
-				executor: "openai-codex/gpt-5.6-terra:low",
-				planner: "anthropic/claude-sonnet-5",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				default: "anthropic/claude-opus-5-5:medium",
+				executor: "openai-codex/gpt-6.1-sol:low",
+				planner: "anthropic/claude-sonnet-5-5",
+				critic: "openai-codex/gpt-6.1-sol:xhigh",
+				architect: "openai-codex/gpt-6.1-sol:high",
 			},
 		],
 		[
 			"lunamaxxing",
 			{
-				default: "openai-codex/gpt-5.6-luna:medium",
-				executor: "openai-codex/gpt-5.6-luna:xhigh",
-				planner: "openai-codex/gpt-5.6-luna:max",
-				critic: "openai-codex/gpt-5.6-luna:max",
-				architect: "openai-codex/gpt-5.6-luna:max",
+				default: "openai-codex/gpt-6-luna:medium",
+				executor: "openai-codex/gpt-6-luna:xhigh",
+				planner: "openai-codex/gpt-6-luna:max",
+				critic: "openai-codex/gpt-6-luna:max",
+				architect: "openai-codex/gpt-6-luna:max",
 			},
 		],
 		[
 			"codex-opencodego",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
+				default: "openai-codex/gpt-6.1-sol:low",
 				executor: "opencode-go/deepseek-v4-pro",
 				planner: "opencode-go/kimi-k3",
 				critic: "opencode-go/mimo-v2.5-pro",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				architect: "openai-codex/gpt-6.1-sol:high",
 			},
 		],
 		[
 			"fable-opus-codex",
 			{
 				default: "anthropic/claude-fable-5-1:high",
-				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "anthropic/claude-opus-5:medium",
-				critic: "anthropic/claude-opus-5:high",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				executor: "openai-codex/gpt-6.1-sol:medium",
+				planner: "anthropic/claude-opus-5-5:medium",
+				critic: "anthropic/claude-opus-5-5:high",
+				architect: "openai-codex/gpt-6.1-sol:xhigh",
 			},
 		],
 		[
@@ -1454,7 +2537,7 @@ describe("model profile activation", () => {
 			resolveModelByLookupAlias: (alias: string) => (alias === "shared-model" ? selected : undefined),
 		} as unknown as ModelRegistry;
 		const session = Object.assign(fakeSession(), { modelRegistry: registry });
-		session.setActiveModelProfile("provider-agnostic-profile");
+		session.setActiveModelProfile("provider-agnostic-profile", true);
 		const settings = Settings.isolated({ "modelProfile.default": "provider-agnostic-profile" });
 		settings.override("modelRoles", { default: "shared-model" });
 		settings.override("task.agentModelOverrides", {
@@ -1504,6 +2587,7 @@ describe("model profile activation", () => {
 		expect(settings.get("modelRoles")).toEqual(previousRoles);
 		expect(settings.get("task.agentModelOverrides")).toEqual(previousOverrides);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+		expect(session.getActivatedModelProfile()).toBe("profile-a");
 	});
 
 	test("materialization restores canonical affinity when concretization mutates before persistence fails", () => {
@@ -1525,7 +2609,7 @@ describe("model profile activation", () => {
 			},
 		} as unknown as ModelRegistry;
 		Object.assign(session, { modelRegistry: registry });
-		session.setActiveModelProfile("profile-a");
+		session.setActiveModelProfile("profile-a", true);
 		const setConfiguredModelChain = session.setConfiguredModelChain.bind(session);
 		let chainWrites = 0;
 		session.setConfiguredModelChain = (role: string, entries: readonly string[]) => {
@@ -1574,6 +2658,189 @@ describe("model profile activation", () => {
 		});
 
 		expect(settings.get("modelRoles").default).toBe("provider-b/executor");
+	});
+
+	test("role materialization keeps the activated alternative provider after a CLI override", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "alternative-provider-profile",
+			requiredProviders: [],
+			alternativeProviderGroups: [["provider-a", "provider-b"]],
+			modelMapping: { default: "provider-a/default", executor: "provider-a/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile], missingProviders: ["provider-a"] });
+		const defaultAlternative = model("provider-b", "default");
+		const executorAlternative = model("provider-b", "executor");
+		const registry = {
+			...baseRegistry,
+			getAll: () => [...baseRegistry.getAll(), defaultAlternative, executorAlternative],
+			getAvailable: () => [...baseRegistry.getAll(), defaultAlternative, executorAlternative],
+		};
+		const startupModel = model("provider-c", "cli-model");
+		let profileState: AgentSessionProfileInstalledOverrideState = {
+			modelRoles: new Map(),
+			agentModelOverrides: new Map(),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map(),
+			manualModelRoles: new Set(),
+			manualAgentModelOverrides: new Set(),
+			configuredAgentModelOverrides: new Set(),
+			preProfileModel: undefined,
+		};
+		const baseSession = fakeSession(model("provider-a", "default"));
+		const session = Object.assign(baseSession, {
+			modelRegistry: registry as unknown as ModelRegistry,
+			getProfileInstalledOverrideState: () => profileState,
+			noteProfileInstalledOverrides: (...args: Parameters<AgentSession["noteProfileInstalledOverrides"]>) => {
+				const currentChain = baseSession.getConfiguredModelChainState("default");
+				const chain =
+					args[6] ??
+					(currentChain?.origin === "profile-activation" &&
+					currentChain.identity === baseSession.getActiveModelProfile()
+						? currentChain.entries
+						: undefined);
+				profileState = {
+					...profileState,
+					configuredDefaultChain: chain ? [...chain] : undefined,
+				};
+			},
+		});
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		settings.overrideModelRoles({ default: "cli-model-alias" });
+		expect(await registry.getApiKeyForProvider("provider-a")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("provider-b")).toBe("key-provider-b");
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profile.name });
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-b/default"]);
+		expect(profileState.configuredDefaultChain).toEqual(["provider-b/default"]);
+
+		session.model = startupModel;
+		session.setConfiguredModelChain("default", [`${startupModel.provider}/${startupModel.id}`], "startup-override");
+		await applyModelProfileRuntimeBindings({ session, modelRegistry: registry, settings, profileName: profile.name });
+		expect(session.getConfiguredModelChainState("default")?.origin).toBe("startup-override");
+		expect(profileState.configuredDefaultChain).toEqual(["provider-b/default"]);
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor",
+		});
+		expect(session.model).toBe(startupModel);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [`${startupModel.provider}/${startupModel.id}`],
+			origin: "startup-override",
+		});
+
+		const reloadedSettings = Settings.isolated({
+			modelRoles: settings.getGlobal("modelRoles"),
+			"task.agentModelOverrides": settings.getGlobal("task.agentModelOverrides"),
+			"modelProfile.default": settings.getGlobal("modelProfile.default"),
+		});
+		expect(settings.getGlobal("modelRoles")?.default).toBe("provider-b/default");
+		expect(reloadedSettings.getModelRole("default")).toBe("provider-b/default");
+		expect(reloadedSettings.getGlobal("modelProfile.default")).toBeUndefined();
+	});
+
+	test("materializing a role-only profile does not promote a startup model to the global default", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "role-only-profile",
+			requiredProviders: [],
+			modelMapping: { executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = { ...baseRegistry, getAvailable: () => baseRegistry.getAll() };
+		const startupModel = model("provider-c", "cli-model");
+		const session = Object.assign(fakeSession(startupModel), { modelRegistry: registry as unknown as ModelRegistry });
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		settings.overrideModelRoles({ default: "cli-model-alias" });
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profile.name });
+
+		session.model = startupModel;
+		session.setConfiguredModelChain("default", [`${startupModel.provider}/${startupModel.id}`], "startup-override");
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor",
+		});
+
+		expect(settings.getGlobal("modelRoles")?.default).toBeUndefined();
+	});
+
+	test("role selections never materialize a persisted profile whose activation failed", async () => {
+		const baseRegistry = fakeRegistry({ missingProviders: ["provider-a"] });
+		const registry = { ...baseRegistry, getAvailable: () => baseRegistry.getAll() };
+		const startupModel = model("provider-c", "cli-model");
+		const startupSelector = `${startupModel.provider}/${startupModel.id}`;
+		const session = Object.assign(fakeSession(startupModel), { modelRegistry: registry as unknown as ModelRegistry });
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+
+		settings.overrideModelRoles({ default: startupSelector });
+		session.setConfiguredModelChain("default", [startupSelector], "startup-override");
+
+		expect(
+			materializeActiveModelProfileAssignments({
+				session,
+				settings,
+				assignments: new Map([["executor", "provider-c/executor"]]),
+			}),
+		).toBe(false);
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "architect",
+				selector: "provider-c/architect",
+			}),
+		).toBe(false);
+		// Callers fall back to persisting only the requested roles.
+		settings.setAgentModelOverride("executor", "provider-c/executor");
+		settings.setAgentModelOverride("architect", "provider-c/architect");
+
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [startupSelector],
+			origin: "startup-override",
+		});
+		const reloadedSettings = Settings.isolated({
+			modelRoles: settings.getGlobal("modelRoles"),
+			"task.agentModelOverrides": settings.getGlobal("task.agentModelOverrides"),
+			"modelProfile.default": settings.getGlobal("modelProfile.default"),
+		});
+		expect(reloadedSettings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(reloadedSettings.getModelRole("default")).toBeUndefined();
+		expect(reloadedSettings.getGlobal("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+			architect: "provider-c/architect",
+		});
+	});
+
+	test("an explicit default selection still supersedes a persisted profile whose activation failed", async () => {
+		const registry = fakeRegistry({ missingProviders: ["provider-a"] });
+		const session = Object.assign(fakeSession(model("provider-c", "cli-model")), {
+			modelRegistry: { ...registry, getAvailable: () => registry.getAll() } as unknown as ModelRegistry,
+		});
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		session.setConfiguredModelChain("default", ["provider-c/cli-model"], "startup-override");
+
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "default",
+				selector: "provider-c/default",
+			}),
+		).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/default" });
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
 	});
 
 	test("profile deletion materializes the complete default fallback chain", async () => {
@@ -1797,6 +3064,151 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
+	test("seeded materialization properties preserve failed profiles and startup defaults", () => {
+		const seed = 0x6881;
+		const random = seededRandom(seed);
+		const assignmentKinds = ["single", "batch"] as const;
+
+		for (let index = 0; index < 24; index++) {
+			const durableProfile = `durable-profile-${index}`;
+			const durableDefault = generatedSelector(random, "durable-default", index);
+			const startupSelector = generatedSelector(random, "startup", index);
+			const storedExecutor = generatedSelector(random, "stored-executor", index);
+
+			for (const kind of assignmentKinds) {
+				const inactiveSession = fakeSession(model("startup-provider", `startup-model-${index}`));
+				inactiveSession.setConfiguredModelChain("default", [startupSelector], "startup-override");
+				const inactiveSettings = Settings.isolated({
+					"modelProfile.default": durableProfile,
+					modelRoles: { default: durableDefault },
+					"task.agentModelOverrides": { executor: storedExecutor },
+				});
+				const inactiveMaterialized =
+					kind === "single"
+						? materializeActiveModelProfileAssignment({
+								session: inactiveSession,
+								settings: inactiveSettings,
+								role: "executor",
+								selector: generatedSelector(random, "selected-single", index),
+							})
+						: materializeActiveModelProfileAssignments({
+								session: inactiveSession,
+								settings: inactiveSettings,
+								assignments: new Map([
+									["executor", generatedSelector(random, "selected-executor", index)],
+									["architect", generatedSelector(random, "selected-architect", index)],
+								]),
+							});
+				expect(inactiveMaterialized).toBe(false);
+				expect(inactiveSettings.getGlobal("modelProfile.default")).toBe(durableProfile);
+				expect(inactiveSettings.getGlobal("modelRoles")?.default).toBe(durableDefault);
+				expect(inactiveSettings.getGlobal("task.agentModelOverrides")?.executor).toBe(storedExecutor);
+			}
+
+			const activeProfile = `activated-profile-${index}`;
+			const profileDefault =
+				index % 4 === 3
+					? undefined
+					: index % 4 === 2
+						? [
+								generatedSelector(random, "profile-default-head", index),
+								generatedSelector(random, "profile-default-fallback", index),
+							]
+						: generatedSelector(random, "profile-default", index);
+			const globalDefault =
+				index % 5 === 4
+					? undefined
+					: index % 5 === 2
+						? [
+								generatedSelector(random, "global-default-head", index),
+								generatedSelector(random, "global-default-fallback", index),
+							]
+						: generatedSelector(random, "global-default", index);
+			const activatedDefaultChain =
+				index % 4 === 0
+					? [
+							generatedSelector(random, "activated-chain-head", index),
+							generatedSelector(random, "activated-chain-fallback", index),
+						]
+					: index % 4 === 1
+						? [generatedSelector(random, "activated-chain-head", index)]
+						: undefined;
+			const expectedDefault = activatedDefaultChain?.length
+				? activatedDefaultChain.length === 1
+					? activatedDefaultChain[0]
+					: [...activatedDefaultChain]
+				: (profileDefault ?? globalDefault);
+			expect(resolveMaterializationProfileIdentity(undefined, durableProfile, false)).toBeUndefined();
+			expect(resolveMaterializationProfileIdentity(undefined, durableProfile, true)).toBe(durableProfile);
+			expect(resolveMaterializationProfileIdentity(activeProfile, durableProfile, false)).toBe(activeProfile);
+			expect(resolveMaterializedDefaultSelector(activatedDefaultChain, profileDefault, globalDefault)).toEqual(
+				expectedDefault,
+			);
+
+			const profile: ModelProfileDefinition = {
+				name: activeProfile,
+				requiredProviders: [],
+				modelMapping: profileDefault === undefined ? {} : { default: profileDefault },
+				source: "user",
+			};
+			const baseRegistry = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...baseRegistry,
+				getAvailable: () => [],
+			} as unknown as ModelRegistry;
+			const profileInstalledState: AgentSessionProfileInstalledOverrideState = {
+				modelRoles: new Map(),
+				agentModelOverrides: new Map(),
+				installedModelRoles: new Map(),
+				installedAgentModelOverrides: new Map(),
+				manualModelRoles: new Set(),
+				manualAgentModelOverrides: new Set(),
+				configuredAgentModelOverrides: new Set(),
+				configuredDefaultChain: activatedDefaultChain,
+				preProfileModel: undefined,
+			};
+
+			for (const kind of assignmentKinds) {
+				const activeSession = Object.assign(fakeSession(model("startup-provider", `startup-model-${index}`)), {
+					modelRegistry: registry,
+					getProfileInstalledOverrideState: () => profileInstalledState,
+				});
+				activeSession.setActiveModelProfile(activeProfile, true);
+				activeSession.setConfiguredModelChain("default", [startupSelector], "startup-override");
+				const activeSettings = Settings.isolated({
+					"modelProfile.default": activeProfile,
+					modelRoles: globalDefault === undefined ? {} : { default: globalDefault },
+				});
+				activeSettings.overrideModelRoles({ default: startupSelector });
+
+				const activeMaterialized =
+					kind === "single"
+						? materializeActiveModelProfileAssignment({
+								session: activeSession,
+								settings: activeSettings,
+								role: "executor",
+								selector: generatedSelector(random, "active-single", index),
+							})
+						: materializeActiveModelProfileAssignments({
+								session: activeSession,
+								settings: activeSettings,
+								assignments: new Map([
+									["executor", generatedSelector(random, "active-executor", index)],
+									["architect", generatedSelector(random, "active-architect", index)],
+								]),
+							});
+				expect(activeMaterialized).toBe(true);
+				expect(activeSettings.getGlobal("modelRoles")?.default).toEqual(expectedDefault);
+				expect(activeSettings.getGlobal("modelRoles")?.default).not.toBe(startupSelector);
+				expect(activeSettings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(activeSession.getConfiguredModelChainState("default")).toMatchObject({
+					entries: [startupSelector],
+					origin: "startup-override",
+				});
+			}
+		}
+	});
+
 	test("--default persists profile default, clears persisted assignments, and flushes", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated();
@@ -1826,6 +3238,60 @@ describe("model profile activation", () => {
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+	});
+
+	test("rolls back stale persisted activation without overwriting the newer model selection", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-a/previous", architect: "provider-c/previous-architect" },
+			"task.agentModelOverrides": { critic: "provider-c/previous-critic" },
+			"modelProfile.default": "old-profile",
+			defaultThinkingLevel: ThinkingLevel.Low,
+		});
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const selectedModel = model("provider-c", "selected");
+		let selectionRevision = 0;
+		let flushCount = 0;
+		settings.flushOrThrow = async () => {
+			flushCount += 1;
+			if (flushCount !== 1) return;
+			selectionRevision += 1;
+			session.model = selectedModel;
+			session.thinkingLevel = ThinkingLevel.Medium;
+			settings.setModelRole("default", "provider-c/selected");
+			settings.clearOverride("modelRoles");
+			settings.clearOverride("task.agentModelOverrides");
+			settings.setAgentModelOverride("executor", "provider-c/selected-executor");
+			settings.unset("modelProfile.default");
+			session.setConfiguredModelChain("default", ["provider-c/selected"], "model_selection");
+		};
+
+		await applyPreparedModelProfileActivation(prepared, {
+			persistDefault: true,
+			isCurrent: () => selectionRevision === 0,
+		});
+
+		expect(session.model).toBe(selectedModel);
+		expect(session.getConfiguredModelChainState("default")?.origin).toBe("model_selection");
+		expect(settings.getModelRole("default")).toBe("provider-c/selected");
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "provider-c/selected",
+			architect: "provider-c/previous-architect",
+		});
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "provider-c/previous-critic",
+			executor: "provider-c/selected-executor",
+		});
+		expect(settings.getOverride("modelRoles")).toBeUndefined();
+		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+		expect(flushCount).toBe(2);
 	});
 
 	test("missing credentials hard-block before mutation", async () => {
@@ -1989,7 +3455,6 @@ describe("model profile activation", () => {
 				getApiKeyForProvider: runtimeRegistry.getApiKeyForProvider.bind(runtimeRegistry),
 				getAll: runtimeRegistry.getAll.bind(runtimeRegistry),
 				getAvailable: runtimeRegistry.getAvailable.bind(runtimeRegistry),
-				getAvailableForProfileActivation: runtimeRegistry.getAvailableForProfileActivation.bind(runtimeRegistry),
 			} as unknown as ModelRegistry;
 
 			const prepared = await prepareModelProfileActivation({
@@ -2064,6 +3529,7 @@ function stubXiaomiRegistry(
 	| "resolveCanonicalModel"
 	| "getCanonicalVariants"
 	| "getCanonicalId"
+	| "isSelectorCircuitOpen"
 > {
 	const profiles = mergeModelProfiles();
 	const xiaomiProviders = ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"];
@@ -2082,6 +3548,7 @@ function stubXiaomiRegistry(
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: (item: Model) => item.id,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 
@@ -2275,6 +3742,7 @@ describe("preset-equivalent profile activation", () => {
 					getCanonicalId,
 					seedCanonicalVariant,
 					clearCanonicalVariant,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -2372,6 +3840,81 @@ describe("preset-equivalent profile activation", () => {
 		expect(prepared.defaultModel).toMatchObject({ provider: "provider-b", id: "opus-real" });
 		// Prepare never seeds a winner; the successful activation path owns the seed.
 		expect(seedCanonicalVariant).not.toHaveBeenCalled();
+	});
+
+	test("canceled recovered runtime preparation restores sticky state for temporary choices", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credential-gated",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "opus" },
+			source: "user",
+		};
+		const { registry, sticky } = stickyAliasRegistry({ profiles: [profile] });
+		const session = fakeSession(model("provider-a", "opus-real"));
+		sticky.set(session.sessionId, "provider-a/opus-real");
+		Object.assign(session, {
+			getUserCanonicalVariantSelection: () => ({ revision: 0, canonicalVariant: "provider-a/opus-real" }),
+		});
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const probeStarted = Promise.withResolvers<void>();
+		let probeBlocked = false;
+		vi.spyOn(registry, "getApiKeyForProvider").mockImplementation(async () => {
+			if (probeBlocked) return "key-provider-a";
+			probeBlocked = true;
+			probeStarted.resolve();
+			return apiKey.promise;
+		});
+		let current = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry, settings: Settings.isolated(), profileName: profile.name },
+			() => current,
+		);
+
+		await probeStarted.promise;
+		current = false;
+		apiKey.resolve("key-provider-a");
+		await activation;
+
+		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("canceled preparation preserves a newer concrete canonical selection", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credential-gated",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "opus" },
+			source: "user",
+		};
+		const { registry, sticky } = stickyAliasRegistry({ profiles: [profile] });
+		const session = fakeSession(model("provider-a", "opus-real"));
+		sticky.set(session.sessionId, "provider-a/opus-real");
+		let userCanonicalSelection = { revision: 0, canonicalVariant: "provider-a/opus-real" as string | undefined };
+		Object.assign(session, { getUserCanonicalVariantSelection: () => userCanonicalSelection });
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const probeStarted = Promise.withResolvers<void>();
+		let probeBlocked = false;
+		vi.spyOn(registry, "getApiKeyForProvider").mockImplementation(async () => {
+			if (probeBlocked) return "key-provider-a";
+			probeBlocked = true;
+			probeStarted.resolve();
+			return apiKey.promise;
+		});
+		let current = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry, settings: Settings.isolated(), profileName: profile.name },
+			() => current,
+		);
+
+		await probeStarted.promise;
+		userCanonicalSelection = { revision: 1, canonicalVariant: "provider-b/opus-real" };
+		sticky.set(session.sessionId, "provider-b/opus-real");
+		current = false;
+		apiKey.resolve("key-provider-a");
+		await activation;
+
+		expect(sticky.get(session.sessionId)).toBe("provider-b/opus-real");
+		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
 	test("prepare failure restores the prior canonical sticky", async () => {
@@ -2568,6 +4111,83 @@ describe("preset-equivalent profile activation", () => {
 		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
 	});
 
+	test("profile deletion failure and restore retain explicit same-value role ownership", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "delete-owner-profile",
+			requiredProviders: [],
+			modelMapping: { default: "provider-a/default", planner: "provider-b/executor" },
+			source: "user",
+		};
+		const initialOwnership: AgentSessionProfileInstalledOverrideState = {
+			modelRoles: new Map(),
+			agentModelOverrides: new Map([["planner", "provider-b/executor"]]),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map([["planner", "provider-b/executor"]]),
+			manualModelRoles: new Set<string>(),
+			manualAgentModelOverrides: new Set(["planner"]),
+			configuredAgentModelOverrides: new Set<string>(),
+			preProfileModel: undefined,
+		};
+		const emptyOwnership = (): AgentSessionProfileInstalledOverrideState => ({
+			modelRoles: new Map(),
+			agentModelOverrides: new Map(),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map(),
+			manualModelRoles: new Set(),
+			manualAgentModelOverrides: new Set(),
+			configuredAgentModelOverrides: new Set(),
+			preProfileModel: undefined,
+		});
+		let activeProfile: string | undefined = profile.name;
+		let ownership = initialOwnership;
+		const session = Object.assign(fakeSession(), {
+			getActiveModelProfile: () => activeProfile,
+			setActiveModelProfile: (name: string | undefined) => {
+				if (name !== activeProfile) {
+					ownership = {
+						...ownership,
+						manualModelRoles: new Set(),
+						manualAgentModelOverrides: new Set(),
+					};
+				}
+				activeProfile = name;
+			},
+			getProfileInstalledOverrideKeys: () => ({ modelRoles: [], agentModelOverrides: ["planner"] }),
+			getProfileInstalledOverrideState: () => ownership,
+			restoreProfileInstalledOverrideState: (state: AgentSessionProfileInstalledOverrideState) => {
+				ownership = state;
+			},
+			clearProfileInstalledOverrides: () => {
+				ownership = emptyOwnership();
+			},
+		});
+		const registry = fakeRegistry({ profiles: [profile] });
+		const settings = Settings.isolated({
+			"modelProfile.default": profile.name,
+			"task.agentModelOverrides": { planner: "provider-b/executor" },
+		});
+		settings.override("task.agentModelOverrides", { planner: "provider-b/executor" });
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(
+			materializeModelProfileForDeletion({ session, modelRegistry: registry, settings, profileName: profile.name }),
+		).rejects.toThrow("flush failed");
+		expect(session.getActiveModelProfile()).toBe(profile.name);
+		expect(ownership).toEqual(initialOwnership);
+
+		const snapshot = await materializeModelProfileForDeletion({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		});
+		expect(ownership.manualAgentModelOverrides.size).toBe(0);
+		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
+
+		expect(session.getActiveModelProfile()).toBe(profile.name);
+		expect(ownership).toEqual(initialOwnership);
+	});
+
 	test("successful activation leaves the new model sticky", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-sticky-success-");
 		try {
@@ -2626,19 +4246,19 @@ describe("preset-equivalent profile activation", () => {
 describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 	test("preserves an exported model when native discovery also exposes its wire id", () => {
 		const models = [
-			model("opencodex", "anthropic/claude-opus-5"),
-			{ ...model("opencodex", "opencodex/anthropic/claude-opus-5"), wireModelId: "anthropic/claude-opus-5" },
+			model("opencodex", "anthropic/claude-opus-5-5"),
+			{ ...model("opencodex", "opencodex/anthropic/claude-opus-5-5"), wireModelId: "anthropic/claude-opus-5-5" },
 		];
 		expect(
 			rewriteSelectorForProxy(
-				"anthropic/claude-opus-5",
+				"anthropic/claude-opus-5-5",
 				"opencodex",
 				"always",
 				models,
 				new Set(),
 				new Set(["anthropic"]),
 			),
-		).toBe("opencodex/anthropic/claude-opus-5");
+		).toBe("opencodex/anthropic/claude-opus-5-5");
 	});
 
 	test("retains public proxy aliases when a distinct wire id is configured", () => {
@@ -2685,12 +4305,12 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			profileName: "opus-codex",
 		});
 		expect(prepared.defaultModel?.provider).toBe("opencodex");
-		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5");
+		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5-5");
 		expect(prepared.agentModelOverrides).toEqual({
-			executor: "opencodex/opencodex/gpt-5.6-terra:low",
-			architect: "opencodex/opencodex/gpt-5.6-sol:high",
-			planner: "opencodex/opencodex/anthropic/claude-sonnet-5",
-			critic: "opencodex/opencodex/gpt-5.6-sol:xhigh",
+			executor: "opencodex/opencodex/gpt-6.1-sol:low",
+			architect: "opencodex/opencodex/gpt-6.1-sol:high",
+			planner: "opencodex/opencodex/anthropic/claude-sonnet-5-5",
+			critic: "opencodex/opencodex/gpt-6.1-sol:xhigh",
 		});
 	});
 
@@ -2812,6 +4432,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
 			profileName: profile.name,
@@ -2859,6 +4480,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 						proxyModel("meta/muse-spark-1.2"),
 						proxyModel("other/muse-spark-1.2"),
 					],
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 				settings: Settings.isolated({
 					"modelProfile.proxyProvider": "litellm",
@@ -3048,6 +4670,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 			profileName: profile.name,
@@ -3067,6 +4690,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 				modelRegistry: {
 					...registry,
 					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 				profileName: profile.name,

@@ -5,7 +5,7 @@
  */
 export const GEMINI_CLI_VERSION_ENV = "GJC_AI_GEMINI_CLI_VERSION";
 export const LEGACY_GEMINI_CLI_VERSION_ENV = "PI_AI_GEMINI_CLI_VERSION";
-export const DEFAULT_GEMINI_CLI_VERSION = "0.60.0";
+export const DEFAULT_GEMINI_CLI_VERSION = "0.61.0";
 
 export function getGeminiCliUserAgent(modelId = "gemini-3.1-pro-preview"): string {
 	const version =
@@ -80,20 +80,25 @@ This means you do **NOT** need to poll in a loop while waiting for messages or u
 /**
  * Antigravity / Cloud Code Assist user agent.
  *
- * Disassembly-confirmed: getUserAgentName() @ 0x5ecb1dd loads "antigravity-ide"
- * via LEA RDX, [RIP-0x284fc90] → 0x367b554 = "antigravity-ide"
+ * Field-evidence-based default: A/B/A test on Windows+Ultra (subscriber) confirmed that
+ * 'antigravity/cli/1.3.4 (os_type=darwin; arch=arm64; aidev_client; auth_method=oauth)'
+ * unlocks Gemini 4 Argon (low/medium/high) and Gemini 3.8 Flash (low/medium/high) models,
+ * plus Opus 5.5. Reverting to 'antigravity-ide' hides Argon models again. Pro accounts
+ * receive 'gemini-4-argon-disabled' with disabled:true, confirming the UA gates model
+ * visibility by account tier. The darwin/arm64 values were tested on Windows and worked,
+ * suggesting this is not platform-specific but rather a client identity string.
  *
- * The LS sets HTTP headers via: fmt.Sprintf("User-Agent: %s", getUserAgentName())
- * So the final header is: User-Agent: antigravity-ide
+ * Historical note: Disassembly (0x5ecb1dd) showed the IDE binary loads 'antigravity-ide';
+ * this appears to be outdated or a fallback for older clients.
  *
- * -override_user_agent flag can override this (confirmed at 0x5ecbc37).
+ * Overridable via PI_AI_ANTIGRAVITY_USER_AGENT environment variable.
  */
-export let getAntigravityUserAgent = () => {
-	const override = process.env.PI_AI_ANTIGRAVITY_USER_AGENT;
-	const userAgent = override || "antigravity-ide";
-	getAntigravityUserAgent = () => userAgent;
-	return userAgent;
-};
+export function getAntigravityUserAgent(): string {
+	return (
+		process.env.PI_AI_ANTIGRAVITY_USER_AGENT ||
+		"antigravity/cli/1.3.4 (os_type=darwin; arch=arm64; aidev_client; auth_method=oauth)"
+	);
+}
 
 export const getAntigravityRequestHeaders = () => ({
 	"User-Agent": getAntigravityUserAgent(),

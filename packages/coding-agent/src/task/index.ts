@@ -31,12 +31,13 @@ import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
+import type { PlanModeState } from "../plan-mode/state";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
 import { splitSelectorThinkingSuffix } from "../thinking";
 import { formatBytes, formatDuration } from "../tools/render-utils";
+import { renderTaskDescription } from "../tools/session-descriptions";
 import { escapeXmlAttribute } from "../utils/xml-escape";
 import {
 	type AgentDefinition,
@@ -118,11 +119,17 @@ interface DuplicateDisposition {
 	predecessorIds: string[];
 }
 
+interface TaskArtifactPersistence {
+	effectiveArtifactsDir: string | undefined;
+	parentArtifactManager: ArtifactManager | undefined;
+}
+
 interface TaskResumeDescriptor {
 	toolCallId: string;
 	params: TaskParams;
 	task: TaskItem & { id: string };
 	sessionFile: string | null;
+	artifactPersistence: TaskArtifactPersistence;
 	durableOutputAllowed?: boolean;
 	forkContextSeed?: ForkContextSeed;
 	agentSource: AgentDefinition["source"];
@@ -136,6 +143,112 @@ interface TaskResumeDescriptor {
 function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 	return typeof value === "object" && value !== null && "task" in value && "params" in value;
 }
+
+/** Retain the caller-visible execution inputs for detached and resumed runs. */
+function captureTaskExecutionScope(session: ToolSession): ToolSession {
+	const snapshot = new Map<PropertyKey, unknown>([
+		["cwd", session.cwd],
+		["hasUI", session.hasUI],
+		["contextFiles", session.contextFiles ? [...session.contextFiles] : undefined],
+		["workspaceTree", session.workspaceTree],
+		["home", session.home],
+		["profileAuthority", session.profileAuthority],
+		["skills", session.skills ? [...session.skills] : undefined],
+		["promptTemplates", session.promptTemplates ? [...session.promptTemplates] : undefined],
+		["enableLsp", session.enableLsp],
+		["hasEditTool", session.hasEditTool],
+		["eventBus", session.eventBus],
+		["outputSchema", session.outputSchema],
+		["requireYieldTool", session.requireYieldTool],
+		["taskDepth", session.taskDepth],
+		["currentAgentType", session.currentAgentType],
+		["model", session.model],
+		["settings", session.settings.snapshot()],
+		["serviceTier", session.serviceTier],
+		["authStorage", session.authStorage],
+		["modelRegistry", session.modelRegistry],
+		["agentRegistry", session.agentRegistry],
+	]);
+	for (const key of [
+		"getSessionFile",
+		"getSessionSpawns",
+		"getSessionId",
+		"getAsyncEndpointId",
+		"getAsyncJobManager",
+		"getCredentialSessionId",
+		"getAgentId",
+		"getSessionAgentDir",
+		"getActiveModelString",
+		"getModelString",
+		"getActiveModelProfile",
+		"getCompactContext",
+		"getMcpManager",
+		"getHindsightSessionState",
+		"isManagedSessionDestination",
+	] as const) {
+		const accessor: unknown = Reflect.get(session, key, session);
+		if (typeof accessor === "function") {
+			const value: unknown = Reflect.apply(accessor, session, []);
+			snapshot.set(key, () => value);
+		} else {
+			snapshot.set(key, accessor);
+		}
+	}
+
+	const boundMethods = new Map<PropertyKey, { source: unknown; bound: unknown }>();
+	return new Proxy(session, {
+		get(target, property) {
+			if (snapshot.has(property)) return snapshot.get(property);
+			const value: unknown = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			const cached = boundMethods.get(property);
+			if (cached?.source === value) return cached.bound;
+			const bound = value.bind(target);
+			boundMethods.set(property, { source: value, bound });
+			return bound;
+		},
+	}) as ToolSession;
+}
+
+/** Approval policy copied into a task child. A missing mode stays `allow`, the child default. */
+function inheritedSubagentApproval(session: ToolSession) {
+	const mode = session.getSdkPermissionMode?.();
+	return {
+		sdkPermissionMode: mode === "deny" || mode === "prompt" ? mode : ("allow" as const),
+		clientBridge: session.getClientBridge?.(),
+	};
+}
+
+/** Enabled plan mode only. A missing or disabled state leaves the child writable. */
+function inheritedPlanMode(session: ToolSession): { planModeState?: PlanModeState } {
+	const state = session.getPlanModeState?.();
+	if (!state?.enabled || !state.planFilePath) return {};
+	return {
+		planModeState: {
+			enabled: true,
+			planFilePath: state.planFilePath,
+			...(state.workflow ? { workflow: state.workflow } : {}),
+			...(state.reentry !== undefined ? { reentry: state.reentry } : {}),
+		},
+	};
+}
+
+/** Parent bash posture for a task child. Blank prefixes are not a restriction. */
+function inheritedBashRestriction(session: ToolSession): {
+	bashRestrictionProfile?: ToolSession["bashRestrictionProfile"];
+	parentBashAllowedPrefixes?: string[];
+} {
+	const profile = session.bashRestrictionProfile;
+	const prefixes = (session.bashAllowedPrefixes ?? [])
+		.map(prefix => prefix.trim())
+		.filter(prefix => prefix.length > 0);
+	if (!profile && prefixes.length === 0) return {};
+	return {
+		...(profile ? { bashRestrictionProfile: profile } : {}),
+		...(prefixes.length > 0 ? { parentBashAllowedPrefixes: prefixes } : {}),
+	};
+}
+
 function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
 	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
 }
@@ -317,57 +430,26 @@ export {
 	taskSchema,
 } from "./types";
 
-/**
- * Render the tool description from a cached agent list and current settings.
- */
 function hasAvailableIrcTool(session: ToolSession): boolean {
 	return session.settings.get("irc.enabled") === true && session.getToolByName?.("irc") !== undefined;
 }
 
-function renderDescription(
-	agents: AgentDefinition[],
-	maxConcurrency: number,
-	isolationEnabled: boolean,
-	asyncEnabled: boolean,
-	disabledAgents: string[],
-	simpleMode: TaskSimpleMode,
-	ircEnabled: boolean,
-	parentSpawns: string,
-	autoroutingActive: boolean,
-): string {
-	const spawningDisabled = parentSpawns === "";
-	let filteredAgents = filterVisibleAgents(agents);
-	filteredAgents =
-		disabledAgents.length > 0 ? filteredAgents.filter(a => !disabledAgents.includes(a.name)) : filteredAgents;
-	if (spawningDisabled) {
-		filteredAgents = [];
-	} else if (parentSpawns !== "*") {
-		const allowed = new Set(
-			parentSpawns
-				.split(",")
-				.map(s => s.trim())
-				.filter(Boolean),
-		);
-		filteredAgents = filteredAgents.filter(a => allowed.has(a.name));
-	}
-	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
-	const description = prompt.render(taskDescriptionTemplate, {
-		agents: filteredAgents,
-		spawningDisabled,
-		MAX_CONCURRENCY: maxConcurrency,
-		isolationEnabled,
-		asyncEnabled,
-		contextEnabled,
-		customSchemaEnabled,
-		ircEnabled,
-		defaultMode: simpleMode === "default",
-		schemaFreeMode: simpleMode === "schema-free",
-		independentMode: simpleMode === "independent",
-		autoroutingActive,
-	});
-	return description;
+function callableAgents(agents: readonly AgentDefinition[], session: ToolSession): AgentDefinition[] {
+	const disabledAgents = new Set(session.settings.get("task.disabledAgents"));
+	const parentSpawns = session.getSessionSpawns() ?? "*";
+	const allowedSpawns =
+		parentSpawns === "*"
+			? undefined
+			: new Set(
+					parentSpawns
+						.split(",")
+						.map(agent => agent.trim())
+						.filter(Boolean),
+				);
+	return filterVisibleAgents(agents).filter(
+		agent => !disabledAgents.has(agent.name) && (allowedSpawns === undefined || allowedSpawns.has(agent.name)),
+	);
 }
-
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
 		content: [{ type: "text", text }],
@@ -614,38 +696,45 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return renderTaskCall(args as TaskParams, options, theme);
 	}
 
-	/** Dynamic description that reflects current disabled-agent settings */
 	get description(): string {
-		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
-		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
-		const isolationMode = this.session.settings.get("task.isolation.mode");
-		return renderDescription(
-			this.#discoveredAgents,
-			maxConcurrency,
-			isolationMode !== "none",
-			true,
-			disabledAgents,
-			this.#getTaskSimpleMode(),
-			hasAvailableIrcTool(this.session),
-			this.session.getSessionSpawns() ?? "*",
-			this.session.settings.getEffectiveAutorouting().active,
-		);
+		return renderTaskDescription(this.session);
 	}
 	readonly #sessionRepositoryBinding: RepositoryBinding;
+	readonly #ownerSession: ToolSession;
+	readonly #parentModelProfileOwnershipMarker: unknown;
 	#testRunSubprocess: typeof runSubprocess | undefined;
 
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
 		sessionRepositoryBinding: RepositoryBinding,
+		ownerSession?: ToolSession,
+		parentModelProfileOwnershipMarker?: unknown,
 	) {
 		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
 		this.#discoveredAgents = discoveredAgents;
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
+		this.#ownerSession = ownerSession ?? session;
+		this.#parentModelProfileOwnershipMarker = parentModelProfileOwnershipMarker;
 	}
 
 	#runSubprocess(options: Parameters<typeof runSubprocess>[0]): Promise<SingleResult> {
 		return (this.#testRunSubprocess ?? runSubprocess)(options);
+	}
+
+	#createExecutionFacade(): TaskTool {
+		const parentModelProfileOwnershipMarker = (
+			this.#ownerSession as { sessionManager?: { getModelProfileOwnershipMarker?: () => unknown } }
+		).sessionManager?.getModelProfileOwnershipMarker?.();
+		const invocation = new TaskTool(
+			captureTaskExecutionScope(this.#ownerSession),
+			this.#discoveredAgents,
+			this.#sessionRepositoryBinding,
+			this.#ownerSession,
+			parentModelProfileOwnershipMarker,
+		);
+		invocation.#testRunSubprocess = this.#testRunSubprocess;
+		return invocation;
 	}
 
 	#getTaskSimpleMode(): TaskSimpleMode {
@@ -669,7 +758,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * advertise agent:// URIs without a successful allocation.
 	 */
 	async #ensureSessionLifetimeArtifacts(): Promise<{ dir: string; manager: ArtifactManager } | null> {
-		const state = sessionLifetimeArtifactsState(this.session);
+		const state = sessionLifetimeArtifactsState(this.#ownerSession);
 		if (state.authorized && state.dir && state.manager) return { dir: state.dir, manager: state.manager };
 		if (this.session.ensureArtifactManager) {
 			const manager = await this.session.ensureArtifactManager();
@@ -730,13 +819,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		adoptIntoSessionOwner: boolean,
 	): Promise<boolean> {
 		if (state.authorized) return true;
-		state.originalGetArtifactsDir = this.session.getArtifactsDir;
-		state.originalGetAuthorizedArtifactsDirs = this.session.getAuthorizedArtifactsDirs;
-		state.originalGetArtifactManager = this.session.getArtifactManager;
-		state.originalIsArtifactManagerAuthorized = this.session.isArtifactManagerAuthorized;
-		state.originalAgentOutputManager = this.session.agentOutputManager;
+		state.originalGetArtifactsDir = this.#ownerSession.getArtifactsDir;
+		state.originalGetAuthorizedArtifactsDirs = this.#ownerSession.getAuthorizedArtifactsDirs;
+		state.originalGetArtifactManager = this.#ownerSession.getArtifactManager;
+		state.originalIsArtifactManagerAuthorized = this.#ownerSession.isArtifactManagerAuthorized;
+		state.originalAgentOutputManager = this.#ownerSession.agentOutputManager;
 
-		state.installedGetArtifactsDir = () => state.originalGetArtifactsDir?.() ?? dir;
+		state.installedGetArtifactsDir = () => state.originalGetArtifactsDir?.call(this.#ownerSession) ?? dir;
 		state.installedGetAuthorizedArtifactsDirs = () => {
 			const dirs: string[] = [];
 			const add = (candidate: string | null | undefined) => {
@@ -744,68 +833,73 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const normalized = path.resolve(candidate);
 				if (!dirs.includes(normalized)) dirs.push(normalized);
 			};
-			for (const authorized of state.originalGetAuthorizedArtifactsDirs?.() ?? []) add(authorized);
+			for (const authorized of state.originalGetAuthorizedArtifactsDirs?.call(this.#ownerSession) ?? [])
+				add(authorized);
 			add(dir);
 			return dirs;
 		};
 		state.installedGetArtifactManager = () => manager;
 		state.installedIsArtifactManagerAuthorized = candidate =>
-			candidate === manager || state.originalIsArtifactManagerAuthorized?.(candidate) === true;
-		if (owned || !this.session.agentOutputManager) {
-			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null, {
-				parentPrefix: owned ? state.outputPrefix : undefined,
-				getAuthorizedArtifactsDirs: () => this.session.getAuthorizedArtifactsDirs?.() ?? [],
-			});
+			candidate === manager ||
+			state.originalIsArtifactManagerAuthorized?.call(this.#ownerSession, candidate) === true;
+		if (owned || !this.#ownerSession.agentOutputManager) {
+			state.installedAgentOutputManager = new AgentOutputManager(
+				() => this.#ownerSession.getArtifactsDir?.() ?? null,
+				{
+					parentPrefix: owned ? state.outputPrefix : undefined,
+					getAuthorizedArtifactsDirs: () => this.#ownerSession.getAuthorizedArtifactsDirs?.() ?? [],
+				},
+			);
 		}
 
 		let cleanupRan = false;
 		const cleanup = async () => {
 			cleanupRan = true;
-			this.session.releaseArtifactManager?.(manager);
-			if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
-				this.session.getArtifactsDir = state.originalGetArtifactsDir;
-			if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
-				this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
-			if (this.session.getArtifactManager === state.installedGetArtifactManager)
-				this.session.getArtifactManager = state.originalGetArtifactManager;
-			if (this.session.isArtifactManagerAuthorized === state.installedIsArtifactManagerAuthorized)
-				this.session.isArtifactManagerAuthorized = state.originalIsArtifactManagerAuthorized;
-			if (this.session.agentOutputManager === state.installedAgentOutputManager)
-				this.session.agentOutputManager = state.originalAgentOutputManager;
-			sessionLifetimeArtifacts.delete(this.session);
+			this.#ownerSession.releaseArtifactManager?.(manager);
+			if (this.#ownerSession.getArtifactsDir === state.installedGetArtifactsDir)
+				this.#ownerSession.getArtifactsDir = state.originalGetArtifactsDir;
+			if (this.#ownerSession.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
+				this.#ownerSession.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
+			if (this.#ownerSession.getArtifactManager === state.installedGetArtifactManager)
+				this.#ownerSession.getArtifactManager = state.originalGetArtifactManager;
+			if (this.#ownerSession.isArtifactManagerAuthorized === state.installedIsArtifactManagerAuthorized)
+				this.#ownerSession.isArtifactManagerAuthorized = state.originalIsArtifactManagerAuthorized;
+			if (this.#ownerSession.agentOutputManager === state.installedAgentOutputManager)
+				this.#ownerSession.agentOutputManager = state.originalAgentOutputManager;
+			sessionLifetimeArtifacts.delete(this.#ownerSession);
 			if (owned) await fs.rm(dir, { recursive: true, force: true });
 		};
-		const registerCleanup = this.session.registerSessionCleanup;
+		const registerCleanup = this.#ownerSession.registerSessionCleanup;
 		if (!registerCleanup) {
 			state.dir = undefined;
 			state.manager = undefined;
 			state.ensurePromise = undefined;
-			sessionLifetimeArtifacts.delete(this.session);
+			sessionLifetimeArtifacts.delete(this.#ownerSession);
 			if (owned) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 			return false;
 		}
 		try {
-			registerCleanup(cleanup);
+			registerCleanup.call(this.#ownerSession, cleanup);
 		} catch {
 			state.dir = undefined;
 			state.manager = undefined;
 			state.ensurePromise = undefined;
-			sessionLifetimeArtifacts.delete(this.session);
+			sessionLifetimeArtifacts.delete(this.#ownerSession);
 			if (owned) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 			return false;
 		}
 		if (cleanupRan) return false;
 		state.cleanupRegistered = true;
-		if (adoptIntoSessionOwner && this.session.adoptArtifactManager) {
+		if (adoptIntoSessionOwner && this.#ownerSession.adoptArtifactManager) {
 			try {
-				this.session.adoptArtifactManager(manager);
+				this.#ownerSession.adoptArtifactManager(manager);
 			} catch {
 				await cleanup();
 				return false;
 			}
 			if (
-				this.session.getArtifactManager?.() !== manager ||
-				this.session.isArtifactManagerAuthorized?.(manager) !== true
+				this.#ownerSession.getArtifactManager?.() !== manager ||
+				this.#ownerSession.isArtifactManagerAuthorized?.(manager) !== true
 			) {
 				await cleanup();
 				return false;
@@ -813,11 +907,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		state.authorized = true;
-		this.session.getArtifactsDir = state.installedGetArtifactsDir;
-		this.session.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
-		this.session.getArtifactManager = state.installedGetArtifactManager;
-		this.session.isArtifactManagerAuthorized = state.installedIsArtifactManagerAuthorized;
-		if (state.installedAgentOutputManager) this.session.agentOutputManager = state.installedAgentOutputManager;
+		this.#ownerSession.getArtifactsDir = state.installedGetArtifactsDir;
+		this.#ownerSession.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
+		this.#ownerSession.getArtifactManager = state.installedGetArtifactManager;
+		this.#ownerSession.isArtifactManagerAuthorized = state.installedIsArtifactManagerAuthorized;
+		if (state.installedAgentOutputManager) this.#ownerSession.agentOutputManager = state.installedAgentOutputManager;
 		return true;
 	}
 
@@ -864,6 +958,26 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 	}
 
+	#resolveAdmittedArtifactPersistence(admitted: TaskArtifactPersistence): TaskArtifactPersistence {
+		if (!admitted.parentArtifactManager?.getManagedStore()) return admitted;
+		const admittedOwnerId = this.session.getSessionId?.();
+		const currentOwnerId = this.#ownerSession.getSessionId?.();
+		const admittedFile = this.session.getSessionFile();
+		const currentFile = this.#ownerSession.getSessionFile();
+		if (
+			!admittedOwnerId ||
+			admittedOwnerId !== currentOwnerId ||
+			!admittedFile ||
+			!currentFile ||
+			path.basename(admittedFile) !== path.basename(currentFile)
+		)
+			return admitted;
+		const current = this.#sharedArtifactStore();
+		if (!current?.manager.getManagedStore()) return admitted;
+		current.manager.assertManagedBinding();
+		return { effectiveArtifactsDir: current.dir, parentArtifactManager: current.manager };
+	}
+
 	/**
 	 * Create a TaskTool instance.
 	 * Repository authority is captured from session cwd *before* agent discovery so
@@ -908,8 +1022,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
+		return this.#createExecutionFacade().#executeCaptured(_toolCallId, rawParams, signal, onUpdate);
+	}
+
+	async #executeCaptured(
+		_toolCallId: string,
+		rawParams: unknown,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+	): Promise<AgentToolResult<TaskToolDetails>> {
+		const session = this.session;
 		const params = normalizeTaskAdmissionParams(rawParams as TaskParams);
-		const simpleMode = this.#getTaskSimpleMode();
+		const simpleMode = session.settings.get("task.simple");
 		const validationError = validateTaskModeParams(simpleMode, params);
 		if (validationError) {
 			return createTaskModeError(validationError);
@@ -917,7 +1041,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		// Re-verify session authority before using any discovered agents or scheduling work.
 		try {
-			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+			await assertExecutionRootMatchesRepositoryBinding(session.cwd, this.#sessionRepositoryBinding);
 		} catch (error) {
 			const message =
 				error instanceof RepositoryBindingError
@@ -933,7 +1057,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (taskIdValidationError) {
 			return createTaskModeError(taskIdValidationError);
 		}
-		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, rawTaskItems);
+		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(session.cwd, rawTaskItems);
 		if (bindingResolution.error) {
 			return createTaskModeError(bindingResolution.error);
 		}
@@ -945,8 +1069,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
 			const available =
-				filterVisibleAgents(this.#discoveredAgents)
-					.map(a => a.name)
+				callableAgents(this.#discoveredAgents, session)
+					.map(agent => agent.name)
 					.join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Unknown agent "${params.agent}". Available: ${available}` }],
@@ -954,7 +1078,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
-		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
+		const disabledAgents = session.settings.get("task.disabledAgents") as string[];
 		if (disabledAgents.length > 0 && disabledAgents.includes(params.agent)) {
 			const enabled = filterVisibleAgents(this.#discoveredAgents)
 				.filter(a => !disabledAgents.includes(a.name))
@@ -973,7 +1097,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const forkContextValidationError = validateForkContextRequests(
 			taskItems,
 			agent,
-			this.session.settings.get("task.forkContext.enabled"),
+			session.settings.get("task.forkContext.enabled"),
 		);
 		if (forkContextValidationError) {
 			return createTaskModeError(forkContextValidationError);
@@ -1017,9 +1141,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// Durable allocation failed: keep child session jsonl under local:// only.
 			// Do not advertise agent:// URIs without durable output backing.
 			const asyncLocalOptions: LocalProtocolOptions = {
-				getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
-				isManagedDestination: this.session.isManagedSessionDestination,
-				getSessionId: this.session.getSessionId ?? (() => null),
+				getArtifactsDir: () => this.session.getArtifactsDir?.() ?? null,
+				isManagedDestination: session.isManagedSessionDestination,
+				getSessionId: session.getSessionId ?? (() => null),
 			};
 			await initializeLocalRoot(asyncLocalOptions);
 			externalTaskSessionsDir = resolveLocalUrlToPath("local://subagents/sessions", asyncLocalOptions);
@@ -1027,7 +1151,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const outputManager =
-			this.session.agentOutputManager ?? new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
+			this.session.agentOutputManager ?? new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null);
 		const uniqueIds = await outputManager.allocateBatch(taskItems.map(t => t.id));
 		const fallbackAgentSource =
 			this.#discoveredAgents.find(agent => agent.name === params.agent)?.source ?? "bundled";
@@ -1086,9 +1210,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 
-		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
-		const ownerId = this.session.getAgentId?.() ?? undefined;
-		const parentSession = this.session.getSessionFile();
+		const maxConcurrency = session.settings.get("task.maxConcurrency");
+		const ownerId = session.getAgentId?.() ?? undefined;
+		const parentSession = session.getSessionFile();
 		const admitDuplicateLaunch = (
 			subagentId: string,
 			task: TaskItem,
@@ -1128,7 +1252,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			resumeRunner = (_subagentId, message, resumeDescriptor, resumeToolCallId) => {
+			resumeRunner = (
+				_subagentId,
+				message,
+				resumeDescriptor,
+				resumeToolCallId,
+				admissionEndpointId,
+				ownedRegistrationEndpointId,
+			) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const admission = (() => {
@@ -1193,10 +1324,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							{
 								runMode: message ? "message" : "resume",
 								resumeMessage: message,
+								asyncJobManager: manager,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
 								suppressRoiReconciliation: true,
 								...(descriptor.durableOutputAllowed === true
-									? {}
+									? { persistence: descriptor.artifactPersistence }
 									: {
 											persistence: {
 												effectiveArtifactsDir: undefined,
@@ -1226,7 +1358,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					},
 					{
 						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,
-						ownerId: this.session.getAgentId?.() ?? undefined,
+						ownerId: session.getAgentId?.() ?? undefined,
 						metadata: {
 							subagent: {
 								id: descriptor.task.id,
@@ -1253,7 +1385,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					manager,
 					resumeToolCallId ?? descriptor.toolCallId,
 					resumeJobId,
-					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+					admissionEndpointId ?? session.getAsyncEndpointId?.() ?? session.getSessionId?.() ?? undefined,
+					ownedRegistrationEndpointId ?? AsyncJobManager.endpointIdOf(manager),
 				);
 				return resumeJobId;
 			};
@@ -1262,21 +1395,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
 			if (!requestsForkContext(task)) return undefined;
-			if (!this.session.buildForkContextSeed) {
+			if (!session.buildForkContextSeed) {
 				throw new Error("Current session cannot build fork-context seeds.");
 			}
-			const configuredMaxMessages = this.session.settings.has("task.forkContext.maxMessages")
-				? this.session.settings.get("task.forkContext.maxMessages")
+			const configuredMaxMessages = session.settings.has("task.forkContext.maxMessages")
+				? session.settings.get("task.forkContext.maxMessages")
 				: undefined;
-			const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+			const configuredMaxTokens = session.settings.get("task.forkContext.maxTokens");
 			const params = resolveForkSeedParamsForMode(
 				task.inheritContext,
 				configuredMaxMessages,
 				configuredMaxTokens,
-				this.session.model,
+				session.model,
 			);
 			if (!params) return undefined;
-			return await this.session.buildForkContextSeed({
+			return await session.buildForkContextSeed({
 				...params,
 				signal,
 			});
@@ -1373,6 +1506,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								[uniqueId],
 								frozenForkSeeds,
 								{
+									asyncJobManager: manager,
 									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
 									suppressRoiReconciliation: true,
 									persistence: {
@@ -1465,7 +1599,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					},
 					{
 						id: label,
-						ownerId: this.session.getAgentId?.() ?? undefined,
+						ownerId: session.getAgentId?.() ?? undefined,
 						metadata: {
 							subagent: {
 								id: uniqueId,
@@ -1489,19 +1623,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					manager,
 					_toolCallId,
 					jobId,
-					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+					session.getAsyncEndpointId?.() ?? session.getSessionId?.() ?? undefined,
 				);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
 					manager.registerResumeDescriptor(
 						{
 							subagentId: uniqueId,
-							ownerId: this.session.getAgentId?.() ?? undefined,
+							ownerId: session.getAgentId?.() ?? undefined,
 							data: {
 								toolCallId: _toolCallId,
 								params,
 								task: { ...taskItem, id: uniqueId },
 								sessionFile: subtaskSessionFile,
+								artifactPersistence: {
+									effectiveArtifactsDir: batchArtifactsDir,
+									parentArtifactManager: asyncParentArtifactManager,
+								},
 								durableOutputAllowed: Boolean(batchArtifactsDir),
 								forkContextSeed: frozenForkSeed,
 								agentSource: fallbackAgentSource,
@@ -1517,7 +1655,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (typeof manager.registerSubagentRecord === "function") {
 					manager.registerSubagentRecord({
 						subagentId: uniqueId,
-						ownerId: this.session.getAgentId?.() ?? undefined,
+						ownerId: session.getAgentId?.() ?? undefined,
 						currentJobId: jobId,
 						currentJobGeneration: manager.getJob(jobId)?.generation,
 						historicalJobIds: [],
@@ -1601,7 +1739,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? ` Failed to schedule ${failedSchedules.length} task${failedSchedules.length === 1 ? "" : "s"}.`
 				: "";
 
-		const ircEnabled = hasAvailableIrcTool(this.session);
+		const ircEnabled = hasAvailableIrcTool(session);
 		const taskIdByItemId = new Map<string, string>();
 		for (let i = 0; i < taskItems.length; i++) {
 			taskIdByItemId.set(taskItems[i].id, uniqueIds[i]);
@@ -1648,11 +1786,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		executionOverrides?: {
 			runMode?: "initial" | "resume" | "message";
 			resumeMessage?: string;
+			asyncJobManager?: AsyncJobManager;
 			sessionFiles?: ReadonlyMap<string, string | null>;
-			persistence?: {
-				effectiveArtifactsDir: string | undefined;
-				parentArtifactManager: ArtifactManager | undefined;
-			};
+			persistence?: TaskArtifactPersistence;
 			/**
 			 * Set for per-child async runs: the spawnPlan is carried for gate
 			 * consistency, but batch-level ROI reconciliation must not be computed
@@ -1661,10 +1797,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			suppressRoiReconciliation?: boolean;
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
+		const session = this.session;
+		const ownedJobManager = executionOverrides?.asyncJobManager ?? this.#resolveOwnedJobManager();
 		const startTime = Date.now();
 		// Pre-discovery authority: session cwd must still match the capture from create().
 		try {
-			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+			await assertExecutionRootMatchesRepositoryBinding(session.cwd, this.#sessionRepositoryBinding);
 		} catch (error) {
 			const message =
 				error instanceof RepositoryBindingError
@@ -1674,25 +1812,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: String(error);
 			return createTaskModeError(`Session repository binding rejected before task discovery: ${message}`);
 		}
-		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, params.tasks ?? []);
+		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(session.cwd, params.tasks ?? []);
 		if (bindingResolution.error) {
 			return createTaskModeError(bindingResolution.error);
 		}
 		const boundParams: TaskParams = { ...params, tasks: bindingResolution.tasks };
 
-		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
+		const { agents, projectAgentsDir } = await discoverAgents(session.cwd);
 		const { agent: agentName, context, schema: outputSchema } = boundParams;
-		const simpleMode = this.#getTaskSimpleMode();
+		const simpleMode = session.settings.get("task.simple");
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 		const sharedContext = contextEnabled ? context?.trim() : undefined;
-		const isolationMode = this.session.settings.get("task.isolation.mode");
+		const isolationMode = session.settings.get("task.isolation.mode");
 		const isolationRequested = "isolated" in boundParams ? boundParams.isolated === true : false;
 		const isIsolated = isolationMode !== "none" && isolationRequested;
-		const mergeMode = this.session.settings.get("task.isolation.merge");
-		const commitStyle = this.session.settings.get("task.isolation.commits");
-		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
-		const taskDepth = this.session.taskDepth ?? 0;
-		const subagentLspEnabled = (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp");
+		const mergeMode = session.settings.get("task.isolation.merge");
+		const commitStyle = session.settings.get("task.isolation.commits");
+		const maxConcurrency = session.settings.get("task.maxConcurrency");
+		const taskDepth = session.taskDepth ?? 0;
+		const subagentLspEnabled = (session.enableLsp ?? true) && session.settings.get("task.enableLsp");
 
 		if (isolationMode === "none" && "isolated" in boundParams) {
 			return {
@@ -1714,8 +1852,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agent = getAgent(agents, agentName);
 		if (!agent) {
 			const available =
-				filterVisibleAgents(agents)
-					.map(a => a.name)
+				callableAgents(agents, session)
+					.map(agent => agent.name)
 					.join(", ") || "none";
 			return {
 				content: [
@@ -1733,7 +1871,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		// Check if agent is disabled in settings
-		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
+		const disabledAgents = session.settings.get("task.disabledAgents") as string[];
 		if (disabledAgents.length > 0 && disabledAgents.includes(agentName)) {
 			const enabled = filterVisibleAgents(agents)
 				.filter(a => !disabledAgents.includes(a.name))
@@ -1756,13 +1894,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const forkContextValidationError = validateForkContextRequests(
 			boundParams.tasks ?? [],
 			agent,
-			this.session.settings.get("task.forkContext.enabled"),
+			session.settings.get("task.forkContext.enabled"),
 		);
 		if (forkContextValidationError) {
 			return createTaskModeError(forkContextValidationError);
 		}
 
-		const planModeState = this.session.getPlanModeState?.();
+		const planModeState = session.getPlanModeState?.();
 		const planModeTools = ["read", "search", "find", "lsp", "web_search"];
 		const effectiveAgent: typeof agent = planModeState?.enabled
 			? {
@@ -1774,37 +1912,51 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			: agent;
 
 		// Apply per-agent model override from settings (highest priority)
-		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
+		const agentModelOverrides = session.settings.get("task.agentModelOverrides");
 		const settingsModelOverride = agentModelOverrides[agentName];
-		const parentActiveModelPattern = this.session.getActiveModelString?.();
+		const parentActiveModelPattern = session.getActiveModelString?.();
 		// A live active model profile claims persisted agent overrides: bare
 		// profile aliases may re-resolve to an equivalent provider variant at
 		// dispatch. Manual/direct sessions (no active profile) stay exact.
 		const parentActiveModelProfile = (
-			this.session as { getActiveModelProfile?: () => string | undefined }
+			session as { getActiveModelProfile?: () => string | undefined }
 		).getActiveModelProfile?.();
+		// Propagate the parent session's ownership marker when a session-local profile is active.
+		const parentModelProfileOwnershipMarker = this.#parentModelProfileOwnershipMarker;
 		const parentProfileDefinition = parentActiveModelProfile
-			? this.session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
+			? session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
 			: undefined;
+		const parentProfileBindings = parentProfileDefinition
+			? resolveProfileBindings(parentProfileDefinition)
+			: undefined;
+		const parentProfileBinding =
+			parentProfileBindings?.agentModelOverrides[
+				agentName as keyof typeof parentProfileBindings.agentModelOverrides
+			];
 		const parentOwnedModelProfile =
 			parentProfileDefinition &&
-			Object.hasOwn(resolveProfileBindings(parentProfileDefinition).agentModelOverrides, agentName)
+			parentProfileBindings &&
+			Object.hasOwn(parentProfileBindings.agentModelOverrides, agentName)
 				? parentActiveModelProfile
 				: undefined;
 		const modelOverride = resolveAgentModelPatterns({
-			settingsOverride: settingsModelOverride,
+			// Profile bindings are runtime-owned and may not be present in the
+			// persisted settings view exposed to detached task construction.
+			// Keep explicit task settings authoritative, then inherit the active
+			// profile's role binding before falling back to the parent model.
+			settingsOverride: settingsModelOverride ?? parentProfileBinding,
 			agentModel: effectiveAgent.model,
-			settings: this.session.settings,
+			settings: session.settings,
 			activeModelPattern: parentActiveModelPattern,
-			fallbackModelPattern: this.session.getModelString?.(),
+			fallbackModelPattern: session.getModelString?.(),
 		});
 		const thinkingLevelOverride = effectiveAgent.thinkingLevel;
 
 		// Output schema priority: task call > agent frontmatter > inherited parent session.
 		// task.simple can disable the task-call override while leaving agent/session schemas intact.
 		const effectiveOutputSchema = customSchemaEnabled
-			? (outputSchema ?? effectiveAgent.output ?? this.session.outputSchema)
-			: (effectiveAgent.output ?? this.session.outputSchema);
+			? (outputSchema ?? effectiveAgent.output ?? session.outputSchema)
+			: (effectiveAgent.output ?? session.outputSchema);
 
 		// Handle empty or missing tasks
 		if (!boundParams.tasks || boundParams.tasks.length === 0) {
@@ -1894,7 +2046,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let baseline: WorktreeBaseline | null = null;
 		if (isIsolated) {
 			try {
-				repoRoot = await getRepoRoot(this.session.cwd);
+				repoRoot = await getRepoRoot(session.cwd);
 				baseline = await captureBaseline(repoRoot);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
@@ -1919,15 +2071,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// File-backed session artifacts, or a session-lifetime durable temp root for
 		// in-memory parents. Never use a per-task temp dir that is deleted on return —
 		// advertised agent:// URIs must remain readable for the parent session lifetime.
-		const { effectiveArtifactsDir, parentArtifactManager } =
-			executionOverrides?.persistence ?? (await this.#resolveEffectiveArtifactsDir());
+		const { effectiveArtifactsDir, parentArtifactManager } = executionOverrides?.persistence
+			? this.#resolveAdmittedArtifactPersistence(executionOverrides.persistence)
+			: await this.#resolveEffectiveArtifactsDir();
 		const hasDurableOutputBacking = Boolean(effectiveArtifactsDir);
 
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
 		const localProtocolOptions: LocalProtocolOptions = {
-			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
-			isManagedDestination: this.session.isManagedSessionDestination,
-			getSessionId: this.session.getSessionId ?? (() => null),
+			getArtifactsDir: () => this.session.getArtifactsDir?.() ?? null,
+			isManagedDestination: session.isManagedSessionDestination,
+			getSessionId: session.getSessionId ?? (() => null),
 		};
 
 		// Subagents adopt the parent's ArtifactManager (including session-lifetime
@@ -1971,7 +2124,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 
 			// Check spawn restrictions from parent
-			const parentSpawns = this.session.getSessionSpawns() ?? "*";
+			const parentSpawns = session.getSessionSpawns() ?? "*";
 			const allowedSpawns = parentSpawns.split(",").map(s => s.trim());
 			const isSpawnAllowed = (): boolean => {
 				if (parentSpawns === "") return false; // Empty = deny all
@@ -2000,8 +2153,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// Place fork-context handoff material in the session-scoped external local
 			// root. Subagent prompts may expose this path to subprocesses, so it must
 			// never carry managed transcript/artifact authority.
-			const shouldWriteConversationContext = !hasAvailableIrcTool(this.session);
-			const compactContext = shouldWriteConversationContext ? this.session.getCompactContext?.() : undefined;
+			const shouldWriteConversationContext = !hasAvailableIrcTool(session);
+			const compactContext = shouldWriteConversationContext ? session.getCompactContext?.() : undefined;
 			let contextFilePath: string | undefined;
 			if (compactContext) {
 				await initializeLocalRoot(localProtocolOptions);
@@ -2017,13 +2170,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				uniqueIds = preAllocatedIds;
 			} else {
 				const outputManager =
-					this.session.agentOutputManager ?? new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
+					this.session.agentOutputManager ??
+					new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null);
 				uniqueIds = await outputManager.allocateBatch(tasks.map(t => t.id));
 			}
 			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
-			const effectiveAutorouting = this.session.settings.getEffectiveAutorouting();
-			const registry = this.session.modelRegistry as
+			const isResumedRun = executionOverrides?.runMode === "resume" || executionOverrides?.runMode === "message";
+			const routingSettings = isResumedRun ? this.#ownerSession.settings : session.settings;
+			const effectiveAutorouting = routingSettings.getEffectiveAutorouting();
+			const disabledProviders = new Set(
+				routingSettings.get("disabledProviders").map(provider => provider.toLowerCase()),
+			);
+			const registry = session.modelRegistry as
 				| {
 						getAvailable?: () => Model[];
 						getAll?: () => Model[];
@@ -2031,16 +2190,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				  }
 				| undefined;
 			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
+			const availableRoutingSnapshot = routingSnapshot?.filter(
+				model => !disabledProviders.has(model.provider.toLowerCase()),
+			);
 			const routingByIndex = new Map<number, RoutingOutcome>();
 			const routingCandidatesByIndex = new Map<number, string[]>();
 			const routingSkipsByIndex = new Map<number, Array<{ selector: string; code: AutoroutingReasonCode }>>();
+			const routingPreflightErrorsByIndex = new Map<number, Map<string, unknown>>();
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
 				const task = tasksWithUniqueIds[i];
 				const outcome = routingSnapshot
 					? resolveTaskRouting({
 							effectiveAutorouting,
 							requestedTier: task.tier,
-							availableModels: routingSnapshot,
+							availableModels: availableRoutingSnapshot,
 						})
 					: effectiveAutorouting.active
 						? {
@@ -2062,9 +2225,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const configured = effectiveAutorouting.map[outcome.tier] ?? [];
 				const candidates: string[] = [];
 				const skips: Array<{ selector: string; code: AutoroutingReasonCode }> = [];
-				const disabledProviders = new Set(
-					this.session.settings.get("disabledProviders").map(provider => provider.toLowerCase()),
-				);
 				for (const selector of configured) {
 					const slash = selector.indexOf("/");
 					const provider = slash > 0 ? selector.slice(0, slash).toLowerCase() : "";
@@ -2089,6 +2249,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const resolveAutoroutingCandidates = async (
 				index: number,
+				stopAfterFirstAuthenticatedCandidate = false,
 			): Promise<{
 				candidates: string[];
 				skips: Array<{ selector: string; code: AutoroutingReasonCode }>;
@@ -2108,19 +2269,38 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					try {
 						const key = await registry.getApiKey(
 							model,
-							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+							session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 						);
-						if (key) authenticated.push(selector);
-						else skips.push({ selector, code: "credential_unavailable" });
+						if (key) {
+							authenticated.push(selector);
+							if (stopAfterFirstAuthenticatedCandidate) break;
+						} else skips.push({ selector, code: "credential_unavailable" });
 					} catch (error) {
-						// Preserve the candidate for executor preflight, which records the
-						// terminal lookup failure in the routing ledger.
+						// Preserve lookup errors for executor terminalization; only a returned
+						// undefined value means this candidate may be skipped.
 						preflightErrors.set(selector, error);
 						authenticated.push(selector);
+						if (stopAfterFirstAuthenticatedCandidate) break;
 					}
 				}
 				return { candidates: authenticated, skips, preflightErrors };
 			};
+			if (isResumedRun) {
+				for (const [index, outcome] of routingByIndex) {
+					if (outcome.kind !== "routed") continue;
+					const { candidates, skips, preflightErrors } = await resolveAutoroutingCandidates(index, true);
+					routingSkipsByIndex.set(index, skips);
+					const pinnedSelector = candidates[0];
+					if (pinnedSelector) {
+						routingCandidatesByIndex.set(index, [pinnedSelector]);
+						if (preflightErrors.size > 0) routingPreflightErrorsByIndex.set(index, preflightErrors);
+						routingByIndex.set(index, { ...outcome, pinnedSelector });
+						continue;
+					}
+					routingPreflightErrorsByIndex.delete(index);
+					routingCandidatesByIndex.set(index, []);
+				}
+			}
 			const effectivePatterns = (index: number): string | string[] => {
 				const outcome = routingByIndex.get(index);
 				return outcome?.kind === "routed" ? [outcome.pinnedSelector] : modelOverride;
@@ -2139,7 +2319,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				};
 			};
 
-			const availableSkills = [...(this.session.skills ?? [])];
+			const availableSkills = [...(session.skills ?? [])];
 			// Resolve autoload skills from agent definition against available skills
 			const resolvedAutoloadSkills =
 				agent.autoloadSkills?.length && availableSkills.length > 0
@@ -2147,11 +2327,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							.map(name => availableSkills.find(s => s.name === name))
 							.filter((s): s is NonNullable<typeof s> => s !== undefined)
 					: [];
-			const contextFiles = this.session.contextFiles?.filter(
+			const contextFiles = session.contextFiles?.filter(
 				file => path.basename(file.path).toLowerCase() !== "agents.md",
 			);
-			const promptTemplates = this.session.promptTemplates;
-			const parentMcpManager = this.session.getMcpManager?.();
+			const promptTemplates = session.promptTemplates;
+			const parentMcpManager = session.getMcpManager?.();
 			// Exact-config tools-only managers belong to the top-level ACP session and cannot be reused by sub-sessions.
 			const reusableParentMcpManager = parentMcpManager?.isToolsOnly() ? undefined : parentMcpManager;
 
@@ -2181,21 +2361,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const buildForkContextSeed = async (task: (typeof tasksWithUniqueIds)[number]) => {
 				if (!requestsForkContext(task)) return undefined;
-				if (!this.session.buildForkContextSeed) {
+				if (!session.buildForkContextSeed) {
 					throw new Error("Current session cannot build fork-context seeds.");
 				}
-				const configuredMaxMessages = this.session.settings.has("task.forkContext.maxMessages")
-					? this.session.settings.get("task.forkContext.maxMessages")
+				const configuredMaxMessages = session.settings.has("task.forkContext.maxMessages")
+					? session.settings.get("task.forkContext.maxMessages")
 					: undefined;
-				const configuredMaxTokens = this.session.settings.get("task.forkContext.maxTokens");
+				const configuredMaxTokens = session.settings.get("task.forkContext.maxTokens");
 				const params = resolveForkSeedParamsForMode(
 					task.inheritContext,
 					configuredMaxMessages,
 					configuredMaxTokens,
-					this.session.model,
+					session.model,
 				);
 				if (!params) return undefined;
-				return await this.session.buildForkContextSeed({
+				return await session.buildForkContextSeed({
 					...params,
 					signal,
 				});
@@ -2214,7 +2394,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// The session's ENDPOINT-owned manager (resolved once per task so
 				// model metadata and live handles land in the SAME manager the
 				// job runs in — review thread P1).
-				const manager = this.#resolveOwnedJobManager();
+				const manager = ownedJobManager;
 				const forkContext = requestsForkContext(task)
 					? { mode: task.inheritContext, clonedTokens: forkContextSeed?.metadata.approximateTokens ?? 0 }
 					: undefined;
@@ -2229,8 +2409,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					recommendedMode: advisory.recommendedMode,
 					reasons: advisory.reasons,
 				};
+				let retainedPersistence: TaskArtifactPersistence = { effectiveArtifactsDir, parentArtifactManager };
 				const managedPersistence = parentArtifactManager?.getManagedStore()
-					? createManagedTaskPersistence(parentArtifactManager, task.id)
+					? createManagedTaskPersistence(parentArtifactManager, task.id, () => {
+							retainedPersistence = this.#resolveAdmittedArtifactPersistence(retainedPersistence);
+							if (!retainedPersistence.parentArtifactManager)
+								throw new Error("Managed Task storage authority is unavailable");
+							return retainedPersistence.parentArtifactManager;
+						})
 					: undefined;
 
 				const routingOutcome = routingByIndex.get(index);
@@ -2261,6 +2447,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const effectiveRunMode = overrides?.runMode ?? executionOverrides?.runMode;
 				const autoroutingInitial =
 					routingOutcome?.kind === "routed" && (effectiveRunMode ?? "initial") === "initial";
+				const includeAutoroutingResolution =
+					autoroutingInitial || effectiveRunMode === "resume" || effectiveRunMode === "message";
 				const autoroutingData =
 					(effectiveRunMode ?? "initial") === "initial" && routingOutcome && routingOutcome.kind !== "disabled"
 						? routingOutcome.kind === "routed"
@@ -2270,7 +2458,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									skips: [...(routingSkipsByIndex.get(index) ?? [])],
 									preflightErrors: new Map(),
 								}
-						: { candidates: undefined, skips: undefined, preflightErrors: new Map() };
+						: {
+								candidates:
+									includeAutoroutingResolution && routingOutcome?.kind === "routed"
+										? [...(routingCandidatesByIndex.get(index) ?? [])]
+										: undefined,
+								skips: [...(routingSkipsByIndex.get(index) ?? [])],
+								preflightErrors: routingPreflightErrorsByIndex.get(index) ?? new Map(),
+							};
 				const routingForRun = routeEvidence(
 					routingOutcome,
 					effectiveRunMode === "resume" || effectiveRunMode === "message",
@@ -2286,9 +2481,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
 				}
 				if (!isIsolated) {
-					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
+					await assertExecutionRootMatchesRepositoryBinding(session.cwd, taskRepositoryBinding);
 					const result = await this.#runSubprocess({
-						cwd: this.session.cwd,
+						cwd: session.cwd,
 						agent: effectiveAgent,
 						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
@@ -2306,9 +2501,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelOverride: effectivePatterns(index),
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
-						parentSessionId: this.session.getSessionId?.() ?? undefined,
+						parentModelProfileOwnershipMarker: parentModelProfileOwnershipMarker as any,
+						parentSessionId: session.getSessionId?.() ?? undefined,
 						parentCredentialSessionId:
-							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+							session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -2316,39 +2512,44 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						artifactsDir: effectiveArtifactsDir,
 						managedPersistence,
 						contextFile: contextFilePath,
-						ircAvailable: hasAvailableIrcTool(this.session),
+						ircAvailable: hasAvailableIrcTool(session),
 						enableLsp: subagentLspEnabled,
 						signal,
-						eventBus: this.session.eventBus,
+						eventBus: session.eventBus,
 						routing: routingForRun,
-						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
-						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
-						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
+						autoroutingCandidates: includeAutoroutingResolution ? autoroutingData.candidates : undefined,
+						autoroutingSkips: includeAutoroutingResolution ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: includeAutoroutingResolution
+							? autoroutingData.preflightErrors
+							: undefined,
 						autoroutingPreflight: autoroutingInitial,
 
 						onProgress: progress => {
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
-							this.#resolveOwnedJobManager()?.recordSubagentProgress(task.id, progress);
+							ownedJobManager?.recordSubagentProgress(task.id, progress);
 							emitProgress();
 						},
-						authStorage: this.session.authStorage,
-						modelRegistry: this.session.modelRegistry,
-						agentRegistry: this.session.agentRegistry,
-						settings: this.session.settings,
-						agentDir: this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
-						profileAuthority: this.session.profileAuthority,
-						inheritedServiceTier: this.session.serviceTier,
+						authStorage: session.authStorage,
+						modelRegistry: session.modelRegistry,
+						agentRegistry: session.agentRegistry,
+						settings: session.settings,
+						agentDir: session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
+						profileAuthority: session.profileAuthority,
+						inheritedServiceTier: session.serviceTier,
+						...inheritedSubagentApproval(session),
+						...inheritedPlanMode(session),
+						...inheritedBashRestriction(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
-						workspaceTree: this.session.workspaceTree,
+						workspaceTree: session.workspaceTree,
 						promptTemplates,
 						localProtocolOptions,
 						parentArtifactManager,
-						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
-						parentTelemetry: this.session.getTelemetry?.(),
+						parentHindsightSessionState: session.getHindsightSessionState?.(),
+						parentTelemetry: session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
 						forkContextSeed,
 					});
@@ -2374,7 +2575,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					await assertExecutionRootMatchesRepositoryBinding(isolationDir, taskRepositoryBinding);
 
 					const result = await this.#runSubprocess({
-						cwd: this.session.cwd,
+						cwd: session.cwd,
 						worktree: isolationDir,
 						agent: effectiveAgent,
 						task: renderTaskAssignment(task.assignment, simpleMode),
@@ -2393,9 +2594,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelOverride: effectivePatterns(index),
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
-						parentSessionId: this.session.getSessionId?.() ?? undefined,
+						parentModelProfileOwnershipMarker: parentModelProfileOwnershipMarker as any,
+						parentSessionId: session.getSessionId?.() ?? undefined,
 						parentCredentialSessionId:
-							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+							session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -2403,38 +2605,43 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						artifactsDir: effectiveArtifactsDir,
 						managedPersistence,
 						contextFile: contextFilePath,
-						ircAvailable: hasAvailableIrcTool(this.session),
+						ircAvailable: hasAvailableIrcTool(session),
 						enableLsp: subagentLspEnabled,
 						signal,
-						eventBus: this.session.eventBus,
+						eventBus: session.eventBus,
 						routing: routingForRun,
-						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
-						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
-						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
+						autoroutingCandidates: includeAutoroutingResolution ? autoroutingData.candidates : undefined,
+						autoroutingSkips: includeAutoroutingResolution ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: includeAutoroutingResolution
+							? autoroutingData.preflightErrors
+							: undefined,
 						autoroutingPreflight: autoroutingInitial,
 						onProgress: progress => {
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
-							this.#resolveOwnedJobManager()?.recordSubagentProgress(task.id, progress);
+							ownedJobManager?.recordSubagentProgress(task.id, progress);
 							emitProgress();
 						},
-						authStorage: this.session.authStorage,
-						modelRegistry: this.session.modelRegistry,
-						agentRegistry: this.session.agentRegistry,
-						settings: this.session.settings,
-						agentDir: this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
-						profileAuthority: this.session.profileAuthority,
-						inheritedServiceTier: this.session.serviceTier,
+						authStorage: session.authStorage,
+						modelRegistry: session.modelRegistry,
+						agentRegistry: session.agentRegistry,
+						settings: session.settings,
+						agentDir: session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
+						profileAuthority: session.profileAuthority,
+						inheritedServiceTier: session.serviceTier,
+						...inheritedSubagentApproval(session),
+						...inheritedPlanMode(session),
+						...inheritedBashRestriction(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
-						workspaceTree: this.session.workspaceTree,
+						workspaceTree: session.workspaceTree,
 						promptTemplates,
 						localProtocolOptions,
 						parentArtifactManager,
-						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
-						parentTelemetry: this.session.getTelemetry?.(),
+						parentHindsightSessionState: session.getHindsightSessionState?.(),
+						parentTelemetry: session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
 						forkContextSeed,
 					});
@@ -2452,15 +2659,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					if (mergeMode === "branch" && taskSucceeded) {
 						try {
 							const commitMsg =
-								commitStyle === "ai" && this.session.modelRegistry
+								commitStyle === "ai" && session.modelRegistry
 									? async (diff: string) => {
 											return generateCommitMessage(
 												diff,
-												this.session.modelRegistry!,
-												this.session.settings,
-												this.session.getCredentialSessionId?.() ??
-													this.session.getSessionId?.() ??
-													undefined,
+												session.modelRegistry!,
+												session.settings,
+												session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 											);
 										}
 									: undefined;

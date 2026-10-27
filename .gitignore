@@ -10,8 +10,10 @@ packages/*/dist-chrome/
 packages/*/dist-firefox/
 target/
 *.tsbuildinfo
+packages/natives/native/diagnostic-artifact.local.json
 *.node
 *.node.build.json
+*.node.provenance.json
 *.b64.js
 # `bun build --compile` leaves these next to the entrypoint when it is interrupted.
 *.bun-build
@@ -62,6 +64,7 @@ packages/ai/test/.temp-images/
 .gjc/_session-*/
 .gjc/backlog-*/
 .gjc/rss-checkpoints/
+.gjc/profiles/
 .gjc/metrics.json
 **/.gjc/settings.json.fallback-invalid
 **/.gjc/settings.json.config-root.fallback-invalid
@@ -93,6 +96,12 @@ packages/coding-agent/binaries/
 # Tests write evidence there and read it back within the same run;
 # test fixtures belong in packages/*/test/fixtures/ instead.
 /artifacts/
+# These suites also write relative to packages/tui when run through its package script.
+# Keep the issue-3798 historical evidence pair tracked in the same directory.
+/packages/tui/artifacts/g003-qa-report.json
+/packages/tui/artifacts/g011-qa-report.json
+/packages/tui/artifacts/g014-qa-report.json
+/packages/tui/artifacts/g015-qa-report.json
 .release-040-artifacts/
 
 # Python SDK build output

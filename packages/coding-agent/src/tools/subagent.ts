@@ -6,6 +6,7 @@ import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } fro
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
 import type { AgentProgress, AgentSource, LocalErrorSummary } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
+import { wrapUntrustedContent } from "./fetch";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
 import { ToolError } from "./tool-errors";
@@ -120,6 +121,10 @@ export interface SubagentLiveProgress {
 	currentTool?: string;
 	recentTool?: string;
 	recentOutputSummary?: { lineCount: number };
+	toolCount?: number;
+	contextTokens?: number;
+	contextWindow?: number;
+	lastActivityMs?: number;
 	fastMode?: boolean;
 	retryState?: {
 		attempt: number;
@@ -145,6 +150,14 @@ function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
 		...(progress.recentOutput.length > 0
 			? { recentOutputSummary: { lineCount: Math.min(progress.recentOutput.length, 6) } }
 			: {}),
+		...(progress.toolCount > 0 ? { toolCount: progress.toolCount } : {}),
+		...(progress.contextTokens !== undefined && progress.contextTokens > 0
+			? { contextTokens: progress.contextTokens }
+			: {}),
+		...(progress.contextWindow !== undefined && progress.contextWindow > 0
+			? { contextWindow: progress.contextWindow }
+			: {}),
+		...(progress.lastActivityMs !== undefined ? { lastActivityMs: progress.lastActivityMs } : {}),
 		...(progress.fastMode ? { fastMode: true } : {}),
 		...(progress.retryState
 			? {
@@ -528,8 +541,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (!onUpdate || streamingDisabled) return;
 			try {
 				const result = this.#progressResult(manager, records, true);
-				const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
 				const t = nowMs();
+				const snapshots = result.details?.subagents ?? [];
+				const signature = this.session.settings.get("task.compactSubagentPanel")
+					? subagentCompactRenderedStateSignature(snapshots, Date.now())
+					: subagentAwaitRenderedStateSignature(snapshots);
 				const livenessDue = force || t - lastEmitMs >= livenessIntervalMs;
 				if (!livenessDue && signature === lastEmittedSignature) return;
 				lastEmittedSignature = signature;
@@ -784,7 +800,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			}
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
-			if (snapshot.setupFailureSummary) lines.push(`Setup failure: ${snapshot.setupFailureSummary}`);
+			// A markdown fence is not a boundary: subagent text can contain ``` and
+			// close it, leaving the rest as raw tool-result text. Frame the data.
+			if (snapshot.setupFailureSummary) {
+				lines.push(wrapUntrustedContent(`Setup failure: ${snapshot.setupFailureSummary}`));
+			}
 			if (snapshot.localErrorSummary) {
 				const local = snapshot.localErrorSummary;
 				lines.push(`Local failure (${local.kind}): ${local.summary}`);
@@ -801,13 +821,14 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 					);
 				}
 			}
-			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
+			if (snapshot.assignment) lines.push(wrapUntrustedContent(`Assignment:\n${snapshot.assignment}`));
 			if (snapshot.steerMessage) {
-				lines.push(`Steer (${snapshot.steerState ?? "queued"}):`, "```", snapshot.steerMessage, "```");
+				lines.push(wrapUntrustedContent(`Steer (${snapshot.steerState ?? "queued"}):\n${snapshot.steerMessage}`));
 				lines.push(STEER_QUEUED_GUIDANCE);
 			}
 			if (snapshot.resultPreview) {
-				lines.push(snapshot.errorText ? "Error preview:" : "Result preview:", "```", snapshot.resultPreview, "```");
+				const previewLabel = snapshot.errorText ? "Error preview:" : "Result preview:";
+				lines.push(wrapUntrustedContent(`${previewLabel}\n${snapshot.resultPreview}`));
 				if (snapshot.truncated)
 					lines.push("Preview truncated; use the output ref or explicit ids with `verbosity=full` for more.");
 			}
@@ -1104,11 +1125,15 @@ function previewJobOutput(
  * unsafe.
  *
  * Time-derived fields are intentionally excluded so the panel does not churn while
- * idle: raw durations (`durationMs`), current-tool elapsed (`currentToolStartMs`),
+ * idle (the child's last-event timestamp is included; it moves only on real
+ * activity): raw durations (`durationMs`), current-tool elapsed (`currentToolStartMs`),
  * and retry countdowns (`retryState.startedAtMs`) are omitted. Idle duration and
  * countdown ticking is sacrificed by design; every real transition still changes
  * the signature.
  */
+/** Shared cadence for await progress refreshes and rendered last-activity age. */
+export const SUBAGENT_ACTIVITY_BUCKET_MS = 5_000;
+
 export function subagentAwaitRenderedStateSignature(
 	subagents: readonly SubagentSnapshot[],
 	receipt?: Pick<SubagentToolDetails, "awaitOutcome" | "interrupted">,
@@ -1117,6 +1142,110 @@ export function subagentAwaitRenderedStateSignature(
 		awaitOutcome: receipt?.awaitOutcome ?? null,
 		interrupted: receipt?.interrupted === true,
 		subagents: subagents.map(canonicalizeSnapshotForSignature),
+	});
+}
+
+/** A running subagent with no activity for longer than this counts as idle in the compact panel. */
+export const SUBAGENT_COMPACT_IDLE_MS = 30_000;
+
+/** Group counts behind the compact await panel's single summary line. */
+export interface SubagentGroupSummary {
+	running: number;
+	idle: number;
+	retrying: number;
+	queued: number;
+	paused: number;
+	completed: number;
+	failed: number;
+	cancelled: number;
+	/** Running subagents in provider retry, per provider; drives the degradation warning. */
+	retryingByProvider: Record<string, number>;
+}
+
+export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], nowMs: number): SubagentGroupSummary {
+	const summary: SubagentGroupSummary = {
+		running: 0,
+		idle: 0,
+		retrying: 0,
+		queued: 0,
+		paused: 0,
+		completed: 0,
+		failed: 0,
+		cancelled: 0,
+		retryingByProvider: {},
+	};
+	for (const snapshot of subagents) {
+		switch (snapshot.status) {
+			case "running": {
+				summary.running += 1;
+				const live = snapshot.liveProgressAvailable !== false ? snapshot.progress : undefined;
+				if (live?.status === "running" && live.retryState) {
+					summary.retrying += 1;
+					const provider = live.retryState.provider ?? "provider";
+					summary.retryingByProvider[provider] = (summary.retryingByProvider[provider] ?? 0) + 1;
+				}
+				// Before its first activity a subagent has no timestamp; its elapsed job time
+				// is then the age, so one stalled from the start still turns idle.
+				const quietMs = live?.lastActivityMs !== undefined ? nowMs - live.lastActivityMs : snapshot.durationMs;
+				if (quietMs > SUBAGENT_COMPACT_IDLE_MS) summary.idle += 1;
+				break;
+			}
+			case "queued":
+				summary.queued += 1;
+				break;
+			case "paused":
+				summary.paused += 1;
+				break;
+			case "completed":
+			case "already_completed":
+				summary.completed += 1;
+				break;
+			case "failed":
+			case "not_found":
+				summary.failed += 1;
+				break;
+			case "cancelled":
+				summary.cancelled += 1;
+				break;
+		}
+	}
+	return summary;
+}
+
+/**
+ * The compact degradation row shows only the most-degraded provider, its count, and
+ * how many other providers degrade (providers with a single retrying subagent are
+ * not a degradation). Signing exactly that keeps invisible per-provider churn from
+ * re-emitting.
+ */
+function compactDegradationSignature(
+	retryingByProvider: Record<string, number>,
+): { provider: string; count: number; moreProviders: number } | null {
+	const groups = Object.entries(retryingByProvider)
+		.filter(([, count]) => count > 1)
+		.sort(([a, countA], [b, countB]) => countB - countA || a.localeCompare(b));
+	const [worst] = groups;
+	return worst ? { provider: worst[0], count: worst[1], moreProviders: groups.length - 1 } : null;
+}
+
+/**
+ * Rendered-state signature for the compact await panel. It covers only what the
+ * compact view shows (group counts and the single degradation row), so per-subagent activity that does not move
+ * a count no longer re-emits: the update rate is bounded by count transitions and
+ * the liveness interval instead of growing with the number of live subagents.
+ */
+export function subagentCompactRenderedStateSignature(
+	subagents: readonly SubagentSnapshot[],
+	nowMs: number,
+	receipt?: Pick<SubagentToolDetails, "awaitOutcome" | "interrupted">,
+): string {
+	return JSON.stringify({
+		awaitOutcome: receipt?.awaitOutcome ?? null,
+		interrupted: receipt?.interrupted === true,
+		summary: (({ retryingByProvider, ...counts }) => ({
+			...counts,
+			degradation: compactDegradationSignature(retryingByProvider),
+		}))(summarizeSubagentGroup(subagents, nowMs)),
 	});
 }
 
@@ -1156,6 +1285,16 @@ function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unkno
 		currentTool: progress.currentTool ?? null,
 		recentTool: progress.recentTool ?? null,
 		recentOutputSummary: progress.recentOutputSummary ?? null,
+		toolCount: progress.toolCount ?? 0,
+		contextTokens: progress.contextTokens ?? null,
+		contextWindow: progress.contextWindow ?? null,
+		// Event timestamp, bucketed: it only moves when the child actually does
+		// something (idle gating holds), and the bucket keeps a streaming child from
+		// re-emitting on every delta. The status-line age is quantized to this cadence.
+		lastActivityBucket:
+			progress.lastActivityMs === undefined
+				? null
+				: Math.floor(progress.lastActivityMs / SUBAGENT_ACTIVITY_BUCKET_MS),
 		fastMode: progress.fastMode ?? false,
 		retryFailure: progress.retryFailure ?? null,
 		retryState: progress.retryState

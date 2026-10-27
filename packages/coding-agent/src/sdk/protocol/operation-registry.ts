@@ -125,6 +125,10 @@ const controls = [
 	["retry.now", "Immediately retry pending backoff."],
 	["bash.background", "Move active managed bash to the background."],
 	["model.profile.set", "Activate a model profile for the current session."],
+	["turn.image.begin", "Begin a bounded host-owned image upload."],
+	["turn.image.append", "Append a canonical base64 image chunk."],
+	["turn.image.finish", "Verify and stage a complete image."],
+	["turn.image.discard", "Discard an unfinished or staged image."],
 ] as const;
 
 const globals = [
@@ -174,6 +178,10 @@ const queries = [
 	["providers.list/active", "List active providers."],
 	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
 	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
+	[
+		"session.progress",
+		"Read the read-only project progress snapshot (gjc.project_progress.v1) derived from durable session state.",
+	],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -208,6 +216,7 @@ const queryIds = [
 	"Q29",
 	"Q30",
 	"Q31",
+	"Q32",
 ] as const;
 
 function queryId(index: number): string {
@@ -230,6 +239,15 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["C54", "C55", "C56", "C57"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
 	if (["C25", "C26", "C27", "C28", "C29", "C30", "C31", "C32", "C34", "C48"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -263,11 +281,21 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
-		C01: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
-		C02: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
+		// C01/C05 submit a prompt and therefore run the prompt preflight, which
+		// refuses a session with no selected model before admission. The code is
+		// appended: ACP machine-only mapping reads errorCodes[0].
+		C01: [
+			"client_ref_conflict",
+			"reconciliation_capacity",
+			"reconciliation_persist_failed",
+			"model_not_selected",
+			"image_upload_unavailable",
+		],
+		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C06: ["action_claimed"],
 		C07: ["action_claimed", "terminal_uncertain"],
+		C05: ["invalid_request", "busy", "model_not_selected"],
 		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],
@@ -285,6 +313,10 @@ function controlErrors(id: string): string[] {
 		C50: ["nothing_to_retry", "busy"],
 		C51: ["retry_not_pending"],
 		C52: ["not_foldable", "already_backgrounded", "no_active_bash"],
+		C54: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
+		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
+		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
+		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }
@@ -307,7 +339,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31", "Q32"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }
@@ -345,8 +377,15 @@ export const OPERATIONS: readonly Operation[] = [
 					: id === "G10"
 						? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
 						: ["G03", "G04", "G05"].includes(id)
-							? ["invalid_request", "unknown_model_profile", "model_profile_registry_error"]
-							: ["invalid_request"],
+							? [
+									"invalid_request",
+									"unknown_model_profile",
+									"model_profile_registry_error",
+									"legacy_lifecycle_ambiguous",
+								]
+							: ["G06", "G07", "G08"].includes(id)
+								? ["invalid_request", "legacy_lifecycle_ambiguous"]
+								: ["invalid_request"],
 			adapterDispositions:
 				id === "G02"
 					? dispositions({
@@ -394,7 +433,9 @@ export const OPERATIONS: readonly Operation[] = [
 					? ["invalid_request", "resource_gone", "internal"]
 					: id === "Q27"
 						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-						: ["invalid_request", "resource_gone"],
+						: id === "Q32"
+							? ["invalid_request", "resource_gone", "unavailable"]
+							: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
 			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),

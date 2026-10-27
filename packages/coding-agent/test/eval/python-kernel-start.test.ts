@@ -16,11 +16,20 @@ const OK_RESULT: KernelExecuteResult = {
 
 class FakeKernel {
 	alive = true;
+	#exitCode: number | null = null;
 	execute = vi.fn(async () => OK_RESULT);
 	shutdown = vi.fn(async (): Promise<KernelShutdownResult> => ({ confirmed: true }));
 
 	isAlive(): boolean {
 		return this.alive;
+	}
+
+	getExitCode(): number | null {
+		return this.#exitCode;
+	}
+
+	setExitCode(code: number | null): void {
+		this.#exitCode = code;
 	}
 }
 
@@ -119,7 +128,11 @@ describe("PythonExecutorOptions.onKernelStart", () => {
 	it("does not invoke onKernelStart for execute-per-call mode", async () => {
 		const kernel = new FakeKernel();
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		vi.spyOn(pythonKernel.PythonKernel, "start").mockResolvedValue(kernel as unknown as PythonKernelInstance);
+		vi.spyOn(pythonKernel.PythonKernel, "start").mockImplementation(async options => {
+			const created = kernel as unknown as PythonKernelInstance;
+			options.onKernelCreated?.(created);
+			return created;
+		});
 		const onKernelStart = vi.fn();
 
 		await executePython("per call", {

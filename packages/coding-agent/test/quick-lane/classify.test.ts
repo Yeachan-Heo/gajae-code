@@ -1,6 +1,14 @@
 import { describe, expect, it } from "bun:test";
+import fc from "fast-check";
 import { commands } from "../../src/cli-main";
 import { classifyQuickLane } from "../../src/quick-lane/classify";
+
+const FILE_PATH_REFERENCE_SOURCE =
+	"(?:(?:[A-Za-z0-9_@.+~\\-]+/)*[A-Za-z0-9_.@+\\-]+|(?:[A-Za-z0-9_@.+~\\-]+/)*\\.[A-Za-z0-9_-]+|(?:[A-Za-z0-9_@.+~\\-]+/)*)\\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|rb|md|markdown|json|jsonl|yml|yaml|toml|xml|sql|sh|bash|css|scss|html|vue|svelte|java|kt|scala|c|cpp|h|hpp|csv|txt|env|tf)(?![A-Za-z0-9])";
+
+function referenceFilePaths(text: string): string[] {
+	return Array.from(text.matchAll(new RegExp(FILE_PATH_REFERENCE_SOURCE, "gi")), match => match[0]);
+}
 
 describe("quick-lane classifier (issue #3984)", () => {
 	describe("quick-lane selection", () => {
@@ -313,6 +321,108 @@ describe("post-merge codex review regressions", () => {
 		const singlePath = classifyQuickLane("update src/Foo.ts");
 		expect(singlePath.lane).toBe("quick");
 		expect(singlePath.reasons).toContain("explicit file path");
+	});
+
+	it("still allows one concrete file path and keeps a dotfile anchor", () => {
+		const single = classifyQuickLane("fix src/hooks/bridge.ts so it loads");
+		expect(single.lane).toBe("quick");
+		expect(single.reasons).toContain("explicit file path");
+		expect(single.exclusions).toEqual([]);
+
+		const dotfile = classifyQuickLane("fix .env");
+		expect(dotfile.lane).toBe("quick");
+		expect(dotfile.reasons).toContain("explicit file path");
+
+		const dottedName = classifyQuickLane("fix foo.ts.bar.ts");
+		expect(dottedName.lane).toBe("quick");
+		expect(dottedName.reasons).toContain("explicit file path");
+		expect(dottedName.exclusions).toEqual([]);
+
+		const upper = classifyQuickLane("fix FILE.TS");
+		expect(upper.lane).toBe("quick");
+		expect(upper.reasons).toContain("explicit file path");
+
+		const many = classifyQuickLane("update src/a.ts and src/b.ts");
+		expect(many.lane).toBe("deep");
+		expect(many.exclusions.some(exclusion => exclusion.includes("2 or more distinct file paths"))).toBe(true);
+	});
+
+	it("bounds a slash-only task that names no file", async () => {
+		// One attempt is engine-capped near half a second, so a single call fits the
+		// watchdog on both sides. Repeating the public entry turns that cap into a hang.
+		const watchdogMs = 8_000;
+		const repeats = 60;
+		const moduleHref = new URL("../../src/quick-lane/classify.ts", import.meta.url).href;
+		const childSource = [
+			`const mod = await import(${JSON.stringify(moduleHref)});`,
+			`const dotted = "a.a/".repeat(4000);`,
+			`const slashes = "a/".repeat(8000);`,
+			`for (let step = 0; step < ${repeats}; step += 1) {`,
+			`  for (const text of [dotted, slashes]) {`,
+			`    const decision = mod.classifyQuickLane(text);`,
+			`    if (decision.lane !== "deep" || decision.reasons.length !== 0) process.exit(2);`,
+			`  }`,
+			`}`,
+			`process.stdout.write("ok\\n");`,
+		].join("\n");
+		const proc = Bun.spawn({
+			cmd: [process.execPath, "-e", childSource],
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdoutPromise = new Response(proc.stdout).text();
+		const stderrPromise = new Response(proc.stderr).text();
+		const outcome: { settledBy: "exit" | "timeout"; exitCode: number } = {
+			settledBy: "exit",
+			exitCode: -1,
+		};
+		await new Promise<void>(resolve => {
+			const timer = setTimeout(() => {
+				outcome.settledBy = "timeout";
+				proc.kill();
+				resolve();
+			}, watchdogMs);
+			void proc.exited.then(code => {
+				clearTimeout(timer);
+				if (outcome.settledBy === "timeout") return;
+				outcome.exitCode = code;
+				resolve();
+			});
+		});
+		if (outcome.settledBy === "timeout") outcome.exitCode = await proc.exited;
+		const stdout = await stdoutPromise;
+		const stderr = await stderrPromise;
+		expect({ settledBy: outcome.settledBy, exitCode: outcome.exitCode, stdout, stderr }).toEqual({
+			settledBy: "exit",
+			exitCode: 0,
+			stdout: "ok\n",
+			stderr: "",
+		});
+	}, 20_000);
+
+	it("property: file-path anchors agree with the extension pattern, fc.property seed 434, numRuns 64", () => {
+		fc.assert(
+			fc.property(fc.string({ maxLength: 36 }), input => {
+				const text = input.trim();
+				const distinct = new Set(referenceFilePaths(text));
+				const decision = classifyQuickLane(input);
+				expect(classifyQuickLane(input)).toEqual(decision);
+				if (distinct.size >= 2) {
+					expect(decision.lane).toBe("deep");
+					expect(decision.reasons).toEqual([]);
+					expect(decision.exclusions.some(exclusion => exclusion.includes("2 or more distinct file paths"))).toBe(
+						true,
+					);
+				} else if (distinct.size === 1 && decision.exclusions.length === 0) {
+					expect(decision.lane).toBe("quick");
+					expect(decision.reasons).toContain("explicit file path");
+				} else if (distinct.size === 0 && decision.exclusions.length === 0) {
+					expect(decision.reasons.includes("explicit file path")).toBe(false);
+				}
+			}),
+			{ seed: 434, numRuns: 64 },
+		);
 	});
 
 	it("keeps the quick-lane entry lazy-loading through the registry after the top-level-import repair", async () => {

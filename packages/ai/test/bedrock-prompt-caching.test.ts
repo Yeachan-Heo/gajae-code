@@ -31,6 +31,7 @@ describe("Bedrock prompt caching support", () => {
 			"au.anthropic.claude-haiku-4-5-20251001-v1:0",
 			"jp.anthropic.claude-sonnet-4-6",
 			"apac.anthropic.claude-opus-5",
+			"in.anthropic.claude-sonnet-5",
 			"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-6-v1:0",
 			"arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-opus-4-20250514-v1:0",
 		];

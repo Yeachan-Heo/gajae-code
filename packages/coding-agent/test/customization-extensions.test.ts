@@ -121,6 +121,30 @@ describe("customization inventory", () => {
 		expect(row?.scope).toBe("global");
 	});
 
+	test("uses scanned import metadata for external user skill symlinks", async () => {
+		const skillDir = path.join(tmpRoot, "shared", "linked-skill");
+		const skillLink = path.join(getAgentDir(), "skills", "linked-skill");
+		await writeFile(
+			path.join(skillDir, "SKILL.md"),
+			"---\nname: linked-skill\ndescription: Shared helper\nx-gjc-imported-from: claude-code\n---\n# Shared helper\n",
+		);
+		await fs.mkdir(path.dirname(skillLink), { recursive: true });
+		await fs.symlink(skillDir, skillLink, "dir");
+
+		const inventory = await loadCustomizationInventory({
+			cwd: projectDir,
+			home: homeDir,
+			policy: { trustUserSkills: true },
+			allowExternalUserSkillSymlinks: true,
+		});
+		const row = inventory.rows.find(entry => entry.surface === "skills" && entry.name === "linked-skill");
+		expect(row).toMatchObject({
+			status: "imported",
+			provenance: expect.stringContaining("Claude Code"),
+			path: path.join(skillLink, "SKILL.md"),
+		});
+	});
+
 	test("invalid frontmatter is flagged with remediation diagnostics", async () => {
 		await writeFile(path.join(projectDir, ".gjc", "skills", "broken", "SKILL.md"), "no frontmatter here\n");
 		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });
@@ -129,13 +153,16 @@ describe("customization inventory", () => {
 		expect(row?.diagnostics?.join(" ")).toContain("frontmatter");
 	});
 
-	test("native hooks are discovered from the canonical phase directories", async () => {
+	test("project hooks are stored-only and do not shadow global hooks", async () => {
 		await writeFile(path.join(projectDir, ".gjc", "hooks", "pre", "bash.ts"), "export {}\n");
 		await writeFile(path.join(getAgentDir(), "hooks", "pre", "bash.ts"), "export {}\n");
 		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });
 		const rows = inventory.rows.filter(r => r.surface === "hooks" && r.name === "bash.ts");
-		expect(rows.find(r => r.scope === "project")?.status).toBe("enabled");
-		expect(rows.find(r => r.scope === "global")?.status).toBe("shadowed");
+		expect(rows.find(r => r.scope === "project")).toMatchObject({
+			status: "stored-only",
+			diagnostics: [expect.stringContaining("do not load repository hook modules")],
+		});
+		expect(rows.find(r => r.scope === "global")?.status).toBe("enabled");
 	});
 
 	test("project MCP server shadows the same global server; disabled markers union", async () => {
@@ -244,6 +271,7 @@ describe("import from Claude Code (project → project .gjc)", () => {
 		// Canonical phase-relative destination identity.
 		expect(hooks.map(e => e.destinationName)).toEqual(["pre/bash.ts"]);
 		expect(mcps.map(e => e.destinationName)).toEqual(["claude-server"]);
+		expect(preview.warnings.join(" ")).toContain("Project-scope hooks are stored-only");
 		const mcp = mcps[0];
 		expect(mcp.status).toBe("add");
 		expect(mcp.reason).toContain("env:API_KEY");
@@ -270,7 +298,8 @@ describe("import from Claude Code (project → project .gjc)", () => {
 		expect(skillRow?.status).toBe("imported");
 		expect(skillRow?.provenance).toContain("Claude Code");
 		const hookRow = inventory.rows.find(r => r.surface === "hooks" && r.name === "bash.ts");
-		expect(hookRow?.status).toBe("enabled");
+		expect(hookRow?.status).toBe("stored-only");
+		expect(hookRow?.diagnostics?.join(" ")).toContain("do not load repository hook modules");
 	});
 });
 

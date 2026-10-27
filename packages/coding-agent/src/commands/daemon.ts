@@ -1,93 +1,89 @@
-/**
- * Manage GJC background daemons (status/list/stop/restart).
- */
-import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
+/** Manage public daemon operations while keeping worker grammar private. */
+import {
+	type ArgDescriptor,
+	Args,
+	CliParseError,
+	Command,
+	type FlagDescriptor,
+	Flags,
+	type ParseOutput,
+} from "@gajae-code/utils/cli";
 import {
 	type DaemonCommandAction,
 	type DaemonCommandArgs,
 	isDaemonInternalAction,
 	runDaemonCommand,
 } from "../cli/daemon-cli";
+import { PublicCommandFailure } from "../cli/public-command-errors";
+import { getPublicCommand } from "../cli/public-command-registry";
 import type { DaemonKind } from "../daemon/control-types";
-import { DAEMON_ACTION_TOKENS, resolveDaemonAction } from "../daemon/operator-contract";
+import { resolveDaemonAction } from "../daemon/operator-contract";
 import { initTheme } from "../modes/theme/theme";
 
-const ACTIONS = [...DAEMON_ACTION_TOKENS, "discord-internal", "slack-internal"] as const;
-
-function parsePositiveTimeout(raw: string | undefined, flagName: string): number | undefined {
-	if (raw === undefined) return undefined;
-	if (!/^[0-9]+$/.test(raw)) {
-		throw new CliParseError(`Expected ${flagName} to be a positive safe integer, got "${raw}"`);
-	}
-	const value = Number(raw);
-	if (!Number.isSafeInteger(value) || value <= 0) {
-		throw new CliParseError(`Expected ${flagName} to be a positive safe integer, got "${raw}"`);
-	}
-	return value;
-}
-
 export default class Daemon extends Command {
-	static description =
-		"Manage GJC background daemons. Routine use: `gjc daemon status` to check, `gjc daemon restart` to reload (spawns one if none is running). `stop`/`list` and the escalation flags below are advanced primitives.";
-
-	static examples = [
-		"# Check the daemon (concise per-daemon result)\n  gjc daemon status",
-		"# Reload, spawning a fresh owner if none is running\n  gjc daemon restart",
-		"# Full runtime detail and the roots list\n  gjc daemon status --verbose",
-		"# Machine-readable output for automation\n  gjc daemon status --json",
-		"# Stop, hard-killing an unresponsive owner\n  gjc daemon stop --force",
-	];
-
-	static args = {
-		action: Args.string({
-			description: "Daemon action (status, restart, reload, stop, list)",
-			required: false,
-			options: [...ACTIONS] as string[],
-		}),
-		kind: Args.string({ description: "Daemon kind(s) to target", required: false, multiple: true }),
-	};
-
-	static flags = {
-		verbose: Flags.boolean({ char: "v", description: "Show runtime detail and the full roots list" }),
-		all: Flags.boolean({ description: "Target all registered daemon kinds" }),
-		json: Flags.boolean({ description: "Emit JSON output" }),
-		force: Flags.boolean({ description: "Allow hard-kill escalation when graceful stop times out" }),
-		"graceful-timeout-ms": Flags.string({ description: "Cooperative stop timeout before escalation" }),
-		"kill-timeout-ms": Flags.string({ description: "Wait for old pid death after SIGKILL" }),
-		"spawn-if-stopped": Flags.boolean({ description: "On restart, spawn even when no daemon is running" }),
-		smoke: Flags.boolean({ description: "Internal: run worker smoke without configuration or network" }),
-		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
-		"agent-dir": Flags.string({ description: "Internal: daemon state directory" }),
-	};
+	static description = getPublicCommand(["daemon"])!.description;
+	static args: Record<string, ArgDescriptor> = getPublicCommand(["daemon"])!.args;
+	static flags: Record<string, FlagDescriptor> = getPublicCommand(["daemon"])!.flags;
 
 	async run(): Promise<void> {
-		const { args, flags } = await this.parse(Daemon);
-		const rawAction = args.action ?? "status";
+		const internal = isDaemonInternalAction(this.argv[0] as DaemonCommandAction);
+		const resolved = resolveDaemonAction(this.argv[0]);
+		const action = (internal ? this.argv[0] : (resolved ?? "status")) as DaemonCommandAction;
+		const descriptor = getPublicCommand(["daemon", resolved ?? "status"])!;
+		class PublicDaemonOperation extends Daemon {
+			static args = { kind: { ...descriptor.args.kind!, options: undefined } };
+			static flags = descriptor.flags;
+		}
+		const parser = internal
+			? new DaemonWorker(this.argv, this.config)
+			: new PublicDaemonOperation(resolved ? this.argv.slice(1) : this.argv, this.config);
+		let parsed: ParseOutput;
+		try {
+			parsed = await parser.parse((internal ? DaemonWorker : PublicDaemonOperation) as typeof Daemon);
+		} catch (error) {
+			if (!internal && error instanceof CliParseError)
+				throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
+			throw error;
+		}
+		const { args, flags } = parsed;
+		const timeout = (name: string): number | undefined => {
+			const raw = flags[name];
+			if (raw === undefined) return undefined;
+			if (
+				typeof raw !== "string" ||
+				!/^[0-9]+$/.test(raw) ||
+				!Number.isSafeInteger(Number(raw)) ||
+				Number(raw) <= 0
+			) {
+				throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
+			}
+			return Number(raw);
+		};
 		const positional = Array.isArray(args.kind) ? args.kind : args.kind ? [args.kind] : [];
-		const flagRec = flags as Record<string, unknown>;
-		const gracefulTimeoutMs = parsePositiveTimeout(
-			flagRec["graceful-timeout-ms"] as string | undefined,
-			"--graceful-timeout-ms",
-		);
-		const killTimeoutMs = parsePositiveTimeout(flagRec["kill-timeout-ms"] as string | undefined, "--kill-timeout-ms");
-		const action = (resolveDaemonAction(rawAction) ?? rawAction) as DaemonCommandAction;
-		const kinds = positional as DaemonKind[];
 		const cmd: DaemonCommandArgs = {
 			action,
-			kinds,
+			kinds: positional as DaemonKind[],
 			all: Boolean(flags.all),
 			json: Boolean(flags.json),
 			force: Boolean(flags.force),
 			verbose: Boolean(flags.verbose),
-			gracefulTimeoutMs,
-			killTimeoutMs,
-			spawnIfStopped: flagRec["spawn-if-stopped"] as boolean | undefined,
+			gracefulTimeoutMs: timeout("graceful-timeout-ms"),
+			killTimeoutMs: timeout("kill-timeout-ms"),
+			spawnIfStopped: flags["spawn-if-stopped"] as boolean | undefined,
 			smoke: Boolean(flags.smoke),
-			ownerId: flagRec["owner-id"] as string | undefined,
-			agentDir: flagRec["agent-dir"] as string | undefined,
+			ownerId: flags["owner-id"] as string | undefined,
+			agentDir: flags["agent-dir"] as string | undefined,
 		};
-
-		if (!isDaemonInternalAction(action)) await initTheme();
+		if (!internal) await initTheme();
 		await runDaemonCommand(cmd);
 	}
+}
+
+class DaemonWorker extends Daemon {
+	static args = { action: Args.string({ required: true }), kind: Args.string({ multiple: true }) };
+	static flags = {
+		smoke: Flags.boolean({ description: "Run worker smoke without configuration or network" }),
+		"owner-id": Flags.string({ description: "Daemon owner id" }),
+		"agent-dir": Flags.string({ description: "Daemon state directory" }),
+	};
 }

@@ -109,6 +109,14 @@ const expectedDispositions: Record<string, Record<string, AdapterDisposition>> =
 		acp: "generic_safe",
 		daemonCli: "generic_safe",
 	},
+	Q32: {
+		telegram: "prohibited",
+		discord: "prohibited",
+		slack: "prohibited",
+		mcp: "generic_safe",
+		acp: "generic_safe",
+		daemonCli: "generic_safe",
+	},
 	C52: {
 		telegram: "prohibited",
 		discord: "prohibited",
@@ -166,9 +174,9 @@ describe("SDK operation matrix", () => {
 	});
 
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(57);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(30);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS.filter(operation => operation.kind === "control"))
 			expect(operation.errorCodes.length).toBeGreaterThan(0);
@@ -240,6 +248,46 @@ describe("SDK operation matrix", () => {
 			expect(secretResult).toMatchObject({ ok: false, error: { code: "secret_input_forbidden" } });
 			expect(secretSends).toBe(0);
 			expect(JSON.stringify(secretResult)).not.toContain(secret);
+		}
+	});
+	it("rejects ultrafast service-tier controls on chat before SDK send", async () => {
+		for (const transport of ["telegram", "discord", "slack"] as const) {
+			let sends = 0;
+			const result = await sendAuthorizedChatOperation(
+				transport,
+				{ kind: "control", operation: "service_tier.set", input: { tier: "ultrafast" } },
+				async () => {
+					sends++;
+					return "sent";
+				},
+			);
+			expect(result).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+			expect(sends).toBe(0);
+		}
+	});
+	it("preserves the ultrafast restriction error for chat config patches", async () => {
+		for (const transport of ["telegram", "discord", "slack"] as const) {
+			let sends = 0;
+			const result = await sendAuthorizedChatOperation(
+				transport,
+				{
+					kind: "control",
+					operation: "config.patch",
+					input: { patch: { "task.serviceTier": "ultrafast" } },
+				},
+				async () => {
+					sends++;
+					return "sent";
+				},
+			);
+			expect(result).toMatchObject({
+				ok: false,
+				error: {
+					code: "ultrafast_tier_forbidden",
+					message: "config.patch serviceTier ultrafast is restricted to trusted local sources.",
+				},
+			});
+			expect(sends).toBe(0);
 		}
 	});
 	it("removes Broker lifecycle controls from host surfaces before mutation", async () => {

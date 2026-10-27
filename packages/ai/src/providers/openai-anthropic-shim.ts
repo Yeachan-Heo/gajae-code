@@ -67,6 +67,7 @@ export function streamOpenAIAnthropicShim(
 					thinking: model.thinking,
 					input: model.input,
 					cost: model.cost,
+					streamIdleTimeoutMs: model.streamIdleTimeoutMs,
 				};
 
 				const reasoningEffort = options?.reasoning;

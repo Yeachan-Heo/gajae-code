@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import { ensureCoordinatorDirectory, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
@@ -567,7 +568,7 @@ async function readTransactionJson<T>(file: string): Promise<T | null> {
 		source = await fs.readFile(file, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw new Error("state_corrupt");
+		throw error;
 	}
 	try {
 		const value: unknown = JSON.parse(source);
@@ -605,6 +606,71 @@ function migrateLegacyTransactionV1(transaction: CoordinatorSessionTransactionV1
 	}
 	const authorities = canonical.gate_authorities;
 	const endpointIncarnation = typeof broker?.endpoint_incarnation === "string" ? broker.endpoint_incarnation : null;
+	// Report ids predate COORDINATOR_REPORT_ID_PATTERN. A legacy id is rejected by
+	// the reader forever, and because the reader is the namespace-wide scan, one
+	// historical report bricks every coordination read. Rekey legacy reports onto
+	// the canonical digest form instead of leaving the WAL permanently unreadable.
+	const reports = canonical.reports;
+	const migratedReportIds = new Map<string, string>();
+	if (reports && typeof reports === "object" && !Array.isArray(reports)) {
+		const table = reports as Record<string, Record<string, unknown>>;
+		for (const [reportId, report] of Object.entries(table)) {
+			if (COORDINATOR_REPORT_ID_PATTERN.test(reportId)) continue;
+			if (!report || typeof report !== "object" || Array.isArray(report)) continue;
+			const operationId = typeof report.operation_id === "string" ? report.operation_id : reportId;
+			let migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}`)}`;
+			const existing = table[migratedId];
+			if (existing) {
+				const existingOperationId = typeof existing.operation_id === "string" ? existing.operation_id : null;
+				if (existingOperationId !== operationId) {
+					// A malformed legacy WAL can collide with the operation-derived digest.
+					// Preserve both records under distinct canonical ids rather than silently
+					// discarding an unrelated report.
+					migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}\0${reportId}`)}`;
+				}
+			}
+			if (table[migratedId]) {
+				// The canonical report already wins this deterministic collision. The
+				// operation/outbox rewrites below keep every surviving reference coherent.
+				logger.warn("Coordinator legacy report id collision resolved", {
+					sessionId: record.session_id,
+					legacyReportId: reportId,
+					canonicalReportId: migratedId,
+					operationId,
+				});
+				migratedReportIds.set(reportId, migratedId);
+				delete table[reportId];
+				continue;
+			}
+			report.report_id = migratedId;
+			table[migratedId] = report;
+			migratedReportIds.set(reportId, migratedId);
+			delete table[reportId];
+		}
+	}
+	if (migratedReportIds.size > 0) {
+		const requests = record.requests as Record<string, unknown>;
+		const operations = requests.operations;
+		if (operations && typeof operations === "object" && !Array.isArray(operations)) {
+			for (const operation of Object.values(operations as Record<string, Record<string, unknown>>)) {
+				if (!operation || typeof operation !== "object" || Array.isArray(operation)) continue;
+				if (typeof operation.local_id === "string")
+					operation.local_id = migratedReportIds.get(operation.local_id) ?? operation.local_id;
+			}
+		}
+		const outbox = record.outbox as Record<string, Record<string, unknown>>;
+		for (const event of Object.values(outbox)) {
+			if (!event || typeof event !== "object" || Array.isArray(event) || event.entity !== "report") continue;
+			if (typeof event.entity_id === "string")
+				event.entity_id = migratedReportIds.get(event.entity_id) ?? event.entity_id;
+			const payload = event.payload;
+			if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+				const reportId = (payload as Record<string, unknown>).report_id;
+				if (typeof reportId === "string")
+					(payload as Record<string, unknown>).report_id = migratedReportIds.get(reportId) ?? reportId;
+			}
+		}
+	}
 	if (authorities && typeof authorities === "object" && !Array.isArray(authorities)) {
 		for (const authority of Object.values(authorities as Record<string, unknown>)) {
 			if (!authority || typeof authority !== "object" || Array.isArray(authority)) continue;
@@ -1322,9 +1388,16 @@ export async function listCanonicalActiveSessions(
 	const active: string[] = [];
 	for (const sessionId of sessionIds) {
 		if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
-		const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
-		if (!transaction) continue;
-		assertTransaction(transaction, path.basename(paths.root), sessionId);
+		let transaction: CoordinatorSessionTransactionV1 | null;
+		try {
+			transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+			if (!transaction) continue;
+			assertTransaction(transaction, path.basename(paths.root), sessionId);
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "state_corrupt") throw error;
+			logger.warn("Coordinator active-session scan skipped corrupt WAL", { sessionId });
+			continue;
+		}
 		const hasActiveTurn = Object.values(transaction.canonical.turns).some(turn =>
 			["queued", "delivering", "active", "waiting_for_answer", "completing"].includes(turn.status),
 		);
@@ -1418,12 +1491,72 @@ export async function advanceSchedulerCursor(
 export async function readSessionTransaction(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
+	options: { signal?: AbortSignal } = {},
 ): Promise<CoordinatorSessionTransactionV1 | null> {
+	options.signal?.throwIfAborted();
 	const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+	options.signal?.throwIfAborted();
 	if (!transaction) return null;
+	// Atomic WAL replacement permits lock-free snapshots. Normalize only in
+	// memory; durable report migration belongs to explicit projection recovery.
 	assertTransaction(transaction, path.basename(paths.root), sessionId);
-	normalizeOutbox(transaction);
 	return transaction;
+}
+
+export async function repairLegacyReportIds(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<CoordinatorSessionTransactionV1 | null> {
+	options.signal?.throwIfAborted();
+	const file = transactionPath(paths, sessionId);
+	const snapshot = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+	options.signal?.throwIfAborted();
+	if (!snapshot) return null;
+	const hasLegacyReports = Object.keys(snapshot.canonical?.reports ?? {}).some(
+		reportId => !COORDINATOR_REPORT_ID_PATTERN.test(reportId),
+	);
+	if (!hasLegacyReports) {
+		// Atomic WAL replacement permits lock-free snapshots. In-memory schema
+		// normalization alone must never turn an observation into a durable write.
+		assertTransaction(snapshot, path.basename(paths.root), sessionId);
+		return snapshot;
+	}
+	// Only legacy report rekeying needs a durable repair. Re-read under the lock
+	// so a concurrent writer cannot be overwritten; never wait behind that writer
+	// during namespace observation. The caller can skip a contended peer and retry.
+	return await withFileLock(
+		transactionLockPath(paths, sessionId),
+		async () => {
+			const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+			if (!transaction) return null;
+			const legacyReportIds = Object.keys(transaction.canonical?.reports ?? {}).filter(
+				reportId => !COORDINATOR_REPORT_ID_PATTERN.test(reportId),
+			);
+			assertTransaction(transaction, path.basename(paths.root), sessionId);
+			normalizeOutbox(transaction);
+			if (legacyReportIds.some(reportId => !Object.hasOwn(transaction.canonical.reports, reportId))) {
+				// Legacy report ids and their references are repaired as one durable WAL
+				// transaction. Bump the revision so scheduler/projection consumers cannot
+				// mistake the repaired image for the pre-migration one.
+				transaction.revision += 1;
+				transaction.projection.scheduler_pending_revision = transaction.revision;
+				transaction.projection.scheduler_digest = digest(
+					JSON.stringify({
+						session_id: transaction.session_id,
+						revision: transaction.revision,
+						active: transaction.canonical.queue.active_turn_id !== null,
+						state: transaction.canonical.desired_session_state,
+					}),
+				);
+				assertTransaction(transaction, path.basename(paths.root), sessionId);
+				options.signal?.throwIfAborted();
+				await writeAtomic(file, transaction);
+			}
+			return transaction;
+		},
+		{ ...lockOptions(options.signal), retries: 1, retryDelayMs: 0 },
+	);
 }
 
 export async function withSessionTransaction<T>(
@@ -1746,7 +1879,10 @@ export async function bindCreationRequest(
 			)
 		)
 			throw new Error("session_closing");
-		if (request.canonical_create_intent && canonicalJson(request.canonical_create_intent) !== canonicalJson(intent))
+		if (
+			request.canonical_create_intent &&
+			creationIntentDigest(request.canonical_create_intent) !== creationIntentDigest(intent)
+		)
 			throw new Error("idempotency_conflict");
 		request.canonical_create_intent ??= intent;
 		request.session_id = session.session_id;
@@ -2303,10 +2439,19 @@ export async function enumeratePublicDeliveries(
 					after_order_key: afterOrderKey,
 				});
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (error instanceof Error && (error.message === "resource_gone" || error.message === "state_corrupt")) {
+					if (error.message === "state_corrupt")
+						logger.warn("Coordinator delivery scan skipped corrupt WAL", { sessionId });
+				} else throw error;
 			}
-			const endpointIncarnation = (await readSessionTransaction(paths, sessionId))?.canonical.session.broker
-				.endpoint_incarnation;
+			let endpointIncarnation: string | undefined;
+			try {
+				endpointIncarnation = (await readSessionTransaction(paths, sessionId))?.canonical.session.broker
+					.endpoint_incarnation;
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "state_corrupt") throw error;
+				logger.warn("Coordinator delivery scan skipped corrupt WAL", { sessionId });
+			}
 			for (const claim of batch)
 				claims.push({
 					...claim,
@@ -2349,6 +2494,30 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 	);
 	const pinnedRequests = new Set<object>(pinnedPrompts);
 	const pinnedTurns = new Set(pinnedPrompts.map(request => request.coordinator_turn_id));
+	// An active acknowledged turn proves its runtime receipt through the prompt
+	// request that carries it. Dropping that request on retention leaves the WAL
+	// failing its own `assertTransaction` receipt invariant on the next read, so
+	// the session — and every namespace-wide scan that touches it — is corrupt
+	// forever. Retention must never outrank an invariant the reader enforces.
+	const activeTurnStatuses = new Set(["delivering", "active", "waiting_for_answer", "completing"]);
+	const receiptBearingPromptIds = new Set(
+		Object.entries(transaction.requests.prompts)
+			.filter(([, request]) => {
+				const turn = request.coordinator_turn_id
+					? transaction.canonical.turns[request.coordinator_turn_id]
+					: undefined;
+				if (!turn || !activeTurnStatuses.has(turn.status)) return false;
+				const delivery = turn.delivery as Record<string, unknown>;
+				if (delivery.prompt_acknowledged !== true) return false;
+				return (
+					["accepted", "linked", "terminal", "completed"].includes(request.phase) &&
+					request.runtime_receipt?.accepted === true &&
+					request.runtime_receipt.command_id === delivery.runtime_command_id &&
+					request.runtime_receipt.turn_id === delivery.runtime_turn_id
+				);
+			})
+			.map(([id]) => id),
+	);
 	for (const [id, event] of Object.entries(transaction.outbox))
 		if (
 			event.emitted &&
@@ -2362,6 +2531,7 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 			if (
 				request.phase === "completed" &&
 				!pinnedRequests.has(request) &&
+				!receiptBearingPromptIds.has(id) &&
 				old(request.updated_at) &&
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)

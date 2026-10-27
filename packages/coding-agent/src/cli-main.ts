@@ -5,22 +5,16 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
-import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
+import { Args, type CliConfig, CliParseError, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { time } from "@gajae-code/utils/logger";
-import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
-import QuickLane from "./commands/quick-lane";
-import { runBashShellGuardian } from "./exec/bash-shell-guardian";
-import { runBashShellSupervisor } from "./exec/bash-shell-supervisor";
-import { runBashShellWorker } from "./exec/bash-shell-worker";
 import {
 	BASH_SHELL_RUNTIME_ARG,
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
-import { smokeTestIsolatedShell } from "./exec/isolated-shell";
-import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
+import { requireDaemonInternalOwnerId } from "./sdk/bus/daemon-internal-cli-args";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -81,7 +75,7 @@ export const commands: CommandEntry[] = [
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
-	{ name: "quick-lane", load: async () => QuickLane },
+	{ name: "quick-lane", load: () => import("./commands/quick-lane").then(m => m.default) },
 ];
 
 async function showHelp(config: CliConfig): Promise<void> {
@@ -95,14 +89,10 @@ async function showHelp(config: CliConfig): Promise<void> {
 }
 
 async function installRuntimeGlobals(): Promise<void> {
-	const { installH2Fetch } = await import("@gajae-code/ai/utils/h2-fetch");
-	// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
-	// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
-	// can't toggle from JS, so we patch globalThis.fetch to pass
-	// `protocol: "http2"` per request, with transparent HTTP/1.1 fallback on
-	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
-	installH2Fetch();
-
+	// fetch() deliberately stays on HTTP/1.1. Bun's HTTP/2 client (per-request
+	// `protocol: "http2"`) wedges a pooled connection while uploading large
+	// request bodies (~300KB): every later request on it waits forever for
+	// response headers. Do not re-enable HTTP/2 without re-running that probe.
 	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
 	warnIfMacOSNoFileLimitTooLow();
 
@@ -168,12 +158,25 @@ function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
 	return argv[0] === "notify" && argv[1] === "daemon-internal";
 }
 
+function reportInternalDaemonUsageError(command: string, argv: readonly string[]): boolean {
+	try {
+		requireDaemonInternalOwnerId(argv);
+		return false;
+	} catch (error) {
+		if (!(error instanceof CliParseError)) throw error;
+		process.stderr.write(`${APP_NAME} ${command}: ${error.message}\n`);
+		process.exitCode = 2;
+		return true;
+	}
+}
+
 async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
 	const { parseNotifyArgs, runNotifyCommand } = await import("./cli/notify-cli");
 	const cmd = parseNotifyArgs(argv);
 	if (cmd?.action !== "daemon-internal") {
 		throw new Error("invalid notify daemon-internal fast path");
 	}
+	if (!cmd.smoke && reportInternalDaemonUsageError("notify daemon-internal", cmd.rawArgs)) return;
 	await runNotifyCommand(cmd);
 }
 
@@ -187,7 +190,9 @@ async function runChatDaemonInternalFastPath(argv: string[]): Promise<void> {
 		throw new Error("invalid chat daemon internal fast path");
 	}
 	const { runChatDaemonInternal } = await import("./sdk/bus/chat-daemon-cli");
-	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", argv.slice(2));
+	const daemonArgv = argv.slice(2);
+	if (reportInternalDaemonUsageError(`daemon ${action}`, daemonArgv)) return;
+	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", daemonArgv);
 }
 
 type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
@@ -234,7 +239,7 @@ export function runMemoryGuardNativeSmokeFastPath(
 
 async function runMemoryGuardNativeSmokeFastPathFromCli(): Promise<void> {
 	const { runMemoryGuardNativeSmoke } = await import("./cli/native-smoke");
-	runMemoryGuardNativeSmoke();
+	await runMemoryGuardNativeSmoke();
 }
 
 function isLaunchWorktreeSelector(arg: string): boolean {
@@ -335,23 +340,29 @@ function isSubcommand(first: string | undefined): boolean {
 }
 
 /**
- * Smoke-test entry. Spawns the stats sync worker and the browser tab worker, then verifies their protocol.
+ * Smoke-test entry. Spawns the stats sync worker, the browser tab worker, and
+ * the publication-liveness watchdog worker, then verifies their protocol.
  *
  * Purpose: catch silent compiled-worker load regressions (issues #1011,
- * #1027, and #2598). Neither `--version` nor `stats --summary` spawns both
+ * #1027, and #2598). Neither `--version` nor `stats --summary` spawns these
  * worker entries on a fresh install. This probe proves each bundled worker
  * module resolves and evaluates; the tab-worker probe also completes its
- * bootstrap/closed protocol without launching a browser. Wired into
- * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball installs
- * exercise it on every CI run.
+ * bootstrap/closed protocol without launching a browser. The publication
+ * watchdog probe waits for its ready message and does not arm a deadline.
+ * Wired into `scripts/install-tests/run-ci.sh` so binary / source-link /
+ * tarball installs exercise it on every CI run.
  */
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
 	await smokeTestSyncWorker();
 	const { runNativeSmokeTest } = await import("./cli/native-smoke");
 	await runNativeSmokeTest();
+	const { smokeTestTabWorker } = await import("./tools/browser/tab-worker-smoke");
+	const { smokeTestIsolatedShell } = await import("./exec/isolated-shell");
+	const { smokeTestPublicationLivenessWatchdog } = await import("./sdk/broker/publication-liveness-watchdog-smoke");
 	await smokeTestTabWorker();
 	await smokeTestIsolatedShell();
+	await smokeTestPublicationLivenessWatchdog();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -405,14 +416,17 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCliAfterAdmission(argv: string[]): Promise<void> {
 	if (argv.length === 1 && argv[0] === BASH_SHELL_WORKER_ARG) {
+		const { runBashShellGuardian } = await import("./exec/bash-shell-guardian");
 		await runBashShellGuardian();
 		return;
 	}
 	if (argv.length === 1 && argv[0] === BASH_SHELL_SUPERVISOR_ARG) {
+		const { runBashShellSupervisor } = await import("./exec/bash-shell-supervisor");
 		await runBashShellSupervisor();
 		return;
 	}
 	if (argv.length === 1 && argv[0] === BASH_SHELL_RUNTIME_ARG) {
+		const { runBashShellWorker } = await import("./exec/bash-shell-worker");
 		await runBashShellWorker();
 		return;
 	}
@@ -482,6 +496,7 @@ export async function runCliAfterAdmission(argv: string[]): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
+		const { runFixtureReport } = await import("./cli/fixture-report");
 		process.exitCode = await runFixtureReport(id);
 		return;
 	}

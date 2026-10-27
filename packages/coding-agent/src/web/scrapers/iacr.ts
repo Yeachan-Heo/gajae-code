@@ -72,7 +72,7 @@ export const handleIacr: SpecialHandler = async (
 				const converted = await convertWithMarkit(pdfResult.buffer, ".pdf", timeout, signal);
 				if (converted.ok && converted.content.length > 500) {
 					md += `---\n\n## Full Paper\n\n${converted.content}\n`;
-					notes.push("PDF converted via markit");
+					notes.push("PDF converted by native inspector");
 				}
 			}
 		}

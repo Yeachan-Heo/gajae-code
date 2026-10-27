@@ -380,7 +380,7 @@ From `settings-schema.ts`:
 - `compaction.autoContinue` = `true` (gated on unfinished work; see above)
 - `compaction.remoteEnabled` = `true`
 - `compaction.remoteEndpoint` = `undefined`
-- `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; when no positive override is set, the threshold is `contextWindow - max(15% of contextWindow, reserveTokens)`
+- `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; when no positive override is set and adaptive mode is disabled, the default auto-compaction threshold is `min(contextWindow - max(15% of contextWindow, reserveTokens), 300,000)`. While opt-in context promotion is active, the promoted model uses its uncapped reserve-based threshold to benefit from the larger context window.
 - `compaction.adaptive.enabled` = `false`
 - `compaction.adaptive.baseThresholdPercent` = `85`, `compaction.adaptive.aggression` = `0.15`, `compaction.adaptive.turnWindow` = `15` minutes, and `compaction.adaptive.minThresholdPercent` = `50`; when enabled, the adaptive base replaces the sentinel reserve-based percentage and is lowered only for sustained high-context, high-call-rate sessions
 - `compaction.idleEnabled` = `false` (when enabled, idle maintenance rewrites history with reason `"idle"` and never auto-continues)

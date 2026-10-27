@@ -237,3 +237,74 @@ describe("cli run — usage instead of uncaught crash", () => {
 		await expect(runCapturing(["boom"])).rejects.toThrow(/boom: genuine runtime failure/);
 	});
 });
+
+describe("cli registered family dispatch", () => {
+	it("dispatches aliases before help interception or command loading", async () => {
+		let calls = 0;
+		await run({
+			bin: "gjc",
+			version: "1.2.3",
+			argv: ["alias", "nested", "--help", "--json"],
+			commands: [
+				{
+					name: "family",
+					aliases: ["alias"],
+					load: async () => {
+						throw new Error("loader must remain inert");
+					},
+					dispatch: async (argv, context) => {
+						calls++;
+						expect(argv).toEqual(["nested", "--help", "--json"]);
+						expect(context).toEqual({ bin: "gjc", version: "1.2.3", command: "family" });
+					},
+				},
+			],
+		});
+		expect(calls).toBe(1);
+	});
+
+	it("dispatches ordinary and empty family argv without loading", async () => {
+		for (const argv of [["family"], ["family", "operation"], ["family", "--", "--help"]]) {
+			let received: string[] | undefined;
+			await run({
+				bin: "gjc",
+				version: "1",
+				argv,
+				commands: [
+					{
+						name: "family",
+						load: async () => {
+							throw new Error("unexpected load");
+						},
+						dispatch: async args => {
+							received = args;
+						},
+					},
+				],
+			});
+			expect(received).toEqual(argv.slice(1));
+		}
+	});
+
+	it("does not catch dispatch failures with the generic usage writer", async () => {
+		const error = new CliParseError("family-owned failure");
+		await expect(
+			run({
+				bin: "gjc",
+				version: "1",
+				argv: ["family"],
+				commands: [
+					{
+						name: "family",
+						load: async () => {
+							throw new Error("unexpected load");
+						},
+						dispatch: async () => {
+							throw error;
+						},
+					},
+				],
+			}),
+		).rejects.toBe(error);
+	});
+});

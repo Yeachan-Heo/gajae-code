@@ -146,6 +146,7 @@ export type ResolvedOpenAICompat = Required<
 		| "toolChoiceSupport"
 		| "supportsResponsesSessionAffinity"
 		| "supportsServiceTier"
+		| "supportsUltrafastTier"
 		| "reservedToolNames"
 	>
 > & {
@@ -155,6 +156,7 @@ export type ResolvedOpenAICompat = Required<
 	toolStrictMode: ResolvedToolStrictMode;
 	supportsResponsesSessionAffinity?: OpenAICompat["supportsResponsesSessionAffinity"];
 	supportsServiceTier?: OpenAICompat["supportsServiceTier"];
+	supportsUltrafastTier?: OpenAICompat["supportsUltrafastTier"];
 	/** Optional explicit capability override; resolved via deriveToolChoiceSupport. */
 	toolChoiceSupport?: OpenAICompat["toolChoiceSupport"];
 };
@@ -349,6 +351,8 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsDeveloperRole: !isNonStandard,
 		sendSessionHeaders: false,
 		supportsResponsesSessionAffinity: false,
+		supportsServiceTier: false,
+		supportsUltrafastTier: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort:
 			hasAuditedReasoningEffortTransport &&
@@ -422,6 +426,7 @@ export function resolveOpenAICompat(
 				? model.compat.supportsResponsesSessionAffinity
 				: undefined) ?? detected.supportsResponsesSessionAffinity,
 		supportsServiceTier: model.compat.supportsServiceTier ?? detected.supportsServiceTier,
+		supportsUltrafastTier: model.compat.supportsUltrafastTier ?? detected.supportsUltrafastTier,
 		supportsMultipleSystemMessages:
 			model.compat.supportsMultipleSystemMessages ?? detected.supportsMultipleSystemMessages,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,

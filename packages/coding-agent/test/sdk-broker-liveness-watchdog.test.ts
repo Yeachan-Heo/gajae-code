@@ -3,8 +3,17 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { Broker, setHeartbeatStallForTest, setLivenessGraceForTest } from "../src/sdk/broker/broker";
-import { publishBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { publishBrokerDiscovery, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	publicationLivenessHardExitEnabled,
+	publicationLivenessMustExit,
+} from "../src/sdk/broker/publication-liveness-deadline";
+import {
+	setPublicationLivenessSlotExhaustedForTest,
+	setPublicationLivenessWorkerStartFailureForTest,
+} from "../src/sdk/broker/publication-liveness-watchdog";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so a liveness deadline
 // expressed in cadences expires in tens of milliseconds.
@@ -35,6 +44,8 @@ function completedWithin(broker: Broker, ms: number): Promise<boolean> {
 }
 
 afterEach(async () => {
+	setPublicationLivenessWorkerStartFailureForTest(undefined);
+	setPublicationLivenessSlotExhaustedForTest(false);
 	for (const broker of brokers) {
 		setHeartbeatStallForTest(broker, false);
 		setLivenessGraceForTest(broker, undefined);
@@ -72,6 +83,91 @@ test("a broker that keeps publishing is never terminated by the liveness deadlin
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 8);
 
 	expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 24)).toBe(false);
+});
+
+test("AC1: a stalled session checkpoint does not starve discovery heartbeats or block stop", async () => {
+	const broker = await startBroker();
+	const checkpointEntered = Promise.withResolvers<void>();
+	const releaseCheckpoint = Promise.withResolvers<void>();
+	// Install after startup so only the periodic checkpoint stalls; retained
+	// publication IO and the broker's watchdog/checkpoint wrapper stay real.
+	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats").mockImplementation(async () => {
+		checkpointEntered.resolve();
+		await releaseCheckpoint.promise;
+		return 0;
+	});
+	try {
+		expect(
+			await Promise.race([
+				checkpointEntered.promise.then(() => true),
+				Bun.sleep(WATCHDOG_CADENCE_MS * 20).then(() => false),
+			]),
+		).toBe(true);
+		const before = await readBrokerDiscovery(broker.settings.agentDir, HEARTBEAT_TTL_MS);
+		expect(before).not.toBeNull();
+		let heartbeatAt = before!.heartbeatAt;
+		await Bun.sleep(HEARTBEAT_TTL_MS + WATCHDOG_CADENCE_MS);
+		for (let tick = 0; tick < 3; tick += 1) {
+			expect(checkpoint).toHaveBeenCalledTimes(1);
+			const discovery = await readBrokerDiscovery(broker.settings.agentDir, HEARTBEAT_TTL_MS);
+			expect(discovery).not.toBeNull();
+			expect(discovery!.ownerId).toBe(before!.ownerId);
+			expect(discovery!.heartbeatAt).toBeGreaterThan(heartbeatAt);
+			heartbeatAt = discovery!.heartbeatAt;
+			await Bun.sleep(WATCHDOG_CADENCE_MS * 2);
+		}
+		expect(checkpoint).toHaveBeenCalledTimes(1);
+		// Stop must settle while the checkpoint is still waiting on its release.
+		expect(
+			await Promise.race([broker.stop().then(() => true), Bun.sleep(WATCHDOG_CADENCE_MS * 20).then(() => false)]),
+		).toBe(true);
+	} finally {
+		releaseCheckpoint.resolve();
+		checkpoint.mockRestore();
+		await broker.stop();
+	}
+});
+
+test("AC2: a contender yields to the live owner while its session checkpoint is stalled beyond discovery TTL", async () => {
+	const broker = await startBroker();
+	const checkpointEntered = Promise.withResolvers<void>();
+	const releaseCheckpoint = Promise.withResolvers<void>();
+	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats").mockImplementation(async () => {
+		checkpointEntered.resolve();
+		await releaseCheckpoint.promise;
+		return 0;
+	});
+	const info = vi.spyOn(logger, "info");
+	try {
+		expect(
+			await Promise.race([
+				checkpointEntered.promise.then(() => true),
+				Bun.sleep(WATCHDOG_CADENCE_MS * 20).then(() => false),
+			]),
+		).toBe(true);
+		const owner = broker.discovery!;
+		await Bun.sleep(HEARTBEAT_TTL_MS + WATCHDOG_CADENCE_MS);
+		const contender = new Broker({ agentDir: broker.settings.agentDir, heartbeatTtlMs: HEARTBEAT_TTL_MS });
+		brokers.push(contender);
+		const discovered = await contender.start();
+		expect(discovered).toMatchObject({
+			ownerId: owner.ownerId,
+			pid: owner.pid,
+			url: owner.url,
+			token: owner.token,
+			startedAt: owner.startedAt,
+		});
+		expect(info).toHaveBeenCalledWith(
+			expect.any(String),
+			expect.objectContaining({ reason: "startup-race-lost", ownerId: owner.ownerId, pid: owner.pid, exitCode: 0 }),
+		);
+		expect(checkpoint).toHaveBeenCalledTimes(1);
+	} finally {
+		releaseCheckpoint.resolve();
+		checkpoint.mockRestore();
+		info.mockRestore();
+		await broker.stop();
+	}
 });
 
 test("the retained heartbeat never runs its blocking write or fsync on the JS thread", async () => {
@@ -209,6 +305,237 @@ test("a stale watchdog observation cannot mutate a restarted broker generation",
 		retain.mockRestore();
 	}
 });
+
+interface WatchdogInitChildReport {
+	result: string;
+	message?: string;
+	reason?: string | null;
+	mode?: string | null;
+	memory?: boolean;
+	file?: boolean;
+	lock?: boolean;
+}
+
+async function runWatchdogInitChild(mode: "fail" | "slots" | "lost"): Promise<WatchdogInitChildReport> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-init-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const home = path.join(root, "home");
+	await fs.mkdir(home);
+	const childPath = path.join(import.meta.dir, "sdk-broker-liveness-watchdog-init-child.ts");
+	const child = Bun.spawn([process.execPath, childPath, agentDir, mode], {
+		cwd: path.join(import.meta.dir, ".."),
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			HOME: home,
+			GJC_CODING_AGENT_DIR: agentDir,
+			GJC_BROKER_LIVENESS_HARD_EXIT: "1",
+		},
+	});
+	const finished = await Promise.race([child.exited.then(() => true), Bun.sleep(10_000).then(() => false)]);
+	if (!finished) child.kill("SIGKILL");
+	const stdout = await new Response(child.stdout).text();
+	const stderr = await new Response(child.stderr).text();
+	expect(finished, `still alive\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(true);
+	expect(child.exitCode, `${stderr}\n${stdout}`).toBe(0);
+	const line = stdout
+		.trim()
+		.split("\n")
+		.findLast(row => row.startsWith("{"));
+	expect(line, stdout).toBeTruthy();
+	return JSON.parse(line ?? "{}") as WatchdogInitChildReport;
+}
+
+test("broker startup fails and releases lock and discovery when the liveness watchdog cannot start", async () => {
+	const report = await runWatchdogInitChild("fail");
+	expect(report.result).toBe("failed");
+	expect(report.message).toContain("publication liveness watchdog unavailable");
+	expect(report.message).toContain("worker failed to start");
+	expect(report.memory).toBe(false);
+	expect(report.file).toBe(false);
+	expect(report.lock).toBe(false);
+}, 15_000);
+
+test("broker startup fails and releases lock and discovery when the liveness watchdog slot table is full", async () => {
+	const report = await runWatchdogInitChild("slots");
+	expect(report.result).toBe("failed");
+	expect(report.message).toContain("publication liveness watchdog slot table is full");
+	expect(report.memory).toBe(false);
+	expect(report.file).toBe(false);
+	expect(report.lock).toBe(false);
+}, 15_000);
+
+test("a watchdog worker that exits after startup ends the broker", async () => {
+	const report = await runWatchdogInitChild("lost");
+	expect(report).toMatchObject({
+		result: "exited",
+		reason: "publication-liveness-timeout",
+		mode: "lost-root",
+		memory: false,
+		file: true,
+		lock: true,
+	});
+}, 15_000);
+
+test("hard-exit opt-out still starts when watchdog initialization cannot succeed", async () => {
+	const previous = process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
+	process.env.GJC_BROKER_LIVENESS_HARD_EXIT = "0";
+	setPublicationLivenessWorkerStartFailureForTest(new Error("worker failed to start"));
+	setPublicationLivenessSlotExhaustedForTest(true);
+	try {
+		const broker = await startBroker();
+		expect(broker.discovery).not.toBeNull();
+		expect((await readBrokerDiscovery(broker.settings.agentDir, HEARTBEAT_TTL_MS))?.ownerId).toBe(
+			broker.discovery?.ownerId,
+		);
+		const lockPath = path.join(broker.settings.agentDir, "sdk", "broker.lock");
+		expect(await fs.stat(lockPath)).toBeTruthy();
+	} finally {
+		setPublicationLivenessWorkerStartFailureForTest(undefined);
+		setPublicationLivenessSlotExhaustedForTest(false);
+		if (previous === undefined) delete process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
+		else process.env.GJC_BROKER_LIVENESS_HARD_EXIT = previous;
+	}
+});
+
+test("publication liveness hard-exit stays disarmed in the test runner", () => {
+	expect(publicationLivenessHardExitEnabled()).toBe(false);
+	expect(publicationLivenessHardExitEnabled({ GJC_BROKER_LIVENESS_HARD_EXIT: "1", BUN_ENV: "test" })).toBe(true);
+	expect(publicationLivenessHardExitEnabled({ GJC_BROKER_LIVENESS_HARD_EXIT: "0" })).toBe(false);
+});
+
+test("a blocked event loop is the only hard-exit case", () => {
+	const graceMs = 60_000n;
+	const cadenceMs = 5_000n;
+	const publishedMs = 1_000n;
+	// cadence * 4 = 20s, which is inside the 60s publication grace.
+	const loopLimitMs = 20_000n;
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs - 1n,
+			publishedMs,
+			loopMs: publishedMs,
+			graceMs,
+			cadenceMs,
+			active: 1n,
+		}),
+	).toBe(false);
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs,
+			publishedMs,
+			loopMs: publishedMs + graceMs - cadenceMs,
+			graceMs,
+			cadenceMs,
+			active: 1n,
+		}),
+	).toBe(false);
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs,
+			publishedMs,
+			loopMs: publishedMs + graceMs - loopLimitMs,
+			graceMs,
+			cadenceMs,
+			active: 1n,
+		}),
+	).toBe(true);
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs,
+			publishedMs,
+			loopMs: publishedMs + graceMs - loopLimitMs,
+			graceMs,
+			cadenceMs,
+			active: 0n,
+		}),
+	).toBe(false);
+});
+
+test("a heartbeat write that blocks the JS thread still trips publication-liveness-timeout", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-block-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const home = path.join(root, "home");
+	await fs.mkdir(home);
+	const graceMs = 500;
+	const blockMs = 30_000;
+	const childPath = path.join(import.meta.dir, "sdk-broker-liveness-blocked-write-child.ts");
+	const startedAt = performance.now();
+	const child = Bun.spawn([process.execPath, childPath, agentDir, String(graceMs), String(blockMs)], {
+		cwd: path.join(import.meta.dir, ".."),
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			HOME: home,
+			GJC_CODING_AGENT_DIR: agentDir,
+			GJC_BROKER_LIVENESS_HARD_EXIT: "1",
+		},
+	});
+	const finished = await Promise.race([child.exited.then(() => true), Bun.sleep(15_000).then(() => false)]);
+	if (!finished) child.kill("SIGKILL");
+	const stdout = await new Response(child.stdout).text();
+	const stderr = await new Response(child.stderr).text();
+	const elapsedMs = performance.now() - startedAt;
+	expect(finished, `still alive after ${elapsedMs}ms\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(true);
+	expect(stdout, stderr).toContain("hooks-installed");
+	expect(stdout, stderr).not.toContain("graceful");
+	expect(stderr, stdout).toContain("sdk broker: publication-liveness-timeout");
+	expect(elapsedMs, stderr).toBeLessThan(blockMs);
+	expect(
+		child.signalCode === "SIGKILL" || child.exitCode === 137,
+		`signal=${String(child.signalCode)} exit=${String(child.exitCode)}\n${stderr}`,
+	).toBe(true);
+}, 30_000);
+
+test.skipIf(process.platform === "win32")(
+	"publication-liveness SIGKILL still fires when stderr cannot accept a write",
+	async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-stderr-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const home = path.join(root, "home");
+		await fs.mkdir(home);
+		const graceMs = 500;
+		const blockMs = 30_000;
+		const childPath = path.join(import.meta.dir, "sdk-broker-liveness-blocked-write-child.ts");
+		const startedAt = performance.now();
+		const child = Bun.spawn(
+			[process.execPath, childPath, agentDir, String(graceMs), String(blockMs), "block-stderr"],
+			{
+				cwd: path.join(import.meta.dir, ".."),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					HOME: home,
+					GJC_CODING_AGENT_DIR: agentDir,
+					GJC_BROKER_LIVENESS_HARD_EXIT: "1",
+				},
+			},
+		);
+		const finished = await Promise.race([child.exited.then(() => true), Bun.sleep(15_000).then(() => false)]);
+		if (!finished) child.kill("SIGKILL");
+		const stdout = await new Response(child.stdout).text();
+		const elapsedMs = performance.now() - startedAt;
+		expect(finished, `still alive after ${elapsedMs}ms\nstdout:\n${stdout}`).toBe(true);
+		expect(stdout).toContain("hooks-installed");
+		expect(stdout).toContain("stderr-blocked");
+		expect(stdout).not.toContain("graceful");
+		expect(elapsedMs).toBeLessThan(blockMs);
+		expect(
+			child.signalCode === "SIGKILL" || child.exitCode === 137,
+			`signal=${String(child.signalCode)} exit=${String(child.exitCode)}`,
+		).toBe(true);
+	},
+	30_000,
+);
 
 test("a heartbeat that resumes before the deadline clears the accrued stall", async () => {
 	const broker = await startBroker();

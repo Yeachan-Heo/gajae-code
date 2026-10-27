@@ -23,6 +23,8 @@ import {
 	piTimeout,
 } from "@gajae-code/ai/providers/cursor/exec-modern";
 import { sanitizeText } from "@gajae-code/utils";
+import { assertDeleteInsideWorkspace } from "./cursor-delete-path";
+import { cursorMcpDispatchName } from "./cursor-mcp-name";
 import { resolveToCwd } from "./tools/path-utils";
 
 /**
@@ -184,6 +186,7 @@ async function executeDelete(
 			throw new Error(`Path is not a file: ${pathArg}`);
 		}
 
+		await assertDeleteInsideWorkspace(options.cwd, absolutePath);
 		fs.rmSync(absolutePath);
 
 		const sizeText = fileStat.size ? ` (${fileStat.size} bytes)` : "";
@@ -646,11 +649,19 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 	async mcp(call: CursorMcpCall, signal?: AbortSignal, markNonAbortable?: () => void) {
 		const options = this.#optionsForCall();
-		const toolName = call.toolName || call.name;
+		const requestedName = call.toolName || call.name || "";
+		const toolName = cursorMcpDispatchName(call);
 		const toolCallId = decodeToolCallId(call.toolCallId);
+		const availableTools = Array.from(options.tools.keys()).filter(
+			name => cursorMcpDispatchName({ toolName: name }) !== null,
+		);
+		if (!toolName) {
+			const message = formatMcpToolErrorMessage(requestedName, availableTools);
+			const result = buildToolErrorResult(message);
+			return createToolResultMessage(toolCallId, requestedName || "mcp", result, true);
+		}
 		const tool = options.tools.get(toolName);
 		if (!tool) {
-			const availableTools = Array.from(options.tools.keys()).filter(name => name.startsWith("mcp__"));
 			const message = formatMcpToolErrorMessage(toolName, availableTools);
 			const result = buildToolErrorResult(message);
 			return createToolResultMessage(toolCallId, toolName, result, true);

@@ -1,16 +1,133 @@
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
+import { sanitizeText } from "@gajae-code/utils";
 import { LRUCache } from "lru-cache/raw";
 import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
+import { hasSvgFence, isClosedSvgFence } from "../chat/svg-source";
 import type { SymbolTheme } from "../symbols";
 import { TERMINAL } from "../terminal-capabilities";
 import type { Component } from "../tui";
 import {
+	annotateCopyOrigin,
+	annotateCopyRow,
 	applyBackgroundToLine,
+	copyAnnotationsEnabled,
+	getIndentation,
 	padding,
+	replaceCopyAnnotationSourceId,
 	replaceTabs,
 	type ViewportAnchorSpan,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "../utils";
+
+// Source text cannot supply renderer-owned decoration or wrap hints.
+const copyHintNonce = crypto.randomUUID();
+const COPY_CODE_ROW_PREFIX = `\x1b_AGJC_COPY_CODE:${copyHintNonce}:`;
+const COPY_CODE_ROW_REGEX = new RegExp(COPY_CODE_ROW_PREFIX + String.raw`([a-z]+)\x1b\\`, "gu");
+const copyCodeRow = (text: string): "open" | "content" | "close" | null => {
+	const match = COPY_CODE_ROW_REGEX.exec(text);
+	COPY_CODE_ROW_REGEX.lastIndex = 0;
+	return match?.[1] === "open" || match?.[1] === "content" || match?.[1] === "close" ? match[1] : null;
+};
+const stripCopyCodeRow = (text: string): string => text.replace(COPY_CODE_ROW_REGEX, "");
+const COPY_TABLE_RANGES_PREFIX = `\x1b_AGJC_COPY_TABLE:${copyHintNonce}:`;
+const COPY_TABLE_RANGES_REGEX = new RegExp(COPY_TABLE_RANGES_PREFIX + String.raw`([^\x1b]*)\x1b\\`, "gu");
+const copyTableRanges = (text: string): Array<[number, number]> | undefined => {
+	const match = COPY_TABLE_RANGES_REGEX.exec(text);
+	COPY_TABLE_RANGES_REGEX.lastIndex = 0;
+	if (!match) return undefined;
+	if (match[1] === "-") return [];
+	if (!match[1]) return undefined;
+	const ranges = match[1].split(",").map(pair => pair.split("-").map(Number));
+	return ranges.every(range => range.length === 2 && Number.isSafeInteger(range[0]) && Number.isSafeInteger(range[1]))
+		? (ranges as Array<[number, number]>)
+		: undefined;
+};
+const stripCopyTableRanges = (text: string): string => text.replace(COPY_TABLE_RANGES_REGEX, "");
+
+// A table row that continues the wrapped cells of the row above carries, per
+// cell, the source text the soft wrap removed before that cell's fragment.
+const COPY_TABLE_WRAP_PREFIX = `\x1b_AGJC_COPY_TABLE_WRAP:${copyHintNonce}:`;
+const COPY_TABLE_WRAP_REGEX = new RegExp(COPY_TABLE_WRAP_PREFIX + String.raw`([^\x1b]*)\x1b\\`, "gu");
+const copyTableWrap = (text: string): string[] | undefined => {
+	const match = COPY_TABLE_WRAP_REGEX.exec(text);
+	COPY_TABLE_WRAP_REGEX.lastIndex = 0;
+	if (!match) return undefined;
+	try {
+		const gaps: unknown = JSON.parse(decodeURIComponent(match[1]!));
+		return Array.isArray(gaps) && gaps.every(gap => typeof gap === "string") ? gaps : undefined;
+	} catch {
+		return undefined;
+	}
+};
+const stripCopyTableWrap = (text: string): string => text.replace(COPY_TABLE_WRAP_REGEX, "");
+
+const COPY_QUOTE_DEPTH_PREFIX = `\x1b_AGJC_COPY_QUOTE_DEPTH:${copyHintNonce}:`;
+const COPY_QUOTE_DEPTH_REGEX = new RegExp(COPY_QUOTE_DEPTH_PREFIX + String.raw`(\d+)\x1b\\`, "gu");
+const copyQuoteDepth = (text: string): number => {
+	const match = COPY_QUOTE_DEPTH_REGEX.exec(text);
+	COPY_QUOTE_DEPTH_REGEX.lastIndex = 0;
+	return match ? Number(match[1]) : 0;
+};
+const stripCopyQuoteDepth = (text: string): string => text.replace(COPY_QUOTE_DEPTH_REGEX, "");
+
+// Zero-width marker where a code or table row's own content begins. Its visible
+// column on the final logical row measures every enclosing prefix (list indent,
+// code indent) without each container having to report its width.
+const COPY_ROW_START = `\x1b_AGJC_COPY_ROW_START:${copyHintNonce}\x1b\\`;
+const copyRowStartColumn = (line: string): number => {
+	const at = line.indexOf(COPY_ROW_START);
+	return at < 0 ? 0 : visibleWidth(line.slice(0, at));
+};
+
+const COPY_QUOTE_CONTINUATION_PREFIX = `\x1b_AGJC_COPY_QUOTE_WRAP:${copyHintNonce}:`;
+const COPY_QUOTE_CONTINUATION_REGEX = new RegExp(COPY_QUOTE_CONTINUATION_PREFIX + String.raw`([^\x1b]*)\x1b\\`, "gu");
+const stripCopyQuoteContinuation = (text: string): string => text.replace(COPY_QUOTE_CONTINUATION_REGEX, "");
+const stripCopyHints = (text: string): string =>
+	text.includes("\x1b_AGJC_COPY_")
+		? stripCopyTableWrap(
+				stripCopyTableRanges(
+					stripCopyCodeRow(stripCopyQuoteDepth(stripCopyQuoteContinuation(text))).replaceAll(COPY_ROW_START, ""),
+				),
+			)
+		: text;
+/**
+ * Pair each rendered code token, at any nesting depth, with the original-spelling
+ * text of the code token at the same tree position. A pair is kept only when the
+ * texts agree once tabs are dropped: marked re-expands list-item tabs to its own
+ * stops, so exact tab-replaced equality would refuse every list code block, and a
+ * tab-induced structure change still cannot restore another block's text.
+ */
+const pairOriginalCode = (rendered: unknown, original: unknown, pairs: Map<Token, string>): void => {
+	if (Array.isArray(rendered)) {
+		if (!Array.isArray(original)) return;
+		for (const [index, child] of rendered.entries()) pairOriginalCode(child, original[index], pairs);
+		return;
+	}
+	if (typeof rendered !== "object" || rendered === null || typeof original !== "object" || original === null) return;
+	const token = rendered as Token;
+	const source = original as Token;
+	if (token.type !== source.type) return;
+	if (token.type === "code" && source.type === "code") {
+		const bare = (text: string): string => text.replace(/[\t ]+/gu, " ");
+		if (bare(source.text) === bare(token.text)) pairs.set(token, source.text);
+		return;
+	}
+	if ("tokens" in token) pairOriginalCode(token.tokens, "tokens" in source ? source.tokens : undefined, pairs);
+	if ("items" in token) pairOriginalCode(token.items, "items" in source ? source.items : undefined, pairs);
+};
+const copyQuoteGap = (text: string): string => {
+	const match = COPY_QUOTE_CONTINUATION_REGEX.exec(text);
+	COPY_QUOTE_CONTINUATION_REGEX.lastIndex = 0;
+	if (!match) return "";
+	try {
+		return decodeURIComponent(match[1]!);
+	} catch {
+		return "";
+	}
+};
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
@@ -48,6 +165,7 @@ markdownParser.setOptions({
 const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
 const DOCUMENT_CACHE_SIZE = 8 * 1024 * 1024;
 const DOCUMENT_ENTRY_SIZE = 1024 * 1024;
+const CACHED_COPY_SOURCE_ID = "cached";
 
 /** Account retained payload, not live heap. Stop once admission is impossible. */
 export function getMarkdownCacheEntryAccountedSize(key: string, value: unknown, cap: number): number {
@@ -214,10 +332,12 @@ export function resetMarkdownHighlightCallCount(): void {
 export const __markdownPerfCounters = {
 	lexerInvocations: 0,
 	lexedBytes: 0,
+	svgFenceDetectionCalls: 0,
 	highlightAdmissionScans: 0,
 	reset(): void {
 		this.lexerInvocations = 0;
 		this.lexedBytes = 0;
+		this.svgFenceDetectionCalls = 0;
 		this.highlightAdmissionScans = 0;
 	},
 };
@@ -307,7 +427,27 @@ export interface MarkdownTheme {
 	 * Return null to fall back to fenced code rendering.
 	 */
 	resolveMermaidAscii?: (source: string) => string | null;
+	/**
+	 * Resolve an SVG figure component by fenced block source text. Components
+	 * are retained by fence order. Return null for a stable fenced-code fallback
+	 * that disposes a previous component; return undefined for a fallback that
+	 * preserves the previous component and should be retried on the next render.
+	 */
+	resolveSvgFigure?: (source: string, context: SvgFigureResolveContext) => Component | null | undefined;
 	symbols: SymbolTheme;
+}
+
+export interface SvgFigureResolveContext {
+	/** Whether the containing message is still streaming. */
+	streaming: boolean;
+	/** The individual code fence has received its closing marker. */
+	closed: boolean;
+	/** Request a repaint after the figure's asynchronous output changes. */
+	onChange: () => void;
+	/** Available render width in terminal cells. */
+	width: number;
+	/** The component previously resolved for this fence position, if any. */
+	previous?: Component;
 }
 
 interface InlineStyleContext {
@@ -319,17 +459,78 @@ type ListToken = Token & { items: Array<{ tokens?: Token[] }>; ordered: boolean;
 type TableCellToken = { tokens?: Token[] };
 type TableToken = Token & { header: TableCellToken[]; rows: TableCellToken[][]; raw?: string };
 
+/** Relative markdown links follow the active session's process cwd and home. */
+function markdownLinkContextKey(): string {
+	let cwd = "<unavailable>";
+	let home = "<unavailable>";
+	try {
+		cwd = process.cwd();
+	} catch {}
+	try {
+		home = os.homedir();
+	} catch {}
+	return `${cwd}\x00${home}`;
+}
+
+/** Decodes valid `%XX` runs; a `%` that does not start a valid UTF-8 escape stays a literal percent sign. */
+function decodePercentEscapes(value: string): string {
+	return value.replace(/(?:%[0-9a-f]{2})+/giu, escapes => {
+		try {
+			return decodeURIComponent(escapes);
+		} catch {
+			return escapes;
+		}
+	});
+}
+
+/**
+ * Converts a local Markdown link destination to an absolute `file://` URI. The destination is a URI
+ * reference: its path may be percent-encoded, and `?` or `#` starts the query or fragment, which stay
+ * URI components instead of becoming part of the filename.
+ */
+function localFileUri(target: string): string {
+	const suffixStart = target.search(/[?#]/u);
+	const pathPart = suffixStart === -1 ? target : target.slice(0, suffixStart);
+	const suffix = suffixStart === -1 ? "" : target.slice(suffixStart);
+	const filePath = decodePercentEscapes(pathPart);
+	let absolutePath: string;
+	if (path.isAbsolute(filePath)) {
+		absolutePath = filePath;
+	} else if (filePath === "~") {
+		absolutePath = os.homedir();
+	} else if (filePath.startsWith("~/")) {
+		absolutePath = path.resolve(os.homedir(), filePath.slice(2));
+	} else {
+		absolutePath = path.resolve(process.cwd(), filePath);
+	}
+	const fileUrl = url.pathToFileURL(absolutePath);
+	return suffix ? new URL(suffix, fileUrl).href : fileUrl.href;
+}
+
 function formatHyperlink(text: string, target: string): string {
 	if (!TERMINAL.hyperlinks || !target) {
 		return text;
 	}
 
-	const safeTarget = target.replaceAll("\x1b", "").replaceAll("\x07", "");
-	if (!safeTarget) {
+	if (/[\u0000-\u001f\u007f-\u009f]/u.test(target)) {
 		return text;
 	}
 
-	return `\x1b]8;;${safeTarget}\x07${text}\x1b]8;;\x07`;
+	// `#fragment` and `//authority/path` (network-path reference) are URI references, not local paths.
+	let destination = target;
+	if (
+		!target.startsWith("#") &&
+		!target.startsWith("//") &&
+		(path.isAbsolute(target) || !/^[a-z][a-z\d+.-]*:/iu.test(target))
+	) {
+		try {
+			destination = localFileUri(target);
+		} catch {
+			return text;
+		}
+	}
+
+	return `\x1b]8;;${destination}\x07${text}\x1b]8;;\x07`;
 }
 
 function stripHtmlComments(raw: string): string {
@@ -355,6 +556,15 @@ function stripHtmlComments(raw: string): string {
 	return result;
 }
 
+// Untrusted source is sanitized before marked parses it. Theme SGR, OSC 8, and
+// copy APCs are added later and must stay. sanitizeText drops CR, which is a
+// line break today, so normalize CR/CRLF to LF first.
+function sanitizeMarkdownSource(text: string | null | undefined): string {
+	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
+	if (typeof text !== "string") return "";
+	return sanitizeText(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+}
+
 export class Markdown implements Component {
 	#text: string;
 	#paddingX: number; // Left/right padding
@@ -364,6 +574,12 @@ export class Markdown implements Component {
 	#defaultStylePrefix?: string;
 	/** Number of spaces used to indent code block content. */
 	#codeBlockIndent: number;
+	#copySourceId = crypto.randomUUID();
+	#cachedCopyEnabled = false;
+	/** Original-spelling lex, reused while the text is unchanged (streaming re-renders). */
+	#originalParse?: { source: string; tokens: Token[] };
+	/** Code tokens emitted as code rows while rendering one top-level token, in row order. */
+	#emittedCode: Token[] = [];
 
 	// Cache for rendered output
 	#cachedText?: string;
@@ -377,6 +593,16 @@ export class Markdown implements Component {
 	#lastFullParseAt = 0;
 	#onStaleThrottle?: () => void;
 	#staleThrottleTimer?: ReturnType<typeof setTimeout>;
+	#mayHaveDynamicSvgFigures: boolean;
+	#svgFenceDetectionPending = false;
+	#svgResolverAvailable: boolean;
+	#hasActiveDynamicSvgFigures = false;
+	#hasRetryableSvgFigureFallback = false;
+	#cachedImageProtocol: typeof TERMINAL.imageProtocol | undefined;
+	#cachedLinkContextKey?: string;
+	#dynamicFigures = new Map<number, Component>();
+	#nextDynamicFigureIndex = 0;
+	#disposed = false;
 
 	constructor(
 		text: string,
@@ -386,7 +612,11 @@ export class Markdown implements Component {
 		defaultTextStyle?: DefaultTextStyle,
 		codeBlockIndent: number = 2,
 	) {
-		this.#text = text;
+		const source = sanitizeMarkdownSource(text);
+		this.#text = source;
+		this.#svgResolverAvailable = theme.resolveSvgFigure !== undefined;
+		if (this.#svgResolverAvailable) __markdownPerfCounters.svgFenceDetectionCalls++;
+		this.#mayHaveDynamicSvgFigures = this.#svgResolverAvailable && hasSvgFence(source);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -399,11 +629,28 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string, options?: { streaming?: boolean }): void {
+		const source = sanitizeMarkdownSource(text);
 		if (options?.streaming !== undefined) {
 			this.setStreaming(options.streaming);
 		}
-		if (this.#text !== text) this.#rejectedParseKey = undefined;
-		this.#text = text;
+		if (this.#text !== source) this.#rejectedParseKey = undefined;
+		const textChanged = this.#text !== source;
+		this.#text = source;
+		const svgResolverAvailable = this.#theme.resolveSvgFigure !== undefined;
+		const svgResolverChanged = svgResolverAvailable !== this.#svgResolverAvailable;
+		this.#svgResolverAvailable = svgResolverAvailable;
+		if (!svgResolverAvailable) {
+			this.#mayHaveDynamicSvgFigures = false;
+			this.#svgFenceDetectionPending = false;
+		} else if (this.#streaming) {
+			// Streaming writes already feed the throttled lexer; don't rescan the growing
+			// document here before that parse budget gets a chance to run.
+			if (textChanged || svgResolverChanged) this.#svgFenceDetectionPending = true;
+		} else {
+			__markdownPerfCounters.svgFenceDetectionCalls++;
+			this.#mayHaveDynamicSvgFigures = hasSvgFence(source);
+			this.#svgFenceDetectionPending = false;
+		}
 		if (this.#streaming) {
 			return;
 		}
@@ -441,9 +688,11 @@ export class Markdown implements Component {
 	}
 
 	dispose(): void {
+		this.#disposed = true;
 		this.#clearStaleThrottleTimer();
 		this.#currentParse = undefined;
 		this.#rejectedParseKey = undefined;
+		this.#disposeDynamicFiguresFrom(0);
 	}
 
 	invalidate(): void {
@@ -451,6 +700,48 @@ export class Markdown implements Component {
 		this.#cachedWidth = undefined;
 		this.#cachedLines = undefined;
 		this.#cachedAnchorSpans = undefined;
+		this.#lastFullParseAt = 0;
+		this.#clearStaleThrottleTimer();
+	}
+
+	#disposeDynamicFiguresFrom(startIndex: number): void {
+		for (const [index, component] of this.#dynamicFigures) {
+			if (index < startIndex) continue;
+			this.#dynamicFigures.delete(index);
+			component.dispose?.();
+		}
+	}
+
+	#resolveDynamicFigure(source: string, closed: boolean, width: number): Component | undefined {
+		const index = this.#nextDynamicFigureIndex++;
+		const previous = this.#dynamicFigures.get(index);
+		const component = this.#theme.resolveSvgFigure?.(source, {
+			streaming: this.#streaming,
+			closed,
+			width,
+			onChange: () => {
+				if (this.#disposed) return;
+				this.invalidate();
+				this.#onStaleThrottle?.();
+			},
+			previous,
+		});
+		if (component) {
+			if (previous && previous !== component) previous.dispose?.();
+			this.#dynamicFigures.set(index, component);
+			this.#hasActiveDynamicSvgFigures = true;
+			return component;
+		}
+		if (component === undefined) {
+			this.#hasRetryableSvgFigureFallback = true;
+			if (previous) this.#dynamicFigures.set(index, previous);
+		} else if (previous) {
+			// A stable fallback no longer needs the component or any raster data it
+			// retains. A future source change can create a fresh component.
+			this.#dynamicFigures.delete(index);
+			previous.dispose?.();
+		}
+		return undefined;
 	}
 
 	#exceedsHighlightCap(code: string): boolean {
@@ -483,35 +774,56 @@ export class Markdown implements Component {
 		return result;
 	}
 
-	#emitCodeBlock(lines: string[], code: string, lang: string, codeIndent: string): void {
-		lines.push(this.#theme.codeBlockBorder(`\`\`\`${lang}`));
+	/** `token` is the rendered code token; copy rows map it back to its original text. */
+	#emitCodeBlock(lines: string[], token: Token, code: string, lang: string, codeIndent: string): void {
+		this.#emittedCode.push(token);
+		lines.push(`${this.#theme.codeBlockBorder(`\`\`\`${lang}`)}${COPY_CODE_ROW_PREFIX}open\x1b\\`);
 		const highlighted = this.#highlightCodeBlock(code, lang);
 		if (highlighted) {
 			for (const hlLine of highlighted) {
-				lines.push(`${codeIndent}${hlLine}`);
+				lines.push(`${COPY_ROW_START}${codeIndent}${hlLine}${COPY_CODE_ROW_PREFIX}content\x1b\\`);
 			}
 		} else {
 			if (this.#theme.highlightCode && this.#exceedsHighlightCap(code)) {
 				lines.push(`${codeIndent}${this.#theme.codeBlock("[syntax highlighting skipped: code block too large]")}`);
 			}
 			for (const codeLine of code.split("\n")) {
-				lines.push(`${codeIndent}${this.#theme.codeBlock(codeLine)}`);
+				lines.push(
+					`${COPY_ROW_START}${codeIndent}${this.#theme.codeBlock(codeLine)}${COPY_CODE_ROW_PREFIX}content\x1b\\`,
+				);
 			}
 		}
-		lines.push(this.#theme.codeBlockBorder("```"));
+		lines.push(`${this.#theme.codeBlockBorder("```")}${COPY_CODE_ROW_PREFIX}close\x1b\\`);
 	}
 
 	render(width: number): string[] {
 		return this.#render(width, false).lines;
 	}
 
+	/** Bind cached rows to this instance, or drop copy data when no copying TUI runs. */
+	#bindCopySource(lines: string[], copyEnabled: boolean): string[] {
+		this.#cachedCopyEnabled = copyEnabled;
+		return copyEnabled ? lines.map(line => replaceCopyAnnotationSourceId(line, this.#copySourceId)) : lines;
+	}
+
 	#render(width: number, includeAnchors: boolean): { lines: string[]; spans?: Array<ViewportAnchorSpan | null> } {
+		if (!this.#mayHaveDynamicSvgFigures) this.#disposeDynamicFiguresFrom(0);
+
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
+		const copyEnabled = copyAnnotationsEnabled();
+		// Only bracketed Markdown can contain a link target; plain text stays shared.
+		const linkContextKey = this.#text.includes("]") ? markdownLinkContextKey() : "";
 		if (
+			!this.#hasActiveDynamicSvgFigures &&
+			!this.#hasRetryableSvgFigureFallback &&
+			!this.#svgFenceDetectionPending &&
 			this.#cachedLines &&
 			this.#cachedText === this.#text &&
 			this.#cachedWidth === width &&
+			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedLinkContextKey === linkContextKey &&
+			this.#cachedCopyEnabled === copyEnabled &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
 			return { lines: this.#cachedLines, spans: this.#cachedAnchorSpans };
@@ -521,9 +833,14 @@ export class Markdown implements Component {
 		const contentWidth = Math.max(1, width - this.#paddingX * 2);
 
 		if (
+			!this.#hasActiveDynamicSvgFigures &&
+			!this.#hasRetryableSvgFigureFallback &&
 			this.#streaming &&
 			this.#cachedLines &&
 			this.#cachedWidth === width &&
+			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedLinkContextKey === linkContextKey &&
+			this.#cachedCopyEnabled === copyEnabled &&
 			this.#lastFullParseAt > 0 &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
@@ -534,15 +851,24 @@ export class Markdown implements Component {
 			}
 		}
 
+		this.#hasActiveDynamicSvgFigures = false;
+		this.#hasRetryableSvgFigureFallback = false;
+
 		// Don't render anything if there's no actual text
 		if (!this.#text || this.#text.trim() === "") {
 			this.#currentParse = undefined;
+			this.#mayHaveDynamicSvgFigures = false;
+			this.#svgFenceDetectionPending = false;
+			this.#disposeDynamicFiguresFrom(0);
 			const result: string[] = [];
 			// Update per-instance cache
 			this.#cachedText = this.#text;
 			this.#cachedWidth = width;
 			this.#cachedLines = result;
+			this.#cachedCopyEnabled = copyEnabled;
 			this.#cachedAnchorSpans = includeAnchors ? [] : undefined;
+			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			return { lines: result, spans: this.#cachedAnchorSpans };
 		}
 
@@ -551,6 +877,15 @@ export class Markdown implements Component {
 		const normalizedText = replaceTabs(renderedText);
 		this.#clearStaleThrottleTimer();
 		const contentKey = markdownContentKey(normalizedText);
+		// Annotated rows carry original (tab-preserving) spelling, so they are keyed
+		// and verified by the original text and never shared with stock entries. The
+		// tab-expanded key stays in the copy key so a tab-width change misses.
+		const renderCacheSource = copyEnabled ? renderedText : normalizedText;
+		const renderContentKey = copyEnabled
+			? renderedText === normalizedText
+				? `copy:${contentKey}`
+				: `copy:${contentKey}:${markdownContentKey(renderedText)}`
+			: contentKey;
 
 		// L2: module-level LRU — survives component disposal/recreation across
 		// session-tree navigations. Key encodes every dimension that affects the
@@ -559,20 +894,26 @@ export class Markdown implements Component {
 		// and verify it on hit so hash collisions can never serve wrong output.
 		const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
 		const headingProbe = this.#theme.heading("");
-		const cacheKey = `${contentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
+		const linkContextSuffix = linkContextKey ? `\x00${linkContextKey}` : "";
+		const cacheKey = `${renderContentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}${linkContextSuffix}\x00${bgColorProbe}\x00${headingProbe}`;
 		const cached = renderCache.get(cacheKey);
 		if (
+			!this.#mayHaveDynamicSvgFigures &&
+			!this.#svgFenceDetectionPending &&
 			cached !== undefined &&
-			cached.source === normalizedText &&
+			cached.source === renderCacheSource &&
 			(!includeAnchors || cached.anchorSpans !== undefined)
 		) {
 			// Populate L1 so subsequent calls from this instance are O(1) map lookup.
 			this.#cachedText = renderedText;
 			this.#cachedWidth = width;
-			this.#cachedLines = cached.lines;
+			const lines = this.#bindCopySource(cached.lines, copyEnabled);
+			this.#cachedLines = lines;
 			this.#cachedAnchorSpans = cached.anchorSpans;
+			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			if (!this.#streaming || this.#currentParse?.source !== normalizedText) this.#currentParse = undefined;
-			return { lines: cached.lines, spans: cached.anchorSpans };
+			return { lines, spans: cached.anchorSpans };
 		}
 
 		// Parse markdown to marked tokens. Parse cache is width/theme independent,
@@ -589,9 +930,40 @@ export class Markdown implements Component {
 			__markdownPerfCounters.lexedBytes += normalizedText.length;
 			tokens = markdownParser.lexer(normalizedText);
 		}
+		this.#mayHaveDynamicSvgFigures =
+			this.#theme.resolveSvgFigure !== undefined &&
+			tokens.some(token => {
+				if (token.type !== "code") return false;
+				return token.lang?.trim().split(/[ \t]/, 1)[0]?.toLowerCase() === "svg";
+			});
+		this.#svgFenceDetectionPending = false;
 		if (this.#streaming && this.#text === renderedText) {
 			this.#currentParse = { source: normalizedText, tokens };
 		}
+		// Keep original token spelling (notably code tabs) separate from normalized
+		// render tokens. It is used only as local row source or a one-row token copy.
+		let originalTokens = tokens;
+		if (copyEnabled && renderedText !== normalizedText) {
+			if (this.#originalParse?.source !== renderedText) {
+				__markdownPerfCounters.lexerInvocations += 1;
+				__markdownPerfCounters.lexedBytes += renderedText.length;
+				this.#originalParse = { source: renderedText, tokens: markdownParser.lexer(renderedText) };
+			}
+			originalTokens = this.#originalParse.tokens;
+		}
+		// Tab expansion can change block structure (an indented-code tab becomes a
+		// paragraph), shifting token indexes. An original token is trusted only when
+		// it spells exactly the rendered token.
+		const originalAt = (i: number): Token | undefined => {
+			const original = originalTokens[i];
+			const raw = (tokens[i] as { raw?: unknown } | undefined)?.raw;
+			return original && typeof original.raw === "string" && replaceTabs(original.raw) === raw
+				? original
+				: undefined;
+		};
+		// Original code text for code blocks at any depth (inside quotes and lists too).
+		const originalCode = new Map<Token, string>();
+		if (copyEnabled) pairOriginalCode(tokens, originalTokens, originalCode);
 
 		// Convert tokens to styled terminal output. When anchoring, record each
 		// top-level token's rendered-line range plus a width-invariant source-text
@@ -599,36 +971,112 @@ export class Markdown implements Component {
 		// numbered over stable source identities instead of the rendered glyph
 		// stream (#2031).
 		const renderedLines: string[] = [];
-		const tokenBoundaries: Array<{ start: number; end: number; srcLo: number; srcHi: number; units: number[] }> = [];
+		const tokenBoundaries: Array<{
+			start: number;
+			end: number;
+			srcLo: number;
+			srcHi: number;
+			units: number[];
+			token: number;
+			kind: string;
+			tokenSource: string;
+			codeSource?: string;
+		}> = [];
 		let srcOffset = 0;
+		this.#nextDynamicFigureIndex = 0;
 
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
 			const nextToken = tokens[i + 1];
 			const tokenStart = renderedLines.length;
 			const units: number[] | undefined = includeAnchors ? [] : undefined;
+			this.#emittedCode = [];
 			const tokenLines = this.#renderToken(token, contentWidth, nextToken?.type, undefined, units);
+			const codeTexts = this.#emittedCode.map(code => originalCode.get(code));
+			this.#emittedCode = [];
 			renderedLines.push(...tokenLines);
-			if (includeAnchors) {
-				const rawLength = "raw" in token && typeof token.raw === "string" ? token.raw.length : 0;
-				const srcLo = srcOffset;
-				srcOffset += Math.max(1, rawLength);
-				// units must align 1:1 with the token's rendered lines; if a renderer
-				// path emitted none, treat the whole token as a single unit.
-				const lineUnits =
-					units && units.length === tokenLines.length ? units : new Array<number>(tokenLines.length).fill(0);
-				tokenBoundaries.push({
-					start: tokenStart,
-					end: renderedLines.length,
-					srcLo,
-					srcHi: srcOffset,
-					units: lineUnits,
-				});
-			}
+			const raw = "raw" in token && typeof token.raw === "string" ? token.raw : "";
+			const srcLo = srcOffset;
+			srcOffset += Math.max(1, raw.length);
+			// Units must align 1:1 with rendered lines; semantic copy uses the same
+			// token ownership even when viewport anchors are not requested.
+			const lineUnits =
+				units && units.length === tokenLines.length ? units : new Array<number>(tokenLines.length).fill(0);
+			tokenBoundaries.push({
+				start: tokenStart,
+				end: renderedLines.length,
+				srcLo,
+				srcHi: srcOffset,
+				units: lineUnits,
+				token: i,
+				kind: token.type,
+				tokenSource: (copyEnabled ? originalAt(i)?.raw : undefined) ?? raw,
+				// Code rows of every emitted block map, in order, onto their original lines.
+				codeSource:
+					codeTexts.length > 0 && codeTexts.every(text => text !== undefined) ? codeTexts.join("\n") : undefined,
+			});
 		}
+		this.#disposeDynamicFiguresFrom(this.#nextDynamicFigureIndex);
 
 		let wrappedLines: string[];
 		let wrappedSpans: Array<ViewportAnchorSpan | null> | undefined;
+		const wrappedCopyRows: Array<{
+			token: number;
+			kind: string;
+			/** Row-local source; filled from the fragment (or original code text) below. */
+			source: string;
+			fragment: string;
+			logical: string;
+			continuation: boolean;
+			joinGap: string;
+			tokenSource?: string;
+			/** Position of this row among its token's rendered rows. */
+			tokenRow: number;
+			/** The token's rendered row count, set with `tokenSource` on its last row. */
+			tokenRows?: number;
+			/** `source` is the row's original-spelling code slice. */
+			originalCode?: true;
+			codeRow: "open" | "content" | "close" | null;
+			ranges?: Array<[number, number]>;
+			cellGaps?: string[];
+			quoteDepth: number;
+			/** Visible column where a code/table row's own content begins on the logical row. */
+			rowStart: number;
+		} | null> = [];
+		// Copy rows exist only while a copying TUI runs; stock renders skip the work.
+		const pushCopyRows = (boundary: (typeof tokenBoundaries)[number], line: string, wrapped: string[]): void => {
+			if (!copyEnabled) return;
+			const logical = stripCopyHints(Bun.stripANSI(line));
+			const continued = line.includes(COPY_QUOTE_CONTINUATION_PREFIX);
+			const joinGap = copyQuoteGap(line);
+			const codeRow = copyCodeRow(line);
+			const rowStart = copyRowStartColumn(line);
+			// Table ranges are table-local; enclosing quote/list prefixes shift them.
+			const ranges = copyTableRanges(line)?.map(([start, end]): [number, number] => [
+				start + rowStart,
+				end + rowStart,
+			]);
+			const quoteDepth = copyQuoteDepth(line);
+			const cellGaps = copyTableWrap(line);
+			for (let wrapIndex = 0; wrapIndex < wrapped.length; wrapIndex++) {
+				wrappedCopyRows.push({
+					token: boundary.token,
+					kind: boundary.kind,
+					source: "",
+					fragment: stripCopyHints(Bun.stripANSI(wrapped[wrapIndex]!)),
+					logical,
+					continuation: wrapIndex > 0 || continued,
+					joinGap,
+					// Filled per token once all of its rows are known.
+					tokenRow: 0,
+					codeRow,
+					ranges,
+					cellGaps,
+					quoteDepth,
+					rowStart,
+				});
+			}
+		};
 		if (includeAnchors) {
 			wrappedLines = [];
 			const spans: Array<ViewportAnchorSpan | null> = [];
@@ -659,6 +1107,7 @@ export class Markdown implements Component {
 					const lineWrapped = TERMINAL.isImageLine(renderedLine)
 						? [renderedLine]
 						: wrapTextIfNeeded(renderedLine, contentWidth);
+					pushCopyRows(boundary, renderedLine, lineWrapped);
 					for (const w of lineWrapped) {
 						wrappedLines.push(w);
 						spans.push(null);
@@ -689,9 +1138,94 @@ export class Markdown implements Component {
 			wrappedSpans = spans;
 		} else {
 			wrappedLines = [];
-			for (const line of renderedLines) {
-				if (TERMINAL.isImageLine(line)) wrappedLines.push(line);
-				else wrappedLines.push(...wrapTextIfNeeded(line, contentWidth));
+			for (const boundary of tokenBoundaries) {
+				for (let lineIndex = boundary.start; lineIndex < boundary.end; lineIndex++) {
+					const line = renderedLines[lineIndex]!;
+					const lineWrapped = TERMINAL.isImageLine(line) ? [line] : wrapTextIfNeeded(line, contentWidth);
+					pushCopyRows(boundary, line, lineWrapped);
+					wrappedLines.push(...lineWrapped);
+				}
+			}
+		}
+
+		const copyRowsByToken = new Map<number, number[]>();
+		for (let index = 0; index < wrappedCopyRows.length; index++) {
+			const row = wrappedCopyRows[index];
+			if (!row) continue;
+			const indexes = copyRowsByToken.get(row.token) ?? [];
+			indexes.push(index);
+			copyRowsByToken.set(row.token, indexes);
+		}
+		for (const indexes of copyRowsByToken.values()) {
+			const first = wrappedCopyRows[indexes[0]!];
+			if (!first) continue;
+			const boundary = tokenBoundaries[first.token]!;
+			let logical = "";
+			let cursor = 0;
+			let codeLine = -1;
+			const originalCodeLines = (boundary.codeSource ?? "").split("\n");
+			let original = "";
+			let display = "";
+			let codeOriginalCursor = 0;
+			let codeDisplayCursor = 0;
+			for (const [position, index] of indexes.entries()) {
+				const row = wrappedCopyRows[index];
+				if (!row) continue;
+				row.tokenRow = position;
+				if (!row.continuation) {
+					if (row.codeRow === "content") {
+						codeLine += 1;
+						original = originalCodeLines[codeLine] ?? "";
+						display = replaceTabs(original);
+						codeOriginalCursor = 0;
+						codeDisplayCursor = 0;
+					}
+					logical = row.logical;
+					cursor = 0;
+					row.joinGap = "";
+				} else {
+					const at = logical.indexOf(row.fragment, cursor);
+					if (!row.joinGap) row.joinGap = at < 0 ? "" : logical.slice(cursor, at);
+				}
+				const at = logical.indexOf(row.fragment, cursor);
+				if (at >= 0) cursor = at + row.fragment.length;
+				// Row metadata stays row-local: a wrapped paragraph must not replicate
+				// its complete logical line into every APC payload, and a growing token
+				// must not change rows that are already painted.
+				row.source = row.fragment;
+				if (row.codeRow === "content" && boundary.codeSource !== undefined) {
+					// A wrapped nested code row repeats its quote borders before the code text.
+					const visible = row.continuation
+						? row.fragment.slice(row.quoteDepth * visibleWidth(`${this.#theme.symbols.quoteBorder} `))
+						: row.fragment.slice(row.rowStart + this.#codeBlockIndent);
+					const start = display.indexOf(visible, codeDisplayCursor);
+					if (start >= 0) {
+						let originalStart = codeOriginalCursor;
+						let displayOffset = codeDisplayCursor;
+						while (originalStart < original.length && displayOffset < start) {
+							displayOffset += original[originalStart] === "\t" ? getIndentation() : 1;
+							originalStart++;
+						}
+						let originalEnd = originalStart;
+						while (originalEnd < original.length && displayOffset < start + visible.length) {
+							displayOffset += original[originalEnd] === "\t" ? getIndentation() : 1;
+							originalEnd++;
+						}
+						if (row.continuation) row.joinGap = original.slice(codeOriginalCursor, originalStart);
+						row.source = original.slice(originalStart, originalEnd);
+						row.originalCode = true;
+						codeOriginalCursor = originalEnd;
+						codeDisplayCursor = displayOffset;
+					}
+				}
+				// The whole-token source rides on the token's last row. It is attached while
+				// streaming too: only the growing tail token's last row changes per delta,
+				// and ending the stream leaves already-painted rows byte-identical.
+				// The row count rides with it, so earlier rows stay stable as the token grows.
+				if (index === indexes[indexes.length - 1]) {
+					row.tokenSource = boundary.tokenSource;
+					row.tokenRows = indexes.length;
+				}
 			}
 		}
 
@@ -701,23 +1235,47 @@ export class Markdown implements Component {
 		const bgFn = this.#defaultTextStyle?.bgColor;
 		const contentLines: string[] = [];
 
-		for (const line of wrappedLines) {
-			// Image lines must be output raw - no margins or background
+		for (let index = 0; index < wrappedLines.length; index++) {
+			const line = wrappedLines[index]!;
+			// Image lines must be output raw - no margins or background.
 			if (TERMINAL.isImageLine(line)) {
 				contentLines.push(line);
 				continue;
 			}
 
-			const lineWithMargins = leftMargin + line + rightMargin;
-
-			if (bgFn) {
-				contentLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
-			} else {
-				// No background - just pad to width
-				const visibleLen = visibleWidth(lineWithMargins);
-				const paddingNeeded = Math.max(0, width - visibleLen);
-				contentLines.push(lineWithMargins + padding(paddingNeeded));
-			}
+			// Renderer hints never leave the component; the row annotation sits
+			// before the right margin/padding so callers' trimEnd() still trims it.
+			const content = stripCopyHints(line);
+			const copy = wrappedCopyRows[index];
+			const annotated = copy
+				? annotateCopyRow(annotateCopyOrigin(content), CACHED_COPY_SOURCE_ID, {
+						token: copy.token,
+						kind: copy.kind,
+						source: copy.source,
+						...(copy.tokenSource === undefined ? {} : { tokenSource: copy.tokenSource }),
+						tokenRow: copy.tokenRow,
+						...(copy.tokenRows === undefined ? {} : { tokenRows: copy.tokenRows }),
+						...(copy.originalCode ? { originalCode: true } : {}),
+						joinGap: copy.joinGap,
+						contentStart: 0,
+						contentEnd: visibleWidth(content),
+						continuation: copy.continuation,
+						prefixColumns:
+							copy.codeRow === "content" && !copy.continuation
+								? copy.rowStart + this.#codeBlockIndent
+								: copy.quoteDepth * visibleWidth(`${this.#theme.symbols.quoteBorder} `),
+						fence: copy.codeRow === "open" || copy.codeRow === "close",
+						quoteDepth: copy.quoteDepth,
+						...(copy.ranges === undefined ? {} : { ranges: copy.ranges }),
+						...(copy.cellGaps === undefined ? {} : { cellGaps: copy.cellGaps }),
+					})
+				: content;
+			const lineWithMargins = leftMargin + annotated + rightMargin;
+			contentLines.push(
+				bgFn
+					? applyBackgroundToLine(lineWithMargins, width, bgFn)
+					: lineWithMargins + padding(Math.max(0, width - visibleWidth(lineWithMargins))),
+			);
 		}
 
 		// Add top/bottom padding (empty lines)
@@ -753,20 +1311,38 @@ export class Markdown implements Component {
 		}
 		if (!this.#streaming || this.#text !== renderedText) this.#currentParse = undefined;
 
-		// Update L1 per-instance cache
-		this.#cachedText = renderedText;
-		this.#cachedWidth = width;
-		this.#cachedLines = result;
-		this.#cachedAnchorSpans = anchorSpans;
-		this.#lastFullParseAt = markdownNow();
+		// Active figures and retryable fallbacks must render again. A stable
+		// fenced-code fallback is safe in this instance's L1 cache, but possible
+		// SVG fences stay out of shared L2 because resolver state can vary by instance.
+		const copyBoundResult = this.#bindCopySource(result, copyEnabled);
+		if (this.#hasActiveDynamicSvgFigures || this.#hasRetryableSvgFigureFallback) {
+			this.#cachedText = undefined;
+			this.#cachedWidth = undefined;
+			this.#cachedLines = undefined;
+			this.#cachedAnchorSpans = undefined;
+			this.#cachedImageProtocol = undefined;
+			this.#cachedLinkContextKey = undefined;
+		} else {
+			this.#cachedText = renderedText;
+			this.#cachedWidth = width;
+			this.#cachedLines = copyBoundResult;
+			this.#cachedAnchorSpans = anchorSpans;
+			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
+			this.#lastFullParseAt = markdownNow();
+		}
 
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
-		if (!this.#streaming) {
-			renderCache.set(cacheKey, { source: normalizedText, lines: result, ...(anchorSpans ? { anchorSpans } : {}) });
+		if (!this.#streaming && !this.#mayHaveDynamicSvgFigures) {
+			renderCache.set(cacheKey, {
+				source: renderCacheSource,
+				lines: result,
+				...(anchorSpans ? { anchorSpans } : {}),
+			});
 		}
 
-		return { lines: result, spans: anchorSpans };
+		return { lines: copyBoundResult, spans: anchorSpans };
 	}
 
 	renderWithViewportAnchorSource(
@@ -873,6 +1449,7 @@ export class Markdown implements Component {
 		nextTokenType?: string,
 		styleContext?: InlineStyleContext,
 		units?: number[],
+		allowSvgFigure = true,
 	): string[] {
 		const lines: string[] = [];
 
@@ -922,8 +1499,24 @@ export class Markdown implements Component {
 					}
 				}
 
+				// Handle SVG figures when available. Marked keeps the complete info
+				// string in token.lang, so match its normalized language token.
+				const language = token.lang?.trim().split(/[ \t]/, 1)[0]?.toLowerCase();
+				if (allowSvgFigure && language === "svg" && this.#theme.resolveSvgFigure) {
+					const figure = this.#resolveDynamicFigure(token.text, isClosedSvgFence(token.raw), width);
+					if (figure) {
+						// SVG figures are components that render directly
+						const figureLines = figure.render(width);
+						lines.push(...figureLines);
+						if (nextTokenType && nextTokenType !== "space") {
+							lines.push("");
+						}
+						break;
+					}
+				}
+
 				const codeIndent = padding(this.#codeBlockIndent);
-				this.#emitCodeBlock(lines, token.text, token.lang || "", codeIndent);
+				this.#emitCodeBlock(lines, token, token.text, token.lang || "", codeIndent);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}
@@ -978,6 +1571,8 @@ export class Markdown implements Component {
 						quoteContentWidth,
 						nextQuoteToken?.type,
 						quoteInlineStyleContext,
+						undefined,
+						false,
 					);
 					for (let c = 0; c < childLines.length; c++) quoteLineUnit.push(i);
 					renderedQuoteLines.push(...childLines);
@@ -990,9 +1585,31 @@ export class Markdown implements Component {
 
 				for (let q = 0; q < renderedQuoteLines.length; q++) {
 					const styledLine = applyQuoteStyle(renderedQuoteLines[q]);
-					const wrappedLines = wrapTextIfNeeded(styledLine, quoteContentWidth);
-					for (const wrappedLine of wrappedLines) {
-						lines.push(this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) + wrappedLine);
+					// Every wrapped part of a code row is a code row; wrapping would leave
+					// the trailing hint on the last part only.
+					const codeRow = copyCodeRow(styledLine);
+					const codeRowHint = codeRow ? `${COPY_CODE_ROW_PREFIX}${codeRow}\x1b\\` : "";
+					const wrappedLines = wrapTextIfNeeded(
+						codeRow ? stripCopyCodeRow(styledLine) : styledLine,
+						quoteContentWidth,
+					);
+					const quoteLogical = Bun.stripANSI(styledLine);
+					let quoteCursor = 0;
+					for (let quoteWrapIndex = 0; quoteWrapIndex < wrappedLines.length; quoteWrapIndex++) {
+						const wrappedLine = wrappedLines[quoteWrapIndex]!;
+						const fragment = Bun.stripANSI(wrappedLine);
+						const at = quoteLogical.indexOf(fragment, quoteCursor);
+						const gap = at < 0 ? "" : quoteLogical.slice(quoteCursor, at);
+						if (at >= 0) quoteCursor = at + fragment.length;
+						lines.push(
+							this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) +
+								stripCopyQuoteDepth(wrappedLine) +
+								codeRowHint +
+								(quoteWrapIndex > 0
+									? `${COPY_QUOTE_CONTINUATION_PREFIX}${encodeURIComponent(gap.toWellFormed())}\x1b\\`
+									: "") +
+								`${COPY_QUOTE_DEPTH_PREFIX}${copyQuoteDepth(styledLine) + 1}\x1b\\`,
+						);
 						units?.push(quoteLineUnit[q]);
 					}
 				}
@@ -1216,7 +1833,7 @@ export class Markdown implements Component {
 			} else if (token.type === "code") {
 				// Code block in list item
 				const codeIndent = padding(this.#codeBlockIndent);
-				this.#emitCodeBlock(lines, token.text, token.lang || "", codeIndent);
+				this.#emitCodeBlock(lines, token, token.text, token.lang || "", codeIndent);
 			} else {
 				// Other token types - try to render as inline
 				const text = this.#renderInlineTokens([token], styleContext);
@@ -1252,6 +1869,28 @@ export class Markdown implements Component {
 	 */
 	#wrapCellText(text: string, maxWidth: number): string[] {
 		return wrapTextIfNeeded(text, Math.max(1, maxWidth));
+	}
+
+	/**
+	 * Copy hint for physical row `lineIdx` of a wrapped table row: per cell, the
+	 * cell text the soft wrap removed before this row's fragment. The first row
+	 * of a table row (and every row of a stock render) gets none.
+	 */
+	#tableWrapHint(cellTexts: string[], cellLines: string[][], lineIdx: number): string {
+		if (lineIdx === 0 || !copyAnnotationsEnabled()) return "";
+		const gaps = cellTexts.map((text, cell) => {
+			const logical = Bun.stripANSI(text);
+			let cursor = 0;
+			let gap = "";
+			for (const [index, line] of (cellLines[cell] ?? []).slice(0, lineIdx + 1).entries()) {
+				const fragment = Bun.stripANSI(line);
+				const at = logical.indexOf(fragment, cursor);
+				if (index === lineIdx) gap = at < 0 ? "" : logical.slice(cursor, at);
+				if (at >= 0) cursor = at + fragment.length;
+			}
+			return gap.toWellFormed();
+		});
+		return `${COPY_TABLE_WRAP_PREFIX}${encodeURIComponent(JSON.stringify(gaps))}\x1b\\`;
 	}
 
 	/**
@@ -1382,13 +2021,13 @@ export class Markdown implements Component {
 
 		// Render top border
 		const topBorderCells = columnWidths.map(w => h.repeat(w));
-		lines.push(`${t.topLeft}${h}${topBorderCells.join(`${h}${t.teeDown}${h}`)}${h}${t.topRight}`);
+		lines.push(
+			`${t.topLeft}${h}${topBorderCells.join(`${h}${t.teeDown}${h}`)}${h}${t.topRight}${COPY_TABLE_RANGES_PREFIX}-\x1b\\`,
+		);
 
 		// Render header with wrapping
-		const headerCellLines: string[][] = token.header.map((cell, i) => {
-			const text = this.#renderInlineTokens(cell.tokens || [], styleContext);
-			return this.#wrapCellText(text, columnWidths[i]);
-		});
+		const headerCellTexts = token.header.map(cell => this.#renderInlineTokens(cell.tokens || [], styleContext));
+		const headerCellLines: string[][] = headerCellTexts.map((text, i) => this.#wrapCellText(text, columnWidths[i]));
 		const headerLineCount = Math.max(...headerCellLines.map(c => c.length));
 
 		for (let lineIdx = 0; lineIdx < headerLineCount; lineIdx++) {
@@ -1397,12 +2036,23 @@ export class Markdown implements Component {
 				const padded = text + padding(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
 				return this.#theme.bold(padded);
 			});
-			lines.push(`${v} ${rowParts.join(` ${v} `)} ${v}`);
+			const tableLine = `${v} ${rowParts.join(` ${v} `)} ${v}`;
+			let tableColumn = 2;
+			const tableRanges = rowParts.map(part => {
+				const start = tableColumn;
+				tableColumn += visibleWidth(part);
+				const range: [number, number] = [start, tableColumn];
+				tableColumn += 3;
+				return range;
+			});
+			lines.push(
+				`${COPY_ROW_START}${tableLine}${COPY_TABLE_RANGES_PREFIX}${tableRanges.map(range => range.join("-")).join(",")}\x1b\\${this.#tableWrapHint(headerCellTexts, headerCellLines, lineIdx)}`,
+			);
 		}
 
 		// Render separator
 		const separatorCells = columnWidths.map(w => h.repeat(w));
-		const separatorLine = `${t.teeRight}${h}${separatorCells.join(`${h}${t.cross}${h}`)}${h}${t.teeLeft}`;
+		const separatorLine = `${t.teeRight}${h}${separatorCells.join(`${h}${t.cross}${h}`)}${h}${t.teeLeft}${COPY_TABLE_RANGES_PREFIX}-\x1b\\`;
 		lines.push(separatorLine);
 		// Anchor units: the whole header block (top border + header rows + separator)
 		// is unit 0; each source data row is its own width-invariant unit below.
@@ -1411,10 +2061,8 @@ export class Markdown implements Component {
 		// Render rows with wrapping
 		for (let rowIndex = 0; rowIndex < token.rows.length; rowIndex++) {
 			const row = token.rows[rowIndex];
-			const rowCellLines: string[][] = row.map((cell, i) => {
-				const text = this.#renderInlineTokens(cell.tokens || [], styleContext);
-				return this.#wrapCellText(text, columnWidths[i]);
-			});
+			const rowCellTexts = row.map(cell => this.#renderInlineTokens(cell.tokens || [], styleContext));
+			const rowCellLines: string[][] = rowCellTexts.map((text, i) => this.#wrapCellText(text, columnWidths[i]));
 			const rowLineCount = Math.max(...rowCellLines.map(c => c.length));
 
 			for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
@@ -1422,7 +2070,18 @@ export class Markdown implements Component {
 					const text = cellLines[lineIdx] || "";
 					return text + padding(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
 				});
-				lines.push(`${v} ${rowParts.join(` ${v} `)} ${v}`);
+				const tableLine = `${v} ${rowParts.join(` ${v} `)} ${v}`;
+				let tableColumn = 2;
+				const tableRanges = rowParts.map(part => {
+					const start = tableColumn;
+					tableColumn += visibleWidth(part);
+					const range: [number, number] = [start, tableColumn];
+					tableColumn += 3;
+					return range;
+				});
+				lines.push(
+					`${COPY_ROW_START}${tableLine}${COPY_TABLE_RANGES_PREFIX}${tableRanges.map(range => range.join("-")).join(",")}\x1b\\${this.#tableWrapHint(rowCellTexts, rowCellLines, lineIdx)}`,
+				);
 			}
 
 			if (rowIndex < token.rows.length - 1) {
@@ -1433,7 +2092,9 @@ export class Markdown implements Component {
 
 		// Render bottom border
 		const bottomBorderCells = columnWidths.map(w => h.repeat(w));
-		lines.push(`${t.bottomLeft}${h}${bottomBorderCells.join(`${h}${t.teeUp}${h}`)}${h}${t.bottomRight}`);
+		lines.push(
+			`${t.bottomLeft}${h}${bottomBorderCells.join(`${h}${t.teeUp}${h}`)}${h}${t.bottomRight}${COPY_TABLE_RANGES_PREFIX}-\x1b\\`,
+		);
 
 		if (nextTokenType && nextTokenType !== "space") {
 			lines.push(""); // Add spacing after table
@@ -1450,7 +2111,7 @@ export class Markdown implements Component {
 export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseColor?: (t: string) => string): string {
 	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
 	if (typeof text !== "string") return (baseColor ?? (t => t))(text != null ? String(text) : "");
-	const tokens = marked.lexer(text);
+	const tokens = marked.lexer(sanitizeMarkdownSource(text));
 	const applyText = baseColor ?? ((t: string) => t);
 	let result = "";
 	for (const token of tokens) {

@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { type MermaidAsciiRenderOptions, prompt, renderMermaidAscii } from "@gajae-code/utils";
+import { type MermaidRenderOptions, prompt, renderMermaidAscii } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import renderMermaidDescription from "../prompts/tools/render-mermaid.md" with { type: "text" };
 import type { ToolSession } from "./index";
@@ -18,7 +18,7 @@ const renderMermaidSchema = z.object({
 
 type RenderMermaidParams = z.infer<typeof renderMermaidSchema>;
 
-function sanitizeRenderConfig(config: MermaidAsciiRenderOptions | undefined): MermaidAsciiRenderOptions | undefined {
+function sanitizeRenderConfig(config: MermaidRenderOptions | undefined): MermaidRenderOptions | undefined {
 	if (!config) return undefined;
 	return {
 		useAscii: config.useAscii,

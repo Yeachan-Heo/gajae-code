@@ -41,6 +41,8 @@ export interface MCPServer {
 	url?: string;
 	/** HTTP headers (for HTTP transport) */
 	headers?: Record<string, string>;
+	/** Persisted public-network requirement for an HTTP MCP endpoint. */
+	publicNetwork?: boolean;
 	/** Authentication configuration */
 	auth?: {
 		type: "oauth" | "apikey";

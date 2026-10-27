@@ -51,9 +51,52 @@ Migration does not automatically clean up legacy files, copied files, locks, art
 
 Managed storage enforces owner-only directory/file security and refuses unsafe symlinks or malformed bindings on the paths it verifies. This is a local storage-integrity boundary, not authentication, authorization, encryption, or a guarantee against a hostile concurrent local actor/race outside the verified operations. Callers must still protect the agent directory and session contents.
 
+Path-backed descendant stores reject a final pathname symlink even when it points to the original directory with the same device and inode. A derived subtree store owns its newly retained native authority: closing the store releases that authority once, and failed construction releases it before returning an error. Directly supplied authorities remain borrowed and caller-owned.
+
+GC retirement receipt publication rejects a candidate exceeding 64 MiB of canonical UTF-8 JSON, including its trailing newline, before candidate codec serialization or receipt-buffer allocation. Strict authority and continuation validation still applies to admitted receipts. Stored committed histories have per-target quotas below, plus a distinct 50,000-entry receipt-directory limit shared by every transcript in one scope; neither limit proves writer quiescence or physical retirement.
+
+Managed artifact rollback removes only the exact captured named artifact or an attempt's issued subtree identity; newly observed `.gjc-*` or `.removing` names are not deletion authority. Attempt cleanup releases its own retained child on every outcome without closing the borrowed parent or independent authorities. Native tree removal can durably detach the exact tree into recovery quarantine and report `cleanup_pending`; direct discard propagates that outcome. At the post-publication staging cleanup boundary, authorized pending cleanup preserves the completed artifact mapping and reservation rather than rolling back published files, including for empty-artifact staged sessions. Publication and identity failures still fail normally. Canonical absence or returned quarantine evidence does not prove physical reclamation or authorize a residue sweep.
+
+Existing cleanup-pending history consumers replay incrementally with fresh per-replay limits: 50,000 inventory entries and receipt reads each, 100,000 charged work units, 64 MiB per receipt and 512 MiB of cumulative receipt bytes. Inventory is admitted before retaining entries, and no-follow descriptor size is admitted before allocation; canonical positive safe-integer attempts replay in numeric, contiguous order. Protocol inspection preserves retained-file authority and reports `managed_gc_journal_capacity_exceeded` rather than treating exhaustion as absence or corruption. The same explicit code survives SDK `session.list` saved-session omission diagnostics. These replay limits do not establish operation-wide nested-work or append admission, independent writer quiescence or physical reclamation.
+
+Each transcript's committed GC retirement history admits at most 50,000 distinct persisted state files and 512 MiB of unique stored receipt bytes, with the same 64 MiB individual-receipt limit. Separately, a scope's shared receipt directory admits at most 50,000 retirement-receipt entries across all transcript targets. Readers, publishers, prepared-target discovery, and protocol inspectors use streamed bounded inventories and no-follow bounded reads; an over-limit target or shared directory fails the whole inspection rather than disappearing from discovery. Replay keeps incremental continuation evidence, checks canonical numeric contiguous attempts, and rejects immutable-field changes or authority expansion, including shrink then reintroduction. Publishers hold a scope-wide lease while admitting the projected new receipt and per-transcript bytes before candidate codec serialization, buffer allocation, or publication, preventing concurrent appends for distinct transcripts from overshooting the shared directory-entry limit. An idempotent nonappend does not consume another stored slot. These stored-history limits are distinct from the fresh per-replay inventory/read/work limits above; no aggregate operation-wide cumulative read, transcript/hash, nested-work, or append-reservation budget is installed. None of these limits establish writer quiescence or physical reclamation.
+
+Leased and read-only GC receipt readers admit stored-history bytes from the original no-follow descriptor's size and link count before allocating receipt buffers. Reads cannot expand beyond that admitted size, and final descriptor and named-file generation checks reject growth or replacement. GC reader cleanup preserves the original capture failure when closing also fails. These checks do not establish operation-wide traversal admission or writer quiescence.
+
+Separately, managed-session descriptor preflight and bounded range reads preserve the original metadata, pathname, or range error when closing their actual file descriptor also fails; close-only errors after a successful read still propagate. This narrow error-precedence behavior does not complete or expand whole-GC inspection capacity, capture, or protocol admission, nor does it imply completion of broader task-owner work.
+
+Read-only receipt reads, discovery calls, and each protocol-inspector invocation separately admit the shared count/collect inventory family within 100,000 work units and 50,000 aggregate physical entry observations. Both passes, unrelated entries, repeated inventories and internal discovery consume the same invocation budget; acquisition, read attempts including EOF/errors, retention and metadata checks reserve work before proceeding. These units are conservative admitted actions, not exact syscall counts or elapsed time. Each stream has a one-entry buffer and closes on refusal; a fresh independent invocation gets a fresh budget. Multiple passes can exhaust admission below 50,000 distinct stored files and report `managed_gc_journal_capacity_exceeded`. Genuine leased receipt reader/publication paths preserve their stored quotas and ownership checks without this new post-publication inspection cap.
+
+Standalone read-only receipt lookup reuses its admitted initial count for final verification only after fresh directory evidence matches. It still performs a fresh collecting stream and checks counts, names, types and final directory evidence. This removes one redundant count-only stream without changing quotas or leased, discovery, protocol-inspector or destructive paths.
+
+This inventory admission does not cover separate cleanup-receipt replay, artifact-manifest or native-tree enumeration, aggregate file reads/hashing/nested work, or future writer reservations before serialization. Existing authority and discovery fences remain required; exhaustion is not absence, reclamation, quiescence or deletion permission.
+
+Discovery retains each processed scope's original binding and receipt inventory, including authenticated absence, until its terminal consistency check. A new populated scope or journal inserted into an already-processed scope causes refusal instead of silent target omission or adoption of newly observed authority. Original readers are closed on success and refusal.
+
+Exchange-placeholder capture and cleanup verification use a bounded native empty-directory proof. It retains no-follow root/parent handles, stops at the first child instead of traversing or hashing foreign payload, and rechecks the original native identity and metadata. An unexpected child or replacement refuses cleanup without changing it. This proof does not establish physical reclamation, revoke live writers, or bound other GC traversal paths.
+
 On Linux filesystems where the exact POSIX ACL xattr operation returns `ENOTSUP`/`EOPNOTSUPP`, GJC treats that result only as proof that the filesystem cannot store that ACL attribute. The ACL gate still requires the same opened object to pass effective-owner, exact `0700` directory or `0600` file mode, safe-type, no-follow traversal, and identity/replacement checks. Permission denial, I/O errors, present or malformed ACL data, and unknown results remain failures. Managed descriptors use close-on-exec and are not delegated as authority to subprocesses. This compatibility rule does not change explicit `--session-dir`, macOS ACL, or Windows DACL policy.
 
 Managed migration-lock release checks its retained descriptor before native security verification. On Linux, a closed or reused descriptor can be replaced only by reopening the same lock file with no-follow, owner-only security and original file identity checks; the original attempt id must still own the lock before its released record is written. A successor or an insecure replacement is never release authority. Repeated release is inert and cannot retire a successor.
+
+Managed replacement receipts bind the exact staging attempt to a publisher (PID,
+kernel process incarnation, host, and JS-isolate owner). Both pending-receipt
+promotion and canonical-receipt retirement defer to a live or unobservable
+publisher. A stopped process is still an owner; age alone is never permission
+to reconcile. The publishing isolate releases its local attempt only after the
+transaction exits. A different process or isolate requires positive owner-exit
+or PID-reuse evidence before recovering its receipt. A foreign host remains
+unresolved. Existing orphan receipts still follow the exact receipt-identity
+recovery protocol; a missing pending name is accepted only when the canonical
+receipt proves the same file object and bytes.
+
+Deploy this protocol at an owner-coordinated checkpoint for every writer and
+reconciler sharing a managed scope: older writers do not honor the publisher
+field. Updating one binary does not update already-running processes or clear
+their latched persistence errors. Preserve live owners, descendants, locks,
+transcripts, and ambiguous commit evidence; do not delete guards, refresh an
+expected inode blindly, or retry an uncertain write. A successful SDK query is
+not a durable-append or recovery verdict.
 
 Blob store location:
 
@@ -516,7 +559,11 @@ Implementations:
 - `FileSessionStorage`: real filesystem (Bun + node fs)
 - `MemorySessionStorage`: map-backed in-memory implementation for tests/non-persistent sessions
 
+Verified memory deletion rejects owner-bearing transcripts, including replayed header patches, and owner-retirement targets before changing transcript or spill keys. An absent transcript does not prove physical owner retirement; the memory backend cannot execute that protocol. Owner-store opening and deletion-evidence capture also require the final manifest to retain the requested session association, not merely the same owner locator.
+
 `SessionStorageWriter` exposes `writeLine`, `flush`, `fsync`, `close`, `getError`.
+
+Rollback snapshots are authenticated by the issuing live manager; copied, modified, or foreign objects cannot redirect restoration. Explicit persisted-file identity checks support already-admitted cold transcripts above 128 MiB without hashing the entire file: each check requests at most 8,585,217 bytes and compares the canonical pathname, session ID, file identity, size, and modification/change timestamps across bounded reads. This metadata-dependent fingerprint is not whole-file cryptographic coverage or one retained descriptor; unsampled changes preserving every compared field remain outside its detection boundary. Rejected cold restoration leaves the current session installed.
 
 ## Session Discovery Utilities
 

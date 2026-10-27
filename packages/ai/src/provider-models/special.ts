@@ -3,7 +3,7 @@ import { once, sanitizeText } from "@gajae-code/utils";
 
 import type { ModelManagerOptions } from "../model-manager";
 import { buildZCodeSourceHeaders, resolveGlmZcodeAnthropicBaseUrl } from "../providers/anthropic";
-import { fetchKiroApiModels, isKiroApiKey, kiroApiStaticModels } from "../providers/kiro-api-key";
+import { fetchKiroApiModels, fetchKiroOAuthModels, isKiroApiKey, kiroApiStaticModels } from "../providers/kiro-api-key";
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import type { Model } from "../types";
 import { fetchCodexModels } from "../utils/discovery/codex";
@@ -212,6 +212,7 @@ export function kiroModelManagerOptions(
 	config: KiroModelManagerConfig = {},
 ): ModelManagerOptions<"kiro-codewhisperer-stream"> {
 	const apiKey = config.apiKey;
+	const oauth = resolveKiroOAuthCredential(apiKey);
 	return {
 		providerId: "kiro",
 		...(isKiroApiKey(apiKey)
@@ -219,6 +220,29 @@ export function kiroModelManagerOptions(
 					staticModels: kiroApiStaticModels(),
 					fetchDynamicModels: () => fetchKiroApiModels(apiKey),
 				}
-			: undefined),
+			: oauth
+				? {
+						staticModels: kiroApiStaticModels(),
+						fetchDynamicModels: () => fetchKiroOAuthModels(oauth.accessToken, oauth.profileArn),
+					}
+				: undefined),
 	};
+}
+
+function resolveKiroOAuthCredential(
+	apiKey: string | undefined,
+): { accessToken: string; profileArn?: string } | undefined {
+	if (!apiKey || isKiroApiKey(apiKey)) return undefined;
+	try {
+		const parsed = JSON.parse(apiKey) as { token?: unknown; profileArn?: unknown };
+		if (typeof parsed.token === "string" && parsed.token.length > 0) {
+			return {
+				accessToken: parsed.token,
+				profileArn: typeof parsed.profileArn === "string" ? parsed.profileArn : undefined,
+			};
+		}
+	} catch {
+		// Environment bearer tokens are passed as plain strings.
+	}
+	return { accessToken: apiKey };
 }

@@ -19,7 +19,11 @@ function createHarness() {
 		agent: new Agent({ initialState: { model: defaultModel, systemPrompt: [], tools: [], messages: [] } }),
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ modelRoles: { plan: "test/plan" } }),
-		modelRegistry: { getAvailable: () => [defaultModel, planModel], getApiKey: async () => "key" } as never,
+		modelRegistry: {
+			getAvailable: () => [defaultModel, planModel],
+			getApiKey: async () => "key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 	});
 	return { session, mode: new InteractiveMode(session, "test") };
 }

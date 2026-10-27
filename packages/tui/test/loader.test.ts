@@ -69,6 +69,42 @@ describe("Loader component", () => {
 		tui.stop();
 	});
 
+	it("fits loader rows and wide Text glyphs to the terminal width", () => {
+		const term = new VirtualTerminal(20, 4);
+		const tui = new TUI(term);
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"Checking",
+			["\u2834"],
+		);
+		const paint = (line: string) => `\x1b[44m${line}\x1b[0m`;
+		const glyph = new Text("\u3042", 0, 0);
+		try {
+			const wide = loader.render(20);
+			expect(wide[0]).toBe("");
+			expect(wide.slice(1).every(line => visibleWidth(line) === 20)).toBe(true);
+
+			const narrow = loader.render(1);
+			expect(narrow[0]).toBe("");
+			expect(narrow.every(line => visibleWidth(line) <= 1)).toBe(true);
+
+			loader.setCustomBgFn(paint);
+			expect(loader.render(1).every(line => visibleWidth(line) <= 1)).toBe(true);
+
+			expect(glyph.render(1).every(line => visibleWidth(line) <= 1)).toBe(true);
+			expect(glyph.render(1).join("")).not.toContain("\u3042");
+			glyph.setCustomBgFn(paint);
+			const paintedGlyph = glyph.render(1);
+			expect(paintedGlyph.every(line => visibleWidth(line) <= 1)).toBe(true);
+			expect(paintedGlyph.join("")).toContain("\x1b[0m");
+		} finally {
+			loader.stop();
+			tui.stop();
+		}
+	});
+
 	it("unrefs its animation interval so it does not keep the event loop alive", () => {
 		const term = new VirtualTerminal(20, 4);
 		const tui = new TUI(term);

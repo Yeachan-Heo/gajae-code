@@ -74,6 +74,9 @@ const WORKER_ENV_KEYS = [
 	"XDG_DATA_HOME",
 	"XDG_STATE_HOME",
 	"XDG_CACHE_HOME",
+	// SDK_BROKER_AUTOSTART_ENV (sdk/broker/ensure.ts), kept literal so this supervisor stays
+	// import-light. A supervisor-owned broker must stay unrestartable from the doctor worker.
+	"GJC_SDK_BROKER_AUTOSTART",
 ] as const;
 
 const COMPILED = /(?:\/\$bunfs\/|\/~BUN\/|\/%7EBUN\/)/i.test(import.meta.url);

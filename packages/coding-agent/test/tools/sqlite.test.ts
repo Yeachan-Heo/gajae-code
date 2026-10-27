@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import "../../src/tools/renderers";
+import * as Utils from "@gajae-code/utils";
 import { Settings } from "../../src/config/settings";
 import { ReadTool } from "../../src/tools/read";
 import {
@@ -610,6 +611,133 @@ describe("SQLite tool support", () => {
 		});
 
 		expect(readUserEmail(sqlitePath, 2)).toBe("bob+new@example.com");
+	});
+
+	it("updates an in-workspace database", async () => {
+		await writeTool.execute("sqlite-write-inside-workspace", {
+			path: `${sqlitePath}:users:1`,
+			content: "{ email: 'alice+inside@example.com' }",
+		});
+		expect(readUserEmail(sqlitePath, 1)).toBe("alice+inside@example.com");
+	});
+
+	it.skipIf(process.platform === "win32")("refuses a symlink to an outside database", async () => {
+		const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "sqlite-outside-"));
+		try {
+			const outsideDb = path.join(outsideDir, "secret.sqlite");
+			createFixtureDatabase(outsideDb);
+			const link = path.join(tmpDir, "linked.sqlite");
+			await fs.symlink(outsideDb, link);
+			await expect(
+				writeTool.execute("sqlite-write-symlink-escape", {
+					path: `${link}:users:2`,
+					content: "{ email: 'escaped@example.com' }",
+				}),
+			).rejects.toThrow(/outside the workspace/);
+			expect(readUserEmail(outsideDb, 2)).toBe("bob@example.com");
+		} finally {
+			await fs.rm(outsideDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a database path given directly outside the workspace", async () => {
+		const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "sqlite-direct-"));
+		try {
+			const outsideDb = path.join(outsideDir, "secret.sqlite");
+			createFixtureDatabase(outsideDb);
+			await expect(
+				writeTool.execute("sqlite-write-direct-outside", {
+					path: `${outsideDb}:users:2`,
+					content: "{ email: 'escaped@example.com' }",
+				}),
+			).rejects.toThrow(/outside the workspace/);
+			const relative = path.relative(tmpDir, outsideDb);
+			await expect(
+				writeTool.execute("sqlite-write-relative-outside", {
+					path: `${relative}:users:2`,
+					content: "{ email: 'escaped@example.com' }",
+				}),
+			).rejects.toThrow(/outside the workspace/);
+			expect(readUserEmail(outsideDb, 2)).toBe("bob@example.com");
+		} finally {
+			await fs.rm(outsideDir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"updates a database when the workspace path is a symlink to the real directory",
+		async () => {
+			const link = path.join(os.tmpdir(), `sqlite-ws-${process.pid}`);
+			await fs.symlink(tmpDir, link);
+			try {
+				const tool = new WriteTool(createSession(link));
+				const linkedDb = path.join(link, "app.sqlite");
+				await tool.execute("sqlite-write-symlinked-workspace", {
+					path: `${linkedDb}:users:1`,
+					content: "{ email: 'alice+linked@example.com' }",
+				});
+				expect(readUserEmail(sqlitePath, 1)).toBe("alice+linked@example.com");
+			} finally {
+				await fs.unlink(link);
+			}
+		},
+	);
+
+	it("does not open the database when aborted during path resolution", async () => {
+		const originalRealpath = fs.realpath;
+		let release: () => void = () => {};
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let entered: () => void = () => {};
+		const started = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		const realpathSpy = spyOn(fs, "realpath").mockImplementation((async (target: string) => {
+			entered();
+			await gate;
+			return originalRealpath(target);
+		}) as typeof fs.realpath);
+		let opens = 0;
+		const originalRun = Database.prototype.run;
+		const countedRun = spyOn(Database.prototype, "run").mockImplementation(function (
+			this: Database,
+			sql: string,
+			...params: unknown[]
+		) {
+			opens += 1;
+			return originalRun.call(this, sql, ...(params as never[]));
+		});
+		let inner: Promise<unknown> | undefined;
+		const originalUntil = Utils.untilAborted;
+		const abortSpy = spyOn(Utils, "untilAborted").mockImplementation((signal, task) => {
+			return originalUntil(signal, () => {
+				const work = typeof task === "function" ? task() : task;
+				inner = work;
+				return work;
+			});
+		});
+		const controller = new AbortController();
+		const pending = writeTool.execute(
+			"sqlite-write-abort",
+			{ path: `${sqlitePath}:users:1`, content: "{ email: 'aborted@example.com' }" },
+			controller.signal,
+		);
+		try {
+			await started;
+			controller.abort();
+			release();
+			await expect(pending).rejects.toThrow();
+			expect(inner).toBeDefined();
+			await inner?.catch(() => undefined);
+			expect(opens).toBe(0);
+			expect(readUserEmail(sqlitePath, 1)).toBe("alice@example.com");
+		} finally {
+			realpathSpy.mockRestore();
+			countedRun.mockRestore();
+			abortSpy.mockRestore();
+			release();
+		}
 	});
 
 	it("deletes rows through the write tool with empty content", async () => {

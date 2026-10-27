@@ -7,7 +7,9 @@
  * SQLite store, never POSTs the broker sentinel to an OpenAI token endpoint.
  */
 import * as os from "node:os";
-import { type AuthStorage, getBundledModels } from "@gajae-code/ai/core";
+import type { AuthStorage } from "@gajae-code/ai/core";
+import { OPENAI_HEADER_VALUES } from "@gajae-code/ai/providers/openai-codex/constants";
+import { fetchCodexModels } from "@gajae-code/ai/utils/discovery/codex";
 import { decodeJwt } from "@gajae-code/ai/utils/oauth/openai-codex";
 import { $env, readSseJson, sanitizeHeaderComponent } from "@gajae-code/utils";
 import packageJson from "../../../../package.json" with { type: "json" };
@@ -20,17 +22,9 @@ import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
-const FALLBACK_MODEL = "gpt-5.5";
-const DEFAULT_MODEL_PREFERENCES = [
-	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5-codex",
-	"gpt-5",
-	"gpt-5.3-codex",
-	"gpt-5.2-codex",
-	"gpt-5.1-codex",
-	"gpt-5-codex-mini",
-];
+// Reviewed search candidates, additionally filtered by current account discovery.
+// Upstream Codex web-search metadata informs this policy, not bundle presence.
+const DEFAULT_MODEL_PREFERENCES = ["gpt-6.1-sol", "gpt-6-luna"];
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";
@@ -40,21 +34,26 @@ function getConfiguredModel(): string | undefined {
 	return configuredModel ? configuredModel : undefined;
 }
 
-function getDefaultModelCandidates(): string[] {
-	const bundledModels = getBundledModels("openai-codex");
-	const bundledIds = new Set(bundledModels.map(model => model.id));
-	const candidates = DEFAULT_MODEL_PREFERENCES.filter(modelId => bundledIds.has(modelId));
-
-	if (candidates.length > 0) {
-		return candidates;
+async function getDefaultModelCandidates(
+	auth: { accessToken: string; accountId: string },
+	signal: AbortSignal | undefined,
+): Promise<string[]> {
+	signal?.throwIfAborted();
+	const discovery = await fetchCodexModels({ ...auth, signal: withHardTimeout(signal, "llm") });
+	signal?.throwIfAborted();
+	if (!discovery) {
+		throw new SearchProviderError("codex", "Codex model discovery unavailable", 503);
 	}
-
-	const nonMini = bundledModels.find(model => !model.id.includes("mini") && !model.id.includes("spark"));
-	if (nonMini) {
-		return [nonMini.id];
+	const advertisedIds = new Set(discovery.models.map(model => model.id));
+	const candidates = DEFAULT_MODEL_PREFERENCES.filter(modelId => advertisedIds.has(modelId));
+	if (candidates.length === 0) {
+		throw new SearchProviderError(
+			"codex",
+			"No preferred Codex web-search models are advertised for this account",
+			503,
+		);
 	}
-
-	return bundledModels[0]?.id ? [bundledModels[0].id] : [FALLBACK_MODEL];
+	return candidates;
 }
 
 function shouldRetryWithNextDefaultModel(error: unknown): boolean {
@@ -157,8 +156,8 @@ function buildCodexHeaders(accessToken: string, accountId: string): Record<strin
 		Authorization: `Bearer ${accessToken}`,
 		"chatgpt-account-id": accountId,
 		"OpenAI-Beta": "responses=experimental",
-		originator: "pi",
-		"User-Agent": `pi/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
+		originator: OPENAI_HEADER_VALUES.ORIGINATOR_CODEX,
+		"User-Agent": `${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
 		Accept: "text/event-stream",
 		"Content-Type": "application/json",
 	};
@@ -336,12 +335,11 @@ async function callCodexSearch(
  * Executes a web search using OpenAI code provider's built-in web search tool.
  *
  * Default-model behavior:
- * - If `PI_CODEX_WEB_SEARCH_MODEL` is set, use it exactly once and surface any
- *   upstream error verbatim.
- * - Otherwise prefer ChatGPT-account-safe bundled defaults (GPT-5.5, GPT-5.4,
- *   GPT-5 code backend, …) and retry the next candidate only when OpenAI code backend returns the
- *   known 400 "model is not supported" family. This avoids selecting
- *   `gpt-5-codex-mini` first on ChatGPT accounts, which OpenAI rejects.
+ * - Use `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` (then `PI_CODEX_WEB_SEARCH_MODEL`)
+ *   exactly once when configured and surface upstream errors without model retries.
+ * - Otherwise intersect current account discovery with GPT-6.1 Sol, then GPT-6 Luna.
+ *   Fail closed when discovery is unavailable or neither candidate is advertised.
+ *   Retry the next advertised candidate only for the known unsupported-model 400 family.
  */
 export async function searchCodex(params: SearchParams): Promise<SearchResponse> {
 	const auth = await findCodexAuth(params.authStorage, params.sessionId, params.signal);
@@ -352,7 +350,7 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 	}
 
 	const configuredModel = getConfiguredModel();
-	const modelCandidates = configuredModel ? [configuredModel] : getDefaultModelCandidates();
+	const modelCandidates = configuredModel ? [configuredModel] : await getDefaultModelCandidates(auth, params.signal);
 
 	let result:
 		| {

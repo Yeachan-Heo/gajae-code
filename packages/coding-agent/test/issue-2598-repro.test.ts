@@ -216,7 +216,7 @@ describe("issue #2598 — tab worker source and compiled smoke contract", () => 
 		expectGraphToContain(graph, "src/web/scrapers/html-to-markdown.ts");
 		expectGraphToContain(graph, "src/tools/browser/tab-worker-path-resolver.ts");
 		expectGraphToContain(graph, "../utils/src/abortable.ts");
-		expectGraphToContain(graph, "../utils/src/snowflake.ts");
+		// The shared-temp screenshot path no longer imports snowflake. That module is native-free.
 		expectGraphNotToContain(graph, "src/tools/path-utils.ts");
 		expectGraphNotToContain(graph, "src/web/scrapers/types.ts");
 		expectNativeFreeRuntimeGraph(graph);

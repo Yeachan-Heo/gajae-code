@@ -3,9 +3,12 @@ import { prompt } from "@gajae-code/utils";
 import type * as z from "zod/v4";
 import {
 	executeHashlineSingle,
+	type HashlineEdit,
 	HashlineMismatchError,
 	type HashlineParams,
 	hashlineEditParamsSchema,
+	parseHashline,
+	splitHashlineInputs,
 } from "../hashline";
 import hashlineGrammarTemplate from "../hashline/grammar.lark" with { type: "text" };
 import { resolveHashlineGrammarPlaceholders } from "../hashline/hash";
@@ -21,13 +24,28 @@ import hashlineDescription from "../prompts/tools/hashline.md" with { type: "tex
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
 import type { ToolSession } from "../tools";
+import { assertEditableFile } from "../tools/auto-generated-guard";
+import { resolvePlanPath } from "../tools/plan-mode-guard";
 import { VimTool, vimSchema } from "../tools/vim";
 import { type EditMode, resolveEditMode, resolveForcedEnvEditMode } from "../utils/edit-mode";
 import type { VimToolDetails } from "../vim/types";
-import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
+import { normalizeCreateContent } from "./diff";
+import {
+	type ApplyPatchEntry,
+	type ApplyPatchParams,
+	applyPatchSchema,
+	expandApplyPatchToEntries,
+	expandApplyPatchToPreviewEntries,
+} from "./modes/apply-patch";
 import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
-import { executePatchSingle, type PatchEditEntry, type PatchParams, patchEditSchema } from "./modes/patch";
-import { executeReplaceSingle, type ReplaceEditEntry, type ReplaceParams, replaceEditSchema } from "./modes/replace";
+import {
+	executePatchSingle,
+	type PatchEditEntry,
+	type PatchParams,
+	patchEditEntrySchema,
+	patchEditSchema,
+} from "./modes/patch";
+import { executeReplaceEntries, type ReplaceEditEntry, type ReplaceParams, replaceEditSchema } from "./modes/replace";
 import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type LspBatchRequest } from "./renderer";
 
 export { DEFAULT_EDIT_MODE, type EditMode, normalizeEditMode } from "../utils/edit-mode";
@@ -56,6 +74,12 @@ type TInput =
 type VimParams = z.infer<typeof vimSchema>;
 type EditParams = ReplaceParams | PatchParams | HashlineParams | VimParams | ApplyPatchParams;
 type EditToolResultDetails = EditToolDetails | VimToolDetails;
+
+/** Diff bodies introduce only `+` rows, not unified-diff file headers. */
+function addedPatchDigest(diff: string): string | undefined {
+	const added = diff.split("\n").filter(line => line.startsWith("+") && !line.startsWith("+++ "));
+	return added.length > 0 ? added.map(line => line.slice(1)).join("\n") : undefined;
+}
 
 const UNSAFE_EDIT_SUMMARY_PATH =
 	/(?:\b(?:https?|wss?):\/\/|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,})/i;
@@ -165,6 +189,56 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
 	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
+}
+
+type PatchGuardFailure = { path: string; errorText: string };
+
+/**
+ * Refuse a generated source or rename destination before any entry writes.
+ * A single entry still throws. Several entries return the per-entry errors
+ * the patch aggregators already use, and the caller writes nothing.
+ */
+async function collectPatchGuardFailures(
+	session: ToolSession,
+	entries: { path: string; rename?: string }[],
+	signal?: AbortSignal,
+): Promise<PatchGuardFailure[] | undefined> {
+	const failures: PatchGuardFailure[] = [];
+	const aggregate = entries.length > 1;
+	for (const entry of entries) {
+		signal?.throwIfAborted();
+		try {
+			const resolvedPath = resolvePlanPath(session, entry.path);
+			await assertEditableFile(resolvedPath, entry.path, session.settings);
+			signal?.throwIfAborted();
+			if (!entry.rename) continue;
+			const resolvedRename = resolvePlanPath(session, entry.rename);
+			if (resolvedRename === resolvedPath) continue;
+			await assertEditableFile(resolvedRename, entry.rename, session.settings);
+			signal?.throwIfAborted();
+		} catch (err) {
+			signal?.throwIfAborted();
+			if (!aggregate || (err instanceof Error && err.name === "AbortError")) throw err;
+			failures.push({ path: entry.path, errorText: err instanceof Error ? err.message : String(err) });
+		}
+	}
+	return failures.length > 0 ? failures : undefined;
+}
+
+function refusedPatchEntriesResult(
+	failures: PatchGuardFailure[],
+	details: { path?: string; perFileResults?: EditToolPerFileResult[] },
+): AgentToolResult<EditToolDetails, TInput> {
+	return {
+		content: [
+			{
+				type: "text",
+				text: failures.map(failure => `Error editing ${failure.path}: ${failure.errorText}`).join("\n"),
+			},
+		],
+		details: { diff: "", ...details },
+		isError: true,
+	};
 }
 
 /** Run apply_patch file operations and aggregate their multi-file result. */
@@ -364,6 +438,96 @@ export class EditTool implements AgentTool<TInput> {
 		return this.#getModeDefinition().parameters;
 	}
 
+	matcherDigest(args: unknown): string | undefined {
+		const digest = this.matcherEntries(args)
+			?.map(entry => entry.digest)
+			.filter(Boolean)
+			.join("\n");
+		return digest || undefined;
+	}
+
+	matcherEntries(args: unknown): readonly { path: string; digest: string }[] | undefined {
+		try {
+			if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+			const record = args as Record<string, unknown>;
+			const digests = new Map<string, string>();
+			const add = (path: string, digest: string | undefined) => {
+				if (!path || digest === undefined) return;
+				const current = digests.get(path);
+				digests.set(path, current === undefined ? digest : `${current}\n${digest}`);
+			};
+
+			switch (this.mode) {
+				case "replace": {
+					if (typeof record.path !== "string" || !Array.isArray(record.edits)) return undefined;
+					for (const entry of record.edits) {
+						if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+						const text = (entry as Record<string, unknown>).new_text;
+						if (text !== undefined && typeof text !== "string") return undefined;
+						add(record.path, text);
+					}
+					break;
+				}
+				case "patch": {
+					if (typeof record.path !== "string" || !Array.isArray(record.edits)) return undefined;
+					for (const entry of record.edits) {
+						const parsed = patchEditEntrySchema.safeParse(entry);
+						if (!parsed.success) return undefined;
+						const { diff, op, rename } = parsed.data;
+						if (op === "delete" || diff === undefined) continue;
+						// A create body is digested exactly as the writer will persist it.
+						add(rename ?? record.path, op === "create" ? normalizeCreateContent(diff) : addedPatchDigest(diff));
+					}
+					break;
+				}
+				case "hashline": {
+					const parsed = hashlineEditParamsSchema.safeParse(args);
+					if (!parsed.success) return undefined;
+					for (const section of splitHashlineInputs(parsed.data.input, {
+						path: parsed.data.path,
+						cwd: this.session.cwd,
+					})) {
+						// A section still streaming (e.g. a trailing op with no anchor yet)
+						// does not parse; it contributes nothing, but earlier complete
+						// sections keep their entries (as pi-edit's hashline inspect does).
+						let edits: HashlineEdit[];
+						try {
+							edits = parseHashline(section.diff);
+						} catch {
+							continue;
+						}
+						const inserted = edits.filter(edit => edit.kind === "insert");
+						if (inserted.length > 0) add(section.path, inserted.map(edit => edit.text).join("\n"));
+					}
+					break;
+				}
+				case "apply_patch": {
+					const parsed = applyPatchSchema.safeParse(args);
+					if (!parsed.success) return undefined;
+					let entries: ApplyPatchEntry[];
+					try {
+						entries = expandApplyPatchToEntries(parsed.data);
+					} catch {
+						entries = expandApplyPatchToPreviewEntries(parsed.data);
+					}
+					for (const entry of entries) {
+						if (entry.op === "delete" || entry.diff === undefined) continue;
+						// The envelope parser already strips Add File prefixes.
+						add(entry.rename ?? entry.path, entry.op === "create" ? entry.diff : addedPatchDigest(entry.diff));
+					}
+					break;
+				}
+				case "vim":
+					return undefined;
+			}
+
+			return digests.size > 0 ? Array.from(digests, ([path, digest]) => ({ path, digest })) : undefined;
+		} catch {
+			// Streamed arguments can be incomplete or malformed in any mode.
+			return undefined;
+		}
+	}
+
 	/**
 	 * When in `apply_patch` mode, expose the OpenAI code backend Lark grammar so providers
 	 * that support OpenAI-style custom tools can emit a grammar-constrained
@@ -403,7 +567,7 @@ export class EditTool implements AgentTool<TInput> {
 			patch: {
 				description: () => prompt.render(patchDescription),
 				parameters: patchEditSchema,
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -411,7 +575,14 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const { edits, path } = params as PatchParams;
-					const runs = (edits as PatchEditEntry[]).map(
+					const patchEdits = edits as PatchEditEntry[];
+					const guardFailures = await collectPatchGuardFailures(
+						tool.session,
+						patchEdits.map(entry => ({ path, rename: entry.rename })),
+						signal,
+					);
+					if (guardFailures) return refusedPatchEntriesResult(guardFailures, { path });
+					const runs = patchEdits.map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executePatchSingle({
 								session: tool.session,
@@ -431,7 +602,7 @@ export class EditTool implements AgentTool<TInput> {
 			apply_patch: {
 				description: () => prompt.render(applyPatchDescription),
 				parameters: applyPatchSchema,
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -439,6 +610,21 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
+					const guardFailures = await collectPatchGuardFailures(
+						tool.session,
+						entries.map(entry => ({ path: entry.path, rename: entry.rename })),
+						signal,
+					);
+					if (guardFailures) {
+						return refusedPatchEntriesResult(guardFailures, {
+							perFileResults: guardFailures.map(failure => ({
+								path: failure.path,
+								diff: "",
+								isError: true,
+								errorText: failure.errorText,
+							})),
+						});
+					}
 					const perFile = entries.map(entry => {
 						const { path, ...patchParams } = entry;
 						return {
@@ -490,24 +676,20 @@ export class EditTool implements AgentTool<TInput> {
 					params: EditParams,
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
-					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					_onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const { edits, path } = params as ReplaceParams;
-					const runs = (edits as ReplaceEditEntry[]).map(
-						entry => (br: LspBatchRequest | undefined) =>
-							executeReplaceSingle({
-								session: tool.session,
-								path,
-								params: entry,
-								signal,
-								batchRequest: br,
-								allowFuzzy: tool.#allowFuzzy,
-								fuzzyThreshold: tool.#fuzzyThreshold,
-								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-							}),
-					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate);
+					return executeReplaceEntries({
+						session: tool.session,
+						path,
+						edits: edits as ReplaceEditEntry[],
+						signal,
+						batchRequest,
+						allowFuzzy: tool.#allowFuzzy,
+						fuzzyThreshold: tool.#fuzzyThreshold,
+						writethrough: tool.#writethrough,
+						beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+					});
 				},
 			},
 			vim: {

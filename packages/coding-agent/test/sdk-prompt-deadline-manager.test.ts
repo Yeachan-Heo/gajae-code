@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PromptDeadlineManager } from "../src/sdk/prompt-deadline-manager";
+import { failedPromptOutcome } from "../src/sdk/prompt-failure";
 
 /**
  * Issue #4668 exact-head review (P1): when expiry reconciliation fails, the
@@ -112,6 +113,38 @@ function fakeReconciliation(): {
 }
 
 describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
+	test("does not flush when another terminal outcome wins the claim", async () => {
+		const { reconciliation } = fakeReconciliation();
+		let flushes = 0;
+		let expired = 0;
+		const claimed = {
+			kind: "stopped" as const,
+			reason: "cancelled" as const,
+			provenance: "client_cancel" as const,
+		};
+		const manager = new PromptDeadlineManager({
+			reconciliation: {
+				...reconciliation,
+				claimPendingOutcome: async () => claimed,
+			} as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			onDeadlineExceeded: () => {
+				flushes += 1;
+			},
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cancel-wins-cmd", turnId: "cancel-wins-turn" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(80);
+
+		expect(flushes).toBe(0);
+		expect(expired).toBe(0);
+		manager.clearAll();
+	});
+
 	test("expires an accepted lease while reconciliation is barriered, without agent_start", async () => {
 		let now = 0;
 		const { reconciliation, state } = fakeReconciliation();
@@ -192,21 +225,146 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
-	test("a recorded real failure wins over deadline expiry and remains failed", async () => {
+	test("a diagnostic failure without terminal proof stays recoverable", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.error = { code: "provider_unavailable", message: "Agent run failed." };
 		const manager = new PromptDeadlineManager({
 			reconciliation: reconciliation as never,
 			getLeaseMs: () => 20,
 			getMaxMs: () => 60_000,
+			onDeadlineTerminalization: async () => "uncertain" as const,
 		});
 		const correlation = { commandId: "cmd-real-failure", turnId: "turn-real-failure" };
 		manager.onAccepted(correlation);
 		await Bun.sleep(80);
-		expect(state.noteTransitionFrames).toEqual(["agent_end"]);
+		expect(state.noteTransitionFrames).toEqual([]);
 		expect(state.finalizeCodes).toEqual([]);
-		expect(state.status).toBe("failed");
+		expect(state.status).toBe("uncertain");
+		expect(state.uncertainCalls).toBeGreaterThan(0);
+		expect(manager.has(correlation)).toBe(true);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("a recovered deadline prompt defers terminal frames without restored run evidence", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-recovered-uncertain", turnId: "turn-recovered-uncertain" };
+		const acceptedAt = Date.now();
+		manager.recoverPending(correlation, acceptedAt, acceptedAt + 60_000);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.onRunStarted(correlation);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
+		manager.clearAll();
+	});
+
+	test("a recovered run start keeps a captured terminal intent deferred", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-recovered-terminal", turnId: "turn-recovered-terminal" };
+		const acceptedAt = Date.now();
+		manager.recoverPending(correlation, acceptedAt, acceptedAt + 60_000);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			true,
+		);
+		manager.onRunStarted(correlation);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("captured terminal intent stays deferred after expiry leaves the active state", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-captured-terminal", turnId: "turn-captured-terminal" };
+		manager.onAccepted(correlation);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			true,
+		);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("a later ordinary terminal observation cannot downgrade deadline deferral", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-deferred-terminal", turnId: "turn-deferred-terminal" };
+		manager.onAccepted(correlation);
+		const evidence = { outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const };
+		manager.noteTerminalTransition(correlation, undefined, evidence, true);
+		manager.noteTerminalTransition(correlation, undefined, evidence);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("a durable terminal retains a retry owner until publication succeeds", async () => {
+		let now = 0;
+		let publicationAttempts = 0;
+		let expired = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		const outcome = {
+			kind: "failed",
+			code: "prompt_deadline_exceeded",
+			message: "Prompt deadline exceeded.",
+			provenance: "deadline",
+			phase: "post_start",
+			category: "deadline",
+		} as const;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineTerminalization: async () => "settled" as const,
+			onDeadlinePublishTerminal: async () => {
+				publicationAttempts += 1;
+				return { outcome, published: publicationAttempts > 1 };
+			},
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-publish-retry", turnId: "turn-publish-retry" };
+		manager.onAccepted(correlation);
+		manager.noteTerminalTransition(correlation, undefined, { outcome }, true);
+		now = 20;
+		const firstAttemptDeadline = Date.now() + 2_000;
+		while (publicationAttempts === 0 && Date.now() < firstAttemptDeadline) await Bun.sleep(5);
+		expect(publicationAttempts).toBe(1);
+		expect(manager.has(correlation)).toBe(true);
+		expect(state.uncertainCalls).toBe(0);
+
+		const settledDeadline = Date.now() + 3_000;
+		while (expired === 0 && Date.now() < settledDeadline) await Bun.sleep(5);
+		expect(publicationAttempts).toBe(2);
+		expect(expired).toBe(1);
 		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
 	});
 
 	test("a late terminal upgrade without a lease re-arms bounded replay ownership", async () => {
@@ -625,7 +783,7 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		});
 
 		manager.recoverPending(correlation, 0);
-		await Bun.sleep(20);
+		await Bun.sleep(1_100);
 
 		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
 		expect(state.status).toBe("failed");
@@ -644,11 +802,169 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		});
 
 		manager.recoverPending(correlation, 0, 50);
-		await Bun.sleep(20);
+		await Bun.sleep(1_100);
 
 		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
 		expect(state.status).toBe("failed");
 		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
+
+	test("progress at the hard maximum does not extend an already-due deadline", async () => {
+		let now = 0;
+		const claimStarted = Promise.withResolvers<void>();
+		const claimGate = Promise.withResolvers<void>();
+		const { reconciliation, state } = fakeReconciliation();
+		state.claimStarted = () => claimStarted.resolve();
+		state.claimRelease = claimGate.promise;
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60,
+			now: () => now,
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-hard-max-progress", turnId: "turn-hard-max-progress" };
+		manager.onAccepted(correlation);
+		now = 60;
+		await claimStarted.promise;
+		for (let tick = 0; tick < 5; tick += 1) manager.onProgress(correlation, now + tick);
+		claimGate.resolve();
+		const terminalDeadline = Date.now() + 2_000;
+		while (expired === 0 && Date.now() < terminalDeadline) await Bun.sleep(5);
+		expect(expired).toBe(1);
+		expect(state.finalizeCalls).toBe(1);
+		manager.clearAll();
+	});
+
+	test("uncertain recovery after the hard maximum backs off without duplicate writes", async () => {
+		let now = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 20,
+			now: () => now,
+			onDeadlineTerminalization: async () => "uncertain" as const,
+		});
+		const correlation = { commandId: "cmd-hard-max-uncertain", turnId: "turn-hard-max-uncertain" };
+		manager.onAccepted(correlation);
+		now = 20;
+		const recoveryDeadline = Date.now() + 2_000;
+		while (state.uncertainCalls === 0 && Date.now() < recoveryDeadline) await Bun.sleep(5);
+		expect(state.uncertainCalls).toBe(1);
+		expect(manager.hasRecoveryPending(correlation)).toBe(true);
+		await Bun.sleep(150);
+		expect(state.uncertainCalls).toBe(1);
+		expect(manager.has(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	const deadlineExceeded = () =>
+		failedPromptOutcome({
+			code: "prompt_deadline_exceeded",
+			provenance: "deadline",
+			evidence: {},
+		});
+
+	test("a drained renewal whose new lease is already due publishes on the follow-up expiry", async () => {
+		// The tool-boundary wait captures one generation, then tool_execution_end
+		// renews the lease. On a slow runner that wait outlives the renewal, so
+		// the new deadline is already due when the wait returns. Time-only
+		// supersession used to keep the stale pass, the publisher refused the
+		// old generation, and uncertainty recovery refused the same mismatch —
+		// the prompt stayed in flight until settledStatus gave up.
+		let now = 0;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let terminalizations = 0;
+		let publications = 0;
+		const currentAtTerminalization: boolean[] = [];
+		const { reconciliation, state } = fakeReconciliation();
+		let manager: PromptDeadlineManager;
+		manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 250,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineTerminalization: async (correlation, isCurrent) => {
+				terminalizations += 1;
+				if (terminalizations === 1) {
+					started.resolve();
+					await release.promise;
+				}
+				currentAtTerminalization.push(isCurrent());
+				if (!isCurrent()) return "uncertain";
+				manager.noteTerminalTransition(correlation, undefined, { outcome: deadlineExceeded() }, true);
+				return "settled";
+			},
+			onDeadlinePublishTerminal: async (_correlation, isCurrent) => {
+				if (!isCurrent()) return false;
+				publications += 1;
+				state.status = "failed";
+				return { published: true, outcome: deadlineExceeded() };
+			},
+		});
+		const correlation = { commandId: "cmd-drained-lease", turnId: "turn-drained-lease" };
+		manager.onAccepted(correlation);
+		now = 250;
+		await started.promise;
+		now = 800;
+		manager.onAttributableEvent(correlation, "tool_execution_end", 500);
+		release.resolve();
+		const deadline = Date.now() + 2_000;
+		while (publications === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(publications).toBe(1);
+		expect(state.status).toBe("failed");
+		expect(state.uncertainCalls).toBe(0);
+		expect(currentAtTerminalization[0]).toBe(false);
+		expect(terminalizations).toBeGreaterThanOrEqual(2);
+		manager.clearAll();
+	});
+
+	test("progress during the flush whose renewed lease is already due publishes on the follow-up expiry", async () => {
+		let now = 0;
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		let publications = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		let manager: PromptDeadlineManager;
+		manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 250,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineTerminalization: async (correlation, isCurrent) => {
+				if (!isCurrent()) return "uncertain";
+				manager.noteTerminalTransition(correlation, undefined, { outcome: deadlineExceeded() }, true);
+				return "settled";
+			},
+			onDeadlineExceeded: async () => {
+				flushStarted.resolve();
+				await releaseFlush.promise;
+			},
+			onDeadlinePublishTerminal: async (_correlation, isCurrent) => {
+				if (!isCurrent()) return false;
+				publications += 1;
+				state.status = "failed";
+				return { published: true, outcome: deadlineExceeded() };
+			},
+		});
+		const correlation = { commandId: "cmd-flush-lease", turnId: "turn-flush-lease" };
+		manager.onAccepted(correlation);
+		now = 250;
+		await flushStarted.promise;
+		now = 800;
+		manager.onAttributableEvent(correlation, "tool_execution_update", 500);
+		releaseFlush.resolve();
+		const deadline = Date.now() + 2_000;
+		while (publications === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(publications).toBe(1);
+		expect(state.status).toBe("failed");
+		expect(state.uncertainCalls).toBe(0);
 		manager.clearAll();
 	});
 });

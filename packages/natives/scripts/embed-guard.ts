@@ -5,6 +5,8 @@ export interface CandidateAddon {
 
 export interface BuildSidecar {
 	languageSet?: string;
+	profile?: string;
+	version?: string;
 }
 
 export interface NativeBuildInfo {

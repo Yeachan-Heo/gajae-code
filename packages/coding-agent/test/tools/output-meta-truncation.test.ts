@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "@gajae-code/ai";
 import { Settings } from "../../src/config/settings";
 import { truncateHead, truncateMiddleWindows } from "../../src/session/streaming-output";
 import {
 	BASH_DEFAULT_OUTPUT_TAIL_BYTES,
 	formatOutputNotice,
+	formatTruncationMetaNotice,
 	outputMeta,
 	resolveBashOutputSinkHeadBytes,
 	resolveBashOutputSinkTailBytes,
+	wrapToolWithMetaNotice,
 } from "../../src/tools/output-meta";
+import { ToolError } from "../../src/tools/tool-errors";
 
 describe("output truncation metadata plumbing", () => {
 	test("defaults Bash capture to a 1 KiB tail while preserving explicit retention budgets", () => {
@@ -21,6 +25,27 @@ describe("output truncation metadata plumbing", () => {
 		const result = truncateHead("one\ntwo\nthree", { maxLines: 2, maxBytes: 100 });
 		const meta = outputMeta().truncation(result, { direction: "head", noticeOwner: "body" }).get();
 		expect(meta?.truncation?.noticeOwner).toBe("body");
+	});
+
+	test("preserves designed tool errors through the output wrapper", async () => {
+		const expected = new ToolError("Tool call rejected by user (refuse)");
+		const tool = wrapToolWithMetaNotice({
+			name: "refuse",
+			label: "Refuse",
+			description: "refuses",
+			parameters: z.object({}),
+			execute: async (_toolCallId: string, _params: Record<string, never>) => {
+				throw expected;
+			},
+		});
+
+		let thrown: unknown;
+		try {
+			await tool.execute("call-1", {});
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBe(expected);
 	});
 
 	test("uses actual windows for truncationWindows and forwards noticeOwner", () => {
@@ -73,5 +98,28 @@ describe("output truncation metadata plumbing", () => {
 			.truncationFromText("one", { direction: "head", totalLines: 2, noticeOwner: "body" })
 			.get();
 		expect(textMeta?.truncation?.noticeOwner).toBe("body");
+	});
+
+	test("preserves nextOffset pagination hint in middle-direction truncation notice", () => {
+		// Regression test for #5966 blocker: when backstop truncates to middle,
+		// the nextOffset hint must be preserved in the model-visible notice.
+		// Simulate a large text that gets truncated to the middle by backstop.
+		const largeText = Array(300)
+			.fill(0)
+			.map((_, i) => `line ${i} ${"".padEnd(64, "x")}`)
+			.join("\n");
+
+		const windows = truncateMiddleWindows(largeText, { maxBytes: 12 * 1024, maxLines: 50 });
+		const meta = outputMeta().truncationWindows(windows, { artifactId: "art-full" }).get();
+
+		// Add nextOffset to simulate the read tool adding a pagination hint
+		if (meta?.truncation && meta.truncation.direction === "middle") {
+			(meta.truncation as any).nextOffset = 304;
+			const notice = formatTruncationMetaNotice(meta.truncation);
+			// The notice should contain both the middle elision info and the nextOffset pagination hint
+			expect(notice).toContain("elided"); // either "bytes" or "lines" depending on actual truncation
+			expect(notice).toContain("Use :304 to continue"); // CRITICAL: nextOffset must be in notice
+			expect(notice).toContain("artifact://art-full");
+		}
 	});
 });

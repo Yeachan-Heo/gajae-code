@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import {
 	detectDiscoveredApiFamily,
 	fetchOpenAICompatibleModels,
 	isSafeCatalogModelId,
+	MODELS_LIST_REQUEST_TIMEOUT_MS,
 	resolveLoopbackOpenAIBaseUrl,
 } from "../src/utils/discovery/openai-compatible";
 
@@ -238,6 +239,36 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 			throw new DOMException("Aborted", "AbortError");
 		}) as unknown as typeof fetch;
 		expect(await fetchOpenAICompatibleModels({ ...options, signal: controller.signal })).toBeNull();
+	});
+
+	it("uses the shared ten-second deadline for runtime model discovery", async () => {
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+		try {
+			respondWithModels([{ id: "deadline-model" }]);
+			await fetchOpenAICompatibleModels(options);
+			expect(timeoutSpy).toHaveBeenCalledWith(MODELS_LIST_REQUEST_TIMEOUT_MS);
+		} finally {
+			timeoutSpy.mockRestore();
+		}
+	});
+
+	it("returns no models when a runtime endpoint stalls past its deadline", async () => {
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(), 20);
+			return controller.signal;
+		});
+		global.fetch = (async (_url: string | URL | Request, init?: RequestInit) =>
+			await new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(new DOMException("timeout", "AbortError")), {
+					once: true,
+				});
+			})) as typeof fetch;
+		try {
+			expect(await fetchOpenAICompatibleModels(options)).toBeNull();
+		} finally {
+			timeoutSpy.mockRestore();
+		}
 	});
 
 	it("accepts only loopback endpoints for implicit local-provider overrides", () => {

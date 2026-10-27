@@ -8,7 +8,8 @@
  * - Hooks: Claude `.claude/hooks/<pre|post>/<file>` and Codex flat
  *   `.codex/hooks/<phase>-<tool>.ts|js` conventions, normalized through the
  *   canonical hook IR (`normalizeDirectoryHook`, #4286/#4289) and written to
- *   the runtime-discovered `<root>/hooks/<pre|post>/` layout.
+ *   the canonical `<root>/hooks/<pre|post>/` layout. Project-scope hooks are
+ *   stored-only; ordinary sessions do not load repository hook modules.
  * - MCPs: `normalizeClaudeMcpJson` / `normalizeCodexMcpToml` plus
  *   `validateMCPCompatServer` (#4284 bounded compatibility adapters), merged
  *   through the canonical atomic config writer.
@@ -17,12 +18,16 @@
  * secret values live only in the separate `ImportPlan`. `applyImport` runs as
  * a validated transaction: every destination path is containment- and
  * symlink-checked before any write, destinations are revalidated against the
- * preview decisions, files are published with same-directory temp+rename, and
- * any failure restores exactly the files this transaction wrote (pre-existing
- * symlinks are never touched). Verification failures roll back too.
+ * preview decisions, and skill/hook files are published through a no-follow
+ * directory descriptor with same-directory temp+rename. Any failure restores
+ * exactly the files this transaction wrote (pre-existing symlinks are never
+ * touched). Verification failures roll back too.
  */
+import { dlopen, FFIType, read } from "bun:ffi";
 import type { Dirent } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -351,6 +356,11 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 	const entries: ImportPreviewEntry[] = [];
 	const payloads: (NormalizedPayload | undefined)[] = [];
 	const warnings: string[] = [];
+	if (surfaces.includes("hooks") && options.destinationScope === "project") {
+		warnings.push(
+			"Project-scope hooks are stored-only: ordinary sessions do not load repository hook modules. Import hooks into Global .gjc or configure an explicit hook path to activate them.",
+		);
+	}
 	const productName = productLabel(options.product);
 	const sourceLabel = `${productName} ${sourceScopeLabel(options.sourceScope)}`;
 
@@ -538,7 +548,9 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 			read.kind === "value"
 				? options.product === "claude-code"
 					? normalizeClaudeMcpJson(read.content, sourcePath, options.sourceScope)
-					: normalizeCodexMcpToml(read.content, sourcePath, options.sourceScope)
+					: normalizeCodexMcpToml(read.content, sourcePath, options.sourceScope, {
+							omitEnvReferences: options.destinationScope === "project",
+						})
 				: { items: [], warnings: [] as string[] };
 		for (const warning of normalized.warnings) warnings.push(`${sourceLabel} MCPs: ${warning}`);
 		const unsupportedNestedAuth =
@@ -634,6 +646,9 @@ interface FileSnapshot {
 	path: string;
 	/** Previous content, or null when the file did not exist. */
 	previous: string | null;
+	/** Set when publication was bound to this directory descriptor. */
+	parentFd?: number;
+	name?: string;
 }
 
 interface PlannedFileWrite {
@@ -673,6 +688,13 @@ async function findSymlinkedAncestor(root: string, target: string): Promise<stri
 
 /** Remove stale staging temp files from an interrupted earlier apply. */
 async function sweepStagingTemps(dir: string): Promise<void> {
+	try {
+		const stat = await fs.lstat(dir);
+		// readdir follows a swapped directory symlink; never clean through one.
+		if (stat.isSymbolicLink() || !stat.isDirectory()) return;
+	} catch {
+		return;
+	}
 	let names: string[];
 	try {
 		names = await fs.readdir(dir);
@@ -683,6 +705,209 @@ async function sweepStagingTemps(dir: string): Promise<void> {
 		if (!name.includes(".gjc-import-") || !name.endsWith(".tmp")) continue;
 		await fs.rm(path.join(dir, name), { force: true }).catch(() => {});
 	}
+}
+
+const { ENOENT, EEXIST, ELOOP, ENOTDIR } = os.constants.errno;
+const CLOEXEC = (fsSync.constants as { O_CLOEXEC?: number }).O_CLOEXEC ?? 0;
+const NOFOLLOW = fsSync.constants.O_NOFOLLOW ?? 0;
+const DIR_FLAGS = fsSync.constants.O_RDONLY | (fsSync.constants.O_DIRECTORY ?? 0) | NOFOLLOW | CLOEXEC;
+const READ_FLAGS = fsSync.constants.O_RDONLY | (fsSync.constants.O_NONBLOCK ?? 0) | NOFOLLOW | CLOEXEC;
+const WRITE_FLAGS = fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | NOFOLLOW | CLOEXEC;
+const MAX_PINNED_IMPORT_PARENTS = 128;
+
+interface PinnedDestination {
+	fds: number[];
+	parentFd: number;
+	name: string;
+}
+
+type DirectoryOps = {
+	mkdirat: (dirfd: number, name: string, mode: number) => number;
+	openat: (dirfd: number, name: string, flags: number, mode: number) => number;
+	renameat: (fromfd: number, from: string, tofd: number, to: string) => number;
+	unlinkat: (dirfd: number, name: string, flags: number) => number;
+	errno: () => number;
+};
+
+let directoryOpsCache: DirectoryOps | undefined;
+
+/** POSIX only. Windows has no O_NOFOLLOW, so publication keeps the lexical recheck. */
+function pinnedPublicationAvailable(): boolean {
+	return (
+		process.platform !== "win32" &&
+		fsSync.constants.O_NOFOLLOW !== undefined &&
+		fsSync.constants.O_DIRECTORY !== undefined
+	);
+}
+
+function directoryOps(): DirectoryOps {
+	if (directoryOpsCache) return directoryOpsCache;
+	const darwin = process.platform === "darwin";
+	const lib = dlopen(darwin ? "/usr/lib/libSystem.B.dylib" : "libc.so.6", {
+		mkdirat: { args: [FFIType.i32, FFIType.cstring, FFIType.u32], returns: FFIType.i32 },
+		openat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.u32], returns: FFIType.i32 },
+		renameat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring], returns: FFIType.i32 },
+		unlinkat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
+		...(darwin
+			? { __error: { args: [], returns: FFIType.ptr } }
+			: { __errno_location: { args: [], returns: FFIType.ptr } }),
+	});
+	const symbols = lib.symbols as unknown as DirectoryOps & {
+		__error?: () => Parameters<typeof read.i32>[0];
+		__errno_location?: () => Parameters<typeof read.i32>[0];
+	};
+	directoryOpsCache = {
+		mkdirat: symbols.mkdirat,
+		openat: symbols.openat,
+		renameat: symbols.renameat,
+		unlinkat: symbols.unlinkat,
+		errno: () => read.i32(darwin ? symbols.__error!() : symbols.__errno_location!()),
+	};
+	return directoryOpsCache;
+}
+
+function closeRawFds(fds: number[]): void {
+	for (const fd of fds.splice(0).reverse()) fsSync.closeSync(fd);
+}
+
+function symlinkRefusal(location: string): Error {
+	return new Error(`refusing to write through symlinked ancestor: ${location}`);
+}
+
+/** Lexical shape of an import destination. Symlink checks are separate. */
+export function importDestinationShapeAllowed(root: string, target: string): boolean {
+	const relative = path.relative(root, path.dirname(target));
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
+	const segments = relative === "" ? [] : relative.split(path.sep);
+	return [...segments, path.basename(target)].every(isSafeName);
+}
+
+/** Walk from `root` with openat/mkdirat and retain only the final parent descriptor. */
+function pinImportParent(root: string, target: string): PinnedDestination {
+	if (!importDestinationShapeAllowed(root, target)) throw new Error(`refusing unsafe import destination: ${target}`);
+	const relative = path.relative(root, path.dirname(target));
+	const segments = relative === "" ? [] : relative.split(path.sep);
+	const name = path.basename(target);
+	const ops = directoryOps();
+	const fds: number[] = [];
+	try {
+		let parentFd: number;
+		try {
+			parentFd = fsSync.openSync(root, DIR_FLAGS);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ELOOP" || code === "ENOTDIR") throw symlinkRefusal(root);
+			throw error;
+		}
+		fds.push(parentFd);
+		let cursor = root;
+		for (const segment of segments) {
+			cursor = path.join(cursor, segment);
+			let fd = ops.openat(parentFd, segment, DIR_FLAGS, 0);
+			if (fd < 0 && ops.errno() === ENOENT) {
+				if (ops.mkdirat(parentFd, segment, 0o700) < 0 && ops.errno() !== EEXIST) {
+					throw new Error(`cannot create import directory ${cursor}: errno ${ops.errno()}`);
+				}
+				fd = ops.openat(parentFd, segment, DIR_FLAGS, 0);
+			}
+			if (fd < 0) {
+				const err = ops.errno();
+				if (err === ELOOP || err === ENOTDIR) throw symlinkRefusal(cursor);
+				throw new Error(`cannot open import directory ${cursor}: errno ${err}`);
+			}
+			let isDirectory: boolean;
+			try {
+				isDirectory = fsSync.fstatSync(fd).isDirectory();
+			} catch (error) {
+				fsSync.closeSync(fd);
+				throw error;
+			}
+			if (!isDirectory) {
+				fsSync.closeSync(fd);
+				throw symlinkRefusal(cursor);
+			}
+			closeRawFds(fds);
+			fds.push(fd);
+			parentFd = fd;
+		}
+		const named = fsSync.lstatSync(path.dirname(target));
+		const opened = fsSync.fstatSync(parentFd);
+		if (named.isSymbolicLink() || !named.isDirectory() || named.dev !== opened.dev || named.ino !== opened.ino) {
+			throw symlinkRefusal(path.dirname(target));
+		}
+		return { fds, parentFd, name };
+	} catch (error) {
+		closeRawFds(fds);
+		throw error;
+	}
+}
+
+function readRegularAt(parentFd: number, name: string, lexicalPath: string): string | null {
+	const ops = directoryOps();
+	const fd = ops.openat(parentFd, name, READ_FLAGS, 0);
+	if (fd < 0) {
+		const err = ops.errno();
+		if (err === ENOENT) return null;
+		if (err === ELOOP || err === ENOTDIR) throw new Error(`refusing to write through symlink: ${lexicalPath}`);
+		throw new Error(`cannot read ${lexicalPath}: errno ${err}`);
+	}
+	try {
+		if (!fsSync.fstatSync(fd).isFile()) throw new Error(`not a regular file: ${lexicalPath}`);
+		return fsSync.readFileSync(fd, "utf-8");
+	} finally {
+		fsSync.closeSync(fd);
+	}
+}
+
+function writeRegularAt(parentFd: number, name: string, content: string, index: number, lexicalPath: string): void {
+	const ops = directoryOps();
+	const tmp = `.gjc-import-${process.pid}-${index}-${name}.tmp`;
+	const fd = ops.openat(parentFd, tmp, WRITE_FLAGS, 0o600);
+	if (fd < 0) throw new Error(`cannot stage import file ${lexicalPath}: errno ${ops.errno()}`);
+	try {
+		fsSync.writeFileSync(fd, content, "utf-8");
+		fsSync.fchmodSync(fd, 0o600);
+	} finally {
+		fsSync.closeSync(fd);
+	}
+	if (ops.renameat(parentFd, tmp, parentFd, name) < 0) {
+		const err = ops.errno();
+		ops.unlinkat(parentFd, tmp, 0);
+		throw new Error(`cannot publish import file ${lexicalPath}: errno ${err}`);
+	}
+}
+
+/** The lexical parent must still be the directory the descriptor published into. */
+function assertPinnedParentStillAt(parentFd: number, lexicalParent: string, lexicalPath: string): void {
+	let named: fsSync.Stats;
+	try {
+		named = fsSync.lstatSync(lexicalParent);
+	} catch {
+		throw new Error(`post-import verification failed: ${lexicalPath} was not persisted`);
+	}
+	const opened = fsSync.fstatSync(parentFd);
+	if (named.isSymbolicLink() || !named.isDirectory() || named.dev !== opened.dev || named.ino !== opened.ino) {
+		throw new Error(`post-import verification failed: ${lexicalPath} was not persisted`);
+	}
+	try {
+		const leaf = fsSync.lstatSync(lexicalPath);
+		if (leaf.isSymbolicLink() || !leaf.isFile()) {
+			throw new Error(`post-import verification failed: ${lexicalPath} was not persisted`);
+		}
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("post-import verification failed:")) throw error;
+		throw new Error(`post-import verification failed: ${lexicalPath} was not persisted`);
+	}
+}
+
+function restoreRegularAt(parentFd: number, name: string, previous: string | null, lexicalPath: string): void {
+	if (previous === null) {
+		if (directoryOps().unlinkat(parentFd, name, 0) < 0 && directoryOps().errno() !== ENOENT) {
+			throw new Error(`cannot remove ${lexicalPath}: errno ${directoryOps().errno()}`);
+		}
+		return;
+	}
+	writeRegularAt(parentFd, name, previous, 1_000_000 + process.pid, lexicalPath);
 }
 
 /**
@@ -848,12 +1073,44 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 
 	// --- Phase 2: publication ------------------------------------------------
 	const snapshots: FileSnapshot[] = [];
+	const pins: PinnedDestination[] = [];
+	const pinsByParent = new Map<string, PinnedDestination>();
 	for (const dir of [destination.skillsDir, destination.hooksDir]) {
 		await sweepStagingTemps(dir).catch(() => {});
 	}
 
 	try {
+		if (fileWrites.length > 0 && pinnedPublicationAvailable()) {
+			// Scope root only. Children are created with mkdirat on the pinned fd.
+			await fs.mkdir(destination.root, { recursive: true, mode: 0o700 });
+			for (const write of fileWrites) {
+				const parentPath = path.dirname(write.path);
+				if (pinsByParent.has(parentPath)) continue;
+				if (pinsByParent.size >= MAX_PINNED_IMPORT_PARENTS) {
+					throw new Error(
+						`import batch exceeds the limit of ${MAX_PINNED_IMPORT_PARENTS} distinct destination directories`,
+					);
+				}
+				const pin = pinImportParent(destination.root, write.path);
+				pins.push(pin);
+				pinsByParent.set(parentPath, pin);
+			}
+			// Fail before publishing anything if pinned directories leave no
+			// descriptor available for staging or rollback.
+			const descriptorProbe = fsSync.openSync(os.devNull, fsSync.constants.O_RDONLY | CLOEXEC);
+			fsSync.closeSync(descriptorProbe);
+		}
 		for (const [index, write] of fileWrites.entries()) {
+			if (pinnedPublicationAvailable()) {
+				const pin = pinsByParent.get(path.dirname(write.path));
+				if (!pin) throw new Error(`cannot pin import destination directory: ${path.dirname(write.path)}`);
+				const previous = readRegularAt(pin.parentFd, pin.name, write.path);
+				writeRegularAt(pin.parentFd, pin.name, write.content, index, write.path);
+				snapshots.push({ path: write.path, previous, parentFd: pin.parentFd, name: pin.name });
+				continue;
+			}
+			const symlinked = await findSymlinkedAncestor(destination.root, write.path);
+			if (symlinked) throw new Error(`refusing to write through symlinked ancestor: ${symlinked}`);
 			await fs.mkdir(path.dirname(write.path), { recursive: true, mode: 0o700 });
 			const stat = await fs.lstat(write.path).catch(() => null);
 			if (stat?.isSymbolicLink()) throw new Error(`refusing to write through symlink: ${write.path}`);
@@ -889,8 +1146,18 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 
 		// --- Phase 3: verification (inside the transaction) ------------------
 		for (const write of fileWrites) {
-			const persisted = await readStructured(write.path);
-			if (persisted.kind !== "value" || persisted.content !== write.content) {
+			const pinned = snapshots.find(snapshot => snapshot.path === write.path && snapshot.parentFd !== undefined);
+			let persisted: string | null;
+			if (pinned?.parentFd !== undefined && pinned.name) {
+				assertPinnedParentStillAt(pinned.parentFd, path.dirname(write.path), write.path);
+				persisted = readRegularAt(pinned.parentFd, pinned.name, write.path);
+				assertPinnedParentStillAt(pinned.parentFd, path.dirname(write.path), write.path);
+			} else {
+				persisted = await readStructured(write.path).then(result =>
+					result.kind === "value" ? result.content : null,
+				);
+			}
+			if (persisted !== write.content) {
 				throw new Error(`post-import verification failed: ${write.path} was not persisted`);
 			}
 		}
@@ -908,7 +1175,9 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 		const rollbackErrors: string[] = [];
 		for (const snapshot of snapshots.reverse()) {
 			try {
-				if (snapshot.previous === null) {
+				if (snapshot.parentFd !== undefined && snapshot.name) {
+					restoreRegularAt(snapshot.parentFd, snapshot.name, snapshot.previous, snapshot.path);
+				} else if (snapshot.previous === null) {
 					await fs.rm(snapshot.path, { force: true });
 				} else {
 					const staged = `${snapshot.path}.gjc-rollback-${process.pid}.tmp`;
@@ -926,6 +1195,8 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 			`import failed and was rolled back: ${reason}` +
 				(rollbackErrors.length > 0 ? `; ROLLBACK ERRORS (manual repair needed): ${rollbackErrors.join("; ")}` : ""),
 		);
+	} finally {
+		for (const pin of pins) closeRawFds(pin.fds);
 	}
 
 	for (const { entry } of writable) {

@@ -170,6 +170,7 @@ describe("GJC tmux session management", () => {
 		expect(Bun.spawnSync).toHaveBeenCalledWith(
 			[
 				"tmux-test",
+				"-u",
 				"list-sessions",
 				"-F",
 				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-owner-generation}\t#{@gjc-version}\t#{@gjc-psmux-incarnation}\t#{session_id}",
@@ -369,7 +370,7 @@ describe("GJC tmux session management", () => {
 		expect(() => statusGjcTmuxSession("unrelated", env)).toThrow("gjc_tmux_session_not_found:unrelated");
 		injectSafeMutationProof();
 		expect(removeGjcTmuxSession("gajae_code_work", env).name).toBe("gajae_code_work");
-		expect(calls.at(-1)?.[1]).toBe("if-shell");
+		expect(calls.at(-1)?.slice(1, 3)).toEqual(["-u", "if-shell"]);
 	}, 15_000);
 
 	it("refuses a same-name replacement before the final guarded remove", () => {
@@ -522,7 +523,7 @@ describe("GJC tmux session management", () => {
 		expect(session.name).toBe("win_session");
 		expect(session.profile).toBe("1");
 		expect(session.branch).toBe("issue-882-windows-tmux");
-		expect(calls).toContainEqual(["tmux", "show-options", "-qv", "-t", "=win_session:", "@gjc-profile"]);
+		expect(calls).toContainEqual(["tmux", "-u", "show-options", "-qv", "-t", "=win_session:", "@gjc-profile"]);
 	});
 
 	it("still reports plain not-found when the multiplexer does not list the session", () => {
@@ -558,9 +559,9 @@ describe("GJC tmux session management", () => {
 		removeGjcTmuxSession("gajae_code_work", env);
 
 		const showOptions = calls.find(call => call.includes("show-options") && call.includes("@gjc-profile"));
-		expect(showOptions).toEqual(["tmux", "show-options", "-qv", "-t", "=gajae_code_work:", "@gjc-profile"]);
+		expect(showOptions).toEqual(["tmux", "-u", "show-options", "-qv", "-t", "=gajae_code_work:", "@gjc-profile"]);
 		// Destructive removal targets the re-proven immutable native session ID.
-		expect(calls.at(-1)?.[1]).toBe("if-shell");
+		expect(calls.at(-1)?.slice(1, 3)).toEqual(["-u", "if-shell"]);
 	});
 
 	it("builds psmux-aware targets for session-scoped commands", () => {
@@ -679,6 +680,8 @@ describe("GJC tmux session management", () => {
 				"psmux_session",
 				"@gjc-profile",
 			]);
+			// The UTF-8 client flag is a native tmux flag; psmux never receives it.
+			expect(calls.filter(call => call.includes("-u"))).toEqual([]);
 		} finally {
 			__setBinaryResolverForTests(null);
 			__setExecutableIdentityResolverForTests(null);
@@ -815,7 +818,7 @@ describe("GJC tmux session management", () => {
 				{ platform: "win32" },
 			),
 		).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
-		expect(plannedArgv?.slice(0, -1)).toEqual(["tmux", "new-session", "-d", "-s", "psmux-session"]);
+		expect(plannedArgv?.slice(0, -1)).toEqual(["tmux", "-u", "new-session", "-d", "-s", "psmux-session"]);
 
 		const innerCommand = plannedArgv?.at(-1);
 		const encodedMatch = innerCommand?.match(/-EncodedCommand\s+(\S+)/);
@@ -838,6 +841,48 @@ describe("GJC tmux session management", () => {
 				},
 			}),
 		);
+	});
+	it("creates psmux sessions without the native tmux UTF-8 client flag", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-sessions-test-"));
+		fixtureDirectories.push(stateDir);
+		let plannedArgv: string[] | undefined;
+		__setCreateOwnerIsolationForTests({
+			execute: plan => {
+				if (!plan.ok) throw new Error("expected owner-isolation plan");
+				plannedArgv = plan.execution.argv;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		__setTmuxProviderAuthorityPlatformForTests("win32");
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		__setExecutableIdentityResolverForTests(executablePath => `identity:${executablePath}`);
+		try {
+			expect(() =>
+				createGjcTmuxSession(
+					{
+						GJC_TMUX_COMMAND: "psmux",
+						GJC_PSMUX_COMMAND: "psmux",
+						GJC_TMUX_SESSION: "psmux_session",
+						GJC_COORDINATOR_SESSION_STATE_FILE: path.join(stateDir, "runtime-state.json"),
+					},
+					{ platform: "win32" },
+				),
+			).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+		} finally {
+			__setBinaryResolverForTests(null);
+			__setExecutableIdentityResolverForTests(null);
+		}
+		// psmux takes its namespace prefix directly after the executable and never the
+		// native tmux UTF-8 client flag.
+		expect(plannedArgv?.slice(0, 6)).toEqual([
+			"/fake/psmux",
+			"-L",
+			expect.stringMatching(/^gjc-[a-f0-9]{32}$/),
+			"new-session",
+			"-d",
+			"-s",
+		]);
+		expect(plannedArgv).not.toContain("-u");
 	});
 	it("passes a structured Broker launch through managed tmux without inheriting the parent session identity", () => {
 		let plannedArgv: string[] | undefined;
@@ -873,6 +918,7 @@ describe("GJC tmux session management", () => {
 		).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
 		expect(plannedArgv?.slice(0, -1)).toEqual([
 			"tmux",
+			"-u",
 			"new-session",
 			"-d",
 			"-s",
@@ -973,11 +1019,14 @@ describe("GJC tmux session management", () => {
 			),
 		).toThrow("gjc_tmux_managed_launch_proof_unavailable");
 		const cleanup = calls.find(
-			command => command[1] === "if-shell" && command.some(argument => argument.includes("kill-session")),
+			command =>
+				command[1] === "-u" &&
+				command[2] === "if-shell" &&
+				command.some(argument => argument.includes("kill-session")),
 		);
-		expect(cleanup?.[3]).toBe("$1");
-		expect(cleanup?.[5]).toContain("#{session_id},$1");
-		expect(cleanup?.[5]).toContain(`#{session_name},${sessionName}`);
+		expect(cleanup?.[4]).toBe("$1");
+		expect(cleanup?.[6]).toContain("#{session_id},$1");
+		expect(cleanup?.[6]).toContain(`#{session_name},${sessionName}`);
 	});
 	it("refuses psmux before attach-session mutation", () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
@@ -1055,6 +1104,7 @@ describe("GJC tmux session management", () => {
 		expect(calls.some(cmd => cmd.includes("kill-session"))).toBe(false);
 		expect(calls).toContainEqual([
 			"tmux",
+			"-u",
 			"display-message",
 			"-p",
 			"-t",
@@ -1199,6 +1249,7 @@ describe("GJC tmux session management", () => {
 		]);
 		expect(calls).toContainEqual([
 			"tmux",
+			"-u",
 			"if-shell",
 			"-t",
 			"$1",
@@ -1207,7 +1258,7 @@ describe("GJC tmux session management", () => {
 			expect.stringContaining('kill-session -t "\\$1"'),
 			"display-message -p __gjc_tmux_guarded_mutation_refused__",
 		]);
-		expect(calls.filter(command => command[1] === "kill-session")).toEqual([]);
+		expect(calls.filter(command => command.includes("kill-session"))).toEqual([]);
 	});
 
 	it("preserves a created session without publishing when metadata readback changes a required value", async () => {
@@ -1289,17 +1340,17 @@ describe("GJC tmux session management", () => {
 				GJC_COORDINATOR_SESSION_STATE_FILE: path.join(os.tmpdir(), `gjc-replacement-${crypto.randomUUID()}.json`),
 			}),
 		).toThrow("gjc_tmux_precommit_failed_cleanup_failed");
-		expect(calls.filter(command => command[1] === "set-option" || command[1] === "kill-session")).toEqual([]);
+		expect(calls.filter(command => command.includes("set-option") || command.includes("kill-session"))).toEqual([]);
 		// Select the guarded-mutation if-shell by content, not by a fixed index: the
 		// psmux detection probe issues `-V`/`--version` spawns first on POSIX, so any
 		// positional index here is host-dependent.
-		const guardedTag = calls.find(command => command[1] === "if-shell");
-		expect(guardedTag?.slice(0, 6)).toEqual(["tmux", "if-shell", "-t", "$1", "-F", expect.any(String)]);
-		expect(guardedTag?.[5]).toContain("#{pid},1");
-		expect(guardedTag?.[5]).toContain("#{session_id},$1");
-		expect(guardedTag?.[5]).toContain("#{session_name},managed");
-		expect(guardedTag?.[6]).toContain('"@gjc-profile" "1"');
-		expect(guardedTag?.[7]).toBe("display-message -p __gjc_tmux_guarded_mutation_refused__");
+		const guardedTag = calls.find(command => command.includes("if-shell"));
+		expect(guardedTag?.slice(0, 7)).toEqual(["tmux", "-u", "if-shell", "-t", "$1", "-F", expect.any(String)]);
+		expect(guardedTag?.[6]).toContain("#{pid},1");
+		expect(guardedTag?.[6]).toContain("#{session_id},$1");
+		expect(guardedTag?.[6]).toContain("#{session_name},managed");
+		expect(guardedTag?.[7]).toContain('"@gjc-profile" "1"');
+		expect(guardedTag?.[8]).toBe("display-message -p __gjc_tmux_guarded_mutation_refused__");
 	});
 
 	it("omits the server PID guard clause when the platform cannot prove a tmux server PID", () => {
@@ -1360,11 +1411,11 @@ describe("GJC tmux session management", () => {
 				{ platform: "darwin" },
 			),
 		).toThrow("gjc_tmux_precommit_failed_cleanup_failed");
-		const guarded = calls.find(command => command[1] === "if-shell");
-		expect(guarded?.slice(0, 5)).toEqual(["tmux", "if-shell", "-t", "$1", "-F"]);
-		expect(guarded?.[5]).not.toContain("#{pid}");
-		expect(guarded?.[5]).toContain("#{session_id},$1");
-		expect(guarded?.[5]).toContain("#{session_name},managed");
+		const guarded = calls.find(command => command.includes("if-shell"));
+		expect(guarded?.slice(0, 6)).toEqual(["tmux", "-u", "if-shell", "-t", "$1", "-F"]);
+		expect(guarded?.[6]).not.toContain("#{pid}");
+		expect(guarded?.[6]).toContain("#{session_id},$1");
+		expect(guarded?.[6]).toContain("#{session_name},managed");
 	});
 
 	it("rejects psmux force-close before signal or cleanup", async () => {
@@ -1580,11 +1631,12 @@ describe("GJC tmux session management", () => {
 		).toMatchObject({ owner_generation: generation, generation });
 		expect(calls).toEqual(
 			expect.arrayContaining([
-				["tmux", "list-panes", "-s", "-t", "$0", "-F", "#{pane_pid}"],
-				["tmux", "display-message", "-p", "-t", "$0", "#{session_id}"],
-				["tmux", "show-options", "-qv", "-t", "$0", "@gjc-profile"],
+				["tmux", "-u", "list-panes", "-s", "-t", "$0", "-F", "#{pane_pid}"],
+				["tmux", "-u", "display-message", "-p", "-t", "$0", "#{session_id}"],
+				["tmux", "-u", "show-options", "-qv", "-t", "$0", "@gjc-profile"],
 				[
 					"tmux",
+					"-u",
 					"if-shell",
 					"-t",
 					"$0",
@@ -1917,7 +1969,7 @@ describe("GJC tmux session management", () => {
 		).rejects.toThrow("gjc_tmux_owner_changed:managed");
 		expect(cleanupSession).not.toHaveBeenCalled();
 		expect(Bun.spawnSync).toHaveBeenCalledWith(
-			["tmux", "display-message", "-p", "-t", originalNativeSessionId, "#{session_id}"],
+			["tmux", "-u", "display-message", "-p", "-t", originalNativeSessionId, "#{session_id}"],
 			expect.any(Object),
 		);
 		await fs.rm(stateDir, { recursive: true, force: true });

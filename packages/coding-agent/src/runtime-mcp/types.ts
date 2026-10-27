@@ -139,6 +139,12 @@ export interface MCPHttpServerConfig extends MCPServerConfigBase {
 	type: "http";
 	url: string;
 	headers?: Record<string, string>;
+	/**
+	 * When true, every request and redirect for this URL is rechecked against
+	 * the public-network policy. Persisted so a later process cannot fall back
+	 * to an unguarded fetch. Ordinary localhost MCP servers leave this unset.
+	 */
+	publicNetwork?: boolean;
 }
 
 /** SSE server configuration (deprecated, use HTTP) */

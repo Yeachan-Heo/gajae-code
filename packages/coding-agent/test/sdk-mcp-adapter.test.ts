@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
+import { VERSION } from "@gajae-code/utils";
 import { Broker } from "../src/sdk/broker/broker";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionLifecycleService } from "../src/sdk/lifecycle";
@@ -87,6 +88,31 @@ async function fixture() {
 	await broker.heartbeatSessions();
 	return { repo, agentDir, sessionId, endpointPath, sent: () => sends };
 }
+
+test("SDK MCP initialize negotiates supported versions and reports server version", async () => {
+	const mcp = createSdkMcpServer({ agentDir: process.cwd() });
+	const cases = [
+		{ protocolVersion: "2025-06-18", expected: "2025-06-18" },
+		{ protocolVersion: "unsupported", expected: "2025-06-18" },
+		{ protocolVersion: undefined, expected: "2025-06-18" },
+	] as const;
+
+	for (const input of cases) {
+		const response = await mcp.handleJsonRpc({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "initialize",
+			...(input.protocolVersion === undefined ? {} : { params: { protocolVersion: input.protocolVersion } }),
+		});
+		const result = response.result as {
+			protocolVersion: string;
+			serverInfo: { version: string };
+		};
+		expect(result.protocolVersion).toBe(input.expected);
+		expect(result.serverInfo.version).toBe(VERSION);
+		expect(result.serverInfo.version.length).toBeGreaterThan(0);
+	}
+});
 
 function sessionListRouter(
 	responses: Array<Record<string, unknown>>,

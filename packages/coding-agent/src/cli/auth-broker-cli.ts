@@ -25,6 +25,7 @@ import {
 	AuthStorage,
 	type CredentialDisabledEvent,
 	DEFAULT_AUTH_BROKER_BIND,
+	formatOAuthIdentityLabel,
 	getEnvApiKey,
 	getOAuthProviders,
 	listProvidersWithEnvKey,
@@ -169,6 +170,10 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 		storage,
 		bind,
 		bearerTokens: [token],
+		readBearerTokens: async () => {
+			const latest = await readToken();
+			return latest ? [latest] : [];
+		},
 		version: VERSION,
 	});
 	logger.info("auth-broker listening", { url: handle.url });
@@ -467,7 +472,7 @@ async function runImport(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (!target) {
 		throw new Error("Usage: gjc auth-broker import <file|dir> [--provider=<id>] [--include-disabled] [--dry-run]");
 	}
-	const resolvedTarget = path.resolve(target.startsWith("~") ? target.replace(/^~/, os.homedir()) : target);
+	const resolvedTarget = path.resolve(target.startsWith("~") ? target.replace(/^~/, () => os.homedir()) : target);
 	const { entries, skipped } = await loadImportPlan(resolvedTarget, flags.provider, flags.includeDisabled === true);
 
 	if (flags.json) {
@@ -568,19 +573,21 @@ interface MigrateSkip {
 
 function credentialIdentity(provider: string, credential: AuthCredential): string {
 	if (credential.type === "api_key") return "(api key)";
-	return credential.email ?? credential.accountId ?? credential.projectId ?? `<${provider} oauth>`;
+	return formatOAuthIdentityLabel(credential) ?? `<${provider} oauth>`;
 }
 
 /**
  * Build the set of "identities already on the broker" so re-runs are idempotent.
- * For OAuth, identity = email|accountId|projectId. For api_key, we collapse
- * to a single marker per provider (broker has no concept of "multiple api keys
- * per provider with different identities"; upsert would coalesce them).
+ * For OAuth, identity = email|accountId|projectId, scoped to the organization
+ * when the credential carries one (one account can sign in to several
+ * organizations). For api_key, we collapse to a single marker per provider
+ * (broker has no concept of "multiple api keys per provider with different
+ * identities"; upsert would coalesce them).
  */
 function indexBrokerSnapshot(snapshot: {
 	credentials: Array<{
 		provider: string;
-		credential: { type: string; email?: string; accountId?: string; projectId?: string };
+		credential: { type: string; email?: string; accountId?: string; projectId?: string; organizationId?: string };
 	}>;
 }): Map<string, Set<string>> {
 	const out = new Map<string, Set<string>>();
@@ -589,22 +596,29 @@ function indexBrokerSnapshot(snapshot: {
 		if (entry.credential.type === "api_key") {
 			ids.add("@api_key");
 		} else {
-			if (entry.credential.email) ids.add(`email:${entry.credential.email}`);
-			if (entry.credential.accountId) ids.add(`accountId:${entry.credential.accountId}`);
-			if (entry.credential.projectId) ids.add(`projectId:${entry.credential.projectId}`);
+			const org = organizationSuffix(entry.credential.organizationId);
+			if (entry.credential.email) ids.add(`email:${entry.credential.email}${org}`);
+			if (entry.credential.accountId) ids.add(`accountId:${entry.credential.accountId}${org}`);
+			if (entry.credential.projectId) ids.add(`projectId:${entry.credential.projectId}${org}`);
 		}
 		out.set(entry.provider, ids);
 	}
 	return out;
 }
 
+function organizationSuffix(organizationId: string | undefined): string {
+	const trimmed = organizationId?.trim();
+	return trimmed ? `|org:${trimmed}` : "";
+}
+
 function brokerAlreadyHas(existing: Map<string, Set<string>>, provider: string, credential: AuthCredential): boolean {
 	const ids = existing.get(provider);
 	if (!ids) return false;
 	if (credential.type === "api_key") return ids.has("@api_key");
-	if (credential.email && ids.has(`email:${credential.email}`)) return true;
-	if (credential.accountId && ids.has(`accountId:${credential.accountId}`)) return true;
-	if (credential.projectId && ids.has(`projectId:${credential.projectId}`)) return true;
+	const org = organizationSuffix(credential.organizationId);
+	if (credential.email && ids.has(`email:${credential.email}${org}`)) return true;
+	if (credential.accountId && ids.has(`accountId:${credential.accountId}${org}`)) return true;
+	if (credential.projectId && ids.has(`projectId:${credential.projectId}${org}`)) return true;
 	return false;
 }
 

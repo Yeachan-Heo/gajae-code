@@ -66,6 +66,10 @@ function createControllerContext(
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		scopedModels: [],
+		markUserModelSelection: vi.fn(),
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -86,6 +90,9 @@ function createControllerContext(
 				login: vi.fn(async () => {}),
 				listCredentialInventory: vi.fn(() => []),
 				listCredentialRemovalTargets: vi.fn(() => []),
+				hasRuntimeApiKey: vi.fn(() => false),
+				hasLiteralConfigApiKey: vi.fn(() => false),
+				hasSessionCredentialUnavailable: vi.fn(() => false),
 			},
 			getModelProfiles: () => new Map(profiles),
 			getModelProfile: (name: string) => profiles.get(name),
@@ -95,6 +102,7 @@ function createControllerContext(
 			resolveCanonicalModel: () => undefined,
 			getCanonicalVariants: () => [],
 			getCanonicalId: () => undefined,
+			isSelectorCircuitOpen: (_selector: string) => false,
 		},
 	};
 	const ctx = {
@@ -132,8 +140,9 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showError).not.toHaveBeenCalled();
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
+		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		expect(session.setModelTemporaryCalls).toEqual([{ model: codexModel, thinkingLevel: ThinkingLevel.Medium }]);
-		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium");
+		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium", true);
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(setCalls).not.toContainEqual({ path: "modelProfile.default", value: "codex-medium" });
 	});
@@ -144,6 +153,7 @@ describe("login preset recommendation", () => {
 		await login(ctx, "openai-codex");
 
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
+		expect(session.markUserModelSelection).not.toHaveBeenCalled();
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.setActiveModelProfile).not.toHaveBeenCalled();
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "openai-codex/original-executor" });
@@ -176,7 +186,7 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply minimax-medium now?", "");
 		expect(session.setModelTemporaryCalls).toEqual([{ model: minimaxModel, thinkingLevel: ThinkingLevel.Medium }]);
-		expect(session.setActiveModelProfile).toHaveBeenCalledWith("minimax-medium");
+		expect(session.setActiveModelProfile).toHaveBeenCalledWith("minimax-medium", true);
 	});
 
 	test("provider with no recommendation mapping does nothing", async () => {

@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { logger } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import { type OwnedProcess, spawnOwnedProcess } from "../runtime/process-lifecycle";
@@ -134,7 +135,7 @@ export class DapClient {
 		// debuggee children can reach /dev/tty and trigger SIGTTIN, suspending
 		// the parent harness under shell job control.
 		const env = {
-			...Bun.env,
+			...projectSafeSpawnEnv(),
 			...NON_INTERACTIVE_ENV,
 		};
 		const owner = spawnOwnedProcess([adapter.resolvedCommand, ...adapter.args], {
@@ -159,7 +160,7 @@ export class DapClient {
 	 */
 	static async #spawnSocket({ adapter, cwd }: DapSpawnOptions): Promise<DapClient> {
 		const env = {
-			...Bun.env,
+			...projectSafeSpawnEnv(),
 			...NON_INTERACTIVE_ENV,
 		};
 		const isLinux = process.platform === "linux";
