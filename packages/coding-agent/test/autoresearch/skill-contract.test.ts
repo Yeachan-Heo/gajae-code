@@ -33,13 +33,19 @@ describe("autoresearch skill intake and verdict handoff", () => {
 
 	it("asks for the handoff only after the persisted verdict and pauses the matching goal", () => {
 		const handoff = section(autoresearchSkill.content, "- **Verdict handoff (ask point 2)**", "- **Complete**");
+		const afterHandoff = section(autoresearchSkill.content, "- **After the handoff answer**", "- **Drop**");
 
 		expect(handoff).toContain("structured receipt is persisted");
 		expect(handoff).toContain("call `ask` exactly once");
 		expect(handoff).toContain("`ask` tool description reports an interactive or remote answer channel");
 		expect(handoff).toContain("`requireExplicitAnswer: true`");
 		expect(handoff).toContain('goal({"op":"pause"})');
-		expect(handoff).toContain("`ralplan`, `deep-interview`, `implement directly`, and `stop`");
+		expect(handoff).toContain("`ralplan` — plan follow-up research or a decision from the findings");
+		expect(handoff).toContain("`deep-interview` — clarify or refine the research scope");
+		expect(handoff).toContain("`Implementation plan (approval required)`");
+		expect(handoff).toContain("`stop` — end without another workflow");
+		expect(afterHandoff).toContain("`ralplan` plans follow-up research or a decision; it is not the implementation choice");
+		expect(afterHandoff).toContain("waits for its explicit execution approval before product-code changes");
 		expect(handoff.indexOf("structured receipt is persisted")).toBeLessThan(
 			handoff.indexOf("call `ask` exactly once"),
 		);
