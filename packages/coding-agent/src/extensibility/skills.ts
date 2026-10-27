@@ -460,13 +460,14 @@ function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
 		cursor = match.end;
 	}
 	pieces.push(text.slice(cursor));
-	return pieces.join("").trim();
+	return pieces.join("");
 }
 
 export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 	text: string,
 	skillsByCommandName: ReadonlyMap<string, TSkill>,
 ): ParsedSkillInvocation<TSkill>[] {
+	const leadingWhitespaceLength = text.length - text.trimStart().length;
 	const trimmedText = text.trim();
 	if (!trimmedText) return [];
 	const normalizedSkillsByCommandName = new Map<string, TSkill>();
@@ -498,7 +499,12 @@ export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 		// should remain plain text rather than silently skipping the unknown
 		// leading command and invoking the later known one.
 		if (trimmedText.startsWith("/")) return [];
-		const args = buildInlineSkillInvocationArgs(trimmedText, matches);
+		const rawMatches = matches.map(match => ({
+			...match,
+			index: match.index + leadingWhitespaceLength,
+			end: match.end + leadingWhitespaceLength,
+		}));
+		const args = buildInlineSkillInvocationArgs(text, rawMatches);
 		return matches.map(match => ({
 			commandName: match.commandName,
 			args,

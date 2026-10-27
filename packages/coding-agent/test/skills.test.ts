@@ -83,6 +83,13 @@ describe("parseSkillInvocations", () => {
 		]);
 	});
 
+	it("preserves leading and trailing whitespace outside the removed inline token", () => {
+		const text = "  Keep exactly /skill:alpha these spaces  \n";
+		expect(parseSkillInvocations(text, skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args: "  Keep exactly these spaces  \n", skill: alpha },
+		]);
+	});
+
 	it("matches canonical skill invocations case-insensitively", () => {
 		expect(parseSkillInvocations("/Skill:alpha first /SKILL:beta second", skillsByCommandName)).toEqual([
 			{ commandName: "Skill:alpha", args: "first", skill: alpha },
