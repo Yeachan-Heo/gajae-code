@@ -547,9 +547,11 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 		const afterCursor = currentLine.slice(cursorCol);
 
-		// Plain slash commands are completed only at the start of the prompt.
+		// Plain slash commands and skill invocations are completed only at the start of the prompt.
 		const isSlashCommand = prefix.startsWith("/") && !prefix.slice(1).includes("/") && beforePrefix.trim() === "";
-		const isSkillSlashCommand = /^\/skill:/i.test(prefix);
+		// Skill command completions should not match file path prefixes ending with "."/
+		// (review P3: distinguish file suggestions from skill-command suggestions).
+		const isSkillSlashCommand = /^\/skill:/i.test(prefix) && !prefix.endsWith("/");
 		if (isSlashCommand || isSkillSlashCommand) {
 			// This is a command name completion
 			const newLine = `${beforePrefix}/${item.value} ${afterCursor}`;
