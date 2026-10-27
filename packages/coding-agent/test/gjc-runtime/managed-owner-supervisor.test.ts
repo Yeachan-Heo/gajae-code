@@ -662,7 +662,8 @@ setInterval(() => {}, 1_000);`;
 			}
 		},
 	);
-	it.skipIf(process.platform === "linux")(
+	// Windows has no owner-only reader, so a real supervisor cannot start a child there.
+	it.skipIf(process.platform === "linux" || process.platform === "win32")(
 		"keeps a replacement supervisor child blocked off Linux without persisting a predecessor handoff",
 		async () => {
 			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));

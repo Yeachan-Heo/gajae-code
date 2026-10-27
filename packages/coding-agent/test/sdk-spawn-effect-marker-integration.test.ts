@@ -672,7 +672,9 @@ async function captureManagedDiagnostics(proof: SpawnSubstrateProof, env: NodeJS
 }
 
 for (const lane of ["headless", "managed-source", "managed-compiled", "managed-early-failure"] as const) {
-	test.skipIf(lane === "managed-compiled" && !compiledAvailable)(
+	// Windows always selects headless, and the managed lanes need a real tmux pane;
+	// the headless lane and the Windows selector test cover those hosts.
+	test.skipIf((lane !== "headless" && !realTmuxAvailable) || (lane === "managed-compiled" && !compiledAvailable))(
 		`real session.spawn ${lane}: ${lane === "managed-early-failure" ? "injected refusal after observed owner resolution" : "registers before seed delivery"}${lane === "managed-compiled" ? " (requires packages/coding-agent/dist/gjc)" : ""}`,
 		async () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-real-marker-"));
