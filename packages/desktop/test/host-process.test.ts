@@ -115,12 +115,18 @@ test("real isolated host creates, persists and resumes sessions without provider
 		expect(jobs.output).toContain("No background jobs running");
 		// Session lifecycle is catalog-owned: these commands refuse instead of
 		// half-applying and leaving an unreopenable transcript.
-		for (const text of ["/move /tmp", "/session delete", "/handoff"]) {
+		for (const text of ["/move /tmp", "/session delete", "/handoff", "/rename x", "/star"]) {
 			const refused = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text });
 			expect(refused.refused).toBe(true);
 			expect(refused.consumed).toBe(false);
-			expect(refused.output).toContain("데스크톱 앱이 세션을 직접 관리");
+			expect(refused.output).not.toBe("");
 		}
+		// Refusal copy is per command: it names the control that actually exists.
+		const renameRefusal = await host.request<DesktopCommandResult>("command.run", {
+			sessionId: session.id,
+			text: "/rename 제목",
+		});
+		expect(renameRefusal.output).toContain("이름 변경");
 		// The palette can only offer commands the host will actually run.
 		const catalog = await host.request<{ name: string }[]>("command.list");
 		for (const name of ["move", "session", "handoff", "rename"]) {

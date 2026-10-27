@@ -125,7 +125,10 @@ export interface DesktopCommand {
 	hint?: string;
 }
 export interface DesktopCommandResult {
-	/** True when the builtin handled the text; false means nothing was executed. */
+	/**
+	 * True when a builtin handled the text. False means nothing was executed: see
+	 * `prompt` for text forwarded to the model and `refused` for declined text.
+	 */
 	consumed: boolean;
 	/** The host declined to run this text; `output` explains why and nothing happened. */
 	refused?: boolean;

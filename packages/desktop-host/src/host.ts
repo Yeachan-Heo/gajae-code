@@ -71,6 +71,20 @@ const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
  * They stay visibly unavailable instead of half-applying.
  */
 const DESKTOP_OWNED_COMMANDS = new Set(["move", "session", "rename", "star", "unstar", "handoff"]);
+/** Refusal copy names the app control that does the job, because one generic hint fits none. */
+const DESKTOP_OWNED_REFUSALS: Record<string, string> = {
+	move: "/move는 세션 파일 경로를 바꾸므로 앱이 직접 관리합니다. 대화 메뉴에서 새 대화로 시작하세요.",
+	session: "/session은 세션 삭제·전환이라 앱이 직접 관리합니다. 대화 목록에서 선택하거나 대화 메뉴에서 삭제하세요.",
+	rename: "/rename 대신 대화 메뉴의 '이름 변경'을 사용하세요.",
+	star: "즐겨찾기는 대화 목록의 별표 버튼으로 설정하세요.",
+	unstar: "즐겨찾기 해제는 대화 목록의 별표 버튼으로 설정하세요.",
+	handoff: "/handoff는 세션 정체성을 바꾸므로 앱에서 지원하지 않습니다. 새 대화로 이어가세요.",
+};
+const DESKTOP_UNAVAILABLE = "이 명령은 데스크톱 앱에서 사용할 수 없습니다. 일반 메시지는 슬래시 없이 보내세요.";
+/** Commands the palette advertises; everything else is refused before dispatch. */
+const ADVERTISED_COMMANDS = new Set(
+	ACP_BUILTIN_SLASH_COMMANDS.filter(command => !DESKTOP_OWNED_COMMANDS.has(command.name)).map(command => command.name),
+);
 
 export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "sessions", label: "Independent SDK sessions and streaming", available: true },
@@ -200,33 +214,38 @@ export function validateDesktopSetting(path: unknown, value: unknown): SettingPa
  * credentials are never serialized. `limit` bounds per-message text; the caller
  * decides how many messages to keep.
  */
-function projectVisibleMessages(messages: readonly unknown[], limit: number, startIndex = 0): DesktopMessage[] {
-	return messages.flatMap((value, index) => {
-		const message = record(value);
-		if (!message || !["user", "assistant", "toolResult"].includes(String(message.role))) return [];
-		const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
-		const text =
-			typeof message.content === "string"
+function projectVisibleMessage(value: unknown, index: number, limit: number): DesktopMessage | undefined {
+	const message = record(value);
+	if (!message || !["user", "assistant", "toolResult"].includes(String(message.role))) return undefined;
+	const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
+	const text =
+		typeof message.content === "string"
+			? message.content
+			: Array.isArray(message.content)
 				? message.content
-				: Array.isArray(message.content)
-					? message.content
-							.flatMap(part => {
-								const block = record(part);
-								return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
-							})
-							.join("\n")
-					: "";
-		return [
-			{
-				id: `${startIndex + index}:${String(message.timestamp ?? "")}`,
-				role,
-				text: text.slice(-limit),
-				...(text.length > limit ? { truncated: true } : {}),
-				...(typeof message.toolName === "string" ? { toolName: message.toolName.slice(0, 100) } : {}),
-				...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
-			},
-		];
-	});
+						.flatMap(part => {
+							const block = record(part);
+							return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
+						})
+						.join("\n")
+				: "";
+	return {
+		id: `${index}:${String(message.timestamp ?? "")}`,
+		role,
+		text: text.slice(-limit),
+		...(text.length > limit ? { truncated: true } : {}),
+		...(typeof message.toolName === "string" ? { toolName: message.toolName.slice(0, 100) } : {}),
+		...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
+	};
+}
+
+function projectVisibleMessages(messages: readonly unknown[], limit: number): DesktopMessage[] {
+	const projected: DesktopMessage[] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = projectVisibleMessage(messages[index], index, limit);
+		if (message) projected.push(message);
+	}
+	return projected;
 }
 
 /** How many messages the transcript view would show, without projecting text. */
@@ -256,20 +275,26 @@ export function projectHistoryPage(
 	offset: number,
 	limit: number,
 ): { total: number; page: DesktopMessage[]; truncated: boolean } {
-	// Slice before projecting: projecting every message would allocate the whole
-	// transcript (32k chars each) just to discard all but one page.
+	const total = countVisibleMessages(messages);
 	const page: DesktopMessage[] = [];
 	// Bound the response by characters as well as message count so one huge page
 	// cannot exceed the frame budget.
 	let budget = HISTORY_PAGE_BYTES;
-	for (const message of projectVisibleMessages(messages.slice(offset, offset + limit), FULL_TEXT_LIMIT, offset)) {
-		if (page.length > 0 && message.text.length > budget) {
-			return { total: countVisibleMessages(messages), page, truncated: true };
+	let visible = 0;
+	for (let index = 0; index < messages.length && page.length < limit; index += 1) {
+		const message = projectVisibleMessage(messages[index], index, FULL_TEXT_LIMIT);
+		if (!message) continue;
+		if (visible < offset) {
+			visible += 1;
+			continue;
 		}
+		visible += 1;
+		// Project only the requested page: the whole transcript would be allocated
+		// (32k chars per message) just to discard all but one page.
+		if (page.length > 0 && message.text.length > budget) break;
 		budget -= message.text.length;
 		page.push(message);
 	}
-	const total = countVisibleMessages(messages);
 	return { total, page, truncated: offset + page.length < total };
 }
 
@@ -1131,11 +1156,11 @@ export class DesktopHost {
 		const live = await this.#open(metadata);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 		if (DESKTOP_OWNED_COMMANDS.has(name))
-			return {
-				consumed: false,
-				refused: true,
-				output: `/${name}은(는) 데스크톱 앱이 세션을 직접 관리하므로 사용할 수 없습니다. 앱의 대화 메뉴를 사용하세요.`,
-			};
+			return { consumed: false, refused: true, output: DESKTOP_OWNED_REFUSALS[name] ?? DESKTOP_UNAVAILABLE };
+		if (text.trimStart().startsWith("/") && !ADVERTISED_COMMANDS.has(name))
+			// TUI-only or unknown names never reach the dispatcher: its own notice
+			// would report success and an unknown name would spend a provider turn.
+			return { consumed: false, refused: true, output: DESKTOP_UNAVAILABLE };
 		// Commands mutate the same session as prompts, so they take the same lock.
 		return this.#exclusive(live, () => this.#runCommand(live, text));
 	}

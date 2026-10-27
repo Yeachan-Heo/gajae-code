@@ -292,10 +292,23 @@ export default function App() {
 		if (!sessionId || !text.trim()) return;
 		const generation = dialogGeneration.current;
 		setNotice("");
+		// Plain text belongs to the conversation, not the command dispatcher: route it
+		// through the same queue-aware prompt path as the composer so it is never
+		// dropped when a run is active.
+		if (!text.trimStart().startsWith("/")) {
+			closeDialog();
+			const queued = session?.status === "running" || session?.status === "waiting";
+			void run(`command:${sessionId}`, async () => {
+				const result = await request<{ queued?: boolean }>("prompt", {
+					sessionId,
+					text,
+					...(queued ? { deliverAs } : {}),
+				});
+				if (result.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+			});
+			return;
+		}
 		void run(`command:${sessionId}`, async () => {
-			// A forwarded prompt streams into the conversation; the modal would hide it
-			// and make a mid-run question unanswerable, so close before dispatch.
-			if (!text.trimStart().startsWith("/")) closeDialog();
 			const result = await request<DesktopCommandResult>("command.run", { sessionId, text });
 			if (dialogGeneration.current !== generation) return;
 			setCommandOutput(
@@ -695,7 +708,12 @@ export default function App() {
 												disabled={!connected}
 												onClick={() =>
 													void run(`queue:${selected}`, async () => {
-														await request("queue.cancel", { sessionId: selected, queueId: item.id });
+														const outcome = await request<{ removed: boolean }>("queue.cancel", {
+															sessionId: selected,
+															queueId: item.id,
+														});
+														if (!outcome.removed)
+															setNotice("이미 실행에 반영된 입력이라 취소하지 못했습니다.");
 													})
 												}
 											>

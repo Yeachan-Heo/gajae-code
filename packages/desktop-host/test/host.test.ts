@@ -129,6 +129,25 @@ describe("desktop protocol validation", () => {
 		const second = projectHistoryPage(messages, 380, 50);
 		expect(second.page).toHaveLength(20);
 		expect(second.page[0]?.id.startsWith("380:")).toBe(true);
+
+		// Visible indexes drive paging: hidden entries (bash, compaction summaries)
+		// must not shift the offset or inflate the count.
+		const interleaved = Array.from({ length: 30 }, (_, index) =>
+			index % 3 === 1
+				? { role: "custom", customType: "hook", content: "hidden" }
+				: { role: index % 3 === 2 ? "toolResult" : "user", content: `m${index}` },
+		);
+		const firstPage = projectHistoryPage(interleaved, 0, 10);
+		expect(firstPage.total).toBe(20);
+		expect(firstPage.page.map(message => message.id)).toEqual(
+			[0, 2, 3, 5, 6, 8, 9, 11, 12, 14].map(index => `${index}:`),
+		);
+		const nextPage = projectHistoryPage(interleaved, 10, 10);
+		expect(nextPage.page.map(message => message.id)).toEqual(
+			[15, 17, 18, 20, 21, 23, 24, 26, 27, 29].map(index => `${index}:`),
+		);
+		expect(nextPage.truncated).toBe(false);
+		expect(new Set([...firstPage.page, ...nextPage.page].map(message => message.id)).size).toBe(20);
 		expect(second.page[19]?.id.startsWith("399:")).toBe(true);
 		// The byte budget stops a page early instead of exceeding the frame limit.
 		const huge = projectHistoryPage(
@@ -153,6 +172,11 @@ describe("desktop settings surface", () => {
 		expect(items.some(item => item.path === "theme.dark")).toBe(false);
 		expect(items.some(item => /token|secret|password|credential/i.test(item.path))).toBe(false);
 		expect(items.every(item => ["boolean", "number", "enum"].includes(item.type))).toBe(true);
+		// Notification delivery is terminal/host-owned: a headless desktop host cannot
+		// deliver bells or Telegram messages, so those settings must stay read-only.
+		const notificationSettings = items.filter(item => item.path.startsWith("notification"));
+		expect(notificationSettings.length).toBeGreaterThan(0);
+		expect(notificationSettings.every(item => item.writable === false)).toBe(true);
 		// Terminal-only settings stay visible but are not writable from the desktop.
 		const uiLanguage = items.find(item => item.path === "ui.language");
 		if (uiLanguage) expect(uiLanguage.writable).toBe(false);
