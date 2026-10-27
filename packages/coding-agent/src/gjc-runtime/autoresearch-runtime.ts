@@ -533,6 +533,32 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 	};
 }
 
+function belongsToAutoresearchMission(event: AutoresearchLedgerEvent, mission: AutoresearchMission): boolean {
+	if (typeof event.slug === "string" && event.slug !== mission.slug) return false;
+	const eventTime = Date.parse(event.timestamp);
+	const missionUpdatedAt = Date.parse(mission.updatedAt);
+	return Number.isFinite(eventTime) && Number.isFinite(missionUpdatedAt) && eventTime >= missionUpdatedAt;
+}
+
+/** Retire a conclusive mission's full working set after its canonical skill handoff was dispatched. */
+export async function autoresearchRetireConclusiveMissionAfterHandoff(
+	cwd: string,
+	sessionId?: string | null,
+): Promise<AutoresearchClearReceipt | undefined> {
+	const state = await autoresearchRead(cwd, sessionId);
+	const mission = state.mission;
+	if (!mission) return undefined;
+	const latestVerdict = [...state.ledger]
+		.reverse()
+		.find(
+			event =>
+				event.event === "verdict_issued" && event.verdictReceipt && belongsToAutoresearchMission(event, mission),
+		);
+	const verdictReceipt = latestVerdict?.verdictReceipt as AutoresearchVerdictReceipt | undefined;
+	if (verdictReceipt?.status.disposition !== "conclusive") return undefined;
+	return await autoresearchClear(cwd, state.sessionId);
+}
+
 /**
  * Move every durable mission artifact aside into a uniquely-reserved directory.
  *
@@ -838,6 +864,10 @@ export async function autoresearchRecordCritic(input: {
 	const caveats = requireStringArray(input.caveats, "critic caveats");
 	const evaluator = input.evaluator.trim();
 	if (!evaluator) throw new AutoresearchCommandError(2, "autoresearch critic evaluator is required");
+	const sessionId =
+		input.sessionId?.trim() ||
+		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
 	const receipt: AutoresearchCriticReceipt = {
 		criticId: crypto.randomUUID(),
 		status: input.status,
@@ -850,10 +880,10 @@ export async function autoresearchRecordCritic(input: {
 		input.cwd,
 		{
 			event: "critic_recorded",
-			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
+			...(input.slug?.trim() || mission?.slug ? { slug: input.slug?.trim() || mission?.slug } : {}),
 			criticReceipt: receipt,
 		},
-		input.sessionId,
+		sessionId,
 	);
 	return receipt;
 }
@@ -877,9 +907,20 @@ export async function autoresearchIssueVerdict(input: {
 	const sessionId =
 		input.sessionId?.trim() ||
 		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
 	const ledger = await readAutoresearchLedger(input.cwd, sessionId);
-	const latestCritic = [...ledger].reverse().find(event => event.event === "critic_recorded" && event.criticReceipt)
-		?.criticReceipt as AutoresearchCriticReceipt | undefined;
+	const latestCriticEvent = mission
+		? [...ledger]
+				.reverse()
+				.find(
+					event =>
+						event.event === "critic_recorded" &&
+						event.criticReceipt &&
+						belongsToAutoresearchMission(event, mission),
+				)
+		: undefined;
+	const latestCritic = latestCriticEvent?.criticReceipt as AutoresearchCriticReceipt | undefined;
+	const slug = input.slug?.trim() || mission?.slug;
 	const receipt: AutoresearchVerdictReceipt = {
 		receiptId: crypto.randomUUID(),
 		status: input.status,
@@ -893,12 +934,11 @@ export async function autoresearchIssueVerdict(input: {
 		input.cwd,
 		{
 			event: "verdict_issued",
-			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
+			...(slug ? { slug } : {}),
 			verdictReceipt: receipt,
 		},
 		sessionId,
 	);
-	const mission = await readAutoresearchMission(input.cwd, sessionId);
 	if (mission) await reconcileAutoresearchState(input.cwd, mission, sessionId, { phase: "verdict" });
 	return receipt;
 }

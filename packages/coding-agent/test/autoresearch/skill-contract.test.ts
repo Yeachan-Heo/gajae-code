@@ -44,8 +44,12 @@ describe("autoresearch skill intake and verdict handoff", () => {
 		expect(handoff).toContain("`deep-interview` — clarify or refine the research scope");
 		expect(handoff).toContain("`Implementation plan (approval required)`");
 		expect(handoff).toContain("`stop` — end without another workflow");
-		expect(afterHandoff).toContain("`ralplan` plans follow-up research or a decision; it is not the implementation choice");
+		expect(afterHandoff).toContain(
+			"`ralplan` plans follow-up research or a decision; it is not the implementation choice",
+		);
 		expect(afterHandoff).toContain("waits for its explicit execution approval before product-code changes");
+		expect(afterHandoff).toContain("the `skill` tool retires the conclusive autoresearch working set");
+		expect(afterHandoff).toContain("while preserving the callee's active workflow state");
 		expect(handoff.indexOf("structured receipt is persisted")).toBeLessThan(
 			handoff.indexOf("call `ask` exactly once"),
 		);

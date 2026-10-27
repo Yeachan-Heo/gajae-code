@@ -28,6 +28,7 @@ import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaul
 import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gjc-plugins";
 import { findRuntimeSkillByName } from "../extensibility/runtime-skill-discovery";
 import { buildSkillPromptMessage } from "../extensibility/skills";
+import { autoresearchRetireConclusiveMissionAfterHandoff } from "../gjc-runtime/autoresearch-runtime";
 import {
 	executionApprovalLineage,
 	hasSanctionedRalplanFinalAdmissionForHandoff,
@@ -281,6 +282,10 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				// the callee in an extra turn.
 				{ triggerTurn: false, deliverAs: "steer" },
 			);
+			if (activeSkill === "autoresearch" && isCanonicalGjcWorkflowSkill(skill.name)) {
+				const sessionId = activeState?.session_id?.trim() || this.#session.getSessionId?.()?.trim();
+				if (sessionId) await autoresearchRetireConclusiveMissionAfterHandoff(this.#session.cwd, sessionId);
+			}
 
 			const summary = JSON.stringify({
 				callee: skill.name,

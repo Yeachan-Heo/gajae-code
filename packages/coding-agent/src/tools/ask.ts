@@ -65,7 +65,6 @@ import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-ga
 
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import { renderStatusLine } from "../tui";
-import { askToolDescriptionForSession } from "./session-descriptions";
 import type {
 	AskAnswerRequest,
 	AskRemoteControl,
@@ -86,6 +85,7 @@ import {
 	recoverRoundZeroIntentContract,
 	selectAskParameters,
 } from "./ask-contract";
+import { askToolDescriptionForSession } from "./session-descriptions";
 
 export { askSchema } from "./ask-contract";
 

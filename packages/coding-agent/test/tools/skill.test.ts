@@ -8,6 +8,16 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { clearPluginRootsAndCaches } from "@gajae-code/coding-agent/discovery/helpers";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import {
+	autoresearchIntake,
+	autoresearchIssueVerdict,
+	autoresearchLogRun,
+	autoresearchRead,
+	autoresearchRecordCritic,
+	autoresearchRunsStore,
+	autoresearchWrite,
+	getAutoresearchPaths,
+} from "@gajae-code/coding-agent/gjc-runtime/autoresearch-runtime";
 import * as stateRuntime from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -819,6 +829,161 @@ describe("SkillTool", () => {
 			expect(promoted?.handoff_from).toBe("autoresearch");
 		});
 	}
+
+	it("retires a conclusive autoresearch working set only after canonical handoff dispatch", async () => {
+		const cwd = await makeTempCwd();
+		const sessionId = "s1";
+		let autoresearch: Skill | undefined;
+		let ralplan: Skill | undefined;
+		try {
+			await writeCallerModeState(cwd, "autoresearch", "verdict", sessionId);
+			autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+			const mission = {
+				cwd,
+				sessionId,
+				objective: "Measure the tokenizer hot path",
+				mode: "web" as const,
+				slug: "completed-research",
+			};
+			await autoresearchWrite(mission);
+			await autoresearchLogRun({
+				cwd,
+				sessionId,
+				runId: "run-before-handoff",
+				status: "keep",
+				description: "completed the benchmark",
+			});
+			const critic = await autoresearchRecordCritic({
+				cwd,
+				sessionId,
+				status: { disposition: "conclusive" },
+				evidence: ["critic evidence from the completed mission"],
+				caveats: [],
+				evaluator: "critic-agent",
+			});
+			const verdict = await autoresearchIssueVerdict({
+				cwd,
+				sessionId,
+				status: { disposition: "conclusive" },
+				evidence: ["mission completed"],
+				caveats: [],
+				evaluator: "mission-agent",
+			});
+			expect(verdict.criticReceipt).toEqual(critic);
+
+			const paths = getAutoresearchPaths(cwd, sessionId);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [autoresearch, ralplan], captured, {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: sessionId }),
+				getActiveSkillPhase: () => "verdict",
+				sendCustomMessage: async (message, options) => {
+					expect((await autoresearchRead(cwd, sessionId)).exists).toBe(true);
+					captured.push({ message, options });
+				},
+			});
+			const tool = SkillTool.createIf(session);
+			if (!tool) throw new Error("Expected skill tool");
+
+			const result = await tool.execute("conclusive-handoff", { name: "ralplan" });
+
+			expect(result.details?.name).toBe("ralplan");
+			expect(captured).toHaveLength(1);
+			expect(await autoresearchRead(cwd, sessionId)).toMatchObject({ exists: false, ledger: [] });
+			const retiredDirs = await fs.readdir(paths.retiredRoot);
+			expect(retiredDirs).toHaveLength(1);
+			const retiredPath = path.join(paths.retiredRoot, retiredDirs[0]!);
+			expect(await Bun.file(path.join(retiredPath, "mission.json")).json()).toMatchObject({
+				objective: mission.objective,
+				slug: mission.slug,
+			});
+			expect(await Bun.file(path.join(retiredPath, "runs.jsonl")).exists()).toBe(true);
+			const retiredEvents = (await Bun.file(path.join(retiredPath, "ledger.jsonl")).text())
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as { event: string });
+			expect(retiredEvents.map(event => event.event)).toEqual([
+				"mission_created",
+				"run_logged",
+				"critic_recorded",
+				"verdict_issued",
+				"mission_cleared",
+			]);
+			expect((await autoresearchRunsStore(cwd, sessionId)).listLoggedRuns()).toEqual([]);
+
+			const successorSpecPath = path.join(cwd, "successor-spec.md");
+			await fs.writeFile(
+				successorSpecPath,
+				"# Successor research\n\n## Metadata\n- Interview ID: successor-research\n\nautoresearch-mode: web\n\n## Goal\nAssess a successor research question.\n",
+				"utf8",
+			);
+			const successor = await autoresearchIntake({ cwd, sessionId, specPath: successorSpecPath });
+			expect(successor.mission.slug).toBe("successor-research");
+			const successorVerdict = await autoresearchIssueVerdict({
+				cwd,
+				sessionId,
+				status: { disposition: "conclusive" },
+				evidence: ["successor evidence"],
+				caveats: [],
+				evaluator: "successor-agent",
+			});
+			expect(successorVerdict.criticReceipt).toBeUndefined();
+			expect((await autoresearchRead(cwd, sessionId)).ledger.map(event => event.event)).toEqual([
+				"mission_created",
+				"verdict_issued",
+			]);
+			expect((await readModeState(cwd, "autoresearch", sessionId))?.current_phase).toBe("handoff");
+			expect((await readModeState(cwd, "autoresearch", sessionId))?.active).toBe(false);
+			expect((await readModeState(cwd, "ralplan", sessionId))?.active).toBe(true);
+		} finally {
+			if (autoresearch) await safeRm(autoresearch.baseDir, { recursive: true, force: true });
+			if (ralplan) await safeRm(ralplan.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("retains a conclusive autoresearch mission when callee dispatch fails", async () => {
+		const cwd = await makeTempCwd();
+		const sessionId = "s1";
+		let autoresearch: Skill | undefined;
+		let ralplan: Skill | undefined;
+		try {
+			await writeCallerModeState(cwd, "autoresearch", "verdict", sessionId);
+			autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+			await autoresearchWrite({
+				cwd,
+				sessionId,
+				objective: "Measure the tokenizer hot path",
+				mode: "web",
+				slug: "dispatch-failure-research",
+			});
+			await autoresearchIssueVerdict({
+				cwd,
+				sessionId,
+				status: { disposition: "conclusive" },
+				evidence: ["mission completed"],
+				caveats: [],
+				evaluator: "mission-agent",
+			});
+			const session = createSession(cwd, [autoresearch, ralplan], [], {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: sessionId }),
+				getActiveSkillPhase: () => "verdict",
+				sendCustomMessage: async () => {
+					throw new Error("callee dispatch failed");
+				},
+			});
+			const tool = SkillTool.createIf(session);
+			if (!tool) throw new Error("Expected skill tool");
+
+			await expect(tool.execute("failed-handoff", { name: "ralplan" })).rejects.toThrow("callee dispatch failed");
+			expect((await autoresearchRead(cwd, sessionId)).exists).toBe(true);
+		} finally {
+			if (autoresearch) await safeRm(autoresearch.baseDir, { recursive: true, force: true });
+			if (ralplan) await safeRm(ralplan.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+		}
+	});
 
 	it("allows ralplan (phase=final, manifest terminal) to chain into ultragoal", async () => {
 		mockRalplanApprovalConsume();

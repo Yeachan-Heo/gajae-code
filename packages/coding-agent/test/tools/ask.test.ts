@@ -598,14 +598,10 @@ describe("AskTool cancellation", () => {
 		);
 		const abort = vi.fn();
 		const select = vi.fn(
-			async (
-				_prompt: string,
-				_options: string[],
-				dialogOptions?: { timeout?: number; onTimeout?: () => void },
-			) => {
-			expect(dialogOptions?.timeout).toBeUndefined();
-			dialogOptions?.onTimeout?.();
-			return undefined;
+			async (_prompt: string, _options: string[], dialogOptions?: { timeout?: number; onTimeout?: () => void }) => {
+				expect(dialogOptions?.timeout).toBeUndefined();
+				dialogOptions?.onTimeout?.();
+				return undefined;
 			},
 		);
 

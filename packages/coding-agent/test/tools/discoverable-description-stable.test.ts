@@ -165,10 +165,13 @@ async function withTempSession(
 describe("discoverable tool descriptions are stable across first load (#5992)", () => {
 	it("reports live answer-channel state on the deferred ask facade before materialization", () => {
 		let uiAttached = true;
-		const toolSession = session({}, {
-			hasUI: true,
-			getToolUIContext: () => ({ hasUI: uiAttached, ui: uiAttached ? {} : undefined }),
-		});
+		const toolSession = session(
+			{},
+			{
+				hasUI: true,
+				getToolUIContext: () => ({ hasUI: uiAttached, ui: uiAttached ? {} : undefined }),
+			},
+		);
 		const descriptor = BUILTIN_TOOL_DESCRIPTORS.ask;
 		if (!descriptor) throw new Error("missing ask descriptor");
 		const facade = new LazyAgentTool(descriptor, undefined, () => descriptor.load(toolSession), toolSession);

@@ -7,6 +7,7 @@
  * prompt-cache prefix) does not change when the implementation loads (#5992).
  */
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import architectAgent from "../prompts/agents/architect.md" with { type: "text" };
 import criticAgent from "../prompts/agents/critic.md" with { type: "text" };
 import executorAgent from "../prompts/agents/executor.md" with { type: "text" };
@@ -15,7 +16,6 @@ import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import searchDescription from "../prompts/tools/search.md" with { type: "text" };
 import taskDescription from "../prompts/tools/task.md" with { type: "text" };
-import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "../task/simple-mode";
 import { getTaskSchema, type TaskToolSchemaInstance } from "../task/types";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -99,9 +99,7 @@ export function searchToolDescriptionForSession(session: DescriptionSession): st
 
 export function askAnswerChannelAvailable(session: AskDescriptionSession): boolean {
 	const toolContext = session.getToolUIContext?.();
-	const hasInteractiveUi = toolContext
-		? toolContext.hasUI === true && Boolean(toolContext.ui)
-		: session.hasUI;
+	const hasInteractiveUi = toolContext ? toolContext.hasUI === true && Boolean(toolContext.ui) : session.hasUI;
 	if (hasInteractiveUi || session.getAskAnswerSource?.()) return true;
 	const gateEmitter = session.getWorkflowGateEmitter?.();
 	return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() !== false;

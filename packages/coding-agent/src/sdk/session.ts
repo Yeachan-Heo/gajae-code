@@ -4655,10 +4655,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			settings,
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
-		toolSession.getToolUIContext = () => {
-			const context = toolContextStore.getContext();
-			return { ui: context.ui, hasUI: context.hasUI === true };
-		};
+		toolSession.getToolUIContext = () => toolContextStore.getUIContext();
 
 		const registeredTools = extensionRunner?.getAllRegisteredTools() ?? [];
 		let wrappedExtensionTools: Tool[];

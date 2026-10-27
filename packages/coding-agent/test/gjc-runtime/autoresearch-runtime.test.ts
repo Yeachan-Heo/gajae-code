@@ -12,6 +12,7 @@ import {
 	autoresearchLogRun,
 	autoresearchRead,
 	autoresearchRecordCritic,
+	autoresearchRetireConclusiveMissionAfterHandoff,
 	autoresearchRunsStore,
 	autoresearchWrite,
 	getAutoresearchPaths,
@@ -349,6 +350,59 @@ describe("autoresearch ledger", () => {
 		expect(successor.mission?.slug).toBe("successor-mission");
 		expect(successor.ledger.map(event => event.event)).toEqual(["mission_created"]);
 		expect(JSON.stringify(successor.ledger)).not.toContain("prior-mission evidence");
+	});
+
+	it("does not attach an earlier mission's critic to a successor verdict", async () => {
+		const root = await tempDir();
+		const firstMission = baseMission(root);
+		await autoresearchWrite(firstMission);
+		await autoresearchRecordCritic({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["critic evidence from the previous mission"],
+			caveats: [],
+			evaluator: "previous-critic",
+			slug: firstMission.slug,
+		});
+
+		await autoresearchWrite({
+			...firstMission,
+			objective: "Investigate a separate follow-up question",
+			slug: "successor-mission",
+		});
+		const verdict = await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["successor evidence"],
+			caveats: [],
+			evaluator: "successor-agent",
+		});
+
+		expect(verdict.criticReceipt).toBeUndefined();
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).mission?.slug).toBe("successor-mission");
+	});
+
+	it("does not retire an inconclusive mission after a handoff", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+		await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "inconclusive" },
+			evidence: ["follow-up remains"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+
+		const retired = await autoresearchRetireConclusiveMissionAfterHandoff(root, TEST_SESSION_ID);
+		const current = await autoresearchRead(root, TEST_SESSION_ID);
+
+		expect(retired).toBeUndefined();
+		expect(current.exists).toBe(true);
+		expect(current.mission?.slug).toBe("tokenizer-mission");
+		expect(await Bun.file(current.paths.missionPath).exists()).toBe(true);
 	});
 
 	it("clear on a session with no mission is a safe no-op and creates no retired dir", async () => {
