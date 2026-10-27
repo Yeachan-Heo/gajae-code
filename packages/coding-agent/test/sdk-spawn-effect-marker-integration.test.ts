@@ -1,10 +1,11 @@
 import { expect, test, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { executeTmuxOwnerIsolationPlanSync } from "../src/gjc-runtime/tmux-owner-isolation";
+import { classifyCgroup, executeTmuxOwnerIsolationPlanSync } from "../src/gjc-runtime/tmux-owner-isolation";
 import {
 	__setCreateOwnerIsolationForTests,
 	createManagedGjcTmuxSession,
@@ -316,10 +317,34 @@ function captureScopedBootstrap(
 	}
 }
 
-// The wrong-outer fixture allocates a real tmux pane. A supported development
-// install without tmux (or a Windows host) cannot run it; CI provisions tmux and
-// keeps exercising this path.
-const realTmuxAvailable = process.platform !== "win32" && Bun.which("tmux") !== null;
+// The wrong-outer fixture allocates a real tmux pane under managed owner
+// isolation. A supported development install without tmux (or a Windows host)
+// cannot run it, nor can a Linux service cgroup without a usable user bus for the
+// owner scope. CI provisions tmux in a safe cgroup and keeps exercising this path.
+function linuxOwnerIsolationAvailable(): boolean {
+	let cgroupText: string;
+	try {
+		cgroupText = fsSync.readFileSync("/proc/self/cgroup", "utf8");
+	} catch {
+		return false;
+	}
+	const cgroup = classifyCgroup({ platform: "linux", cgroupText });
+	if (cgroup.classification === "safe") return true;
+	if (cgroup.classification !== "unsafe_service") return false;
+	const systemdRun = Bun.which("systemd-run");
+	return (
+		systemdRun !== null &&
+		Bun.spawnSync([systemdRun, "--user", "--scope", "--quiet", "true"], {
+			env: { ...linuxUserBusEnvironment, PATH: process.env.PATH ?? "" },
+			stdout: "ignore",
+			stderr: "ignore",
+		}).exitCode === 0
+	);
+}
+const realTmuxAvailable =
+	process.platform !== "win32" &&
+	Bun.which("tmux") !== null &&
+	(process.platform !== "linux" || linuxOwnerIsolationAvailable());
 
 test.skipIf(!realTmuxAvailable)(
 	"managed wrong outer cannot register a valid inner CLI or substitute headless",
@@ -359,7 +384,9 @@ test.skipIf(!realTmuxAvailable)(
 					() =>
 						createManagedGjcTmuxSession(spec, environment, {
 							platform,
-							supervisorArgvForTest: ["/bin/sleep", "5"],
+							// Inert pane command: `sh -c` ignores the supervisor flag and child argv
+							// the managed invocation appends as positional parameters.
+							supervisorArgvForTest: ["/bin/sh", "-c", "sleep 5", "gjc-wrong-outer"],
 						}),
 					environment,
 					bootstrapDiagnostics,
