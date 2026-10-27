@@ -21171,6 +21171,19 @@ export class AgentSession {
 			);
 			this.#selectionAwaitingMutationTransaction = selectionTransaction;
 			await this.waitForIdle(selectionFenceGeneration);
+			// If abort is in progress, the selection was interrupted and should not be applied.
+			// Wait for abort to complete and then skip the mutation to avoid reentrancy errors.
+			if (this.#abortUnwind) {
+				await this.#abortUnwind;
+				// Selection was cancelled by abort, do not apply mutation
+				throw new DefaultModelSelectionRecoveryError("Model selection was cancelled by abort", {
+					message: "Model selection was cancelled by user abort",
+					rollback: {
+						disposition: "restored" as const,
+						failures: [],
+					},
+				});
+			}
 			await options?.onBeforeMutationAdmissionForTests?.();
 			return await this.#withSessionAdmission(
 				"selection",
