@@ -451,16 +451,16 @@ function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
 	const pieces: string[] = [];
 	let cursor = 0;
 	for (const match of matches) {
-		pieces.push(text.slice(cursor, match.index));
+		let prefix = text.slice(cursor, match.index);
+		// Removing the token joins the whitespace on each side. Drop only one
+		// adjacent ASCII space when that join would otherwise double a separator;
+		// preserve all other spacing, including indentation and repeated spaces.
+		if (prefix.endsWith(" ") && text[match.end] === " ") prefix = prefix.slice(0, -1);
+		pieces.push(prefix);
 		cursor = match.end;
 	}
 	pieces.push(text.slice(cursor));
-	return pieces
-		.join("")
-		.replace(/[ \t]{2,}/g, " ")
-		.replace(/[ \t]+\n/g, "\n")
-		.replace(/\n[ \t]+/g, "\n")
-		.trim();
+	return pieces.join("").trim();
 }
 
 export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
