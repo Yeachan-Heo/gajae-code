@@ -61,6 +61,7 @@ import {
 	gateAnswerToResult,
 	questionToGate,
 } from "../modes/shared/agent-wire/deep-interview-gate";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
@@ -806,7 +807,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly description: string;
+	readonly #baseDescription: string;
+	get description(): string {
+		const channelStatus = this.#hasAnswerChannel()
+			? "An interactive or remote answer channel is available for this session."
+			: "No interactive or remote answer channel is available in this session. Do not call this tool; use the non-interactive fallback.";
+		return `${this.#baseDescription}\n\n${channelStatus}`;
+	}
 	get parameters(): AskParametersSchema {
 		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
 	}
@@ -823,13 +830,23 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(askDescription);
+		this.#baseDescription = prompt.render(askDescription);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
 		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
 			? new AskTool(session)
 			: null;
+	}
+
+	#hasAnswerChannel(): boolean {
+		if (this.session.hasUI || this.session.getAskAnswerSource?.()) return true;
+		const gateEmitter = this.session.getWorkflowGateEmitter?.();
+		return this.#hasWorkflowGateAnswerChannel(gateEmitter);
+	}
+
+	#hasWorkflowGateAnswerChannel(gateEmitter: WorkflowGateEmitter | undefined): boolean {
+		return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() !== false;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -993,16 +1010,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			if (receipt) await receipt.settle(settlement);
 		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
-		// A durable workflow-gate emitter now exists for every session, and its
-		// supportsRemoteGateAnswers() is always true, so it can no longer signal
-		// "no local UI". The workflow gate is only the headless (non-TUI) answer
-		// path: when a real interactive UI is present, prefer it — otherwise
-		// attended TUI asks would route to emitGate() and hang forever waiting on
-		// a remote responder.
+		// The durable emitter exists before a remote host subscribes, so its general
+		// remote-answer capability alone is not proof that a responder can receive
+		// this ask. Require an active listener before entering the workflow-gate path.
 		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
 		const initialAnswerSource = this.session.getAskAnswerSource?.();
 		const canUseWorkflowGate =
-			!hasInteractiveUi && !initialAnswerSource && gateEmitter?.supportsRemoteGateAnswers() === true;
+			!hasInteractiveUi && !initialAnswerSource && this.#hasWorkflowGateAnswerChannel(gateEmitter);
 		// Headless fallback: an SDK answer source or workflow gate is the non-TUI answer path.
 		if (!hasInteractiveUi && !initialAnswerSource && !canUseWorkflowGate) {
 			context?.abort();

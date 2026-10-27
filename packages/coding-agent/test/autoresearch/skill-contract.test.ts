@@ -19,7 +19,11 @@ describe("autoresearch skill intake and verdict handoff", () => {
 
 		expect(intake).toContain("research question, success criterion, or scope is ambiguous");
 		expect(intake).toContain("Before writing the mission artifact");
+		expect(intake).toContain("A listed `ask` tool alone is not enough");
 		expect(intake).toContain("call `ask` exactly once");
+		expect(intake).toContain(
+			"runtime description explicitly says an interactive or remote answer channel is available",
+		);
 		expect(intake).toContain("`Refine the spec` and `Proceed with stated assumptions`");
 		expect(intake.indexOf("Before writing the mission artifact")).toBeLessThan(
 			intake.indexOf("call `ask` exactly once"),
@@ -32,6 +36,7 @@ describe("autoresearch skill intake and verdict handoff", () => {
 
 		expect(handoff).toContain("structured receipt is persisted");
 		expect(handoff).toContain("call `ask` exactly once");
+		expect(handoff).toContain("`ask` tool description reports an interactive or remote answer channel");
 		expect(handoff).toContain('goal({"op":"pause"})');
 		expect(handoff).toContain("`ralplan`, `deep-interview`, `implement directly`, and `stop`");
 		expect(handoff.indexOf("structured receipt is persisted")).toBeLessThan(
@@ -43,11 +48,11 @@ describe("autoresearch skill intake and verdict handoff", () => {
 		const intake = section(autoresearchSkill.content, "### Intake clarification (ask point 1)", "## Mode");
 		const handoff = section(autoresearchSkill.content, "- **Verdict handoff (ask point 2)**", "- **Complete**");
 
-		expect(intake).toContain("If `ask` is unavailable");
-		expect(intake).toContain("do not simulate or print an ask");
+		expect(intake).toContain("If no answer channel is available");
+		expect(intake).toContain("do not call or simulate `ask`");
 		expect(intake).toContain("persist each one in the mission's `assumptions` array");
 		expect(intake).toContain("--assumption <text>");
 		expect(handoff).toContain("use the recorded no-handoff assumption");
-		expect(handoff).toContain("do not call or simulate it");
+		expect(handoff).toContain("do not call or simulate `ask`");
 	});
 });

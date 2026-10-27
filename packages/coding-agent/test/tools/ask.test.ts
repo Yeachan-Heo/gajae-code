@@ -28,7 +28,11 @@ import {
 import type { AskToolInput } from "@gajae-code/coding-agent/tools/ask-contract";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger, TempDir } from "@gajae-code/utils";
-import type { OpenGateInput } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	BrokerWorkflowGateEmitter,
+	MemoryGateStore,
+	type OpenGateInput,
+} from "../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 
 function createAskFixture() {
@@ -138,6 +142,33 @@ function singleDeepInterviewQuestion() {
 }
 
 describe("AskTool execution integrity", () => {
+	it("reports and enforces whether a headless answer channel is available", async () => {
+		const gateEmitter = new BrokerWorkflowGateEmitter("ask-answer-channel-test", new MemoryGateStore());
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => gateEmitter,
+			}),
+		);
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		await expect(
+			tool.execute(
+				"headless-without-answer-channel",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toBeInstanceOf(ToolAbortError);
+		expect(gateEmitter.listPendingGates()).toEqual([]);
+
+		const dispose = gateEmitter.onGateEmitted(() => {});
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+		dispose();
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		gateEmitter.fence();
+	});
+
 	it("rejects empty ordinary bodies before local or remote UI side effects", async () => {
 		const select = vi.fn(async () => "yes");
 		const awaitAnswer = vi.fn(async () => "yes");

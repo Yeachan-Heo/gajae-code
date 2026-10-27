@@ -919,7 +919,7 @@ function renderAutoresearchHelp(): string {
 		"Run native GJC Autoresearch workflow commands",
 		"",
 		"USAGE",
-		"  $ gjc autoresearch [--spec <path>] [--assumption <text>] [--json] [goal...]",
+		"  $ gjc autoresearch [--spec <path>] [--json] [goal...]",
 		"  $ gjc autoresearch intake --spec <path> [--assumption <text>] [--json]",
 		"  $ gjc autoresearch read [--json]",
 		"  $ gjc autoresearch clear [--json]",

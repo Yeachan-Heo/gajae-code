@@ -100,6 +100,8 @@ export interface AskSelectedAckRecoveryParticipant {
 /** SDK-native surface for emitting a workflow gate and awaiting its answer. */
 export interface WorkflowGateEmitter {
 	supportsRemoteGateAnswers(): boolean;
+	/** Whether an SDK host is currently subscribed to receive workflow-gate prompts. */
+	hasRemoteGateAnswerChannel?(): boolean;
 	emitGate(input: OpenGateInput): Promise<unknown>;
 	onGateEmitted?(listener: (gate: WorkflowGate) => void): () => void;
 	resolveGate?(response: WorkflowGateResponse): Promise<WorkflowGateResolution>;
@@ -174,6 +176,9 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 
 	supportsRemoteGateAnswers(): boolean {
 		return true;
+	}
+	hasRemoteGateAnswerChannel(): boolean {
+		return this.#listeners.size > 0;
 	}
 	setRuntimeTurnProvider(provider: (() => string | undefined) | null): void {
 		this.#runtimeTurnProvider = provider ?? undefined;

@@ -772,6 +772,8 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("--spec");
 		expect(result.stdout).toContain("--assumption");
+		expect(result.stdout).toContain("$ gjc autoresearch [--spec <path>] [--json] [goal...]");
+		expect(result.stdout).not.toContain("$ gjc autoresearch [--spec <path>] [--assumption");
 		expect(result.stdout).toContain("Spec intake");
 		expect(result.stdout).toContain("intake --spec");
 		expect(result.stdout).toContain("Cold intake");
