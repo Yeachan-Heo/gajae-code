@@ -76,6 +76,13 @@ describe("parseSkillInvocations", () => {
 		]);
 	});
 
+	it("preserves code indentation and repeated spaces outside the removed inline token", () => {
+		const text = 'Explain /skill:alpha\n    run("a  b")';
+		expect(parseSkillInvocations(text, skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args: 'Explain \n    run("a  b")', skill: alpha },
+		]);
+	});
+
 	it("matches canonical skill invocations case-insensitively", () => {
 		expect(parseSkillInvocations("/Skill:alpha first /SKILL:beta second", skillsByCommandName)).toEqual([
 			{ commandName: "Skill:alpha", args: "first", skill: alpha },
