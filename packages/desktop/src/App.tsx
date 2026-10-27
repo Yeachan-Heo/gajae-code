@@ -50,6 +50,7 @@ export default function App() {
 	const [diffPath, setDiffPath] = useState("");
 	const [diffLoading, setDiffLoading] = useState(false);
 	const [settings, setSettings] = useState<DesktopSetting[] | null>(null);
+	const [settingFilter, setSettingFilter] = useState("");
 	const [provider, setProvider] = useState("");
 	const [key, setKey] = useState("");
 	const [notice, setNotice] = useState("");
@@ -230,6 +231,7 @@ export default function App() {
 		const sessionId = selected;
 		const generation = setDialog("settings");
 		setSettings(null);
+		setSettingFilter("");
 		void run(`settings:${sessionId}:${generation}`, async () => {
 			const value = await request<DesktopSetting[]>("settings.get", sessionId ? { sessionId } : {});
 			if (dialogGeneration.current === generation) setSettings(value);
@@ -770,14 +772,40 @@ export default function App() {
 								) : settings.length === 0 ? (
 									<p>공개된 설정이 없습니다.</p>
 								) : (
-									settings.map(setting => (
-										<SettingField
-											key={`${setting.path}:${textOf(setting.value)}`}
-											setting={setting}
-											pending={!connected || pending[settingsScope]}
-											onSave={value => saveSetting(setting.path, value)}
+									<>
+										<label htmlFor="setting-search">설정 검색</label>
+										<input
+											id="setting-search"
+											value={settingFilter}
+											placeholder="compaction, retry, todo…"
+											onChange={event => setSettingFilter(event.target.value)}
 										/>
-									))
+										<p className="muted">
+											{
+												settings.filter(setting =>
+													`${setting.path} ${setting.description ?? ""}`
+														.toLowerCase()
+														.includes(settingFilter.toLowerCase()),
+												).length
+											}
+											개 표시 / 전체 {settings.length}개
+										</p>
+										{settings
+											.filter(setting =>
+												`${setting.path} ${setting.description ?? ""}`
+													.toLowerCase()
+													.includes(settingFilter.toLowerCase()),
+											)
+											.slice(0, 200)
+											.map(setting => (
+												<SettingField
+													key={`${setting.path}:${textOf(setting.value)}`}
+													setting={setting}
+													pending={!connected || pending[settingsScope]}
+													onSave={value => saveSetting(setting.path, value)}
+												/>
+											))}
+									</>
 								)}
 							</section>
 							<section>
