@@ -142,6 +142,12 @@ function isAiCatalogModelPath(changedPath: string): boolean {
 }
 
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
+	"packages/coding-agent/src/prompts/agent-fragments/browser-aside.md": [
+		"packages/coding-agent/test/sdk-browser-aside-backend.test.ts",
+	],
+	"packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md": [
+		"packages/coding-agent/test/gjc-runtime/ralplan-worktree-root.test.ts",
+	],
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
 	"packages/agent/src/agent.ts": [
 		"packages/agent/test/agent-force-abort.test.ts",
@@ -1014,6 +1020,10 @@ export function planTasks(
 	// embedded index is generated from, so either side changing must run its gate.
 	// The gate loads the generated corpus through the package barrel, so it is a
 	// native consumer and must bring its own producer.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 		addNativeBuild(tasks);
@@ -1128,6 +1138,10 @@ export function planTargetedTasks(
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
 	// index is generated from, so shipping the edit without regenerating that index is
 	// the one drift class a docs-only PR can introduce. Select just its gate.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 	}
@@ -1404,7 +1418,6 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 function behavioralTestsFor(changedPath: string): readonly string[] {
 	if (changedPath.endsWith(".md") && (
 		changedPath.startsWith("packages/coding-agent/src/prompts/agents/") ||
-		changedPath.startsWith("packages/coding-agent/src/prompts/agent-fragments/") ||
 		changedPath.startsWith("packages/coding-agent/src/defaults/gjc/")
 	)) return ["packages/coding-agent/test/default-gjc-definitions.test.ts"];
 	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
@@ -2388,4 +2401,4 @@ function assertTaskKeys(value: Record<string, unknown>): void {
 
 if (import.meta.main) {
 	await main();
-}
+		}
