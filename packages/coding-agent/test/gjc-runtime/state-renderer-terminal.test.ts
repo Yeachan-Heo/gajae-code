@@ -358,7 +358,7 @@ describe("state terminal text", () => {
 		);
 	});
 
-	it("property: markdown prose keeps line breaks and is idempotent", () => {
+	it("property: markdown prose line breaks survive controls and stay idempotent", () => {
 		fc.assert(
 			fc.property(noisy, plain, plain, (extra, left, right) => {
 				const phase = `${left}\n${right}${extra}`;
