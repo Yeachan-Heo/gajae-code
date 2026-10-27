@@ -5556,10 +5556,17 @@ export class AgentSession {
 		if (this.#livePromptsInFlight() > 0 || this.agent.state.isStreaming) {
 			await this.abort({ cause: "session_switch" });
 		}
+		// Cancel any ongoing preflight (skill preparation) that may be pending.
+		// This ensures that skill invocations queued during the old tree cannot
+		// run on the new tree after navigation (issue #7314).
+		if (this.#livePromptsInFlight() === 0 && !this.agent.state.isStreaming) {
+			this.#promptGeneration++;
+			this.#promptPreflightCancellationGeneration++;
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
+		}
 		const activeAdmission = this.#activeSessionAdmission;
 		if (activeAdmission?.kind === "prompt") {
-			if (this.#livePromptsInFlight() === 0 && !this.agent.state.isStreaming)
-				this.cancelPendingPreflightForTerminalAbort();
 			await activeAdmission.settled.promise;
 		}
 	}
@@ -20634,6 +20641,7 @@ export class AgentSession {
 				return;
 			}
 
+			const independentOfTurn = appMessage.attribution === "user" || options.origin === "external";
 			await this.#queueFollowUpAfterReservation(appMessage, this.#getCustomMessageTextContent(appMessage), {
 				forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 				createDisplayEntry: false,
@@ -20642,6 +20650,10 @@ export class AgentSession {
 				onPromoted: options?.onQueuedPromoted,
 			});
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
+			if (independentOfTurn) {
+				this.#externalFollowUps.add(appMessage);
+				if (this.#isTurnContinuationBlocked()) this.#freshRootLineageRequests.add(appMessage);
+			}
 			// The session can report streaming while no agent loop owns the queue
 			// (post-prompt unwind): without a scheduled delivery a cron/monitor
 			// notification would sit queued until unrelated activity.
