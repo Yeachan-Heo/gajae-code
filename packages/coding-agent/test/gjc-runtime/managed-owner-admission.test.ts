@@ -83,59 +83,65 @@ async function writeBinding(root: string, token: string, patch: Record<string, u
 	);
 }
 
-it("preserves ordinary admission against eighteen exact framing specimens", async () => {
-	const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-admission-framing-"));
-	try {
-		const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
-		const file = path.join(root, "child-framing.binding.json");
-		await writeBinding(root, "framing", { binding_kind: "opaque", command: undefined, command_sha256: undefined });
-		const json = (await fs.readFile(file, "utf8")).trimEnd();
-		const command = ["�"];
-		await writeBinding(root, "framing", {
-			command,
-			command_sha256: crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex"),
-		});
-		const replacementJson = await fs.readFile(file);
-		const replacementAt = replacementJson.indexOf(Buffer.from("�"));
-		expect(replacementAt).toBeGreaterThan(0);
-		const invalidUtf8String = Buffer.concat([
-			replacementJson.subarray(0, replacementAt),
-			Buffer.from([255]),
-			replacementJson.subarray(replacementAt + 3),
-		]);
-		const specimens: [string, Uint8Array, boolean, boolean][] = [
-			["LF", Buffer.from(`${json}\n`), true, true],
-			["no LF", Buffer.from(json), false, false],
-			["CRLF", Buffer.from(`${json}\r\n`), false, false],
-			["two LFs", Buffer.from(`${json}\n\n`), false, false],
-			["embedded LF", Buffer.from(`{\n${json.slice(1)}\n`), false, false],
-			["leading LF", Buffer.from(`\n${json}\n`), false, false],
-			["embedded CR", Buffer.from(`{\r${json.slice(1)}\n`), false, false],
-			["empty", Buffer.alloc(0), false, false],
-			["LF only", Buffer.from("\n"), false, false],
-			["BOM", Buffer.from(`\ufeff${json}\n`), false, false],
-			["invalid UTF8 in bound command", invalidUtf8String, true, true],
-			["invalid UTF8 token", Buffer.from([255, 10]), false, false],
-			["escaped LF scalar", Buffer.from('"\\n"\n'), true, false],
-			["escaped CR scalar", Buffer.from('"\\r"\n'), true, false],
-			["horizontal whitespace", Buffer.from(` \t${json} \t\n`), true, true],
-			["null", Buffer.from("null\n"), true, false],
-			["trailing token", Buffer.from(`${json} true\n`), false, false],
-			["duplicate key", Buffer.from(`${json.slice(0, -1)},"binding_kind":"opaque"}\n`), true, true],
-		];
-		for (const [name, bytes, readable, admitted] of specimens) {
-			await fs.writeFile(file, bytes);
-			if (readable) expect(readSecureOwnerJson(file), name).toEqual(JSON.parse(Buffer.from(bytes).toString("utf8")));
-			else expect(() => readSecureOwnerJson(file), name).toThrow();
-			const result = await admit(stateDir, "framing");
-			expect(result.admitted, name).toBe(admitted);
-			expect(result.exitCode, name).toBe(admitted ? 0 : 75);
-			expect(result.stderr, name).not.toContain("framing_invalid");
+// The real native owner-only reader is unavailable on Windows.
+it.skipIf(process.platform === "win32")(
+	"preserves ordinary admission against eighteen exact framing specimens",
+	async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-admission-framing-"));
+		try {
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			const file = path.join(root, "child-framing.binding.json");
+			await writeBinding(root, "framing", { binding_kind: "opaque", command: undefined, command_sha256: undefined });
+			const json = (await fs.readFile(file, "utf8")).trimEnd();
+			const command = ["�"];
+			await writeBinding(root, "framing", {
+				command,
+				command_sha256: crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex"),
+			});
+			const replacementJson = await fs.readFile(file);
+			const replacementAt = replacementJson.indexOf(Buffer.from("�"));
+			expect(replacementAt).toBeGreaterThan(0);
+			const invalidUtf8String = Buffer.concat([
+				replacementJson.subarray(0, replacementAt),
+				Buffer.from([255]),
+				replacementJson.subarray(replacementAt + 3),
+			]);
+			const specimens: [string, Uint8Array, boolean, boolean][] = [
+				["LF", Buffer.from(`${json}\n`), true, true],
+				["no LF", Buffer.from(json), false, false],
+				["CRLF", Buffer.from(`${json}\r\n`), false, false],
+				["two LFs", Buffer.from(`${json}\n\n`), false, false],
+				["embedded LF", Buffer.from(`{\n${json.slice(1)}\n`), false, false],
+				["leading LF", Buffer.from(`\n${json}\n`), false, false],
+				["embedded CR", Buffer.from(`{\r${json.slice(1)}\n`), false, false],
+				["empty", Buffer.alloc(0), false, false],
+				["LF only", Buffer.from("\n"), false, false],
+				["BOM", Buffer.from(`\ufeff${json}\n`), false, false],
+				["invalid UTF8 in bound command", invalidUtf8String, true, true],
+				["invalid UTF8 token", Buffer.from([255, 10]), false, false],
+				["escaped LF scalar", Buffer.from('"\\n"\n'), true, false],
+				["escaped CR scalar", Buffer.from('"\\r"\n'), true, false],
+				["horizontal whitespace", Buffer.from(` \t${json} \t\n`), true, true],
+				["null", Buffer.from("null\n"), true, false],
+				["trailing token", Buffer.from(`${json} true\n`), false, false],
+				["duplicate key", Buffer.from(`${json.slice(0, -1)},"binding_kind":"opaque"}\n`), true, true],
+			];
+			for (const [name, bytes, readable, admitted] of specimens) {
+				await fs.writeFile(file, bytes);
+				if (readable)
+					expect(readSecureOwnerJson(file), name).toEqual(JSON.parse(Buffer.from(bytes).toString("utf8")));
+				else expect(() => readSecureOwnerJson(file), name).toThrow();
+				const result = await admit(stateDir, "framing");
+				expect(result.admitted, name).toBe(admitted);
+				expect(result.exitCode, name).toBe(admitted ? 0 : 75);
+				expect(result.stderr, name).not.toContain("framing_invalid");
+			}
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
 		}
-	} finally {
-		await fs.rm(stateDir, { recursive: true, force: true });
-	}
-}, 30_000);
+	},
+	30_000,
+);
 
 it("turns ordinary native read failures and exceptions into the same blocked admission", async () => {
 	const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-admission-native-failure-"));
@@ -256,7 +262,9 @@ async function writeRecoveryEvidence(cwd: string): Promise<string> {
 	return transcript;
 }
 
-describe("managed owner admission", () => {
+// Admission reads its binding through the owner-only reader, which is
+// unsupported on Windows (covered by the exact owner JSON framing suite).
+describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 	it("preserves whitespace-only recoverable arguments and validates the digest of the original array", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-whitespace-"));
 		try {

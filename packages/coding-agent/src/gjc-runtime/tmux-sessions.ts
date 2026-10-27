@@ -782,6 +782,9 @@ export function createGjcTmuxSession(
 ): GjcTmuxSessionStatus {
 	const launch = options.launch;
 	const platform = options.platform ?? process.platform;
+	// Managed admission requires the retained owner-only reader, unavailable on Windows.
+	// Reject before provider probes, lifecycle storage, or supervisor allocation.
+	if (launch && platform === "win32") throw new Error("gjc_tmux_managed_launch_platform_unsupported:win32");
 	if (launch && !validManagedLaunchSpec(launch, platform)) throw new Error("gjc_tmux_managed_launch_spec_invalid");
 	const provider = resolveGjcTmuxProviderContext({ env, platform });
 	const tmuxCommand = provider.command;

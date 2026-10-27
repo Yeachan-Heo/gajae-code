@@ -1022,6 +1022,26 @@ describe("GJC tmux session management", () => {
 		},
 	);
 
+	it("rejects a managed launch on Windows before any lifecycle storage or owner isolation", () => {
+		const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-win32-"));
+		fixtureDirectories.push(root);
+		let reachedIsolation = false;
+		__setCreateOwnerIsolationForTests({
+			execute: () => {
+				reachedIsolation = true;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		expect(() =>
+			createGjcTmuxSession(
+				{ GJC_TMUX_COMMAND: "psmux" },
+				{ platform: "win32", launch: { childSessionId: "broker-child", cwd: root, argv: ["child-command"] } },
+			),
+		).toThrow("gjc_tmux_managed_launch_platform_unsupported:win32");
+		expect(reachedIsolation).toBe(false);
+		expect(fsSync.readdirSync(root)).toEqual([]);
+	});
+
 	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
 		const cwd = path.join(os.tmpdir(), `gjc-managed-proof-cleanup-${crypto.randomUUID()}`);
 		const sessionName = "broker-child";

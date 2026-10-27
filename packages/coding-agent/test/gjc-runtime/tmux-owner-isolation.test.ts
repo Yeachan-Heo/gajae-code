@@ -72,29 +72,48 @@ describe("exact owner JSON framing", () => {
 		["trailing token", Buffer.from("{} true\n"), "json"],
 		["duplicate keys", Buffer.from('{"key":1,"key":2}\n'), "value", { key: 2 }],
 	];
-	it.each(
-		specimens.map(([name, bytes, kind, value]) => [name, bytes, kind, value] as const),
-	)("preserves native-reader and retained-byte semantics: %s", async (_name, bytes, kind, value) => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
-		try {
-			const file = path.join(root, "evidence.json");
-			await fs.writeFile(file, bytes, { mode: 0o600 });
-			const secure = () => readSecureOwnerJson(file);
-			const retained = () => parseExactOwnerJson(bytes, "managed_owner_json_framing_invalid");
-			if (kind === "value") {
-				expect(secure()).toEqual(value);
-				expect(retained()).toEqual(value);
-			} else if (kind === "framing") {
-				expect(secure).toThrow(bytes.length ? "owner_evidence_framing_invalid" : "owner_evidence_unavailable");
-				expect(retained).toThrow("managed_owner_json_framing_invalid");
-			} else {
-				expect(secure).toThrow(SyntaxError);
-				expect(retained).toThrow(SyntaxError);
+	// The native owner-only reader exists only on macOS and Linux.
+	it
+		.skipIf(process.platform === "win32")
+		.each(specimens.map(([name, bytes, kind, value]) => [name, bytes, kind, value] as const))(
+		"preserves native-reader and retained-byte semantics: %s",
+		async (_name, bytes, kind, value) => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
+			try {
+				const file = path.join(root, "evidence.json");
+				await fs.writeFile(file, bytes, { mode: 0o600 });
+				const secure = () => readSecureOwnerJson(file);
+				const retained = () => parseExactOwnerJson(bytes, "managed_owner_json_framing_invalid");
+				if (kind === "value") {
+					expect(secure()).toEqual(value);
+					expect(retained()).toEqual(value);
+				} else if (kind === "framing") {
+					expect(secure).toThrow(bytes.length ? "owner_evidence_framing_invalid" : "owner_evidence_unavailable");
+					expect(retained).toThrow("managed_owner_json_framing_invalid");
+				} else {
+					expect(secure).toThrow(SyntaxError);
+					expect(retained).toThrow(SyntaxError);
+				}
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
 			}
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"fails closed on Windows, where the owner-only reader is unsupported",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
+			try {
+				const file = path.join(root, "evidence.json");
+				await fs.writeFile(file, "{}\n");
+				expect(natives.readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "unsupported_platform" });
+				expect(() => readSecureOwnerJson(file)).toThrow("owner_evidence_unavailable");
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("keeps native failure classification and the 65536-byte bound", () => {
 		const read = spyOn(natives, "readOwnerOnlyFile").mockReturnValue({ ok: false, code: "read_failed" });
