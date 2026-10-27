@@ -153,6 +153,38 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
 }
 
+/**
+ * An intent its supervisor confirmed relaying: the delivery evidence that makes a
+ * later SIGTERM an operator shutdown on every platform (Darwin requires it).
+ */
+async function createRelayedOwnerIntent(
+	stateDir: string,
+	input: Parameters<typeof createOwnerIntent>[1],
+): Promise<Awaited<ReturnType<typeof createOwnerIntent>>> {
+	const intent = await createOwnerIntent(stateDir, input);
+	const paths = lifecyclePaths(stateDir, intent.session_id, intent.generation);
+	const supervisor = { child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" };
+	const ownerOnly = (file: string, value: unknown) =>
+		fs.writeFile(file, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: "wx" });
+	await ownerOnly(paths.supervisorIndexFile, {
+		schema_version: 1,
+		generation: intent.generation,
+		session_id: intent.session_id,
+		...supervisor,
+	});
+	await ownerOnly(paths.relayFile, {
+		schema_version: 1,
+		intent_id: intent.intent_id,
+		dispatch_id: intent.dispatch_id,
+		generation: intent.generation,
+		session_id: intent.session_id,
+		server_key: intent.server_key,
+		...supervisor,
+		relayed_at: intent.created_at,
+	});
+	return intent;
+}
+
 describe("coordinator runtime state sidecar", () => {
 	it("persists post-publication integration failures with correlation", async () => {
 		const root = await tempRoot();
@@ -2168,7 +2200,7 @@ describe("coordinator runtime state sidecar", () => {
 		const stateFile = path.join(root, "state.json");
 		const sessionId = "preserved-owner-session";
 		const generation = await replaceOwnerGeneration(root, sessionId, "preserved-owner-generation");
-		await createOwnerIntent(root, {
+		await createRelayedOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "opaque-owner",
@@ -2299,7 +2331,7 @@ describe("coordinator runtime state sidecar", () => {
 		const stateFile = path.join(root, "state.json");
 		const sessionId = "owner-sidecar-session";
 		const generation = await replaceOwnerGeneration(root, sessionId, "generation-one");
-		await createOwnerIntent(root, {
+		await createRelayedOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "opaque-server-key",
@@ -2576,7 +2608,7 @@ describe("coordinator runtime state sidecar", () => {
 		const root = await tempRoot();
 		const sessionId = "barrier-race";
 		const generation = await replaceOwnerGeneration(root, sessionId, "barrier-generation");
-		await createOwnerIntent(root, {
+		await createRelayedOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "private-owner",

@@ -140,6 +140,12 @@ function installPsmuxAuthorityFixture(
 	replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline);
 }
 
+/**
+ * Kernel-signal close: the closer delivers SIGTERM itself after publishing the
+ * intent. Only Linux closes that way; a Darwin closer needs a supervisor relay.
+ */
+const itKernelSignalClose = it.skipIf(process.platform === "darwin");
+
 describe("GJC tmux session management", () => {
 	beforeEach(() => {
 		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\tools\\tmux.exe" : null));
@@ -1584,7 +1590,7 @@ describe("GJC tmux session management", () => {
 			__setBinaryResolverForTests(null);
 		}
 	});
-	it("refuses a psmux replacement that differs only by incarnation before cleanup", async () => {
+	itKernelSignalClose("refuses a psmux replacement that differs only by incarnation before cleanup", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-psmux-close-incarnation-"));
 		fixtureDirectories.push(stateDir);
 		const sessionId = "psmux-session";
@@ -1677,7 +1683,7 @@ describe("GJC tmux session management", () => {
 		).rejects.toThrow("gjc_tmux_owner_changed:managed");
 		expect(cleanupSession).not.toHaveBeenCalled();
 	});
-	it("recovers a matching durable SIGTERM verdict when the owner-exit observer fails", async () => {
+	itKernelSignalClose("recovers a matching durable SIGTERM verdict when the owner-exit observer fails", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-"));
 		const sessionId = "session";
 		const generation = "generation";
@@ -2564,7 +2570,7 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 		110_000,
 	);
 
-	it("surfaces an exact compatibility cleanup failure after a matching SIGTERM verdict", async () => {
+	itKernelSignalClose("surfaces an exact compatibility cleanup failure after a matching SIGTERM verdict", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-cleanup-failure-"));
 		const sessionId = "session";
 		const generation = "generation";
@@ -2651,110 +2657,113 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 		await fs.rm(stateDir, { recursive: true, force: true });
 	});
 
-	it("does not kill a same-name replacement when the original native session ID disappears during verdict observation", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-replacement-"));
-		const sessionId = "session";
-		const generation = "generation";
-		const marker = path.join(stateDir, "marker");
-		await fs.mkdir(path.join(stateDir, sessionId, "owner-lifecycle"), {
-			recursive: true,
-		});
-		await fs.writeFile(
-			path.join(stateDir, sessionId, "owner-lifecycle", "generation.json"),
-			JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				generation,
-				published_at: new Date().toISOString(),
-			}),
-		);
-		let replacementPublished = false;
-		const cleanupSession = vi.fn();
-		const originalNativeSessionId = "$0";
-		const replacementNativeSessionId = "$1";
-		spyOn(Bun, "spawnSync").mockImplementation(((command: string[]) => {
-			if (command.includes("display-message")) {
-				const target = command[command.indexOf("-t") + 1];
-				if (target === originalNativeSessionId && replacementPublished)
-					return spawnResult(1, "", "can't find session");
-				return spawnResult(
-					0,
-					target === "=managed:"
-						? `${replacementPublished ? replacementNativeSessionId : originalNativeSessionId}\n`
-						: "",
-				);
-			}
-			if (command.includes("list-sessions"))
-				return spawnResult(
-					0,
-					`managed\t1\t0\t1770000000\t1\troot\t1\t321\t\t\t\t${sessionId}\t${marker}\t${generation}\tmanaged\n`,
-				);
-			if (command.includes("list-panes")) return spawnResult(0, "321\n");
-			if (command.includes("show-options")) {
-				const option = command.at(-1);
-				return spawnResult(
-					0,
-					option === "@gjc-profile"
-						? "1\n"
-						: option === "@gjc-session-id"
-							? `${sessionId}\n`
-							: option === "@gjc-owner-generation"
-								? `${generation}\n`
-								: option === "@gjc-owner-server-key"
-									? "managed\n"
-									: `${marker}\n`,
-				);
-			}
-			return spawnResult(0, "");
-		}) as unknown as typeof Bun.spawnSync);
-		injectSafeMutationProof();
-		await expect(
-			forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker, {
-				resolveOwner: async () => ({
-					sessionId,
-					stateDir,
-					socketKey: "managed",
+	itKernelSignalClose(
+		"does not kill a same-name replacement when the original native session ID disappears during verdict observation",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-replacement-"));
+			const sessionId = "session";
+			const generation = "generation";
+			const marker = path.join(stateDir, "marker");
+			await fs.mkdir(path.join(stateDir, sessionId, "owner-lifecycle"), {
+				recursive: true,
+			});
+			await fs.writeFile(
+				path.join(stateDir, sessionId, "owner-lifecycle", "generation.json"),
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
 					generation,
-					pid: 321,
-					startTime: "10",
+					published_at: new Date().toISOString(),
 				}),
-				readProcessStartTime: async () => "10",
-				shutdownModeForTest: "kernel_signal",
-				signalTerm: () => {},
-				sleep: async () => {
-					const intent = JSON.parse(
-						await fs.readFile(
-							path.join(stateDir, sessionId, "owner-lifecycle", `intent-${generation}.json`),
-							"utf8",
-						),
+			);
+			let replacementPublished = false;
+			const cleanupSession = vi.fn();
+			const originalNativeSessionId = "$0";
+			const replacementNativeSessionId = "$1";
+			spyOn(Bun, "spawnSync").mockImplementation(((command: string[]) => {
+				if (command.includes("display-message")) {
+					const target = command[command.indexOf("-t") + 1];
+					if (target === originalNativeSessionId && replacementPublished)
+						return spawnResult(1, "", "can't find session");
+					return spawnResult(
+						0,
+						target === "=managed:"
+							? `${replacementPublished ? replacementNativeSessionId : originalNativeSessionId}\n`
+							: "",
 					);
-					await observeOwnerTerminal({
-						schema_version: 1,
-						op: "observe_terminal",
-						session_id: sessionId,
-						owner_generation: generation,
-						state_dir: stateDir,
-						socket_key: "managed",
-						observer: "sidecar",
-						observed_at: new Date().toISOString(),
-						signal: "SIGTERM",
-						exit_code: null,
-						exit_kind: "exit",
-						reason: "test",
-						operator_dispatch_id: intent.dispatch_id,
-					});
-					replacementPublished = true;
-				},
-				cleanupSession,
-			}),
-		).rejects.toThrow("gjc_tmux_owner_changed:managed");
-		expect(cleanupSession).not.toHaveBeenCalled();
-		expect(Bun.spawnSync).toHaveBeenCalledWith(
-			["tmux", "-u", "display-message", "-p", "-t", originalNativeSessionId, "#{session_id}"],
-			expect.any(Object),
-		);
-		await fs.rm(stateDir, { recursive: true, force: true });
-	});
+				}
+				if (command.includes("list-sessions"))
+					return spawnResult(
+						0,
+						`managed\t1\t0\t1770000000\t1\troot\t1\t321\t\t\t\t${sessionId}\t${marker}\t${generation}\tmanaged\n`,
+					);
+				if (command.includes("list-panes")) return spawnResult(0, "321\n");
+				if (command.includes("show-options")) {
+					const option = command.at(-1);
+					return spawnResult(
+						0,
+						option === "@gjc-profile"
+							? "1\n"
+							: option === "@gjc-session-id"
+								? `${sessionId}\n`
+								: option === "@gjc-owner-generation"
+									? `${generation}\n`
+									: option === "@gjc-owner-server-key"
+										? "managed\n"
+										: `${marker}\n`,
+					);
+				}
+				return spawnResult(0, "");
+			}) as unknown as typeof Bun.spawnSync);
+			injectSafeMutationProof();
+			await expect(
+				forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker, {
+					resolveOwner: async () => ({
+						sessionId,
+						stateDir,
+						socketKey: "managed",
+						generation,
+						pid: 321,
+						startTime: "10",
+					}),
+					readProcessStartTime: async () => "10",
+					shutdownModeForTest: "kernel_signal",
+					signalTerm: () => {},
+					sleep: async () => {
+						const intent = JSON.parse(
+							await fs.readFile(
+								path.join(stateDir, sessionId, "owner-lifecycle", `intent-${generation}.json`),
+								"utf8",
+							),
+						);
+						await observeOwnerTerminal({
+							schema_version: 1,
+							op: "observe_terminal",
+							session_id: sessionId,
+							owner_generation: generation,
+							state_dir: stateDir,
+							socket_key: "managed",
+							observer: "sidecar",
+							observed_at: new Date().toISOString(),
+							signal: "SIGTERM",
+							exit_code: null,
+							exit_kind: "exit",
+							reason: "test",
+							operator_dispatch_id: intent.dispatch_id,
+						});
+						replacementPublished = true;
+					},
+					cleanupSession,
+				}),
+			).rejects.toThrow("gjc_tmux_owner_changed:managed");
+			expect(cleanupSession).not.toHaveBeenCalled();
+			expect(Bun.spawnSync).toHaveBeenCalledWith(
+				["tmux", "-u", "display-message", "-p", "-t", originalNativeSessionId, "#{session_id}"],
+				expect.any(Object),
+			);
+			await fs.rm(stateDir, { recursive: true, force: true });
+		},
+	);
 
 	it("rejects a missing native session ID before SIGTERM or cleanup", async () => {
 		const signalTerm = vi.fn();

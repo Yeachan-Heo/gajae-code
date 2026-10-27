@@ -1743,14 +1743,14 @@ function isExpectedIntent(intent: OwnerIntent | null, request: ObserveTerminalRe
  * published by the closer but delivered only by that exact supervisor, so a pending
  * intent alone does not explain a SIGTERM: an unrelated signal can arrive while the
  * intent is still unconsumed. Only the supervisor's relay record for this exact
- * intent makes the shutdown expected. Without an index the closer itself delivers
- * the signal after publishing the intent.
+ * intent makes the shutdown expected. Without an index a Linux closer itself
+ * delivers the signal after publishing the intent; a Darwin closer never does.
  */
 function hasCooperativeRelayEvidence(paths: LifecyclePaths, intent: OwnerIntent | null): boolean {
 	try {
 		fsSync.lstatSync(paths.supervisorIndexFile);
 	} catch (error) {
-		if (isCode(error, "ENOENT")) return true;
+		if (isCode(error, "ENOENT")) return process.platform !== "darwin";
 		return false;
 	}
 	if (!intent) return false;

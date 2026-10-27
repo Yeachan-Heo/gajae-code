@@ -821,6 +821,12 @@ function holdSqliteWriteLock(databaseFile: string): Database {
 	return database;
 }
 
+/**
+ * Kernel-signal close: the closer delivers SIGTERM itself after publishing the
+ * intent. Only Linux closes that way; a Darwin closer needs a supervisor relay.
+ */
+const itKernelSignalClose = it.skipIf(process.platform === "darwin");
+
 describe("tmux owner isolation", () => {
 	it("recognizes only the exact owner-isolation argv", () => {
 		expect(isTmuxOwnerIsolationCliArgv([ownerIsolationFlag])).toBe(true);
@@ -1834,53 +1840,58 @@ describe("tmux owner isolation", () => {
 		await fs.rm(state, { recursive: true, force: true });
 	});
 
-	it("writes verdict before consuming a matching attempt intent and converges observers", async () => {
-		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
-		const generation = await replaceOwnerGeneration(state, "session", "generation");
-		await createOwnerIntent(state, {
-			generation,
-			session_id: "session",
-			server_key: "socket",
-			expected_terminal: {
-				signal: "SIGTERM",
-				result: "owner_term_then_session_cleanup",
-			},
-			dispatch_id: "dispatch",
-			created_at: "2026-01-01T00:00:00.000Z",
-			expires_at: "2026-01-01T00:01:00.000Z",
-		});
-		const observed = {
-			schema_version: 1 as const,
-			op: "observe_terminal" as const,
-			session_id: "session",
-			owner_generation: generation,
-			state_dir: state,
-			socket_key: "socket",
-			observer: "sidecar" as const,
-			observed_at: "2026-01-01T00:00:01.000Z",
-			signal: "SIGTERM" as const,
-			exit_code: 0,
-			exit_kind: "exit",
-			reason: "owner_exit",
-			operator_dispatch_id: "dispatch",
-		};
-		const first = await observeOwnerTerminal(observed);
-		const second = await observeOwnerTerminal({
-			...observed,
-			observer: "raw_monitor",
-			reason: "different",
-		});
-		expect(first.classification).toBe("expected_operator_shutdown");
-		expect(second).toEqual(first);
-		await expect(
-			fs.access(path.join(state, "session", "owner-lifecycle", "intent-generation.json.consumed")),
-		).resolves.toBeNull();
-		await expect(Bun.file(path.join(state, "session", "owner-lifecycle", "verdict.json")).json()).resolves.toEqual({
-			...first,
-			owner_generation: generation,
-		});
-		await fs.rm(state, { recursive: true, force: true });
-	});
+	itKernelSignalClose(
+		"writes verdict before consuming a matching attempt intent and converges observers",
+		async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "dispatch",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2026-01-01T00:01:00.000Z",
+			});
+			const observed = {
+				schema_version: 1 as const,
+				op: "observe_terminal" as const,
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar" as const,
+				observed_at: "2026-01-01T00:00:01.000Z",
+				signal: "SIGTERM" as const,
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "owner_exit",
+				operator_dispatch_id: "dispatch",
+			};
+			const first = await observeOwnerTerminal(observed);
+			const second = await observeOwnerTerminal({
+				...observed,
+				observer: "raw_monitor",
+				reason: "different",
+			});
+			expect(first.classification).toBe("expected_operator_shutdown");
+			expect(second).toEqual(first);
+			await expect(
+				fs.access(path.join(state, "session", "owner-lifecycle", "intent-generation.json.consumed")),
+			).resolves.toBeNull();
+			await expect(Bun.file(path.join(state, "session", "owner-lifecycle", "verdict.json")).json()).resolves.toEqual(
+				{
+					...first,
+					owner_generation: generation,
+				},
+			);
+			await fs.rm(state, { recursive: true, force: true });
+		},
+	);
 
 	it("rejects a foreign generation while using the shared SQLite lock database", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
@@ -2690,6 +2701,42 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				exit_kind: "SIGTERM",
 				reason: "process_postmortem",
 				operator_dispatch_id: first!.dispatch_id,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("never treats a missing supervisor index as delivery evidence", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-no-index-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			let published: OwnerIntent | undefined;
+			// The closer published its intent; the index is gone and no relay happened.
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					published = intent;
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(fsSync.existsSync(paths.supervisorIndexFile)).toBe(false);
+			expect(readSecureOwnerJson(paths.intentFile)).toEqual(published);
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date(Date.parse(published!.created_at) + 1).toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: published!.dispatch_id,
 			});
 			expect(verdict.classification).toBe("unexpected_owner_loss");
 		} finally {

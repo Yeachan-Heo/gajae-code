@@ -13,3 +13,4 @@
 - A pinned macOS session relaunched after a backward wall-clock correction can still be closed: a new owner generation is never published earlier than its predecessor or that predecessor's terminal verdict, so the genuine predecessor no longer reads as a conflicting terminal (`owner_terminal_conflict`).
 - A macOS cooperative close now treats the pinned supervisor as exited only when the process table positively reports its PID absent or reused. A transient process lookup failure no longer counts as exit, so the session is never killed while owner cleanup may still be running.
 - The cooperative relay publisher is injected by the supervisor, keeping managed session storage out of the MCP machine entrypoint's import graph.
+- A missing supervisor index is no longer accepted as delivery evidence on macOS: an unrelated SIGTERM after a cooperative close intent stays `unexpected_owner_loss` unless the supervisor confirmed relaying that intent.
