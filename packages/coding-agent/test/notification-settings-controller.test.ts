@@ -1503,6 +1503,267 @@ describe("notification settings controller adapter", () => {
 		expect(typeof committed.retainCommitted).toBe("function");
 		expect(events).toEqual(["commit", "ensure", "enter-blocked", "commit", "notify"]);
 	});
+	it.each([
+		"primary",
+		"marker",
+	] as const)("notifies observers only after a restored primary receipt when %s is not restorable", async target => {
+		let notifications = 0;
+		const primary = {
+			...receipt(),
+			restore: async () =>
+				target === "primary"
+					? { status: "not-restorable" as const }
+					: { status: "restored" as const, receipt: receipt() },
+		};
+		const marker = { ...receipt(), restore: async () => ({ status: "not-restorable" as const }) };
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getAgentDir: () => "/unused",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => primary,
+			commitAtomicBatchWithCurrent: async () => marker,
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+				notifyConfigChanged: () => {
+					notifications++;
+				},
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				resolveTelegramSetupPreflight: async () => ({ status: "safe" }) as never,
+				runTelegramSetup: async () => ({
+					ok: true,
+					chatId: "chat",
+					tokenFingerprint: "fp",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				}),
+				proposedTelegramIdentity: async () => ({ status: "same" }),
+				ensureTelegramDaemonRunningDetailed: async () => "blocked_identity",
+			},
+		);
+		const prepared = await operations.preflightProposedIdentity(
+			{ token: secret(), chatId: "chat", richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
+			new AbortController().signal,
+		);
+		if (!prepared.draft) throw new Error("Expected draft.");
+		const committed = await operations.commitConfigure(prepared.draft);
+		if (committed.status !== "blocked_identity") throw new Error("Expected blocked commit.");
+		expect(notifications).toBe(1);
+		const restored = await committed.restore();
+		expect(restored.status).toBe(target === "primary" ? "not-restorable" : "restored");
+		expect(notifications).toBe(target === "primary" ? 1 : 2);
+	});
+
+	it.each([
+		"activate",
+		"deactivate",
+		"reconnect",
+		"remove",
+	] as const)("reports resolved reconciliation failure for %s", async action => {
+		const events: string[] = [];
+		const committed = receipt();
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getAgentDir: () => "/unused",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				events.push("commit");
+				return committed;
+			},
+		} as unknown as Settings;
+		const controller = {
+			reconcileCurrentSession: async () => {
+				events.push("reconcile");
+				return { outcome: "failed" as const, status: sessionStatus() };
+			},
+			clearBlockedRuntime: async () => {
+				events.push("clear");
+			},
+			enterBlockedRuntime: async () => {
+				events.push("fence");
+				return true;
+			},
+		};
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: controller },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+				notifyConfigChanged: () => {
+					events.push("notify");
+				},
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				ensureTelegramDaemonRunningDetailed: async () => "attached",
+				stopTelegramDaemon: async () => ({ ok: true, message: "stopped" }),
+				getCurrentTelegramActivationMarker: () => undefined,
+			},
+		);
+		if (action === "reconnect") {
+			await expect(operations.reconnect()).rejects.toThrow("reconciliation failed; runtime was fenced");
+			expect(events).toEqual(["clear", "reconcile", "fence"]);
+		} else {
+			const result =
+				action === "remove"
+					? await operations.removeTelegram()
+					: await operations.setProviderDesired("telegram", action === "activate");
+			expect(result).toMatchObject({ receipt: committed, outcome: "degraded" });
+			expect(events).toContain("notify");
+			expect(result.message).toContain(
+				action === "remove"
+					? "reconciliation failed"
+					: `${action === "activate" ? "activation" : "deactivation"} failed`,
+			);
+			if (action === "remove") expect(events).toEqual(["fence", "commit", "clear", "reconcile", "fence", "notify"]);
+		}
+	});
+
+	it.each([
+		"blocked",
+		"reconcile",
+		"remove-before",
+		"remove-after",
+	] as const)("reports a false fencing result for %s", async action => {
+		const events: string[] = [];
+		const committed = receipt();
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				events.push("commit");
+				return committed;
+			},
+		} as unknown as Settings;
+		let fences = 0;
+		const controller = {
+			clearBlockedRuntime: async () => {},
+			reconcileCurrentSession: async () => ({ outcome: "failed" as const, status: sessionStatus() }),
+			enterBlockedRuntime: async () => {
+				events.push("fence");
+				return action === "remove-after" && ++fences === 1;
+			},
+		};
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: controller },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+				notifyConfigChanged: () => {
+					events.push("notify");
+				},
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				ensureTelegramDaemonRunningDetailed: async () => (action === "blocked" ? "blocked_identity" : "attached"),
+				stopTelegramDaemon: async () => {
+					events.push("stop");
+					return { ok: true, message: "stopped" };
+				},
+			},
+		);
+		if (action === "blocked" || action === "reconcile") {
+			await expect(operations.reconnect()).rejects.toThrow("could not be fenced");
+		} else if (action === "remove-before") {
+			await expect(operations.removeTelegram()).rejects.toThrow("could not be fenced");
+			expect(events).toEqual(["fence"]);
+		} else {
+			const result = await operations.removeTelegram();
+			expect(result).toMatchObject({ outcome: "degraded", receipt: committed });
+			expect(result.message).toContain("current runtime could not be fenced");
+			expect(events).toEqual(["fence", "stop", "commit", "fence", "notify"]);
+		}
+	});
+
+	it("reports false fencing when reconciliation fails during removal recovery", async () => {
+		const events: string[] = [];
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				throw new Error("commit failed");
+			},
+		} as unknown as Settings;
+		let fences = 0;
+		const controller = {
+			enterBlockedRuntime: async () => {
+				events.push("fence");
+				return ++fences === 1;
+			},
+			clearBlockedRuntime: async () => {
+				events.push("clear");
+			},
+			reconcileCurrentSession: async () => ({ outcome: "failed" as const, status: sessionStatus() }),
+		};
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: controller },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				stopTelegramDaemon: async () => ({ ok: true, message: "stopped" }),
+				ensureTelegramDaemonRunningDetailed: async () => "attached",
+			},
+		);
+		await expect(operations.removeTelegram()).rejects.toThrow("runtime could not be fenced");
+		expect(events).toEqual(["fence", "clear", "fence"]);
+	});
+
+	it("reports unsuccessful fencing after a failed reconnect reconciliation", async () => {
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getNotificationSettingsSnapshot: () => snapshot(),
+		} as unknown as Settings;
+		const controller = {
+			clearBlockedRuntime: async () => {},
+			reconcileCurrentSession: async () => ({ outcome: "failed" as const, status: sessionStatus() }),
+			enterBlockedRuntime: async () => {
+				throw new Error(TOKEN);
+			},
+		};
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: controller },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			} as unknown as NotificationsEditorAdapterContext,
+			{ ensureTelegramDaemonRunningDetailed: async () => "attached" },
+		);
+		await expect(operations.reconnect()).rejects.toThrow("runtime could not be fenced");
+	});
+
+	it("redacts provider secrets in a post-commit daemon reload diagnostic", async () => {
+		const secrets = ["old-telegram-secret", "discord-secret", "slack-bot-secret", "slack-app-secret"];
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getNotificationSettingsSnapshot: () =>
+				snapshot({
+					telegram: { ...snapshot().telegram, enabled: true, botToken: secrets[0], chatId: "chat" },
+					discord: { botToken: secrets[1] },
+					slack: { botToken: secrets[2], appToken: secrets[3] },
+				}),
+			commitAtomicBatch: async () => receipt(),
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				reloadTelegramDaemon: async () => ({ ok: false, message: `failure ${secrets.join(" ")}` }),
+			},
+		);
+		const result = await operations.commitPreferences({ ...editorState().preferences, toolActivityEnabled: true });
+		expect(result.outcome).toBe("degraded");
+		expect(result.message).toContain("daemon reload failed");
+		for (const secret of secrets) expect(result.message).not.toContain(secret);
+	});
+
 	it("stops the Telegram supervisor before removing its configuration", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-remove-"));
 		const currentSnapshot = snapshot();

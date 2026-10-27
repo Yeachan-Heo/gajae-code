@@ -988,13 +988,20 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#selectedIndex = 0;
 				switch (result.status) {
 					case "restored":
-						this.#status = `${result.runtimeFailed || result.observerFailed ? "WARNING" : "OK"} — Previous Telegram configuration restored after the blocked activation.${result.runtimeFailed ? `${result.markerRestoreFailed ? " Inactive marker restore failed." : ""}${result.markerRetainFailed ? " Inactive marker retention failed; its state is unconfirmed." : ""}${result.markerRestoreFailed || result.markerRetainFailed ? "" : " Runtime reconciliation failed."}${result.runtimeFenced ? " The current runtime was fenced." : " The current runtime could not be fenced."}` : ""}${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
+						this.#status = `${result.runtimeFailed || result.observerFailed ? "WARNING" : "OK"} — Previous Telegram configuration restored after the blocked activation.${result.runtimeFailed ? `${result.markerRestoreFailed ? " Inactive marker restore failed." : ""}${result.markerRetainFailed ? " Inactive marker retention failed; its state is unconfirmed." : ""}${result.markerRestoreFailed || result.markerRetainFailed ? "" : " Runtime reconciliation failed."}${result.runtimeFenced ? " The current runtime was fenced or no local session was present." : " The current runtime could not be fenced."}` : ""}${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
 						return;
 					case "conflict":
 						this.#status = `ERROR — Previous configuration was not restored because settings changed at: ${result.paths.join(", ")}. Saved configuration remains inactive.`;
 						return;
+					case "marker_blocked":
+						this.#status = `ERROR — Previous configuration restored, but its inactive marker could not be restored; the current runtime was fenced or no local session was present.${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
+						return;
 					case "still_blocked":
 						this.#status = `ERROR — Previous configuration restored, but activation remains blocked by a foreign daemon. Current session remains inactive.${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
+						return;
+					case "not-restorable":
+						this.#status =
+							"WARNING — Previous configuration could not be restored because the receipt is not restorable. Saved configuration remains inactive.";
 						return;
 					case "discarded":
 						this.#status =

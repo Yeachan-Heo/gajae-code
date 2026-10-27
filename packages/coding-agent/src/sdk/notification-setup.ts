@@ -164,7 +164,10 @@ export function createNotificationsEditorOperations(
 				if (result === "blocked_identity" || result === "disabled") {
 					throw new Error("Telegram activation failed after the durable save.");
 				}
-				await ctx.session.notificationSessionController?.reconcileCurrentSession(sessionContext());
+				const reconciliation = await ctx.session.notificationSessionController?.reconcileCurrentSession(
+					sessionContext(),
+				);
+				if (reconciliation?.outcome === "failed") throw new Error("Current-session reconciliation failed.");
 				return;
 			}
 			const result = await new ChatDaemonController(ctx.settings, provider).ensure();
@@ -174,7 +177,10 @@ export function createNotificationsEditorOperations(
 			if (provider === "telegram") {
 				const result = await services.stopTelegramDaemon(ctx.settings);
 				if (!result.ok) throw new Error(result.message);
-				await ctx.session.notificationSessionController?.reconcileCurrentSession(sessionContext());
+				const reconciliation = await ctx.session.notificationSessionController?.reconcileCurrentSession(
+					sessionContext(),
+				);
+				if (reconciliation?.outcome === "failed") throw new Error("Current-session reconciliation failed.");
 				return;
 			}
 			const result = await new ChatDaemonController(ctx.settings, provider).stop();
@@ -304,10 +310,23 @@ export function createNotificationsEditorOperations(
 				const result = await reconnect();
 				const controller = ctx.session.notificationSessionController;
 				if (result === "blocked_identity") {
-					await controller?.enterBlockedRuntime(sessionContext());
+					if (controller && !(await controller.enterBlockedRuntime(sessionContext()))) {
+						throw new Error("Telegram identity was blocked, but the current runtime could not be fenced.");
+					}
 				} else if (result === "spawned" || result === "reloaded" || result === "attached") {
 					await controller?.clearBlockedRuntime(sessionContext());
-					await controller?.reconcileCurrentSession(sessionContext());
+					const reconciliation = await controller?.reconcileCurrentSession(sessionContext());
+					if (reconciliation?.outcome === "failed") {
+						let fenced = false;
+						try {
+							fenced = (await controller?.enterBlockedRuntime(sessionContext())) === true;
+						} catch {
+							// Report the failure without claiming the runtime was fenced.
+						}
+						throw new Error(
+							`Current-session reconciliation failed; runtime ${fenced ? "was fenced" : "could not be fenced"}.`,
+						);
+					}
 				}
 				return result;
 			} catch (error) {
@@ -467,7 +486,7 @@ export function createNotificationsEditorOperations(
 							: {
 									enterBlockedRuntime: async () => undefined,
 									clearBlockedRuntime: async () => undefined,
-									reconcileCurrentSession: async () => undefined,
+									reconcileCurrentSession: async () => unavailableNotificationSessionResult(),
 								},
 						reconnect,
 						persistInactive: async marker => await persistTelegramActivationMarker(ctx.settings, marker),
@@ -496,7 +515,11 @@ export function createNotificationsEditorOperations(
 							} catch (error) {
 								throw notificationOperationError(services, error, token);
 							}
-							if (restored.status === "restored" || restored.status === "still_blocked") {
+							if (
+								restored.status === "restored" ||
+								restored.status === "still_blocked" ||
+								restored.status === "marker_blocked"
+							) {
 								try {
 									await notifyAfterDurableCommit();
 								} catch {
@@ -909,7 +932,9 @@ export function createNotificationsEditorOperations(
 					settings: ctx.settings,
 					removal: {
 						stopAndUnregister: async () => {
-							if (controller) await controller.enterBlockedRuntime(sessionContext());
+							if (controller && !(await controller.enterBlockedRuntime(sessionContext()))) {
+								throw new Error("Telegram removal failed because the current runtime could not be fenced.");
+							}
 							runtimePrepared = true;
 							const stopped = await services.stopTelegramDaemon(ctx.settings);
 							if (!stopped.ok) throw new Error(stopped.message);
@@ -920,9 +945,19 @@ export function createNotificationsEditorOperations(
 				if (runtimePrepared && controller) {
 					try {
 						await controller.clearBlockedRuntime(sessionContext());
-						await controller.reconcileCurrentSession(sessionContext());
+						const reconciliation = await controller.reconcileCurrentSession(sessionContext());
+						if (reconciliation.outcome === "failed")
+							postCommitFailures.push("current-session reconciliation failed");
 					} catch {
 						postCommitFailures.push("current-session reconciliation failed");
+					}
+					if (postCommitFailures.length > 0) {
+						try {
+							const fenced = await controller.enterBlockedRuntime(sessionContext());
+							postCommitFailures.push(fenced ? "current runtime fenced" : "current runtime could not be fenced");
+						} catch {
+							postCommitFailures.push("current runtime could not be fenced");
+						}
 					}
 				}
 				try {
@@ -943,7 +978,22 @@ export function createNotificationsEditorOperations(
 					const restored = await reconnect();
 					if (restored !== "blocked_identity" && controller) {
 						await controller.clearBlockedRuntime(sessionContext());
-						await controller.reconcileCurrentSession(sessionContext());
+						const reconciliation = await controller.reconcileCurrentSession(sessionContext());
+						if (reconciliation.outcome === "failed") {
+							let fenced = false;
+							try {
+								fenced = await controller.enterBlockedRuntime(sessionContext());
+							} catch {
+								// Preserve the original removal failure and report unsuccessful fencing.
+							}
+							throw notificationOperationError(
+								services,
+								new Error(
+									`Telegram removal failed and current-session reconciliation failed; runtime ${fenced ? "was fenced" : "could not be fenced"}.`,
+								),
+								services.getNotificationConfig(ctx.settings).botToken,
+							);
+						}
 					}
 				}
 				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
@@ -1020,7 +1070,18 @@ export function createNotificationsEditorOperations(
 						const reload = daemonWasRunningForDisable
 							? await services.restartTelegramDaemon(ctx.settings)
 							: await services.reloadTelegramDaemon(ctx.settings);
-						if (!reload.ok) postCommitFailures.push(`daemon reload failed: ${reload.message}`);
+						if (!reload.ok) {
+							let detail = reload.message;
+							for (const token of [
+								config.botToken,
+								config.discord.botToken,
+								config.slack.botToken,
+								config.slack.appToken,
+							]) {
+								detail = services.sanitizeDiagnostic(detail, token);
+							}
+							postCommitFailures.push(`daemon reload failed: ${detail}`);
+						}
 					} catch {
 						postCommitFailures.push("daemon reload failed");
 					}

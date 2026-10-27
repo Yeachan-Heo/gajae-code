@@ -654,6 +654,35 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("settings changed at: notifications.telegram.chatId");
 	});
 
+	it.each([
+		"not-restorable",
+		"marker_blocked",
+	] as const)("reports %s without claiming a foreign daemon", async status => {
+		const operations = new FakeNotificationsOperations();
+		operations.commitResult = {
+			status: "blocked_identity",
+			receipt: {} as never,
+			message: "Blocked.",
+			restore: async () =>
+				status === "not-restorable" ? { status: "not-restorable" } : { status: "marker_blocked" },
+			retainCommitted: () => {},
+		};
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		const display = render(component);
+		expect(display).toContain(
+			status === "not-restorable" ? "receipt is not restorable" : "inactive marker could not be restored",
+		);
+		expect(display).not.toContain("foreign daemon");
+	});
+
 	it("retains blocked configuration only when Keep saved (inactive) is explicitly selected", async () => {
 		const operations = new FakeNotificationsOperations();
 		let retained = 0;
