@@ -148,6 +148,9 @@ type ReceiptChange = {
 
 // Descendant tasks retain this context after completion, so the lease must be
 // deactivated rather than treating every inherited path as permanently held.
+// While active, ancestry is a conservative lease, not proof of an actual await:
+// even a detached timer inherits it and must not acquire the same or a busy file.
+// Only the narrowly scoped Settings admission below deliberately drops the lease.
 type QueueContext = { path: string; active: boolean; parent: QueueContext | undefined };
 
 const queues = new Map<string, Promise<void>>();
@@ -1360,7 +1363,10 @@ export function assertNoActiveAtomicYamlOperation(configPath: string): void {
 /**
  * Reserve a FIFO operation for a config file immediately. The patch supplier runs
  * only when this operation reaches the front of the in-process queue, which lets
- * Settings debounce/coalesce inside its already-reserved causal slot.
+ * Settings debounce/coalesce inside its already-reserved causal slot. Nested
+ * callers holding an active lease may acquire an idle different file, but cannot
+ * queue behind a busy file. This conservative rule also applies to detached
+ * callbacks that inherited the lease, even when nobody awaits their work.
  */
 export function enqueueAtomicYamlOperation<T>(
 	configPath: string,
@@ -1373,7 +1379,19 @@ export function enqueueAtomicYamlOperation<T>(
 		return Promise.reject(error);
 	}
 	const parent = queueContext.getStore();
-	const prior = queues.get(canonicalPath) ?? Promise.resolve();
+	const queued = queues.get(canonicalPath);
+	// A nested operation may acquire an idle file, but must not wait behind
+	// another queue while holding a lease. Independent roots may be waiting on
+	// each other through different async contexts, which ancestry cannot detect.
+	if (queued) {
+		for (let context = parent; context; context = context.parent) {
+			if (context.active)
+				return Promise.reject(
+					new Error(`Cannot enqueue a nested atomic YAML operation for busy ${canonicalPath}.`),
+				);
+		}
+	}
+	const prior = queued ?? Promise.resolve();
 	const result = prior
 		.catch(() => undefined)
 		.then(async () => {

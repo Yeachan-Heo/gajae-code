@@ -45,14 +45,10 @@ afterEach(async () => {
 
 describe("atomic YAML patches", () => {
 	async function bounded<T>(promise: Promise<T>): Promise<T> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = Promise.withResolvers<never>();
+		const timer = setTimeout(() => timeout.reject(new Error("Atomic YAML operation timed out")), 1000);
 		try {
-			return await Promise.race([
-				promise,
-				new Promise<never>((_, reject) => {
-					timer = setTimeout(() => reject(new Error("Atomic YAML operation timed out")), 1000);
-				}),
-			]);
+			return await Promise.race([promise, timeout.promise]);
 		} finally {
 			clearTimeout(timer);
 		}
@@ -150,6 +146,55 @@ describe("atomic YAML patches", () => {
 		await bounded(completion.promise);
 		expect(ran).toBe(true);
 		expect(await readYaml(configPath)).toEqual({ feature: "deferred" });
+	});
+
+	test("independent roots reject cross-file waits without deadlock and release their queues", async () => {
+		const first = await configPathForTest();
+		const second = await configPathForTest();
+		await Bun.write(first, "value: old\n");
+		await Bun.write(second, "value: old\n");
+		const bothEntered = Promise.withResolvers<void>();
+		const bothAttempted = Promise.withResolvers<void>();
+		let entered = 0;
+		let attempted = 0;
+		const run = (own: string, other: string) =>
+			withAtomicYamlConfigTransaction(own, async tx => {
+				if (++entered === 2) bothEntered.resolve();
+				await bounded(bothEntered.promise);
+				await expect(bounded(applyAtomicYamlPatches(other, []))).rejects.toThrow(
+					"nested atomic YAML operation for busy",
+				);
+				if (++attempted === 2) bothAttempted.resolve();
+				await bounded(bothAttempted.promise);
+				await tx.applyPatches([{ path: "value", op: "set", value: "root" }]);
+			});
+		await bounded(Promise.all([run(first, second), run(second, first)]));
+		await bounded(
+			Promise.all(
+				[first, second].map(file => applyAtomicYamlPatches(file, [{ path: "value", op: "set", value: "after" }])),
+			),
+		);
+		expect(await readYaml(first)).toEqual({ value: "after" });
+		expect(await readYaml(second)).toEqual({ value: "after" });
+	});
+
+	test("a detached timer inherits the active lease and rejects same-file admission", async () => {
+		const configPath = await configPathForTest();
+		const timerResult = Promise.withResolvers<unknown>();
+		const release = Promise.withResolvers<void>();
+		const owner = enqueueAtomicYamlOperation(configPath, async () => {
+			setTimeout(() => {
+				void applyAtomicYamlPatches(configPath, []).then(timerResult.resolve, timerResult.resolve);
+			}, 0);
+			await bounded(release.promise);
+		});
+		const error = await bounded(timerResult.promise);
+		expect(error).toBeInstanceOf(Error);
+		expect(String(error)).toContain("reentrant atomic YAML operation");
+		release.resolve();
+		await bounded(owner);
+		await bounded(applyAtomicYamlPatches(configPath, [{ path: "value", op: "set", value: "after" }]));
+		expect(await readYaml(configPath)).toEqual({ value: "after" });
 	});
 
 	test("independent callers wait in FIFO order and make progress", async () => {
