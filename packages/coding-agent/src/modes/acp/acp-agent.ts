@@ -38,6 +38,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { getAgentDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
+import { parseSkillInvocations } from "../../extensibility/skills";
 import { PROJECT_PROGRESS_SNAPSHOT_SCHEMA, type ProjectProgressSnapshot } from "../../progress/progress-contract";
 import { PROGRESS_COMMAND_ACP_DESCRIPTION, renderProgressSnapshot } from "../../progress/render-progress";
 import {
@@ -551,6 +552,16 @@ export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand
 		});
 	}
 	return [...commands.values()];
+}
+
+function acpSkillCommandMap(query: unknown): Map<string, { name: string }> {
+	const skills = new Map<string, { name: string }>();
+	for (const command of acpAvailableCommandsFromSkills(query)) {
+		if (!command.name.startsWith("skill:")) continue;
+		const name = command.name.slice("skill:".length);
+		skills.set(command.name, { name });
+	}
+	return skills;
 }
 
 function hasCorrelation(correlation: PromptCorrelation): boolean {
@@ -1512,12 +1523,21 @@ export function acpSessionStateFromConfig(
 	};
 }
 
-/** Recognize a canonical ACP skill command only when it is the complete, single text prompt. */
-export function acpSkillInvocation(blocks: PromptRequest["prompt"]): { name: string; args: string } | undefined {
+/** Recognize a complete ACP skill command or a single known inline skill token. */
+export function acpSkillInvocation(
+	blocks: PromptRequest["prompt"],
+	inlineSkills?: ReadonlyMap<string, { name: string }>,
+): { name: string; args: string } | undefined {
 	if (blocks.length !== 1 || blocks[0]?.type !== "text") return undefined;
-	const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(blocks[0].text.trim());
-	if (!match?.[1]) return undefined;
-	return { name: match[1], args: match[2]?.trim() ?? "" };
+	const text = blocks[0].text.trim();
+	const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(text);
+	if (match?.[1]) return { name: match[1], args: match[2]?.trim() ?? "" };
+	if (text.startsWith("/") || !inlineSkills) return undefined;
+	const invocations = parseSkillInvocations(text, inlineSkills);
+	if (invocations.length !== 1) return undefined;
+	const invocation = invocations[0];
+	if (!invocation) return undefined;
+	return { name: invocation.skill.name, args: invocation.args };
 }
 
 /**
@@ -2517,7 +2537,18 @@ export class AcpAgent implements Agent {
 			);
 
 		const payload = acpPromptPayload(params.prompt);
-		const skillInvocation = acpSkillInvocation(params.prompt);
+		let skillInvocation = acpSkillInvocation(params.prompt);
+		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
+		if (!skillInvocation && textBlock?.text.toLowerCase().includes("/skill:")) {
+			try {
+				skillInvocation = acpSkillInvocation(
+					params.prompt,
+					acpSkillCommandMap(await record.adapter.query("skill.list/state")),
+				);
+			} catch {
+				// Keep the complete user text on the ordinary prompt path if skill discovery is unavailable.
+			}
+		}
 		const clientRef = randomUUID();
 		if (!skillInvocation) {
 			const promptError = validateRequiredPromptText("turn.prompt", {

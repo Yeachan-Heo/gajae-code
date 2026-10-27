@@ -343,7 +343,6 @@ import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
-	isNamespacedSkillSlashCommandName,
 	type ParsedSkillInvocation,
 	parseSkillInvocations,
 	type Skill,
@@ -14854,7 +14853,7 @@ export class AgentSession {
 	 * that must mirror it, such as startup title seeding.
 	 */
 	resolvePromptSkillInvocation(text: string, images?: readonly unknown[]): ParsedSkillInvocation | undefined {
-		if (images?.length || !text.startsWith("/") || !isNamespacedSkillSlashCommandName(text.slice(1))) return;
+		if (images?.length) return;
 		const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
 		const invocations = parseSkillInvocations(text, skillCommands);
 		return invocations.length === 1 ? invocations[0] : undefined;
