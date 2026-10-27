@@ -63,6 +63,8 @@ type Fixture = {
 	sendIdle(): void;
 	dispose(): void;
 	queryCalls: string[];
+	skillDiscoveryEntered: Promise<void>;
+	releaseSkillDiscovery(): void;
 	blockedAdvisoryQueryCount(): number;
 	releaseBlockedAdvisoryQueries(): void;
 	releaseIdleUpdate(): void;
@@ -144,6 +146,7 @@ async function createFixture(
 		uncertainPromptAcknowledgement?: boolean;
 		deferRecoveryAcknowledgement?: boolean;
 		retainRecoveryQuery?: boolean;
+		deferSkillDiscovery?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -156,6 +159,9 @@ async function createFixture(
 	const updates: SessionNotification[] = [];
 	const queryCalls: string[] = [];
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
+	const skillDiscoveryEntered = Promise.withResolvers<void>();
+	let blockedSkillDiscovery: { socket: TestSocket; id: string; result: unknown } | undefined;
+	let skillDiscoveryBlocked = false;
 	const mutationInputs: Record<string, unknown>[] = [];
 	const recoveryInputs: Record<string, unknown>[] = [];
 	let recoveryQuery: { socket: TestSocket; id: unknown } | undefined;
@@ -357,7 +363,9 @@ async function createFixture(
 								? [{ provider: "openai", id: "gpt", name: "GPT" }]
 								: frame.query === "providers.list/active"
 									? [{ provider: "openai", connectionKind: "credential" }]
-									: [];
+									: frame.query === "skill.list/state" && options.deferSkillDiscovery
+										? [{ name: "fixture-skill", description: "Fixture skill" }]
+										: [];
 					const result =
 						frame.query === "runtime.capabilities"
 							? { promptTerminalOutcomeVersion: 1, primaryControlSurface: "sdk" }
@@ -384,6 +392,12 @@ async function createFixture(
 						blockedAdvisoryQueries.length === 0
 					) {
 						blockedAdvisoryQueries.push({ socket, id: String(frame.id), result });
+						return;
+					}
+					if (frame.query === "skill.list/state" && options.deferSkillDiscovery && !skillDiscoveryBlocked) {
+						skillDiscoveryBlocked = true;
+						blockedSkillDiscovery = { socket, id: String(frame.id), result };
+						skillDiscoveryEntered.resolve();
 						return;
 					}
 					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, result }));
@@ -648,15 +662,19 @@ async function createFixture(
 		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");
-	await waitFor(
-		() =>
-			updates.some(
-				update =>
-					update.update.sessionUpdate === "session_info_update" &&
-					(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
-			),
-		"bootstrap update",
-	);
+	if (options.deferSkillDiscovery) {
+		await bounded(skillDiscoveryEntered.promise, "deferred skill discovery");
+	} else {
+		await waitFor(
+			() =>
+				updates.some(
+					update =>
+						update.update.sessionUpdate === "session_info_update" &&
+						(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+				),
+			"bootstrap update",
+		);
+	}
 	blockNextIdleUpdate = options.blockIdleUpdate === true;
 	blockAdvisoryQuery = true;
 	let reboundGeneration = authority.endpointGeneration;
@@ -697,6 +715,15 @@ async function createFixture(
 		sendAssistantMessage,
 		sendIdle,
 		queryCalls,
+		skillDiscoveryEntered: skillDiscoveryEntered.promise,
+		releaseSkillDiscovery: () => {
+			const blocked = blockedSkillDiscovery;
+			blockedSkillDiscovery = undefined;
+			if (blocked)
+				blocked.socket.send(
+					JSON.stringify({ type: "query_response", id: blocked.id, ok: true, result: blocked.result }),
+				);
+		},
 		mutationInputs,
 		recoveryInputs,
 		releaseRecoveryResult: result => {
@@ -742,6 +769,12 @@ async function createFixture(
 			);
 		},
 		dispose: () => {
+			const blocked = blockedSkillDiscovery;
+			blockedSkillDiscovery = undefined;
+			if (blocked)
+				blocked.socket.send(
+					JSON.stringify({ type: "query_response", id: blocked.id, ok: true, result: blocked.result }),
+				);
 			agentMessageUpdateRelease.resolve();
 			failureDiagnosticRelease.resolve();
 			abort.abort();
@@ -758,6 +791,31 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
 		prompt: [{ type: "text", text }],
 	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
 }
+
+test("ACP inline skill discovery reserves prompt ownership and honors cancellation (review P1)", async () => {
+	const fixture = await createFixture({ deferSkillDiscovery: true });
+	try {
+		await bounded(fixture.skillDiscoveryEntered, "skill discovery query");
+		const pending = prompt(fixture, "Review the proposal /skill:fixture-skill alternatives");
+		const competing = prompt(fixture, "competing prompt");
+		await expect(bounded(competing, "competing prompt rejection")).rejects.toMatchObject({ code: "conflict" });
+
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel pending skill discovery");
+		expect(await bounded(pending, "cancelled inline skill discovery")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(0);
+
+		fixture.releaseSkillDiscovery();
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "available_commands_update"),
+			"completed skill discovery publication",
+		);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.queryCalls.filter(query => query === "skill.list/state")).toHaveLength(1);
+	} finally {
+		fixture.releaseSkillDiscovery();
+		fixture.dispose();
+	}
+});
 
 async function promptWhenDelivered(
 	fixture: Fixture,

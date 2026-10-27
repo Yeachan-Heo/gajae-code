@@ -287,6 +287,8 @@ type SessionRecord = {
 	busy: boolean;
 	/** Cached names from the last published skill list; prompt dispatch must not await discovery before claiming ownership. */
 	inlineSkillCommands?: Map<string, { name: string }>;
+	inlineSkillState?: unknown;
+	inlineSkillDiscovery?: Promise<{ skills: unknown; commands: Map<string, { name: string }> }>;
 	/** Last SDK activity state; ACP prompt settlement can precede the SDK's idle publication. */
 	sdkIdle: boolean;
 	backgroundBusy: boolean;
@@ -2415,6 +2417,12 @@ export class AcpAgent implements Agent {
 	): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
+		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
+		const needsInlineSkillDiscovery =
+			record.inlineSkillCommands === undefined &&
+			textBlock !== undefined &&
+			!textBlock.text.trimStart().startsWith("/") &&
+			/(^|\s)\/skill:[^\s]+/i.test(textBlock.text);
 		let admissionReservation: PromptAdmissionReservation | undefined;
 		if (record.pendingPromptAdmission)
 			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
@@ -2429,17 +2437,44 @@ export class AcpAgent implements Agent {
 			const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
 			admissionReservation = { wake, woken };
 			record.pendingPromptAdmission = admissionReservation;
+		} else if (needsInlineSkillDiscovery) {
+			const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
+			admissionReservation = { localCommand: true, wake, woken };
+			record.pendingPromptAdmission = admissionReservation;
 		}
 		try {
 			if (admissionReservation) {
-				const settled = await this.#waitForPromptSettlement(activePrompt as PromptWaiter, admissionReservation);
-				const settlement = admissionReservation.settlement;
+				if (activePrompt) {
+					const settled = await this.#waitForPromptSettlement(activePrompt, admissionReservation);
+					const settlement = admissionReservation.settlement;
+					if (settlement?.kind === "rejected") throw settlement.error;
+					if (settlement?.kind === "cancelled" || admissionReservation.cancelled)
+						return { stopReason: "cancelled" };
+					if (!settled) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+					await this.#drainPromptPublicationTails(params.sessionId);
+					if (admissionReservation.settlement?.kind === "rejected") throw admissionReservation.settlement.error;
+					if (admissionReservation.settlement?.kind === "cancelled" || admissionReservation.cancelled)
+						return { stopReason: "cancelled" };
+				}
+			}
+			if (needsInlineSkillDiscovery && record.inlineSkillCommands === undefined) {
+				const discoveryReservation = admissionReservation;
+				if (!discoveryReservation) throw new Error("Inline skill discovery requires prompt admission ownership.");
+				// Discovery runs before a host turn exists, even when this prompt first waited
+				// for a cancelled predecessor to settle.
+				discoveryReservation.localCommand = true;
+				const discovery = this.#discoverInlineSkillCommands(params.sessionId, record, record.adapter);
+				void discovery.catch(() => undefined);
+				const result = await Promise.race([
+					discovery.then(
+						value => ({ value }),
+						() => ({ unavailable: true as const }),
+					),
+					discoveryReservation.woken.then(() => ({ cancelled: true as const })),
+				]);
+				const settlement = discoveryReservation.settlement;
 				if (settlement?.kind === "rejected") throw settlement.error;
-				if (settlement?.kind === "cancelled" || admissionReservation.cancelled) return { stopReason: "cancelled" };
-				if (!settled) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-				await this.#drainPromptPublicationTails(params.sessionId);
-				if (admissionReservation.settlement?.kind === "rejected") throw admissionReservation.settlement.error;
-				if (admissionReservation.settlement?.kind === "cancelled" || admissionReservation.cancelled)
+				if (settlement?.kind === "cancelled" || discoveryReservation.cancelled || "cancelled" in result)
 					return { stopReason: "cancelled" };
 			}
 			return await this.#submitPromptCore(params, echoUserMessage, retryReservation, admissionReservation);
@@ -5636,15 +5671,46 @@ export class AcpAgent implements Agent {
 		return acpSessionStateFromConfig(config, modelCatalog, modelPreset, activeProviders);
 	}
 
+	#discoverInlineSkillCommands(
+		id: string,
+		record: SessionRecord,
+		adapter: AcpSdkAdapter,
+	): Promise<{ skills: unknown; commands: Map<string, { name: string }> }> {
+		if (record.inlineSkillCommands) {
+			return Promise.resolve({ skills: record.inlineSkillState, commands: record.inlineSkillCommands });
+		}
+		if (record.inlineSkillDiscovery) return record.inlineSkillDiscovery;
+		const discovery = adapter.query("skill.list/state").then(skills => ({
+			skills,
+			commands: acpSkillCommandMap(skills),
+		}));
+		record.inlineSkillDiscovery = discovery;
+		void discovery.then(
+			result => {
+				if (this.#sessions.get(id) === record && record.adapter === adapter) {
+					record.inlineSkillState = result.skills;
+					record.inlineSkillCommands = result.commands;
+				}
+				if (record.inlineSkillDiscovery === discovery) record.inlineSkillDiscovery = undefined;
+			},
+			() => {
+				if (record.inlineSkillDiscovery === discovery) record.inlineSkillDiscovery = undefined;
+			},
+		);
+		return discovery;
+	}
+
 	async #publishAvailableCommands(id: string, adapter: AcpSdkAdapter): Promise<void> {
 		let skills: unknown;
+		const record = this.#sessions.get(id);
 		try {
-			skills = await adapter.query("skill.list/state");
+			skills =
+				record?.adapter === adapter
+					? (await this.#discoverInlineSkillCommands(id, record, adapter)).skills
+					: await adapter.query("skill.list/state");
 		} catch {
 			// Builtins remain useful when an older SDK host cannot expose skill state.
 		}
-		const record = this.#sessions.get(id);
-		if (record?.adapter === adapter) record.inlineSkillCommands = acpSkillCommandMap(skills);
 		await this.#publishSessionUpdate(
 			id,
 			{
