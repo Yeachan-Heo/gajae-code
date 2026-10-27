@@ -178,11 +178,41 @@ describe("AskTool execution integrity", () => {
 		).rejects.toBeInstanceOf(ToolAbortError);
 		expect(gateEmitter.listPendingGates()).toEqual([]);
 
-		const dispose = gateEmitter.onGateEmitted(() => {});
-		expect(tool.description).toContain("An interactive or remote answer channel is available");
-		dispose();
+		const disposeObserver = gateEmitter.onGateEmitted(() => {});
 		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		const disposeResponder = gateEmitter.registerRemoteGateAnswerChannel();
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+		disposeResponder();
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		disposeObserver();
 		gateEmitter.fence();
+	});
+
+	it("rechecks a workflow-gate answer channel immediately before opening the gate", async () => {
+		const hasAnswerChannel = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValueOnce(false);
+		const emitGate = vi.fn(async () => ({ selected: ["Yes"] }));
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => ({
+					supportsRemoteGateAnswers: () => true,
+					hasRemoteGateAnswerChannel: hasAnswerChannel,
+					emitGate,
+				}),
+			}),
+		);
+
+		await expect(
+			tool.execute(
+				"channel-disappeared",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("active workflow-gate answer channel");
+		expect(hasAnswerChannel).toHaveBeenCalledTimes(3);
+		expect(emitGate).not.toHaveBeenCalled();
 	});
 
 	it("rejects empty ordinary bodies before local or remote UI side effects", async () => {
@@ -3290,6 +3320,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		record.mockClear();
 		const emitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Execute with ultragoal"] })),
 		};
 		const remote = await new AskTool(
@@ -3737,6 +3768,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Timeline"] })),
 		};
 		await new AskTool(
@@ -3765,6 +3797,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 		const defaultGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		await new AskTool(
@@ -3790,6 +3823,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 		const ralplanGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			onGateEmitted: (onGate: (gate: WorkflowGate) => void) => {
 				listener = onGate;
 				return stopObservation;
@@ -3878,6 +3912,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("omits single-option recommendations from workflow gates", async () => {
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Keep current"] })),
 		};
 
@@ -3921,6 +3956,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		// selector instead of stranding on emitGate() waiting for a remote responder.
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["no"] })),
 		};
 		const select = vi.fn(async () => "yes");
@@ -3958,6 +3994,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		const tool = new AskTool(
@@ -3985,7 +4022,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("bounds the complete legacy and multi-question ask payload before any gate emission", async () => {
-		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn(async () => ({ selected: ["A"] })) };
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["A"] })),
+		};
 		const tool = new AskTool(
 			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
 		);
@@ -4013,6 +4054,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("forwards bounded inert adapter context through the canonical gate", async () => {
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Continue"] })),
 		};
 		const adapterContext = {
@@ -4467,6 +4509,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Looks right"] })),
 		};
 		const tool = new AskTool(

@@ -467,7 +467,7 @@ export async function autoresearchWrite(input: {
 		assumptions: dedupeStrings(input.assumptions ?? []),
 		slug,
 		intake: "cold",
-		createdAt: existing?.createdAt ?? now,
+		createdAt: existing?.slug === slug ? existing.createdAt : now,
 		updatedAt: now,
 		...metric,
 	};
@@ -536,8 +536,9 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 function belongsToAutoresearchMission(event: AutoresearchLedgerEvent, mission: AutoresearchMission): boolean {
 	if (typeof event.slug === "string" && event.slug !== mission.slug) return false;
 	const eventTime = Date.parse(event.timestamp);
-	const missionUpdatedAt = Date.parse(mission.updatedAt);
-	return Number.isFinite(eventTime) && Number.isFinite(missionUpdatedAt) && eventTime >= missionUpdatedAt;
+	// Rewrites advance updatedAt; createdAt remains the identity boundary for this mission.
+	const missionCreatedAt = Date.parse(mission.createdAt);
+	return Number.isFinite(eventTime) && Number.isFinite(missionCreatedAt) && eventTime >= missionCreatedAt;
 }
 
 /** Retire a conclusive mission's full working set after its canonical skill handoff was dispatched. */
@@ -556,7 +557,11 @@ export async function autoresearchRetireConclusiveMissionAfterHandoff(
 		);
 	const verdictReceipt = latestVerdict?.verdictReceipt as AutoresearchVerdictReceipt | undefined;
 	if (verdictReceipt?.status.disposition !== "conclusive") return undefined;
-	return await autoresearchClear(cwd, state.sessionId);
+	const retirement = await autoresearchClear(cwd, state.sessionId);
+	if (!retirement.cleared) {
+		throw new AutoresearchCommandError(1, "conclusive autoresearch mission was not retired after handoff");
+	}
+	return retirement;
 }
 
 /**
@@ -748,7 +753,7 @@ export async function autoresearchIntake(input: {
 		assumptions: dedupeStrings([...parsed.assumptions, ...(input.assumptions ?? [])]),
 		slug: parsed.slug,
 		intake: "handoff",
-		createdAt: existing?.createdAt ?? now,
+		createdAt: existing?.slug === parsed.slug ? existing.createdAt : now,
 		updatedAt: now,
 		specPath: resolvedSpecPath,
 		handedOffAt: now,

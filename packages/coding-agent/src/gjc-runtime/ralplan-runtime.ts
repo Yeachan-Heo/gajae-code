@@ -16,6 +16,7 @@ import {
 	type RalplanIndexRow,
 	summarizeRalplanIndex,
 } from "./ledger-event-renderer";
+import { parseRalplanExecutionBoundary, type RalplanExecutionBoundary } from "./ralplan-execution-boundary";
 import {
 	type IndexedReviewArtifact,
 	parseReviewConflictDocument,
@@ -112,6 +113,7 @@ export interface RalplanAutoHandoffResolution {
 	effectiveTarget: RalplanAutoHandoffTarget;
 	degradationReason: string | null;
 	source: string;
+	executionBoundary?: RalplanExecutionBoundary;
 }
 
 const RALPLAN_AUTO_HANDOFF_TARGETS = new Set<RalplanAutoHandoffTarget>(["off", "ultragoal", "autoresearch"]);
@@ -519,6 +521,8 @@ function parseRalplanAutoHandoffTarget(value: unknown): RalplanAutoHandoffTarget
 
 type RalplanAutoHandoffOptions = {
 	planningStuck?: boolean;
+	/** Run-bound restriction overrides configured automatic admission. */
+	executionBoundary?: RalplanExecutionBoundary;
 	/** The session's effective agent directory (see resolveWorkflowSetting). */
 	agentDir?: string;
 };
@@ -550,7 +554,22 @@ function resolveRalplanAutoHandoffTarget(
 	options: RalplanAutoHandoffOptions,
 ): RalplanAutoHandoffResolution {
 	if (options.planningStuck) {
-		return { configuredTarget, effectiveTarget: "off", degradationReason: "planning_stuck", source };
+		return {
+			configuredTarget,
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+			source,
+			...(options.executionBoundary ? { executionBoundary: options.executionBoundary } : {}),
+		};
+	}
+	if (options.executionBoundary) {
+		return {
+			configuredTarget,
+			effectiveTarget: "off",
+			degradationReason: "execution_boundary",
+			source,
+			executionBoundary: options.executionBoundary,
+		};
 	}
 	return { configuredTarget, effectiveTarget: configuredTarget, degradationReason: null, source };
 }
@@ -706,6 +725,7 @@ const VALUE_FLAGS = new Set([
 	"--fallback-receipt-path",
 	"--lane-verdict",
 	"--worktree-root",
+	"--execution-boundary",
 ]);
 
 export function isRalplanArtifactWriteInvocation(args: readonly string[]): boolean {
@@ -951,6 +971,32 @@ async function readActiveRunId(cwd: string, sessionId: string): Promise<string |
 	return candidate;
 }
 
+async function readRalplanExecutionBoundary(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+): Promise<RalplanExecutionBoundary | undefined> {
+	const stateRead = await readExistingStateForMutation(ralplanStatePath(cwd, sessionId));
+	if (stateRead.kind === "corrupt") {
+		throw new RalplanCommandError(
+			2,
+			`existing ralplan state is corrupt or tampered (${stateRead.error}); refusing to resolve its execution boundary`,
+		);
+	}
+	if (stateRead.kind === "absent") return undefined;
+	const rawBoundary = stateRead.value.execution_boundary;
+	if (rawBoundary === undefined) return undefined;
+	const boundary = parseRalplanExecutionBoundary(rawBoundary);
+	if (!boundary) throw new RalplanCommandError(2, "ralplan run state has an invalid execution boundary");
+	if (stateRead.value.run_id !== runId) {
+		throw new RalplanCommandError(
+			2,
+			`ralplan execution boundary is bound to run ${String(stateRead.value.run_id)} and cannot be reused by ${runId}`,
+		);
+	}
+	return boundary;
+}
+
 /**
  * Read the authoritative repository binding from ralplan run state and fail closed
  * when the active cwd no longer matches (handoff / QA / stage write) (#2901).
@@ -1054,6 +1100,12 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 			// previous run's terminal/locked phase (which would start the new run already
 			// "complete"/"handoff" and disarm the Stop hook). PHASE_LOCK only guards same-run writes.
 			const isNewRun = existing.run_id !== runId;
+			if (isNewRun && existing.execution_boundary !== undefined) {
+				throw new RalplanCommandError(
+					2,
+					`ralplan execution boundary is bound to run ${String(existing.run_id)} and cannot be changed by a stage writer`,
+				);
+			}
 			const nextPhase = isNewRun ? stage : advanceCurrentPhase(existing.current_phase, stage);
 			if (isNewRun) {
 				// State writes shallow-merge, so clear both HUD verdict sources at the run boundary.
@@ -1975,11 +2027,16 @@ interface ExistingStageArtifact {
 function parseRalplanFinalAdmission(value: unknown): RalplanAutoHandoffResolution | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const admission = value as Record<string, unknown>;
+	const executionBoundary =
+		admission.executionBoundary === undefined
+			? undefined
+			: parseRalplanExecutionBoundary(admission.executionBoundary);
 	if (
 		!RALPLAN_AUTO_HANDOFF_TARGETS.has(admission.configuredTarget as RalplanAutoHandoffTarget) ||
 		!RALPLAN_AUTO_HANDOFF_TARGETS.has(admission.effectiveTarget as RalplanAutoHandoffTarget) ||
 		(typeof admission.degradationReason !== "string" && admission.degradationReason !== null) ||
-		typeof admission.source !== "string"
+		typeof admission.source !== "string" ||
+		(admission.executionBoundary !== undefined && executionBoundary === undefined)
 	) {
 		return undefined;
 	}
@@ -1988,6 +2045,7 @@ function parseRalplanFinalAdmission(value: unknown): RalplanAutoHandoffResolutio
 		effectiveTarget: admission.effectiveTarget as RalplanAutoHandoffTarget,
 		degradationReason: typeof admission.degradationReason === "string" ? admission.degradationReason : null,
 		source: admission.source,
+		...(executionBoundary ? { executionBoundary } : {}),
 	};
 }
 
@@ -2660,6 +2718,7 @@ async function handleArtifactWrite(
 		autoHandoff = await resolveRalplanAutoHandoff(persistCwd, {
 			agentDir,
 			planningStuck: await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId),
+			executionBoundary: await readRalplanExecutionBoundary(persistCwd, resolved.sessionId, resolved.runId),
 		});
 		finalPublication = { id: randomUUID(), sha256 };
 		await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, finalPublication);
@@ -2787,6 +2846,7 @@ async function buildDeduplicatedResult(
 interface ConsensusHandoffArgs {
 	interactive: boolean;
 	deliberate: boolean;
+	executionBoundary?: RalplanExecutionBoundary;
 	architectKind?: string;
 	criticKind?: string;
 	sessionId: string;
@@ -2819,6 +2879,14 @@ function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHa
 	if (hasFlag(args, "--lane-verdict")) {
 		throw new RalplanCommandError(2, "--lane-verdict is only supported with gjc ralplan --write.");
 	}
+	const rawExecutionBoundary = flagValue(args, "--execution-boundary")?.trim();
+	if (hasFlag(args, "--execution-boundary") && !rawExecutionBoundary) {
+		throw new RalplanCommandError(2, "--execution-boundary requires plan-only or approval-required.");
+	}
+	const executionBoundary = parseRalplanExecutionBoundary(rawExecutionBoundary);
+	if (rawExecutionBoundary && !executionBoundary) {
+		throw new RalplanCommandError(2, "--execution-boundary must be plan-only or approval-required.");
+	}
 	const architectKind = flagValue(args, "--architect")?.trim() || undefined;
 	if (architectKind && !KNOWN_ARCHITECT_KINDS.has(architectKind)) {
 		throw new RalplanCommandError(
@@ -2843,6 +2911,7 @@ function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHa
 	return {
 		interactive: hasFlag(args, "--interactive"),
 		deliberate: hasFlag(args, "--deliberate"),
+		...(executionBoundary ? { executionBoundary } : {}),
 		architectKind,
 		criticKind,
 		sessionId,
@@ -2870,6 +2939,20 @@ async function seedRalplanState(
 				existingStateRead.kind === "valid" && typeof existingStateRead.value.run_id === "string"
 					? existingStateRead.value.run_id.trim() || undefined
 					: undefined;
+			const rawExistingBoundary =
+				existingStateRead.kind === "valid" ? existingStateRead.value.execution_boundary : undefined;
+			const existingBoundary =
+				rawExistingBoundary === undefined ? undefined : parseRalplanExecutionBoundary(rawExistingBoundary);
+			if (rawExistingBoundary !== undefined && !existingBoundary) {
+				throw new RalplanCommandError(2, "existing ralplan state has an invalid execution boundary");
+			}
+			if (existingBoundary === "plan-only" && resolved.executionBoundary === "approval-required") {
+				throw new RalplanCommandError(2, "ralplan plan-only execution boundary cannot be relaxed");
+			}
+			const executionBoundary =
+				existingBoundary === "plan-only" || resolved.executionBoundary === "plan-only"
+					? "plan-only"
+					: (existingBoundary ?? resolved.executionBoundary);
 			const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
 			assertSafePathComponent(runId, "run-id");
 			const now = new Date().toISOString();
@@ -2888,6 +2971,7 @@ async function seedRalplanState(
 				updated_at: now,
 				repository_binding: repositoryBinding,
 			};
+			if (executionBoundary) payload.execution_boundary = executionBoundary;
 			if (existingStateRead.kind === "valid" && existingStateRead.value.active === true) {
 				for (const field of ["handoff_from", "handoff_at"] as const) {
 					if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
@@ -2950,6 +3034,7 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 		run_id: runId,
 		handoff: "/skill:ralplan",
 		repository_binding: repositoryBinding,
+		...(resolved.executionBoundary ? { execution_boundary: resolved.executionBoundary } : {}),
 	};
 	const stdout = resolved.json
 		? renderCliWriteReceipt({ ok: true, ...summary })
@@ -2976,7 +3061,12 @@ export async function runNativeRalplanCommand(
 ): Promise<RalplanCommandResult> {
 	try {
 		if (isRalplanDoctorInvocation(args)) return await handleDoctor(args, cwd);
-		if (isRalplanArtifactWriteInvocation(args)) return await handleArtifactWrite(args, cwd, options.agentDir);
+		if (isRalplanArtifactWriteInvocation(args)) {
+			if (hasFlag(args, "--execution-boundary")) {
+				throw new RalplanCommandError(2, "--execution-boundary is only supported when seeding a Ralplan run.");
+			}
+			return await handleArtifactWrite(args, cwd, options.agentDir);
+		}
 		return await handleConsensusHandoff(args, cwd);
 	} catch (error) {
 		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };

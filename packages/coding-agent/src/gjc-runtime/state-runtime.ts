@@ -46,6 +46,7 @@ import {
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
+import { parseRalplanExecutionBoundary } from "./ralplan-execution-boundary";
 import {
 	activeSnapshotPath,
 	auditPath,
@@ -1595,6 +1596,9 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				merged.run_id !== existingPayload.run_id
 			)
 				throw new StateCommandError(2, "Ralplan run identity cannot change through generic state write");
+			if (mode === "ralplan" && merged.execution_boundary !== existingPayload.execution_boundary) {
+				throw new StateCommandError(2, "Ralplan execution boundary cannot change through generic state write");
+			}
 			if (mode === "deep-interview") {
 				assertDeepInterviewEvidenceUnchanged(existingPayload, merged, "generic state write");
 			}
@@ -3700,11 +3704,16 @@ async function verifiedRalplanFinalEvidence(
 	}
 	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
 	if (!admission) return undefined;
+	const rawExecutionBoundary = state.execution_boundary;
+	const executionBoundary =
+		rawExecutionBoundary === undefined ? undefined : parseRalplanExecutionBoundary(rawExecutionBoundary);
+	if (rawExecutionBoundary !== undefined && executionBoundary === undefined) return undefined;
 	if (
 		typeof admission.effectiveTarget !== "string" ||
 		admission.degradationReason === "planning_stuck" ||
 		typeof admission.source !== "string" ||
-		!admission.source.trim()
+		!admission.source.trim() ||
+		admission.executionBoundary !== executionBoundary
 	)
 		return undefined;
 	const ralplanPath = modeStateFile(cwd, "ralplan", sessionId);
@@ -3765,6 +3774,7 @@ async function verifiedRalplanFinalEvidence(
 		indexedAdmission.effectiveTarget !== admission.effectiveTarget ||
 		indexedAdmission.degradationReason !== admission.degradationReason ||
 		indexedAdmission.source !== admission.source ||
+		indexedAdmission.executionBoundary !== admission.executionBoundary ||
 		typeof finalRow.path !== "string" ||
 		typeof finalRow.sha256 !== "string" ||
 		!/^[0-9a-f]{64}$/.test(finalRow.sha256)
@@ -3801,6 +3811,7 @@ async function hasSanctionedRalplanFinalAdmission(
 	return (
 		admission?.effectiveTarget === "ultragoal" &&
 		admission.degradationReason === null &&
+		admission.executionBoundary === undefined &&
 		(await verifiedRalplanFinalEvidence(cwd, sessionId, state)) !== undefined
 	);
 }
@@ -3824,6 +3835,9 @@ async function assertRalplanApprovalRecordCurrent(
 		if (read.kind !== "valid")
 			throw new StateCommandError(2, "Ralplan execution approval final state is unavailable");
 		ralplanState = migrateWorkflowState(read.value, "ralplan").state;
+	}
+	if (ralplanState.execution_boundary === "plan-only") {
+		throw new StateCommandError(2, "Ralplan plan-only execution boundary forbids execution approval");
 	}
 	const evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanState);
 	if (!evidence) throw new StateCommandError(2, "Ralplan execution approval final evidence is unavailable");
@@ -4269,6 +4283,13 @@ async function handleHandoffUnlocked(
 	}
 	if (caller === "ralplan" && (await hasDurableRalplanPlanningStuck(cwd, sessionId, existingCaller)))
 		throw new StateCommandError(2, "planning-stuck Ralplan is terminal and cannot hand off");
+	if (caller === "ralplan" && existingCaller.execution_boundary !== undefined) {
+		const executionBoundary = parseRalplanExecutionBoundary(existingCaller.execution_boundary);
+		if (!executionBoundary) throw new StateCommandError(2, "Ralplan execution boundary is invalid");
+		if (executionBoundary === "plan-only") {
+			throw new StateCommandError(2, "Ralplan plan-only execution boundary forbids all workflow handoffs");
+		}
+	}
 	let ralplanExecutionFinal: VerifiedRalplanFinalEvidence | undefined;
 	if (caller === "ralplan" && callee === "ultragoal") {
 		ralplanExecutionFinal = await verifiedRalplanFinalEvidence(cwd, sessionId, existingCaller);

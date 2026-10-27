@@ -102,7 +102,7 @@ export function askAnswerChannelAvailable(session: AskDescriptionSession): boole
 	const hasInteractiveUi = toolContext ? toolContext.hasUI === true && Boolean(toolContext.ui) : session.hasUI;
 	if (hasInteractiveUi || session.getAskAnswerSource?.()) return true;
 	const gateEmitter = session.getWorkflowGateEmitter?.();
-	return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() !== false;
+	return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() === true;
 }
 
 export function askToolDescriptionForSession(session: AskDescriptionSession): string {

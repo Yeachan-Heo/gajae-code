@@ -1,7 +1,7 @@
 ---
 name: ralplan
 description: Consensus planning entrypoint that auto-gates vague ultragoal requests before execution
-argument-hint: "[--interactive] [--deliberate] [--architect openai-code] [--critic openai-code] <task description>"
+argument-hint: "[--interactive] [--deliberate] [--execution-boundary plan-only|approval-required] [--architect openai-code] [--critic openai-code] <task description>"
 level: 4
 
 source: "forked from upstream ralplan skill and rebranded for GJC"
@@ -21,6 +21,7 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 - `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` without `degradationReason: "planning_stuck"`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8.
 - `--deliberate`: Forces high-risk deliberation: pre-mortem plus expanded test planning. It may also auto-enable for explicit auth/security, migration, destructive, incident, compliance/PII, or public-API-breakage risk.
+- `--execution-boundary plan-only|approval-required`: Run-bound restriction passed by an autoresearch handoff. Preserve it in the initial `gjc ralplan` seed command and verify the seed receipt; never pass it to `--write` calls. `plan-only` forbids execution approval and all workflow handoffs after the final plan. `approval-required` forces `auto_handoff.effectiveTarget` to `off` and requires explicit approval of the current final artifact, even when project configuration enables automatic handoff.
 - `--architect openai-code` / `--critic openai-code`: Use OpenAI code for that review pass when available; otherwise note the fallback and use default GJC review.
 - `gjc.ralplan.autoHandoff`: Selects final-plan admission: `off` (default), `ultragoal`, or `autoresearch`. An `autoresearch` target admits `/skill:autoresearch` to continue research from the approved plan rather than implement it; it needs no availability probe. `PLANNING-STUCK` also resolves every target to `off`. Invalid settings reject the final write before any final artifact is persisted. The final receipt's ledger-backed runtime-owned `auto_handoff.effectiveTarget` is authoritative across state loss and run switching.
 - `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native writer for Planner/Architect/Critic/revision/ADR/final pending-approval markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`; do not edit `.gjc/` directly.
@@ -36,6 +37,8 @@ For corrupt, tampered, unreadable, or stale current-session ralplan state, run `
 Ralplan is planning only. It may inspect context and draft plan/spec/proposal artifacts, but those remain `pending approval` until tagged structured-UI execution approval for the current final artifact, or a valid non-off final receipt's runtime-owned `auto_handoff.effectiveTarget` admits the existing handoff chain. Before either admission, do not mutate product source, run mutation-oriented shell, commit, push, open PRs, invoke execution skills, or delegate implementation.
 
 Explicitly naming `ultragoal` (including `/skill:` and `gjc` forms) selects the desired execution target; it does not replace structured approval for the current final artifact when `auto_handoff.effectiveTarget` is `off`. Never invent a direct approval record or infer execution consent from the skill name.
+
+An incoming `--execution-boundary` is persisted on the seeded run and authenticated into its final admission receipt. If a seed receipt reports `execution_boundary: "plan-only"`, leave the final plan pending approval and stop without asking for execution approval or handing off. If it reports `"approval-required"`, treat the final as `auto_handoff.effectiveTarget: "off"` and require the explicit Ralplan approval gate; never let `gjc.ralplan.autoHandoff` relax that restriction.
 
 Persist planning artifacts and handoffs through the ralplan CLI writer, never direct `.gjc/` edits:
 Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden unless an explicit force override is active.
@@ -56,6 +59,8 @@ The ralplan seed/write receipt's `session_id` is the immutable workflow owner se
 The seed/write receipt's `repository_binding.worktreeRoot` is the canonical artifact root for the run. Whenever a writer's cwd can differ from that root — a dispatcher directory, a linked branch worktree, or a role subagent runtime cwd — propagate the seed receipt's `repository_binding.worktreeRoot` as `--worktree-root <repository_binding.worktreeRoot>` on every `gjc ralplan` seed/write (Planner, Architect, Critic, revision, disposition, post-interview, ADR, and final). Explicit-target mode routes all run state, stage artifacts, `index.jsonl`, HUD state, stuck markers, and review-budget accounting to that exact worktree regardless of the writer's cwd; it fails before any write when the target is missing, not a directory, not a git worktree root, when no seeded run state exists there, or when the target is not exactly the run's bound `worktreeRoot` (a linked worktree that merely shares `commonDir` is rejected). A relative `--artifact` file is still resolved from the invoking cwd. Without `--worktree-root`, legacy cwd-based behavior is unchanged. Never scan the filesystem for runs or merge artifact trees by hand.
 
 This skill runs GJC planning in consensus mode for the provided arguments.
+
+For an autoresearch handoff carrying `--execution-boundary`, seed or verify the run before launching Planner: invoke `gjc ralplan --execution-boundary <plan-only|approval-required> --json "<task description>"` and retain its `run_id`, `session_id`, `repository_binding`, and `execution_boundary` receipt fields. Every later `--write` uses that exact run; a missing or mismatched boundary is a stop condition, never a reason to seed unrestricted.
 
 The consensus workflow:
 1. **Planner** creates the initial plan and a compact **RALPLAN-DR summary** before review. Launch the Planner ONCE per run as a detached, resumable subagent (await it before the Architect) and record its returned subagent id as the run's persisted Planner id; persist the stage with `gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage planner --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT --planner-id <id> --planner-resumable <true|false>` (see **Persisted role agents** below):

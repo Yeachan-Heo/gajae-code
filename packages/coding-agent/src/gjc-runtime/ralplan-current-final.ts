@@ -22,7 +22,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
-import { resolveRalplanAutoHandoff } from "./ralplan-runtime";
+import { parseRalplanExecutionBoundary, type RalplanExecutionBoundary } from "./ralplan-execution-boundary";
+import { type RalplanAutoHandoffResolution, resolveRalplanAutoHandoff } from "./ralplan-runtime";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
 
 /** Stages that open a consensus iteration; a final is only valid after one. */
@@ -36,6 +37,7 @@ export interface RalplanIndexRow {
 	stageN: number;
 	path: string;
 	sha256: string;
+	autoHandoff?: unknown;
 }
 
 export interface RalplanCurrentFinalDescriptor {
@@ -57,6 +59,8 @@ export type RalplanCurrentFinalRefusalCode =
 	| "missing_state"
 	| "run_not_final"
 	| "auto_handoff_enabled"
+	| "execution_boundary_plan_only"
+	| "execution_boundary_mismatch"
 	| "missing_index"
 	| "malformed_index"
 	| "no_iteration_opener"
@@ -123,10 +127,24 @@ function parseIndexRow(line: string): RalplanIndexRow | undefined {
 	if (typeof stageN !== "number" || !Number.isInteger(stageN) || stageN <= 0) return undefined;
 	if (typeof artifactPath !== "string" || !artifactPath.trim()) return undefined;
 	if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(sha256)) return undefined;
-	return { stage: stage.trim(), stageN, path: artifactPath.trim(), sha256: sha256.toLowerCase() };
+	return {
+		stage: stage.trim(),
+		stageN,
+		path: artifactPath.trim(),
+		sha256: sha256.toLowerCase(),
+		...(record.auto_handoff === undefined ? {} : { autoHandoff: record.auto_handoff }),
+	};
 }
 
-async function readRunState(statePath: string): Promise<{ runId: string; phase: string } | RalplanCurrentFinalRefusal> {
+async function readRunState(statePath: string): Promise<
+	| {
+			runId: string;
+			phase: string;
+			executionBoundary?: RalplanExecutionBoundary;
+			autoHandoff?: unknown;
+	  }
+	| RalplanCurrentFinalRefusal
+> {
 	let text: string;
 	try {
 		text = await fs.readFile(statePath, "utf-8");
@@ -147,7 +165,48 @@ async function readRunState(statePath: string): Promise<{ runId: string; phase: 
 	const runId = typeof record.run_id === "string" ? record.run_id.trim() : "";
 	const phase = typeof record.current_phase === "string" ? record.current_phase.trim().toLowerCase() : "";
 	if (!runId) return refusal("malformed_index", `ralplan run state at ${statePath} has no run_id`);
-	return { runId, phase };
+	const rawBoundary = record.execution_boundary;
+	const executionBoundary = rawBoundary === undefined ? undefined : parseRalplanExecutionBoundary(rawBoundary);
+	if (rawBoundary !== undefined && executionBoundary === undefined) {
+		return refusal(
+			"execution_boundary_mismatch",
+			`ralplan run state at ${statePath} has an invalid execution boundary`,
+		);
+	}
+	return {
+		runId,
+		phase,
+		...(executionBoundary ? { executionBoundary } : {}),
+		...(record.auto_handoff === undefined ? {} : { autoHandoff: record.auto_handoff }),
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isBoundaryAdmission(
+	value: unknown,
+	boundary: RalplanExecutionBoundary,
+): value is RalplanAutoHandoffResolution {
+	if (!isRecord(value)) return false;
+	return (
+		["off", "ultragoal", "autoresearch"].includes(String(value.configuredTarget)) &&
+		value.effectiveTarget === "off" &&
+		value.degradationReason === "execution_boundary" &&
+		typeof value.source === "string" &&
+		value.executionBoundary === boundary
+	);
+}
+
+function sameAdmission(left: RalplanAutoHandoffResolution, right: RalplanAutoHandoffResolution): boolean {
+	return (
+		left.configuredTarget === right.configuredTarget &&
+		left.effectiveTarget === right.effectiveTarget &&
+		left.degradationReason === right.degradationReason &&
+		left.source === right.source &&
+		left.executionBoundary === right.executionBoundary
+	);
 }
 
 /**
@@ -170,15 +229,12 @@ export async function resolveRalplanCurrentFinal(
 			refusal: refusal("run_not_final", `ralplan run ${state.runId} is in phase "${state.phase}", not final`),
 		};
 	}
-
-	// A final that would hand off automatically is not waiting for approval.
-	const autoHandoff = await resolveRalplanAutoHandoff(input.cwd, { agentDir: input.agentDir });
-	if (autoHandoff.effectiveTarget !== "off") {
+	if (state.executionBoundary === "plan-only") {
 		return {
 			ok: false,
 			refusal: refusal(
-				"auto_handoff_enabled",
-				`ralplan autoHandoff is "${autoHandoff.effectiveTarget}"; a current final is only approvable while handoff is off`,
+				"execution_boundary_plan_only",
+				"this Ralplan run is restricted to planning and cannot receive execution approval",
 			),
 		};
 	}
@@ -211,6 +267,47 @@ export async function resolveRalplanCurrentFinal(
 			ok: false,
 			refusal: refusal("final_not_last", `the newest ralplan stage is "${finalRow.stage}", not "final"`),
 		};
+	}
+	const autoHandoff = await resolveRalplanAutoHandoff(input.cwd, {
+		agentDir: input.agentDir,
+		executionBoundary: state.executionBoundary,
+	});
+	if (state.executionBoundary === "approval-required") {
+		const stateAdmission = state.autoHandoff;
+		const finalAdmission = finalRow.autoHandoff;
+		if (
+			!isBoundaryAdmission(stateAdmission, state.executionBoundary) ||
+			!isBoundaryAdmission(finalAdmission, state.executionBoundary) ||
+			!sameAdmission(stateAdmission, finalAdmission)
+		) {
+			return {
+				ok: false,
+				refusal: refusal(
+					"execution_boundary_mismatch",
+					"the current final does not carry the run-bound approval-required execution boundary",
+				),
+			};
+		}
+	} else {
+		const stateAdmissionBoundary = isRecord(state.autoHandoff) ? state.autoHandoff.executionBoundary : undefined;
+		const finalAdmissionBoundary = isRecord(finalRow.autoHandoff)
+			? finalRow.autoHandoff.executionBoundary
+			: undefined;
+		if (stateAdmissionBoundary !== undefined || finalAdmissionBoundary !== undefined) {
+			return {
+				ok: false,
+				refusal: refusal("execution_boundary_mismatch", "final admission has a detached execution boundary"),
+			};
+		}
+		if (autoHandoff.effectiveTarget !== "off") {
+			return {
+				ok: false,
+				refusal: refusal(
+					"auto_handoff_enabled",
+					`ralplan autoHandoff is "${autoHandoff.effectiveTarget}"; a current final is only approvable while handoff is off`,
+				),
+			};
+		}
 	}
 
 	const earlierRows = rows.filter(row => row.stageN < finalRow.stageN);

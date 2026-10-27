@@ -24,7 +24,10 @@ import {
 	modeStatePath,
 	sessionPlansDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import {
+	hasSanctionedRalplanFinalAdmissionForHandoff,
+	runNativeStateCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -161,6 +164,76 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(typeof payload.run_id).toBe("string");
 		expect(payload.state_path).toBe(ralplanStatePath(root));
 		expect(payload.task).toBeUndefined();
+	});
+
+	it.each([
+		"plan-only",
+		"approval-required",
+	] as const)("keeps the %s run boundary stronger than configured autoHandoff", async boundary => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		const seed = await runNativeRalplanCommand(
+			["--json", "--execution-boundary", boundary, "plan the autoresearch findings"],
+			root,
+		);
+		expect(seed.status).toBe(0);
+		const seedReceipt = JSON.parse(seed.stdout ?? "{}") as { run_id: string; execution_boundary: string };
+		expect(seedReceipt.execution_boundary).toBe(boundary);
+		const stateAfterSeed = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
+		expect(stateAfterSeed.execution_boundary).toBe(boundary);
+
+		const final = await writeRalplanArtifact(root, seedReceipt.run_id, "final", 1, "# Final plan");
+		expect(final.status).toBe(0);
+		const admission = JSON.parse(final.stdout ?? "{}").auto_handoff;
+		expect(admission).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "execution_boundary",
+			executionBoundary: boundary,
+		});
+		expect(await hasSanctionedRalplanFinalAdmissionForHandoff(root, TEST_SESSION_ID)).toBe(false);
+
+		const handoff = await runNativeStateCommand(
+			["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json", "--session-id", TEST_SESSION_ID],
+			root,
+		);
+		expect(handoff.status).toBe(2);
+		if (boundary === "plan-only") expect(handoff.stderr).toContain("plan-only execution boundary");
+		else expect(handoff.stderr).toContain("execution approval");
+	});
+
+	it("only tightens a seeded execution boundary", async () => {
+		const root = await tempDir();
+		const first = await runNativeRalplanCommand(
+			["--json", "--execution-boundary", "approval-required", "plan the findings"],
+			root,
+		);
+		expect(first.status).toBe(0);
+		const tightened = await runNativeRalplanCommand(
+			["--json", "--execution-boundary", "plan-only", "continue planning"],
+			root,
+		);
+		expect(tightened.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8")).execution_boundary).toBe("plan-only");
+
+		const relaxed = await runNativeRalplanCommand(
+			["--json", "--execution-boundary", "approval-required", "continue planning"],
+			root,
+		);
+		expect(relaxed.status).toBe(2);
+		expect(relaxed.stderr).toContain("cannot be relaxed");
+
+		const stateMutation = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", '{"execution_boundary":"approval-required"}', "--json"],
+			root,
+		);
+		expect(stateMutation.status).toBe(2);
+		expect(stateMutation.stderr).toContain("execution boundary cannot change");
 	});
 
 	it("rejects corrupt ralplan state before consensus handoff seeding", async () => {

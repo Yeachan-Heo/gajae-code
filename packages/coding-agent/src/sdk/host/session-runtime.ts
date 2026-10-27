@@ -542,6 +542,8 @@ export class SessionSdkSessionRuntime {
 	readonly transport: SessionSdkTransport;
 	readonly #connectionCapabilities = new Map<string, ReadonlySet<string>>();
 	readonly #connectionIds = new Set<string>();
+	readonly #connectionStateListeners = new Set<() => void>();
+	readonly #hasExternalConnectionCapabilities: boolean;
 	readonly #connectionCapabilitiesProvider: (connectionId: string) => ReadonlySet<string> | undefined;
 	readonly #connectionDisposer?: () => void;
 	readonly #malformedDisposer?: () => void;
@@ -551,6 +553,7 @@ export class SessionSdkSessionRuntime {
 
 	constructor(options: SessionSdkRuntimeOptions) {
 		this.transport = options.transport;
+		this.#hasExternalConnectionCapabilities = options.connectionCapabilities !== undefined;
 		this.#connectionCapabilitiesProvider =
 			options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId));
 		this.host = new SessionSdkHost({
@@ -566,33 +569,41 @@ export class SessionSdkSessionRuntime {
 			},
 			onFrame: handler =>
 				options.transport.onFrame((connectionId, frame) => {
+					const wasKnown = this.#connectionIds.has(connectionId);
 					this.#connectionIds.add(connectionId);
+					let observerStatusChanged = false;
 					if (
 						!options.connectionCapabilities &&
 						frame.type === "event_replay" &&
 						isStringArray(frame.capabilities)
 					) {
-						this.#connectionCapabilities.set(
-							connectionId,
-							new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...frame.capabilities]),
-						);
+						const previous = this.#connectionCapabilities.get(connectionId);
+						const next = new Set([...(previous ?? []), ...frame.capabilities]);
+						observerStatusChanged =
+							previous?.has(SESSION_HOST_OBSERVER_CAPABILITY) !== next.has(SESSION_HOST_OBSERVER_CAPABILITY);
+						this.#connectionCapabilities.set(connectionId, next);
 					}
+					if (!wasKnown || observerStatusChanged) this.#notifyConnectionStateChanged();
 					handler(connectionId, frame);
 				}),
 		});
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
-			this.#connectionIds.delete(connectionId);
+			const removed = this.#connectionIds.delete(connectionId);
 			this.#connectionCapabilities.delete(connectionId);
+			if (removed) this.#notifyConnectionStateChanged();
 			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
 			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
+			const wasKnown = this.#connectionIds.has(connectionId);
+			const previous = this.#connectionCapabilities.get(connectionId);
+			const next = new Set([...(previous ?? []), ...negotiated]);
+			const observerStatusChanged =
+				previous?.has(SESSION_HOST_OBSERVER_CAPABILITY) !== next.has(SESSION_HOST_OBSERVER_CAPABILITY);
 			this.#connectionIds.add(connectionId);
-			this.#connectionCapabilities.set(
-				connectionId,
-				new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...negotiated]),
-			);
+			this.#connectionCapabilities.set(connectionId, next);
+			if (!wasKnown || observerStatusChanged) this.#notifyConnectionStateChanged();
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
 			this.host.handleMalformedFrame(connectionId, message);
@@ -605,6 +616,27 @@ export class SessionSdkSessionRuntime {
 
 	get generation(): number {
 		return this.host.generation;
+	}
+
+	/** True only while an authenticated, non-observer SDK client can receive and answer gates. */
+	hasRemoteGateAnswerChannel(): boolean {
+		return [...this.#connectionIds].some(connectionId => {
+			if (this.transport.isConnectionOpen?.(connectionId) === false) return false;
+			const capabilities = this.#connectionCapabilitiesProvider(connectionId);
+			if (this.#hasExternalConnectionCapabilities && capabilities === undefined) return false;
+			return capabilities?.has(SESSION_HOST_OBSERVER_CAPABILITY) !== true;
+		});
+	}
+
+	/** Observe live answer-capable client membership. The listener receives an immediate snapshot. */
+	onConnectionStateChanged(listener: () => void): () => void {
+		this.#connectionStateListeners.add(listener);
+		listener();
+		return () => this.#connectionStateListeners.delete(listener);
+	}
+
+	#notifyConnectionStateChanged(): void {
+		for (const listener of this.#connectionStateListeners) listener();
 	}
 
 	getProviderDefinitions(capability: string): unknown | undefined {
@@ -7902,9 +7934,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 		});
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(runtime.host);
-		const disposeWorkflowGate = ctx.workflowGate?.onGateEmitted?.(gate =>
+		const workflowGateEmitter = ctx.workflowGate;
+		const disposeWorkflowGate = workflowGateEmitter?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
+		let disposeRemoteGateAnswerChannel: (() => void) | undefined;
+		const refreshRemoteGateAnswerChannel = (): void => {
+			if (runtime.hasRemoteGateAnswerChannel()) {
+				disposeRemoteGateAnswerChannel ??= workflowGateEmitter?.registerRemoteGateAnswerChannel?.();
+			} else {
+				disposeRemoteGateAnswerChannel?.();
+				disposeRemoteGateAnswerChannel = undefined;
+			}
+		};
+		const disposeConnectionState = runtime.onConnectionStateChanged(refreshRemoteGateAnswerChannel);
 		// Every fold (steer, chord, auto-background timer, `bash.background`)
 		// publishes one replayable `bash_folded` frame; `runtime.jobs.list`
 		// `foldReason` remains the source of truth clients reconcile against after
@@ -7936,6 +7979,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		});
 		const disposeGate = (): void => {
 			disposeWorkflowGate?.();
+			disposeConnectionState();
+			disposeRemoteGateAnswerChannel?.();
+			disposeRemoteGateAnswerChannel = undefined;
 			disposeFold?.();
 			disposeStream?.();
 		};

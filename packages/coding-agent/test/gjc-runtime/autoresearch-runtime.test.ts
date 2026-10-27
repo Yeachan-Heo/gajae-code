@@ -384,6 +384,56 @@ describe("autoresearch ledger", () => {
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).mission?.slug).toBe("successor-mission");
 	});
 
+	it("keeps a critic receipt associated across a same-mission rewrite", async () => {
+		const root = await tempDir();
+		const initial = await autoresearchWrite(baseMission(root));
+		const critic = await autoresearchRecordCritic({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["critic evidence for this mission"],
+			caveats: [],
+			evaluator: "mission-critic",
+		});
+		await Bun.sleep(5);
+		await autoresearchWrite(baseMission(root, { assumptions: ["Use the production-like corpus"] }));
+		const rewritten = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(rewritten.mission?.createdAt).toBe(initial.mission.createdAt);
+		expect(rewritten.mission?.updatedAt).not.toBe(initial.mission.updatedAt);
+
+		const verdict = await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["mission evidence"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+		expect(verdict.criticReceipt).toEqual(critic);
+	});
+
+	it("retires a conclusive mission after its same-mission artifact is rewritten", async () => {
+		const root = await tempDir();
+		const initial = await autoresearchWrite(baseMission(root));
+		await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["mission completed"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+		await Bun.sleep(5);
+		await autoresearchWrite(baseMission(root));
+		const rewritten = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(rewritten.mission?.createdAt).toBe(initial.mission.createdAt);
+		expect(rewritten.mission?.updatedAt).not.toBe(initial.mission.updatedAt);
+
+		const retired = await autoresearchRetireConclusiveMissionAfterHandoff(root, TEST_SESSION_ID);
+		expect(retired?.cleared).toBe(true);
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
+	});
+
 	it("does not retire an inconclusive mission after a handoff", async () => {
 		const root = await tempDir();
 		await autoresearchWrite(baseMission(root));

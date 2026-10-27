@@ -834,7 +834,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	}
 
 	#hasWorkflowGateAnswerChannel(gateEmitter: WorkflowGateEmitter | undefined): boolean {
-		return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() !== false;
+		return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() === true;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -1368,6 +1368,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				});
 				let answer: unknown;
 				try {
+					if (!this.#hasWorkflowGateAnswerChannel(gateEmitter)) {
+						throw new ToolAbortError("Ask tool requires an active workflow-gate answer channel");
+					}
 					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
 				} finally {
 					stopGateObservation?.();
