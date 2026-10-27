@@ -48,8 +48,10 @@ type DiscoveredHarnessEndpoint = {
 };
 
 /**
- * A discovery record may replace spawning only when it is a live loopback endpoint
- * for this session. Any other record is ignored so the owner starts the real session.
+ * A discovery record may replace spawning only when it was read and parsed and is a
+ * live loopback endpoint for this session. A parsed record that fails that check is
+ * ignored so the owner starts the real session when spawn exists. An error from the
+ * first discovery read is propagated and does not spawn.
  */
 function isOwnedHarnessDiscoveryEndpoint(endpoint: DiscoveredHarnessEndpoint, sessionId: string): boolean {
 	if (typeof endpoint.url !== "string" || typeof endpoint.token !== "string" || endpoint.token.length === 0)

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createSdkSessionTransport } from "../../src/harness-control-plane/sdk-transport";
+import { SdkDiscoveryError } from "../../src/sdk/client/discovery";
 
 const replay = {
 	type: "event_replay_result",
@@ -146,6 +147,40 @@ describe("harness owner discovery trust", () => {
 		);
 		expect(dead.spawnCalls).toBe(1);
 		expect(dead.token).toBe("spawned-token");
+	});
+
+	it("propagates a first discovery read error without spawning", async () => {
+		const cases = [
+			new SdkDiscoveryError(
+				"sdk/session-a.json",
+				"SDK endpoint discovery record session id does not match its filename.",
+			),
+			new SdkDiscoveryError("sdk/session-a.json", "SDK endpoint discovery record must be an object."),
+		];
+		for (const error of cases) {
+			let spawnCalls = 0;
+			let connectCalls = 0;
+			await expect(
+				createSdkSessionTransport({
+					repo: "unused-repo",
+					sessionId: "session-a",
+					discoveryTimeoutMs: 1_000,
+					readEndpoint: async () => {
+						throw error;
+					},
+					spawn: () => {
+						spawnCalls += 1;
+						return { async stop(): Promise<void> {} };
+					},
+					connect: async () => {
+						connectCalls += 1;
+						return client as never;
+					},
+				}),
+			).rejects.toBe(error);
+			expect(spawnCalls).toBe(0);
+			expect(connectCalls).toBe(0);
+		}
 	});
 
 	it("still attaches to a live loopback endpoint without spawning", async () => {
