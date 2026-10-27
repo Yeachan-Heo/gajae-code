@@ -389,145 +389,154 @@ function captureScopedBootstrap(
 	}
 }
 
-test("managed wrong outer cannot register a valid inner CLI or substitute headless", async () => {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-wrong-outer-"));
-	const env = {
-		...linuxUserBusEnvironment,
-		PATH: process.env.PATH ?? "",
-		LANG: process.platform === "darwin" ? "en_US.UTF-8" : "C.UTF-8",
-		HOME: root,
-		TMPDIR: root,
-		TMUX_TMPDIR: root,
-		BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
-	};
-	let launched: SpawnSubstrateProof | undefined;
-	const retained: { process: Process | null } = { process: null };
-	let allocations = 0;
-	let validInnerObserved = false;
-	let headlessAttempts = 0;
-	let passed = false;
-	let cleanupProven = false;
-	const bootstrapDiagnostics: string[] = [];
-	const provider = createSpawnSubstrateProvider({
-		env,
-		selectMultiplexer: () => "tmux",
-		startHeadless: () => {
-			headlessAttempts += 1;
-			throw new Error("Forbidden headless fallback");
-		},
-		launchManaged: (spec, environment, platform) => {
-			allocations += 1;
-			expect(spec.argv).toEqual([process.execPath, "run", sourceCli, "sdk", "session-host-internal"]);
-			validInnerObserved = true;
-			// A genuine allocated tmux pane, but deliberately not a GJC supervisor.
-			// Its bounded natural exit is containment, never readiness success.
-			return captureScopedBootstrap(
-				() =>
-					createManagedGjcTmuxSession(spec, environment, {
-						platform,
-						supervisorArgvForTest: ["/bin/sleep", "5"],
-					}),
-				environment,
-				bootstrapDiagnostics,
-			);
-		},
-	});
-	const broker = new Broker({
-		agentDir: path.join(root, "agent"),
-		masterCapabilityVerifier: verifier,
-		spawnSubstrateProvider: {
-			...provider,
-			launch: async spec => {
-				const result = await provider.launch({ ...spec, inheritedEnv: env });
-				if (result.ok) {
-					launched = result.proof;
-					retained.process = nativeProcessBindings().Process.fromPid(result.proof.pid!);
-				}
-				return result;
-			},
-			resolveLifecycleOwner: (proof, deadline) =>
-				provider.resolveLifecycleOwner(proof, Math.min(deadline, Date.now() + 1_000)),
-		},
-	});
-	setLifecycleCommandResolverForTest(broker, () => ({
-		file: process.execPath,
-		args: ["run", sourceCli, "sdk", "session-host-internal"],
-	}));
-	try {
-		await broker.start();
-		await attest(broker, root);
-		const response = await spawn(broker, root);
-		expect(response.ok).toBe(false);
-		expect(allocations).toBe(1);
-		expect(validInnerObserved).toBe(true);
-		expect(headlessAttempts).toBe(0);
-		expect(broker.index.listSessionIdentities().filter(row => row.sessionId !== ownerId)).toHaveLength(0);
-		const ledger = await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text();
-		for (const state of ["authority_active", "seed_prepared", "dispatching", "accepted"])
-			expect(ledger).not.toContain(`"${state}"`);
-		if (!launched) throw new Error(`Wrong-outer allocation proof was not captured; retained ${root}`);
-		if (launched) {
-			expect(launched.substrateKind).toBe("tmux");
-			const store = new SpawnAuthorityStore(
-				broker.settings.agentDir,
-				await getBrokerIdentityKey(broker.settings.agentDir),
-			);
-			await store.open();
-			const claims = store.claims();
-			expect(claims).toHaveLength(1);
-			if (process.platform === "linux") {
-				// Linux closes the exact pane through its kernel-signaled owner path, so
-				// the Broker proves the release and reports a deterministic failure.
-				expect(response).toMatchObject({
-					ok: false,
-					error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
-				});
-				expect(claims[0]).toMatchObject({
-					state: "pre_send_rejected",
-					failure: { code: "lifecycle_owner_unresolved" },
-				});
-			} else {
-				// Darwin close is cooperative and needs the supervisor's published
-				// binding. A wrong outer never publishes one, so release stays unproven.
-				expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-				expect(claims[0]).toMatchObject({
-					state: "uncertain",
-					failure: { code: "child_registration_release_unproven" },
-				});
-			}
-			if (!retained.process) throw new Error(`Missing exact wrong-outer reference; retained ${root}`);
-			expect(await retained.process.waitForExit({ timeoutMs: 5_000 })).toBe(true);
-			expect(await provider.verify(launched)).toBe("gone");
-		}
-		// This fixture owns an isolated socket namespace. Observe absence only;
-		// never kill a whole server or guess which allocated pane to remove.
-		const listing = Bun.spawn(["tmux", "list-sessions", "-F", "#{session_id}"], {
+// The wrong-outer fixture allocates a real tmux pane. A supported development
+// install without tmux (or a Windows host) cannot run it; CI provisions tmux and
+// keeps exercising this path.
+const realTmuxAvailable = process.platform !== "win32" && Bun.which("tmux") !== null;
+
+test.skipIf(!realTmuxAvailable)(
+	"managed wrong outer cannot register a valid inner CLI or substitute headless",
+	async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-wrong-outer-"));
+		const env = {
+			...linuxUserBusEnvironment,
+			PATH: process.env.PATH ?? "",
+			LANG: process.platform === "darwin" ? "en_US.UTF-8" : "C.UTF-8",
+			HOME: root,
+			TMPDIR: root,
+			TMUX_TMPDIR: root,
+			BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+		};
+		let launched: SpawnSubstrateProof | undefined;
+		const retained: { process: Process | null } = { process: null };
+		let allocations = 0;
+		let validInnerObserved = false;
+		let headlessAttempts = 0;
+		let passed = false;
+		let cleanupProven = false;
+		const bootstrapDiagnostics: string[] = [];
+		const provider = createSpawnSubstrateProvider({
 			env,
-			stdout: "pipe",
-			stderr: "pipe",
+			selectMultiplexer: () => "tmux",
+			startHeadless: () => {
+				headlessAttempts += 1;
+				throw new Error("Forbidden headless fallback");
+			},
+			launchManaged: (spec, environment, platform) => {
+				allocations += 1;
+				expect(spec.argv).toEqual([process.execPath, "run", sourceCli, "sdk", "session-host-internal"]);
+				validInnerObserved = true;
+				// A genuine allocated tmux pane, but deliberately not a GJC supervisor.
+				// Its bounded natural exit is containment, never readiness success.
+				return captureScopedBootstrap(
+					() =>
+						createManagedGjcTmuxSession(spec, environment, {
+							platform,
+							supervisorArgvForTest: ["/bin/sleep", "5"],
+						}),
+					environment,
+					bootstrapDiagnostics,
+				);
+			},
 		});
-		const [stdout, stderr] = await Promise.all([
-			new Response(listing.stdout).text(),
-			new Response(listing.stderr).text(),
-		]);
-		const exit = await listing.exited;
-		expect(stdout.trim()).toBe("");
-		expect(exit).not.toBe(0);
-		expect(stderr).toMatch(/no server running|failed to connect|error connecting/);
-		cleanupProven = true;
-		passed = true;
-	} catch (error) {
-		process.stderr.write(`${JSON.stringify({ fixture: "wrong-outer", scopedBootstrap: bootstrapDiagnostics })}\n`);
-		throw new AggregateError(
-			[error],
-			`Wrong-outer fixture failed; scoped bootstrap: ${bootstrapDiagnostics.join("; ")}`,
-		);
-	} finally {
-		await broker.stop();
-		setLifecycleCommandResolverForTest(broker, undefined);
-		if (passed && cleanupProven) await fs.rm(root, { recursive: true, force: true });
-	}
-}, 30_000);
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				...provider,
+				launch: async spec => {
+					const result = await provider.launch({ ...spec, inheritedEnv: env });
+					if (result.ok) {
+						launched = result.proof;
+						retained.process = nativeProcessBindings().Process.fromPid(result.proof.pid!);
+					}
+					return result;
+				},
+				resolveLifecycleOwner: (proof, deadline) =>
+					provider.resolveLifecycleOwner(proof, Math.min(deadline, Date.now() + 1_000)),
+			},
+		});
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: process.execPath,
+			args: ["run", sourceCli, "sdk", "session-host-internal"],
+		}));
+		try {
+			await broker.start();
+			await attest(broker, root);
+			const response = await spawn(broker, root);
+			expect(response.ok).toBe(false);
+			expect(allocations).toBe(1);
+			expect(validInnerObserved).toBe(true);
+			expect(headlessAttempts).toBe(0);
+			expect(broker.index.listSessionIdentities().filter(row => row.sessionId !== ownerId)).toHaveLength(0);
+			const ledger = await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text();
+			for (const state of ["authority_active", "seed_prepared", "dispatching", "accepted"])
+				expect(ledger).not.toContain(`"${state}"`);
+			if (!launched) throw new Error(`Wrong-outer allocation proof was not captured; retained ${root}`);
+			if (launched) {
+				expect(launched.substrateKind).toBe("tmux");
+				const store = new SpawnAuthorityStore(
+					broker.settings.agentDir,
+					await getBrokerIdentityKey(broker.settings.agentDir),
+				);
+				await store.open();
+				const claims = store.claims();
+				expect(claims).toHaveLength(1);
+				if (process.platform === "linux") {
+					// Linux closes the exact pane through its kernel-signaled owner path, so
+					// the Broker proves the release and reports a deterministic failure.
+					expect(response).toMatchObject({
+						ok: false,
+						error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
+					});
+					expect(claims[0]).toMatchObject({
+						state: "pre_send_rejected",
+						failure: { code: "lifecycle_owner_unresolved" },
+					});
+				} else {
+					// Darwin close is cooperative and needs the supervisor's published
+					// binding. A wrong outer never publishes one, so release stays unproven.
+					expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+					expect(claims[0]).toMatchObject({
+						state: "uncertain",
+						failure: { code: "child_registration_release_unproven" },
+					});
+				}
+				if (!retained.process) throw new Error(`Missing exact wrong-outer reference; retained ${root}`);
+				expect(await retained.process.waitForExit({ timeoutMs: 5_000 })).toBe(true);
+				expect(await provider.verify(launched)).toBe("gone");
+			}
+			// This fixture owns an isolated socket namespace. Observe absence only;
+			// never kill a whole server or guess which allocated pane to remove.
+			const listing = Bun.spawn(["tmux", "list-sessions", "-F", "#{session_id}"], {
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(listing.stdout).text(),
+				new Response(listing.stderr).text(),
+			]);
+			const exit = await listing.exited;
+			expect(stdout.trim()).toBe("");
+			expect(exit).not.toBe(0);
+			expect(stderr).toMatch(/no server running|failed to connect|error connecting/);
+			cleanupProven = true;
+			passed = true;
+		} catch (error) {
+			process.stderr.write(`${JSON.stringify({ fixture: "wrong-outer", scopedBootstrap: bootstrapDiagnostics })}\n`);
+			throw new AggregateError(
+				[error],
+				`Wrong-outer fixture failed; scoped bootstrap: ${bootstrapDiagnostics.join("; ")}`,
+			);
+		} finally {
+			await broker.stop();
+			setLifecycleCommandResolverForTest(broker, undefined);
+			if (passed && cleanupProven) await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+	30_000,
+);
 
 test("managed task.dag advance still publishes lifecycle authority before seed delivery", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-marker-"));
