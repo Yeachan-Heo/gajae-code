@@ -149,6 +149,7 @@ async function createFixture(
 		deferSkillDiscovery?: boolean;
 		paginateSkillDiscovery?: boolean;
 		skillCatalogNames?: string[];
+		enableSkillCommands?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -361,7 +362,7 @@ async function createFixture(
 					}
 					const items =
 						frame.query === "config.list/get"
-							? [{ mode: "default", model: "openai/gpt", thinking: "medium" }]
+							? [{ mode: "default", model: "openai/gpt", thinking: "medium", enableSkillCommands: options.enableSkillCommands !== false }]
 							: frame.query === "models.list/current"
 								? [{ provider: "openai", id: "gpt", name: "GPT" }]
 								: frame.query === "providers.list/active"
@@ -875,6 +876,29 @@ test("ACP inline skill dispatch refreshes names after a catalog change", async (
 			stopReason: "end_turn",
 		});
 		expect(fixture.queryCalls.filter(query => query === "skill.list/state")).toHaveLength(2);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP inline skill discovery is skipped when enableSkillCommands is false", async () => {
+	const fixture = await createFixture({ enableSkillCommands: false });
+	try {
+		// With enableSkillCommands false, no skill discovery should happen
+		await Bun.sleep(100);
+		const skillStateQueriesBefore = fixture.queryCalls.filter(query => query === "skill.list/state").length;
+		const inlineSkillText = "Analyze the code /skill:deep-interview requirements";
+		const pending = prompt(fixture, inlineSkillText);
+		await bounded(fixture.promptDelivered, "prompt delivered when discovery disabled");
+		// Verify the prompt text is NOT converted to a skill command
+		expect(fixture.mutationInputs[0]).toMatchObject({ text: inlineSkillText });
+		// Verify skill discovery did not happen (config query still happens, but no skill.list/state query)
+		const skillStateQueriesAfter = fixture.queryCalls.filter(query => query === "skill.list/state").length;
+		expect(skillStateQueriesAfter).toBe(skillStateQueriesBefore);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion when discovery disabled")).toEqual({
+			stopReason: "end_turn",
+		});
 	} finally {
 		fixture.dispose();
 	}

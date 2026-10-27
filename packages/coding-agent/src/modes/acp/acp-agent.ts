@@ -1278,6 +1278,19 @@ function configValues(query: unknown): Map<string, string> {
 }
 
 /**
+ * Check if inline skill command discovery is enabled in the session settings.
+ * Defaults to true if the setting is not present or not explicitly disabled.
+ */
+function isInlineSkillDiscoveryEnabled(configQuery: unknown): boolean {
+	for (const item of pageItems(configQuery)) {
+		const record = object(item);
+		if (!record) continue;
+		if (record.enableSkillCommands === false) return false;
+	}
+	return true;
+}
+
+/**
  * Recover a session-scoped preset only when the host's current model carries
  * the synthetic profile namespace. A plain `modelPreset` value may be the
  * persisted default and is therefore insufficient to identify an active
@@ -2449,7 +2462,14 @@ export class AcpAgent implements Agent {
 		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
 		// Inline skill discovery is delegated to the session layer, which respects enableSkillCommands
 		// (review P2: implicit ACP conversion must honor the host's settings, not bypass them via direct SDK invocation).
-		const needsInlineSkillDiscovery = false;
+		let needsInlineSkillDiscovery = false;
+		try {
+			const configQuery = await record.adapter.query("config.list/get");
+			needsInlineSkillDiscovery = textBlock !== undefined && isInlineSkillDiscoveryEnabled(configQuery);
+		} catch {
+			// Query failure defaults to discovery enabled (backward compatible); explicit false gate requires session support.
+			needsInlineSkillDiscovery = textBlock !== undefined;
+		}
 		const discoveryAdapter = record.adapter;
 		let inlineSkillCommands: Map<string, { name: string }> | undefined;
 		let admissionReservation: PromptAdmissionReservation | undefined;
