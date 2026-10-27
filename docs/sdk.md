@@ -1283,11 +1283,14 @@ dispatch inputs and never persist in any durable store, log, or output.
 Supervised managed tmux launches (Broker-spawned sessions and interactive root
 `gjc --tmux` launches, on macOS and Linux) publish a private (`0600` file in a
 `0700` lifecycle root) child binding before the supervised child starts.
-Launches that do not run the supervisor, such as `gjc session create` without
-a launch specification, start `gjc` directly and receive neither a binding nor
-exact CLI admission. The derived state path of a supervised launch is named
-through its canonical trusted anchor (the workspace, or its `.gjc` when
-present), so a workspace, an in-repository `.worktrees` bucket or a `.gjc`
+Windows has no owner-only reader for that binding, so a managed launch there is
+refused before allocation and Broker `session.spawn` selects the
+identity-fenced headless substrate before any multiplexer probe. Launches that
+do not run the supervisor, such as `gjc session create` without a launch
+specification, start `gjc` directly and receive neither a binding nor exact CLI
+admission. The derived state path of a supervised launch is named through its
+canonical trusted anchor (the workspace, or its `.gjc` when present), so a
+workspace, an in-repository `.worktrees` bucket or a `.gjc`
 reached through a symlink passes the no-follow verification of the private
 lifecycle root. The `_session-*` tail below `.gjc` stays lexical, so a link
 inside managed storage is still refused (`gjc_tmux_managed_storage_unsafe` or
