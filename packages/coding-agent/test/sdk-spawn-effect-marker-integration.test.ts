@@ -471,7 +471,8 @@ test.skipIf(!realTmuxAvailable)(
 							// makes the pane process the sleep itself, with no child to adopt on
 							// any shell (one that forks would leave `sleep` as a direct child).
 							// Linux must outlive resolution so its release is the Broker's exact
-							// close, not a natural exit racing it; Darwin relies on that exit.
+							// close, not a natural exit racing it; on Darwin that bounded exit is
+							// what ends the cooperative close's wait for a binding.
 							supervisorArgvForTest: [
 								"/bin/sh",
 								"-c",
@@ -537,26 +538,18 @@ test.skipIf(!realTmuxAvailable)(
 				await store.open();
 				const claims = store.claims();
 				expect(claims).toHaveLength(1);
-				if (process.platform === "linux") {
-					// Linux closes the exact pane through its kernel-signaled owner path, so
-					// the Broker proves the release and reports a deterministic failure.
-					expect(response).toMatchObject({
-						ok: false,
-						error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
-					});
-					expect(claims[0]).toMatchObject({
-						state: "pre_send_rejected",
-						failure: { code: "lifecycle_owner_unresolved" },
-					});
-				} else {
-					// Darwin close is cooperative and needs the supervisor's published
-					// binding. A wrong outer never publishes one, so release stays unproven.
-					expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-					expect(claims[0]).toMatchObject({
-						state: "uncertain",
-						failure: { code: "child_registration_release_unproven" },
-					});
-				}
+				// Linux closes the exact pane through its kernel-signaled owner path. A
+				// Darwin close is cooperative and needs a binding the wrong outer never
+				// publishes, so it waits on that exact outer until it exits, fails, and
+				// then proves the substrate gone. Either way the release is proven.
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
+				});
+				expect(claims[0]).toMatchObject({
+					state: "pre_send_rejected",
+					failure: { code: "lifecycle_owner_unresolved" },
+				});
 				if (!retained.process) throw new Error(`Missing exact wrong-outer reference; retained ${root}`);
 				expect(await retained.process.waitForExit({ timeoutMs: 5_000 })).toBe(true);
 				expect(await provider.verify(launched)).toBe("gone");
@@ -691,15 +684,27 @@ async function assertOpaqueSinks(
 	observations: readonly string[],
 ) {
 	let files = 0;
+	// The live Broker keeps writing while this scans: a transient entry (a pending
+	// lock directory) removed before it is read is not a durable sink.
+	const unlessVanished = async <T>(read: () => Promise<T>): Promise<T | undefined> => {
+		try {
+			return await read();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+			throw error;
+		}
+	};
 	async function scan(directory: string): Promise<void> {
-		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+		const entries = await unlessVanished(() => fs.readdir(directory, { withFileTypes: true }));
+		for (const entry of entries ?? []) {
 			const file = path.join(directory, entry.name);
 			if (file === alias) continue;
 			if (entry.isSymbolicLink()) throw new Error(`Unscanned product sink symlink: ${file}`);
 			if (entry.isDirectory()) await scan(file);
 			else if (entry.isFile()) {
+				const content = await unlessVanished(() => Bun.file(file).text());
+				if (content === undefined) continue;
 				files += 1;
-				const content = await Bun.file(file).text();
 				for (const probe of probes) expect(content, `opaque sink ${file}`).not.toContain(probe);
 			}
 		}
