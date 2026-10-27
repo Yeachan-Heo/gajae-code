@@ -686,7 +686,11 @@ export default function App() {
 								`question:${selected}`,
 								`abort:${selected}`,
 								`queue:${selected}`,
+								// Palette dispatch happens after its dialog closes, so its failures
+								// and queue notices must render here or disappear entirely.
+								`command:${selected}`,
 							].map(scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>)}
+							{notice && <p role="status">{notice}</p>}
 						</div>
 						{session.queued && session.queued.length > 0 && (
 							<div className="queued-inputs">

@@ -127,6 +127,11 @@ test("real isolated host creates, persists and resumes sessions without provider
 			text: "/rename 제목",
 		});
 		expect(renameRefusal.output).toContain("이름 변경");
+		// Refusal copy must not point at a menu the app does not have.
+		for (const text of ["/move /tmp", "/session delete", "/rename x"]) {
+			const refused = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text });
+			expect(refused.output).not.toContain("대화 메뉴");
+		}
 		// The palette can only offer commands the host will actually run.
 		const catalog = await host.request<{ name: string }[]>("command.list");
 		for (const name of ["move", "session", "handoff", "rename"]) {
@@ -159,6 +164,14 @@ test("real isolated host creates, persists and resumes sessions without provider
 		await host.request("settings.set", { path: "retry.maxRetries", value: 2, sessionId: session.id });
 		const updated = await host.request<DesktopSetting[]>("settings.get", { sessionId: session.id });
 		expect(updated.find(item => item.path === "retry.maxRetries")?.value).toBe(2);
+		// A durable host can persist app-effective settings...
+		expect(updated.find(item => item.path === "retry.maxRetries")?.writable).toBe(true);
+		// ...but notification delivery is terminal/host-owned, so it stays read-only.
+		const notificationSettings = updated.filter(item => item.path.startsWith("notification"));
+		expect(notificationSettings.length).toBeGreaterThan(0);
+		expect(notificationSettings.every(item => item.writable === false)).toBe(true);
+		const deferred = await host.request<DesktopSetting[]>("settings.get", {});
+		expect(deferred.find(item => item.path === "retry.maxRetries")?.writable).toBe(true);
 		const diff = await host.request<DesktopDiff[]>("diff.get", { sessionId: session.id });
 		expect(diff.find(file => file.path === "review.txt")?.patch).toContain("+실제 변경 내용");
 		await host.request("session.rename", { sessionId: session.id, title: "한국어 작업" });

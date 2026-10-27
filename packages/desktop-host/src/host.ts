@@ -63,7 +63,7 @@ const WITHHELD_SETTING = /token|secret|password|credential|apiKey|broker|oauth/i
  * app cannot deliver.
  */
 const TERMINAL_ONLY_SETTING =
-	/^(statusLine\.|theme\.|clipboard\.|ui\.|symbolPreset$|syntaxTheme|footer|header|editor\.)/i;
+	/^(statusLine\.|theme\.|clipboard\.|ui\.|notifications?\.|symbolPreset$|syntaxTheme|footer|header|editor\.)/i;
 const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
 /**
  * Session lifecycle belongs to the desktop catalog: these builtins would rotate
@@ -73,9 +73,9 @@ const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
 const DESKTOP_OWNED_COMMANDS = new Set(["move", "session", "rename", "star", "unstar", "handoff"]);
 /** Refusal copy names the app control that does the job, because one generic hint fits none. */
 const DESKTOP_OWNED_REFUSALS: Record<string, string> = {
-	move: "/move는 세션 파일 경로를 바꾸므로 앱이 직접 관리합니다. 대화 메뉴에서 새 대화로 시작하세요.",
-	session: "/session은 세션 삭제·전환이라 앱이 직접 관리합니다. 대화 목록에서 선택하거나 대화 메뉴에서 삭제하세요.",
-	rename: "/rename 대신 대화 메뉴의 '이름 변경'을 사용하세요.",
+	move: "/move는 세션 파일 경로를 바꾸므로 지원하지 않습니다. 프로젝트 목록의 '새 대화'로 세션을 시작하세요.",
+	session: "/session은 지원하지 않습니다. 대화 목록에서 세션을 선택하거나 상단 '삭제' 버튼을 사용하세요.",
+	rename: "/rename 대신 상단 '이름 변경' 버튼을 사용하세요.",
 	star: "즐겨찾기는 대화 목록의 별표 버튼으로 설정하세요.",
 	unstar: "즐겨찾기 해제는 대화 목록의 별표 버튼으로 설정하세요.",
 	handoff: "/handoff는 세션 정체성을 바꾸므로 앱에서 지원하지 않습니다. 새 대화로 이어가세요.",

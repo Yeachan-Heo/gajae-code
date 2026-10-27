@@ -173,10 +173,11 @@ describe("desktop settings surface", () => {
 		expect(items.some(item => /token|secret|password|credential/i.test(item.path))).toBe(false);
 		expect(items.every(item => ["boolean", "number", "enum"].includes(item.type))).toBe(true);
 		// Notification delivery is terminal/host-owned: a headless desktop host cannot
-		// deliver bells or Telegram messages, so those settings must stay read-only.
-		const notificationSettings = items.filter(item => item.path.startsWith("notification"));
-		expect(notificationSettings.length).toBeGreaterThan(0);
-		expect(notificationSettings.every(item => item.writable === false)).toBe(true);
+		// deliver bells or Telegram messages, so those settings must be refused. Assert
+		// through validation: isolated settings cannot persist anywhere, which would
+		// make a `writable === false` check pass for every path.
+		expect(() => validateDesktopSetting("notifications.terminalBell", true)).toThrow("terminal UI");
+		expect(() => validateDesktopSetting("notifications.enabled", true)).toThrow("terminal UI");
 		// Terminal-only settings stay visible but are not writable from the desktop.
 		const uiLanguage = items.find(item => item.path === "ui.language");
 		if (uiLanguage) expect(uiLanguage.writable).toBe(false);
