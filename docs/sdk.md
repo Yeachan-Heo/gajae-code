@@ -1382,11 +1382,18 @@ for it instead of ending with `owner_verdict_unavailable`. A pinned relaunch is
 refused with `managed_owner_predecessor_live` while the current generation's
 supervisor is still live. The closer holds a per-generation closer lock
 (`closer-<generation>.sqlite`) from before its intent is visible until it stops
-waiting, and the supervisor relays only while that lock is held, so an intent
-whose closer gave up, exited or crashed is never delivered, whatever the wall
-clock says. The child sidecar also captures the intent's dispatch only when the
-relay record for it is already visible, so a SIGTERM handled before the relay
-is never attributed to it.
+waiting. The supervisor checks that lock before publishing its pending record
+and again immediately before signaling, so no relay is newly authorized after
+the closer gave up, exited or crashed, whatever the wall clock says. A relay
+that had already passed that final check when the supervisor was suspended can
+still complete; its pending record then marks the delivery as uncertain. The
+child sidecar captures the intent's dispatch synchronously when its postmortem
+begins, and only if a relay record for that intent is already visible, so a
+SIGTERM whose postmortem began before the relay is never attributed to it. The
+remaining limits are an unrelated signal that arrives after the pending record
+is durable but before delivery combined with a backward wall-clock step, and
+the latency between signal arrival and the start of the postmortem, which no
+userspace evidence can order.
 
 A supervisor that is stopped or stalled past the intent's deadline, before or
 during publication, refuses the expired intent and never relays it. A close

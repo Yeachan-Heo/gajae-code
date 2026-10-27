@@ -2951,16 +2951,16 @@ async function persistInvalidOwnerTerminalMetadata(
 }
 
 /**
- * Captured before the observation is stamped. Where a supervisor relays, the intent
- * explains this terminal only if the relay record for it is already visible: an
- * unrelated signal handled before the relay never gains its dispatch id, independent
- * of wall-clock ordering. Timing is otherwise judged by the verdict, which still
- * accepts a timely relay that a stopped child handled late.
+ * Synchronous and first in the postmortem: where a supervisor relays, the intent
+ * explains this terminal only if the relay record for it was already visible when the
+ * postmortem began. An unrelated signal handled before the relay never gains its
+ * dispatch id, independent of wall-clock ordering. Timing is otherwise judged by the
+ * verdict, which still accepts a timely relay that a stopped child handled late.
  */
-async function operatorDispatchIdForOwner(owner: OwnerTerminalContext, sessionId: string): Promise<string | undefined> {
+function operatorDispatchIdForOwner(owner: OwnerTerminalContext, sessionId: string): string | undefined {
 	try {
 		const paths = lifecyclePaths(owner.stateDir, sessionId, owner.generation);
-		const intent = JSON.parse(await Bun.file(paths.intentFile).text()) as unknown;
+		const intent = JSON.parse(fsSync.readFileSync(paths.intentFile, "utf8")) as unknown;
 		if (
 			!isValidOwnerIntent(intent) ||
 			intent.generation !== owner.generation ||
@@ -2975,15 +2975,21 @@ async function operatorDispatchIdForOwner(owner: OwnerTerminalContext, sessionId
 	}
 }
 
-async function observeOwnerTerminalPostmortem(
+/**
+ * Captures the owner-terminal observation synchronously, before any other postmortem
+ * work can yield, so relay visibility and `observed_at` describe the moment the
+ * postmortem began.
+ */
+export function captureOwnerTerminalObservation(
 	reason: postmortem.Reason,
-	owner: OwnerTerminalContext,
-	sessionId: string,
-): Promise<OwnerVerdict | null> {
+	context: RuntimeStateContext,
+): ObserveTerminalRequest | null {
+	const owner = context.ownerTerminal;
+	if (!owner) return null;
 	try {
-		const operatorDispatchId = await operatorDispatchIdForOwner(owner, sessionId);
-		const now = new Date().toISOString();
-		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id"> = {
+		const sessionId = normalizedIdentity(context).sessionId;
+		const operatorDispatchId = operatorDispatchIdForOwner(owner, sessionId);
+		return {
 			schema_version: 1,
 			op: "observe_terminal",
 			session_id: sessionId,
@@ -2991,16 +2997,24 @@ async function observeOwnerTerminalPostmortem(
 			state_dir: owner.stateDir,
 			socket_key: owner.socketKey,
 			observer: "sidecar",
-			observed_at: now,
+			observed_at: new Date().toISOString(),
 			signal: ownerTerminalSignal(reason),
 			exit_code: numericProcessExitCode(null),
 			exit_kind: String(reason),
 			reason: "process_postmortem",
-		};
-		return await observeOwnerTerminal({
-			...observation,
 			...(operatorDispatchId ? { operator_dispatch_id: operatorDispatchId } : {}),
-		});
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function observeOwnerTerminalPostmortem(
+	observation: ObserveTerminalRequest | null,
+): Promise<OwnerVerdict | null> {
+	if (!observation) return null;
+	try {
+		return await observeOwnerTerminal(observation);
 	} catch {
 		return null;
 	}
@@ -3082,13 +3096,14 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 export async function persistCoordinatorRuntimeStateFromPostmortem(
 	reason: postmortem.Reason,
 	context: RuntimeStateContext,
+	ownerTerminalObservation: ObserveTerminalRequest | null = captureOwnerTerminalObservation(reason, context),
 ): Promise<void> {
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	const identity = normalizedIdentity(context);
 	const ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
 	const ownerTerminalVerdict = context.ownerTerminal
-		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, identity.sessionId)
+		? await observeOwnerTerminalPostmortem(ownerTerminalObservation)
 		: null;
 	await serializeStateFileWrite(
 		stateFile,
@@ -3183,7 +3198,10 @@ export function registerCoordinatorRuntimeStateFinalizer(
 				: ownerTerminal
 					? { ...liveContext, ownerTerminal }
 					: liveContext;
+		// Before anything yields: relay visibility and the observation time describe the
+		// moment the postmortem began.
+		const ownerTerminalObservation = captureOwnerTerminalObservation(reason, finalizerContext);
 		await recoverCoordinatorRuntimeStateRescope(finalizerContext);
-		await persistCoordinatorRuntimeStateFromPostmortem(reason, finalizerContext);
+		await persistCoordinatorRuntimeStateFromPostmortem(reason, finalizerContext, ownerTerminalObservation);
 	});
 }
