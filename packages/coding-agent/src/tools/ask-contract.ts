@@ -296,7 +296,7 @@ const OrdinaryQuestionItem = z.object({
 		.boolean()
 		.describe("do not apply ask.timeout or synthesize a selection when no answer was received")
 		.optional(),
-	workflowGate: WorkflowGateMeta.describe("optional workflow-gate stage/kind override").optional(),
+	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
 });
 
 export const askSchema = z.object({
