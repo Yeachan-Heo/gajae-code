@@ -1148,6 +1148,9 @@ export function resolveManagedOwnerPredecessorSync(
 		if (receipt) receipts.add(receipt[1]!);
 	}
 	if (bindings.size === 0 && receipts.size === 0) return undefined;
+	// SIGABRT receipts are a Linux-only capability. Elsewhere a prior generation's
+	// child binding without a receipt is ordinary history, not partial recovery evidence.
+	if (receipts.size === 0 && process.platform !== "linux") return undefined;
 	const tokens = [...bindings].filter(token => receipts.has(token));
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;

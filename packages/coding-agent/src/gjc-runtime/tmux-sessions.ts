@@ -7,6 +7,7 @@ import { type Process, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { hasMacOSMallocEnv, macOSMallocEnvUnsetArgs } from "../cli/malloc-env-guard";
 import {
 	managedDirectoryRoot,
 	managedSecurityFailureClassification,
@@ -835,7 +836,12 @@ export function createGjcTmuxSession(
 			: (() => {
 					const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
 					const invocation = launch ? supervisorArgv : ["gjc"];
-					return `exec env ${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
+					// The pane process must stay the exact supervisor; never let the CLI malloc
+					// guard re-exec it below the pane PID.
+					const unsetArgs = launch && platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
+					return `exec env ${unsetArgs}${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
+						// An explicit spawn override must not re-add what the scrub removed.
+						.filter(([name]) => !unsetArgs || !hasMacOSMallocEnv({ [name]: "" }))
 						.map(([name, value]) => `${name}=${shellQuote(value)}`)
 						.join(" ")} ${invocation.map(shellQuote).join(" ")}`;
 				})();
@@ -1915,8 +1921,9 @@ function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): Manage
  * @internal Bounded discovery of the exact supervisor's binding.
  *
  * The launch proof can return before the supervisor durably publishes its binding.
- * Only an absent binding is retried, and only while the same exact supervisor stays
- * live; untrusted, ambiguous, or changed evidence still fails closed immediately.
+ * Only an absent binding, or one whose `created_at` is still in the future (clock
+ * skew), is retried, and only while the same exact supervisor stays live; untrusted,
+ * ambiguous, or changed evidence still fails closed immediately.
  */
 export async function awaitCooperativeSupervisorBinding(
 	identity: ExactOwnerIdentity,

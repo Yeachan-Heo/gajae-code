@@ -7,6 +7,7 @@ import { VERSION } from "@gajae-code/utils/dirs";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
+import { macOSMallocEnvUnsetArgs } from "../cli/malloc-env-guard";
 import { prepareManagedDirectoryRoot } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
@@ -547,7 +548,9 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]
 		: [...command, ...childArgs];
 	const quoted = invocationArgs.map(shellQuote).join(" ");
-	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })}${
+	const unsetArgs =
+		context.managedOwnerSupervisor && context.platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
+	const invocation = `env ${unsetArgs}${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })}${
 		context.bootstrapSecret
 			? ` ${context.bootstrapSecret.urlEnv}=${shellQuote(context.bootstrapSecret.path)} ${context.bootstrapSecret.keyIdEnv}=${shellQuote(context.bootstrapSecret.keyId)}`
 			: ""
@@ -1233,6 +1236,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	plan.ownerGeneration = generation;
 	plan.ownerRunId = runId;
 	plan.ownerIncarnation = incarnation;
+	const supervised = plan.platform === "linux" || plan.platform === "darwin";
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1279,11 +1283,12 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 						keyId: plan.coordinatorSidecarBootstrap.keyId,
 					}
 				: undefined,
-			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
-			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
-			tmuxExitMarkerPath: plan.platform === "linux" ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
+			// Managed close proves the pane PID is the exact supervisor (Linux signals it,
+			// Darwin publishes a cooperative intent bound to its binding). Do not place the
+			// exit-marker shell in front of it; `buildInnerCommand` therefore execs it directly.
+			tmuxExitMarkerPath: supervised ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
 			platform: plan.platform,
-			managedOwnerSupervisor: plan.platform === "linux",
+			managedOwnerSupervisor: supervised,
 		},
 		context.rawArgs,
 	);

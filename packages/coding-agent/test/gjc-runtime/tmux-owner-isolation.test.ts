@@ -360,6 +360,31 @@ describe("closed managed predecessor evidence", () => {
 			}
 		},
 	);
+
+	it("treats a receipt-less prior binding as history only where SIGABRT receipts cannot exist", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-history-"));
+		try {
+			const baseline = {
+				state: "current",
+				schema_version: 1,
+				generation: "generation",
+				session_id: "session",
+				published_at: "2026-09-08T00:00:00.000Z",
+			} as const;
+			const root = lifecyclePaths(stateDir, "session", "generation").root;
+			await fs.mkdir(root, { recursive: true, mode: 0o700 });
+			// A supervised owner that exited normally leaves only its child binding.
+			await fs.writeFile(path.join(root, "child-token.binding.json"), "{}\n", { mode: 0o600 });
+			const resolve = () => resolveManagedOwnerPredecessorSync(stateDir, "session", baseline);
+			if (process.platform === "linux") expect(resolve).toThrow("managed_owner_replacement_evidence_ambiguous");
+			else expect(resolve()).toBeUndefined();
+			// A receipt still fails closed off Linux; it is never trusted as recovery evidence.
+			await fs.writeFile(path.join(root, "sigabrt-token.receipt.json"), "{}\n", { mode: 0o600 });
+			if (process.platform !== "linux") expect(resolve).toThrow("managed_owner_replacement_evidence_unavailable");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commit", () => {
