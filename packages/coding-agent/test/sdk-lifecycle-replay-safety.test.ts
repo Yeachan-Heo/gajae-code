@@ -71,42 +71,42 @@ test("SDK observer tags do not exempt context handlers from replay invalidation"
 	expect(records.isClean(scope)).toBe(false);
 });
 
-test.each([
-	false,
-	true,
-])("real SDK run-start registration preserves only host replay authority: %s", async userHandler => {
-	const authority = createAttemptScopeAuthority();
-	const scope = authority.mintMain();
-	const records = new AttemptRecordStore(authority);
-	records.register(scope);
-	records.establishClean(scope);
-	const runtime = new ExtensionRuntime();
-	let userStarts = 0;
-	const extension = await loadExtensionFromFactory(
-		api => {
-			// Register the production SDK handler, rather than reproducing its tag
-			// in the test. No session_start means no broker or transport is launched.
-			// broker-seam-opt-out: only agent_start is emitted; transport creation throws if reached.
-			createSdkSessionRuntimeExtension(api, {
-				agentDir: process.cwd(),
-				createTransport: () => {
-					throw new Error("Run-start replay test must not launch a transport");
-				},
-			});
-			if (userHandler)
-				api.on("agent_start", () => {
-					userStarts++;
+test.each([false, true])(
+	"real SDK run-start registration preserves only host replay authority: %s",
+	async userHandler => {
+		const authority = createAttemptScopeAuthority();
+		const scope = authority.mintMain();
+		const records = new AttemptRecordStore(authority);
+		records.register(scope);
+		records.establishClean(scope);
+		const runtime = new ExtensionRuntime();
+		let userStarts = 0;
+		const extension = await loadExtensionFromFactory(
+			api => {
+				// Register the production SDK handler, rather than reproducing its tag
+				// in the test. No session_start means no broker or transport is launched.
+				// broker-seam-opt-out: only agent_start is emitted; transport creation throws if reached.
+				createSdkSessionRuntimeExtension(api, {
+					agentDir: process.cwd(),
+					createTransport: () => {
+						throw new Error("Run-start replay test must not launch a transport");
+					},
 				});
-		},
-		process.cwd(),
-		new EventBus(),
-		runtime,
-		"sdk-production-observer-replay-test",
-	);
-	const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
-	runner.setAttemptRecordStore(records);
-	expect(runner.hasHandlers("agent_start")).toBe(true);
-	await runner.emit({ type: "agent_start" }, undefined, scope);
-	expect(userStarts).toBe(userHandler ? 1 : 0);
-	expect(records.isClean(scope)).toBe(!userHandler);
-});
+				if (userHandler)
+					api.on("agent_start", () => {
+						userStarts++;
+					});
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"sdk-production-observer-replay-test",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+		runner.setAttemptRecordStore(records);
+		expect(runner.hasHandlers("agent_start")).toBe(true);
+		await runner.emit({ type: "agent_start" }, undefined, scope);
+		expect(userStarts).toBe(userHandler ? 1 : 0);
+		expect(records.isClean(scope)).toBe(!userHandler);
+	},
+);

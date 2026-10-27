@@ -1604,33 +1604,36 @@ describe("AgentSession durable default model selection", () => {
 			{ default: "initial-provider/initial:low", planner: "planner/model:medium" },
 		],
 		["no prior session default", undefined, { planner: "planner/model:medium" }],
-	])("restores %s when live apply fails after a partial session mutation", async (_description, previousSessionDefault, previousModelRoles) => {
-		// Given
-		if (previousSessionDefault) {
-			sessionManager.appendModelChange(previousSessionDefault, "default");
-		}
-		settings.set("modelRoles", previousModelRoles);
-		const entriesBeforeSelection = sessionManager.getEntries();
-		const defaultEntriesBeforeSelection = entriesBeforeSelection.filter(
-			entry => entry.type === "model_change" && entry.role === "default",
-		);
-		const liveApplyError = new Error("session promotion failed");
-		failDefaultSelectionPromotion(sessionManager, liveApplyError);
+	])(
+		"restores %s when live apply fails after a partial session mutation",
+		async (_description, previousSessionDefault, previousModelRoles) => {
+			// Given
+			if (previousSessionDefault) {
+				sessionManager.appendModelChange(previousSessionDefault, "default");
+			}
+			settings.set("modelRoles", previousModelRoles);
+			const entriesBeforeSelection = sessionManager.getEntries();
+			const defaultEntriesBeforeSelection = entriesBeforeSelection.filter(
+				entry => entry.type === "model_change" && entry.role === "default",
+			);
+			const liveApplyError = new Error("session promotion failed");
+			failDefaultSelectionPromotion(sessionManager, liveApplyError);
 
-		// When
-		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
+			// When
+			const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
 
-		// Then
-		await expectPostDurableSelectionRecovery(selection, {
-			message: liveApplyError.message,
-			rollback: { disposition: "restored", failures: [] },
-		});
-		expect(settings.getGlobal("modelRoles")).toEqual(previousModelRoles);
-		expect(
-			sessionManager.getEntries().filter(entry => entry.type === "model_change" && entry.role === "default"),
-		).toEqual(defaultEntriesBeforeSelection);
-		expect(sessionManager.buildSessionContext().models.default === previousSessionDefault).toBeTrue();
-	});
+			// Then
+			await expectPostDurableSelectionRecovery(selection, {
+				message: liveApplyError.message,
+				rollback: { disposition: "restored", failures: [] },
+			});
+			expect(settings.getGlobal("modelRoles")).toEqual(previousModelRoles);
+			expect(
+				sessionManager.getEntries().filter(entry => entry.type === "model_change" && entry.role === "default"),
+			).toEqual(defaultEntriesBeforeSelection);
+			expect(sessionManager.buildSessionContext().models.default === previousSessionDefault).toBeTrue();
+		},
+	);
 
 	it.each([
 		["the previous default", { default: "original-provider/original:low", planner: "planner/model:medium" }],

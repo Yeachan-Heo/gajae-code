@@ -69,64 +69,65 @@ describe("broker startup heartbeat budget", () => {
 		}
 	});
 
-	it.each([
-		20_000, 11_200,
-	])("publishes before its %i-ms fence despite repeated checkpoint contention", async startupDeadline => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-heartbeat-budget-"));
-		const index = await new SessionIndex(dir).open();
-		await index.append({
-			type: "host_registered",
-			sessionId: "startup-host",
-			locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
-			endpointGeneration: 1,
-			pid: process.pid,
-		});
-		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
-		let elapsed = 0;
-		let acquisitions = 0;
-		const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsed);
-		const realWithFileLock = lockModule.withFileLock;
-		const locking = vi.spyOn(lockModule, "withFileLock").mockImplementation(async (file, callback, options) => {
-			if (file !== log || !options?.signal) return await realWithFileLock(file, callback, options);
-			const holderMs = [10_000, 10_500][acquisitions++] ?? 0;
-			const waitBudgetMs = (options.retries ?? 600) * (options.retryDelayMs ?? 100);
-			if (holderMs >= waitBudgetMs) {
-				elapsed += waitBudgetMs;
-				throw new lockModule.FileLockAcquireError(file, `${file}.lock`, options.retries ?? 600, "live owner");
-			}
-			return await realWithFileLock(
-				file,
-				async () => {
-					elapsed += holderMs;
-					return await callback();
+	it.each([20_000, 11_200])(
+		"publishes before its %i-ms fence despite repeated checkpoint contention",
+		async startupDeadline => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-heartbeat-budget-"));
+			const index = await new SessionIndex(dir).open();
+			await index.append({
+				type: "host_registered",
+				sessionId: "startup-host",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+			let elapsed = 0;
+			let acquisitions = 0;
+			const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+			const realWithFileLock = lockModule.withFileLock;
+			const locking = vi.spyOn(lockModule, "withFileLock").mockImplementation(async (file, callback, options) => {
+				if (file !== log || !options?.signal) return await realWithFileLock(file, callback, options);
+				const holderMs = [10_000, 10_500][acquisitions++] ?? 0;
+				const waitBudgetMs = (options.retries ?? 600) * (options.retryDelayMs ?? 100);
+				if (holderMs >= waitBudgetMs) {
+					elapsed += waitBudgetMs;
+					throw new lockModule.FileLockAcquireError(file, `${file}.lock`, options.retries ?? 600, "live owner");
+				}
+				return await realWithFileLock(
+					file,
+					async () => {
+						elapsed += holderMs;
+						return await callback();
+					},
+					options,
+				);
+			});
+			let ready = false;
+			const broker = new Broker({
+				agentDir: dir,
+				port: 0,
+				startupCheckpointDeadline: startupDeadline - 1_000,
+				onStartupReady: () => {
+					ready = true;
 				},
-				options,
-			);
-		});
-		let ready = false;
-		const broker = new Broker({
-			agentDir: dir,
-			port: 0,
-			startupCheckpointDeadline: startupDeadline - 1_000,
-			onStartupReady: () => {
-				ready = true;
-			},
-		});
-		try {
-			const discovery = await broker.start();
-			expect(ready).toBe(true);
-			expect(elapsed).toBeLessThan(startupDeadline);
-			expect(acquisitions).toBe(2);
-			expect(discovery.port).toBeGreaterThan(0);
-			expect((await readBrokerDiscovery(dir))?.ownerId).toBe(discovery.ownerId);
-			expect(broker.index.listSessions().sessions[0]?.lastHeartbeatAt).toBeUndefined();
-		} finally {
-			await broker.stop();
-			locking.mockRestore();
-			clock.mockRestore();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
+			});
+			try {
+				const discovery = await broker.start();
+				expect(ready).toBe(true);
+				expect(elapsed).toBeLessThan(startupDeadline);
+				expect(acquisitions).toBe(2);
+				expect(discovery.port).toBeGreaterThan(0);
+				expect((await readBrokerDiscovery(dir))?.ownerId).toBe(discovery.ownerId);
+				expect(broker.index.listSessions().sessions[0]?.lastHeartbeatAt).toBeUndefined();
+			} finally {
+				await broker.stop();
+				locking.mockRestore();
+				clock.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("tears down its transport and discovery after cancellation before retained publication", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-heartbeat-cancel-"));

@@ -174,76 +174,82 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		["tool only", false, false, false],
 		["reasoning and rejected tool", true, true, false],
 		["reasoning and callback abort", true, false, true],
-	] as const)("publishes %s callbacks before done without premature execution", async (_label, reasoning, escaped, abort) => {
-		const executed: Array<Record<string, unknown>> = [];
-		const turn = reasoning ? thinkingToolTurn("tc-streamed", escaped) : literalTurn("tc-streamed");
-		const mock = createMockModel({ responses: [turn, { content: ["done"] }] });
-		const controller = new AbortController();
-		let terminalSent = false;
-		const callbacksBeforeDone: string[] = [];
-		const executionsBeforeDone: number[] = [];
-		const streamFn: typeof mock.stream = (model, context, options) => {
-			const upstream = mock.stream(model, context, options);
-			const live = new AssistantMessageEventStream();
-			void (async () => {
-				for await (const event of upstream) {
-					if (event.type === "done" || event.type === "error") {
-						// Give the consumer a turn while the provider has not yet completed.
-						await Bun.sleep(0);
-						if (!terminalSent) executionsBeforeDone.push(executed.length);
-						terminalSent = true;
+	] as const)(
+		"publishes %s callbacks before done without premature execution",
+		async (_label, reasoning, escaped, abort) => {
+			const executed: Array<Record<string, unknown>> = [];
+			const turn = reasoning ? thinkingToolTurn("tc-streamed", escaped) : literalTurn("tc-streamed");
+			const mock = createMockModel({ responses: [turn, { content: ["done"] }] });
+			const controller = new AbortController();
+			let terminalSent = false;
+			const callbacksBeforeDone: string[] = [];
+			const executionsBeforeDone: number[] = [];
+			const streamFn: typeof mock.stream = (model, context, options) => {
+				const upstream = mock.stream(model, context, options);
+				const live = new AssistantMessageEventStream();
+				void (async () => {
+					for await (const event of upstream) {
+						if (event.type === "done" || event.type === "error") {
+							// Give the consumer a turn while the provider has not yet completed.
+							await Bun.sleep(0);
+							if (!terminalSent) executionsBeforeDone.push(executed.length);
+							terminalSent = true;
+						}
+						live.push(event);
 					}
-					live.push(event);
-				}
-				live.end();
-			})().catch(error => live.fail(error));
-			return live;
-		};
-		const events: AgentEvent[] = [];
-		const stream = agentLoop(
-			[createUserMessage("ask me")],
-			{ systemPrompt: [""], messages: [], tools: [askTool(executed)] },
-			{
-				model: mock,
-				convertToLlm: identityConverter,
-				onAssistantMessageEvent: (_message, event) => {
-					if (!terminalSent) {
-						callbacksBeforeDone.push(event.type);
-						executionsBeforeDone.push(executed.length);
-					}
-					if (abort && event.type === "toolcall_end") controller.abort();
+					live.end();
+				})().catch(error => live.fail(error));
+				return live;
+			};
+			const events: AgentEvent[] = [];
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				{ systemPrompt: [""], messages: [], tools: [askTool(executed)] },
+				{
+					model: mock,
+					convertToLlm: identityConverter,
+					onAssistantMessageEvent: (_message, event) => {
+						if (!terminalSent) {
+							callbacksBeforeDone.push(event.type);
+							executionsBeforeDone.push(executed.length);
+						}
+						if (abort && event.type === "toolcall_end") controller.abort();
+					},
 				},
-			},
-			controller.signal,
-			streamFn,
-		);
-		for await (const event of stream) events.push(event);
-		expect(callbacksBeforeDone).toEqual([
-			...(reasoning ? ["thinking_start", "thinking_delta", "thinking_end"] : []),
-			"toolcall_start",
-			"toolcall_delta",
-			"toolcall_end",
-		]);
-		expect(executionsBeforeDone.every(count => count === 0)).toBe(true);
-		expect(executed).toEqual(escaped || abort ? [] : [{ question: QUESTION }]);
-		const toolEnds = events.filter(
-			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
-		);
-		expect(toolEnds.map(event => [event.toolCallId, event.isError])).toEqual([["tc-streamed", escaped || abort]]);
-		if (escaped) {
-			const first = toolEnds[0]?.result.content[0];
-			expect(first?.type === "text" ? first.text : "").toContain("\\uXXXX");
-		}
-		if (abort) {
-			expect(mock.calls).toHaveLength(1);
-			const terminal = events.findLast(event => event.type === "message_end" && event.message.role === "assistant");
-			expect(
-				terminal?.type === "message_end" && terminal.message.role === "assistant"
-					? terminal.message.stopReason
-					: undefined,
-			).toBe("aborted");
-		}
-	});
+				controller.signal,
+				streamFn,
+			);
+			for await (const event of stream) events.push(event);
+			expect(callbacksBeforeDone).toEqual([
+				...(reasoning ? ["thinking_start", "thinking_delta", "thinking_end"] : []),
+				"toolcall_start",
+				"toolcall_delta",
+				"toolcall_end",
+			]);
+			expect(executionsBeforeDone.every(count => count === 0)).toBe(true);
+			expect(executed).toEqual(escaped || abort ? [] : [{ question: QUESTION }]);
+			const toolEnds = events.filter(
+				(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+					event.type === "tool_execution_end",
+			);
+			expect(toolEnds.map(event => [event.toolCallId, event.isError])).toEqual([["tc-streamed", escaped || abort]]);
+			if (escaped) {
+				const first = toolEnds[0]?.result.content[0];
+				expect(first?.type === "text" ? first.text : "").toContain("\\uXXXX");
+			}
+			if (abort) {
+				expect(mock.calls).toHaveLength(1);
+				const terminal = events.findLast(
+					event => event.type === "message_end" && event.message.role === "assistant",
+				);
+				expect(
+					terminal?.type === "message_end" && terminal.message.role === "assistant"
+						? terminal.message.stopReason
+						: undefined,
+				).toBe("aborted");
+			}
+		},
+	);
 	it("executes canonical valid escapes without a resample, including mutating tools", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const call: ToolCall = {
@@ -1818,48 +1824,51 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		["emoji", String.raw`{"question":"feeling \ud83d\ude00 today?"}`, "feeling 😀 today?"],
 		["en-dash", String.raw`{"question":"range 0\u20131 inclusive?"}`, "range 0–1 inclusive?"],
 		["currency", String.raw`{"question":"price \u20a91,000?"}`, "price ₩1,000?"],
-	])("executes a corroborated escaped %s payload on a display-safe tool with one warning and no resample", async (_label, rawArguments, decodedQuestion) => {
-		const executed: Array<Record<string, unknown>> = [];
-		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
-		const turn = (id: string) => ({
-			content: [
-				{
-					type: "toolCall" as const,
-					id,
-					name: "ask",
-					arguments: { question: decodedQuestion },
-					escapedNonAsciiArguments: true,
-					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
-				},
-			],
-		});
-		const mock = createMockModel({ responses: [turn("tc-1"), { content: ["done"] }] });
-		const warnings: string[] = [];
-		const warn = vi.spyOn(logger, "warn").mockImplementation(message => {
-			warnings.push(message);
-		});
-		try {
-			const stream = agentLoop(
-				[createUserMessage("ask me")],
-				context,
-				{ model: mock, convertToLlm: identityConverter },
-				undefined,
-				mock.stream,
-			);
-			for await (const _event of stream) {
-				// drain
+	])(
+		"executes a corroborated escaped %s payload on a display-safe tool with one warning and no resample",
+		async (_label, rawArguments, decodedQuestion) => {
+			const executed: Array<Record<string, unknown>> = [];
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+			const turn = (id: string) => ({
+				content: [
+					{
+						type: "toolCall" as const,
+						id,
+						name: "ask",
+						arguments: { question: decodedQuestion },
+						escapedNonAsciiArguments: true,
+						escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+					},
+				],
+			});
+			const mock = createMockModel({ responses: [turn("tc-1"), { content: ["done"] }] });
+			const warnings: string[] = [];
+			const warn = vi.spyOn(logger, "warn").mockImplementation(message => {
+				warnings.push(message);
+			});
+			try {
+				const stream = agentLoop(
+					[createUserMessage("ask me")],
+					context,
+					{ model: mock, convertToLlm: identityConverter },
+					undefined,
+					mock.stream,
+				);
+				for await (const _event of stream) {
+					// drain
+				}
+				// Issue #4983 acceptance: the decoded display text executes on the
+				// first wire attempt; exactly one warning, no resample.
+				expect(executed).toEqual([{ question: decodedQuestion }]);
+				expect(mock.calls).toHaveLength(2);
+				expect(warnings).toEqual([
+					"agent: executing a tool-call turn whose display-safe arguments were \\uXXXX-escaped",
+				]);
+			} finally {
+				warn.mockRestore();
 			}
-			// Issue #4983 acceptance: the decoded display text executes on the
-			// first wire attempt; exactly one warning, no resample.
-			expect(executed).toEqual([{ question: decodedQuestion }]);
-			expect(mock.calls).toHaveLength(2);
-			expect(warnings).toEqual([
-				"agent: executing a tool-call turn whose display-safe arguments were \\uXXXX-escaped",
-			]);
-		} finally {
-			warn.mockRestore();
-		}
-	});
+		},
+	);
 
 	it("executes a display-safe escaped turn in managed fallback without reporting the discarded outcome", async () => {
 		const executed: Array<Record<string, unknown>> = [];

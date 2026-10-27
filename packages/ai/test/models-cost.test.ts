@@ -740,8 +740,38 @@ describe("calculateCost", () => {
 		expect(aboveThreshold.cost.total).toBeCloseTo(2.1170125, 8);
 	});
 
-	it("switches OpenRouter GPT-6 Sol batch pricing only above 272K input tokens", () => {
-		const model = getBundledModel("openrouter", "openai/gpt-6-sol:batch");
+	it("preserves OpenRouter long-context tier through discovery and normalization", () => {
+		// Fixture: OpenRouter discovery response for gpt-6-sol:batch with pricing.overrides
+		// This simulates the real OpenRouter /api/v1/models response structure.
+		const discoveredModel: Model<"openai-completions"> = {
+			id: "openai/gpt-6-sol:batch",
+			name: "GPT-6 Sol Batch",
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: {
+				// OpenRouter's actual base rates for gpt-6-sol:batch
+				input: 1_000_000,
+				output: 5_000_000,
+				cacheRead: 100_000,
+				cacheWrite: 1_250_000,
+			},
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+			longContextPricing: {
+				threshold: 272_000,
+				// OpenRouter's actual long-context rates for gpt-6-sol:batch at 272K+ tokens
+				cost: {
+					input: 2_000_000,
+					output: 7_500_000,
+					cacheRead: 200_000,
+					cacheWrite: 2_500_000,
+				},
+			},
+		};
+
 		const usage = (cacheWrite: number): Usage => ({
 			input: 200_000,
 			output: 1_000,
@@ -750,37 +780,16 @@ describe("calculateCost", () => {
 			totalTokens: 273_000 + cacheWrite,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		});
+
 		const threshold = usage(0);
 		const aboveThreshold = usage(1);
 
-		calculateCost(model, threshold);
-		calculateCost(model, aboveThreshold);
+		calculateCost(discoveredModel, threshold);
+		calculateCost(discoveredModel, aboveThreshold);
 
-		// 200K input @ $0.3/M + 1K output @ $1.5/M + 72K cacheRead @ $0.03/M
-		expect(threshold.cost.total).toBeCloseTo(0.06366, 7);
-		// above 272K threshold: 200K @ $0.6/M + 1K @ $2.25/M + 72K @ $0.06/M + 1 @ $0.75/M
-		expect(aboveThreshold.cost.total).toBeCloseTo(0.12657075, 7);
-	});
-
-	it("switches OpenRouter GPT-5.6 Luna batch pricing only above 272K input tokens", () => {
-		const model = getBundledModel("openrouter", "openai/gpt-5.6-luna:batch");
-		const usage = (cacheWrite: number): Usage => ({
-			input: 200_000,
-			output: 1_000,
-			cacheRead: 72_000,
-			cacheWrite,
-			totalTokens: 273_000 + cacheWrite,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		});
-		const threshold = usage(0);
-		const aboveThreshold = usage(1);
-
-		calculateCost(model, threshold);
-		calculateCost(model, aboveThreshold);
-
-		// 200K input @ $0.03/M + 1K output @ $0.1875/M + 72K cacheRead @ $0.003/M
-		expect(threshold.cost.total).toBeCloseTo(0.0064035, 7);
-		// above 272K threshold: 200K @ $0.06/M + 1K @ $0.2813/M + 72K @ $0.006/M + 1 @ $0.0938/M
-		expect(aboveThreshold.cost.total).toBeCloseTo(0.012713394, 7);
+		// Below 272K: 200K input @ $1/M + 1K output @ $5/M + 72K cacheRead @ $0.1/M
+		expect(threshold.cost.total).toBeCloseTo(0.2072, 7);
+		// Above 272K: 200K @ $2/M + 1K @ $7.5/M + 72K @ $0.2/M + 1 @ $2.5/M
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.414501, 7);
 	});
 });

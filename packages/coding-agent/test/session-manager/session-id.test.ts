@@ -530,58 +530,58 @@ describe("authenticated generic rollback", () => {
 		}
 	});
 
-	it.each([
-		"clone",
-		"id",
-		"file",
-		"managed-identity",
-		"adopted-manager",
-		"header",
-		"cold-file",
-	] as const)("rollback rejects %s snapshot substitution without changing the active session", async alteration => {
-		using root = TempDir.createSync("gjc-rollback-auth-");
-		const session = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
-		const borrowed = new ArtifactManager(path.join(root.path(), "borrowed"));
-		try {
-			session.appendMessage({ role: "user", content: "predecessor", timestamp: 1 });
-			await session.ensureOnDisk();
-			session.adoptArtifactManager(borrowed);
-			let snapshot = await session.captureRollbackState();
-			await session.newSession();
-			session.appendMessage({ role: "user", content: "successor", timestamp: 2 });
-			await session.ensureOnDisk();
-			const activeId = session.getSessionId();
-			const activeFile = session.getSessionFile();
-			if (!activeFile) throw new Error("Expected active transcript");
-			const activeBytes = await Bun.file(activeFile).text();
-			const activeManager = session.getArtifactManager();
-			if (alteration === "clone") snapshot = { ...snapshot };
-			else if (alteration === "id") snapshot.sessionId = activeId;
-			else if (alteration === "file") snapshot.sessionFile = activeFile;
-			else if (alteration === "managed-identity") {
-				if (!snapshot.managedPersistExpectedIdentity) throw new Error("Expected managed identity");
-				snapshot.managedPersistExpectedIdentity.ino += 1n;
-			} else if (alteration === "adopted-manager") {
-				snapshot.adoptedArtifactManager = new ArtifactManager(borrowed.dir);
-			} else if (alteration === "cold-file") snapshot.coldRestoreFile = activeFile;
-			else {
-				const header = snapshot.materializedFileEntries.find(entry => entry.type === "session");
-				if (!header) throw new Error("Expected rollback header");
-				header.id = activeId;
+	it.each(["clone", "id", "file", "managed-identity", "adopted-manager", "header", "cold-file"] as const)(
+		"rollback rejects %s snapshot substitution without changing the active session",
+		async alteration => {
+			using root = TempDir.createSync("gjc-rollback-auth-");
+			const session = SessionManager.create(
+				root.path(),
+				SessionManager.managedDestination(root.path(), root.path()),
+			);
+			const borrowed = new ArtifactManager(path.join(root.path(), "borrowed"));
+			try {
+				session.appendMessage({ role: "user", content: "predecessor", timestamp: 1 });
+				await session.ensureOnDisk();
+				session.adoptArtifactManager(borrowed);
+				let snapshot = await session.captureRollbackState();
+				await session.newSession();
+				session.appendMessage({ role: "user", content: "successor", timestamp: 2 });
+				await session.ensureOnDisk();
+				const activeId = session.getSessionId();
+				const activeFile = session.getSessionFile();
+				if (!activeFile) throw new Error("Expected active transcript");
+				const activeBytes = await Bun.file(activeFile).text();
+				const activeManager = session.getArtifactManager();
+				if (alteration === "clone") snapshot = { ...snapshot };
+				else if (alteration === "id") snapshot.sessionId = activeId;
+				else if (alteration === "file") snapshot.sessionFile = activeFile;
+				else if (alteration === "managed-identity") {
+					if (!snapshot.managedPersistExpectedIdentity) throw new Error("Expected managed identity");
+					snapshot.managedPersistExpectedIdentity.ino += 1n;
+				} else if (alteration === "adopted-manager") {
+					snapshot.adoptedArtifactManager = new ArtifactManager(borrowed.dir);
+				} else if (alteration === "cold-file") snapshot.coldRestoreFile = activeFile;
+				else {
+					const header = snapshot.materializedFileEntries.find(entry => entry.type === "session");
+					if (!header) throw new Error("Expected rollback header");
+					header.id = activeId;
+				}
+				// The rollback lane owns snapshot authority; the generic adoption lane
+				// (`restoreState`) is caller-driven state and accepts copies, so it is
+				// covered by its own live-state assertions instead.
+				await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("not authentic");
+				expect(session.getSessionId()).toBe(activeId);
+				expect(session.getSessionFile()).toBe(activeFile);
+				expect(session.getArtifactManager()).toBe(activeManager);
+				expect(await Bun.file(activeFile).text()).toBe(activeBytes);
+				expect(session.buildSessionContext().messages).toEqual([
+					{ role: "user", content: "successor", timestamp: 2 },
+				]);
+			} finally {
+				await session.close();
 			}
-			// The rollback lane owns snapshot authority; the generic adoption lane
-			// (`restoreState`) is caller-driven state and accepts copies, so it is
-			// covered by its own live-state assertions instead.
-			await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("not authentic");
-			expect(session.getSessionId()).toBe(activeId);
-			expect(session.getSessionFile()).toBe(activeFile);
-			expect(session.getArtifactManager()).toBe(activeManager);
-			expect(await Bun.file(activeFile).text()).toBe(activeBytes);
-			expect(session.buildSessionContext().messages).toEqual([{ role: "user", content: "successor", timestamp: 2 }]);
-		} finally {
-			await session.close();
-		}
-	});
+		},
+	);
 
 	it("rejects nested message and custom-entry edits without aliasing the live transcript", async () => {
 		using root = TempDir.createSync("gjc-rollback-nested-edit-");
@@ -974,47 +974,50 @@ describe("authenticated generic rollback", () => {
 		}
 	});
 
-	it.each([
-		"invalid-utf8",
-		"mismatched-id",
-	] as const)("rejects explicit rollback capture with %s header", async alteration => {
-		using root = TempDir.createSync("gjc-explicit-header-rollback-invalid-");
-		const storage = new FileSessionStorage();
-		const seed = SessionManager.create(root.path(), root.path(), storage);
-		let session: SessionManager | undefined;
-		try {
-			seed.appendMessage({ role: "user", content: "header identity", timestamp: 1 });
-			await seed.ensureOnDisk();
-			const file = seed.getSessionFile();
-			if (!file) throw new Error("Expected explicit transcript");
-			await seed.close();
-			session = await SessionManager.open(file, root.path(), storage, "copy-retain", "shadow");
-			const originalBytes = fsSync.readFileSync(file);
-			if (alteration === "invalid-utf8") {
-				const headerType = originalBytes.indexOf(Buffer.from('"session"'));
-				if (headerType < 0) throw new Error("Expected JSON session header");
-				originalBytes[headerType + 1] = 0xff;
-				fsSync.writeFileSync(file, originalBytes);
-			} else {
-				const newline = originalBytes.indexOf(0x0a);
-				if (newline < 0) throw new Error("Expected header record terminator");
-				const header = JSON.parse(originalBytes.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
-				header.id = `${String(header.id)}-replacement`;
-				fsSync.writeFileSync(
-					file,
-					Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), originalBytes.subarray(newline + 1)]),
-				);
+	it.each(["invalid-utf8", "mismatched-id"] as const)(
+		"rejects explicit rollback capture with %s header",
+		async alteration => {
+			using root = TempDir.createSync("gjc-explicit-header-rollback-invalid-");
+			const storage = new FileSessionStorage();
+			const seed = SessionManager.create(root.path(), root.path(), storage);
+			let session: SessionManager | undefined;
+			try {
+				seed.appendMessage({ role: "user", content: "header identity", timestamp: 1 });
+				await seed.ensureOnDisk();
+				const file = seed.getSessionFile();
+				if (!file) throw new Error("Expected explicit transcript");
+				await seed.close();
+				session = await SessionManager.open(file, root.path(), storage, "copy-retain", "shadow");
+				const originalBytes = fsSync.readFileSync(file);
+				if (alteration === "invalid-utf8") {
+					const headerType = originalBytes.indexOf(Buffer.from('"session"'));
+					if (headerType < 0) throw new Error("Expected JSON session header");
+					originalBytes[headerType + 1] = 0xff;
+					fsSync.writeFileSync(file, originalBytes);
+				} else {
+					const newline = originalBytes.indexOf(0x0a);
+					if (newline < 0) throw new Error("Expected header record terminator");
+					const header = JSON.parse(originalBytes.subarray(0, newline).toString("utf8")) as Record<
+						string,
+						unknown
+					>;
+					header.id = `${String(header.id)}-replacement`;
+					fsSync.writeFileSync(
+						file,
+						Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), originalBytes.subarray(newline + 1)]),
+					);
+				}
+				if (alteration === "invalid-utf8") {
+					expect(() => session!.captureState()).toThrow("persistence identity is unavailable");
+				} else {
+					await expect(session.captureRollbackState()).rejects.toThrow("persistence identity is unavailable");
+				}
+			} finally {
+				await session?.close();
+				await seed.close();
 			}
-			if (alteration === "invalid-utf8") {
-				expect(() => session!.captureState()).toThrow("persistence identity is unavailable");
-			} else {
-				await expect(session.captureRollbackState()).rejects.toThrow("persistence identity is unavailable");
-			}
-		} finally {
-			await session?.close();
-			await seed.close();
-		}
-	});
+		},
+	);
 
 	it.each(["at-limit", "over-limit"] as const)("bounds explicit rollback header lines %s", async boundary => {
 		using root = TempDir.createSync("gjc-explicit-header-rollback-prefix-");

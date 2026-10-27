@@ -276,45 +276,48 @@ describe("interactive /fork prompt selector", () => {
 		["first", 2, "prompt-1", 0],
 		["middle", 1, "prompt-2", 2],
 		["latest", 0, "prompt-3", 4],
-	] as const)("selecting the %s prompt persists an independent resumable predecessor and restores a draft", async (_label, up, selected, keptMessages) => {
-		const harness = await createHarness();
-		const parentFile = harness.session.sessionFile;
-		if (!parentFile) throw new Error("Expected persisted parent");
-		const parentBytes = fs.readFileSync(parentFile);
-		const promptSpy = vi.spyOn(harness.session, "prompt");
-		await dispatchFork(harness);
-		const list = visibleSelector(harness).getMessageList();
-		for (let index = 0; index < up; index++) list.handleInput("\x1b[A");
-		list.handleInput("\r");
-		await waitForSelectorClosed(harness);
+	] as const)(
+		"selecting the %s prompt persists an independent resumable predecessor and restores a draft",
+		async (_label, up, selected, keptMessages) => {
+			const harness = await createHarness();
+			const parentFile = harness.session.sessionFile;
+			if (!parentFile) throw new Error("Expected persisted parent");
+			const parentBytes = fs.readFileSync(parentFile);
+			const promptSpy = vi.spyOn(harness.session, "prompt");
+			await dispatchFork(harness);
+			const list = visibleSelector(harness).getMessageList();
+			for (let index = 0; index < up; index++) list.handleInput("\x1b[A");
+			list.handleInput("\r");
+			await waitForSelectorClosed(harness);
 
-		const childFile = harness.session.sessionFile;
-		if (!childFile) throw new Error("Expected persisted child");
-		expect(childFile).not.toBe(parentFile);
-		expect(fs.readFileSync(parentFile)).toEqual(parentBytes);
-		expect(harness.session.messages).toHaveLength(keptMessages);
-		expect(harness.editorContainer.children).toEqual([harness.editor]);
-		expect(harness.editor.getText()).toBe(selected);
-		expect(promptSpy).not.toHaveBeenCalled();
-		expect(harness.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
-		expect(harness.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
-		expect(harness.ctx.resetObserverRegistry).toHaveBeenCalledTimes(1);
-		expect(harness.ctx.reloadTodos).toHaveBeenCalledTimes(1);
-		expect(harness.ctx.statusLine.setSessionStartTime).toHaveBeenCalledWith(expect.any(Number));
-		expect(titleGenerator.setSessionTerminalTitle).toHaveBeenLastCalledWith(
-			harness.sessionManager.getSessionName(),
-			harness.sessionManager.getCwd(),
-		);
-		expect(harness.committedUiCleanup).toHaveBeenCalledTimes(1);
-		expect(harness.scheduleGoalContinuation).not.toHaveBeenCalled();
+			const childFile = harness.session.sessionFile;
+			if (!childFile) throw new Error("Expected persisted child");
+			expect(childFile).not.toBe(parentFile);
+			expect(fs.readFileSync(parentFile)).toEqual(parentBytes);
+			expect(harness.session.messages).toHaveLength(keptMessages);
+			expect(harness.editorContainer.children).toEqual([harness.editor]);
+			expect(harness.editor.getText()).toBe(selected);
+			expect(promptSpy).not.toHaveBeenCalled();
+			expect(harness.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+			expect(harness.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
+			expect(harness.ctx.resetObserverRegistry).toHaveBeenCalledTimes(1);
+			expect(harness.ctx.reloadTodos).toHaveBeenCalledTimes(1);
+			expect(harness.ctx.statusLine.setSessionStartTime).toHaveBeenCalledWith(expect.any(Number));
+			expect(titleGenerator.setSessionTerminalTitle).toHaveBeenLastCalledWith(
+				harness.sessionManager.getSessionName(),
+				harness.sessionManager.getCwd(),
+			);
+			expect(harness.committedUiCleanup).toHaveBeenCalledTimes(1);
+			expect(harness.scheduleGoalContinuation).not.toHaveBeenCalled();
 
-		const resumed = await SessionManager.open(childFile, harness.tempDir);
-		try {
-			expect(resumed.getEntries().filter(entry => entry.type === "message")).toHaveLength(keptMessages);
-		} finally {
-			await resumed.close();
-		}
-	});
+			const resumed = await SessionManager.open(childFile, harness.tempDir);
+			try {
+				expect(resumed.getEntries().filter(entry => entry.type === "message")).toHaveLength(keptMessages);
+			} finally {
+				await resumed.close();
+			}
+		},
+	);
 
 	it("refreshes the todo panel from the child rather than retaining parent-only tasks", async () => {
 		const harness = await createHarness();
@@ -470,153 +473,151 @@ describe("interactive /fork prompt selector", () => {
 		expect(titleGenerator.setSessionTerminalTitle).not.toHaveBeenCalled();
 	});
 
-	it.each([
-		"MCP restoration",
-		"tool cleanup",
-	] as const)("reconciles the durable child when real branch lifecycle fails during %s", async failurePoint => {
-		const harness = await createHarness({ mcpDiscoveryEnabled: failurePoint === "MCP restoration" });
-		attachExactMcpControls(harness.session, {
-			grantSource: "root-interactive-exact-config",
-			configPath: path.join(harness.tempDir, "mcp.json"),
-		});
-		let mcpMetadataVisible = true;
-		const refreshSlashCommandState = vi
-			.spyOn(harness.ctx, "refreshSlashCommandState")
-			.mockImplementation(async () => {
-				mcpMetadataVisible = harness.session.hasExactMcpControls;
+	it.each(["MCP restoration", "tool cleanup"] as const)(
+		"reconciles the durable child when real branch lifecycle fails during %s",
+		async failurePoint => {
+			const harness = await createHarness({ mcpDiscoveryEnabled: failurePoint === "MCP restoration" });
+			attachExactMcpControls(harness.session, {
+				grantSource: "root-interactive-exact-config",
+				configPath: path.join(harness.tempDir, "mcp.json"),
 			});
-		const parentFile = harness.session.sessionFile!;
-		const parentId = harness.sessionManager.getSessionId();
-		const parentBytes = fs.readFileSync(parentFile);
-		harness.session.agent.replaceMessages(harness.sessionManager.buildSessionContext().messages);
-		const branch = vi.spyOn(harness.session, "branch");
-		const prompt = vi.spyOn(harness.session, "prompt");
-		let unregister = () => {};
-		if (failurePoint === "MCP restoration") {
-			// This public query is called by the real MCP selection restoration
-			// path before it applies the restored tool selection.
-			vi.spyOn(harness.session, "getActiveToolNames").mockImplementationOnce(() => {
-				throw new Error("MCP selection restore failed");
-			});
-		} else {
-			unregister = harness.session.registerToolSessionTransitionCleanup(() => {
-				throw new Error("tool cleanup failed");
-			});
-		}
-		let renderedMessages = -1;
-		let observedFile: string | undefined;
-		let todoFile: string | undefined;
-		harness.ctx.rebuildInitialMessages = vi.fn(() => {
-			renderedMessages = harness.sessionManager.buildSessionContext().messages.length;
-		});
-		harness.ctx.resetObserverRegistry = () => {
-			observedFile = harness.sessionManager.getSessionFile();
-		};
-		harness.ctx.reloadTodos = async () => {
-			todoFile = harness.sessionManager.getSessionFile();
-		};
-		try {
-			await dispatchFork(harness);
-			visibleSelector(harness).getMessageList().handleInput("\r");
-			await waitForSelectorClosed(harness);
-
-			const childFile = harness.session.sessionFile!;
-			expect(branch).toHaveBeenCalledTimes(1);
-			expect(childFile).not.toBe(parentFile);
-			expect(harness.sessionManager.getSessionId()).not.toBe(parentId);
-			expect(fs.readFileSync(parentFile)).toEqual(parentBytes);
-			expect(harness.session.agent.sessionId).toBe(harness.sessionManager.getSessionId());
-			expect(harness.session.messages).toEqual(harness.sessionManager.buildSessionContext().messages);
-			expect(harness.session.messages).toHaveLength(4);
-			expect(renderedMessages).toBe(4);
-			expect(observedFile).toBe(childFile);
-			expect(todoFile).toBe(childFile);
-			expect(harness.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
-			expect(harness.committedUiCleanup).toHaveBeenCalledTimes(1);
-			expect(harness.ctx.statusLine.setSessionStartTime).toHaveBeenCalledTimes(1);
-			expect(titleGenerator.setSessionTerminalTitle).toHaveBeenLastCalledWith(
-				harness.sessionManager.getSessionName(),
-				harness.sessionManager.getCwd(),
-			);
-			expect(harness.editor.getText()).toBe("prompt-3");
-			expect(prompt).not.toHaveBeenCalled();
-			expect(harness.scheduleGoalContinuation).not.toHaveBeenCalled();
-			expect(harness.errors.join("\n")).toContain("Fork created, but session setup failed");
-			expect(harness.errors.join("\n")).toContain(
-				failurePoint === "MCP restoration"
-					? "MCP selection restore failed"
-					: "Tool session transition cleanup failed",
-			);
-			expect(harness.session.hasExactMcpControls).toBe(false);
-			expect(mcpMetadataVisible).toBe(false);
-			expect(refreshSlashCommandState).toHaveBeenCalledTimes(1);
-			const resumed = await SessionManager.open(childFile, harness.tempDir);
-			try {
-				expect(resumed.buildSessionContext().messages).toHaveLength(4);
-			} finally {
-				await resumed.close();
+			let mcpMetadataVisible = true;
+			const refreshSlashCommandState = vi
+				.spyOn(harness.ctx, "refreshSlashCommandState")
+				.mockImplementation(async () => {
+					mcpMetadataVisible = harness.session.hasExactMcpControls;
+				});
+			const parentFile = harness.session.sessionFile!;
+			const parentId = harness.sessionManager.getSessionId();
+			const parentBytes = fs.readFileSync(parentFile);
+			harness.session.agent.replaceMessages(harness.sessionManager.buildSessionContext().messages);
+			const branch = vi.spyOn(harness.session, "branch");
+			const prompt = vi.spyOn(harness.session, "prompt");
+			let unregister = () => {};
+			if (failurePoint === "MCP restoration") {
+				// This public query is called by the real MCP selection restoration
+				// path before it applies the restored tool selection.
+				vi.spyOn(harness.session, "getActiveToolNames").mockImplementationOnce(() => {
+					throw new Error("MCP selection restore failed");
+				});
+			} else {
+				unregister = harness.session.registerToolSessionTransitionCleanup(() => {
+					throw new Error("tool cleanup failed");
+				});
 			}
-		} finally {
-			unregister();
-		}
-	});
+			let renderedMessages = -1;
+			let observedFile: string | undefined;
+			let todoFile: string | undefined;
+			harness.ctx.rebuildInitialMessages = vi.fn(() => {
+				renderedMessages = harness.sessionManager.buildSessionContext().messages.length;
+			});
+			harness.ctx.resetObserverRegistry = () => {
+				observedFile = harness.sessionManager.getSessionFile();
+			};
+			harness.ctx.reloadTodos = async () => {
+				todoFile = harness.sessionManager.getSessionFile();
+			};
+			try {
+				await dispatchFork(harness);
+				visibleSelector(harness).getMessageList().handleInput("\r");
+				await waitForSelectorClosed(harness);
 
-	it.each([
-		"escape",
-		"hook cancellation",
-		"failure",
-		"stopped",
-	] as const)("closes BTW before the picker owns the composer on %s", async outcome => {
-		const harness = await createHarness();
-		const parentFile = harness.session.sessionFile;
-		let active = true;
-		harness.editor.setText("private side-chat draft");
-		harness.ctx.hasActiveBtw = () => active;
-		const closeBtw = vi.fn(() => {
-			active = false;
-			harness.editor.setText("");
-			return true;
-		});
-		harness.ctx.handleBtwEscape = closeBtw;
-		const gate = Promise.withResolvers<{ selectedText: string; cancelled: boolean }>();
-		const branch = vi.spyOn(harness.session, "branch").mockReturnValue(gate.promise);
-		await dispatchFork(harness);
-		expect(closeBtw).toHaveBeenCalledTimes(1);
-		expect(active).toBe(false);
-		expect(harness.editor.getText()).toBe("");
-		const list = visibleSelector(harness).getMessageList();
-		if (outcome === "escape") {
-			list.handleInput("\x1b");
-			expect(branch).not.toHaveBeenCalled();
-		} else {
-			list.handleInput("\r");
-			if (outcome === "stopped") harness.ctx.isStopped = () => true;
-			if (outcome === "failure") gate.reject(new Error("branch failed"));
-			else gate.resolve({ selectedText: "prompt-3", cancelled: true });
-			if (outcome !== "stopped") await waitForSelectorClosed(harness);
-			else await Promise.resolve();
-		}
-		expect(closeBtw).toHaveBeenCalledTimes(1);
-		expect(harness.session.sessionFile).toBe(parentFile);
-		expect(harness.resetIrcSidebarSession).not.toHaveBeenCalled();
-		expect(harness.committedUiCleanup).not.toHaveBeenCalled();
-	});
+				const childFile = harness.session.sessionFile!;
+				expect(branch).toHaveBeenCalledTimes(1);
+				expect(childFile).not.toBe(parentFile);
+				expect(harness.sessionManager.getSessionId()).not.toBe(parentId);
+				expect(fs.readFileSync(parentFile)).toEqual(parentBytes);
+				expect(harness.session.agent.sessionId).toBe(harness.sessionManager.getSessionId());
+				expect(harness.session.messages).toEqual(harness.sessionManager.buildSessionContext().messages);
+				expect(harness.session.messages).toHaveLength(4);
+				expect(renderedMessages).toBe(4);
+				expect(observedFile).toBe(childFile);
+				expect(todoFile).toBe(childFile);
+				expect(harness.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+				expect(harness.committedUiCleanup).toHaveBeenCalledTimes(1);
+				expect(harness.ctx.statusLine.setSessionStartTime).toHaveBeenCalledTimes(1);
+				expect(titleGenerator.setSessionTerminalTitle).toHaveBeenLastCalledWith(
+					harness.sessionManager.getSessionName(),
+					harness.sessionManager.getCwd(),
+				);
+				expect(harness.editor.getText()).toBe("prompt-3");
+				expect(prompt).not.toHaveBeenCalled();
+				expect(harness.scheduleGoalContinuation).not.toHaveBeenCalled();
+				expect(harness.errors.join("\n")).toContain("Fork created, but session setup failed");
+				expect(harness.errors.join("\n")).toContain(
+					failurePoint === "MCP restoration"
+						? "MCP selection restore failed"
+						: "Tool session transition cleanup failed",
+				);
+				expect(harness.session.hasExactMcpControls).toBe(false);
+				expect(mcpMetadataVisible).toBe(false);
+				expect(refreshSlashCommandState).toHaveBeenCalledTimes(1);
+				const resumed = await SessionManager.open(childFile, harness.tempDir);
+				try {
+					expect(resumed.buildSessionContext().messages).toHaveLength(4);
+				} finally {
+					await resumed.close();
+				}
+			} finally {
+				unregister();
+			}
+		},
+	);
 
-	it.each([
-		"builtin",
-		"shared picker",
-	] as const)("rejects ephemeral sessions through %s without closing BTW", async entrypoint => {
-		const harness = await createHarness({ persisted: false });
-		harness.ctx.hasActiveBtw = () => true;
-		harness.editor.setText("side-chat draft");
-		if (entrypoint === "builtin") await dispatchFork(harness);
-		else harness.ctx.showUserMessageSelector();
-		expect(harness.errors).toEqual(["Fork requires a persisted session"]);
-		expect(harness.ctx.handleBtwEscape).not.toHaveBeenCalled();
-		expect(harness.editor.getText()).toBe(entrypoint === "builtin" ? "" : "side-chat draft");
-		expect(harness.editorContainer.children).toEqual([harness.editor]);
-		expect(harness.cancelGoalContinuation).not.toHaveBeenCalled();
-	});
+	it.each(["escape", "hook cancellation", "failure", "stopped"] as const)(
+		"closes BTW before the picker owns the composer on %s",
+		async outcome => {
+			const harness = await createHarness();
+			const parentFile = harness.session.sessionFile;
+			let active = true;
+			harness.editor.setText("private side-chat draft");
+			harness.ctx.hasActiveBtw = () => active;
+			const closeBtw = vi.fn(() => {
+				active = false;
+				harness.editor.setText("");
+				return true;
+			});
+			harness.ctx.handleBtwEscape = closeBtw;
+			const gate = Promise.withResolvers<{ selectedText: string; cancelled: boolean }>();
+			const branch = vi.spyOn(harness.session, "branch").mockReturnValue(gate.promise);
+			await dispatchFork(harness);
+			expect(closeBtw).toHaveBeenCalledTimes(1);
+			expect(active).toBe(false);
+			expect(harness.editor.getText()).toBe("");
+			const list = visibleSelector(harness).getMessageList();
+			if (outcome === "escape") {
+				list.handleInput("\x1b");
+				expect(branch).not.toHaveBeenCalled();
+			} else {
+				list.handleInput("\r");
+				if (outcome === "stopped") harness.ctx.isStopped = () => true;
+				if (outcome === "failure") gate.reject(new Error("branch failed"));
+				else gate.resolve({ selectedText: "prompt-3", cancelled: true });
+				if (outcome !== "stopped") await waitForSelectorClosed(harness);
+				else await Promise.resolve();
+			}
+			expect(closeBtw).toHaveBeenCalledTimes(1);
+			expect(harness.session.sessionFile).toBe(parentFile);
+			expect(harness.resetIrcSidebarSession).not.toHaveBeenCalled();
+			expect(harness.committedUiCleanup).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(["builtin", "shared picker"] as const)(
+		"rejects ephemeral sessions through %s without closing BTW",
+		async entrypoint => {
+			const harness = await createHarness({ persisted: false });
+			harness.ctx.hasActiveBtw = () => true;
+			harness.editor.setText("side-chat draft");
+			if (entrypoint === "builtin") await dispatchFork(harness);
+			else harness.ctx.showUserMessageSelector();
+			expect(harness.errors).toEqual(["Fork requires a persisted session"]);
+			expect(harness.ctx.handleBtwEscape).not.toHaveBeenCalled();
+			expect(harness.editor.getText()).toBe(entrypoint === "builtin" ? "" : "side-chat draft");
+			expect(harness.editorContainer.children).toEqual([harness.editor]);
+			expect(harness.cancelGoalContinuation).not.toHaveBeenCalled();
+		},
+	);
 
 	it("detaches all captured parent UI despite throwing disposers and preserves child replacements", async () => {
 		const harness = await createHarness();

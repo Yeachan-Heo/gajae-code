@@ -729,48 +729,47 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		expect(await server.sessionReaper.sweepOnce()).toBe(0);
 	});
 
-	it.each([
-		"ordinary-close",
-		"foreign-session",
-		"authority-changed",
-	])("retains durable state when the eviction fence returns %s instead of retirement proof", async response => {
-		const root = await tempRoot();
-		const sessionId = "unproven-retirement";
-		const { server, controls, registryFile, sessionFile } = await createServer(root, {
-			brokerSessionsOverride: async () => [],
-			closeHandler: async () => {
-				if (response === "authority-changed")
-					return { ok: false, error: { code: "endpoint_stale", message: "authority changed" } };
-				if (response === "foreign-session")
-					return { ok: true, result: { sessionId: "foreign-session", retired: true } };
-				return { ok: true, result: { sessionId } };
-			},
-		});
-		await writeSession(sessionFile(sessionId), root, sessionId, { ephemeral: true });
-		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
-		const before = await readSessionTransaction(paths, sessionId);
-		const deliveryIds = Object.keys(before!.outbox);
-		expect(deliveryIds.length).toBeGreaterThan(0);
+	it.each(["ordinary-close", "foreign-session", "authority-changed"])(
+		"retains durable state when the eviction fence returns %s instead of retirement proof",
+		async response => {
+			const root = await tempRoot();
+			const sessionId = "unproven-retirement";
+			const { server, controls, registryFile, sessionFile } = await createServer(root, {
+				brokerSessionsOverride: async () => [],
+				closeHandler: async () => {
+					if (response === "authority-changed")
+						return { ok: false, error: { code: "endpoint_stale", message: "authority changed" } };
+					if (response === "foreign-session")
+						return { ok: true, result: { sessionId: "foreign-session", retired: true } };
+					return { ok: true, result: { sessionId } };
+				},
+			});
+			await writeSession(sessionFile(sessionId), root, sessionId, { ephemeral: true });
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			const before = await readSessionTransaction(paths, sessionId);
+			const deliveryIds = Object.keys(before!.outbox);
+			expect(deliveryIds.length).toBeGreaterThan(0);
 
-		// Cross the eviction boundary twice: an unproven close must never
-		// authorize deletion, even after repeated stale observations.
-		for (let i = 0; i < MAX_REAP_FAILURES * 2; i++) await server.sessionReaper.sweepOnce();
+			// Cross the eviction boundary twice: an unproven close must never
+			// authorize deletion, even after repeated stale observations.
+			for (let i = 0; i < MAX_REAP_FAILURES * 2; i++) await server.sessionReaper.sweepOnce();
 
-		expect(controls.filter(control => control.input.forceRetireStale === true)).toHaveLength(2);
-		expect(await Bun.file(sessionFile(sessionId)).exists()).toBe(true);
-		const after = await readSessionTransaction(paths, sessionId);
-		if (!before?.endpoint || !after?.endpoint)
-			throw new Error("Expected endpoint authority before and after refused retirement");
-		expect(after.endpoint.incarnation).toBe(before.endpoint.incarnation);
-		for (const id of deliveryIds) {
-			expect(after?.outbox[id]?.public_event_id).toBe(before!.outbox[id]!.public_event_id);
-			expect(after?.outbox[id]?.public_delivery).toBeDefined();
-		}
-		const registry = JSON.parse(await fs.readFile(registryFile, "utf8")) as {
-			deletions: Record<string, { session_id: string }>;
-		};
-		expect(Object.values(registry.deletions).filter(entry => entry.session_id === sessionId)).toEqual([]);
-	});
+			expect(controls.filter(control => control.input.forceRetireStale === true)).toHaveLength(2);
+			expect(await Bun.file(sessionFile(sessionId)).exists()).toBe(true);
+			const after = await readSessionTransaction(paths, sessionId);
+			if (!before?.endpoint || !after?.endpoint)
+				throw new Error("Expected endpoint authority before and after refused retirement");
+			expect(after.endpoint.incarnation).toBe(before.endpoint.incarnation);
+			for (const id of deliveryIds) {
+				expect(after?.outbox[id]?.public_event_id).toBe(before!.outbox[id]!.public_event_id);
+				expect(after?.outbox[id]?.public_delivery).toBeDefined();
+			}
+			const registry = JSON.parse(await fs.readFile(registryFile, "utf8")) as {
+				deletions: Record<string, { session_id: string }>;
+			};
+			expect(Object.values(registry.deletions).filter(entry => entry.session_id === sessionId)).toEqual([]);
+		},
+	);
 
 	it("reuses the close idempotency key when the idle reaper retries", async () => {
 		const root = await tempRoot();

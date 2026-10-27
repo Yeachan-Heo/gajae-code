@@ -43,39 +43,39 @@ it("throws the typed pre-write rejection when the append expectation no longer m
 	}
 });
 
-it.each([
-	false,
-	true,
-])("disposes a rejected append without rewriting the winner (flush first: %s)", async flushFirst => {
-	const root = await makeRoot();
-	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
-	const auth = await AuthStorage.create(path.join(root, "auth.db"));
-	const session = new AgentSession({
-		agent: new Agent(),
-		sessionManager: manager,
-		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: new ModelRegistry(auth, path.join(root, "models.yml")),
-	});
-	try {
-		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
-		await manager.ensureOnDisk();
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Missing transcript");
-		const winner = await Bun.file(file).text();
-		await Bun.write(`${file}.successor`, winner);
-		await fs.rename(`${file}.successor`, file);
-		expect(() => manager.appendMessage({ role: "user", content: "loser", timestamp: 2 })).toThrow(
-			ManagedAppendIdentityMismatchError,
-		);
-		if (flushFirst) expect(await manager.flushAndCloseStrict()).toEqual({ kind: "closed" });
-		await expect(session.dispose()).resolves.toBeUndefined();
-		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
-		expect(await Bun.file(file).text()).toBe(winner);
-	} finally {
-		await session.dispose();
-		auth.close();
-	}
-});
+it.each([false, true])(
+	"disposes a rejected append without rewriting the winner (flush first: %s)",
+	async flushFirst => {
+		const root = await makeRoot();
+		const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
+		const auth = await AuthStorage.create(path.join(root, "auth.db"));
+		const session = new AgentSession({
+			agent: new Agent(),
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(auth, path.join(root, "models.yml")),
+		});
+		try {
+			manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+			await manager.ensureOnDisk();
+			const file = manager.getSessionFile();
+			if (!file) throw new Error("Missing transcript");
+			const winner = await Bun.file(file).text();
+			await Bun.write(`${file}.successor`, winner);
+			await fs.rename(`${file}.successor`, file);
+			expect(() => manager.appendMessage({ role: "user", content: "loser", timestamp: 2 })).toThrow(
+				ManagedAppendIdentityMismatchError,
+			);
+			if (flushFirst) expect(await manager.flushAndCloseStrict()).toEqual({ kind: "closed" });
+			await expect(session.dispose()).resolves.toBeUndefined();
+			expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+			expect(await Bun.file(file).text()).toBe(winner);
+		} finally {
+			await session.dispose();
+			auth.close();
+		}
+	},
+);
 
 it("retains close_unknown for a genuine managed append I/O failure", async () => {
 	const root = await makeRoot();

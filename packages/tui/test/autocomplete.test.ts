@@ -480,20 +480,20 @@ describe("slash command suggestion position", () => {
 		expect(result?.items.map(item => item.value)).toContain("model");
 	});
 
-	it.each([
-		"explain this /mo",
-		"explain this/hel",
-	])("does not open automatic slash-command suggestions after prompt text: %s", async line => {
-		const provider = new CombinedAutocompleteProvider(
-			[
-				{ name: "model", description: "Switch AI model", value: "model" },
-				{ name: "help", description: "Learn commands", value: "help" },
-			],
-			"/tmp",
-		);
+	it.each(["explain this /mo", "explain this/hel"])(
+		"does not open automatic slash-command suggestions after prompt text: %s",
+		async line => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{ name: "model", description: "Switch AI model", value: "model" },
+					{ name: "help", description: "Learn commands", value: "help" },
+				],
+				"/tmp",
+			);
 
-		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
-	});
+			expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+		},
+	);
 
 	it("preserves inline file-path suggestions after prompt text", async () => {
 		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-inline-path-test-"));

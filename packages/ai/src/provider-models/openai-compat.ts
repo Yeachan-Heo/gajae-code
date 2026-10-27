@@ -1035,7 +1035,7 @@ export function openrouterModelManagerOptions(
 
 					const supportsToolChoice = params.includes("tool_choice");
 
-					return {
+					const model: Model<"openai-completions"> = {
 						...defaults,
 						reasoning: params.includes("reasoning"),
 						input: modality.includes("image") ? ["text", "image"] : ["text"],
@@ -1055,6 +1055,32 @@ export function openrouterModelManagerOptions(
 							compat: { supportsToolChoice: false },
 						}),
 					};
+
+					// Map long-context pricing from pricing.overrides if present
+					const overrides = Array.isArray((entry as Record<string, unknown>).pricing_overrides)
+						? ((entry as Record<string, unknown>).pricing_overrides as Array<Record<string, unknown>>)
+						: undefined;
+					if (overrides) {
+						for (const override of overrides) {
+							if (override.min_prompt_tokens === 272_000) {
+								const overridePricing = override.pricing as Record<string, unknown> | undefined;
+								if (overridePricing) {
+									model.longContextPricing = {
+										threshold: 272_000,
+										cost: {
+											input: parseFloat(String(overridePricing.prompt ?? "0")) * 1_000_000,
+											output: parseFloat(String(overridePricing.completion ?? "0")) * 1_000_000,
+											cacheRead: parseFloat(String(overridePricing.input_cache_read ?? "0")) * 1_000_000,
+											cacheWrite: parseFloat(String(overridePricing.input_cache_write ?? "0")) * 1_000_000,
+										},
+									};
+									break;
+								}
+							}
+						}
+					}
+
+					return model;
 				},
 			}),
 	};

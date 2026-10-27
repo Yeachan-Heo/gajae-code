@@ -241,43 +241,44 @@ describe("interactive background activity indicator", () => {
 		return { events, run, firstTool, continuedTool, terminal };
 	}
 
-	it.each([
-		"compaction",
-		"hook-veto",
-		"retry",
-	] as const)("keeps the working intent visible through a real %s continuation without agent_start", async recovery => {
-		const { events, run, firstTool, continuedTool, terminal } = await startContinuingRun(recovery);
-		try {
-			expect(renderStatus(mode)).toContain("Preparing continuation");
-			firstTool.resolve("first tool complete");
-			const recoveredToolId = recovery === "retry" ? "probe-3" : "probe-2";
-			await waitFor(() => mode.pendingTools.has(recoveredToolId) && !mode.autoCompactionLoader && !mode.retryLoader);
-			expect(events.filter(event => event.type === "agent_start")).toHaveLength(1);
-			expect(events.filter(event => event.type === "agent_end")).toHaveLength(0);
-			expect(
-				events.some(event => event.type === (recovery === "retry" ? "auto_retry_end" : "auto_compaction_end")),
-			).toBe(true);
-			expect(session.isStreaming).toBe(true);
-			expect(renderStatus(mode)).toContain("Reviewing remaining responsibility boundaries");
-			for (const width of [60, 100, 160]) {
-				terminal.resize(width, 30);
+	it.each(["compaction", "hook-veto", "retry"] as const)(
+		"keeps the working intent visible through a real %s continuation without agent_start",
+		async recovery => {
+			const { events, run, firstTool, continuedTool, terminal } = await startContinuingRun(recovery);
+			try {
+				expect(renderStatus(mode)).toContain("Preparing continuation");
+				firstTool.resolve("first tool complete");
+				const recoveredToolId = recovery === "retry" ? "probe-3" : "probe-2";
+				await waitFor(
+					() => mode.pendingTools.has(recoveredToolId) && !mode.autoCompactionLoader && !mode.retryLoader,
+				);
+				expect(events.filter(event => event.type === "agent_start")).toHaveLength(1);
+				expect(events.filter(event => event.type === "agent_end")).toHaveLength(0);
+				expect(
+					events.some(event => event.type === (recovery === "retry" ? "auto_retry_end" : "auto_compaction_end")),
+				).toBe(true);
+				expect(session.isStreaming).toBe(true);
+				expect(renderStatus(mode)).toContain("Reviewing remaining responsibility boundaries");
+				for (const width of [60, 100, 160]) {
+					terminal.resize(width, 30);
+					await terminal.waitForRender();
+					expect(terminal.getViewport().join("\n")).toContain("Reviewing remaining responsibility boundaries");
+				}
+				continuedTool.resolve("continued tool complete");
+				await run;
+				await session.waitForIdle();
+				await waitFor(() => mode.loadingAnimation === undefined);
+				expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+				expect(renderStatus(mode)).toBe("");
 				await terminal.waitForRender();
-				expect(terminal.getViewport().join("\n")).toContain("Reviewing remaining responsibility boundaries");
+				expect(terminal.getViewport().join("\n")).not.toContain("Reviewing remaining responsibility boundaries");
+			} finally {
+				firstTool.resolve("cleanup");
+				continuedTool.resolve("cleanup");
+				await run;
 			}
-			continuedTool.resolve("continued tool complete");
-			await run;
-			await session.waitForIdle();
-			await waitFor(() => mode.loadingAnimation === undefined);
-			expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
-			expect(renderStatus(mode)).toBe("");
-			await terminal.waitForRender();
-			expect(terminal.getViewport().join("\n")).not.toContain("Reviewing remaining responsibility boundaries");
-		} finally {
-			firstTool.resolve("cleanup");
-			continuedTool.resolve("cleanup");
-			await run;
-		}
-	});
+		},
+	);
 
 	it("retains foreground intent and background ownership across compaction and terminal cleanup", async () => {
 		const { run, firstTool, continuedTool } = await startContinuingRun("compaction");
@@ -440,38 +441,44 @@ describe("interactive background activity indicator", () => {
 		expect(quit).toHaveBeenCalledWith(0);
 	});
 
-	it.each([
-		"compaction",
-		"retry",
-	] as const)("does not resurrect terminal foreground activity after %s cleanup with stale streaming state", async recovery => {
-		mode.ensureLoadingAnimation();
-		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
-		const controller = new EventController(mode);
-		try {
-			await controller.handleEvent(
-				recovery === "compaction"
-					? { type: "auto_compaction_start", reason: "threshold", action: "context-full" }
-					: { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: "rate limited" },
-			);
-			await controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" });
-			await controller.handleEvent(
-				recovery === "compaction"
-					? {
-							type: "auto_compaction_end",
-							action: "context-full",
-							result: undefined,
-							aborted: true,
-							willRetry: false,
-						}
-					: { type: "auto_retry_end", success: false, attempt: 1, finalError: "cancelled" },
-			);
-			mode.syncActivityIndicator();
-			expect(mode.loadingAnimation).toBeUndefined();
-			expect(renderStatus(mode)).toBe("");
-		} finally {
-			controller.dispose();
-		}
-	});
+	it.each(["compaction", "retry"] as const)(
+		"does not resurrect terminal foreground activity after %s cleanup with stale streaming state",
+		async recovery => {
+			mode.ensureLoadingAnimation();
+			Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+			const controller = new EventController(mode);
+			try {
+				await controller.handleEvent(
+					recovery === "compaction"
+						? { type: "auto_compaction_start", reason: "threshold", action: "context-full" }
+						: {
+								type: "auto_retry_start",
+								attempt: 1,
+								maxAttempts: 3,
+								delayMs: 1000,
+								errorMessage: "rate limited",
+							},
+				);
+				await controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" });
+				await controller.handleEvent(
+					recovery === "compaction"
+						? {
+								type: "auto_compaction_end",
+								action: "context-full",
+								result: undefined,
+								aborted: true,
+								willRetry: false,
+							}
+						: { type: "auto_retry_end", success: false, attempt: 1, finalError: "cancelled" },
+				);
+				mode.syncActivityIndicator();
+				expect(mode.loadingAnimation).toBeUndefined();
+				expect(renderStatus(mode)).toBe("");
+			} finally {
+				controller.dispose();
+			}
+		},
+	);
 
 	it("preserves foreground ownership across repeated retries and nested display suspension", async () => {
 		const controller = new EventController(mode);

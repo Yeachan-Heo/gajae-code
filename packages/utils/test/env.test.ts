@@ -678,17 +678,13 @@ describe("$envpos", () => {
 		delete process.env[NAME];
 	});
 
-	it.each([
-		"12oops",
-		"1.5",
-		"1e3",
-		"0",
-		"-1",
-		String(Number.MAX_SAFE_INTEGER + 1),
-	])("returns the default for invalid complete-token value %j", value => {
-		process.env[NAME] = value;
-		expect($envpos(NAME, 100)).toBe(100);
-	});
+	it.each(["12oops", "1.5", "1e3", "0", "-1", String(Number.MAX_SAFE_INTEGER + 1)])(
+		"returns the default for invalid complete-token value %j",
+		value => {
+			process.env[NAME] = value;
+			expect($envpos(NAME, 100)).toBe(100);
+		},
+	);
 
 	it("accepts a whitespace-padded positive safe integer", () => {
 		process.env[NAME] = " 42 ";

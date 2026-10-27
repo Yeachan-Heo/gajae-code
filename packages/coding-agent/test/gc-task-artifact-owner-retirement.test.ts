@@ -255,97 +255,93 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
-	it.each([
-		"live",
-		"removed",
-		"shared",
-		"removed-shared",
-	] as const)("authenticates unrelated historical sibling storage without borrowing workspace authority (%s)", async mode => {
-		const fixture = makeFixture();
-		const otherCwd = path.join(fixture.root, "other-workspace");
-		fs.mkdirSync(otherCwd, { mode: 0o700 });
-		const other = managedScope(fixture.agentDir, fixture.sessionsRoot, otherCwd);
-		const shared = mode === "shared" || mode === "removed-shared";
-		writeSession(
-			other,
-			shared ? fixture.sessionId : crypto.randomUUID(),
-			otherCwd,
-			shared ? fixture.locator : undefined,
-		);
-		const bindingPath = path.join(other.directoryPath, MANAGED_SESSION_BINDING_FILE);
-		const binding = fs.readFileSync(bindingPath);
-		if (mode === "removed" || mode === "removed-shared") fs.rmSync(otherCwd, { recursive: true });
-		const owner = snapshotTree(fixture.ownerPath);
-		expect(
-			await hasSiblingTaskArtifactOwnerTranscript(
-				new FileSessionStorage(),
-				fixture.transcriptPath,
-				fixture.locator,
-				taskArtifactOwnerStorageContextForScope(fixture.scope),
-				managedGcProtocolScopeInspectorForScope(fixture.scope),
-			),
-		).toBe(shared);
-		expect(fs.readFileSync(bindingPath)).toEqual(binding);
-		expect(snapshotTree(fixture.ownerPath)).toEqual(owner);
-	});
-	it.each([
-		"same-owner-sibling",
-		"reserved-protocol-alias",
-	] as const)("reports a real pre-effect storage refusal as kept with its journal still prepared (%s)", async obstruction => {
-		const fixture = makeFixture();
-		await backdate(fixture.transcriptPath, 90);
-		writeSession(fixture.scope, "newest-session", fixture.cwd);
-		const transcript = fs.readFileSync(fixture.transcriptPath);
-		const owner = snapshotTree(fixture.ownerPath);
-		let injected = false;
-		let obstructionPath: string | undefined;
-		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
-		const fault = vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified").mockImplementation(async function (
-			this: FileSessionStorage,
-			target,
-			inspector,
-		) {
-			if (target.transcriptPath === fixture.transcriptPath && !injected) {
-				injected = true;
-				expect((await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath))?.state).toBe(
-					"prepared",
-				);
-				if (obstruction === "same-owner-sibling") {
-					obstructionPath = writeSession(fixture.scope, crypto.randomUUID(), fixture.cwd, fixture.locator);
-				} else {
-					obstructionPath = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved");
-					fs.mkdirSync(obstructionPath, { mode: 0o700 });
-				}
-			}
-			const result = await originalDelete.call(this, target, inspector);
-			if (target.transcriptPath === fixture.transcriptPath)
-				expect(result).toMatchObject({
-					kind: "cleanup_pending",
-					phase: "task_artifact_owner",
-					artifactsRemoved: false,
+	it.each(["live", "removed", "shared", "removed-shared"] as const)(
+		"authenticates unrelated historical sibling storage without borrowing workspace authority (%s)",
+		async mode => {
+			const fixture = makeFixture();
+			const otherCwd = path.join(fixture.root, "other-workspace");
+			fs.mkdirSync(otherCwd, { mode: 0o700 });
+			const other = managedScope(fixture.agentDir, fixture.sessionsRoot, otherCwd);
+			const shared = mode === "shared" || mode === "removed-shared";
+			writeSession(
+				other,
+				shared ? fixture.sessionId : crypto.randomUUID(),
+				otherCwd,
+				shared ? fixture.locator : undefined,
+			);
+			const bindingPath = path.join(other.directoryPath, MANAGED_SESSION_BINDING_FILE);
+			const binding = fs.readFileSync(bindingPath);
+			if (mode === "removed" || mode === "removed-shared") fs.rmSync(otherCwd, { recursive: true });
+			const owner = snapshotTree(fixture.ownerPath);
+			expect(
+				await hasSiblingTaskArtifactOwnerTranscript(
+					new FileSessionStorage(),
+					fixture.transcriptPath,
+					fixture.locator,
+					taskArtifactOwnerStorageContextForScope(fixture.scope),
+					managedGcProtocolScopeInspectorForScope(fixture.scope),
+				),
+			).toBe(shared);
+			expect(fs.readFileSync(bindingPath)).toEqual(binding);
+			expect(snapshotTree(fixture.ownerPath)).toEqual(owner);
+		},
+	);
+	it.each(["same-owner-sibling", "reserved-protocol-alias"] as const)(
+		"reports a real pre-effect storage refusal as kept with its journal still prepared (%s)",
+		async obstruction => {
+			const fixture = makeFixture();
+			await backdate(fixture.transcriptPath, 90);
+			writeSession(fixture.scope, "newest-session", fixture.cwd);
+			const transcript = fs.readFileSync(fixture.transcriptPath);
+			const owner = snapshotTree(fixture.ownerPath);
+			let injected = false;
+			let obstructionPath: string | undefined;
+			const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+			const fault = vi
+				.spyOn(FileSessionStorage.prototype, "deleteSessionVerified")
+				.mockImplementation(async function (this: FileSessionStorage, target, inspector) {
+					if (target.transcriptPath === fixture.transcriptPath && !injected) {
+						injected = true;
+						expect(
+							(await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath))?.state,
+						).toBe("prepared");
+						if (obstruction === "same-owner-sibling") {
+							obstructionPath = writeSession(fixture.scope, crypto.randomUUID(), fixture.cwd, fixture.locator);
+						} else {
+							obstructionPath = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved");
+							fs.mkdirSync(obstructionPath, { mode: 0o700 });
+						}
+					}
+					const result = await originalDelete.call(this, target, inspector);
+					if (target.transcriptPath === fixture.transcriptPath)
+						expect(result).toMatchObject({
+							kind: "cleanup_pending",
+							phase: "task_artifact_owner",
+							artifactsRemoved: false,
+						});
+					return result;
 				});
-			return result;
-		});
-		const report = await runGc(fixture, true);
-		fault.mockRestore();
-		expect(injected).toBe(true);
-		expect(report.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath)).toMatchObject({
-			action: "keep",
-			reason: expect.stringContaining("retention_declined"),
-		});
-		expect(report.totals.failed).toBe(0);
-		expect(fs.readFileSync(fixture.transcriptPath)).toEqual(transcript);
-		expect(snapshotTree(fixture.ownerPath)).toEqual(owner);
-		const receipt = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
-		expect(receipt?.state).toBe("prepared");
-		expect(receipt?.artifactsRemoved).toBeUndefined();
-		if (!obstructionPath) throw new Error("fixture_obstruction_missing");
-		fs.rmSync(obstructionPath, { recursive: true });
-		const retry = await runGc(fixture, true);
-		expect(
-			retry.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath)?.reason,
-		).not.toContain("task_artifact_owner_shared_with_sibling_transcript");
-	});
+			const report = await runGc(fixture, true);
+			fault.mockRestore();
+			expect(injected).toBe(true);
+			expect(report.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath)).toMatchObject({
+				action: "keep",
+				reason: expect.stringContaining("retention_declined"),
+			});
+			expect(report.totals.failed).toBe(0);
+			expect(fs.readFileSync(fixture.transcriptPath)).toEqual(transcript);
+			expect(snapshotTree(fixture.ownerPath)).toEqual(owner);
+			const receipt = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+			expect(receipt?.state).toBe("prepared");
+			expect(receipt?.artifactsRemoved).toBeUndefined();
+			if (!obstructionPath) throw new Error("fixture_obstruction_missing");
+			fs.rmSync(obstructionPath, { recursive: true });
+			const retry = await runGc(fixture, true);
+			expect(
+				retry.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath)?.reason,
+			).not.toContain("task_artifact_owner_shared_with_sibling_transcript");
+		},
+	);
 	it("preserves partial failure after real native scrub when outcome publication fails", async () => {
 		const fixture = makeFixture();
 		await backdate(fixture.transcriptPath, 90);
@@ -405,56 +401,54 @@ describe("owner-aware disk session retirement", () => {
 			expect(results.length).toBe(nativeCalls);
 		}
 	});
-	it.each([
-		false,
-		true,
-	])("keeps owner-free GC usable after its historical workspace is removed (prune=%s)", async prune => {
-		const fixture = makeFixture();
-		writeSession(fixture.scope, fixture.sessionId, fixture.cwd);
-		await fs.promises.rm(fixture.ownerPath, { recursive: true });
-		await backdate(fixture.transcriptPath, 90);
-		writeSession(fixture.scope, "newest-session", fixture.cwd);
-		await fs.promises.rm(fixture.cwd, { recursive: true });
-		const report = await runGc(fixture, prune);
-		expect(report.errors).toEqual([]);
-		const oldSession = report.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath);
-		expect(oldSession?.action).toBe(prune ? "reclaimed" : "would_reclaim");
-		expect(fs.existsSync(fixture.transcriptPath)).toBe(!prune);
-		expect(fs.existsSync(path.join(fixture.scope.directoryPath, "newest-session.jsonl"))).toBe(true);
-	});
-	it.each([
-		"binding-bytes",
-		"binding-digest",
-		"protocol-symlink",
-		"journal",
-	] as const)("refuses unauthenticated or journal-bearing historical scopes after workspace deletion (%s)", async obstruction => {
-		const fixture = makeFixture();
-		const bindingPath = path.join(fixture.scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
-		if (obstruction === "binding-bytes") {
-			const bytes = await Bun.file(bindingPath).text();
-			await Bun.write(bindingPath, bytes.trim());
-		} else if (obstruction === "binding-digest") {
-			const binding = await Bun.file(bindingPath).json();
-			await Bun.write(bindingPath, `${JSON.stringify({ ...binding, identityDigest: "a".repeat(52) })}\n`);
-		} else if (obstruction === "protocol-symlink") {
-			const protocol = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
-			await fs.promises.rm(protocol, { recursive: true, force: true });
-			const foreign = path.join(fixture.root, "foreign-protocol");
-			await fs.promises.mkdir(foreign, { mode: 0o700 });
-			await fs.promises.symlink(foreign, protocol, process.platform === "win32" ? "junction" : "dir");
-		} else {
-			await publishPrepared(fixture);
-		}
-		await fs.promises.rm(fixture.cwd, { recursive: true });
-		const before = snapshotTree(fixture.scope.directoryPath);
-		const report = await runGc(fixture, false);
-		expect(JSON.stringify(report.errors)).toContain(
-			obstruction === "protocol-symlink"
-				? "Managed descendant path escapes retained store"
-				: "managed_gc_scope_authority_mismatch",
-		);
-		expect(snapshotTree(fixture.scope.directoryPath)).toEqual(before);
-	});
+	it.each([false, true])(
+		"keeps owner-free GC usable after its historical workspace is removed (prune=%s)",
+		async prune => {
+			const fixture = makeFixture();
+			writeSession(fixture.scope, fixture.sessionId, fixture.cwd);
+			await fs.promises.rm(fixture.ownerPath, { recursive: true });
+			await backdate(fixture.transcriptPath, 90);
+			writeSession(fixture.scope, "newest-session", fixture.cwd);
+			await fs.promises.rm(fixture.cwd, { recursive: true });
+			const report = await runGc(fixture, prune);
+			expect(report.errors).toEqual([]);
+			const oldSession = report.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath);
+			expect(oldSession?.action).toBe(prune ? "reclaimed" : "would_reclaim");
+			expect(fs.existsSync(fixture.transcriptPath)).toBe(!prune);
+			expect(fs.existsSync(path.join(fixture.scope.directoryPath, "newest-session.jsonl"))).toBe(true);
+		},
+	);
+	it.each(["binding-bytes", "binding-digest", "protocol-symlink", "journal"] as const)(
+		"refuses unauthenticated or journal-bearing historical scopes after workspace deletion (%s)",
+		async obstruction => {
+			const fixture = makeFixture();
+			const bindingPath = path.join(fixture.scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+			if (obstruction === "binding-bytes") {
+				const bytes = await Bun.file(bindingPath).text();
+				await Bun.write(bindingPath, bytes.trim());
+			} else if (obstruction === "binding-digest") {
+				const binding = await Bun.file(bindingPath).json();
+				await Bun.write(bindingPath, `${JSON.stringify({ ...binding, identityDigest: "a".repeat(52) })}\n`);
+			} else if (obstruction === "protocol-symlink") {
+				const protocol = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
+				await fs.promises.rm(protocol, { recursive: true, force: true });
+				const foreign = path.join(fixture.root, "foreign-protocol");
+				await fs.promises.mkdir(foreign, { mode: 0o700 });
+				await fs.promises.symlink(foreign, protocol, process.platform === "win32" ? "junction" : "dir");
+			} else {
+				await publishPrepared(fixture);
+			}
+			await fs.promises.rm(fixture.cwd, { recursive: true });
+			const before = snapshotTree(fixture.scope.directoryPath);
+			const report = await runGc(fixture, false);
+			expect(JSON.stringify(report.errors)).toContain(
+				obstruction === "protocol-symlink"
+					? "Managed descendant path escapes retained store"
+					: "managed_gc_scope_authority_mismatch",
+			);
+			expect(snapshotTree(fixture.scope.directoryPath)).toEqual(before);
+		},
+	);
 
 	it("authenticates an external configured root for empty historical journal discovery without mutation", async () => {
 		const fixture = makeHistoricalExternalScope();

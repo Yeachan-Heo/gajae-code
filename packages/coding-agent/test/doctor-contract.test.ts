@@ -50,30 +50,29 @@ describe("doctor contracts", () => {
 		["rollback_conflict", false, 4],
 		["verified", true, 0],
 		["not_needed", false, 0],
-	] satisfies [
-		RepairState,
-		boolean,
-		number,
-	][])("maps actual repair state %s and side effects %s to exit %s", (state, sideEffectStarted, expected) => {
-		const repair: DoctorRepair = {
-			id: "service.restart-owned",
-			targetId: service,
-			riskClasses: ["service-interruption"],
-			authorization: [],
-			readiness: [],
-			candidates: [],
-			preconditions: [],
-			state,
-			sideEffectStarted,
-			beforeCheckIds: [],
-			afterCheckIds: [],
-			restartRequired: false,
-			nonrollbackableEffects: [],
-		};
-		expect(finalizeReport({ ...base, mode: "fix", checks: [check()], repairs: [repair] }).summary.exitCode).toBe(
-			expected,
-		);
-	});
+	] satisfies [RepairState, boolean, number][])(
+		"maps actual repair state %s and side effects %s to exit %s",
+		(state, sideEffectStarted, expected) => {
+			const repair: DoctorRepair = {
+				id: "service.restart-owned",
+				targetId: service,
+				riskClasses: ["service-interruption"],
+				authorization: [],
+				readiness: [],
+				candidates: [],
+				preconditions: [],
+				state,
+				sideEffectStarted,
+				beforeCheckIds: [],
+				afterCheckIds: [],
+				restartRequired: false,
+				nonrollbackableEffects: [],
+			};
+			expect(finalizeReport({ ...base, mode: "fix", checks: [check()], repairs: [repair] }).summary.exitCode).toBe(
+				expected,
+			);
+		},
+	);
 
 	test("retains historical findings but computes verified repair health from fresh checks", () => {
 		const repair: DoctorRepair = {

@@ -336,7 +336,10 @@ export function modelSupportsReasoningControl<TApi extends Api>(
  * Each model is first normalized through `refreshModelThinking()` so generated
  * catalogs keep canonical thinking metadata and policy fixes in one pass.
  */
-export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
+export function applyGeneratedModelPolicies(
+	models: ApiModel<Api>[],
+	discoveredLongContextPricing?: Map<string, import("./types").LongContextPricing>,
+): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
 		const inputCost = nonNegativeFinitePrice(source.cost.input);
@@ -382,7 +385,7 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 			source.contextWindow = 1_048_576;
 		}
 		const model = refreshModelThinking(source);
-		applyGeneratedModelPolicy(model);
+		applyGeneratedModelPolicy(model, discoveredLongContextPricing);
 		models[index] = model;
 	}
 }
@@ -609,8 +612,11 @@ function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi
 	return false;
 }
 
-function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
-	applyOpenAIModelPricing(model);
+function applyGeneratedModelPolicy(
+	model: ApiModel<Api>,
+	discoveredLongContextPricing?: Map<string, import("./types").LongContextPricing>,
+): void {
+	applyOpenAIModelPricing(model, discoveredLongContextPricing);
 	applyAnthropicModelPricing(model);
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {

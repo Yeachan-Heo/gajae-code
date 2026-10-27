@@ -77,22 +77,22 @@ async function starred(file: string): Promise<boolean> {
 }
 
 describe("picker star persistence", () => {
-	it.each([
-		true,
-		false,
-	])("appends star and unstar, preserves transcript bytes, and relists (newline=%s)", async newline => {
-		const { candidate, content, file } = await fixture({ newline });
-		await SessionManager.setSessionStarredForPicker(candidate, true, directory);
-		const saved = await Bun.file(file).text();
-		expect(saved).toBe(`${content}${newline ? "" : "\n"}{"type":"header_patch","patch":{"starred":true}}\n`);
-		expect(await starred(file)).toBe(true);
-		expect((await SessionManager.listForResumePickerReadOnly(cwd, directory))[0]?.starred).toBe(true);
-		await SessionManager.setSessionStarredForPicker(candidate, true, directory);
-		expect(await Bun.file(file).text()).toBe(saved);
-		await SessionManager.setSessionStarredForPicker(candidate, false, directory);
-		expect(await starred(file)).toBe(false);
-		expect((await SessionManager.listForResumePickerReadOnly(cwd, directory))[0]?.starred).toBe(false);
-	});
+	it.each([true, false])(
+		"appends star and unstar, preserves transcript bytes, and relists (newline=%s)",
+		async newline => {
+			const { candidate, content, file } = await fixture({ newline });
+			await SessionManager.setSessionStarredForPicker(candidate, true, directory);
+			const saved = await Bun.file(file).text();
+			expect(saved).toBe(`${content}${newline ? "" : "\n"}{"type":"header_patch","patch":{"starred":true}}\n`);
+			expect(await starred(file)).toBe(true);
+			expect((await SessionManager.listForResumePickerReadOnly(cwd, directory))[0]?.starred).toBe(true);
+			await SessionManager.setSessionStarredForPicker(candidate, true, directory);
+			expect(await Bun.file(file).text()).toBe(saved);
+			await SessionManager.setSessionStarredForPicker(candidate, false, directory);
+			expect(await starred(file)).toBe(false);
+			expect((await SessionManager.listForResumePickerReadOnly(cwd, directory))[0]?.starred).toBe(false);
+		},
+	);
 
 	it("upgrades star capability without rewriting message payloads or consuming artifacts", async () => {
 		const { candidate, content, file } = await fixture({ capable: false });
@@ -198,43 +198,43 @@ describe("picker star persistence", () => {
 		}
 	});
 
-	it.each([
-		true,
-		false,
-	])("rejects a final expected-identity race without mutating explicit live state (capable=%s)", async capable => {
-		const { file } = await fixture({ capable });
-		const manager = SessionManager.create(cwd, SessionManager.explicitDestination(directory));
-		try {
-			await manager.setSessionFile(file);
-			const [candidate] = await manager.listForResumePickerReadOnly();
-			const original = ManagedSessionDescendantStore.prototype.readExpected;
-			const competingPatch = '{"type":"header_patch","patch":{"title":"concurrent writer"}}\n';
-			let competingContent = "";
-			let injected = false;
-			vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
-				this: ManagedSessionDescendantStore,
-				relativePath,
-			) {
-				const snapshot = original.call(this, relativePath);
-				if (snapshot && !injected) {
-					injected = true;
-					competingContent = `${snapshot.bytes.toString("utf8")}${competingPatch}`;
-					if (capable)
-						this.appendExpectedIdentitySync(relativePath, Buffer.from(competingPatch), snapshot.identity);
-					else this.replaceExpectedIdentitySync(relativePath, Buffer.from(competingContent), snapshot.identity);
-				}
-				return snapshot;
-			});
+	it.each([true, false])(
+		"rejects a final expected-identity race without mutating explicit live state (capable=%s)",
+		async capable => {
+			const { file } = await fixture({ capable });
+			const manager = SessionManager.create(cwd, SessionManager.explicitDestination(directory));
+			try {
+				await manager.setSessionFile(file);
+				const [candidate] = await manager.listForResumePickerReadOnly();
+				const original = ManagedSessionDescendantStore.prototype.readExpected;
+				const competingPatch = '{"type":"header_patch","patch":{"title":"concurrent writer"}}\n';
+				let competingContent = "";
+				let injected = false;
+				vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
+					this: ManagedSessionDescendantStore,
+					relativePath,
+				) {
+					const snapshot = original.call(this, relativePath);
+					if (snapshot && !injected) {
+						injected = true;
+						competingContent = `${snapshot.bytes.toString("utf8")}${competingPatch}`;
+						if (capable)
+							this.appendExpectedIdentitySync(relativePath, Buffer.from(competingPatch), snapshot.identity);
+						else this.replaceExpectedIdentitySync(relativePath, Buffer.from(competingContent), snapshot.identity);
+					}
+					return snapshot;
+				});
 
-			await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow("identity_mismatch");
+				await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow("identity_mismatch");
 
-			expect(injected).toBe(true);
-			expect(manager.isSessionStarred()).toBe(false);
-			expect(await Bun.file(file).text()).toBe(competingContent);
-		} finally {
-			await manager.close();
-		}
-	});
+				expect(injected).toBe(true);
+				expect(manager.isSessionStarred()).toBe(false);
+				expect(await Bun.file(file).text()).toBe(competingContent);
+			} finally {
+				await manager.close();
+			}
+		},
+	);
 
 	it("rejects stale live rows without changing the active session", async () => {
 		const manager = SessionManager.create(cwd);
@@ -350,32 +350,32 @@ describe("picker star persistence", () => {
 		expect(await Bun.file(target).text()).toBe(content);
 	});
 
-	it.each([
-		true,
-		false,
-	])("preserves a concurrent winner instead of appending or replacing stale bytes (capable=%s)", async capable => {
-		const { candidate, file } = await fixture({ capable });
-		const original = ManagedSessionDescendantStore.prototype.readExpected;
-		const competingPatch = '{"type":"header_patch","patch":{"title":"concurrent writer"}}\n';
-		let injected = false;
-		vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
-			this: ManagedSessionDescendantStore,
-			relativePath,
-		) {
-			const snapshot = original.call(this, relativePath);
-			if (snapshot && !injected) {
-				injected = true;
-				this.appendExpectedIdentitySync(relativePath, Buffer.from(competingPatch), snapshot.identity);
-			}
-			return snapshot;
-		});
-		const before = await Bun.file(file).text();
-		await expect(SessionManager.setSessionStarredForPicker(candidate, true, directory)).rejects.toThrow(
-			"identity_mismatch",
-		);
-		expect(injected).toBe(true);
-		expect(await Bun.file(file).text()).toBe(before + competingPatch);
-	});
+	it.each([true, false])(
+		"preserves a concurrent winner instead of appending or replacing stale bytes (capable=%s)",
+		async capable => {
+			const { candidate, file } = await fixture({ capable });
+			const original = ManagedSessionDescendantStore.prototype.readExpected;
+			const competingPatch = '{"type":"header_patch","patch":{"title":"concurrent writer"}}\n';
+			let injected = false;
+			vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
+				this: ManagedSessionDescendantStore,
+				relativePath,
+			) {
+				const snapshot = original.call(this, relativePath);
+				if (snapshot && !injected) {
+					injected = true;
+					this.appendExpectedIdentitySync(relativePath, Buffer.from(competingPatch), snapshot.identity);
+				}
+				return snapshot;
+			});
+			const before = await Bun.file(file).text();
+			await expect(SessionManager.setSessionStarredForPicker(candidate, true, directory)).rejects.toThrow(
+				"identity_mismatch",
+			);
+			expect(injected).toBe(true);
+			expect(await Bun.file(file).text()).toBe(before + competingPatch);
+		},
+	);
 
 	it("supports project-local candidates without managed-directory migration", async () => {
 		const projectDir = path.join(cwd, ".gjc", "sessions");

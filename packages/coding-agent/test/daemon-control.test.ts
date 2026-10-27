@@ -460,66 +460,64 @@ describe("Telegram daemon PID provenance fencing", () => {
 });
 
 describe("TelegramDaemonController.reload", () => {
-	test.each([
-		"unused",
-		"state-mismatch",
-		"lock-mismatch",
-		"stale-heartbeat",
-	])("rejects %s legacy migration sidecar evidence without signaling or spawning", async evidenceKind => {
-		const agentDir = tempAgentDir();
-		const s = settings(agentDir);
-		const paths = daemonPaths(agentDir);
-		const pid = process.pid;
-		const incarnation = processIncarnation(pid);
-		if (!incarnation) throw new Error(`Unable to determine process incarnation for pid ${pid}`);
-		const state = {
-			pid,
-			ownerId: "legacy-owner",
-			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
-			chatId: "42",
-			startedAt: 1_000,
-			heartbeatAt: Date.now(),
-			roots: [],
-			version: 1,
-			generation: 3,
-		};
-		writeState(agentDir, state);
-		fs.writeFileSync(paths.lock, evidenceKind === "lock-mismatch" ? "mutated-lock" : "");
-
-		const stat = fs.statSync(paths.lock);
-		fs.writeFileSync(
-			`${paths.state}.legacy-migration.json`,
-			JSON.stringify({
-				stateDigest: evidenceKind === "unused" ? "unused" : "mismatched",
-
-				lock: { size: 0, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs },
+	test.each(["unused", "state-mismatch", "lock-mismatch", "stale-heartbeat"])(
+		"rejects %s legacy migration sidecar evidence without signaling or spawning",
+		async evidenceKind => {
+			const agentDir = tempAgentDir();
+			const s = settings(agentDir);
+			const paths = daemonPaths(agentDir);
+			const pid = process.pid;
+			const incarnation = processIncarnation(pid);
+			if (!incarnation) throw new Error(`Unable to determine process incarnation for pid ${pid}`);
+			const state = {
 				pid,
-				incarnation,
-				heartbeatAt: evidenceKind === "stale-heartbeat" ? 0 : state.heartbeatAt,
-
-				observedAt: evidenceKind === "stale-heartbeat" ? 0 : Date.now(),
-
-				tokenFingerprint: state.tokenFingerprint,
+				ownerId: "legacy-owner",
+				tokenFingerprint: tokenFingerprint(BOT_TOKEN),
 				chatId: "42",
-			}),
-		);
-		let referenceCalls = 0;
-		let spawnCalls = 0;
-		const result = await new TelegramDaemonController(s, {
-			pidAlive: candidatePid => candidatePid === pid,
-			processReference: () => {
-				referenceCalls++;
-				return { incarnation, termination: "cooperative", signalRoot: () => undefined };
-			},
-			spawn: () => {
-				spawnCalls++;
-				return { unref() {} };
-			},
-		}).reload();
-		expect(result.ok).toBe(false);
-		expect(referenceCalls).toBe(0);
-		expect(spawnCalls).toBe(0);
-	});
+				startedAt: 1_000,
+				heartbeatAt: Date.now(),
+				roots: [],
+				version: 1,
+				generation: 3,
+			};
+			writeState(agentDir, state);
+			fs.writeFileSync(paths.lock, evidenceKind === "lock-mismatch" ? "mutated-lock" : "");
+
+			const stat = fs.statSync(paths.lock);
+			fs.writeFileSync(
+				`${paths.state}.legacy-migration.json`,
+				JSON.stringify({
+					stateDigest: evidenceKind === "unused" ? "unused" : "mismatched",
+
+					lock: { size: 0, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs },
+					pid,
+					incarnation,
+					heartbeatAt: evidenceKind === "stale-heartbeat" ? 0 : state.heartbeatAt,
+
+					observedAt: evidenceKind === "stale-heartbeat" ? 0 : Date.now(),
+
+					tokenFingerprint: state.tokenFingerprint,
+					chatId: "42",
+				}),
+			);
+			let referenceCalls = 0;
+			let spawnCalls = 0;
+			const result = await new TelegramDaemonController(s, {
+				pidAlive: candidatePid => candidatePid === pid,
+				processReference: () => {
+					referenceCalls++;
+					return { incarnation, termination: "cooperative", signalRoot: () => undefined };
+				},
+				spawn: () => {
+					spawnCalls++;
+					return { unref() {} };
+				},
+			}).reload();
+			expect(result.ok).toBe(false);
+			expect(referenceCalls).toBe(0);
+			expect(spawnCalls).toBe(0);
+		},
+	);
 	test("hard Windows authority waits for cooperative stop and reload", async () => {
 		const reference = defaultProcessReference(process.pid, "win32");
 		expect(reference).toMatchObject({ termination: "hard" });
@@ -1676,44 +1674,44 @@ describe("runDaemonCommand", () => {
 		expect(out).toBe("");
 	});
 
-	test.each([
-		false,
-		true,
-	])("mixed targets retain successes and stop on interruption (throws=%s)", async interrupted => {
-		const calls: string[] = [];
-		const controllers = (["telegram", "discord", "slack"] as const).map(kind => ({
-			kind,
-			status: async () => {
-				throw new Error("Unused");
-			},
-			stop: async () => {
-				throw new Error("Unused");
-			},
-			reload: async (): Promise<DaemonOperationResult> => {
-				calls.push(kind);
-				if (kind === "discord" && interrupted) throw new Error("private detail");
-				return { kind, action: "reload", ok: kind !== "discord", message: "private detail", warnings: [] };
-			},
-		}));
-		const out = await captureStdout(async () => {
-			try {
-				await runDaemonCommand(
-					{ action: "restart", kinds: [], all: true, json: true, force: true },
-					{ controllers },
-				);
-				throw new Error("Expected failure");
-			} catch (error) {
-				expect(error).toBeInstanceOf(PublicCommandFailure);
-				expect((error as PublicCommandFailure).input.targets).toEqual([
-					{ kind: "telegram", outcome: "applied" },
-					{ kind: "discord", outcome: "unknown" },
-					{ kind: "slack", outcome: interrupted ? "not-applied" : "applied" },
-				]);
-			}
-		});
-		expect(out).toBe("");
-		expect(calls).toEqual(interrupted ? ["telegram", "discord"] : ["telegram", "discord", "slack"]);
-	});
+	test.each([false, true])(
+		"mixed targets retain successes and stop on interruption (throws=%s)",
+		async interrupted => {
+			const calls: string[] = [];
+			const controllers = (["telegram", "discord", "slack"] as const).map(kind => ({
+				kind,
+				status: async () => {
+					throw new Error("Unused");
+				},
+				stop: async () => {
+					throw new Error("Unused");
+				},
+				reload: async (): Promise<DaemonOperationResult> => {
+					calls.push(kind);
+					if (kind === "discord" && interrupted) throw new Error("private detail");
+					return { kind, action: "reload", ok: kind !== "discord", message: "private detail", warnings: [] };
+				},
+			}));
+			const out = await captureStdout(async () => {
+				try {
+					await runDaemonCommand(
+						{ action: "restart", kinds: [], all: true, json: true, force: true },
+						{ controllers },
+					);
+					throw new Error("Expected failure");
+				} catch (error) {
+					expect(error).toBeInstanceOf(PublicCommandFailure);
+					expect((error as PublicCommandFailure).input.targets).toEqual([
+						{ kind: "telegram", outcome: "applied" },
+						{ kind: "discord", outcome: "unknown" },
+						{ kind: "slack", outcome: interrupted ? "not-applied" : "applied" },
+					]);
+				}
+			});
+			expect(out).toBe("");
+			expect(calls).toEqual(interrupted ? ["telegram", "discord"] : ["telegram", "discord", "slack"]);
+		},
+	);
 
 	test("mixed failures retain completed operation results for reconciliation", async () => {
 		const telegramStatus: DaemonStatus = {

@@ -3560,47 +3560,54 @@ describe("ModelRegistry", () => {
 		test.each([
 			["opencode-go", "https://opencode.ai/zen/go"],
 			["opencode-zen", "https://opencode.ai/zen"],
-		] as const)("%s Union Alpha survives production discovery and offline registry reload", async (provider, baseUrl) => {
-			authStorage.setRuntimeApiKey(provider, "union-test-key");
-			let requests = 0;
-			using _hook = hookFetch(input => {
-				const url = input instanceof Request ? input.url : String(input);
-				if (url !== `${baseUrl}/v1/models`) throw new Error(`Unexpected discovery URL: ${url}`);
-				requests++;
-				return Response.json({ data: [{ id: "union-alpha" }] });
-			});
-			const registrySettings = Settings.isolated();
-			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
-			const expected = {
-				id: "union-alpha",
-				provider,
-				name: "Union Alpha Free",
-				api: "anthropic-messages",
-				baseUrl,
-				contextWindow: 262_144,
-				maxTokens: 131_072,
-				input: ["text", "image"],
-				reasoning: true,
-			};
-			try {
-				await registry.refreshProvider(provider, "online");
-				expect(requests).toBe(1);
-				expect(registry.find(provider, "union-alpha")).toMatchObject(expected);
-				expect(readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.dynamicModelIds).toEqual([
-					"union-alpha",
-				]);
-			} finally {
-				registry.dispose();
-			}
-			const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
-			try {
-				await reloaded.refreshProvider(provider, "offline");
-				expect(reloaded.find(provider, "union-alpha")).toMatchObject(expected);
-				expect(requests).toBe(1);
-			} finally {
-				reloaded.dispose();
-			}
-		});
+		] as const)(
+			"%s Union Alpha survives production discovery and offline registry reload",
+			async (provider, baseUrl) => {
+				authStorage.setRuntimeApiKey(provider, "union-test-key");
+				let requests = 0;
+				using _hook = hookFetch(input => {
+					const url = input instanceof Request ? input.url : String(input);
+					if (url !== `${baseUrl}/v1/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+					requests++;
+					return Response.json({ data: [{ id: "union-alpha" }] });
+				});
+				const registrySettings = Settings.isolated();
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, {
+					automaticRefresh: false,
+				});
+				const expected = {
+					id: "union-alpha",
+					provider,
+					name: "Union Alpha Free",
+					api: "anthropic-messages",
+					baseUrl,
+					contextWindow: 262_144,
+					maxTokens: 131_072,
+					input: ["text", "image"],
+					reasoning: true,
+				};
+				try {
+					await registry.refreshProvider(provider, "online");
+					expect(requests).toBe(1);
+					expect(registry.find(provider, "union-alpha")).toMatchObject(expected);
+					expect(readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.dynamicModelIds).toEqual([
+						"union-alpha",
+					]);
+				} finally {
+					registry.dispose();
+				}
+				const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, {
+					automaticRefresh: false,
+				});
+				try {
+					await reloaded.refreshProvider(provider, "offline");
+					expect(reloaded.find(provider, "union-alpha")).toMatchObject(expected);
+					expect(requests).toBe(1);
+				} finally {
+					reloaded.dispose();
+				}
+			},
+		);
 
 		test("discoverable custom compat survives refresh", async () => {
 			writeRawModelsJson({
@@ -7830,24 +7837,23 @@ describe("ModelRegistry", () => {
 		expect(String(registry.getError()?.message)).toContain("only supported for the openai provider");
 	});
 
-	test.each([
-		"https://api.openai.com",
-		"https://api.openai.com/v1",
-		"https://api.openai.com/",
-	])("rejects unknown-provider responses affinity on a canonical OpenAI base URL %s", baseUrl => {
-		writeRawModelsConfig({
-			providers: {
-				relay: {
-					baseUrl,
-					api: "openai-responses",
-					compat: { supportsResponsesSessionAffinity: true },
+	test.each(["https://api.openai.com", "https://api.openai.com/v1", "https://api.openai.com/"])(
+		"rejects unknown-provider responses affinity on a canonical OpenAI base URL %s",
+		baseUrl => {
+			writeRawModelsConfig({
+				providers: {
+					relay: {
+						baseUrl,
+						api: "openai-responses",
+						compat: { supportsResponsesSessionAffinity: true },
+					},
 				},
-			},
-		});
+			});
 
-		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
-	});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
+		},
+	);
 	test("rejects unknown-provider responses affinity without a base URL", () => {
 		writeRawModelsConfig({
 			providers: {

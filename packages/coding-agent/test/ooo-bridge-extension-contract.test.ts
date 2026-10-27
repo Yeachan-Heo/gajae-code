@@ -89,28 +89,26 @@ describe("ooo bridge extension contract", () => {
 		});
 	});
 
-	it.each([
-		"ooo\nsecond line",
-		"ooo ; rm -rf /",
-		"ooo `touch nope`",
-		"ooo $(touch nope)",
-	])("passes dangerous or multiline text as a single argv for %p", async text => {
-		const { handler, dispatchSpy } = createHandler(0);
+	it.each(["ooo\nsecond line", "ooo ; rm -rf /", "ooo `touch nope`", "ooo $(touch nope)"])(
+		"passes dangerous or multiline text as a single argv for %p",
+		async text => {
+			const { handler, dispatchSpy } = createHandler(0);
 
-		const result = await handler(input(text, "interactive"), context());
+			const result = await handler(input(text, "interactive"), context());
 
-		expect(result).toEqual(text.startsWith("ooo\n") ? {} : { handled: true });
-		if (text.startsWith("ooo\n")) {
-			expect(dispatchSpy).not.toHaveBeenCalled();
-		} else {
-			expect(dispatchSpy).toHaveBeenCalledWith(
-				"ouroboros",
-				["dispatch", text],
-				expect.anything(),
-				expect.anything(),
-			);
-		}
-	});
+			expect(result).toEqual(text.startsWith("ooo\n") ? {} : { handled: true });
+			if (text.startsWith("ooo\n")) {
+				expect(dispatchSpy).not.toHaveBeenCalled();
+			} else {
+				expect(dispatchSpy).toHaveBeenCalledWith(
+					"ouroboros",
+					["dispatch", text],
+					expect.anything(),
+					expect.anything(),
+				);
+			}
+		},
+	);
 
 	it("does not crash on very long args", async () => {
 		const { handler, dispatchSpy } = createHandler(0);

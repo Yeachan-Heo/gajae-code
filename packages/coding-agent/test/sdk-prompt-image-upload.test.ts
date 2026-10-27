@@ -15,41 +15,37 @@ const MAX_CHUNK_BYTES = 96 * 1024;
 const alwaysConnected = (_owner: string): boolean => true;
 const STATIC_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
 
-test.each([
-	"unknown_run",
-	"quarantined",
-	"run_not_sealed",
-	"resources_pending",
-	"throw",
-	"reject",
-] as const)("retirement retains on %s with one diagnostic and no retry", async reason => {
-	vi.useFakeTimers();
-	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-	const release = vi.fn();
-	const getProof = vi.fn((): Promise<RunSettlementProof> => {
-		if (reason === "throw") throw new Error("ledger unavailable");
-		if (reason === "reject") return Promise.reject(new Error("ledger unavailable"));
-		return Promise.resolve({ status: "unfenced", reason, pending: [] });
-	});
-	try {
-		retirePromptImageReservation("run", getProof, () => true, release);
-		await Promise.resolve();
-		vi.advanceTimersByTime(60_000);
-		await Promise.resolve();
-		expect(getProof).toHaveBeenCalledTimes(1);
-		expect(release).not.toHaveBeenCalled();
-		expect(warning).toHaveBeenCalledTimes(1);
-		expect(warning.mock.calls[0]?.[0]).toContain("capacity retained");
-		expect(warning.mock.calls[0]?.[1]).toMatchObject({
-			reason: reason === "throw" || reason === "reject" ? "observation_failed" : reason,
-			...(reason === "run_not_sealed" || reason === "resources_pending" ? { contractViolation: true } : {}),
+test.each(["unknown_run", "quarantined", "run_not_sealed", "resources_pending", "throw", "reject"] as const)(
+	"retirement retains on %s with one diagnostic and no retry",
+	async reason => {
+		vi.useFakeTimers();
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const release = vi.fn();
+		const getProof = vi.fn((): Promise<RunSettlementProof> => {
+			if (reason === "throw") throw new Error("ledger unavailable");
+			if (reason === "reject") return Promise.reject(new Error("ledger unavailable"));
+			return Promise.resolve({ status: "unfenced", reason, pending: [] });
 		});
-		expect(vi.getTimerCount()).toBe(0);
-	} finally {
-		vi.useRealTimers();
-		warning.mockRestore();
-	}
-});
+		try {
+			retirePromptImageReservation("run", getProof, () => true, release);
+			await Promise.resolve();
+			vi.advanceTimersByTime(60_000);
+			await Promise.resolve();
+			expect(getProof).toHaveBeenCalledTimes(1);
+			expect(release).not.toHaveBeenCalled();
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning.mock.calls[0]?.[0]).toContain("capacity retained");
+			expect(warning.mock.calls[0]?.[1]).toMatchObject({
+				reason: reason === "throw" || reason === "reject" ? "observation_failed" : reason,
+				...(reason === "run_not_sealed" || reason === "resources_pending" ? { contractViolation: true } : {}),
+			});
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+			warning.mockRestore();
+		}
+	},
+);
 
 test("retirement waits beyond the former cutoff without timers and releases on one definitive proof", async () => {
 	vi.useFakeTimers();
@@ -78,32 +74,32 @@ test("retirement waits beyond the former cutoff without timers and releases on o
 	}
 });
 
-test.each([
-	false,
-	true,
-])("retirement cannot release a stale reservation (initially current: %s)", async initiallyCurrent => {
-	vi.useFakeTimers();
-	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-	let current = initiallyCurrent;
-	const proof = Promise.withResolvers<RunSettlementProof>();
-	const getProof = vi.fn(() => proof.promise);
-	const release = vi.fn();
-	try {
-		retirePromptImageReservation("run", getProof, () => current, release);
-		await Promise.resolve();
-		current = false;
-		proof.resolve({ status: "settled" });
-		await Promise.resolve();
-		vi.advanceTimersByTime(60_000);
-		expect(getProof).toHaveBeenCalledTimes(initiallyCurrent ? 1 : 0);
-		expect(release).not.toHaveBeenCalled();
-		expect(warning).not.toHaveBeenCalled();
-		expect(vi.getTimerCount()).toBe(0);
-	} finally {
-		vi.useRealTimers();
-		warning.mockRestore();
-	}
-});
+test.each([false, true])(
+	"retirement cannot release a stale reservation (initially current: %s)",
+	async initiallyCurrent => {
+		vi.useFakeTimers();
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		let current = initiallyCurrent;
+		const proof = Promise.withResolvers<RunSettlementProof>();
+		const getProof = vi.fn(() => proof.promise);
+		const release = vi.fn();
+		try {
+			retirePromptImageReservation("run", getProof, () => current, release);
+			await Promise.resolve();
+			current = false;
+			proof.resolve({ status: "settled" });
+			await Promise.resolve();
+			vi.advanceTimersByTime(60_000);
+			expect(getProof).toHaveBeenCalledTimes(initiallyCurrent ? 1 : 0);
+			expect(release).not.toHaveBeenCalled();
+			expect(warning).not.toHaveBeenCalled();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+			warning.mockRestore();
+		}
+	},
+);
 
 test("late ledger resource settlement releases accepted capacity after close without timers", async () => {
 	const baseline = getPromptImageProcessBudgetSnapshot();
@@ -389,50 +385,48 @@ test("a session has one decoder slot and recovers it after finishing", async () 
 	}
 });
 
-test.each([
-	"unknown_run",
-	"quarantined",
-	"throw",
-	"reject",
-] as const)("accepted image stays charged after close on %s", async reason => {
-	const baseline = getPromptImageProcessBudgetSnapshot();
-	const store = new PromptImageUploadStore(alwaysConnected);
-	const id = await stage(store, "sender", tinyPng());
-	const accepted = store.redeem("sender", [{ id }]);
-	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-	const ledger = createRunResourceLedger();
-	if (reason === "quarantined") {
-		ledger.open("run");
-		ledger.quarantine("run");
-	}
-	try {
-		const retained = getPromptImageProcessBudgetSnapshot();
-		expect(retained.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
-		vi.useFakeTimers();
-		const release = vi.fn(accepted.release);
-		const waitForRunSettlement = vi.fn((handle: string): Promise<RunSettlementProof> => {
-			if (reason === "throw") throw new Error("ledger unavailable");
-			if (reason === "reject") return Promise.reject(new Error("ledger unavailable"));
-			return ledger.waitForSettlement(handle, { graceMs: null });
-		});
-		retirePromptImageReservation("run", waitForRunSettlement, () => true, release);
-		store.close();
-		await Promise.resolve();
-		vi.advanceTimersByTime(60_000);
-		expect(waitForRunSettlement).toHaveBeenCalledTimes(1);
-		expect(release).not.toHaveBeenCalled();
-		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
-		expect(warning).toHaveBeenCalledTimes(1);
-		expect(vi.getTimerCount()).toBe(0);
-	} finally {
-		// Test-owned cleanup only; production teardown must not release a live producer.
-		accepted.release();
-		store.close();
-		vi.useRealTimers();
-		warning.mockRestore();
-	}
-	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
-});
+test.each(["unknown_run", "quarantined", "throw", "reject"] as const)(
+	"accepted image stays charged after close on %s",
+	async reason => {
+		const baseline = getPromptImageProcessBudgetSnapshot();
+		const store = new PromptImageUploadStore(alwaysConnected);
+		const id = await stage(store, "sender", tinyPng());
+		const accepted = store.redeem("sender", [{ id }]);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const ledger = createRunResourceLedger();
+		if (reason === "quarantined") {
+			ledger.open("run");
+			ledger.quarantine("run");
+		}
+		try {
+			const retained = getPromptImageProcessBudgetSnapshot();
+			expect(retained.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+			vi.useFakeTimers();
+			const release = vi.fn(accepted.release);
+			const waitForRunSettlement = vi.fn((handle: string): Promise<RunSettlementProof> => {
+				if (reason === "throw") throw new Error("ledger unavailable");
+				if (reason === "reject") return Promise.reject(new Error("ledger unavailable"));
+				return ledger.waitForSettlement(handle, { graceMs: null });
+			});
+			retirePromptImageReservation("run", waitForRunSettlement, () => true, release);
+			store.close();
+			await Promise.resolve();
+			vi.advanceTimersByTime(60_000);
+			expect(waitForRunSettlement).toHaveBeenCalledTimes(1);
+			expect(release).not.toHaveBeenCalled();
+			expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			// Test-owned cleanup only; production teardown must not release a live producer.
+			accepted.release();
+			store.close();
+			vi.useRealTimers();
+			warning.mockRestore();
+		}
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	},
+);
 
 test("one prompt can redeem exactly 64 MiB, while staging cannot supply a larger prompt", async () => {
 	const baseline = getPromptImageProcessBudgetSnapshot();
@@ -556,29 +550,32 @@ test("a valid original image larger than 256 KiB survives chunk upload and one-s
 test.each([
 	["two-frame GIF", animatedGif(), 0],
 	["two-frame GIF larger than 256 KiB", animatedGif(REQUEST_FRAME_BYTES + 1), REQUEST_FRAME_BYTES],
-] as const)("finish rejects %s and discard permits a static GIF roundtrip", async (_description, bytes, minimumBytes) => {
-	const store = new PromptImageUploadStore(alwaysConnected);
-	try {
-		expect(bytes.length).toBeGreaterThan(minimumBytes);
-		expect(bytes.length).toBeLessThanOrEqual(20 * 1024 * 1024);
-		expect(await new Bun.Image(bytes).metadata()).toMatchObject({ width: 1, height: 1 });
-		const id = upload(store, "sender", bytes, undefined, "image/gif");
-		await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "invalid_input" });
-		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "invalid_input" }));
-		expect(store.discard("sender", { id })).toEqual({ discarded: true });
-
-		const staticId = await stage(store, "sender", STATIC_GIF, undefined, "image/gif");
-		const accepted = store.redeem("sender", [{ id: staticId }]);
+] as const)(
+	"finish rejects %s and discard permits a static GIF roundtrip",
+	async (_description, bytes, minimumBytes) => {
+		const store = new PromptImageUploadStore(alwaysConnected);
 		try {
-			expect(accepted.images[0]?.mimeType).toBe("image/gif");
-			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(STATIC_GIF)).toBe(true);
+			expect(bytes.length).toBeGreaterThan(minimumBytes);
+			expect(bytes.length).toBeLessThanOrEqual(20 * 1024 * 1024);
+			expect(await new Bun.Image(bytes).metadata()).toMatchObject({ width: 1, height: 1 });
+			const id = upload(store, "sender", bytes, undefined, "image/gif");
+			await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "invalid_input" });
+			expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "invalid_input" }));
+			expect(store.discard("sender", { id })).toEqual({ discarded: true });
+
+			const staticId = await stage(store, "sender", STATIC_GIF, undefined, "image/gif");
+			const accepted = store.redeem("sender", [{ id: staticId }]);
+			try {
+				expect(accepted.images[0]?.mimeType).toBe("image/gif");
+				expect(Buffer.from(accepted.images[0]!.data, "base64").equals(STATIC_GIF)).toBe(true);
+			} finally {
+				accepted.release();
+			}
 		} finally {
-			accepted.release();
+			store.close();
 		}
-	} finally {
-		store.close();
-	}
-});
+	},
+);
 
 test("one-byte fragments use bounded slabs and preserve image bytes", async () => {
 	const header = Buffer.alloc(13);
@@ -755,36 +752,34 @@ test("finish rechecks transport liveness after decoding even without a disconnec
 	}
 });
 
-test.each([
-	"append",
-	"finish",
-	"discard",
-	"redeem",
-] as const)("%s enforces the absolute lease deadline without timer delivery", async operation => {
-	let now = 1_700_000_000_000;
-	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
-	const store = new PromptImageUploadStore(alwaysConnected);
-	const bytes = tinyPng();
-	try {
-		const id = operation === "redeem" ? await stage(store, "sender", bytes) : upload(store, "sender", bytes);
-		now += 120_000;
-		if (operation === "append")
-			expect(() => store.append("sender", { id, sequence: 1, data: "AA==" })).toThrow(
-				expect.objectContaining({ code: "resource_gone" }),
-			);
-		else if (operation === "finish")
-			await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "resource_gone" });
-		else if (operation === "discard")
-			expect(() => store.discard("sender", { id })).toThrow(expect.objectContaining({ code: "resource_gone" }));
-		else
-			expect(() => store.redeem("sender", [{ id }])).toThrow(
-				expect.objectContaining({ code: "image_upload_unavailable" }),
-			);
-	} finally {
-		store.close();
-		clock.mockRestore();
-	}
-});
+test.each(["append", "finish", "discard", "redeem"] as const)(
+	"%s enforces the absolute lease deadline without timer delivery",
+	async operation => {
+		let now = 1_700_000_000_000;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const store = new PromptImageUploadStore(alwaysConnected);
+		const bytes = tinyPng();
+		try {
+			const id = operation === "redeem" ? await stage(store, "sender", bytes) : upload(store, "sender", bytes);
+			now += 120_000;
+			if (operation === "append")
+				expect(() => store.append("sender", { id, sequence: 1, data: "AA==" })).toThrow(
+					expect.objectContaining({ code: "resource_gone" }),
+				);
+			else if (operation === "finish")
+				await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "resource_gone" });
+			else if (operation === "discard")
+				expect(() => store.discard("sender", { id })).toThrow(expect.objectContaining({ code: "resource_gone" }));
+			else
+				expect(() => store.redeem("sender", [{ id }])).toThrow(
+					expect.objectContaining({ code: "image_upload_unavailable" }),
+				);
+		} finally {
+			store.close();
+			clock.mockRestore();
+		}
+	},
+);
 
 test("timer expiry removes leases even when no operation observes the deadline", () => {
 	const store = new PromptImageUploadStore(alwaysConnected);

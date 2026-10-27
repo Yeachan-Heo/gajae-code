@@ -66,19 +66,20 @@ describe("streamProxy tool-call event contract", () => {
 			],
 			["start", "text_start", "error"],
 		],
-	] satisfies Array<
-		[string, Array<Record<string, unknown>>, EventType[]]
-	>)("fails closed when toolcall_end references %s", async (_label, proxyEvents, expectedTypes) => {
-		installProxyEvents(proxyEvents);
+	] satisfies Array<[string, Array<Record<string, unknown>>, EventType[]]>)(
+		"fails closed when toolcall_end references %s",
+		async (_label, proxyEvents, expectedTypes) => {
+			installProxyEvents(proxyEvents);
 
-		const events = await collectEvents();
+			const events = await collectEvents();
 
-		expect(events.map(event => event.type)).toEqual(expectedTypes);
-		const terminal = events.at(-1);
-		expect(terminal?.type).toBe("error");
-		if (terminal?.type !== "error") throw new Error("expected an error terminal");
-		expect(terminal.error.errorMessage).toBe("Received toolcall_end for non-toolCall content");
-	});
+			expect(events.map(event => event.type)).toEqual(expectedTypes);
+			const terminal = events.at(-1);
+			expect(terminal?.type).toBe("error");
+			if (terminal?.type !== "error") throw new Error("expected an error terminal");
+			expect(terminal.error.errorMessage).toBe("Received toolcall_end for non-toolCall content");
+		},
+	);
 
 	test("preserves a valid tool-call sequence", async () => {
 		installProxyEvents([

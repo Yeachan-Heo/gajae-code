@@ -70,24 +70,25 @@ async function runCallback(
 }
 
 describe("OAuthCallbackFlow callback script data", () => {
-	it.each([
-		"</script>",
-		"</SCRIPT>",
-		"</ScRiPt>",
-	])("keeps the %s terminator inside exact error JSON data", async terminator => {
-		const injected = `${terminator}<script data-marker=GJC_SCRIPT_DATA_MARKER>GJC_INJECTED_SCRIPT_NODE</script>`;
-		const { response, html, outcome } = await runCallback(
-			new URLSearchParams({ error: "access_denied", error_description: injected }),
-		);
+	it.each(["</script>", "</SCRIPT>", "</ScRiPt>"])(
+		"keeps the %s terminator inside exact error JSON data",
+		async terminator => {
+			const injected = `${terminator}<script data-marker=GJC_SCRIPT_DATA_MARKER>GJC_INJECTED_SCRIPT_NODE</script>`;
+			const { response, html, outcome } = await runCallback(
+				new URLSearchParams({ error: "access_denied", error_description: injected }),
+			);
 
-		expect(response.status).toBe(500);
-		expect(response.headers.get("content-type")).toBe("text/html");
-		expect(html).not.toContain("<script data-marker=GJC_SCRIPT_DATA_MARKER>");
-		expect(html).toContain(`${terminator.replace("<", "\\u003c")}\\u003cscript data-marker=GJC_SCRIPT_DATA_MARKER>`);
-		expect(readServerState(html)).toEqual({ ok: false, error: `Authorization failed: ${injected}` });
-		expect(outcome).toBeInstanceOf(Error);
-		expect((outcome as Error).message).toBe(`Authorization failed: ${injected}`);
-	});
+			expect(response.status).toBe(500);
+			expect(response.headers.get("content-type")).toBe("text/html");
+			expect(html).not.toContain("<script data-marker=GJC_SCRIPT_DATA_MARKER>");
+			expect(html).toContain(
+				`${terminator.replace("<", "\\u003c")}\\u003cscript data-marker=GJC_SCRIPT_DATA_MARKER>`,
+			);
+			expect(readServerState(html)).toEqual({ ok: false, error: `Authorization failed: ${injected}` });
+			expect(outcome).toBeInstanceOf(Error);
+			expect((outcome as Error).message).toBe(`Authorization failed: ${injected}`);
+		},
+	);
 
 	it("escapes JavaScript line separators without changing provider-controlled values", async () => {
 		const injected = "before\u2028middle\u2029after";

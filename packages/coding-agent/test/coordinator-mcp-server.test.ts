@@ -829,39 +829,39 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(controls.filter(control => control.operation === "turn.steer")).toHaveLength(1);
 	});
 
-	it.each([
-		"runtime_command_id",
-		"runtime_turn_id",
-	] as const)("refuses active-turn steering when %s is missing", async missingRuntimeId => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
-		await registerSdkSession(server, root);
-		const sent = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "work",
-			idempotency_key: "missing-runtime-id-work",
-			allow_mutation: true,
-		});
-		const turnId = String(sent.turn_id);
-		await patchTurnDelivery(server, "visible-session", turnId, {
-			[missingRuntimeId]: undefined,
-			prompt_acknowledged: false,
-			state: "unacknowledged",
-		});
-
-		expect(
-			await server.callTool("gjc_coordinator_send_prompt", {
+	it.each(["runtime_command_id", "runtime_turn_id"] as const)(
+		"refuses active-turn steering when %s is missing",
+		async missingRuntimeId => {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls);
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
 				session_id: "visible-session",
-				turn_id: turnId,
-				prompt: "evidence",
-				steer: true,
-				idempotency_key: `missing-${missingRuntimeId}-feedback`,
+				prompt: "work",
+				idempotency_key: "missing-runtime-id-work",
 				allow_mutation: true,
-			}),
-		).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
-		expect(controls.filter(control => control.operation === "turn.steer")).toHaveLength(0);
-	});
+			});
+			const turnId = String(sent.turn_id);
+			await patchTurnDelivery(server, "visible-session", turnId, {
+				[missingRuntimeId]: undefined,
+				prompt_acknowledged: false,
+				state: "unacknowledged",
+			});
+
+			expect(
+				await server.callTool("gjc_coordinator_send_prompt", {
+					session_id: "visible-session",
+					turn_id: turnId,
+					prompt: "evidence",
+					steer: true,
+					idempotency_key: `missing-${missingRuntimeId}-feedback`,
+					allow_mutation: true,
+				}),
+			).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
+			expect(controls.filter(control => control.operation === "turn.steer")).toHaveLength(0);
+		},
+	);
 
 	it("retries an unobserved steer with the same durable client reference", async () => {
 		const root = await tempRoot();
@@ -980,27 +980,26 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(steers.map(control => control.idempotencyKey)).toEqual([input.idempotency_key, input.idempotency_key]);
 	});
 
-	it.each([
-		null,
-		"snapshot payload is unavailable",
-		"snapshot store is closing",
-	])("keeps absent assistant text distinct from missing resources: %s", async payload => {
-		const root = await tempRoot();
-		const server = await createSdkControlServer(root, [], [], query =>
-			query === "session.last_assistant"
-				? payload === null
-					? { ok: true, page: { items: [null] } }
-					: { ok: false, error: { code: "resource_gone", message: payload } }
-				: { ok: true, page: { items: [{ isStreaming: true }], complete: true, revision: "test" } },
-		);
-		await registerSdkSession(server, root);
-		const tail = await server.callTool("gjc_coordinator_read_tail", { session_id: "visible-session" });
-		expect(tail).toMatchObject(
-			payload === "snapshot store is closing"
-				? { ok: false, error: { code: "resource_gone" } }
-				: { ok: true, source: "sdk", lines: [] },
-		);
-	});
+	it.each([null, "snapshot payload is unavailable", "snapshot store is closing"])(
+		"keeps absent assistant text distinct from missing resources: %s",
+		async payload => {
+			const root = await tempRoot();
+			const server = await createSdkControlServer(root, [], [], query =>
+				query === "session.last_assistant"
+					? payload === null
+						? { ok: true, page: { items: [null] } }
+						: { ok: false, error: { code: "resource_gone", message: payload } }
+					: { ok: true, page: { items: [{ isStreaming: true }], complete: true, revision: "test" } },
+			);
+			await registerSdkSession(server, root);
+			const tail = await server.callTool("gjc_coordinator_read_tail", { session_id: "visible-session" });
+			expect(tail).toMatchObject(
+				payload === "snapshot store is closing"
+					? { ok: false, error: { code: "resource_gone" } }
+					: { ok: true, source: "sdk", lines: [] },
+			);
+		},
+	);
 
 	it("refuses to register a running session without an established sidecar authority", async () => {
 		const root = await tempRoot();
@@ -4651,35 +4650,35 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
 		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: false, reason: "not_indexed" } });
 	}, 15_000);
-	it.each([
-		"endpoint_generation",
-		"endpoint_incarnation",
-	] as const)("recovers %s from canonical authority when a session projection is partial", async droppedField => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
-		await registerSdkSession(server, root);
+	it.each(["endpoint_generation", "endpoint_incarnation"] as const)(
+		"recovers %s from canonical authority when a session projection is partial",
+		async droppedField => {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls);
+			await registerSdkSession(server, root);
 
-		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
-		await withSessionTransaction(paths, "visible-session", async transaction => {
-			// Keep the projection revisions caught up so read_status observes the
-			// partial write instead of repairing it first.
-			const nextRevision = transaction.revision + 1;
-			transaction.projection.applied_turns_revision = nextRevision;
-			transaction.projection.applied_reports_revision = nextRevision;
-			transaction.projection.applied_session_revision = nextRevision;
-			transaction.projection.applied_active_revision = nextRevision;
-			transaction.projection.applied_events_revision = nextRevision;
-		});
-		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
-		const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
-		delete record[droppedField];
-		await Bun.write(recordPath, JSON.stringify(record));
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			await withSessionTransaction(paths, "visible-session", async transaction => {
+				// Keep the projection revisions caught up so read_status observes the
+				// partial write instead of repairing it first.
+				const nextRevision = transaction.revision + 1;
+				transaction.projection.applied_turns_revision = nextRevision;
+				transaction.projection.applied_reports_revision = nextRevision;
+				transaction.projection.applied_session_revision = nextRevision;
+				transaction.projection.applied_active_revision = nextRevision;
+				transaction.projection.applied_events_revision = nextRevision;
+			});
+			const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
+			const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+			delete record[droppedField];
+			await Bun.write(recordPath, JSON.stringify(record));
 
-		await expect(
-			server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" }),
-		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
-	});
+			await expect(
+				server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" }),
+			).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+		},
+	);
 	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -5258,57 +5257,57 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 	});
 
-	it.each([
-		false,
-		true,
-	])("does not admit a forged live running sidecar without exact writer identity (empty=%s)", async empty => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		let runtimeTurnId = "unbound";
-		const server = await createSdkControlServer(root, controls, [], query =>
-			query === "Q12"
-				? {
-						ok: true,
-						page: {
-							items: empty ? [] : [sharedAskGate("forged-live-ask", runtimeTurnId)],
-							complete: true,
-							revision: "forged-live-ask",
-						},
-					}
-				: { ok: true, page: { items: [], complete: true, revision: "context" } },
-		);
-		await registerSdkSession(server, root);
-		const sent = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "forged live ask",
-			idempotency_key: "forged-live-ask-prompt",
-			allow_mutation: true,
-		});
-		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
-		const stateFile = coordinatorSessionStatePath(root, "visible-session");
-		const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
-		delete state.sidecar_key_id;
-		delete state.sidecar_signature;
-		await fs.writeFile(
-			stateFile,
-			JSON.stringify({
-				...state,
-				state: "running",
-				ready_for_input: false,
-				current_turn_id: sent.turn_id,
-				last_turn_id: sent.turn_id,
-				source: "agent_session_event",
-				live: true,
-			}),
-		);
+	it.each([false, true])(
+		"does not admit a forged live running sidecar without exact writer identity (empty=%s)",
+		async empty => {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			let runtimeTurnId = "unbound";
+			const server = await createSdkControlServer(root, controls, [], query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: empty ? [] : [sharedAskGate("forged-live-ask", runtimeTurnId)],
+								complete: true,
+								revision: "forged-live-ask",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			);
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "forged live ask",
+				idempotency_key: "forged-live-ask-prompt",
+				allow_mutation: true,
+			});
+			runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+			const stateFile = coordinatorSessionStatePath(root, "visible-session");
+			const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+			delete state.sidecar_key_id;
+			delete state.sidecar_signature;
+			await fs.writeFile(
+				stateFile,
+				JSON.stringify({
+					...state,
+					state: "running",
+					ready_for_input: false,
+					current_turn_id: sent.turn_id,
+					last_turn_id: sent.turn_id,
+					source: "agent_session_event",
+					live: true,
+				}),
+			);
 
-		await expect(
-			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
-		).resolves.toMatchObject({
-			questions: [],
-			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
-		});
-	});
+			await expect(
+				server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+			).resolves.toMatchObject({
+				questions: [],
+				reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+			});
+		},
+	);
 
 	it("rechecks the accepted runtime receipt before dispatching a live answer", async () => {
 		const root = await tempRoot();
@@ -5456,63 +5455,63 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
 	});
 
-	it.each([
-		false,
-		true,
-	])("keeps an uncertain terminal boundary fail-closed despite a Q12 snapshot (empty=%s)", async empty => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		let runtimeTurnId = "unbound";
-		const server = await createSdkControlServer(root, controls, [], query =>
-			query === "Q12"
-				? {
-						ok: true,
-						page: {
-							items: empty ? [] : [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
-							complete: true,
-							revision: "uncertain-terminal",
-						},
-					}
-				: { ok: true, page: { items: [], complete: true, revision: "context" } },
-		);
-		await registerSdkSession(server, root);
-		const sent = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "terminal boundary race",
-			idempotency_key: "uncertain-terminal-prompt",
-			allow_mutation: true,
-		});
-		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
-		await patchTurnDelivery(server, "visible-session", String(sent.turn_id), {
-			prompt_acknowledged: false,
-			runtime_command_id: undefined,
-			runtime_turn_id: undefined,
-			state: "queued",
-		});
-		await patchSessionState(server, root, "visible-session", {
-			state: "completed",
-			ready_for_input: false,
-			current_turn_id: sent.turn_id,
-			last_turn_id: sent.turn_id,
-			source: "agent_session_event",
-			live: false,
-			final_response: {
-				text: "terminal raced broker acknowledgement",
-				format: "markdown",
-				source: "runtime",
-				artifact_path: null,
-				truncated: false,
-			},
-		});
+	it.each([false, true])(
+		"keeps an uncertain terminal boundary fail-closed despite a Q12 snapshot (empty=%s)",
+		async empty => {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			let runtimeTurnId = "unbound";
+			const server = await createSdkControlServer(root, controls, [], query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: empty ? [] : [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
+								complete: true,
+								revision: "uncertain-terminal",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			);
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "terminal boundary race",
+				idempotency_key: "uncertain-terminal-prompt",
+				allow_mutation: true,
+			});
+			runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+			await patchTurnDelivery(server, "visible-session", String(sent.turn_id), {
+				prompt_acknowledged: false,
+				runtime_command_id: undefined,
+				runtime_turn_id: undefined,
+				state: "queued",
+			});
+			await patchSessionState(server, root, "visible-session", {
+				state: "completed",
+				ready_for_input: false,
+				current_turn_id: sent.turn_id,
+				last_turn_id: sent.turn_id,
+				source: "agent_session_event",
+				live: false,
+				final_response: {
+					text: "terminal raced broker acknowledgement",
+					format: "markdown",
+					source: "runtime",
+					artifact_path: null,
+					truncated: false,
+				},
+			});
 
-		await expect(
-			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
-		).resolves.toMatchObject({
-			ok: true,
-			questions: [],
-			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
-		});
-	});
+			await expect(
+				server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+			).resolves.toMatchObject({
+				ok: true,
+				questions: [],
+				reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+			});
+		},
+	);
 
 	it("bounds every Q12 snapshot page by the remaining snapshot budget", async () => {
 		const root = await tempRoot();
@@ -10267,30 +10266,28 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		ok: false,
 		error: { code: "unavailable", message: "Coordinator service is unavailable." },
 	};
-	it.each([
-		"null",
-		"false",
-		"0",
-		'""',
-	])("quarantines present scalar WAL root %s without changing its bytes", async hostile => {
-		const root = await tempRoot();
-		const server = await createSdkControlServer(root, []);
-		await registerSdkSession(server, root);
-		await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "scalar root corruption",
-			idempotency_key: `scalar-root-${hostile}`,
-			allow_mutation: true,
-		});
-		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
-		const file = transactionPath(paths, "visible-session");
-		await fs.writeFile(file, hostile);
+	it.each(["null", "false", "0", '""'])(
+		"quarantines present scalar WAL root %s without changing its bytes",
+		async hostile => {
+			const root = await tempRoot();
+			const server = await createSdkControlServer(root, []);
+			await registerSdkSession(server, root);
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "scalar root corruption",
+				idempotency_key: `scalar-root-${hostile}`,
+				allow_mutation: true,
+			});
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			const file = transactionPath(paths, "visible-session");
+			await fs.writeFile(file, hostile);
 
-		expect(await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" })).toEqual(
-			unavailableEnvelope,
-		);
-		expect(await fs.readFile(file, "utf8")).toBe(hostile);
-	});
+			expect(await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" })).toEqual(
+				unavailableEnvelope,
+			);
+			expect(await fs.readFile(file, "utf8")).toBe(hostile);
+		},
+	);
 
 	const walCorruptions: ReadonlyArray<readonly [string, (value: Record<string, unknown>) => void]> = [
 		[
@@ -12047,83 +12044,87 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		["an old", "old"],
 		["a future", "future"],
 		["a malformed", "malformed"],
-	] as const)("does not age a fresh answer receipt from %s remote resolved_at", async (_description, timestampKind) => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		let runtimeTurnId = "";
-		const remoteResolvedAt =
-			timestampKind === "old"
-				? new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString()
-				: timestampKind === "future"
-					? new Date(Date.now() + 31 * 24 * 60 * 60 * 1000).toISOString()
-					: "not-a-timestamp";
-		const server = await createSdkControlServer(
-			root,
-			controls,
-			[],
-			query =>
-				query === "Q12"
-					? {
-							ok: true,
-							page: {
-								items: [sharedAskGate("remote-old-answer", runtimeTurnId)],
-								complete: true,
-								revision: "remote-old-answer",
-							},
-						}
-					: { ok: true, page: { items: [], complete: true, revision: "context" } },
-			undefined,
-			undefined,
-			undefined,
-			{
-				controlResult: control =>
-					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: remoteResolvedAt } }
-						: undefined,
-			},
-		);
-		await registerSdkSession(server, root);
-		const sent = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "remote timestamp answer",
-			idempotency_key: "remote-old-answer-prompt",
-			allow_mutation: true,
-		});
-		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
-		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
-		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
-		const accepted = await server.callTool("gjc_coordinator_submit_question_answer", {
-			session_id: "visible-session",
-			turn_id: sent.turn_id,
-			question_id: "remote-old-answer",
-			answer_binding: question.answer_binding,
-			answer: { selected: ["opt_0"] },
-			idempotency_key: "remote-old-answer",
-			allow_mutation: true,
-		});
-		expect(accepted).toMatchObject({
-			ok: true,
-			operation: "workflow.gate_answer",
-			status: "accepted",
-			resolved_at: timestampKind === "malformed" ? expect.not.stringMatching(/not-a-timestamp/) : remoteResolvedAt,
-		});
+	] as const)(
+		"does not age a fresh answer receipt from %s remote resolved_at",
+		async (_description, timestampKind) => {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			let runtimeTurnId = "";
+			const remoteResolvedAt =
+				timestampKind === "old"
+					? new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString()
+					: timestampKind === "future"
+						? new Date(Date.now() + 31 * 24 * 60 * 60 * 1000).toISOString()
+						: "not-a-timestamp";
+			const server = await createSdkControlServer(
+				root,
+				controls,
+				[],
+				query =>
+					query === "Q12"
+						? {
+								ok: true,
+								page: {
+									items: [sharedAskGate("remote-old-answer", runtimeTurnId)],
+									complete: true,
+									revision: "remote-old-answer",
+								},
+							}
+						: { ok: true, page: { items: [], complete: true, revision: "context" } },
+				undefined,
+				undefined,
+				undefined,
+				{
+					controlResult: control =>
+						control.operation === "workflow.gate_answer"
+							? { ok: true, result: { status: "accepted", resolved_at: remoteResolvedAt } }
+							: undefined,
+				},
+			);
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "remote timestamp answer",
+				idempotency_key: "remote-old-answer-prompt",
+				allow_mutation: true,
+			});
+			runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+			const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+			const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+			const accepted = await server.callTool("gjc_coordinator_submit_question_answer", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				question_id: "remote-old-answer",
+				answer_binding: question.answer_binding,
+				answer: { selected: ["opt_0"] },
+				idempotency_key: "remote-old-answer",
+				allow_mutation: true,
+			});
+			expect(accepted).toMatchObject({
+				ok: true,
+				operation: "workflow.gate_answer",
+				status: "accepted",
+				resolved_at:
+					timestampKind === "malformed" ? expect.not.stringMatching(/not-a-timestamp/) : remoteResolvedAt,
+			});
 
-		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
-		const persisted = await withSessionTransaction(paths, "visible-session", async current => current);
-		const request = Object.values(persisted.requests.answers).find(candidate => candidate.phase === "completed");
-		expect(request).toBeDefined();
-		expect(request?.safe_receipt).toMatchObject({ status: "accepted" });
-		if (timestampKind === "malformed") {
-			expect(request?.safe_receipt?.resolved_at).not.toBe(remoteResolvedAt);
-			expect(Date.parse(request?.safe_receipt?.resolved_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
-		} else {
-			expect(request?.safe_receipt).toMatchObject({ resolved_at: remoteResolvedAt });
-		}
-		expect(Date.parse(request?.updated_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
-		expect(Date.parse(persisted.canonical.questions["remote-old-answer"]?.updated_at ?? "")).toBeGreaterThan(
-			Date.now() - 5_000,
-		);
-	});
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			const persisted = await withSessionTransaction(paths, "visible-session", async current => current);
+			const request = Object.values(persisted.requests.answers).find(candidate => candidate.phase === "completed");
+			expect(request).toBeDefined();
+			expect(request?.safe_receipt).toMatchObject({ status: "accepted" });
+			if (timestampKind === "malformed") {
+				expect(request?.safe_receipt?.resolved_at).not.toBe(remoteResolvedAt);
+				expect(Date.parse(request?.safe_receipt?.resolved_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
+			} else {
+				expect(request?.safe_receipt).toMatchObject({ resolved_at: remoteResolvedAt });
+			}
+			expect(Date.parse(request?.updated_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
+			expect(Date.parse(persisted.canonical.questions["remote-old-answer"]?.updated_at ?? "")).toBeGreaterThan(
+				Date.now() - 5_000,
+			);
+		},
+	);
 
 	it("reverts an answer claim when runtime admission changes before dispatch and permits exact retry", async () => {
 		const root = await tempRoot();

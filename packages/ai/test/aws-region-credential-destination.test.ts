@@ -473,15 +473,15 @@ if (process.argv[2] === CHILD_FLAG) {
 			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
 		});
 
-		test.each([
-			"kiro-oidc-device",
-			"kiro-oidc-refresh",
-		] as const)("fails closed instead of forwarding %s credentials across a redirect", async scenario => {
-			const result = await probe(scenario, "us-east-1", { redirect: true });
-			expect(result.redirect?.initialRequests).toBe(1);
-			expect(result.redirect?.targetRequests).toHaveLength(0);
-			expect(result.error).not.toBeNull();
-		});
+		test.each(["kiro-oidc-device", "kiro-oidc-refresh"] as const)(
+			"fails closed instead of forwarding %s credentials across a redirect",
+			async scenario => {
+				const result = await probe(scenario, "us-east-1", { redirect: true });
+				expect(result.redirect?.initialRequests).toBe(1);
+				expect(result.redirect?.targetRequests).toHaveLength(0);
+				expect(result.error).not.toBeNull();
+			},
+		);
 
 		test("fails closed instead of forwarding pollForToken credentials across a redirect", async () => {
 			const result = await probe("kiro-oidc-poll", "us-east-1", { redirect: true });
@@ -496,15 +496,15 @@ if (process.argv[2] === CHILD_FLAG) {
 			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
 		});
 
-		test.each([
-			"kiro-static-stream",
-			"kiro-discovered-stream",
-		] as const)("fails closed when a region-derived %s catalog model receives a redirect", async scenario => {
-			const result = await probe(scenario, "us-east-1", { redirect: true });
-			expect(result.redirect?.initialRequests).toBe(1);
-			expect(result.redirect?.targetRequests).toHaveLength(0);
-			expect(result.error).not.toBeNull();
-		});
+		test.each(["kiro-static-stream", "kiro-discovered-stream"] as const)(
+			"fails closed when a region-derived %s catalog model receives a redirect",
+			async scenario => {
+				const result = await probe(scenario, "us-east-1", { redirect: true });
+				expect(result.redirect?.initialRequests).toBe(1);
+				expect(result.redirect?.targetRequests).toHaveLength(0);
+				expect(result.error).not.toBeNull();
+			},
+		);
 
 		test("fails closed when Bedrock's forced-tool-choice fallback receives a redirect", async () => {
 			const result = await probe("bedrock-sigv4", "us-east-1", {
@@ -517,17 +517,14 @@ if (process.argv[2] === CHILD_FLAG) {
 			expect(result.error).not.toBeNull();
 		});
 
-		test.each([
-			"bedrock-bearer",
-			"bedrock-sigv4",
-			"codewhisperer",
-			"kiro-discovery",
-			"kiro-stream",
-		] as const)("rejects a project-aware authority injection before %s sends credentials", async scenario => {
-			const result = await probe(scenario, attackerRegion, { source: "project" });
-			expect(result.fetches).toHaveLength(0);
-			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
-		});
+		test.each(["bedrock-bearer", "bedrock-sigv4", "codewhisperer", "kiro-discovery", "kiro-stream"] as const)(
+			"rejects a project-aware authority injection before %s sends credentials",
+			async scenario => {
+				const result = await probe(scenario, attackerRegion, { source: "project" });
+				expect(result.fetches).toHaveLength(0);
+				expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
+			},
+		);
 
 		test.each([
 			["project", "bedrock-bearer"],
@@ -551,20 +548,17 @@ if (process.argv[2] === CHILD_FLAG) {
 			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
 		});
 
-		test.each([
-			"bedrock-bearer",
-			"bedrock-sigv4",
-			"codewhisperer",
-			"kiro-discovery",
-			"kiro-stream",
-		] as const)("rejects a stateful non-string region before %s sends credentials", async scenario => {
-			const result = await probe(scenario, "us-east-1", {
-				source: "explicit",
-				explicitRegionKind: "stateful",
-			});
-			expect(result.fetches).toHaveLength(0);
-			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
-		});
+		test.each(["bedrock-bearer", "bedrock-sigv4", "codewhisperer", "kiro-discovery", "kiro-stream"] as const)(
+			"rejects a stateful non-string region before %s sends credentials",
+			async scenario => {
+				const result = await probe(scenario, "us-east-1", {
+					source: "explicit",
+					explicitRegionKind: "stateful",
+				});
+				expect(result.fetches).toHaveLength(0);
+				expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
+			},
+		);
 
 		test.each([
 			"us-east-1.attacker.example",
@@ -583,16 +577,14 @@ if (process.argv[2] === CHILD_FLAG) {
 			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
 		});
 
-		test.each([
-			"us-east-1\n",
-			"us-east-1\r",
-			"us-east-1\u2028",
-			"us-east-1\u2029",
-		])("rejects a trailing line terminator before Kiro API-key discovery", async region => {
-			const result = await probe("kiro-discovery", region);
-			expect(result.fetches).toHaveLength(0);
-			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
-		});
+		test.each(["us-east-1\n", "us-east-1\r", "us-east-1\u2028", "us-east-1\u2029"])(
+			"rejects a trailing line terminator before Kiro API-key discovery",
+			async region => {
+				const result = await probe("kiro-discovery", region);
+				expect(result.fetches).toHaveLength(0);
+				expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
+			},
+		);
 
 		test.each([
 			[
@@ -637,13 +629,16 @@ if (process.argv[2] === CHILD_FLAG) {
 				"bearer",
 				"AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			],
-		] as const)("preserves %s credential routing for region %s", async (scenario, region, url, authorization, target) => {
-			const result = await probe(scenario, region);
-			expect(result.error).toBeNull();
-			expect(result.fetches).toHaveLength(1);
-			expect(result.fetches[0]).toMatchObject({ url, authorization, target });
-			if (scenario === "aws-sso") expect(result.fetches[0]?.ssoBearerToken).toBe(true);
-		});
+		] as const)(
+			"preserves %s credential routing for region %s",
+			async (scenario, region, url, authorization, target) => {
+				const result = await probe(scenario, region);
+				expect(result.error).toBeNull();
+				expect(result.fetches).toHaveLength(1);
+				expect(result.fetches[0]).toMatchObject({ url, authorization, target });
+				if (scenario === "aws-sso") expect(result.fetches[0]?.ssoBearerToken).toBe(true);
+			},
+		);
 
 		test("preserves an explicit Kiro model baseUrl without consulting the implicit region", async () => {
 			const result = await probe("kiro-stream", attackerRegion, {

@@ -940,31 +940,35 @@ describe("managed session write protocol", () => {
 	// own CPU/IO-bound cost under real contention. 300s gives ~10x headroom over the typical ~30s
 	// per-boundary cost while still catching a genuinely hung migration. Do not recombine these into
 	// a single it() with a shared timeout, and do not shrink this margin without re-measuring.
-	it.each([9_999, 10_000, 10_001])("migrates legacy artifact directories at count %i", async count => {
-		expect(MANAGED_ARTIFACT_MAX_FILES).toBeGreaterThan(10_001);
-		const { cwd, sessionsRoot, scope } = await fixture();
-		const legacy = legacyDirectory(sessionsRoot, cwd);
-		const source = path.join(legacy, `artifact-cap-${count}.jsonl`);
-		const artifacts = source.slice(0, -6);
-		await fs.mkdir(artifacts, { recursive: true });
-		await fs.writeFile(source, transcript(`artifact-cap-${count}`, cwd));
-		for (let index = 0; index < count; index++) syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
+	it.each([9_999, 10_000, 10_001])(
+		"migrates legacy artifact directories at count %i",
+		async count => {
+			expect(MANAGED_ARTIFACT_MAX_FILES).toBeGreaterThan(10_001);
+			const { cwd, sessionsRoot, scope } = await fixture();
+			const legacy = legacyDirectory(sessionsRoot, cwd);
+			const source = path.join(legacy, `artifact-cap-${count}.jsonl`);
+			const artifacts = source.slice(0, -6);
+			await fs.mkdir(artifacts, { recursive: true });
+			await fs.writeFile(source, transcript(`artifact-cap-${count}`, cwd));
+			for (let index = 0; index < count; index++) syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
 
-		const listed = listManagedCandidates(scope);
-		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
-		const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
-		expect(opened).toMatchObject({ kind: "opened", migrated: true });
-		if (opened.kind !== "opened") return;
-		expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
-		expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
-		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const [committed] = await committedReceiptNames(receipts);
-		if (!committed) throw new Error("Missing committed migration receipt");
-		const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
-			artifactManifest?: unknown[];
-		};
-		expect(receipt.artifactManifest).toHaveLength(count + 1);
-	}, 300_000);
+			const listed = listManagedCandidates(scope);
+			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+			const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
+			expect(opened).toMatchObject({ kind: "opened", migrated: true });
+			if (opened.kind !== "opened") return;
+			expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
+			expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
+			const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+			const [committed] = await committedReceiptNames(receipts);
+			if (!committed) throw new Error("Missing committed migration receipt");
+			const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
+				artifactManifest?: unknown[];
+			};
+			expect(receipt.artifactManifest).toHaveLength(count + 1);
+		},
+		300_000,
+	);
 	it("returns a typed strict-open capacity failure and surfaces it from continueRecent", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);

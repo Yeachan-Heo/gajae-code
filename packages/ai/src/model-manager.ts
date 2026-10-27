@@ -5,7 +5,7 @@ import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "./provider-models/openai-compat";
-import type { Api, Model, Provider } from "./types";
+import type { Api, LongContextPricing, Model, Provider } from "./types";
 import { isSafeCatalogModelId } from "./utils/discovery/openai-compatible";
 
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
@@ -666,14 +666,20 @@ function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 		return [];
 	}
 	const models: Model<TApi>[] = [];
+	// Track discovered long-context pricing to preserve across normalization
+	const discoveredLongContextPricing = new Map<string, LongContextPricing>();
 	for (const item of value) {
 		if (isModelLike(item) && !isRetiredModel(item)) {
 			const model = enrichModelThinking(item as Model<TApi>);
+			// Save discovered long-context pricing before clearing
+			if (model.longContextPricing) {
+				discoveredLongContextPricing.set(model.id, model.longContextPricing);
+			}
 			model.longContextPricing = undefined;
 			models.push({ ...model, name: sanitizeModelDisplayName(model.name, model.id) });
 		}
 	}
-	applyGeneratedModelPolicies(models as Model<Api>[]);
+	applyGeneratedModelPolicies(models as Model<Api>[], discoveredLongContextPricing);
 	return applyFinalCodexGpt56ContextCap(models);
 }
 

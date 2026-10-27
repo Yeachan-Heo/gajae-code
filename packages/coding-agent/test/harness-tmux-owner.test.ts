@@ -332,25 +332,22 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 		);
 	});
 
-	it.each([
-		"",
-		"$not-a-native-id\n",
-		"$1\nnoise",
-		"noise\n$1",
-		"$1\n$2\n",
-	])("rejects a direct creation receipt that is not one immutable native session id: %p", async nativeReceipt => {
-		const seam = await createScopedHarnessSeam();
-		const result = await runHarness(seam.tmuxCommand, 1, {
-			GJC_HARNESS_TEST_CALLER_CGROUP: "/\n",
-			GJC_HARNESS_TEST_SERVER_CGROUP: "/gjc-owner-test.scope\n",
-			GJC_HARNESS_TEST_SERVER_START_TIME: "1",
-			GJC_HARNESS_TEST_NATIVE_RECEIPT: nativeReceipt,
-			PATH: `${seam.path}:${process.env.PATH ?? ""}`,
-		});
-		expect((result.evidence as Record<string, unknown>).ownerFallbackReason).toBe(
-			"tmux-owner-native_session_identity_unavailable:tmux-owner-cleanup_uncertain",
-		);
-	});
+	it.each(["", "$not-a-native-id\n", "$1\nnoise", "noise\n$1", "$1\n$2\n"])(
+		"rejects a direct creation receipt that is not one immutable native session id: %p",
+		async nativeReceipt => {
+			const seam = await createScopedHarnessSeam();
+			const result = await runHarness(seam.tmuxCommand, 1, {
+				GJC_HARNESS_TEST_CALLER_CGROUP: "/\n",
+				GJC_HARNESS_TEST_SERVER_CGROUP: "/gjc-owner-test.scope\n",
+				GJC_HARNESS_TEST_SERVER_START_TIME: "1",
+				GJC_HARNESS_TEST_NATIVE_RECEIPT: nativeReceipt,
+				PATH: `${seam.path}:${process.env.PATH ?? ""}`,
+			});
+			expect((result.evidence as Record<string, unknown>).ownerFallbackReason).toBe(
+				"tmux-owner-native_session_identity_unavailable:tmux-owner-cleanup_uncertain",
+			);
+		},
+	);
 
 	it("refuses a pre-existing private server swap without mutating the replacement", async () => {
 		const seam = await createScopedHarnessSeam();

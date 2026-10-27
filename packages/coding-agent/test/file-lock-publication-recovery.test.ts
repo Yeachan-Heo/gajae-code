@@ -414,49 +414,52 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 				{ ...valid, diagnostic: { schemaVersion: 1, collectionState: "unavailable", osCode: 7 } },
 			],
 		);
-		test.each(
-			invalidResults,
-		)(`${operation} refuses %s even when a second call would publish`, async (_label, result) => {
-			const { root, file, lock } = await makeFixture();
-			let primary = 0;
-			let fallback = 0;
-			let entered = 0;
-			let acquired = 0;
-			FileLockTestHooks.nativePublicationBindings = () => ({
-				renameNoReplacePathAsync: async (source, destination) => {
-					primary++;
-					if (primary > 1) {
-						await fs.rename(source, destination);
-						return successfulPublication(primaryPrimitive ?? "unsupported");
-					}
-					return operation === "primary" ? result : unsupportedRename();
-				},
-				renameDirectoryNoReplacePathAsync: async (source, destination) => {
-					fallback++;
-					if (fallback > 1) {
-						await fs.rename(source, destination);
-						return successfulPublication("mkdirat_renameat_noreplace");
-					}
-					return result;
-				},
-			});
-			const failure = await withFileLock(file, async () => entered++, {
-				...quickAcquire,
-				onAcquired: () => acquired++,
-			}).then(
-				() => undefined,
-				(error: unknown) => error,
-			);
-			expect(failure).toBeInstanceOf(Error);
-			expect(failure).not.toBeInstanceOf(FileLockAcquireError);
-			expect((failure as Error).message).toBe(`Failed to publish file lock: invalid ${operation} success receipt.`);
-			expect(primary).toBe(1);
-			expect(fallback).toBe(operation === "directory" ? 1 : 0);
-			expect(entered).toBe(0);
-			expect(acquired).toBe(0);
-			await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-			expect(await fs.readdir(root)).toEqual([]);
-		});
+		test.each(invalidResults)(
+			`${operation} refuses %s even when a second call would publish`,
+			async (_label, result) => {
+				const { root, file, lock } = await makeFixture();
+				let primary = 0;
+				let fallback = 0;
+				let entered = 0;
+				let acquired = 0;
+				FileLockTestHooks.nativePublicationBindings = () => ({
+					renameNoReplacePathAsync: async (source, destination) => {
+						primary++;
+						if (primary > 1) {
+							await fs.rename(source, destination);
+							return successfulPublication(primaryPrimitive ?? "unsupported");
+						}
+						return operation === "primary" ? result : unsupportedRename();
+					},
+					renameDirectoryNoReplacePathAsync: async (source, destination) => {
+						fallback++;
+						if (fallback > 1) {
+							await fs.rename(source, destination);
+							return successfulPublication("mkdirat_renameat_noreplace");
+						}
+						return result;
+					},
+				});
+				const failure = await withFileLock(file, async () => entered++, {
+					...quickAcquire,
+					onAcquired: () => acquired++,
+				}).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect(failure).toBeInstanceOf(Error);
+				expect(failure).not.toBeInstanceOf(FileLockAcquireError);
+				expect((failure as Error).message).toBe(
+					`Failed to publish file lock: invalid ${operation} success receipt.`,
+				);
+				expect(primary).toBe(1);
+				expect(fallback).toBe(operation === "directory" ? 1 : 0);
+				expect(entered).toBe(0);
+				expect(acquired).toBe(0);
+				await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+				expect(await fs.readdir(root)).toEqual([]);
+			},
+		);
 
 		test(`${operation} admits exact success after publication and reacquires`, async () => {
 			const { root, file, lock } = await makeFixture();
@@ -1428,42 +1431,40 @@ test("retains staging cleanup ownership after abort and blocks acquisition until
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
 });
 
-test.each([
-	"x".repeat(196),
-	"x".repeat(240),
-	"x".repeat(250),
-	"é".repeat(125),
-])("acquires and releases a long canonical target without overflowing derived components: %s", async name => {
-	const { root } = await makeFixture();
-	const file = path.join(root, name);
-	const lock = `${file}.lock`;
-	const transitions: string[] = [];
-	FileLockTestHooks.beforeRemovalOwnerPublish = async transition => {
-		transitions.push(transition);
-		expect(Buffer.byteLength(path.basename(transition), "utf8")).toBeLessThanOrEqual(255);
-		for (const entry of await fs.readdir(root)) {
-			expect(Buffer.byteLength(entry, "utf8")).toBeLessThanOrEqual(255);
+test.each(["x".repeat(196), "x".repeat(240), "x".repeat(250), "é".repeat(125)])(
+	"acquires and releases a long canonical target without overflowing derived components: %s",
+	async name => {
+		const { root } = await makeFixture();
+		const file = path.join(root, name);
+		const lock = `${file}.lock`;
+		const transitions: string[] = [];
+		FileLockTestHooks.beforeRemovalOwnerPublish = async transition => {
+			transitions.push(transition);
+			expect(Buffer.byteLength(path.basename(transition), "utf8")).toBeLessThanOrEqual(255);
+			for (const entry of await fs.readdir(root)) {
+				expect(Buffer.byteLength(entry, "utf8")).toBeLessThanOrEqual(255);
+			}
+		};
+		try {
+			await expect(
+				withFileLock(
+					file,
+					async () => {
+						const info = JSON.parse(await Bun.file(path.join(lock, "info")).text());
+						expect(info.pid).toBe(process.pid);
+						expect((await fs.lstat(lock)).isDirectory()).toBe(true);
+						return "released";
+					},
+					quickAcquire,
+				),
+			).resolves.toBe("released");
+			expect(transitions.length).toBeGreaterThan(0);
+			expect(await fs.readdir(root)).toEqual([]);
+		} finally {
+			FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
 		}
-	};
-	try {
-		await expect(
-			withFileLock(
-				file,
-				async () => {
-					const info = JSON.parse(await Bun.file(path.join(lock, "info")).text());
-					expect(info.pid).toBe(process.pid);
-					expect((await fs.lstat(lock)).isDirectory()).toBe(true);
-					return "released";
-				},
-				quickAcquire,
-			),
-		).resolves.toBe("released");
-		expect(transitions.length).toBeGreaterThan(0);
-		expect(await fs.readdir(root)).toEqual([]);
-	} finally {
-		FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
-	}
-});
+	},
+);
 
 test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {
 	const { file } = await makeFixture();
@@ -1549,114 +1550,110 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(await fs.readdir(root)).toEqual(["state.json"]);
 	});
 
-	test.each([
-		"cloned destination",
-		"replaced info inode",
-		"changed content",
-		"extra entry",
-		"missing destination",
-	])("refuses and preserves a %s after the committed failure", async mutation => {
-		const { root, file, lock } = await makeFixture();
-		const displaced = path.join(root, "original-tree");
-		let before: NativeDirectoryTreeSnapshot | undefined;
-		let retained: NativeDirectoryTreeSnapshot | undefined;
-		const publication = installPublicationFailure(async (_source, destination) => {
-			before = treeSnapshot(destination);
-			if (mutation === "cloned destination") {
-				await fs.rename(destination, displaced);
-				await fs.cp(displaced, destination, { recursive: true, preserveTimestamps: true });
-			} else if (mutation === "replaced info inode") {
-				await fs.rename(path.join(destination, "info"), path.join(root, "original-info"));
-				await fs.copyFile(path.join(root, "original-info"), path.join(destination, "info"));
-			} else if (mutation === "changed content") {
-				await Bun.write(path.join(destination, "info"), "changed owner content");
-			} else if (mutation === "extra entry") {
-				await Bun.write(path.join(destination, "foreign"), "preserve foreign entry");
-			} else {
-				await fs.rename(destination, displaced);
-			}
-			retained = treeSnapshot(mutation === "missing destination" ? displaced : destination);
-		});
-		let entered = 0;
-		let acquired = 0;
-		await expect(
-			withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
-		).rejects.toThrow();
-		expect(entered).toBe(0);
-		expect(acquired).toBe(0);
-		expect(publication.primary).toBe(1);
-		expect(publication.fallback).toBe(1);
-		const retainedPath = mutation === "missing destination" ? displaced : lock;
-		expect(treeSnapshot(retainedPath)).toEqual(recordedSnapshot(retained));
-		expect(await Bun.file(path.join(retainedPath, "info")).text()).toBe(
-			mutation === "changed content" ? "changed owner content" : publication.originalInfo,
-		);
-		if (mutation === "cloned destination") {
-			expect(retained?.rootIno).not.toBe(before?.rootIno);
-			expect(treeSnapshot(displaced).rootIno).toBe(recordedSnapshot(before).rootIno);
-		} else if (mutation === "replaced info inode") {
-			expect(retained?.entries.find(entry => entry.relativePath === "info")?.ino).not.toBe(
-				before?.entries.find(entry => entry.relativePath === "info")?.ino,
+	test.each(["cloned destination", "replaced info inode", "changed content", "extra entry", "missing destination"])(
+		"refuses and preserves a %s after the committed failure",
+		async mutation => {
+			const { root, file, lock } = await makeFixture();
+			const displaced = path.join(root, "original-tree");
+			let before: NativeDirectoryTreeSnapshot | undefined;
+			let retained: NativeDirectoryTreeSnapshot | undefined;
+			const publication = installPublicationFailure(async (_source, destination) => {
+				before = treeSnapshot(destination);
+				if (mutation === "cloned destination") {
+					await fs.rename(destination, displaced);
+					await fs.cp(displaced, destination, { recursive: true, preserveTimestamps: true });
+				} else if (mutation === "replaced info inode") {
+					await fs.rename(path.join(destination, "info"), path.join(root, "original-info"));
+					await fs.copyFile(path.join(root, "original-info"), path.join(destination, "info"));
+				} else if (mutation === "changed content") {
+					await Bun.write(path.join(destination, "info"), "changed owner content");
+				} else if (mutation === "extra entry") {
+					await Bun.write(path.join(destination, "foreign"), "preserve foreign entry");
+				} else {
+					await fs.rename(destination, displaced);
+				}
+				retained = treeSnapshot(mutation === "missing destination" ? displaced : destination);
+			});
+			let entered = 0;
+			let acquired = 0;
+			await expect(
+				withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
+			).rejects.toThrow();
+			expect(entered).toBe(0);
+			expect(acquired).toBe(0);
+			expect(publication.primary).toBe(1);
+			expect(publication.fallback).toBe(1);
+			const retainedPath = mutation === "missing destination" ? displaced : lock;
+			expect(treeSnapshot(retainedPath)).toEqual(recordedSnapshot(retained));
+			expect(await Bun.file(path.join(retainedPath, "info")).text()).toBe(
+				mutation === "changed content" ? "changed owner content" : publication.originalInfo,
 			);
-			expect(await Bun.file(path.join(root, "original-info")).text()).toBe(publication.originalInfo);
-		} else if (mutation === "extra entry") {
-			expect(await Bun.file(path.join(lock, "foreign")).text()).toBe("preserve foreign entry");
-		} else if (mutation === "missing destination") {
-			await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-		}
-	});
-
-	test.each([
-		"directory",
-		"file",
-		"dangling symlink",
-	])("does not remove a recreated staging %s or enter the callback", async kind => {
-		const { root, file, lock } = await makeFixture();
-		const absentTarget = path.join(root, "absent-symlink-target");
-		let retainedTree: NativeDirectoryTreeSnapshot | undefined;
-		let sourceIno = 0n;
-		let sourceCtime = 0n;
-		const publication = installPublicationFailure(async (source, destination) => {
-			if (kind === "directory") {
-				await fs.mkdir(source);
-				await Bun.write(path.join(source, "foreign"), "recreated staging directory");
-			} else if (kind === "file") {
-				await Bun.write(source, "recreated staging file");
-			} else {
-				await fs.symlink(absentTarget, source);
+			if (mutation === "cloned destination") {
+				expect(retained?.rootIno).not.toBe(before?.rootIno);
+				expect(treeSnapshot(displaced).rootIno).toBe(recordedSnapshot(before).rootIno);
+			} else if (mutation === "replaced info inode") {
+				expect(retained?.entries.find(entry => entry.relativePath === "info")?.ino).not.toBe(
+					before?.entries.find(entry => entry.relativePath === "info")?.ino,
+				);
+				expect(await Bun.file(path.join(root, "original-info")).text()).toBe(publication.originalInfo);
+			} else if (mutation === "extra entry") {
+				expect(await Bun.file(path.join(lock, "foreign")).text()).toBe("preserve foreign entry");
+			} else if (mutation === "missing destination") {
+				await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 			}
-			const sourceState = await fs.lstat(source, { bigint: true });
-			sourceIno = sourceState.ino;
-			sourceCtime = sourceState.ctimeNs;
-			retainedTree = treeSnapshot(destination);
-		});
-		let entered = 0;
-		let acquired = 0;
-		await expect(
-			withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
-		).rejects.toThrow();
-		expect(entered).toBe(0);
-		expect(acquired).toBe(0);
-		expect(publication.primary).toBe(1);
-		expect(publication.fallback).toBe(1);
-		const retainedSource = await fs.lstat(publication.source, { bigint: true });
-		expect(retainedSource.ino).toBe(sourceIno);
-		expect(retainedSource.ctimeNs).toBe(sourceCtime);
-		expect(treeSnapshot(lock)).toEqual(recordedSnapshot(retainedTree));
-		expect(await Bun.file(path.join(lock, "info")).text()).toBe(publication.originalInfo);
-		if (kind === "directory") {
-			expect(retainedSource.isDirectory()).toBe(true);
-			expect(await fs.readdir(publication.source)).toEqual(["foreign"]);
-			expect(await Bun.file(path.join(publication.source, "foreign")).text()).toBe("recreated staging directory");
-		} else if (kind === "file") {
-			expect(retainedSource.isFile()).toBe(true);
-			expect(await Bun.file(publication.source).text()).toBe("recreated staging file");
-		} else {
-			expect(retainedSource.isSymbolicLink()).toBe(true);
-			expect(await fs.readlink(publication.source)).toBe(absentTarget);
-			await expect(fs.lstat(absentTarget)).rejects.toMatchObject({ code: "ENOENT" });
-		}
-	});
+		},
+	);
+
+	test.each(["directory", "file", "dangling symlink"])(
+		"does not remove a recreated staging %s or enter the callback",
+		async kind => {
+			const { root, file, lock } = await makeFixture();
+			const absentTarget = path.join(root, "absent-symlink-target");
+			let retainedTree: NativeDirectoryTreeSnapshot | undefined;
+			let sourceIno = 0n;
+			let sourceCtime = 0n;
+			const publication = installPublicationFailure(async (source, destination) => {
+				if (kind === "directory") {
+					await fs.mkdir(source);
+					await Bun.write(path.join(source, "foreign"), "recreated staging directory");
+				} else if (kind === "file") {
+					await Bun.write(source, "recreated staging file");
+				} else {
+					await fs.symlink(absentTarget, source);
+				}
+				const sourceState = await fs.lstat(source, { bigint: true });
+				sourceIno = sourceState.ino;
+				sourceCtime = sourceState.ctimeNs;
+				retainedTree = treeSnapshot(destination);
+			});
+			let entered = 0;
+			let acquired = 0;
+			await expect(
+				withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
+			).rejects.toThrow();
+			expect(entered).toBe(0);
+			expect(acquired).toBe(0);
+			expect(publication.primary).toBe(1);
+			expect(publication.fallback).toBe(1);
+			const retainedSource = await fs.lstat(publication.source, { bigint: true });
+			expect(retainedSource.ino).toBe(sourceIno);
+			expect(retainedSource.ctimeNs).toBe(sourceCtime);
+			expect(treeSnapshot(lock)).toEqual(recordedSnapshot(retainedTree));
+			expect(await Bun.file(path.join(lock, "info")).text()).toBe(publication.originalInfo);
+			if (kind === "directory") {
+				expect(retainedSource.isDirectory()).toBe(true);
+				expect(await fs.readdir(publication.source)).toEqual(["foreign"]);
+				expect(await Bun.file(path.join(publication.source, "foreign")).text()).toBe("recreated staging directory");
+			} else if (kind === "file") {
+				expect(retainedSource.isFile()).toBe(true);
+				expect(await Bun.file(publication.source).text()).toBe("recreated staging file");
+			} else {
+				expect(retainedSource.isSymbolicLink()).toBe(true);
+				expect(await fs.readlink(publication.source)).toBe(absentTarget);
+				await expect(fs.lstat(absentTarget)).rejects.toMatchObject({ code: "ENOENT" });
+			}
+		},
+	);
 
 	const invalidCommittedResults: [string, unknown][] = [
 		["missing fields", { ok: false, code: "destination_identity_changed" }],
@@ -1734,55 +1731,57 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 			},
 		],
 	];
-	test.each(
-		successShapedResults,
-	)("does not enter after a fallback success-shaped %s receipt", async (_label, result) => {
-		const { file, lock } = await makeFixture();
-		let retained: NativeDirectoryTreeSnapshot | undefined;
-		const publication = installPublicationFailure(async (_source, destination) => {
-			retained = treeSnapshot(destination);
-		}, result);
-		let entered = 0;
-		let acquired = 0;
-		await expect(
-			withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
-		).rejects.toThrow();
-		expect(entered).toBe(0);
-		expect(acquired).toBe(0);
-		expect(publication.primary).toBe(1);
-		expect(publication.fallback).toBe(1);
-		expect(treeSnapshot(lock)).toEqual(recordedSnapshot(retained));
-		expect(await Bun.file(path.join(lock, "info")).text()).toBe(publication.originalInfo);
-	});
+	test.each(successShapedResults)(
+		"does not enter after a fallback success-shaped %s receipt",
+		async (_label, result) => {
+			const { file, lock } = await makeFixture();
+			let retained: NativeDirectoryTreeSnapshot | undefined;
+			const publication = installPublicationFailure(async (_source, destination) => {
+				retained = treeSnapshot(destination);
+			}, result);
+			let entered = 0;
+			let acquired = 0;
+			await expect(
+				withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
+			).rejects.toThrow();
+			expect(entered).toBe(0);
+			expect(acquired).toBe(0);
+			expect(publication.primary).toBe(1);
+			expect(publication.fallback).toBe(1);
+			expect(treeSnapshot(lock)).toEqual(recordedSnapshot(retained));
+			expect(await Bun.file(path.join(lock, "info")).text()).toBe(publication.originalInfo);
+		},
+	);
 
-	test.each(
-		successShapedResults,
-	)("does not enter after a primary success-shaped %s receipt", async (_label, result) => {
-		const { root, file, lock } = await makeFixture();
-		let primary = 0;
-		let fallback = 0;
-		let entered = 0;
-		let acquired = 0;
-		FileLockTestHooks.nativePublicationBindings = () => ({
-			renameNoReplacePathAsync: async () => {
-				primary++;
-				return result as NativeNoReplaceResult;
-			},
-			renameDirectoryNoReplacePathAsync: async (source, destination) => {
-				fallback++;
-				return await renameDirectoryNoReplacePathAsync(source, destination);
-			},
-		});
-		await expect(
-			withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
-		).rejects.toThrow();
-		expect(primary).toBe(1);
-		expect(fallback).toBe(0);
-		expect(entered).toBe(0);
-		expect(acquired).toBe(0);
-		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-		expect(await fs.readdir(root)).toEqual([]);
-	});
+	test.each(successShapedResults)(
+		"does not enter after a primary success-shaped %s receipt",
+		async (_label, result) => {
+			const { root, file, lock } = await makeFixture();
+			let primary = 0;
+			let fallback = 0;
+			let entered = 0;
+			let acquired = 0;
+			FileLockTestHooks.nativePublicationBindings = () => ({
+				renameNoReplacePathAsync: async () => {
+					primary++;
+					return result as NativeNoReplaceResult;
+				},
+				renameDirectoryNoReplacePathAsync: async (source, destination) => {
+					fallback++;
+					return await renameDirectoryNoReplacePathAsync(source, destination);
+				},
+			});
+			await expect(
+				withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
+			).rejects.toThrow();
+			expect(primary).toBe(1);
+			expect(fallback).toBe(0);
+			expect(entered).toBe(0);
+			expect(acquired).toBe(0);
+			await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await fs.readdir(root)).toEqual([]);
+		},
+	);
 
 	const invalidPrimaryResults: [string, unknown][] = [
 		["incomplete failure", { ok: false, code: "invalid_request" }],
@@ -2176,52 +2175,50 @@ describe.skipIf(process.platform !== "linux")("file lock retained removal reconc
 		expect(publication.fallback).toBe(2);
 	});
 
-	test.each([
-		"cloned tree",
-		"replaced info inode",
-		"changed content",
-		"extra entry",
-	])("preserves a retained sibling with a %s and never retries removal", async mutation => {
-		const { root, file, lock } = await makeFixture();
-		const displaced = path.join(root, "original-tree");
-		let retained: NativeDirectoryTreeSnapshot | undefined;
-		const publication = installPublicationFailure();
-		const calls = installRetainedRelease(retainedPath => {
-			if (mutation === "cloned tree") {
-				syncFs.renameSync(retainedPath, displaced);
-				syncFs.cpSync(displaced, retainedPath, { recursive: true, preserveTimestamps: true });
-			} else if (mutation === "replaced info inode") {
-				syncFs.renameSync(path.join(retainedPath, "info"), path.join(root, "original-info"));
-				syncFs.copyFileSync(path.join(root, "original-info"), path.join(retainedPath, "info"));
-			} else if (mutation === "changed content") {
-				syncFs.writeFileSync(path.join(retainedPath, "info"), "changed retained owner");
-			} else {
-				syncFs.writeFileSync(path.join(retainedPath, "foreign"), "preserve retained entry");
-			}
-			retained = treeSnapshot(retainedPath);
-			return retainedIdentityFailure(retainedPath);
-		});
-		let entered = 0;
-		await expect(withFileLock(file, async () => entered++, quickAcquire)).rejects.toThrow();
-		expect(entered).toBe(1);
-		expect(calls.map(call => call.path)).toEqual([lock]);
-		expect(publication.primary).toBe(1);
-		expect(publication.fallback).toBe(1);
-		expect(treeSnapshot(`${lock}.removing`)).toEqual(recordedSnapshot(retained));
-		expect(await Bun.file(path.join(`${lock}.removing`, "info")).text()).toBe(
-			mutation === "changed content" ? "changed retained owner" : publication.originalInfo,
-		);
-		if (mutation === "cloned tree") {
-			expect(retained?.rootIno).not.toBe(calls[0]?.snapshot.rootIno);
-			expect(await Bun.file(path.join(displaced, "info")).text()).toBe(publication.originalInfo);
-		} else if (mutation === "replaced info inode") {
-			expect(retained?.entries.find(entry => entry.relativePath === "info")?.ino).not.toBe(
-				calls[0]?.snapshot.entries.find(entry => entry.relativePath === "info")?.ino,
+	test.each(["cloned tree", "replaced info inode", "changed content", "extra entry"])(
+		"preserves a retained sibling with a %s and never retries removal",
+		async mutation => {
+			const { root, file, lock } = await makeFixture();
+			const displaced = path.join(root, "original-tree");
+			let retained: NativeDirectoryTreeSnapshot | undefined;
+			const publication = installPublicationFailure();
+			const calls = installRetainedRelease(retainedPath => {
+				if (mutation === "cloned tree") {
+					syncFs.renameSync(retainedPath, displaced);
+					syncFs.cpSync(displaced, retainedPath, { recursive: true, preserveTimestamps: true });
+				} else if (mutation === "replaced info inode") {
+					syncFs.renameSync(path.join(retainedPath, "info"), path.join(root, "original-info"));
+					syncFs.copyFileSync(path.join(root, "original-info"), path.join(retainedPath, "info"));
+				} else if (mutation === "changed content") {
+					syncFs.writeFileSync(path.join(retainedPath, "info"), "changed retained owner");
+				} else {
+					syncFs.writeFileSync(path.join(retainedPath, "foreign"), "preserve retained entry");
+				}
+				retained = treeSnapshot(retainedPath);
+				return retainedIdentityFailure(retainedPath);
+			});
+			let entered = 0;
+			await expect(withFileLock(file, async () => entered++, quickAcquire)).rejects.toThrow();
+			expect(entered).toBe(1);
+			expect(calls.map(call => call.path)).toEqual([lock]);
+			expect(publication.primary).toBe(1);
+			expect(publication.fallback).toBe(1);
+			expect(treeSnapshot(`${lock}.removing`)).toEqual(recordedSnapshot(retained));
+			expect(await Bun.file(path.join(`${lock}.removing`, "info")).text()).toBe(
+				mutation === "changed content" ? "changed retained owner" : publication.originalInfo,
 			);
-		} else if (mutation === "extra entry") {
-			expect(await Bun.file(path.join(`${lock}.removing`, "foreign")).text()).toBe("preserve retained entry");
-		}
-	});
+			if (mutation === "cloned tree") {
+				expect(retained?.rootIno).not.toBe(calls[0]?.snapshot.rootIno);
+				expect(await Bun.file(path.join(displaced, "info")).text()).toBe(publication.originalInfo);
+			} else if (mutation === "replaced info inode") {
+				expect(retained?.entries.find(entry => entry.relativePath === "info")?.ino).not.toBe(
+					calls[0]?.snapshot.entries.find(entry => entry.relativePath === "info")?.ino,
+				);
+			} else if (mutation === "extra entry") {
+				expect(await Bun.file(path.join(`${lock}.removing`, "foreign")).text()).toBe("preserve retained entry");
+			}
+		},
+	);
 
 	test.each([
 		"different retained path",
