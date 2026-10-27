@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
@@ -82,6 +83,7 @@ describe("AgentSession live sampling settings", () => {
 	function buildSession(): AgentSession {
 		const model = getBundledModel<"openai-completions">("openai", "gpt-4o-mini");
 		const agent = new Agent({
+			temperature: settings.get("temperature") >= 0 ? settings.get("temperature") : undefined,
 			getApiKey: () => "fixture-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (_model, context, options) =>
@@ -197,6 +199,81 @@ describe("AgentSession live sampling settings", () => {
 			await other.close();
 		}
 	});
+
+	for (const shadow of ["none", "project", "runtime"] as const) {
+		it(`publishes an external sampling rebase after a failed save (${shadow})`, async () => {
+			const agentDir = path.join(tempDir.path(), "agent");
+			const scope = { cwd: tempDir.path(), agentDir };
+			if (shadow === "project") {
+				await Bun.write(path.join(tempDir.path(), ".gjc", "settings.json"), JSON.stringify({ temperature: 0.6 }));
+			}
+			settings = await Settings.loadForScope(scope);
+			settings.set("compaction.enabled", false);
+			settings.set("temperature", 0.2);
+			await settings.flushOrThrow();
+			if (shadow === "runtime") settings.override("temperature", 0.7);
+
+			const changes: Array<{ path: string; sessionTemperature: number | undefined }> = [];
+			const thrower = settings.onChanged(settingPath => {
+				if (settingPath === "temperature") throw new Error("observer fixture failure");
+			});
+			const observer = settings.onChanged(settingPath => {
+				if (settingPath === "temperature") {
+					changes.push({ path: settingPath, sessionTemperature: session!.agent.temperature });
+				}
+			});
+			session = buildSession();
+			const initial = shadow === "none" ? 0.2 : shadow === "project" ? 0.6 : 0.7;
+			expect(await request()).toHaveProperty("temperature", initial);
+			const other = await Settings.loadForScope(scope);
+			try {
+				other.set("temperature", 0.8);
+				await other.flushOrThrow();
+			} finally {
+				await other.close();
+			}
+
+			const failure = Object.assign(new Error("fixture config write failure"), { code: "EIO" });
+			const realOpen = fs.open.bind(fs);
+			let failures = 0;
+			const open = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+				if (
+					path.dirname(String(target)) === agentDir &&
+					path.basename(String(target)).startsWith(".config.yml.") &&
+					flags === "wx"
+				) {
+					failures++;
+					throw failure;
+				}
+				return realOpen(target, flags, mode);
+			});
+			try {
+				settings.set("topK", 24);
+				await expect(settings.flushOrThrow()).rejects.toBe(failure);
+				expect(failures).toBeGreaterThanOrEqual(2);
+				expect(settings.get("topK")).toBe(24);
+				const failedDisk = await Bun.file(path.join(agentDir, "config.yml")).text();
+				expect(failedDisk).toContain("temperature: 0.8");
+				expect(failedDisk).not.toContain("topK:");
+				const expected = shadow === "none" ? 0.8 : initial;
+				expect(settings.get("temperature")).toBe(expected);
+				expect(changes).toEqual(shadow === "none" ? [{ path: "temperature", sessionTemperature: 0.8 }] : []);
+				expect(await request()).toMatchObject({ temperature: expected, top_k: 24 });
+			} finally {
+				open.mockRestore();
+			}
+			try {
+				await settings.flushOrThrow();
+				expect(changes).toEqual(shadow === "none" ? [{ path: "temperature", sessionTemperature: 0.8 }] : []);
+				const recoveredDisk = await Bun.file(path.join(agentDir, "config.yml")).text();
+				expect(recoveredDisk).toContain("temperature: 0.8");
+				expect(recoveredDisk).toContain("topK: 24");
+			} finally {
+				thrower();
+				observer();
+			}
+		});
+	}
 
 	it("does not run process-global display hooks for runtime overrides", () => {
 		settings = Settings.isolated();

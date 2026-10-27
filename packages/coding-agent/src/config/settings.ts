@@ -6278,14 +6278,8 @@ export class Settings implements NotificationSettingsReader {
 					if (this.#modified.get(key)?.generation === patch.generation) this.#modified.set(key, patch);
 				}
 				if (durableBeforeWrite) {
-					this.#global = durableBeforeWrite;
 					this.#captureRawNotificationConfig(durableBeforeWrite);
-					for (const patch of this.#pendingPatchesInGenerationOrder()) {
-						applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
-						this.#applyNotificationMutationToRaw(patch.path, patch.value);
-					}
-					this.#rebuildMerged();
-					this.#recomputeNotificationValidationFromRaw();
+					this.#replaceGlobalWithDurable(durableBeforeWrite);
 				}
 				try {
 					await this.#refreshDurableSettings();
