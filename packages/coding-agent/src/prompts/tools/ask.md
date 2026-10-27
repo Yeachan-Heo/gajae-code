@@ -6,6 +6,7 @@ Asks user when you need clarification or input during task execution.
 
 <instruction>
 - Use `recommended: <index>` to mark default (0-indexed); " (Recommended)" added automatically
+- Set `requireExplicitAnswer: true` when a timeout must not choose on the user's behalf
 - Use `questions` for multiple related questions instead of asking one at a time
 - Set `multi: true` on question to allow multiple selections
 - Every question body must contain meaningful, non-whitespace text. Never add empty `metadata`/`ignore` questions.

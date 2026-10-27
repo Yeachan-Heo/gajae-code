@@ -188,6 +188,10 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 			options: z.array(OptionItem).describe("available options"),
 			multi: z.boolean().describe("allow multiple selections").optional(),
 			recommended: z.number().describe("recommended option index").optional(),
+			requireExplicitAnswer: z
+				.boolean()
+				.describe("do not apply ask.timeout or synthesize a selection when no answer was received")
+				.optional(),
 			deepInterview: deepInterviewSchema.describe("optional deep-interview round metadata").optional(),
 			workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
 		})
@@ -288,7 +292,11 @@ const OrdinaryQuestionItem = z.object({
 	options: z.array(OptionItem).describe("available options"),
 	multi: z.boolean().describe("allow multiple selections").optional(),
 	recommended: z.number().describe("recommended option index").optional(),
-	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
+	requireExplicitAnswer: z
+		.boolean()
+		.describe("do not apply ask.timeout or synthesize a selection when no answer was received")
+		.optional(),
+	workflowGate: WorkflowGateMeta.describe("optional workflow-gate stage/kind override").optional(),
 });
 
 export const askSchema = z.object({

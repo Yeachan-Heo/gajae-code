@@ -1291,7 +1291,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// Settings.get("ask.timeout") returns seconds (0 = disabled), convert to ms
 		const timeoutSeconds = this.session.settings.get("ask.timeout");
 		const settingsTimeout = timeoutSeconds === 0 ? null : timeoutSeconds * 1000;
-		const timeout = planModeEnabled ? null : settingsTimeout;
+		const configuredTimeout = planModeEnabled ? null : settingsTimeout;
 
 		// Send notification if waiting and not suppressed
 		this.#sendAskNotification();
@@ -1314,6 +1314,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
+			const timeout = q.requireExplicitAnswer === true ? null : configuredTimeout;
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
 			const isExecutionApprovalQuestion =
@@ -1470,6 +1471,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					scrollTitleRows: DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					otherOptionLabel,
 					autoSelectOnTimeout:
+						q.requireExplicitAnswer !== true &&
 						!intentContract(q.deepInterview) &&
 						!intentReview(q.deepInterview) &&
 						(q.workflowGate === undefined || q.workflowGate.kind === "question"),
@@ -1598,6 +1600,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q);
+			if (timedOut && q.requireExplicitAnswer === true) {
+				context?.abort();
+				throw new ToolAbortError("Ask timed out without an explicit user answer");
+			}
 
 			if (
 				!timedOut &&
@@ -1686,6 +1692,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q, { previous, navigation });
+			if (timedOut && q.requireExplicitAnswer === true) {
+				context?.abort();
+				throw new ToolAbortError("Ask timed out without an explicit user answer");
+			}
 
 			if (cancelled && !timedOut) {
 				context?.abort();

@@ -37,6 +37,7 @@ describe("autoresearch skill intake and verdict handoff", () => {
 		expect(handoff).toContain("structured receipt is persisted");
 		expect(handoff).toContain("call `ask` exactly once");
 		expect(handoff).toContain("`ask` tool description reports an interactive or remote answer channel");
+		expect(handoff).toContain("`requireExplicitAnswer: true`");
 		expect(handoff).toContain('goal({"op":"pause"})');
 		expect(handoff).toContain("`ralplan`, `deep-interview`, `implement directly`, and `stop`");
 		expect(handoff.indexOf("structured receipt is persisted")).toBeLessThan(

@@ -590,6 +590,47 @@ describe("AskTool cancellation", () => {
 		expect(select.mock.calls[0]?.[2]?.timeout).toBeGreaterThan(0);
 	});
 
+	it("does not turn a timed-out explicit-answer question into a selection", async () => {
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+			}),
+		);
+		const abort = vi.fn();
+		const select = vi.fn(
+			async (
+				_prompt: string,
+				_options: string[],
+				dialogOptions?: { timeout?: number; onTimeout?: () => void },
+			) => {
+			expect(dialogOptions?.timeout).toBeUndefined();
+			dialogOptions?.onTimeout?.();
+			return undefined;
+			},
+		);
+
+		await expect(
+			tool.execute(
+				"explicit-answer-timeout",
+				{
+					questions: [
+						{
+							id: "handoff",
+							question: "How should the research continue?",
+							options: [{ label: "ralplan" }, { label: "stop" }],
+							requireExplicitAnswer: true,
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select, abort }),
+			),
+		).rejects.toThrow("Ask timed out without an explicit user answer");
+		expect(abort).toHaveBeenCalledTimes(1);
+		expect(select).toHaveBeenCalledTimes(1);
+	});
+
 	it("does not mark a single option as recommended", async () => {
 		const tool = new AskTool(createSession());
 		const select = vi.fn(async (_prompt: string, options: string[], dialogOptions) => {
@@ -945,6 +986,57 @@ describe("AskTool remote semantic settlements", () => {
 				}),
 			abort,
 		});
+
+	it("does not forward ask.timeout to a remote channel for explicit-answer questions", async () => {
+		const requests: AskAnswerRequest[] = [];
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				requests.push(request);
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "ralplan" },
+					settle: async () => ({
+						kind: "committed" as const,
+						ack: { status: "delivered" as const, messageId: 12 },
+					}),
+				});
+			},
+		};
+		const context = {
+			hasUI: false,
+			ui: undefined,
+			abort: vi.fn(),
+		} as unknown as AgentToolContext;
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getAskAnswerSource: () => source,
+			}),
+		);
+
+		const result = await tool.execute(
+			"remote-explicit-answer",
+			{
+				questions: [
+					{
+						id: "handoff",
+						question: "How should the research continue?",
+						options: [{ label: "ralplan" }, { label: "stop" }],
+						requireExplicitAnswer: true,
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.timeoutMs).toBeUndefined();
+		expect(result.details?.selectedOptions).toEqual(["ralplan"]);
+	});
 
 	it("bounds repeated remote whitespace custom answers and explains the retry", async () => {
 		const requests: AskAnswerRequest[] = [];
