@@ -51,6 +51,9 @@ export class Input implements Component, Focusable {
 
 	// Undo support
 	#undoStack: InputState[] = [];
+	// The stack only appends during a yank chain; undo and resets end the chain.
+	// Keep an index to the existing snapshot without retaining another value copy.
+	#yankUndoIndex = -1;
 
 	getValue(): string {
 		return this.#value;
@@ -317,6 +320,7 @@ export class Input implements Component, Focusable {
 		}
 
 		this.#pushUndo();
+		this.#yankUndoIndex = this.#undoStack.length - 1;
 		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
 		this.#put(inserted.value, inserted.cursor);
 		this.#lastAction = "yank";
@@ -327,11 +331,11 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
+		const beforeYank = this.#undoStack[this.#yankUndoIndex];
+		if (!beforeYank) return;
 		this.#pushUndo();
 
-		const prevText = this.#killRing.peek() ?? "";
-		const removed = this.#value.slice(0, this.#cursor - prevText.length) + this.#value.slice(this.#cursor);
-		this.#put(removed, this.#cursor - prevText.length);
+		this.#put(beforeYank.value, beforeYank.cursor);
 
 		this.#killRing.rotate();
 		const text = this.#killRing.peek() ?? "";

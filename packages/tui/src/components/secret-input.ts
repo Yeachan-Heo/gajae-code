@@ -72,6 +72,9 @@ export class SecretInput implements Component, Focusable {
 	#killRing: string[] = [];
 	#lastAction: "kill" | "yank" | "type-word" | null = null;
 	#undoStack: SecretInputState[] = [];
+	// The stack only appends during a yank chain; undo and resets end the chain.
+	// Keep an index to the existing snapshot without retaining another value copy.
+	#yankUndoIndex = -1;
 	#disposed = false;
 
 	readonly placeholder: string;
@@ -394,6 +397,7 @@ export class SecretInput implements Component, Focusable {
 		}
 
 		this.#pushUndo();
+		this.#yankUndoIndex = this.#undoStack.length - 1;
 		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
 		this.#value = inserted.value;
 		this.#cursor = inserted.cursor;
@@ -405,10 +409,11 @@ export class SecretInput implements Component, Focusable {
 			return;
 		}
 
+		const beforeYank = this.#undoStack[this.#yankUndoIndex];
+		if (!beforeYank) return;
 		this.#pushUndo();
-		const previous = this.#killRing.at(-1) ?? "";
-		this.#value = this.#value.slice(0, this.#cursor - previous.length) + this.#value.slice(this.#cursor);
-		this.#cursor -= previous.length;
+		this.#value = beforeYank.value;
+		this.#cursor = beforeYank.cursor;
 		const last = this.#killRing.pop();
 		if (last !== undefined) {
 			this.#killRing.unshift(last);

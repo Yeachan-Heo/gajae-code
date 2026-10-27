@@ -2053,6 +2053,15 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	// package barrel, so it is a native consumer: it has to bring its own producer, or
 	// the shard's `if: matrix.native` download step asks for an artifact that the
 	// skipped `affected-native` job never uploaded.
+	test("custom provider recipes select runtime loader validation in both planning modes", () => {
+		for (const tasks of [targeted(["docs/custom-providers-and-multi-account.md"]), planTasks(["docs/custom-providers-and-multi-account.md"], packages)]) {
+			const keys = tasks.map(task => task.key);
+			expect(keys).toContain("test:packages/coding-agent/test/custom-provider-docs.test.ts");
+			expect(keys).toContain(EMBEDDED_DOCS_GATE_KEY);
+			expect(keys).toContain("native-linux-x64");
+		}
+	});
+
 	test("docs-only changes select the embedded-docs gate and its native producer", () => {
 		const changed = ["docs/guide.md", "docs/nested/other.md"];
 		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>
