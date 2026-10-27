@@ -25,7 +25,7 @@ export interface StatusLineOptions {
  */
 export function sanitizeStatusLineText(text: string): string {
 	return text
-		.replace(/[\r\n]+/gu, " ")
+		.replace(/[\r\n\t]+/gu, " ")
 		.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "")
 		// Strip OSC sequences EXCEPT well-formed OSC 8 hyperlinks (\x1b]8;...ST)
 		.replace(/\x1b\](?!8;)[^\x1b\x07]*(?:\x07|\x1b\\)/gu, "")

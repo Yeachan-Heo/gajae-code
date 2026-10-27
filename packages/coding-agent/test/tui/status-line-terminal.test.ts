@@ -157,6 +157,19 @@ test("strips injected terminal controls while preserving OSC 8 file hyperlinks",
 	expect(rendered).toContain("src/read.ts");
 });
 
+test("normalizes horizontal tabs to spaces to prevent layout desynchronization", () => {
+	const rendered = renderStatusLine(
+		{
+			title: "Search",
+			description: "foo\tbar\tbaz",
+		},
+		theme,
+	);
+
+	expect(rendered).not.toContain("\t");
+	expect(rendered).toContain("foo bar baz");
+});
+
 test("property: status line strips arbitrary terminal controls, fc.property seed 71291, numRuns 64", () => {
 	const mark = fc.stringMatching(/^[A-Za-z]{6,12}$/);
 	const wrapper = fc.constantFrom(
