@@ -4,7 +4,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import { getKeybindings, setKeybindings } from "@gajae-code/tui";
-import { TempDir } from "@gajae-code/utils";
+import { getDefaultTabWidth, setDefaultTabWidth, TempDir } from "@gajae-code/utils";
 import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
 import { KeybindingsManager } from "../src/config/keybindings";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -171,6 +171,71 @@ describe("AgentSession live sampling settings", () => {
 			resetSettingsForTest();
 		}
 	});
+
+	it("publishes externally rebased sampling when saving an unrelated setting", async () => {
+		const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
+		settings = await Settings.loadForScope(scope);
+		settings.set("compaction.enabled", false);
+		session = buildSession();
+		settings.set("temperature", 0.2);
+		await settings.flushOrThrow();
+		expect(await request()).toHaveProperty("temperature", 0.2);
+		const other = await Settings.loadForScope(scope);
+		try {
+			other.set("temperature", 0.8);
+			await other.flushOrThrow();
+			settings.set("topK", 24);
+			await settings.flushOrThrow();
+			expect(settings.get("temperature")).toBe(0.8);
+			expect(await request()).toMatchObject({ temperature: 0.8, top_k: 24 });
+		} finally { await other.close(); }
+	});
+
+	it("does not run process-global display hooks for runtime overrides", () => {
+		settings = Settings.isolated();
+		const original = getDefaultTabWidth();
+		const width = original === 2 ? 3 : 2;
+		try {
+			settings.override("display.tabWidth", width);
+			expect(settings.get("display.tabWidth")).toBe(width);
+			expect(getDefaultTabWidth()).toBe(original);
+			settings.clearOverride("display.tabWidth");
+			expect(getDefaultTabWidth()).toBe(original);
+		} finally { setDefaultTabWidth(original); }
+	});
+
+	for (const updates of [[0.25], [0.75, 0.25]]) {
+		it(`rejects an older restore after another owner writes ${updates.join("/")}`, async () => {
+			const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
+			settings = await Settings.loadForScope(scope);
+			settings.set("compaction.enabled", false);
+			session = buildSession();
+			const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.25 }]);
+			const other = await Settings.loadForScope(scope);
+			try {
+				for (const value of updates) { other.set("temperature", value); await other.flushOrThrow(); }
+				expect((await receipt.restore()).status).toBe("conflict");
+				expect(await request()).toHaveProperty("temperature", 0.25);
+				expect((await Settings.loadReadonly(scope)).get("temperature")).toBe(0.25);
+				expect(other.get("temperature")).toBe(0.25);
+			} finally { await other.close(); }
+		});
+	}
+
+	for (const durable of [false, true]) {
+		for (const updates of [["openai/gpt-4o-mini"], ["other/model", "openai/gpt-4o-mini"]]) {
+			it(`fences an atomic model leaf against newer parent role writes ${updates.join("/")} (${durable ? "disk" : "memory"})`, async () => {
+				const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
+				settings = durable ? await Settings.loadForScope(scope) : Settings.isolated();
+				const receipt = await settings.commitAtomicBatch([{ path: "modelRoles.default", op: "set", value: "openai/gpt-4o-mini" }]);
+				for (const value of updates) settings.setModelRole("default", value);
+				await settings.flushOrThrow();
+				expect((await receipt.restore()).status).toBe("conflict");
+				expect(settings.getModelRole("default")).toBe("openai/gpt-4o-mini");
+				if (durable) expect((await Settings.loadReadonly(scope)).getModelRole("default")).toBe("openai/gpt-4o-mini");
+			});
+		}
+	}
 
 	it("keeps live sampling after bounded child cleanup", async () => {
 		settings = Settings.isolated({ "compaction.enabled": false });
