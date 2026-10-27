@@ -31,7 +31,7 @@ import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
 	recoverNotifications,
-	sanitizeDiagnostic,
+	sanitizeProviderDiagnostic,
 	sendNotificationTest,
 } from "./bus/notification-service";
 import type { NotificationSessionStatus } from "./bus/session-control";
@@ -65,7 +65,6 @@ export interface NotificationsEditorOperationDependencies {
 	checkNotificationHealth: typeof checkNotificationHealth;
 	sendNotificationTest: typeof sendNotificationTest;
 	recoverNotifications: typeof recoverNotifications;
-	sanitizeDiagnostic: typeof sanitizeDiagnostic;
 	ensureTelegramDaemonRunningDetailed: typeof ensureTelegramDaemonRunningDetailed;
 	runTelegramSetup: typeof runTelegramSetup;
 	resolveTelegramSetupPreflight: typeof resolveTelegramSetupPreflight;
@@ -88,7 +87,6 @@ const notificationEditorOperationDependencies: NotificationsEditorOperationDepen
 	checkNotificationHealth,
 	sendNotificationTest,
 	recoverNotifications,
-	sanitizeDiagnostic,
 	ensureTelegramDaemonRunningDetailed,
 	runTelegramSetup,
 	resolveTelegramSetupPreflight,
@@ -118,16 +116,6 @@ function unavailableNotificationSessionResult() {
 	return { outcome: "disabled" as const, status: unavailableNotificationSessionStatus() };
 }
 
-function notificationOperationError(
-	services: NotificationsEditorOperationDependencies,
-	error: unknown,
-	token?: string,
-): Error {
-	return new Error(
-		services.sanitizeDiagnostic(error instanceof Error ? error.message : "Notification operation failed.", token),
-	);
-}
-
 /**
  * Shared local notification setup service for SDK callers and the Notifications settings tab.
  * Secrets remain in closure-owned WeakMaps; frozen drafts bind authority to prepared values.
@@ -137,6 +125,22 @@ export function createNotificationsEditorOperations(
 	overrides: Partial<NotificationsEditorOperationDependencies> = {},
 ): NotificationsEditorOperations {
 	const services = { ...notificationEditorOperationDependencies, ...overrides };
+	const readConfig = () => {
+		try {
+			return services.getNotificationConfig(ctx.settings);
+		} catch {
+			throw new Error("Notification configuration is unavailable.");
+		}
+	};
+	const sanitize = (text: string, token?: string): string => {
+		try {
+			return sanitizeProviderDiagnostic(text, readConfig(), token);
+		} catch {
+			return "Notification diagnostic unavailable.";
+		}
+	};
+	const operationError = (error: unknown, token?: string): Error =>
+		new Error(sanitize(error instanceof Error ? error.message : "Notification operation failed.", token));
 	const drafts = new WeakMap<
 		PreparedTelegramConfiguration,
 		{ token: string; activationAllowed: boolean; busy: boolean }
@@ -190,7 +194,7 @@ export function createNotificationsEditorOperations(
 
 	return {
 		loadState: async () => {
-			const config = services.getNotificationConfig(ctx.settings);
+			const config = readConfig();
 			const status = services.buildNotificationStatusReport(ctx.settings);
 			const runtime = async (provider: NotificationProvider) => {
 				const daemon =
@@ -237,20 +241,19 @@ export function createNotificationsEditorOperations(
 				};
 				const report = await services.checkNotificationHealth(input);
 				if (signal?.aborted) throw new Error("Notification health refresh cancelled.");
-				const token = services.getNotificationConfig(ctx.settings).botToken;
 				return {
 					...report,
 					checks: report.checks.map(check => ({
 						...check,
-						detail: services.sanitizeDiagnostic(check.detail, token),
+						detail: sanitize(check.detail),
 					})),
 					reachability: {
 						...report.reachability,
-						detail: services.sanitizeDiagnostic(report.reachability.detail, token),
+						detail: sanitize(report.reachability.detail),
 					},
 				};
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -272,13 +275,10 @@ export function createNotificationsEditorOperations(
 				});
 				return {
 					...result,
-					detail: services.sanitizeDiagnostic(
-						result.detail,
-						services.getNotificationConfig(ctx.settings).botToken,
-					),
+					detail: sanitize(result.detail),
 				};
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -293,14 +293,11 @@ export function createNotificationsEditorOperations(
 					...result,
 					daemon: {
 						...result.daemon,
-						detail: services.sanitizeDiagnostic(
-							result.daemon.detail,
-							services.getNotificationConfig(ctx.settings).botToken,
-						),
+						detail: sanitize(result.daemon.detail),
 					},
 				};
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -330,7 +327,7 @@ export function createNotificationsEditorOperations(
 				}
 				return result;
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -359,7 +356,7 @@ export function createNotificationsEditorOperations(
 					return {
 						status: setup.status === "aborted" ? "aborted" : setup.status === "cancelled" ? "cancelled" : "error",
 						identity: unknownIdentity,
-						message: services.sanitizeDiagnostic(setup.detail, token),
+						message: sanitize(setup.detail, token),
 					};
 				}
 				if (signal.aborted) {
@@ -418,10 +415,7 @@ export function createNotificationsEditorOperations(
 					identity: unknownIdentity,
 					message: signal.aborted
 						? "Telegram setup cancelled."
-						: services.sanitizeDiagnostic(
-								error instanceof Error ? error.message : "Telegram setup failed.",
-								token,
-							),
+						: sanitize(error instanceof Error ? error.message : "Telegram setup failed.", token),
 				};
 			}
 		},
@@ -450,7 +444,7 @@ export function createNotificationsEditorOperations(
 				}
 			} catch (error) {
 				prepared.busy = false;
-				throw notificationOperationError(services, error, token);
+				throw operationError(error, token);
 			}
 			drafts.delete(draft);
 			let receipt: SettingsAtomicReceipt | undefined;
@@ -504,7 +498,7 @@ export function createNotificationsEditorOperations(
 					return {
 						status: "blocked_identity" as const,
 						receipt,
-						message: services.sanitizeDiagnostic(
+						message: sanitize(
 							`${activation.message}${observerFailed ? " The settings observer also failed after the durable commit." : ""}`,
 							token,
 						),
@@ -513,7 +507,7 @@ export function createNotificationsEditorOperations(
 							try {
 								restored = await activation.restore();
 							} catch (error) {
-								throw notificationOperationError(services, error, token);
+								throw operationError(error, token);
 							}
 							if (
 								restored.status === "restored" ||
@@ -535,7 +529,7 @@ export function createNotificationsEditorOperations(
 					return {
 						status: "activation_failed" as const,
 						receipt,
-						message: services.sanitizeDiagnostic(
+						message: sanitize(
 							`${activation.message}${observerFailed ? " The settings observer also failed after the durable commit." : ""}`,
 							token,
 						),
@@ -551,7 +545,7 @@ export function createNotificationsEditorOperations(
 				return {
 					status: "saved" as const,
 					receipt,
-					message: services.sanitizeDiagnostic("Telegram configuration saved and reconciled.", token),
+					message: sanitize("Telegram configuration saved and reconciled.", token),
 				};
 			} catch (error) {
 				if (receipt) {
@@ -561,7 +555,7 @@ export function createNotificationsEditorOperations(
 						message: "Telegram configuration was saved, but post-commit activation failed.",
 					};
 				}
-				throw notificationOperationError(services, error, token);
+				throw operationError(error, token);
 			}
 		},
 
@@ -613,7 +607,7 @@ export function createNotificationsEditorOperations(
 					message: "Telegram configuration saved inactive; no runtime activation was requested.",
 				};
 			} catch (error) {
-				throw notificationOperationError(services, error, token);
+				throw operationError(error, token);
 			}
 		},
 
@@ -623,7 +617,7 @@ export function createNotificationsEditorOperations(
 
 		prepareProviderConfiguration: async input => {
 			requireDurableConfig();
-			const cfg = services.getNotificationConfig(ctx.settings);
+			const cfg = readConfig();
 			const consumeSecret = (action: typeof input.botToken): string | undefined => {
 				if (!action.value) return undefined;
 				const value = action.value.consume();
@@ -793,7 +787,7 @@ export function createNotificationsEditorOperations(
 		setProviderDesired: async (provider, enabled) => {
 			requireDurableConfig();
 			if (provider === "telegram" && enabled) {
-				const config = services.getNotificationConfig(ctx.settings);
+				const config = readConfig();
 				if (services.getCurrentTelegramActivationMarker(config)) {
 					return {
 						outcome: "failed",
@@ -986,17 +980,15 @@ export function createNotificationsEditorOperations(
 							} catch {
 								// Preserve the original removal failure and report unsuccessful fencing.
 							}
-							throw notificationOperationError(
-								services,
+							throw operationError(
 								new Error(
 									`Telegram removal failed and current-session reconciliation failed; runtime ${fenced ? "was fenced" : "could not be fenced"}.`,
 								),
-								services.getNotificationConfig(ctx.settings).botToken,
 							);
 						}
 					}
 				}
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -1007,7 +999,7 @@ export function createNotificationsEditorOperations(
 			try {
 				return await controller.setLocalEnabled(sessionContext(), enabled);
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -1015,7 +1007,7 @@ export function createNotificationsEditorOperations(
 			requireDurableConfig();
 			let daemonWasRunningForDisable = false;
 			try {
-				const before = services.getNotificationConfig(ctx.settings);
+				const before = readConfig();
 				const disablingToolActivity =
 					isProviderEffectivelyEnabled(before, "telegram") &&
 					isTelegramComplete(before) &&
@@ -1064,23 +1056,16 @@ export function createNotificationsEditorOperations(
 				}
 
 				const postCommitFailures: string[] = [];
-				const config = services.getNotificationConfig(ctx.settings);
+				const config = readConfig();
 				if (isProviderEffectivelyEnabled(config, "telegram") && isTelegramComplete(config)) {
 					try {
 						const reload = daemonWasRunningForDisable
 							? await services.restartTelegramDaemon(ctx.settings)
 							: await services.reloadTelegramDaemon(ctx.settings);
 						if (!reload.ok) {
-							let detail = reload.message;
-							for (const token of [
-								config.botToken,
-								config.discord.botToken,
-								config.slack.botToken,
-								config.slack.appToken,
-							]) {
-								detail = services.sanitizeDiagnostic(detail, token);
-							}
-							postCommitFailures.push(`daemon reload failed: ${detail}`);
+							postCommitFailures.push(
+								`daemon reload failed: ${sanitizeProviderDiagnostic(reload.message, config)}`,
+							);
 						}
 					} catch {
 						postCommitFailures.push("daemon reload failed");
@@ -1100,7 +1085,7 @@ export function createNotificationsEditorOperations(
 							: `Notification preferences were saved, but post-commit ${postCommitFailures.join(" and ")}.`,
 				};
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 
@@ -1111,7 +1096,7 @@ export function createNotificationsEditorOperations(
 			try {
 				return await controller.reconcileCurrentSession(sessionContext());
 			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+				throw operationError(error);
 			}
 		},
 	};

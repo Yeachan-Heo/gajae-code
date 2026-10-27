@@ -1737,7 +1737,8 @@ describe("notification settings controller adapter", () => {
 	});
 
 	it("redacts provider secrets in a post-commit daemon reload diagnostic", async () => {
-		const secrets = ["old-telegram-secret", "discord-secret", "slack-bot-secret", "slack-app-secret"];
+		const secrets = ["old-telegram-secret", "discord-secret", "discord-secret-longer", "slack-app-secret"];
+		const sensitive = [...secrets, ...secrets.map(tokenFingerprint)];
 		const settings = {
 			canPersistDurableConfig: () => true,
 			getNotificationSettingsSnapshot: () =>
@@ -1755,13 +1756,81 @@ describe("notification settings controller adapter", () => {
 				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
 			} as unknown as NotificationsEditorAdapterContext,
 			{
-				reloadTelegramDaemon: async () => ({ ok: false, message: `failure ${secrets.join(" ")}` }),
+				reloadTelegramDaemon: async () => ({ ok: false, message: `failure ${sensitive.join(" ")}` }),
 			},
 		);
 		const result = await operations.commitPreferences({ ...editorState().preferences, toolActivityEnabled: true });
 		expect(result.outcome).toBe("degraded");
 		expect(result.message).toContain("daemon reload failed");
-		for (const secret of secrets) expect(result.message).not.toContain(secret);
+		for (const secret of sensitive) expect(result.message).not.toContain(secret);
+	});
+
+	it("sanitizes injected health, test and recovery details and errors across providers", async () => {
+		const secrets = [TOKEN, "shared-secret", "shared-secret-longer", "slack-app-secret"];
+		const sensitive = [...secrets, ...secrets.map(tokenFingerprint)];
+		const detail = `diagnostic ${sensitive.join(" ")}`;
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getNotificationSettingsSnapshot: () =>
+				snapshot({
+					telegram: { ...snapshot().telegram, botToken: secrets[0] },
+					discord: { botToken: secrets[1] },
+					slack: { botToken: secrets[2], appToken: secrets[3] },
+				}),
+		} as unknown as Settings;
+		const context = {
+			settings,
+			session: { notificationSessionController: undefined },
+			sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+		} as unknown as NotificationsEditorAdapterContext;
+		const operations = createNotificationsEditorOperations(context, {
+			checkNotificationHealth: async () => ({
+				...health(),
+				checks: [{ name: "config", level: "ok", detail }],
+				reachability: { probed: true, ok: true, detail },
+			}),
+			sendNotificationTest: async () => ({ ok: true, adapter: "discord", detail }),
+			recoverNotifications: async () => ({ ...recovery(), daemon: { ...recovery().daemon, detail } }),
+		});
+		const report = await operations.refreshHealth({ probe: true });
+		const outputs = [
+			report.checks[0].detail,
+			report.reachability.detail,
+			(await operations.sendTest()).detail,
+			(await operations.recover()).daemon.detail,
+		];
+		for (const output of outputs) {
+			expect(output).toContain("diagnostic");
+			for (const secret of sensitive) expect(output).not.toContain(secret);
+		}
+		const failing = createNotificationsEditorOperations(context, {
+			checkNotificationHealth: async () => {
+				throw new Error(detail);
+			},
+			sendNotificationTest: async () => {
+				throw new Error(detail);
+			},
+		});
+		for (const call of [() => failing.refreshHealth({ probe: true }), () => failing.sendTest()]) {
+			try {
+				await call();
+				throw new Error("Expected diagnostic failure");
+			} catch (error) {
+				expect((error as Error).message).toContain("diagnostic");
+				for (const secret of sensitive) expect((error as Error).message).not.toContain(secret);
+			}
+		}
+		const getterFailure = createNotificationsEditorOperations(context, {
+			getNotificationConfig: () => {
+				throw new Error(detail);
+			},
+			checkNotificationHealth: async () => {
+				throw new Error(detail);
+			},
+		});
+		await expect(getterFailure.refreshHealth({ probe: true })).rejects.toThrow(
+			"Notification diagnostic unavailable.",
+		);
 	});
 
 	it("stops the Telegram supervisor before removing its configuration", async () => {
