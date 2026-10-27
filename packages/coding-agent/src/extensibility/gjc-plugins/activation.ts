@@ -74,8 +74,8 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		// Remove the flag from the original text by finding and deleting the exact token
 		// without normalizing other whitespace (review P2, issue #5951).
 		const flagToken = tokens[flagTokenIndex];
-		const flagPattern = new RegExp(`(^|\\s)${flagToken.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}(\\s|$)`);
-		cleanedArgs = input.args.replace(flagPattern, (match, before, after) => {
+		const flagPattern = new RegExp(`(^|\\s)${flagToken.replace(/[.*+?^${}()|[\\\\\]]/g, "\\$&")}(\\s|$)`);
+		cleanedArgs = input.args.replace(flagPattern, (_match, before, after) => {
 			// Preserve one whitespace boundary if present
 			return before || after ? before || after : "";
 		});
