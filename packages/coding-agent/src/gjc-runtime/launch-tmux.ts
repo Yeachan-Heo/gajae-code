@@ -1135,7 +1135,9 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
 	const sessionStateFile =
 		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
-		(platform === "linux" || platform === "darwin" ? canonicalManagedStateFile(derivedStateFile) : derivedStateFile);
+		(platform === "linux" || platform === "darwin"
+			? canonicalManagedStateFile(cwd, derivedStateFile)
+			: derivedStateFile);
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
 	// itself stays in memory until writeCoordinatorSidecarBootstrapFile runs

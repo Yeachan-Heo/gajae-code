@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
+import { GJC_DIR } from "./session-layout";
 
 export {
 	assertGjcTmuxMutationAuthoritySync,
@@ -317,24 +318,26 @@ export function normalizeTmuxCreatedAt(raw: string): string {
 }
 
 /**
- * A derived managed state file with every existing ancestor resolved, so a workspace
- * reached through a symlink (or a symlinked `.gjc`) has one canonical spelling that
- * lifecycle preparation, verification, supervision and admission all share. Missing
- * components are appended verbatim. An unresolvable path is returned unchanged and
- * fails closed in the no-follow verification of managed storage.
+ * A derived managed state file named through its canonical trusted anchor: the
+ * workspace, or its `.gjc` directory when that exists, is resolved once so a
+ * workspace or `.gjc` reached through a symlink has one spelling that lifecycle
+ * preparation, verification, supervision and admission all share. The private
+ * `_session-*` tail below `.gjc` stays lexical, so a link inside managed storage
+ * still fails the no-follow verification. A path outside `<cwd>/.gjc` or an
+ * unresolvable anchor is returned unchanged and fails closed later.
  */
-export function canonicalManagedStateFile(file: string): string {
-	const missing: string[] = [];
-	let existing = path.resolve(file);
-	for (;;) {
-		try {
-			return path.join(fs.realpathSync.native(existing), ...missing);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return file;
-			const parent = path.dirname(existing);
-			if (parent === existing) return file;
-			missing.unshift(path.basename(existing));
-			existing = parent;
-		}
+export function canonicalManagedStateFile(cwd: string, file: string): string {
+	const lexicalAnchor = path.join(path.resolve(cwd), GJC_DIR);
+	const tail = path.relative(lexicalAnchor, path.resolve(file));
+	if (tail === "" || tail.startsWith("..") || path.isAbsolute(tail)) return file;
+	try {
+		return path.join(fs.realpathSync.native(lexicalAnchor), tail);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return file;
+	}
+	try {
+		return path.join(fs.realpathSync.native(path.resolve(cwd)), GJC_DIR, tail);
+	} catch {
+		return file;
 	}
 }

@@ -800,14 +800,19 @@ export function createGjcTmuxSession(
 		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
 		// A managed launch verifies its lifecycle root with no-follow walks, so a
 		// workspace reached through a symlink must be named by its canonical path.
-		(launch && platform !== "win32" ? canonicalManagedStateFile(derivedStateFile) : derivedStateFile);
+		(launch && platform !== "win32" ? canonicalManagedStateFile(cwd, derivedStateFile) : derivedStateFile);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	if (launch) {
 		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
 		if (fsSync.existsSync(lifecycleRoot) && !verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
 			throw new Error("gjc_tmux_managed_storage_unsafe");
-		prepareManagedDirectoryRoot(lifecycleRoot);
+		try {
+			prepareManagedDirectoryRoot(lifecycleRoot);
+		} catch {
+			// Preparation refuses a linked or unsafe component without naming it.
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+		}
 		if (!verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
 			throw new Error("gjc_tmux_managed_storage_unsafe");
 	}

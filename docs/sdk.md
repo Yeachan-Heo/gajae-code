@@ -1285,11 +1285,13 @@ Supervised managed tmux launches (Broker-spawned sessions and interactive root
 `0700` lifecycle root) child binding before the supervised child starts.
 Launches that do not run the supervisor, such as `gjc session create` without
 a launch specification, start `gjc` directly and receive neither a binding nor
-exact CLI admission. The derived state path of a supervised launch names its
-workspace canonically (every existing ancestor resolved), so a workspace, an
-in-repository `.worktrees` bucket or a `.gjc` reached through a symlink passes
-the no-follow verification of the private lifecycle root, which still rejects
-any link inside managed storage; an operator-pinned
+exact CLI admission. The derived state path of a supervised launch is named
+through its canonical trusted anchor (the workspace, or its `.gjc` when
+present), so a workspace, an in-repository `.worktrees` bucket or a `.gjc`
+reached through a symlink passes the no-follow verification of the private
+lifecycle root. The `_session-*` tail below `.gjc` stays lexical, so a link
+inside managed storage is still refused (`gjc_tmux_managed_storage_unsafe` or
+`managed_owner_storage_unsafe`); an operator-pinned
 `GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim. A Broker-redacted
 launch, and every macOS launch, publishes an opaque binding that carries
 neither the launch command nor a command digest, so prompts and flags such as
