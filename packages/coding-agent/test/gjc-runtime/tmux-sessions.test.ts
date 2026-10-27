@@ -1861,37 +1861,41 @@ describe("GJC tmux session management", () => {
 				: scenario === "exit_without_verdict"
 					? "refuses cooperative cleanup when the genuine supervisor exits without publishing a verdict"
 					: "refuses cooperative cleanup when the genuine verdict exists but the supervisor remains alive";
-		it(testName, async () => {
-			// Only tmux metadata/mutation is isolated. Admission, private binding,
-			// process provenance, dispatch, child relay and terminal publication are real.
-			// Darwin uses cooperative intent; Linux uses the native pinned signal route.
-			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-default-deps-"));
-			// Do not register this directory with unconditional afterEach deletion:
-			// failed teardown must retain evidence while either process may be alive.
-			const sessionId = "session";
-			const generation = "generation";
-			const marker = path.join(stateDir, "marker");
-			const paths = lifecyclePaths(stateDir, sessionId, generation);
-			const repoRoot = path.resolve(import.meta.dir, "../../../..");
-			const cli = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
-			const admissionModule = path.join(
-				repoRoot,
-				"packages/coding-agent/src/gjc-runtime/managed-owner-admission.ts",
-			);
-			const readyFile = path.join(stateDir, "child-ready.json");
-			const handlerFile = path.join(stateDir, "child-sigterm.json");
-			const cleanupFile = path.join(stateDir, "child-cleanup.json");
-			const expiredFile = path.join(stateDir, "child-self-expired");
-			const childScript = path.join(stateDir, "owned-child.ts");
-			const preloadFile = path.join(stateDir, "terminal-fault-preload.ts");
-			const faultReachedFile = path.join(stateDir, "terminal-fault-reached");
-			const releaseFile = path.join(stateDir, "release-supervisor");
-			const holdExpiredFile = path.join(stateDir, "supervisor-hold-expired");
-			await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
-			replaceOwnerGenerationSync(stateDir, sessionId, generation, { state: "absent" });
-			await fs.writeFile(
-				childScript,
-				`
+		// A real supervisor needs the owner-only reader and a graceful SIGTERM relay;
+		// Windows has neither (signalRoot terminates with exit 1).
+		it.skipIf(process.platform === "win32")(
+			testName,
+			async () => {
+				// Only tmux metadata/mutation is isolated. Admission, private binding,
+				// process provenance, dispatch, child relay and terminal publication are real.
+				// Darwin uses cooperative intent; Linux uses the native pinned signal route.
+				const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-default-deps-"));
+				// Do not register this directory with unconditional afterEach deletion:
+				// failed teardown must retain evidence while either process may be alive.
+				const sessionId = "session";
+				const generation = "generation";
+				const marker = path.join(stateDir, "marker");
+				const paths = lifecyclePaths(stateDir, sessionId, generation);
+				const repoRoot = path.resolve(import.meta.dir, "../../../..");
+				const cli = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
+				const admissionModule = path.join(
+					repoRoot,
+					"packages/coding-agent/src/gjc-runtime/managed-owner-admission.ts",
+				);
+				const readyFile = path.join(stateDir, "child-ready.json");
+				const handlerFile = path.join(stateDir, "child-sigterm.json");
+				const cleanupFile = path.join(stateDir, "child-cleanup.json");
+				const expiredFile = path.join(stateDir, "child-self-expired");
+				const childScript = path.join(stateDir, "owned-child.ts");
+				const preloadFile = path.join(stateDir, "terminal-fault-preload.ts");
+				const faultReachedFile = path.join(stateDir, "terminal-fault-reached");
+				const releaseFile = path.join(stateDir, "release-supervisor");
+				const holdExpiredFile = path.join(stateDir, "supervisor-hold-expired");
+				await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
+				replaceOwnerGenerationSync(stateDir, sessionId, generation, { state: "absent" });
+				await fs.writeFile(
+					childScript,
+					`
 import * as fs from "node:fs";
 import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)};
 const admission = await admitManagedOwnerBeforeCli();
@@ -1917,14 +1921,14 @@ process.on("SIGTERM", () => {
 });
 fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid, admission: admission.kind, token: process.env.GJC_MANAGED_OWNER_CHILD_TOKEN }));
 `,
-				{ mode: 0o600 },
-			);
-			if (scenario !== "complete") {
-				// Scoped to the actual supervisor process, before CLI module loading.
-				// Do not spoof argv or replace admission, child relay, or terminal data.
-				await fs.writeFile(
-					preloadFile,
-					`
+					{ mode: 0o600 },
+				);
+				if (scenario !== "complete") {
+					// Scoped to the actual supervisor process, before CLI module loading.
+					// Do not spoof argv or replace admission, child relay, or terminal data.
+					await fs.writeFile(
+						preloadFile,
+						`
 import * as fs from "node:fs";
 import { spyOn } from "bun:test";
 import * as isolation from ${JSON.stringify(path.join(repoRoot, "packages/coding-agent/src/gjc-runtime/tmux-owner-isolation.ts"))};
@@ -1947,281 +1951,286 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
   return verdict;
 });
 `,
-					{ mode: 0o600 },
-				);
-			}
-			const childEnv = { ...process.env };
-			for (const key of Object.keys(childEnv)) {
-				if (
-					key.startsWith("GJC_MANAGED_OWNER_") ||
-					key.startsWith("GJC_TMUX_OWNER_") ||
-					key.includes("CAPABILITY") ||
-					key === "GJC_COORDINATOR_SESSION_ID"
-				)
-					delete childEnv[key];
-			}
-			// Avoid a CLI malloc-guard re-exec changing the pinned supervisor identity.
-			delete childEnv.MallocStackLogging;
-			delete childEnv.MallocStackLoggingNoCompact;
-			const owner = Bun.spawn(
-				[
-					process.execPath,
-					...(scenario === "complete" ? [] : ["--preload", preloadFile]),
-					cli,
-					"--internal-managed-owner-supervisor",
-					"--",
-					process.execPath,
-					childScript,
-				],
-				{
-					cwd: repoRoot,
-					stdin: "ignore",
-					stdout: "ignore",
-					stderr: "pipe",
-					env: {
-						...childEnv,
-						GJC_COORDINATOR_SESSION_ID: sessionId,
-						GJC_TMUX_OWNER_GENERATION: generation,
-						GJC_TMUX_OWNER_STATE_DIR: stateDir,
-						GJC_TMUX_OWNER_SERVER_KEY: "managed",
-						GJC_MANAGED_OWNER_RUN_ID: "close-run",
-						GJC_MANAGED_OWNER_INCARNATION: "close-incarnation",
-						GJC_MANAGED_OWNER_REDACT_COMMAND: "1",
+						{ mode: 0o600 },
+					);
+				}
+				const childEnv = { ...process.env };
+				for (const key of Object.keys(childEnv)) {
+					if (
+						key.startsWith("GJC_MANAGED_OWNER_") ||
+						key.startsWith("GJC_TMUX_OWNER_") ||
+						key.includes("CAPABILITY") ||
+						key === "GJC_COORDINATOR_SESSION_ID"
+					)
+						delete childEnv[key];
+				}
+				// Avoid a CLI malloc-guard re-exec changing the pinned supervisor identity.
+				delete childEnv.MallocStackLogging;
+				delete childEnv.MallocStackLoggingNoCompact;
+				const owner = Bun.spawn(
+					[
+						process.execPath,
+						...(scenario === "complete" ? [] : ["--preload", preloadFile]),
+						cli,
+						"--internal-managed-owner-supervisor",
+						"--",
+						process.execPath,
+						childScript,
+					],
+					{
+						cwd: repoRoot,
+						stdin: "ignore",
+						stdout: "ignore",
+						stderr: "pipe",
+						env: {
+							...childEnv,
+							GJC_COORDINATOR_SESSION_ID: sessionId,
+							GJC_TMUX_OWNER_GENERATION: generation,
+							GJC_TMUX_OWNER_STATE_DIR: stateDir,
+							GJC_TMUX_OWNER_SERVER_KEY: "managed",
+							GJC_MANAGED_OWNER_RUN_ID: "close-run",
+							GJC_MANAGED_OWNER_INCARNATION: "close-incarnation",
+							GJC_MANAGED_OWNER_REDACT_COMMAND: "1",
+						},
 					},
-				},
-			);
-			const ownerPid = owner.pid;
-			const stderr = new Response(owner.stderr).text();
-			let childProcess: Process | null = null;
-			let cleanupAtOwnerExit: unknown;
-			const ownerExit = owner.exited.then(code => {
-				if (fsSync.existsSync(cleanupFile))
-					cleanupAtOwnerExit = JSON.parse(fsSync.readFileSync(cleanupFile, "utf8"));
-				return code;
-			});
-			const waitForOwnerExit = async (timeoutMs: number): Promise<boolean> => {
-				const timeout = Promise.withResolvers<boolean>();
-				const timer = setTimeout(() => timeout.resolve(false), timeoutMs);
-				try {
-					return await Promise.race([ownerExit.then(() => true), timeout.promise]);
-				} finally {
-					clearTimeout(timer);
-				}
-			};
-			const calls: string[][] = [];
-			const rawPidSignal = spyOn(process, "kill");
-			(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((rawSpawn: unknown) => {
-				const cmd = spawnArgv(rawSpawn);
-				calls.push(cmd);
-				if (cmd.includes("if-shell")) {
-					expect(scenario, "incomplete cooperative shutdown must never reach guarded cleanup").toBe("complete");
-					// Compatibility cleanup must be last, never the cause of owner exit.
-					expect(owner.exitCode).toBe(0);
-					expect(childProcess?.status()).toBe(nativeProcessBindings().ProcessStatus.Exited);
-					expect(JSON.parse(fsSync.readFileSync(cleanupFile, "utf8"))).toMatchObject({
-						completed: true,
-						handlerCount: 1,
-						parentPid: ownerPid,
-					});
-					const intent = readSecureOwnerJson(`${paths.intentFile}.consumed`);
-					const verdict = readSecureOwnerJson(paths.verdictFile);
-					expect(isValidOwnerIntent(intent)).toBe(true);
-					expect(isValidOwnerVerdict(verdict)).toBe(true);
-					if (!isValidOwnerIntent(intent) || !isValidOwnerVerdict(verdict))
-						throw new Error("invalid_real_terminal_evidence");
-					expect(verdict.intent_id).toBe(intent.intent_id);
-					expect(cmd[cmd.indexOf("-t") + 1]).toBe("$0");
-					expect(cmd).toEqual(expect.arrayContaining([expect.stringContaining("kill-session -t '$0'")]));
-					return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
-				}
-				if (cmd.includes("list-sessions"))
-					return spawnResult(
-						0,
-						`managed\t1\t0\t1770000000\t1\troot\t1\t${ownerPid}\t\t\t\t${sessionId}\t${marker}\t${generation}\t\n`,
-					);
-				if (cmd.includes("list-panes")) return spawnResult(0, `${ownerPid}\n`);
-				if (cmd.includes("display-message")) return spawnResult(0, "$0\n");
-				if (cmd.includes("show-options")) {
-					const option = cmd.at(-1);
-					return spawnResult(
-						0,
-						option === "@gjc-profile"
-							? "1\n"
-							: option === "@gjc-session-id"
-								? `${sessionId}\n`
-								: option === "@gjc-owner-generation"
-									? `${generation}\n`
-									: option === "@gjc-owner-server-key"
-										? "managed\n"
-										: `${marker}\n`,
-					);
-				}
-				return spawnResult(0, "");
-			});
-			injectSafeMutationProof();
-			const failures: unknown[] = [];
-			try {
-				const readyDeadline = Date.now() + 10_000;
-				while (!fsSync.existsSync(readyFile) && owner.exitCode === null && Date.now() < readyDeadline)
-					await Bun.sleep(20);
-				expect(fsSync.existsSync(readyFile), `managed child did not become ready; evidence: ${stateDir}`).toBe(
-					true,
 				);
-				const ready = JSON.parse(await fs.readFile(readyFile, "utf8"));
-				expect(ready).toMatchObject({ admission: "supervised", parentPid: ownerPid });
-				childProcess = nativeProcessBindings().Process.fromPid(ready.pid);
-				if (!childProcess) throw new Error("managed_child_reference_unavailable");
-				expect(childProcess?.ppid).toBe(ownerPid);
-				const bindingFile = path.join(paths.root, `child-${ready.token}.binding.json`);
-				const binding = readSecureOwnerJson(bindingFile);
-				expect(isManagedOwnerBinding(binding)).toBe(true);
-				expect(binding).toMatchObject({
-					schema_version: 3,
-					binding_kind: "opaque",
-					session_id: sessionId,
-					generation,
-					run_id: "close-run",
-					endpoint_incarnation: "close-incarnation",
-					supervisor_pid: ownerPid,
-					child_token: ready.token,
+				const ownerPid = owner.pid;
+				const stderr = new Response(owner.stderr).text();
+				let childProcess: Process | null = null;
+				let cleanupAtOwnerExit: unknown;
+				const ownerExit = owner.exited.then(code => {
+					if (fsSync.existsSync(cleanupFile))
+						cleanupAtOwnerExit = JSON.parse(fsSync.readFileSync(cleanupFile, "utf8"));
+					return code;
 				});
-				expect(binding).not.toHaveProperty("command");
-				expect(binding).not.toHaveProperty("command_sha256");
-				expect((await fs.stat(bindingFile)).mode & 0o777).toBe(0o600);
-				expect((await fs.stat(paths.root)).mode & 0o777).toBe(0o700);
-				if (scenario !== "complete") {
-					// Use the original real close deadline: no forged clock, verdict or
-					// injected completion callback can turn one half into conjunction.
-					await expect(
-						forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker),
-					).rejects.toThrow("owner_term_verdict_timeout");
-					expect(fsSync.existsSync(faultReachedFile)).toBe(true);
-					expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
-					expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({
-						pid: ready.pid,
-						parentPid: ownerPid,
-						handlerCount: 1,
-						completed: true,
-					});
-					expect(JSON.parse(await fs.readFile(handlerFile, "utf8"))).toEqual({
-						pid: ready.pid,
-						parentPid: ownerPid,
-						handlerCount: 1,
-					});
-					expect(fsSync.existsSync(expiredFile)).toBe(false);
-					expect(fsSync.existsSync(holdExpiredFile)).toBe(false);
-					expect(calls.filter(cmd => cmd.includes("if-shell"))).toEqual([]);
-					expect(
-						calls.some(cmd => cmd.some(arg => arg.includes("kill-session") || arg.includes("kill-server"))),
-					).toBe(false);
-					expect(rawPidSignal).not.toHaveBeenCalled();
-					if (scenario === "exit_without_verdict") {
-						expect(await fs.readFile(faultReachedFile, "utf8")).toBe("observer-refused-before-publication\n");
-						expect(await waitForOwnerExit(1_000)).toBe(true);
-						expect(await ownerExit).not.toBe(0);
-						expect(cleanupAtOwnerExit).toMatchObject({ completed: true, handlerCount: 1 });
-						expect(fsSync.existsSync(paths.verdictFile)).toBe(false);
-						expect(fsSync.existsSync(paths.verdictAliasFile)).toBe(false);
-						expect(isValidOwnerIntent(readSecureOwnerJson(paths.intentFile))).toBe(true);
-					} else {
-						expect(await fs.readFile(faultReachedFile, "utf8")).toBe("real-verdict-published-supervisor-held\n");
-						expect(owner.exitCode).toBeNull();
-						expect(await waitForOwnerExit(100)).toBe(false);
+				const waitForOwnerExit = async (timeoutMs: number): Promise<boolean> => {
+					const timeout = Promise.withResolvers<boolean>();
+					const timer = setTimeout(() => timeout.resolve(false), timeoutMs);
+					try {
+						return await Promise.race([ownerExit.then(() => true), timeout.promise]);
+					} finally {
+						clearTimeout(timer);
+					}
+				};
+				const calls: string[][] = [];
+				const rawPidSignal = spyOn(process, "kill");
+				(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((rawSpawn: unknown) => {
+					const cmd = spawnArgv(rawSpawn);
+					calls.push(cmd);
+					if (cmd.includes("if-shell")) {
+						expect(scenario, "incomplete cooperative shutdown must never reach guarded cleanup").toBe("complete");
+						// Compatibility cleanup must be last, never the cause of owner exit.
+						expect(owner.exitCode).toBe(0);
+						expect(childProcess?.status()).toBe(nativeProcessBindings().ProcessStatus.Exited);
+						expect(JSON.parse(fsSync.readFileSync(cleanupFile, "utf8"))).toMatchObject({
+							completed: true,
+							handlerCount: 1,
+							parentPid: ownerPid,
+						});
 						const intent = readSecureOwnerJson(`${paths.intentFile}.consumed`);
 						const verdict = readSecureOwnerJson(paths.verdictFile);
 						expect(isValidOwnerIntent(intent)).toBe(true);
 						expect(isValidOwnerVerdict(verdict)).toBe(true);
 						if (!isValidOwnerIntent(intent) || !isValidOwnerVerdict(verdict))
-							throw new Error("missing_real_held_terminal_evidence");
-						expect(verdict).toMatchObject({
+							throw new Error("invalid_real_terminal_evidence");
+						expect(verdict.intent_id).toBe(intent.intent_id);
+						expect(cmd[cmd.indexOf("-t") + 1]).toBe("$0");
+						expect(cmd).toEqual(expect.arrayContaining([expect.stringContaining("kill-session -t '$0'")]));
+						return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+					}
+					if (cmd.includes("list-sessions"))
+						return spawnResult(
+							0,
+							`managed\t1\t0\t1770000000\t1\troot\t1\t${ownerPid}\t\t\t\t${sessionId}\t${marker}\t${generation}\t\n`,
+						);
+					if (cmd.includes("list-panes")) return spawnResult(0, `${ownerPid}\n`);
+					if (cmd.includes("display-message")) return spawnResult(0, "$0\n");
+					if (cmd.includes("show-options")) {
+						const option = cmd.at(-1);
+						return spawnResult(
+							0,
+							option === "@gjc-profile"
+								? "1\n"
+								: option === "@gjc-session-id"
+									? `${sessionId}\n`
+									: option === "@gjc-owner-generation"
+										? `${generation}\n`
+										: option === "@gjc-owner-server-key"
+											? "managed\n"
+											: `${marker}\n`,
+						);
+					}
+					return spawnResult(0, "");
+				});
+				injectSafeMutationProof();
+				const failures: unknown[] = [];
+				try {
+					const readyDeadline = Date.now() + 10_000;
+					while (!fsSync.existsSync(readyFile) && owner.exitCode === null && Date.now() < readyDeadline)
+						await Bun.sleep(20);
+					expect(fsSync.existsSync(readyFile), `managed child did not become ready; evidence: ${stateDir}`).toBe(
+						true,
+					);
+					const ready = JSON.parse(await fs.readFile(readyFile, "utf8"));
+					expect(ready).toMatchObject({ admission: "supervised", parentPid: ownerPid });
+					childProcess = nativeProcessBindings().Process.fromPid(ready.pid);
+					if (!childProcess) throw new Error("managed_child_reference_unavailable");
+					expect(childProcess?.ppid).toBe(ownerPid);
+					const bindingFile = path.join(paths.root, `child-${ready.token}.binding.json`);
+					const binding = readSecureOwnerJson(bindingFile);
+					expect(isManagedOwnerBinding(binding)).toBe(true);
+					expect(binding).toMatchObject({
+						schema_version: 3,
+						binding_kind: "opaque",
+						session_id: sessionId,
+						generation,
+						run_id: "close-run",
+						endpoint_incarnation: "close-incarnation",
+						supervisor_pid: ownerPid,
+						child_token: ready.token,
+					});
+					expect(binding).not.toHaveProperty("command");
+					expect(binding).not.toHaveProperty("command_sha256");
+					expect((await fs.stat(bindingFile)).mode & 0o777).toBe(0o600);
+					expect((await fs.stat(paths.root)).mode & 0o777).toBe(0o700);
+					if (scenario !== "complete") {
+						// Use the original real close deadline: no forged clock, verdict or
+						// injected completion callback can turn one half into conjunction.
+						await expect(
+							forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker),
+						).rejects.toThrow("owner_term_verdict_timeout");
+						expect(fsSync.existsSync(faultReachedFile)).toBe(true);
+						expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
+						expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({
+							pid: ready.pid,
+							parentPid: ownerPid,
+							handlerCount: 1,
+							completed: true,
+						});
+						expect(JSON.parse(await fs.readFile(handlerFile, "utf8"))).toEqual({
+							pid: ready.pid,
+							parentPid: ownerPid,
+							handlerCount: 1,
+						});
+						expect(fsSync.existsSync(expiredFile)).toBe(false);
+						expect(fsSync.existsSync(holdExpiredFile)).toBe(false);
+						expect(calls.filter(cmd => cmd.includes("if-shell"))).toEqual([]);
+						expect(
+							calls.some(cmd => cmd.some(arg => arg.includes("kill-session") || arg.includes("kill-server"))),
+						).toBe(false);
+						expect(rawPidSignal).not.toHaveBeenCalled();
+						if (scenario === "exit_without_verdict") {
+							expect(await fs.readFile(faultReachedFile, "utf8")).toBe("observer-refused-before-publication\n");
+							expect(await waitForOwnerExit(1_000)).toBe(true);
+							expect(await ownerExit).not.toBe(0);
+							expect(cleanupAtOwnerExit).toMatchObject({ completed: true, handlerCount: 1 });
+							expect(fsSync.existsSync(paths.verdictFile)).toBe(false);
+							expect(fsSync.existsSync(paths.verdictAliasFile)).toBe(false);
+							expect(isValidOwnerIntent(readSecureOwnerJson(paths.intentFile))).toBe(true);
+						} else {
+							expect(await fs.readFile(faultReachedFile, "utf8")).toBe(
+								"real-verdict-published-supervisor-held\n",
+							);
+							expect(owner.exitCode).toBeNull();
+							expect(await waitForOwnerExit(100)).toBe(false);
+							const intent = readSecureOwnerJson(`${paths.intentFile}.consumed`);
+							const verdict = readSecureOwnerJson(paths.verdictFile);
+							expect(isValidOwnerIntent(intent)).toBe(true);
+							expect(isValidOwnerVerdict(verdict)).toBe(true);
+							if (!isValidOwnerIntent(intent) || !isValidOwnerVerdict(verdict))
+								throw new Error("missing_real_held_terminal_evidence");
+							expect(verdict).toMatchObject({
+								intent_id: intent.intent_id,
+								session_id: sessionId,
+								generation,
+								server_key: "managed",
+								signal: "SIGTERM",
+								classification: "expected_operator_shutdown",
+								result: "owner_term_then_session_cleanup",
+								exit_code: 0,
+								reason: "terminal_observation",
+							});
+							expect(readSecureOwnerJson(paths.verdictAliasFile)).toEqual({
+								...verdict,
+								owner_generation: generation,
+							});
+							await fs.writeFile(releaseFile, "release\n", { mode: 0o600 });
+							expect(await waitForOwnerExit(2_000)).toBe(true);
+							expect(await ownerExit, await stderr).toBe(0);
+							expect(cleanupAtOwnerExit).toMatchObject({ completed: true, handlerCount: 1 });
+							expect(fsSync.existsSync(holdExpiredFile)).toBe(false);
+						}
+					} else {
+						await forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker);
+						expect(await waitForOwnerExit(1_000)).toBe(true);
+						expect(await ownerExit, await stderr).toBe(0);
+						expect(owner.signalCode).toBeNull();
+						expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
+						expect(cleanupAtOwnerExit).toEqual({
+							pid: ready.pid,
+							parentPid: ownerPid,
+							handlerCount: 1,
+							completed: true,
+						});
+						expect(JSON.parse(await fs.readFile(handlerFile, "utf8"))).toEqual({
+							pid: ready.pid,
+							parentPid: ownerPid,
+							handlerCount: 1,
+						});
+						expect(fsSync.existsSync(expiredFile)).toBe(false);
+						const intent = readSecureOwnerJson(`${paths.intentFile}.consumed`);
+						expect(isValidOwnerIntent(intent)).toBe(true);
+						if (!isValidOwnerIntent(intent)) throw new Error("missing_real_consumed_intent");
+						expect(intent.dispatch_id).not.toBe("");
+						expect(readSecureOwnerJson(paths.verdictFile)).toMatchObject({
 							intent_id: intent.intent_id,
 							session_id: sessionId,
 							generation,
 							server_key: "managed",
 							signal: "SIGTERM",
-							classification: "expected_operator_shutdown",
 							result: "owner_term_then_session_cleanup",
+							classification: "expected_operator_shutdown",
 							exit_code: 0,
 							reason: "terminal_observation",
 						});
 						expect(readSecureOwnerJson(paths.verdictAliasFile)).toEqual({
-							...verdict,
+							...(readSecureOwnerJson(paths.verdictFile) as object),
 							owner_generation: generation,
 						});
-						await fs.writeFile(releaseFile, "release\n", { mode: 0o600 });
-						expect(await waitForOwnerExit(2_000)).toBe(true);
-						expect(await ownerExit, await stderr).toBe(0);
-						expect(cleanupAtOwnerExit).toMatchObject({ completed: true, handlerCount: 1 });
-						expect(fsSync.existsSync(holdExpiredFile)).toBe(false);
+						expect(rawPidSignal).not.toHaveBeenCalled();
+						expect(calls.filter(cmd => cmd.includes("if-shell"))).toHaveLength(1);
+						expect(calls.some(cmd => cmd.includes("kill-server") || cmd.includes("kill-session"))).toBe(false);
 					}
-				} else {
-					await forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker);
-					expect(await waitForOwnerExit(1_000)).toBe(true);
-					expect(await ownerExit, await stderr).toBe(0);
-					expect(owner.signalCode).toBeNull();
-					expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
-					expect(cleanupAtOwnerExit).toEqual({
-						pid: ready.pid,
-						parentPid: ownerPid,
-						handlerCount: 1,
-						completed: true,
-					});
-					expect(JSON.parse(await fs.readFile(handlerFile, "utf8"))).toEqual({
-						pid: ready.pid,
-						parentPid: ownerPid,
-						handlerCount: 1,
-					});
-					expect(fsSync.existsSync(expiredFile)).toBe(false);
-					const intent = readSecureOwnerJson(`${paths.intentFile}.consumed`);
-					expect(isValidOwnerIntent(intent)).toBe(true);
-					if (!isValidOwnerIntent(intent)) throw new Error("missing_real_consumed_intent");
-					expect(intent.dispatch_id).not.toBe("");
-					expect(readSecureOwnerJson(paths.verdictFile)).toMatchObject({
-						intent_id: intent.intent_id,
-						session_id: sessionId,
-						generation,
-						server_key: "managed",
-						signal: "SIGTERM",
-						result: "owner_term_then_session_cleanup",
-						classification: "expected_operator_shutdown",
-						exit_code: 0,
-						reason: "terminal_observation",
-					});
-					expect(readSecureOwnerJson(paths.verdictAliasFile)).toEqual({
-						...(readSecureOwnerJson(paths.verdictFile) as object),
-						owner_generation: generation,
-					});
-					expect(rawPidSignal).not.toHaveBeenCalled();
-					expect(calls.filter(cmd => cmd.includes("if-shell"))).toHaveLength(1);
-					expect(calls.some(cmd => cmd.includes("kill-server") || cmd.includes("kill-session"))).toBe(false);
-				}
-			} catch (error) {
-				failures.push(error);
-			} finally {
-				try {
-					try {
-						if (scenario === "verdict_without_exit")
-							await fs.writeFile(releaseFile, "release\n", { mode: 0o600 });
-					} catch {
-						// Still perform bounded retained-handle teardown if release fails.
-					}
-					// Teardown cannot rescue a failed close assertion. The retained spawn
-					// handle may request shutdown; never signal a freshly looked-up PID.
-					try {
-						if (owner.exitCode === null) owner.kill("SIGTERM");
-					} catch {
-						// A raced exit is settled below, not treated as termination proof.
-					}
-					const ownerStopped = await waitForOwnerExit(35_000);
-					const childStopped = childProcess ? await childProcess.waitForExit({ timeoutMs: 1_000 }) : false;
-					if (ownerStopped && childStopped) await fs.rm(stateDir, { recursive: true, force: true });
-					else failures.push(new Error(`managed_close_teardown_uncertain:evidence_retained:${stateDir}`));
 				} catch (error) {
 					failures.push(error);
+				} finally {
+					try {
+						try {
+							if (scenario === "verdict_without_exit")
+								await fs.writeFile(releaseFile, "release\n", { mode: 0o600 });
+						} catch {
+							// Still perform bounded retained-handle teardown if release fails.
+						}
+						// Teardown cannot rescue a failed close assertion. The retained spawn
+						// handle may request shutdown; never signal a freshly looked-up PID.
+						try {
+							if (owner.exitCode === null) owner.kill("SIGTERM");
+						} catch {
+							// A raced exit is settled below, not treated as termination proof.
+						}
+						const ownerStopped = await waitForOwnerExit(35_000);
+						const childStopped = childProcess ? await childProcess.waitForExit({ timeoutMs: 1_000 }) : false;
+						if (ownerStopped && childStopped) await fs.rm(stateDir, { recursive: true, force: true });
+						else failures.push(new Error(`managed_close_teardown_uncertain:evidence_retained:${stateDir}`));
+					} catch (error) {
+						failures.push(error);
+					}
 				}
-			}
-			if (failures.length > 0) throw new AggregateError(failures, "Managed close verification or teardown failed");
-		}, 65_000);
+				if (failures.length > 0)
+					throw new AggregateError(failures, "Managed close verification or teardown failed");
+			},
+			65_000,
+		);
 	}
 
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
