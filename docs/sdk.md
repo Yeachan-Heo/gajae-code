@@ -1285,7 +1285,8 @@ and interactive root `gjc --tmux` launches on Linux) publish a private (`0600`
 file in a `0700` lifecycle root) child binding before the supervised child
 starts. Windows has no owner-only reader for that binding, so a managed launch
 there is refused before allocation and Broker `session.spawn` selects the
-identity-fenced headless substrate before any multiplexer probe. Launches that
+identity-fenced headless substrate before any multiplexer probe (its proof file
+is flushed, but Windows offers no directory-entry flush). Launches that
 do not run the supervisor, such as `gjc session create`
 without a launch specification or an ordinary macOS `gjc --tmux`, start `gjc`
 directly and receive neither a binding nor exact CLI admission. The derived

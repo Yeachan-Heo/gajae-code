@@ -184,6 +184,53 @@ describe("Broker spawn substrate provider", () => {
 		expect(managedLaunches).toBe(0);
 	});
 
+	it.each([
+		["win32", true],
+		["darwin", false],
+	] as const)("%s headless publication tolerates an unflushable directory handle: %p", async (platform, published) => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `gjc-spawn-${platform}-dirsync-`));
+		temporaryDirectories.push(cwd);
+		const realOpen = fs.open;
+		const directoryOpens: string[] = [];
+		const open = spyOn(fs, "open").mockImplementation((async (file, flags, mode) => {
+			if (flags === "r") {
+				directoryOpens.push(String(file));
+				throw Object.assign(new Error("EPERM: directory flush unsupported"), { code: "EPERM" });
+			}
+			return realOpen(file, flags, mode);
+		}) as typeof fs.open);
+		let terminated = false;
+		let result: Awaited<ReturnType<ReturnType<typeof createSpawnSubstrateProvider>["launch"]>>;
+		try {
+			const provider = createSpawnSubstrateProvider({
+				platform,
+				selectMultiplexer: () => "none",
+				startHeadless: () => ({ pid: 704, terminate: () => (terminated = true) }),
+				processIncarnation: () => `${platform}:704`,
+			});
+			result = await provider.launch(launchSpec(cwd));
+		} finally {
+			open.mockRestore();
+		}
+		if (published) {
+			if (!result.ok) throw new Error(`headless publication failed: ${result.message}`);
+			const stateFile = result.proof.stateFileProof?.stateFile as string;
+			expect(JSON.parse(await Bun.file(stateFile).text())).toMatchObject({
+				pid: 704,
+				processIncarnation: "win32:704",
+			});
+			expect({ directoryOpens, terminated }).toEqual({ directoryOpens: [], terminated: false });
+		} else {
+			expect(result).toEqual({
+				ok: false,
+				code: "substrate_proof_failed",
+				message: "The selected spawn substrate could not be proven exactly.",
+			});
+			expect(directoryOpens).toHaveLength(1);
+			expect(terminated).toBeTrue();
+		}
+	});
+
 	it("terminates the Windows headless child when its proof cannot be published", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-unpublished-"));
 		temporaryDirectories.push(cwd);
