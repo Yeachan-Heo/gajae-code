@@ -20,7 +20,6 @@ import {
 	verifyOwnerOnlyPathSecurity,
 } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
-import { managedDirectoryRoot, publishManagedFileNoReplaceSync } from "../session/internal/managed-session-storage";
 import { parseLinuxProcStartTime } from "./linux-proc";
 import {
 	isManagedOwnerBinding,
@@ -2067,6 +2066,12 @@ export function consumeCooperativeOwnerIntent(input: {
 	canRelay(): boolean;
 	/** Delivers SIGTERM; returns true only when the signal was actually sent. */
 	relay(intent: OwnerIntent, observedAt: string): boolean;
+	/**
+	 * Durable no-replace publication inside the private lifecycle root. Injected by
+	 * the supervisor so managed session storage stays out of this module's graph
+	 * (it is reachable from the MCP machine entrypoint).
+	 */
+	publishNoReplace(file: string, bytes: Uint8Array): void;
 }): void {
 	if (process.platform !== "darwin") return;
 	const binding = input.binding;
@@ -2111,7 +2116,7 @@ export function consumeCooperativeOwnerIntent(input: {
 		// leaves uncertain evidence (no retirement, no rearm); only a confirmed
 		// delivery renames it to the record an operator-shutdown verdict requires.
 		const bytes = Buffer.from(`${JSON.stringify(relayRecord)}\n`);
-		publishManagedFileNoReplaceSync(paths.relayPendingFile, bytes, managedDirectoryRoot(paths.root));
+		input.publishNoReplace(paths.relayPendingFile, bytes);
 		const recorded = readOwnerOnlyFileSettled(paths.relayPendingFile, 65536);
 		// Expiry is rechecked right before the signal: a supervisor that stalled during
 		// publication must not deliver after the closer has given up.

@@ -2,7 +2,12 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { prepareManagedDirectoryRoot, publishManagedFileNoReplace } from "../session/internal/managed-session-storage";
+import {
+	managedDirectoryRoot,
+	prepareManagedDirectoryRoot,
+	publishManagedFileNoReplace,
+	publishManagedFileNoReplaceSync,
+} from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime } from "./linux-proc";
 import {
 	isManagedOwnerBinding,
@@ -263,6 +268,7 @@ async function superviseManagedOwner(command: string[]): Promise<void> {
 				serverKey: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
 				canRelay: darwinChildRelayable,
 				relay: (intent, observedAt) => relayChild(intent, observedAt),
+				publishNoReplace: (file, bytes) => publishManagedFileNoReplaceSync(file, bytes, managedDirectoryRoot(root)),
 			});
 		} catch {
 			// Release failures cannot reset the relay latch or authorize a retry.

@@ -42,12 +42,20 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
 import { publishOwnerIntentNoReplace } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import * as natives from "@gajae-code/natives";
+import {
+	managedDirectoryRoot,
+	publishManagedFileNoReplaceSync,
+} from "../../src/session/internal/managed-session-storage";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const ownerIsolationCliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const packagedGjcEntry = path.join(repoRoot, "packages", "coding-agent", "bin", "gjc.js");
 const mainEntry = path.join(repoRoot, "packages", "coding-agent", "src", "main.ts");
 const ownerIsolationFlag = "--internal-tmux-owner-isolation";
+// The supervisor's production publisher for the relay record.
+const publishRelayForTest = (file: string, bytes: Uint8Array): void => {
+	publishManagedFileNoReplaceSync(file, bytes, managedDirectoryRoot(path.dirname(file)));
+};
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
 
@@ -585,6 +593,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 			const poll = () =>
 				consumeCooperativeOwnerIntent({
 					stateDir: state,
+					publishNoReplace: publishRelayForTest,
 					binding,
 					serverKey: "socket",
 					canRelay: () => relayable,
@@ -2438,6 +2447,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				close(state, generation, "dispatch", async () => {
 					consumeCooperativeOwnerIntent({
 						stateDir: state,
+						publishNoReplace: publishRelayForTest,
 						binding,
 						serverKey: "socket",
 						canRelay: () => true,
@@ -2610,6 +2620,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 			let relays = 0;
 			consumeCooperativeOwnerIntent({
 				stateDir: state,
+				publishNoReplace: publishRelayForTest,
 				binding,
 				serverKey: "socket",
 				canRelay: () => true,

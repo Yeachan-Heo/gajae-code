@@ -8,6 +8,7 @@ import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { hasMacOSMallocEnv, macOSMallocEnvUnsetArgs } from "../cli/malloc-env-guard";
+import { observeProcessIncarnation, type ProcessIncarnationObservation } from "../sdk/broker/process-incarnation";
 import {
 	managedDirectoryRoot,
 	managedSecurityFailureClassification,
@@ -230,6 +231,8 @@ export interface ForceCloseOwnerDependencies {
 	expectedManagedProof?: ManagedTmuxLaunchProof;
 	/** @internal Exercise the kernel delivery branch with synthetic test dependencies. */
 	shutdownModeForTest?: "kernel_signal";
+	/** @internal Process-table observation of the pinned cooperative supervisor. */
+	observeProcess?(pid: number): ProcessIncarnationObservation;
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 const effectiveSessionEnvironments = new WeakMap<GjcTmuxSessionStatus, NodeJS.ProcessEnv>();
@@ -237,6 +240,32 @@ const fallbackSessionEnvironments = new WeakSet<GjcTmuxSessionStatus>();
 
 const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 15_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
+
+/**
+ * Waits for positive evidence that one pinned process incarnation is gone: the
+ * OS reports the PID absent, or the PID now names a different incarnation.
+ * `unknown` observations (for example a transient Darwin sysctl failure, which
+ * `Process.status` would report as exited) are never treated as exit.
+ */
+export async function waitForPinnedProcessExit(
+	pid: number,
+	incarnation: string,
+	deadline: number,
+	deps: {
+		observe(pid: number): ProcessIncarnationObservation;
+		now(): Date;
+		sleep(ms: number): Promise<void>;
+	},
+): Promise<boolean> {
+	for (;;) {
+		const observed = deps.observe(pid);
+		if (observed.status === "absent") return true;
+		if (observed.status === "present" && observed.incarnation !== incarnation) return true;
+		const remaining = deadline - deps.now().getTime();
+		if (remaining <= 0) return false;
+		await deps.sleep(Math.min(FORCE_CLOSE_VERDICT_POLL_MS, remaining));
+	}
+}
 
 export interface CreateGjcTmuxSessionOptions {
 	platform?: NodeJS.Platform;
@@ -2135,7 +2164,12 @@ export async function forceCloseGjcTmuxSession(
 				if (cooperativeSupervisor) {
 					const remaining = verdictDeadline - now().getTime();
 					if (remaining <= 0) return null;
-					const exited = await cooperativeSupervisor.waitForExit({ timeoutMs: remaining });
+					const exited = await waitForPinnedProcessExit(
+						cooperativeSupervisor.pid,
+						cooperativeSupervisor.incarnation,
+						verdictDeadline,
+						{ observe: deps.observeProcess ?? observeProcessIncarnation, now, sleep },
+					);
 					if (!exited || now().getTime() >= verdictDeadline) return null;
 					return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline, intent.intent_id);
 				}

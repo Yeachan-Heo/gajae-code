@@ -47,9 +47,14 @@ import {
 	listGjcTmuxSessions,
 	removeGjcTmuxSession,
 	statusGjcTmuxSession,
+	waitForPinnedProcessExit,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import {
+	observeProcessIncarnation,
+	type ProcessIncarnationObservation,
+} from "../../src/sdk/broker/process-incarnation";
 import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
 
 // `Bun.spawnSync` is called in two shapes in production: the array form
@@ -2113,8 +2118,23 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 					if (scenario !== "complete") {
 						// Use the original real close deadline: no forged clock, verdict or
 						// injected completion callback can turn one half into conjunction.
+						// While the verdict exists but the supervisor is held alive, make every
+						// live observation inconclusive (a transient Darwin sysctl failure).
+						// Only positive absence may count as supervisor exit.
+						const transientUnknown = (pid: number): ProcessIncarnationObservation => {
+							const observed = observeProcessIncarnation(pid);
+							return observed.status === "present"
+								? { status: "unknown", reasonCode: "transient_sysctl_failure" }
+								: observed;
+						};
 						await expect(
-							forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker),
+							forceCloseGjcTmuxSession(
+								"managed",
+								{ GJC_TMUX_COMMAND: "tmux" },
+								sessionId,
+								marker,
+								scenario === "verdict_without_exit" ? { observeProcess: transientUnknown } : {},
+							),
 						).rejects.toThrow("owner_term_verdict_timeout");
 						expect(fsSync.existsSync(faultReachedFile)).toBe(true);
 						expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
@@ -2897,6 +2917,56 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 			fs.access(path.join(stateDir, sessionId, "owner-lifecycle", `intent-${generation}.json.cancelled`)),
 		).resolves.toBeNull();
 		await fs.rm(stateDir, { recursive: true, force: true });
+	});
+});
+
+describe("pinned supervisor exit proof", () => {
+	const pinned = "darwin:1700000000:1";
+	function run(observations: ProcessIncarnationObservation[], budgetMs = 200) {
+		let clock = 0;
+		const seen: number[] = [];
+		const result = waitForPinnedProcessExit(4242, pinned, budgetMs, {
+			observe: pid => {
+				seen.push(pid);
+				return observations[Math.min(seen.length - 1, observations.length - 1)]!;
+			},
+			now: () => new Date(clock),
+			sleep: async ms => {
+				clock += ms;
+			},
+		});
+		return { result, seen };
+	}
+
+	it("never treats an inconclusive observation as exit, even with a published verdict", async () => {
+		// A transient Darwin sysctl failure is `unknown`; Process.status would call it exited.
+		const { result, seen } = run([{ status: "unknown", reasonCode: "sysctl_failed" }]);
+		expect(await result).toBe(false);
+		expect(seen.length).toBeGreaterThan(1);
+	});
+
+	it("keeps waiting while the pinned incarnation is present", async () => {
+		expect(await run([{ status: "present", incarnation: pinned }]).result).toBe(false);
+	});
+
+	it("accepts positive absence after inconclusive observations", async () => {
+		const { result, seen } = run([
+			{ status: "unknown", reasonCode: "sysctl_failed" },
+			{ status: "present", incarnation: pinned },
+			{ status: "absent" },
+		]);
+		expect(await result).toBe(true);
+		expect(seen).toEqual([4242, 4242, 4242]);
+	});
+
+	it("accepts a reused PID that names a different incarnation", async () => {
+		expect(await run([{ status: "present", incarnation: "darwin:1700000999:7" }]).result).toBe(true);
+	});
+
+	it("observes once and refuses when the deadline has already passed", async () => {
+		const { result, seen } = run([{ status: "unknown", reasonCode: "sysctl_failed" }], 0);
+		expect(await result).toBe(false);
+		expect(seen).toEqual([4242]);
 	});
 });
 
