@@ -284,6 +284,31 @@ describe("Settings", () => {
 		}
 	});
 
+	it("preserves literal special role names and siblings across durable reload", async () => {
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			settings.setGlobalModelRole("default", "test/default");
+			settings.setGlobalModelRole("", "test/empty");
+			settings.setGlobalModelRole("literal.role", "test/dotted");
+			settings.setGlobalModelRole("__proto__", ["test/one", "test/two"]);
+			settings.setGlobalModelRole("second.role", "test/second");
+			await settings.flushOrThrow();
+			const reopened = await Settings.loadForScope({ cwd: projectDir, agentDir });
+			try {
+				const roles = reopened.get("modelRoles");
+				expect(roles.default).toBe("test/default");
+				expect(roles[""]).toBe("test/empty");
+				expect(roles["literal.role"]).toBe("test/dotted");
+				expect(roles["second.role"]).toBe("test/second");
+				expect(Object.getOwnPropertyDescriptor(roles, "__proto__")?.value).toEqual(["test/one", "test/two"]);
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			await settings.close();
+		}
+	});
+
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";
 		const requestedSecret = "requested-settings-secret";
