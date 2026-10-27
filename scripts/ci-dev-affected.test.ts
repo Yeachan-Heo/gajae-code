@@ -1982,6 +1982,45 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	// package barrel, so it is a native consumer: it has to bring its own producer, or
 	// the shard's `if: matrix.native` download step asks for an artifact that the
 	// skipped `affected-native` job never uploaded.
+	test("runtime Markdown keeps direct consumer tests in PR plans without broad suites", () => {
+		for (const changed of [
+			"packages/coding-agent/src/prompts/agents/planner.md",
+			"packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md",
+			"packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md",
+			"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+		]) {
+			const keys = targeted([changed]).map(task => task.key);
+			expect(keys).toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(false);
+		}
+	});
+
+	test("push plans retain runtime Markdown coverage and root README stays cheap", () => {
+		const roleKeys = planTasks(["packages/coding-agent/src/prompts/agents/planner.md"], targetingPackages).map(task => task.key);
+		expect(roleKeys).toContain("check:@gajae-code/coding-agent");
+		expect(roleKeys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(true);
+		const deepInterviewKeys = planTasks(["packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md"], targetingPackages).map(task => task.key);
+		expect(deepInterviewKeys).toContain("deep-interview-definitions");
+		expect(deepInterviewKeys).toContain("deep-interview-runtime");
+		expect(planTasks(["README.md"], targetingPackages)).toEqual([]);
+		expect(targeted(["README.md", "packages/coding-agent/CHANGELOG.md"])).toEqual([]);
+	});
+
+	test("mixed prose and runtime Markdown plans retain both bounded gates exactly once", () => {
+		const keys = targeted(["docs/guide.md", "packages/coding-agent/src/prompts/agents/planner.md", "packages/coding-agent/src/prompts/agents/critic.md"]).map(task => task.key);
+		expect(keys.filter(key => key === "test:packages/coding-agent/test/default-gjc-definitions.test.ts")).toHaveLength(1);
+		expect(keys).toContain(EMBEDDED_DOCS_GATE_KEY);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
+	});
+
+	test("other bundled source Markdown retains owning package checks and smoke", () => {
+		const keys = targeted(["packages/agent/src/compaction/prompts/compaction-summary-context.md"]).map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/agent-core");
+		expect(keys).toContain("cli-smoke");
+	});
+
 	test("docs-only changes select the embedded-docs gate and its native producer", () => {
 		const changed = ["docs/guide.md", "docs/nested/other.md"];
 		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>
