@@ -1463,7 +1463,7 @@ export class SelectorController {
 
 	#applyStatusLineSettings(): void {
 		this.ctx.statusLine.updateSettings({
-			...buildStatusLineSettings(this.ctx.settings),
+			...buildStatusLineSettings(this.ctx.session.settings),
 			...(this.#statusLinePreviewActive ? this.#statusLinePreview : undefined),
 		});
 	}
@@ -1972,6 +1972,7 @@ export class SelectorController {
 
 				const selector = new SettingsSelectorComponent(
 					{
+						settings: this.ctx.session.settings,
 						availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
 						thinkingLevel: this.ctx.session.thinkingLevel,
 						availableThemes,
@@ -2000,7 +2001,7 @@ export class SelectorController {
 							});
 						},
 						onThemeCommit: async (path, themeName, previousTheme) => {
-							if (!settings.canWriteDurableConfig()) {
+							if (!this.ctx.session.settings.canWriteDurableConfig()) {
 								this.ctx.showError(
 									"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
 								);
@@ -2019,7 +2020,7 @@ export class SelectorController {
 								return false;
 							}
 							try {
-								settings.set(path, themeName);
+								this.ctx.session.settings.set(path, themeName);
 							} catch (error) {
 								await restoreThemePreview(previousTheme);
 								this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -2060,7 +2061,7 @@ export class SelectorController {
 							const availableWidth =
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getPreviewContentForSettings(availableWidth, {
-								...buildStatusLineSettings(settings),
+								...buildStatusLineSettings(this.ctx.session.settings),
 								...previewSettings,
 							});
 						},
@@ -2068,7 +2069,7 @@ export class SelectorController {
 							const availableWidth =
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getPreviewPartsForSettings(availableWidth, {
-								...buildStatusLineSettings(settings),
+								...buildStatusLineSettings(this.ctx.session.settings),
 								...previewSettings,
 							});
 						},
@@ -2083,7 +2084,7 @@ export class SelectorController {
 							let editor: ProviderOrderEditorComponent | undefined;
 							const context = new ProviderOrderContext(
 								this.ctx.session.modelRegistry,
-								this.ctx.settings,
+								this.ctx.session.settings,
 								() => {
 									editor?.refresh();
 									this.ctx.ui.requestRender();
@@ -2113,7 +2114,7 @@ export class SelectorController {
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings
-							this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
+							this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.session.settings));
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
@@ -2375,9 +2376,9 @@ export class SelectorController {
 			case "stt.enabled":
 				if (value === true) {
 					void configureSttFromSettings({
-						modelName: settings.get("stt.modelName"),
-						setEnabled: enabled => settings.set("stt.enabled", enabled),
-						flush: () => settings.flushOrThrow(),
+						modelName: this.ctx.session.settings.get("stt.modelName"),
+						setEnabled: enabled => this.ctx.session.settings.set("stt.enabled", enabled),
+						flush: () => this.ctx.session.settings.flushOrThrow(),
 						showStatus: message => this.ctx.showStatus(message),
 						showError: message => this.ctx.showError(message),
 					});
@@ -2471,7 +2472,7 @@ export class SelectorController {
 			case "statusLineGitShowUntracked":
 			case "statusLineTimeFormat":
 			case "statusLineTimeShowSeconds": {
-				this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
+				this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.session.settings));
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 				break;
@@ -2479,7 +2480,8 @@ export class SelectorController {
 			case "irc.enabled":
 			case "irc.sidebar.enabled":
 				this.ctx.applyIrcSidebarAvailability(
-					this.ctx.settings.get("irc.enabled") === true && this.ctx.settings.get("irc.sidebar.enabled") === true,
+					this.ctx.session.settings.get("irc.enabled") === true &&
+						this.ctx.session.settings.get("irc.sidebar.enabled") === true,
 				);
 				break;
 
@@ -2526,7 +2528,7 @@ export class SelectorController {
 				{
 					session: this.ctx.session,
 					modelRegistry: this.ctx.session.modelRegistry,
-					settings: this.ctx.settings,
+					settings: this.ctx.session.settings,
 					profileName,
 				},
 				{ persistDefault },

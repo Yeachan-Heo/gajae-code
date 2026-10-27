@@ -645,7 +645,9 @@ export class Settings implements NotificationSettingsReader {
 	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
 	#saveTimer?: NodeJS.Timeout;
 	#savePromise?: Promise<void>;
+	#changeApplications = new Set<(path: SettingPath) => void>();
 	#changeListeners = new Set<(path: SettingPath) => void>();
+	#tentativePublicationDepth = 0;
 	#pendingSaveSlot?: PendingSaveSlot;
 
 	/** Legacy fallback migration warnings emitted once per settings instance. */
@@ -859,23 +861,40 @@ export class Settings implements NotificationSettingsReader {
 		return structuredClone(this.#autoroutingEffective);
 	}
 
-	onChanged(listener: (path: SettingPath) => void): () => void {
-		this.#changeListeners.add(listener);
-		return () => this.#changeListeners.delete(listener);
+	/** Synchronous live applicators finish before hooks and ordinary observers run. */
+	onChanged(listener: (path: SettingPath) => void, phase: "apply" | "observe" = "observe"): () => void {
+		const listeners = phase === "apply" ? this.#changeApplications : this.#changeListeners;
+		listeners.add(listener);
+		return () => listeners.delete(listener);
 	}
 
-	#notifyAtomicSettingsChanged(paths: Iterable<string>): void {
-		for (const settingPath of paths) {
-			for (const listener of this.#changeListeners) {
+	#publishSettingsChanges(previous: ReadonlyMap<string, unknown>): void {
+		if (this.#tentativePublicationDepth > 0) return;
+		const notify = (listeners: Set<(path: SettingPath) => void>): void => {
+			for (const settingPath of previous.keys()) {
+				for (const listener of listeners) {
+					try {
+						listener(settingPath as SettingPath);
+					} catch {
+						logger.warn("Settings listener failed after mutation", { path: settingPath });
+					}
+				}
+			}
+		};
+		// Publish the complete effective state to sessions before any observer can
+		// synchronously start a run, including observers installed before a session.
+		notify(this.#changeApplications);
+		for (const [settingPath, previousValue] of previous) {
+			const hook = SETTING_HOOKS[settingPath as SettingPath];
+			if (hook) {
 				try {
-					listener(settingPath as SettingPath);
+					hook(this.get(settingPath as SettingPath), previousValue);
 				} catch {
-					// The commit already happened. An observer must not hide its receipt
-					// or prevent other sessions from seeing the committed state.
-					logger.warn("Settings observer failed after atomic mutation", { path: settingPath });
+					logger.warn("Settings hook failed after mutation", { path: settingPath });
 				}
 			}
 		}
+		notify(this.#changeListeners);
 	}
 
 	/** The resolved global config.yml path, or null for in-memory settings. */
@@ -1188,6 +1207,7 @@ export class Settings implements NotificationSettingsReader {
 		this.#rebuildMerged();
 		this.#recomputeNotificationValidationFromRaw();
 
+		this.#tentativePublicationDepth++;
 		try {
 			const result: unknown = commitSync();
 			if (result && typeof result === "object" && "then" in result) {
@@ -1196,6 +1216,8 @@ export class Settings implements NotificationSettingsReader {
 		} catch (error) {
 			rollback();
 			throw error;
+		} finally {
+			this.#tentativePublicationDepth--;
 		}
 
 		this.#hasAcceptedGlobalConfigFile ||= state.sourcePresent;
@@ -1205,26 +1227,14 @@ export class Settings implements NotificationSettingsReader {
 			finalize: () => {
 				if (publicationState !== "pending") return;
 				publicationState = "finalized";
+				const changed = new Map<string, unknown>();
 				for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 					const previousValue = previousValues.get(settingPath);
 					const nextValue = this.get(settingPath);
 					if (util.isDeepStrictEqual(previousValue, nextValue)) continue;
-					const hook = SETTING_HOOKS[settingPath];
-					if (hook) {
-						try {
-							hook(nextValue, previousValue);
-						} catch {
-							logger.warn("Configuration reload setting hook failed", { settingPath });
-						}
-					}
-					for (const listener of this.#changeListeners) {
-						try {
-							listener(settingPath);
-						} catch {
-							logger.warn("Configuration reload listener failed", { settingPath });
-						}
-					}
+					changed.set(settingPath, previousValue);
 				}
+				this.#publishSettingsChanges(changed);
 			},
 		};
 	}
@@ -1271,9 +1281,7 @@ export class Settings implements NotificationSettingsReader {
 		this.#revalidateNotificationSettingsAfterMutation([path]);
 		this.#queueSave();
 
-		const hook = SETTING_HOOKS[path];
-		if (hook) hook(value, prev);
-		for (const listener of this.#changeListeners) listener(path);
+		this.#publishSettingsChanges(new Map([[path, prev]]));
 	}
 
 	/**
@@ -1297,9 +1305,7 @@ export class Settings implements NotificationSettingsReader {
 		this.#revalidateNotificationSettingsAfterMutation([path]);
 		this.#queueSave();
 
-		const hook = SETTING_HOOKS[path];
-		if (hook) hook(this.get(path), prev);
-		for (const listener of this.#changeListeners) listener(path);
+		this.#publishSettingsChanges(new Map([[path, prev]]));
 	}
 
 	/**
@@ -1310,7 +1316,10 @@ export class Settings implements NotificationSettingsReader {
 		this.#assertDurableConfigWritable();
 		if (!this.#persist || !this.#configPath) {
 			const notificationValidationGuard = this.#notificationValidationRestoreGuard();
-			const changes = new Map<string, { before: unknown; beforeHash: string; afterHash: string }>();
+			const changes = new Map<
+				string,
+				{ before: unknown; beforeEffective: unknown; beforeHash: string; afterHash: string; revision: number }
+			>();
 			for (const patch of patches) {
 				if (!isAtomicSettingsPath(patch.path)) {
 					throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
@@ -1321,10 +1330,18 @@ export class Settings implements NotificationSettingsReader {
 				if (!changes.has(patch.path)) {
 					changes.set(patch.path, {
 						before: structuredClone(getByPath(this.#global, patch.path.split("."))),
+						beforeEffective: Object.hasOwn(SETTINGS_SCHEMA, patch.path)
+							? this.get(patch.path as SettingPath)
+							: undefined,
 						beforeHash: atomicYamlPathHash(this.#global, patch.path),
 						afterHash: "",
+						revision: 0,
 					});
 				}
+			}
+			for (const [settingPath, change] of changes) {
+				change.revision = ++this.#nextRevision;
+				this.#pathRevisions.set(settingPath, change.revision);
 			}
 			for (const patch of patches) {
 				if (patch.op === "set") {
@@ -1344,7 +1361,9 @@ export class Settings implements NotificationSettingsReader {
 				notificationValidationGuard,
 				patches.map(patch => patch.path),
 			);
-			this.#notifyAtomicSettingsChanged(changes.keys());
+			this.#publishSettingsChanges(
+				new Map([...changes].map(([settingPath, change]) => [settingPath, change.beforeEffective])),
+			);
 			let discarded = false;
 			let receipt: CasReceipt;
 			receipt = {
@@ -1355,9 +1374,18 @@ export class Settings implements NotificationSettingsReader {
 				restore: async () => {
 					if (discarded) return { status: "discarded" } as const;
 					const conflicts = [...changes].flatMap(([patchPath, change]) =>
-						atomicYamlPathHash(this.#global, patchPath) === change.afterHash ? [] : [patchPath],
+						this.#pathRevisions.get(patchPath) === change.revision &&
+						atomicYamlPathHash(this.#global, patchPath) === change.afterHash
+							? []
+							: [patchPath],
 					);
 					if (conflicts.length > 0) return { status: "conflict", paths: conflicts } as const;
+					const previous = new Map(
+						[...changes.keys()].map(settingPath => [
+							settingPath,
+							Object.hasOwn(SETTINGS_SCHEMA, settingPath) ? this.get(settingPath as SettingPath) : undefined,
+						]),
+					);
 					const restoreNotificationValidationState = this.#canRestoreNotificationValidationState(
 						notificationValidationGuard,
 						changes.keys(),
@@ -1380,7 +1408,7 @@ export class Settings implements NotificationSettingsReader {
 					if (restoreNotificationValidationState) {
 						this.#restoreNotificationValidationState(notificationValidationGuard.state);
 					}
-					this.#notifyAtomicSettingsChanged(changes.keys());
+					this.#publishSettingsChanges(previous);
 					return { status: "restored", receipt } as const;
 				},
 			};
@@ -1413,6 +1441,7 @@ export class Settings implements NotificationSettingsReader {
 		const commit = applyAtomicYamlPatches(this.#configPath, durablePatches, {
 			validateRoot: (root, currentPatches) =>
 				this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
+			restoreConflicts: () => this.#atomicRestoreConflicts(revisions),
 			onRestored: restoredPatches =>
 				this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
 		});
@@ -1478,6 +1507,7 @@ export class Settings implements NotificationSettingsReader {
 			{
 				validateRoot: (root, currentPatches) =>
 					this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
+				restoreConflicts: () => this.#atomicRestoreConflicts(revisions),
 				onRestored: restoredPatches =>
 					this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
 			},
@@ -1507,9 +1537,11 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		if (isNotificationSettingsPath(path)) throw new NotificationSettingsOverrideError(path);
+		const previous = this.get(path);
 		const clonedValue = structuredClone(value);
 		setByPath(this.#overrides, path.split("."), clonedValue);
 		this.#rebuildMerged();
+		this.#publishSettingsChanges(new Map([[path, previous]]));
 	}
 
 	/** Read the exact runtime override without merged defaults. */
@@ -1522,6 +1554,7 @@ export class Settings implements NotificationSettingsReader {
 	 * Clear a runtime override.
 	 */
 	clearOverride(path: SettingPath): void {
+		const previous = this.get(path);
 		const segments = path.split(".");
 		let current = this.#overrides;
 		for (let i = 0; i < segments.length - 1; i++) {
@@ -1531,6 +1564,7 @@ export class Settings implements NotificationSettingsReader {
 		}
 		delete current[segments[segments.length - 1]];
 		this.#rebuildMerged();
+		this.#publishSettingsChanges(new Map([[path, previous]]));
 	}
 
 	/** Flush a reserved debounced save without allowing it to be overtaken. */
@@ -1840,14 +1874,14 @@ export class Settings implements NotificationSettingsReader {
 		}
 		this.#rebuildMerged();
 		this.#recomputeNotificationValidationFromRaw();
+		const changed = new Map<string, unknown>();
 		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 			const previousValue = previous.get(settingPath);
 			const nextValue = this.get(settingPath);
 			if (util.isDeepStrictEqual(previousValue, nextValue)) continue;
-			const hook = SETTING_HOOKS[settingPath];
-			if (hook) hook(nextValue, previousValue);
-			for (const listener of this.#changeListeners) listener(settingPath);
+			changed.set(settingPath, previousValue);
 		}
+		this.#publishSettingsChanges(changed);
 	}
 	/**
 	 * Set an agent model override while keeping any live runtime override aligned.
@@ -6322,7 +6356,10 @@ export class Settings implements NotificationSettingsReader {
 		for (const patch of applicable) {
 			const settingPath = patch.path;
 			const revision = revisionsByPath.get(patch.path)!;
-			previous.set(settingPath, getByPath(this.#global, settingPath.split(".")));
+			previous.set(
+				settingPath,
+				Object.hasOwn(SETTINGS_SCHEMA, settingPath) ? this.get(settingPath as SettingPath) : undefined,
+			);
 			if (patch.op === "set") {
 				setByPath(this.#global, settingPath.split("."), structuredClone(patch.value));
 				this.#applyNotificationMutationToRaw(settingPath, patch.value);
@@ -6349,13 +6386,15 @@ export class Settings implements NotificationSettingsReader {
 		}
 		this.#rebuildMerged();
 		this.#revalidateNotificationSettingsAfterMutation(applicable.map(patch => patch.path));
-		for (const patch of applicable) {
-			const settingPath = patch.path as SettingPath;
-			const hook = SETTING_HOOKS[settingPath];
-			if (hook) hook(this.get(settingPath), previous.get(settingPath)!);
-		}
-		this.#notifyAtomicSettingsChanged(applicable.map(patch => patch.path));
+		this.#publishSettingsChanges(previous);
 		return applicable.some(patch => isNotificationSettingsPath(patch.path));
+	}
+
+	#atomicRestoreConflicts(revisions: readonly DurableBatchRevision[]): string[] {
+		const latest = new Map(revisions.map(entry => [entry.patch.path, entry.revision]));
+		return [...latest]
+			.filter(([settingPath, revision]) => this.#pathRevisions.get(settingPath) !== revision)
+			.map(([settingPath]) => settingPath);
 	}
 
 	#reserveAtomicFailureRefresh(commit: Promise<unknown>): Promise<void> {
@@ -6680,7 +6719,13 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook>> = {
 	},
 	"provider.appendOnlyContext": value => {
 		if (typeof value === "string") {
-			for (const cb of appendOnlyModeCallbacks) cb(value);
+			for (const cb of appendOnlyModeCallbacks) {
+				try {
+					cb(value);
+				} catch {
+					logger.warn("Settings hook subscriber failed", { path: "provider.appendOnlyContext" });
+				}
+			}
 		}
 	},
 };

@@ -3,9 +3,14 @@ import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
+import { getKeybindings, setKeybindings } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
+import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
+import { KeybindingsManager } from "../src/config/keybindings";
 import { ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
+import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "../src/config/settings";
+import { SettingsSelectorComponent } from "../src/modes/components/settings-selector";
+import { initTheme } from "../src/modes/theme/theme";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -79,9 +84,10 @@ describe("AgentSession live sampling settings", () => {
 		});
 		return new AgentSession({
 			agent,
+			agentDir: path.join(tempDir.path(), "agent"),
 			settings,
 			sessionManager: SessionManager.inMemory(tempDir.path()),
-			modelRegistry: new ModelRegistry(auth),
+			modelRegistry: new ModelRegistry(auth, path.join(tempDir.path(), "agent", "models.yml"), settings),
 		});
 	}
 
@@ -115,7 +121,196 @@ describe("AgentSession live sampling settings", () => {
 		expect(session.agent.temperature).toBeUndefined();
 	});
 
+	it("applies and clears runtime overrides without bypassing their precedence", async () => {
+		settings = Settings.isolated({ "compaction.enabled": false });
+		session = buildSession();
+		settings.override("temperature", 0.9);
+		expect(await request()).toHaveProperty("temperature", 0.9);
+		settings.set("temperature", 0.3);
+		expect(await request()).toHaveProperty("temperature", 0.9);
+		settings.clearOverride("temperature");
+		expect(await request()).toHaveProperty("temperature", 0.3);
+	});
+
+	it("applies a scoped TUI sampling selection to its session's next provider request", async () => {
+		resetSettingsForTest();
+		const global = await Settings.init({
+			inMemory: true,
+			cwd: tempDir.path(),
+			agentDir: path.join(tempDir.path(), "global-agent"),
+		});
+		global.set("temperature", 1);
+		const previousKeybindings = getKeybindings();
+		setKeybindings(KeybindingsManager.inMemory());
+		let selector: SettingsSelectorComponent | undefined;
+		try {
+			await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+			settings = Settings.isolated({ "compaction.enabled": false, temperature: 0.2 });
+			session = buildSession();
+			selector = new SettingsSelectorComponent(
+				{
+					settings,
+					cwd: tempDir.path(),
+					availableThinkingLevels: [],
+					thinkingLevel: undefined,
+					availableThemes: ["red-claw", "blue-crab"],
+					availableModelProfiles: [],
+				},
+				{ onChange: () => {}, onCancel: () => {} },
+			);
+			selector.handleInput("\x1b[C");
+			for (const character of "temperature") selector.handleInput(character);
+			selector.handleInput("\n");
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\n");
+			expect(await request()).toHaveProperty("temperature", 0.5);
+			expect(global.get("temperature")).toBe(1);
+		} finally {
+			selector?.dispose();
+			setKeybindings(previousKeybindings);
+			resetSettingsForTest();
+		}
+	});
+
+	it("keeps live sampling after bounded child cleanup", async () => {
+		settings = Settings.isolated({ "compaction.enabled": false });
+		session = buildSession();
+		await session.disposeChildSubprocesses();
+		settings.set("temperature", 0.45);
+		expect(await request()).toHaveProperty("temperature", 0.45);
+	});
+
+	it("uses project sampling ahead of global writes and below runtime overrides", async () => {
+		await Bun.write(path.join(tempDir.path(), ".gjc", "config.yml"), "temperature: 0.65\n");
+		settings = await Settings.loadForScope({ cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") });
+		settings.set("compaction.enabled", false);
+		expect(settings.get("temperature")).toBe(0.65);
+		session = buildSession();
+		settings.set("temperature", 0.3);
+		expect(await request()).toHaveProperty("temperature", 0.65);
+		settings.override("temperature", 0.9);
+		expect(await request()).toHaveProperty("temperature", 0.9);
+		settings.clearOverride("temperature");
+		expect(await request()).toHaveProperty("temperature", 0.65);
+	});
+
+	it("rechecks local revisions after a restore waits in the config queue", async () => {
+		settings = await Settings.loadForScope({ cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") });
+		settings.set("compaction.enabled", false);
+		session = buildSession();
+		const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.25 }]);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const blocker = enqueueAtomicYamlOperation(settings.getGlobalConfigPath()!, async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		let restore: Promise<unknown> | undefined;
+		try {
+			await entered.promise;
+			restore = receipt.restore();
+			settings.set("temperature", 0.25);
+			release.resolve();
+			expect(await restore).toMatchObject({ status: "conflict", paths: ["temperature"] });
+			await settings.flushOrThrow();
+			expect(await request()).toHaveProperty("temperature", 0.25);
+		} finally {
+			release.resolve();
+			await blocker;
+			await restore;
+		}
+	});
+
+	it("does not let an earlier ordinary observer strand set or unset application", async () => {
+		settings = Settings.isolated({ "compaction.enabled": false });
+		const unsubscribe = settings.onChanged(() => {
+			throw new Error("observer fixture failure");
+		});
+		try {
+			session = buildSession();
+			settings.set("temperature", 0.5);
+			expect(await request()).toHaveProperty("temperature", 0.5);
+			settings.unset("temperature");
+			expect(await request()).not.toHaveProperty("temperature");
+		} finally {
+			unsubscribe();
+		}
+	});
+
 	for (const durable of [false, true]) {
+		it(`publishes a complete sampling snapshot before reentrant observers (${durable ? "disk" : "memory"})`, async () => {
+			settings = durable
+				? await Settings.loadForScope({ cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") })
+				: Settings.isolated({ "compaction.enabled": false });
+			settings.set("compaction.enabled", false);
+			let run: Promise<void> | undefined;
+			const unsubscribe = settings.onChanged(settingPath => {
+				if (settingPath === "temperature") run = session!.agent.prompt("Reentrant settings observer");
+			});
+			try {
+				session = buildSession();
+				const receipt = await settings.commitAtomicBatch([
+					{ path: "temperature", op: "set", value: 0.35 },
+					{ path: "topP", op: "set", value: 0.8 },
+				]);
+				await run;
+				await session.waitForIdle();
+				expect(requests[0]).toMatchObject({ temperature: 0.35, top_p: 0.8 });
+				expect((await receipt.restore()).status).toBe("restored");
+				await run;
+				await session.waitForIdle();
+				expect(requests[1]).not.toHaveProperty("temperature");
+				expect(requests[1]).not.toHaveProperty("top_p");
+				expect(requests).toHaveLength(2);
+			} finally {
+				unsubscribe();
+				await run;
+			}
+		});
+
+		it(`preserves receipts and sampling when an append-only hook subscriber throws (${durable ? "disk" : "memory"})`, async () => {
+			settings = durable
+				? await Settings.loadForScope({ cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") })
+				: Settings.isolated({ "compaction.enabled": false });
+			settings.set("compaction.enabled", false);
+			const unsubscribeFailure = onAppendOnlyModeChanged(() => {
+				throw new Error("hook fixture failure");
+			});
+			const modes: string[] = [];
+			const unsubscribe = onAppendOnlyModeChanged(mode => modes.push(mode));
+			try {
+				session = buildSession();
+				const receipt = await settings.commitAtomicBatch([
+					{ path: "provider.appendOnlyContext", op: "set", value: "off" },
+					{ path: "temperature", op: "set", value: 0.25 },
+				]);
+				expect(await request()).toHaveProperty("temperature", 0.25);
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(await request()).not.toHaveProperty("temperature");
+				expect(modes).toEqual(["off", "auto"]);
+			} finally {
+				unsubscribeFailure();
+				unsubscribe();
+			}
+		});
+
+		for (const updates of [[0.25], [0.75, 0.25]]) {
+			it(`rejects same-value or ABA local restore after ${updates.join("/")} (${durable ? "disk" : "memory"})`, async () => {
+				const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
+				settings = durable
+					? await Settings.loadForScope(scope)
+					: Settings.isolated({ "compaction.enabled": false });
+				settings.set("compaction.enabled", false);
+				session = buildSession();
+				const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.25 }]);
+				for (const value of updates) settings.set("temperature", value);
+				await settings.flushOrThrow();
+				expect((await receipt.restore()).status).toBe("conflict");
+				expect(await request()).toHaveProperty("temperature", 0.25);
+				if (durable) expect((await Settings.loadReadonly(scope)).get("temperature")).toBe(0.25);
+			});
+		}
+
 		it(`applies an atomic batch and CAS restore to provider payloads (${durable ? "disk" : "memory"})`, async () => {
 			const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
 			settings = durable ? await Settings.loadForScope(scope) : Settings.isolated({ "compaction.enabled": false });

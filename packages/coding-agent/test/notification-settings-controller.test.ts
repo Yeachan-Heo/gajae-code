@@ -241,6 +241,7 @@ function selectorOperations(
 function selector(operations: NotificationsEditorOperations): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
+			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw"],

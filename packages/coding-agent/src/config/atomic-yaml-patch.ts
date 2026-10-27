@@ -91,6 +91,8 @@ export interface AtomicYamlPatchOptions {
 	platform?: NodeJS.Platform;
 	/** Called under the config lock before patches are applied. */
 	validateRoot?: (root: unknown, patches: readonly AtomicYamlPatch[]) => void | Promise<void>;
+	/** Additional owner revisions checked under the config lock before CAS restoration. */
+	restoreConflicts?: () => readonly string[];
 	/** Called under the config lock after a successful CAS restore. */
 	onRestored?: (patches: readonly AtomicYamlPatch[]) => void | Promise<void>;
 }
@@ -839,12 +841,18 @@ function createReceipt(
 				if (discarded) return { status: "discarded" };
 				return await withFileLock(canonicalPath, async () => {
 					const { current, root } = await readYaml(canonicalPath);
-					const conflicts = changes
-						.filter(
-							change =>
-								stateHash(stateAtPath(current, change.path.split("."))) !== change.publicRevision.afterHash,
-						)
-						.map(change => change.path);
+					const conflicts = [
+						...new Set([
+							...changes
+								.filter(
+									change =>
+										stateHash(stateAtPath(current, change.path.split("."))) !==
+										change.publicRevision.afterHash,
+								)
+								.map(change => change.path),
+							...(options.restoreConflicts?.() ?? []),
+						]),
+					];
 					if (conflicts.length > 0) return { status: "conflict", paths: conflicts };
 
 					const restorePatches: AtomicYamlPatch[] = changes.map(change =>

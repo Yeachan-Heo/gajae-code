@@ -75,11 +75,14 @@ If omitted, it resolves:
 
 Changes to `session.settings` for `temperature`, `topP`, `topK`, `minP`,
 `presencePenalty`, and `repetitionPenalty` update the live session's sampling
-options for subsequent provider requests. The TUI uses this same settings
+options for the next newly started agent run. An already-running agent loop
+retains its sampling snapshot, including later tool rounds, retries, and queued
+follow-ups within that run. The TUI uses this same settings
 observation path; no TUI controller call is needed. Negative sentinel values
 omit the option from provider requests, and `unset` reapplies the effective
 project/runtime/default value. Changing a global value does not bypass a
-higher-priority override.
+higher-priority override. `override` and `clearOverride` update live sampling
+without persisting the runtime override.
 
 ```ts
 session.settings.set("temperature", 0.4);
@@ -90,8 +93,9 @@ await session.settings.flushOrThrow(); // observe background persistence failure
 durability receipt. The existing managed `config.patch` response likewise does
 not certify durable persistence. For a disk-backed atomic change, use
 `Settings.commitAtomicBatch`; its successful commit and CAS-protected restore
-also update live sampling. Atomic observers run after the complete state is
-applied; a failing observer is logged without hiding the commit receipt or
+also update live sampling. Synchronous `onChanged` applicators (the `"apply"`
+phase) finish before hooks and ordinary observers run. A failing subscriber
+is logged by setting path without hiding the commit receipt or
 preventing other observers from receiving the change.
 
 `Settings.isolated()` remains memory-only. Check

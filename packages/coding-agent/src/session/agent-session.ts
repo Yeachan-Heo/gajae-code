@@ -3012,6 +3012,8 @@ function frameUntrustedIrcInbound(from: string, message: string): string {
 	);
 }
 
+const SAMPLING_SETTING_PATHS = ["temperature", "topP", "topK", "minP", "presencePenalty", "repetitionPenalty"] as const;
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -5822,19 +5824,13 @@ export class AgentSession {
 			}
 		});
 		this.#unregisterSamplingSettings = this.settings.onChanged(settingPath => {
-			switch (settingPath) {
-				case "temperature":
-				case "topP":
-				case "topK":
-				case "minP":
-				case "presencePenalty":
-				case "repetitionPenalty": {
-					const value = this.settings.get(settingPath);
-					this.agent[settingPath] = value >= 0 ? value : undefined;
-					break;
+			if (SAMPLING_SETTING_PATHS.some(samplingPath => samplingPath === settingPath)) {
+				for (const samplingPath of SAMPLING_SETTING_PATHS) {
+					const value = this.settings.get(samplingPath);
+					this.agent[samplingPath] = value >= 0 ? value : undefined;
 				}
 			}
-		});
+		}, "apply");
 		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
 		// Worker integration is an injected seam only: hosts that need turn-end
 		// integration supply the request, and no scheduler exists otherwise.
@@ -11641,8 +11637,6 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
-		this.#unregisterSamplingSettings?.();
-		this.#unregisterSamplingSettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([

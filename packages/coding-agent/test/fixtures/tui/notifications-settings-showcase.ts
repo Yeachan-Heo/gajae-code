@@ -1212,6 +1212,7 @@ export async function renderNotificationsSettingsShowcase(
 		const operations = new DeterministicNotificationsEditorOperations(entry.stateId, SHOWCASE_CLOCK);
 		component = new SettingsSelectorComponent(
 			{
+				settings: Settings.instance,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: ["red-claw"],
