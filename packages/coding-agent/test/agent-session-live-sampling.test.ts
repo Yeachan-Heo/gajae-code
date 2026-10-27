@@ -60,7 +60,7 @@ describe("AgentSession live sampling settings", () => {
 	let requests: Record<string, unknown>[];
 
 	beforeEach(async () => {
-		tempDir = TempDir.createSync("gjc-live-sampling-");
+		tempDir = TempDir.createSync("@gjc-live-sampling-");
 		auth = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		auth.setRuntimeApiKey("openai", "fixture-key");
 		session = undefined;
@@ -188,7 +188,9 @@ describe("AgentSession live sampling settings", () => {
 			await settings.flushOrThrow();
 			expect(settings.get("temperature")).toBe(0.8);
 			expect(await request()).toMatchObject({ temperature: 0.8, top_k: 24 });
-		} finally { await other.close(); }
+		} finally {
+			await other.close();
+		}
 	});
 
 	it("does not run process-global display hooks for runtime overrides", () => {
@@ -201,7 +203,9 @@ describe("AgentSession live sampling settings", () => {
 			expect(getDefaultTabWidth()).toBe(original);
 			settings.clearOverride("display.tabWidth");
 			expect(getDefaultTabWidth()).toBe(original);
-		} finally { setDefaultTabWidth(original); }
+		} finally {
+			setDefaultTabWidth(original);
+		}
 	});
 
 	for (const updates of [[0.25], [0.75, 0.25]]) {
@@ -213,12 +217,17 @@ describe("AgentSession live sampling settings", () => {
 			const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.25 }]);
 			const other = await Settings.loadForScope(scope);
 			try {
-				for (const value of updates) { other.set("temperature", value); await other.flushOrThrow(); }
+				for (const value of updates) {
+					other.set("temperature", value);
+					await other.flushOrThrow();
+				}
 				expect((await receipt.restore()).status).toBe("conflict");
 				expect(await request()).toHaveProperty("temperature", 0.25);
 				expect((await Settings.loadReadonly(scope)).get("temperature")).toBe(0.25);
 				expect(other.get("temperature")).toBe(0.25);
-			} finally { await other.close(); }
+			} finally {
+				await other.close();
+			}
 		});
 	}
 
@@ -227,14 +236,32 @@ describe("AgentSession live sampling settings", () => {
 			it(`fences an atomic model leaf against newer parent role writes ${updates.join("/")} (${durable ? "disk" : "memory"})`, async () => {
 				const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
 				settings = durable ? await Settings.loadForScope(scope) : Settings.isolated();
-				const receipt = await settings.commitAtomicBatch([{ path: "modelRoles.default", op: "set", value: "openai/gpt-4o-mini" }]);
+				const receipt = await settings.commitAtomicBatch([
+					{ path: "modelRoles.default", op: "set", value: "openai/gpt-4o-mini" },
+				]);
 				for (const value of updates) settings.setModelRole("default", value);
 				await settings.flushOrThrow();
 				expect((await receipt.restore()).status).toBe("conflict");
 				expect(settings.getModelRole("default")).toBe("openai/gpt-4o-mini");
-				if (durable) expect((await Settings.loadReadonly(scope)).getModelRole("default")).toBe("openai/gpt-4o-mini");
+				if (durable)
+					expect((await Settings.loadReadonly(scope)).getModelRole("default")).toBe("openai/gpt-4o-mini");
 			});
 		}
+	}
+
+	for (const durable of [false, true]) {
+		it(`preserves an unrelated role when restoring the default model (${durable ? "disk" : "memory"})`, async () => {
+			const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
+			settings = durable ? await Settings.loadForScope(scope) : Settings.isolated();
+			const receipt = await settings.commitAtomicBatch([
+				{ path: "modelRoles.default", op: "set", value: "openai/gpt-4o-mini" },
+			]);
+			settings.setModelRole("smol", "other/model");
+			await settings.flushOrThrow();
+			expect((await receipt.restore()).status).toBe("restored");
+			expect(settings.getModelRole("smol")).toBe("other/model");
+			if (durable) expect((await Settings.loadReadonly(scope)).getModelRole("smol")).toBe("other/model");
+		});
 	}
 
 	it("keeps live sampling after bounded child cleanup", async () => {

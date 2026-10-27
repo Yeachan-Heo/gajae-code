@@ -70,6 +70,8 @@ export interface CasReceipt {
 export interface AtomicYamlUpdate<T> {
 	apply(current: Record<string, unknown>): T | Promise<T>;
 	shouldWrite?(result: T): boolean;
+	/** Explicit mutation intent, including same-value writes; omitted means whole-document ownership. */
+	mutationPaths?(): readonly string[];
 	committed?(current: Record<string, unknown>, result: T): void | Promise<void>;
 }
 
@@ -145,6 +147,31 @@ type ReceiptChange = {
 
 const queues = new Map<string, Promise<void>>();
 let nextReceiptRevision = 0;
+// Process-local authority shared by every queued writer, keyed by the canonical
+// file, not its lexical aliases. Unknown/cross-process writers remain hash-only:
+// the lock serializes writes but cannot prove their same-value or ABA intent.
+const durableRevisions = new Map<string, Map<string, number>>();
+
+function recordDurableMutation(configPath: string, paths: readonly string[]): void {
+	let revisions = durableRevisions.get(configPath);
+	if (!revisions) {
+		revisions = new Map();
+		durableRevisions.set(configPath, revisions);
+	}
+	const revision = ++nextReceiptRevision;
+	for (const settingPath of paths) revisions.set(settingPath, revision);
+}
+
+function hasNewerDurableMutation(configPath: string, settingPath: string, revision: number): boolean {
+	return [...(durableRevisions.get(configPath) ?? [])].some(
+		([other, newer]) =>
+			newer > revision &&
+			(other === "" ||
+				other === settingPath ||
+				other.startsWith(`${settingPath}.`) ||
+				settingPath.startsWith(`${other}.`)),
+	);
+}
 /** Bounded Windows sharing-violation retries: 10, 25, 50, 100, then 200 ms. */
 const WINDOWS_RENAME_BACKOFF_MS = [10, 25, 50, 100, 200] as const;
 const WINDOWS_SHARING_VIOLATION_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
@@ -662,6 +689,7 @@ async function writeAtomicYaml(
 	expectedState?: YamlFileState,
 	/** Lexical (unresolved) config path; re-verified against the canonical target before the rename. */
 	lexicalConfigPath?: string,
+	mutationPaths: readonly string[] = [""],
 ): Promise<YamlFileState> {
 	const directory = path.dirname(configPath);
 	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
@@ -819,6 +847,7 @@ async function writeAtomicYaml(
 	} finally {
 		if (!preserveTempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
+	recordDurableMutation(configPath, mutationPaths);
 	return { exists: true, raw: nextRaw };
 }
 
@@ -829,6 +858,7 @@ function createReceipt(
 ): CasReceipt {
 	let discarded = false;
 	const revisions = changes.map(change => change.publicRevision);
+	const ownershipRevision = nextReceiptRevision;
 
 	return {
 		revisions,
@@ -846,8 +876,9 @@ function createReceipt(
 							...changes
 								.filter(
 									change =>
+										hasNewerDurableMutation(canonicalPath, change.path, ownershipRevision) ||
 										stateHash(stateAtPath(current, change.path.split("."))) !==
-										change.publicRevision.afterHash,
+											change.publicRevision.afterHash,
 								)
 								.map(change => change.path),
 							...(options.restoreConflicts?.() ?? []),
@@ -925,7 +956,15 @@ async function applyPatchesUnderLock(
 	}
 	const changes = [...changesByPath.values()];
 
-	if (!skipWrite) await writeAtomicYaml(configPath, current, options, expectedState, lexicalConfigPath);
+	if (!skipWrite)
+		await writeAtomicYaml(
+			configPath,
+			current,
+			options,
+			expectedState,
+			lexicalConfigPath,
+			patches.map(patch => patch.path),
+		);
 	return createReceipt(configPath, changes, options);
 }
 
@@ -1053,6 +1092,7 @@ export function withAtomicYamlConfigTransaction<T>(
 						options,
 						lastKnownState ?? initialState,
 						lexicalPath,
+						keys,
 					);
 					markWritten();
 					// The deleted top-level key values are not journaled, so a
@@ -1081,6 +1121,7 @@ export function withAtomicYamlConfigTransaction<T>(
 						options,
 						lastKnownState ?? initialState,
 						lexicalPath,
+						[...patches.map(patch => patch.path), ...topLevelKeys],
 					);
 					markWritten();
 					let discarded = false;
@@ -1205,6 +1246,7 @@ export function reserveAtomicYamlUpdateSlot<T>(
 					// an external edit during the queue wait is a conflict.
 					state,
 					lexicalPath,
+					atomicUpdate.mutationPaths?.(),
 				);
 			}
 			await atomicUpdate.committed?.(current, result);

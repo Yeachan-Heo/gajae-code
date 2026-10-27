@@ -264,7 +264,10 @@ type NotificationValidationRestoreGuard = {
 	restoreGeneration: number | undefined;
 };
 
-export type SettingsAtomicPatch = { path: SettingPath; op: "set"; value: unknown } | { path: SettingPath; op: "unset" };
+export type SettingsAtomicPath = SettingPath | `modelRoles.${string}`;
+export type SettingsAtomicPatch =
+	| { path: SettingsAtomicPath; op: "set"; value: unknown }
+	| { path: SettingsAtomicPath; op: "unset" };
 export type SettingsAtomicReceipt = CasReceipt;
 
 export interface SettingsOptions {
@@ -620,6 +623,8 @@ export class Settings implements NotificationSettingsReader {
 	#agentDir: string;
 	#storage: AgentStorage | null = null;
 	#isolatedStorage = false;
+	/** Only Settings.init owns the process-wide presentation state. */
+	#ownsPresentation = false;
 
 	/** Global settings from config.yml */
 	#global: RawSettings = {};
@@ -716,6 +721,7 @@ export class Settings implements NotificationSettingsReader {
 
 		globalInitOptions = structuredClone(options);
 		const instance = new Settings(options);
+		instance.#ownsPresentation = true;
 		const promise = instance.#load();
 		globalInstancePromise = promise;
 
@@ -885,7 +891,10 @@ export class Settings implements NotificationSettingsReader {
 		// synchronously start a run, including observers installed before a session.
 		notify(this.#changeApplications);
 		for (const [settingPath, previousValue] of previous) {
-			const hook = SETTING_HOOKS[settingPath as SettingPath];
+			const hook =
+				this.#ownsPresentation || settingPath === "provider.appendOnlyContext"
+					? SETTING_HOOKS[settingPath as SettingPath]
+					: undefined;
 			if (hook) {
 				try {
 					hook(this.get(settingPath as SettingPath), previousValue);
@@ -1375,6 +1384,7 @@ export class Settings implements NotificationSettingsReader {
 					if (discarded) return { status: "discarded" } as const;
 					const conflicts = [...changes].flatMap(([patchPath, change]) =>
 						this.#pathRevisions.get(patchPath) === change.revision &&
+						!this.#hasNewerOverlappingRevision(patchPath, change.revision) &&
 						atomicYamlPathHash(this.#global, patchPath) === change.afterHash
 							? []
 							: [patchPath],
@@ -1837,7 +1847,7 @@ export class Settings implements NotificationSettingsReader {
 			modelRole: role,
 		};
 		setRawModelRole(this.#global, role, modelId);
-		this.#pathRevisions.set("modelRoles", revision);
+		this.#pathRevisions.set(settingsPatchKey(patch), revision);
 		this.#modified.set(settingsPatchKey(patch), patch);
 		this.#rebuildMerged();
 		this.#queueSave();
@@ -6246,19 +6256,14 @@ export class Settings implements NotificationSettingsReader {
 					return { shouldWrite: captured.length > 0 };
 				},
 				shouldWrite: result => result.shouldWrite,
+				mutationPaths: () => captured.map(settingsPatchKey),
 				committed: current => {
 					for (const patch of captured) {
 						const key = settingsPatchKey(patch);
 						if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
 					}
-					this.#global = current;
 					this.#captureRawNotificationConfig(current);
-					for (const patch of this.#pendingPatchesInGenerationOrder()) {
-						applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
-						this.#applyNotificationMutationToRaw(patch.path, patch.value);
-					}
-					this.#rebuildMerged();
-					this.#recomputeNotificationValidationFromRaw();
+					this.#replaceGlobalWithDurable(current);
 				},
 			};
 		})
@@ -6348,7 +6353,11 @@ export class Settings implements NotificationSettingsReader {
 		for (const patch of patches) finalPatches.set(patch.path, patch);
 		const applicable = [...finalPatches.values()].filter(patch => {
 			const revision = revisionsByPath.get(patch.path);
-			return revision !== undefined && this.#pathRevisions.get(patch.path) === revision.revision;
+			return (
+				revision !== undefined &&
+				this.#pathRevisions.get(patch.path) === revision.revision &&
+				!this.#hasNewerOverlappingRevision(patch.path, revision.revision)
+			);
 		});
 		if (applicable.length === 0) return false;
 
@@ -6390,10 +6399,22 @@ export class Settings implements NotificationSettingsReader {
 		return applicable.some(patch => isNotificationSettingsPath(patch.path));
 	}
 
+	#hasNewerOverlappingRevision(settingPath: string, revision: number): boolean {
+		return [...this.#pathRevisions].some(
+			([other, newer]) =>
+				newer > revision &&
+				(other === settingPath || other.startsWith(`${settingPath}.`) || settingPath.startsWith(`${other}.`)),
+		);
+	}
+
 	#atomicRestoreConflicts(revisions: readonly DurableBatchRevision[]): string[] {
 		const latest = new Map(revisions.map(entry => [entry.patch.path, entry.revision]));
 		return [...latest]
-			.filter(([settingPath, revision]) => this.#pathRevisions.get(settingPath) !== revision)
+			.filter(
+				([settingPath, revision]) =>
+					this.#pathRevisions.get(settingPath) !== revision ||
+					this.#hasNewerOverlappingRevision(settingPath, revision),
+			)
 			.map(([settingPath]) => settingPath);
 	}
 
@@ -6605,6 +6626,7 @@ export class Settings implements NotificationSettingsReader {
 
 	#fireAllHooks(): void {
 		for (const key of Object.keys(SETTING_HOOKS) as SettingPath[]) {
+			if (!this.#ownsPresentation && key !== "provider.appendOnlyContext") continue;
 			const hook = SETTING_HOOKS[key];
 			if (hook) {
 				const value = this.get(key);

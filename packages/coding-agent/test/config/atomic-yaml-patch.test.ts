@@ -10,6 +10,7 @@ import {
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
 	atomicYamlPathHash,
+	reserveAtomicYamlUpdateSlot,
 	withAtomicYamlConfigTransaction,
 } from "../../src/config/atomic-yaml-patch";
 import { FileLockAcquireError, FileLockTestHooks } from "../../src/config/file-lock";
@@ -35,6 +36,46 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	for (const writer of ["patch", "update"] as const) {
+		for (const values of [[true], [false, true]]) {
+			test(`fences receipt ownership through a symlink with ${writer} writes ${values.join("/")}`, async () => {
+				const configPath = await configPathForTest();
+				const receipt = await applyAtomicYamlPatches(configPath, [
+					{ path: "feature.enabled", op: "set", value: true },
+				]);
+				const alias = path.join(path.dirname(configPath), "alias.yml");
+				await fs.symlink(configPath, alias);
+				for (const enabled of values) {
+					if (writer === "patch") {
+						await applyAtomicYamlPatches(alias, [{ path: "feature", op: "set", value: { enabled } }]);
+					} else {
+						await reserveAtomicYamlUpdateSlot(alias, () => ({
+							apply: current => {
+								current.feature = { enabled };
+							},
+							mutationPaths: () => ["feature"],
+						}));
+					}
+				}
+				expect(await receipt.restore()).toEqual({ status: "conflict", paths: ["feature.enabled"] });
+				expect(await readYaml(configPath)).toEqual({ feature: { enabled: true } });
+			});
+		}
+	}
+
+	test("ordinary update ownership preserves unrelated receipt restoration", async () => {
+		const configPath = await configPathForTest();
+		const receipt = await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: true }]);
+		await reserveAtomicYamlUpdateSlot(configPath, () => ({
+			apply: current => {
+				current.unrelated = "keep";
+			},
+			mutationPaths: () => ["unrelated"],
+		}));
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(await readYaml(configPath)).toMatchObject({ unrelated: "keep" });
+	});
+
 	test("serializes concurrent writers and preserves unrelated keys", async () => {
 		const configPath = await configPathForTest();
 		await fs.writeFile(configPath, YAML.stringify({ external: { keep: true } }, null, 2));
