@@ -24,6 +24,23 @@ const CSI = "\u001b[2J";
 const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
 const PROPERTY_SEED = 638;
 const PROPERTY_RUNS = 64;
+// Status sanitizers have no length cap. The bound check uses N and 2N code units.
+const BOUND_N = 256 * 1024;
+const BOUND_MS = 2000;
+
+function sized(unit: string, units: number): string {
+	return unit.repeat(Math.ceil(units / unit.length)).slice(0, units);
+}
+
+function expectWorkBound(inputUnits: number, render: () => string, copies = 1): string {
+	const started = performance.now();
+	const rendered = render();
+	expect(performance.now() - started).toBeLessThan(BOUND_MS);
+	// A fixed number of interpolations stays linear. Quadratic growth fails this.
+	expect(rendered.length).toBeLessThanOrEqual(inputUnits * copies + 800);
+	assertNoTerminalControls(rendered);
+	return rendered;
+}
 
 function assertNoTerminalControls(text: string | undefined): void {
 	expect(text).toBeDefined();
@@ -420,5 +437,48 @@ describe("state terminal text", () => {
 			}),
 			{ seed: PROPERTY_SEED, numRuns: PROPERTY_RUNS },
 		);
+	});
+
+	it("bounds work for oversized plain text and unterminated escapes", () => {
+		const plain = sized("phase note ", BOUND_N * 2);
+		const prose = expectWorkBound(
+			plain.length,
+			() => renderStateMarkdown("ultragoal", { current_phase: plain }, manifestFor([])),
+			2,
+		);
+		expect(prose).toContain(plain.trim());
+		const half = sized("phase note ", BOUND_N);
+		expectWorkBound(half.length, () => renderStateMarkdown("ultragoal", { current_phase: half }, manifestFor([])), 2);
+
+		const osc = sized("\u001b]52;c;AAAA", BOUND_N * 2);
+		const csi = sized("\u001b[31m", BOUND_N * 2);
+		const goal = expectWorkBound(osc.length + csi.length, () =>
+			renderUltragoalStatusMarkdown({
+				exists: true,
+				status: csi,
+				paths: { goalsPath: "goals.json" },
+				gjcObjective: osc,
+				currentGoal: { id: "g1", status: "pending" },
+				counts: { pending: 1 },
+				goals: [{}],
+			}),
+		);
+		expect(goal.split("\n").filter(line => line.startsWith("- status:")).length).toBe(1);
+
+		const c1 = sized("\u009d0;title", BOUND_N * 2);
+		const line = expectWorkBound(c1.length, () =>
+			renderStateStatusLine({
+				skill: "ultragoal",
+				phase: c1,
+				active: true,
+				fresh: false,
+				next: ["active"],
+				receipt_status: "fresh",
+				storage_path: "state.json",
+			}),
+		);
+		expect(line.startsWith("ultragoal: phase=")).toBe(true);
+		expect(line.endsWith("\n")).toBe(true);
+		expect(line.slice(0, -1).includes("\n")).toBe(false);
 	});
 });
