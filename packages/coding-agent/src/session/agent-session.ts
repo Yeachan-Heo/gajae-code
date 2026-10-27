@@ -15397,6 +15397,7 @@ export class AgentSession {
 				deliverAs: options.streamingBehavior,
 				followUpQueuePolicy: options.followUpQueuePolicy,
 				steerQueuePolicy: options.steerQueuePolicy,
+				preflightSignal: options?.preflightSignal,
 			});
 			if (options.promptPrelude?.workflowIntentDiff)
 				this.sessionManager.appendCustomEntry(
@@ -16968,6 +16969,9 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 			followUpQueuePolicy?: "respect-mode" | "sequential";
 			steerQueuePolicy?: "respect-mode" | "sequential";
+			/** Cancellation signal for queued prompts. When aborted, prevents queued
+			 *  prompts from executing (review blocker P2 issue #7321). */
+			preflightSignal?: AbortSignal;
 			/** INTERNAL trusted option: origin of a hidden next-turn message —
 			 *  "turn" (produced by the current turn's continuation machinery,
 			 *  purged by a terminal abort) or "external" (background producers,
@@ -17025,12 +17029,17 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations([appMessage]);
 					return;
 				}
-				await this.#queueFollowUpAfterReservation(appMessage, this.#getCustomMessageTextContent(appMessage), {
-					forceOneAtATime: sequential !== undefined,
-					createDisplayEntry: false,
-					trackExternalFollowUp: false,
-					sdkRunToken: this.#activeSdkRunToken,
-				});
+				await this.#queueFollowUpAfterReservation(
+					appMessage,
+					this.#getCustomMessageTextContent(appMessage),
+					{
+						forceOneAtATime: sequential !== undefined,
+						createDisplayEntry: false,
+						trackExternalFollowUp: false,
+						sdkRunToken: this.#activeSdkRunToken,
+					},
+					options?.preflightSignal,
+				);
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
 				// aligned with where the executable message actually landed.
@@ -17061,12 +17070,17 @@ export class AgentSession {
 			}
 
 			const independentOfTurn = appMessage.attribution === "user" || options?.origin === "external";
-			await this.#queueFollowUpAfterReservation(appMessage, this.#getCustomMessageTextContent(appMessage), {
-				forceOneAtATime: options?.followUpQueuePolicy === "sequential",
-				createDisplayEntry: false,
-				trackExternalFollowUp: false,
-				sdkRunToken: this.#activeSdkRunToken,
-			});
+			await this.#queueFollowUpAfterReservation(
+				appMessage,
+				this.#getCustomMessageTextContent(appMessage),
+				{
+					forceOneAtATime: options?.followUpQueuePolicy === "sequential",
+					createDisplayEntry: false,
+					trackExternalFollowUp: false,
+					sdkRunToken: this.#activeSdkRunToken,
+				},
+				options?.preflightSignal,
+			);
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			if (independentOfTurn) {
 				this.#externalFollowUps.add(appMessage);

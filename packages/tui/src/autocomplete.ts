@@ -238,8 +238,17 @@ function normalizeSlashCommandText(value: string): string {
 		.trim()
 		.replace(/\s+/g, " ");
 }
+
+/**
+ * Find the start position of an open code span/fence that contains the end of the text.
+ * Matches the runtime parser logic from skills.ts:
+ * - Fenced code blocks start with 3+ backticks at line start
+ * - Inline code spans use matching backtick run lengths
+ * - Longer closing fences are valid
+ * - Non-matching backtick runs inside a span are literal text
+ */
 function findOpenInlineCodeSpanStart(text: string): number | null {
-	let openDelimiter: number | null = null;
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean, position: number]> = [];
 
 	for (let i = 0; i < text.length; ) {
 		if (text[i] !== "`") {
@@ -249,21 +258,139 @@ function findOpenInlineCodeSpanStart(text: string): number | null {
 
 		let runEnd = i + 1;
 		while (text[runEnd] === "`") runEnd += 1;
-		if (runEnd - i !== 1) {
+		const runLength = runEnd - i;
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		const isEscaped = backslashCount % 2 === 1;
+
+		if (isEscaped) {
 			i = runEnd;
 			continue;
 		}
 
-		let backslashCount = 0;
-		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
-		if (backslashCount % 2 === 0) openDelimiter = openDelimiter === null ? i : null;
+		const isAtLineStart = i === 0 || text[i - 1] === "\n";
+
+		// Handle fenced code blocks (3+ backticks at line start)
+		if (isAtLineStart && runLength >= 3) {
+			const top = delimiterStack[delimiterStack.length - 1];
+			if (top && top[1] && runLength >= top[0]) {
+				// Closing fence: length must be >= opener (per CommonMark)
+				delimiterStack.pop();
+			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
+				// Opening fence (only if not already inside another fence)
+				delimiterStack.push([runLength, true, i]);
+			}
+			i = runEnd;
+			continue;
+		}
+
+		// Handle inline code spans (all backticks except 3+ at line start)
+		// Don't open new inline spans inside fenced blocks
+		const insideFence = delimiterStack.length > 0 && delimiterStack[delimiterStack.length - 1]?.[1];
+		if (insideFence) {
+			i = runEnd;
+			continue;
+		}
+
+		// Check for closing inline code span with matching length
+		if (delimiterStack.length > 0) {
+			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+			if (!openIsAtLineStart && openLength === runLength) {
+				delimiterStack.pop();
+				i = runEnd;
+				continue;
+			}
+			// Non-matching run inside a span: treat as literal text, not a delimiter
+		} else {
+			// Opening inline code span
+			delimiterStack.push([runLength, false, i]);
+		}
+
 		i = runEnd;
 	}
 
-	return openDelimiter;
+	// If there's an open delimiter at the end of the text, return its position
+	const top = delimiterStack[delimiterStack.length - 1];
+	return top ? top[2] : null;
 }
+
+/**
+ * Check if a position is inside a code span/fence.
+ * Matches the runtime parser logic from skills.ts:
+ * - Fenced code blocks start with 3+ backticks at line start
+ * - Inline code spans use matching backtick run lengths
+ * - Longer closing fences are valid
+ * - Non-matching backtick runs inside a span are literal text
+ */
+function isPositionInsideCodeSpan(text: string, position: number): boolean {
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean]> = [];
+
+	for (let i = 0; i < position && i < text.length; ) {
+		if (text[i] !== "`") {
+			i += 1;
+			continue;
+		}
+
+		let runEnd = i + 1;
+		while (text[runEnd] === "`") runEnd += 1;
+		const runLength = runEnd - i;
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		const isEscaped = backslashCount % 2 === 1;
+
+		if (isEscaped) {
+			i = runEnd;
+			continue;
+		}
+
+		const isAtLineStart = i === 0 || text[i - 1] === "\n";
+
+		// Handle fenced code blocks (3+ backticks at line start)
+		if (isAtLineStart && runLength >= 3) {
+			const top = delimiterStack[delimiterStack.length - 1];
+			if (top && top[1] && runLength >= top[0]) {
+				// Closing fence: length must be >= opener (per CommonMark)
+				delimiterStack.pop();
+			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
+				// Opening fence (only if not already inside another fence)
+				delimiterStack.push([runLength, true]);
+			}
+			i = runEnd;
+			continue;
+		}
+
+		// Handle inline code spans (all backticks except 3+ at line start)
+		// Don't open new inline spans inside fenced blocks
+		const insideFence = delimiterStack.length > 0 && delimiterStack[delimiterStack.length - 1]?.[1];
+		if (insideFence) {
+			i = runEnd;
+			continue;
+		}
+
+		// Check for closing inline code span with matching length
+		if (delimiterStack.length > 0) {
+			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+			if (!openIsAtLineStart && openLength === runLength) {
+				delimiterStack.pop();
+				i = runEnd;
+				continue;
+			}
+			// Non-matching run inside a span: treat as literal text, not a delimiter
+		} else {
+			// Opening inline code span
+			delimiterStack.push([runLength, false]);
+		}
+
+		i = runEnd;
+	}
+
+	return delimiterStack.length > 0;
+}
+
 export function isInsideInlineCodeSpan(text: string): boolean {
-	return findOpenInlineCodeSpanStart(text) !== null;
+	return isPositionInsideCodeSpan(text, text.length);
 }
 
 export function hasInlineCodeDelimiter(text: string): boolean {
