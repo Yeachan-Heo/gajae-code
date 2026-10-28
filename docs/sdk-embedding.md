@@ -71,6 +71,31 @@ If omitted, it resolves:
 - LSP integration (enabled by default)
 - `eventBus`: new `EventBus()` unless supplied
 
+### Atomic settings batches
+
+`settings.commitAtomicBatch(patches)` writes one file under a single-file CAS: the patch
+set is applied to `config.yml` through a staged temp file with fsync, an identity-checked
+publish. Cross-file atomicity is **not** provided. A caller that needs to undo a committed
+change after activation fails must explicitly call `receipt.restore()`; restoration uses
+path-level CAS and refuses to overwrite a newer writer.
+
+```ts
+const receipt = await settings.commitAtomicBatch([
+	{ path: "temperature", op: "set", value: 0.4 },
+]);
+// receipt.revisions: path-level before/after hashes and opaque revisions
+//   (populated for in-memory Settings.isolated() batches too).
+const restored = await receipt.restore();
+// status is "restored", "conflict", "discarded", or "not-restorable".
+// "restored" includes an independently owned inverse receipt.
+// A conflict means a newer writer owns one of the paths; nothing is overwritten.
+```
+
+`settings.flush()` and `settings.flushOrThrow()` reserve the pending debounced save so it
+cannot be overtaken. A caller that holds an active YAML lease cannot flush that file and
+gets `Cannot flush Settings for busy atomic YAML file`; `flush()` resolves after a failed
+background save while `flushOrThrow()` rejects.
+
 ### Required vs optional inputs
 
 Typically you must provide only what you want to control:
