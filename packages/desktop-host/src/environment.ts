@@ -4,10 +4,14 @@ import { isolateEnvironment } from "./environment-policy";
 
 // This module is the first import of the process entrypoint, before the SDK
 // captures discovery roots. It must remain synchronous and SDK-independent.
+// Read before isolation strips inherited variables: the desktop connection can
+// only be diagnosed by asking the host which requests it actually received.
+const traceProtocol = process.env.GJC_DESKTOP_TRACE === "1";
 const dataDir = path.resolve(
 	process.env.GJC_DESKTOP_DATA_DIR || path.join(os.homedir(), "Library", "Application Support", "Gajae Code Desktop"),
 );
 isolateEnvironment(process.env);
+if (traceProtocol) process.env.GJC_DESKTOP_TRACE = "1";
 process.env.GJC_DESKTOP_DATA_DIR = dataDir;
 process.env.HOME = path.join(dataDir, "home");
 process.env.USERPROFILE = process.env.HOME;
