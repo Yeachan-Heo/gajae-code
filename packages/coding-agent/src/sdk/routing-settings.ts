@@ -237,7 +237,7 @@ export class RoutingSettingsService {
 					return patches;
 				},
 			);
-			const durability = receipt.revisions.length > 0 ? "persisted" : "memory";
+			const durability = this.dependencies.settings.canPersistDurableConfig() ? "persisted" : "memory";
 			if (this.dependencies.activate) {
 				try {
 					await this.dependencies.activate();

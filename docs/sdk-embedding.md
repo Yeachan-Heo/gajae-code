@@ -71,221 +71,55 @@ If omitted, it resolves:
 - LSP integration (enabled by default)
 - `eventBus`: new `EventBus()` unless supplied
 
-### Live sampling settings
-
-Changes to `session.settings` for `temperature`, `topP`, `topK`, `minP`,
-`presencePenalty`, and `repetitionPenalty` update the live session's sampling
-options for the next newly started agent run. An already-running agent loop
-retains its sampling snapshot, including later tool rounds, retries, and queued
-follow-ups within that run. The TUI uses this same settings
-observation path; no TUI controller call is needed. Negative sentinel values
-omit the option from provider requests, and `unset` reapplies the effective
-project/runtime/default value. Changing a global value does not bypass a
-higher-priority override. `override` and `clearOverride` update live sampling
-without persisting the runtime override.
-
-```ts
-session.settings.set("temperature", 0.4);
-await session.settings.flushOrThrow(); // observe background persistence failure
-```
-
-`set` applies effective state synchronously and schedules a save; it is not a
-durability receipt. The existing managed `config.patch` response likewise does
-not certify durable persistence. For a disk-backed atomic change, use
-`Settings.commitAtomicBatch`; its successful commit and CAS-protected restore
-also update live sampling. Synchronous `onChanged` applicators (the `"apply"`
-phase) finish before hooks and ordinary observers run. A failing subscriber
-is logged by setting path without hiding the commit receipt or
-preventing other observers from receiving the change. Atomic batches reject
-ancestor/descendant path mixtures (for example `modelRoles` together with
-`modelRoles.default`) before applying any patch: their restore scopes overlap.
-Write one parent value or disjoint leaf paths instead. A set also rejects a path
-through an existing scalar, null, or array ancestor: replacing that ancestor would
-exceed the receipt's restore scope. Repeated writes to the same exact path retain
-ordered last-write semantics.
-`commitAtomicBatchWithCurrent` also refuses newer local staged mutations that
-arrive while it waits, and fences nonempty batches against local or runtime-override
-intent during an asynchronous builder, including same-value and ABA overrides.
-Prepare again after refusal; builders returning patches must not perform irreversible
-external work before that commit. Empty batches can serve as lock-only transactions
-for adjacent durable work (such as profile deletion) and do not receive a post-action
-stale-patch rejection. The queue and disk lock do not block synchronous `set` or
-runtime overrides: an empty batch alone does not make an external side effect atomic
-with those mutations. In particular, a concurrent legacy profile-default setter can
-race profile deletion; callers must not infer profile ownership safety from this
-lock-only mechanism. Runtime intent does not take ownership of durable receipt paths. Synchronous memory-only builders publish without yielding between their check
-and mutation. Earlier queued atomic batches still serialize normally and supply the
-next builder's current input. Internal YAML transaction callbacks must await every
-admitted mutation: a detached mutation that fails before the callback returns may
-not be reflected in the transaction result. Nested YAML operations refuse a busy
-file while holding another file's queue, and Settings flushes refuse to wait for
-another active YAML owner while holding a queue. Inherited async callbacks retain
-these conservative restrictions until their originating operation finishes.
-
-Ordinary saves also publish effective changes adopted from another scoped owner's
-on-disk edits. Overlapping writes through the shared in-process YAML writer fence
-older receipts, including same-value and ABA writes and canonical-path aliases.
-Per-role writes track unrelated roles independently when the role is a safe
-single path segment. A literal role name that cannot be represented as one safe
-segment uses whole-record ownership in `setGlobalModelRoleAndFlush` and can
-invalidate a default-role receipt even when it updates a different role. These
-ownership generations are process-local: unknown or cross-process writers retain
-the existing hash/exact-file checks, which do not prove same-value or ABA ownership.
-
-Only the singleton created by `Settings.init` owns process-global presentation
-hooks. Scoped and isolated settings, including runtime overrides, do not change
-another host's theme, symbol preset, color-blind mode, or tab width.
-
-`Settings.isolated()` remains memory-only. Check
-`canPersistDurableConfig()` before describing an atomic result as durable.
-This contract covers sampling, not every setting's live/reload/restart behavior.
-
-### Portable host services
-
-The following exports are available from `@gajae-code/coding-agent/sdk` and the
-package root. They are trusted embedding compositions, not new managed operations.
-
-- **Extension interactions:** construct `ExtensionInteractionService` for one
-  session ID and admit a renderer with `connect()`. Keep its connection ID private
-  to that renderer. Install `service.ui` separately through
-  `result.setToolUIContext(service.ui, true)` and the public
-  `initializeExtensions(session, { uiContext: service.ui, reportSendError,
-  reportRuntimeError, onShutdown })` helper. The latter initializes extension and
-  function-hook context and emits `session_start`; it is not a repeated UI setter.
-  `subscribe()`/`snapshot()` expose bounded pending requests. Payload size is
-  validated against the detached data retained by the service; request options are
-  snapshotted before admission. Replies require the matching session, connection and
-  request IDs. Reconnect rotates responder
-  authority while preserving pending requests. The host **must call
-  `service.dispose()` before awaiting `session.dispose()`**, and before switching
-  session identity. This settles pending requests and immediately refuses new UI
-  requests with `disposed`, including requests from `session_shutdown` handlers
-  after the renderer has gone away. Also register
-  `session.registerToolSessionCleanup(() => service.dispose())` as an idempotent
-  safety net only: registered cleanup runs after awaited shutdown handlers and
-  cannot unblock a handler waiting for a renderer reply. Host shutdown ordering is:
-  `service.dispose(); await session.dispose();`.
-  Terminal factories and unsupported dialog callbacks fail explicitly.
-  A reply, including a workflow-approval reply, grants no execution permission.
-- **Owned jobs:** `result.jobObservation` lazily returns one session-owned view,
-  captured from the factory's actual manager and agent owner. It never borrows the
-  process-global manager. It is unavailable when that factory has no manager or
-  when first accessed after disposal. Snapshots include owner-filtered jobs, task
-  identities and cron schedules; monitor actions require the observed generation,
-  and cron deletion requires the observed `createdAt`. Folded work remains
-  read-only. Terminal monitor cancellation refuses with `already_terminal`.
-  Session cleanup disposes an existing view; stale handles refuse further work,
-  and a manually disposed view is not silently recreated.
-- **Local notification setup:** `createNotificationsEditorOperations` accepts
-  `{ settings, session, sessionManager }` and reuses the same service as the TUI.
-  Mutation and runtime operations require writable durable Settings; memory-only
-  Settings cannot configure or start an external notification daemon. Inactive
-  saves reconcile the current session and report reconciliation failures separately
-  from successful persistence. `preflightProposedIdentity`/`commitConfigure` and
-  `prepareProviderConfiguration`/`commitProviderConfiguration` retain preflight,
-  CAS and saved-but-activation-failed outcomes. Keep prepared objects in the
-  trusted host: they are frozen, instance-bound, one-shot authority, not arbitrary
-  renderer JSON. Forward only display data and bind renderer actions to the
-  retained object. A Telegram draft whose preflight reports a foreign or unknown
-  daemon cannot be activated; it may be saved inactive or discarded. Active commit
-  rechecks identity before writing, but does not lock out external daemon changes.
-  Completed restore outcomes separately report observer and runtime failures. After
-  a blocked reconnect, a failed runtime fence does not guarantee a durable inactive
-  marker; a restore-time marker conflict may not protect the restored identity or
-  notify observers of a retained marker. A blocked reconnect after both receipts
-  restore also does not establish a durable marker for the restored identity.
-  Treat these cases as degraded. Owner IDs
-  originate in daemon state and cannot be assumed free of unknown foreign secrets.
-  Discard prepared configuration on cancellation; prepare a fresh draft after a consumed
-  commit attempt. Forged, copied, foreign, discarded or replayed provider drafts return `invalid_draft` without
-  saving bindings. Secret inputs use the one-way `NotificationSetupSecretValue`
-  contract; do not serialize credentials into renderer state or generic queries.
-
-These compositions do not install generic-host `auth.login`, relax notification
-binding/secret restrictions on `config.patch`, or certify full TUI parity.
-
 ### Settings catalog and layer provenance
 
-`getSettingsCatalog(settings)` is a detached, read-only schema snapshot, not a
-managed operation or a write permission. It enumerates schema paths, types, UI
-metadata, schema choices, defaults, effective scalar values and
-`Settings.getResolutionSnapshot()` provenance. Scalar origins follow
-`global < project < runtime`; `default` means the merged leaf is absent and the
-schema fallback is used, including when a higher layer replaces its ancestor.
-`layers` lists permitted present leaves, including shadowed lower values. An object reported as
-`layered` was constructed using multiple layers; it is not per-leaf provenance.
-`allowedLayers` describes Settings merging, not filesystem authority or proof
-that every consumer uses `Settings.get` rather than a global-only read.
+`getSettingsCatalog(settings)` returns a detached, read-only schema snapshot, not
+mutation authority or a managed operation. It includes schema paths, choices,
+scalar display values and `settings.getResolutionSnapshot()` provenance.
+Scalar origins follow `global < project < runtime`; `default` means the merged
+leaf is absent, including when a higher layer replaces its ancestor. `layers`
+lists permitted layers declaring the path, even when a higher ancestor replacement
+erases it. Object origin `layered` describes construction, not per-leaf provenance.
+`resolution.allowedLayers` describes merge policy, not filesystem write permission.
 
-The display boundary deliberately withholds **all free-form strings and compound
-values**, including innocent-looking endpoints, headers and command snippets;
-secret-shaped paths are withheld using the SDK's shared secret-key classifier.
-Only correctly typed booleans, finite numbers and declared enum values are
-returned. Hosts must not infer that withheld means unset. UI metadata is schema
-metadata, not the set of rows actually visible for a terminal or host. Runtime
-choices report `host-required`; unknown application timing reports
-`unclassified`, never an invented live/restart guarantee. Currently the six
-sampling settings carry audited `next-run` application metadata. The remaining
-runtime choices, free-form editing, detailed application classification and full
-F1 catalog/UI parity are **not complete**. Notification-atomic editor ownership
-is retained in metadata, but this query installs no writer.
+All free-form strings and compound values are withheld, including endpoints,
+headers and command snippets. Secret-shaped paths are withheld using the shared
+SDK classifier. Only typed booleans, finite numbers and declared enums are displayed;
+withheld does not mean unset. UI metadata is not a promise that a terminal row is
+visible. Runtime choices report `host-required` and unaudited application timing
+reports `unclassified`. This catalog does not install a writer or replace the
+notification-atomic editor's ownership. Full settings UI parity remains incomplete.
 
 ```ts
 import { getSettingsCatalog } from "@gajae-code/coding-agent/sdk";
 const catalog = getSettingsCatalog(session.settings);
-// catalog.durableStorage is capability, not an individual save/flush receipt.
+// durableStorage is storage capability, not an individual save receipt.
 ```
 
-### Smart-routing intents
+### Atomic settings batches
 
-`createRoutingSettingsService({ settings, getCatalog, getProviderOrder, isScoped,
-activate? })` is the shared service used by the TUI. It provides
-`previewSmartRouting`, `applySmartRouting`, `refreshSmartRouting`,
-`clearGeneratedSetup` and `setAutoroutingEnabled`. Catalog and provider-order
-callbacks return the embedding session's real model catalog and current priority;
-`isScoped` must report that session's `--models` restriction, not a caller-selected
-permission flag. The supported session scope is stable for the lifetime of each
-admitted operation: a host that can change scope must serialize that change with
-routing mutations through their completion. The service checks at admission and
-again in its writer callback, but those checks cannot revoke an already admitted
-write during asynchronous publication. The TUI session fixes its scope at
-construction. No managed routing operation is installed by constructing it.
+`settings.commitAtomicBatch(patches)` writes one file under a single-file CAS: the patch
+set is applied to `config.yml` through a staged temp file with fsync, an identity-checked
+publish. Cross-file atomicity is **not** provided. A caller that needs to undo a committed
+change after activation fails must explicitly call `receipt.restore()`; restoration uses
+path-level CAS and refuses to overwrite a newer writer.
 
-A preview is instance-bound host authority. Retain the exact returned object in
-the trusted host and send only display data to a renderer; copied, foreign,
-modified, consumed or stale-source previews cannot authorize a write. A failed
-attempt requires fresh preview and explicit review, except a hand-edit guard
-permits confirming the same pending preview. That confirmation is bound to the
-exact guarded global and effective state; intervening edits require new review.
-A `RoutingSettingsConfirmationRequiredError` carries that exact authority as
-`error.preview`; keep it inside the trusted host. Confirm refresh with
-`refreshSmartRouting({ preview: error.preview, confirmHandEdit: true })` or apply
-with `applySmartRouting(draft, { preview: error.preview, confirmHandEdit: true })`.
-A boolean alone cannot confirm a refresh. Separate callers retain separate proofs;
-`discardPreview(preview)` idempotently invalidates only that proof on cancellation.
-It does not undo an already admitted commit. A guarded refresh retains its original
-preview and provider order, so catalog or order drift cannot silently change its
-payload. Catalog changes are refused rather than silently substituting unseen routes. The TUI likewise refreshes display
-preview after failure but never automatically commits it. Do not start mutations
-for scoped sessions; obtain explicit confirmation before replacing hand edits.
+```ts
+const receipt = await settings.commitAtomicBatch([
+	{ path: "temperature", op: "set", value: 0.4 },
+]);
+// receipt.revisions: path-level before/after hashes and opaque revisions
+//   (populated for in-memory Settings.isolated() batches too).
+const restored = await receipt.restore();
+// status is "restored", "conflict", "discarded", or "not-restorable".
+// "restored" includes an independently owned inverse receipt.
+// A conflict means a newer writer owns one of the paths; nothing is overwritten.
+```
 
-Refresh reads the **global** recorded setup, not an effective project/runtime
-setup that would otherwise be promoted into global config. Display a pending
-refresh's actual global target before confirmation. Pair the returned committed
-setup and preview after saving, and distinguish them from any still-effective
-higher-priority overlay; saving globally does not remove that overlay. Atomic mutations
-check current durable state; post-publication `activate` is a host notification,
-not model execution or lifecycle admission. Results report `persisted` versus
-`memory` and `notified` versus `not_requested`. An activation failure throws
-`RoutingSettingsActivationError` with the CAS rollback outcome; `conflict` means
-a newer writer prevented restoration, not that the save never happened. After an
-unresolved durable rollback, `stateUnknown` is true and that Settings instance
-cannot issue routing previews or mutations; create a freshly loaded Settings owner
-before continuing, without discarding pending local changes. Open selectors reflect
-shared invalidation on their next render or input. Do not serialize error causes or
-rollback diagnostics into generic queries. This service
-does not implement temporary/default profile selection or role/all-target model
-assignment; use their existing session/model APIs with their separate scopes.
+`settings.flush()` and `settings.flushOrThrow()` reserve the pending debounced save so it
+cannot be overtaken. A caller that holds an active YAML lease cannot flush that file and
+gets `Cannot flush Settings for busy atomic YAML file`; `flush()` resolves after a failed
+background save while `flushOrThrow()` rejects.
 
 ### Required vs optional inputs
 
@@ -297,6 +131,125 @@ Typically you must provide only what you want to control:
   - `authStorage` + `modelRegistry` (if you own credential/model lifecycle)
   - `model` or `modelPattern` (if deterministic model selection matters)
   - `settings` (if you need isolated/test config)
+
+### Local notification setup
+
+`createNotificationsEditorOperations({ settings, session, sessionManager })` is
+the same trusted service used by the TUI. Mutations and external runtime actions
+require writable durable settings; memory-only settings cannot configure or start
+a notification daemon. Inactive saves reconcile the current session and report
+reconciliation failure separately from successful persistence.
+
+Keep prepared Telegram/provider configurations inside the trusted host. They are
+frozen, instance-bound, one-shot authority, not renderer JSON. Forward display data
+only, bind renderer actions to retained objects, discard on cancellation, and prepare
+a fresh draft after a consumed commit attempt. Forged/copied/foreign/replayed
+provider drafts return `invalid_draft` without saving bindings. Secret inputs use
+`NotificationSetupSecretValue`; never serialize them into renderer state or queries.
+
+Foreign or unknown Telegram daemon identity prevents activation, but permits an
+inactive save or discard. Active commit rechecks identity before writing without
+locking out external daemon changes. Single-file CAS restoration preserves newer
+writers; it does not make configuration and runtime activation cross-file atomic.
+Health diagnostics and free-form daemon metadata redact configured provider tokens
+and their fingerprints. Recovery endpoint identities and filesystem/path metadata
+can still contain sensitive values: keep raw recovery reports inside the trusted
+host and sanitize display data before forwarding it. Unknown foreign secrets
+cannot be recognized reliably.
+
+Treat runtime-fence and restore-marker failures as degraded: a blocked reconnect
+can fail to establish a durable inactive marker. A restore-time marker conflict
+may not protect the restored identity or notify observers of retained markers, and
+a blocked reconnect after both receipts restore does not establish a marker for
+the restored identity. Successful persistence is not proof of successful activation.
+
+### Smart-routing intents and live sampling
+
+`createRoutingSettingsService({ settings, getCatalog, getProviderOrder, isScoped,
+activate })` exposes the same preview/apply/refresh/clear/enable intents used by the
+TUI. Keep previews inside the trusted host: their display fields are detached from
+instance-bound authority, and copied/forged/foreign/discarded previews cannot authorize
+writes. Hand-edit confirmation is bound to the exact guarded state and refresh proof;
+catalog drift or intervening edits require fresh review instead of silent replacement.
+The host must serialize scope changes through each operation's completion.
+
+Refresh regenerates global configuration from the current provider order. Effective
+project/runtime overlays remain distinct from persisted global state. Outcomes report
+`durability` and `activation` separately; activation-notification failure attempts
+single-file CAS restore, preserving newer writers. Restore conflict/failure invalidates
+shared authority on that Settings instance; opening another service over stale Settings
+does not regain write authority. Reload durable Settings before fresh review. Failed
+post-commit view refresh is not evidence that persistence failed.
+
+Sampling changes to `temperature`, `topP`, `topK`, `minP`, `presencePenalty` and
+`repetitionPenalty` now reach sessions through Settings' synchronous `apply` phase,
+before schema hooks or ordinary observers can start a run. In-flight model runs retain
+their captured sampling; later runs use the newly effective values. These six catalog
+entries therefore report `next-run`; other unaudited application timing stays
+`unclassified`. Session disposal unregisters the listener. Settings UI reads and writes
+the active session's Settings rather than a process-global singleton.
+
+### Builtin slash commands over a host transport
+
+Import `ACP_BUILTIN_SLASH_COMMANDS` and `executeAcpBuiltinSlashCommand` from
+`@gajae-code/coding-agent/sdk`. The catalog advertises only text-mode handlers
+allowed over ACP; it is not the full TUI command list or an authorization grant.
+A host must still enforce its own session-rotation and installed-capability policy.
+
+Call `executeAcpBuiltinSlashCommand(text, runtime)` and dispatch its result:
+
+- `false`: not handled; forward the original text through the host's normal prompt path.
+- `{ consumed: true }`: handled (including refusal diagnostics); do not start a model turn.
+- `{ prompt: string }`: handled with a residual prompt; forward that prompt rather than the original text.
+
+Handlers returning `undefined` are normalized to `{ consumed: true }`. Recognized
+commands disallowed over ACP emit an unavailable diagnostic and are consumed.
+Other diagnostic-only results can also be consumed; do not infer a model prompt
+from absence in the advertised catalog.
+
+`runtime` supplies the matching `session`, `sessionManager`, `settings`, `cwd`,
+and three required callbacks: `output(text)` emits operator-visible command text,
+`refreshCommands()` re-advertises commands (a non-ACP host may use a no-op), and
+`reloadPlugins()` reloads caches and registries and re-advertises them. Optional
+`notifyTitleChanged()` and `notifyConfigChanged()` notify host views after changes.
+The SDK does not supply a host's plugin-reload or view-notification implementation.
+
+With `{ disabledOnly: true }`, transport-disallowed commands are still refused
+and consumed, but enabled commands return `false` without executing. This mode
+supports an ACP refusal-policy prepass, not execution of the advertised commands.
+
+### Portable extension interactions and owned jobs
+
+`ExtensionInteractionService` and `JobObservation` are trusted host compositions,
+not new managed operations or proof of TUI parity. They are public SDK/root exports.
+
+Construct an interaction service for one session ID, admit a renderer with
+`connect()`, and keep its connection ID private to that renderer. Install
+`service.ui` through `result.setToolUIContext(service.ui, true)`. Separately call
+`initializeExtensions(session, { uiContext: service.ui, reportSendError,
+reportRuntimeError, onShutdown })` to initialize extension/function-hook context
+and emit `session_start`; it is not a repeatable UI setter.
+
+`subscribe()` and `snapshot()` expose bounded detached pending requests. Replies
+require matching session, connection and request IDs. Reconnect rotates responder
+authority while retaining pending requests. Unsupported terminal/dialog callbacks
+fail explicitly. A reply, including workflow approval, grants no execution permission.
+
+The host must call `service.dispose()` **before** awaiting `session.dispose()`
+and before replacing session identity. Disposal settles pending requests and
+refuses later requests, including those from awaited shutdown handlers. Also
+register `session.registerToolSessionCleanup(() => service.dispose())` as an
+idempotent safety net: cleanup runs after shutdown handlers, so it cannot unblock
+a handler waiting for an already-disconnected renderer.
+
+`result.jobObservation` lazily returns one stable view captured from the factory's
+actual background manager and agent owner, not the transcript session ID or the
+process-global manager. It is unavailable without a manager, or when first read
+after disposal. Snapshots filter jobs, task identities and cron schedules by owner.
+Monitor actions require observed generations; cron deletion requires observed
+`createdAt`. Folded work is read-only and terminal cancellation refuses with
+`already_terminal`. Session cleanup disposes an existing view; stale handles refuse
+work, and a manually disposed view is never silently recreated.
 
 ## Session manager behavior (persistent vs in-memory)
 
