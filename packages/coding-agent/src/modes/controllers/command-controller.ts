@@ -2,7 +2,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
+import {
+	collapseUsageLimitsForDisplay,
+	getEnvApiKey,
+	type ToolCall,
+	type UsageLimit,
+	type UsageReport,
+} from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatBytes, formatDuration, sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
@@ -1906,7 +1912,7 @@ function resolveFraction(limit: UsageLimit): number | undefined {
 
 function resolveProviderUsageTotal(reports: UsageReport[]): number {
 	return reports
-		.flatMap(report => report.limits)
+		.flatMap(report => collapseUsageLimitsForDisplay(report.limits))
 		.map(limit => resolveFraction(limit) ?? 0)
 		.reduce((sum, value) => sum + value, 0);
 }
@@ -2096,14 +2102,35 @@ function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
 	return "exhausted";
 }
 
-function formatAggregateAmount(limits: UsageLimit[]): string {
+/** Horizons that meter one quota pool from both ends. */
+const SIBLING_USAGE_WINDOWS: Readonly<Record<string, string>> = { "5h": "7d", "7d": "5h" };
+
+/**
+ * The quota a window row meters, independent of the horizon in its title.
+ * Providers name rows either by pool ("Gemini") or by window ("Claude 7 Day");
+ * only the pool part can pair a 5-hour row with its weekly row.
+ */
+function usagePoolKey(label: string, windowLabel: string): string {
+	const windowText = windowLabel.trim().toLowerCase();
+	const title = label.trim();
+	if (windowText.length === 0) return title;
+	const lower = title.toLowerCase();
+	if (lower.length !== title.length) return title;
+	const index = lower.lastIndexOf(windowText);
+	if (index < 0) return title;
+	const stripped = (title.slice(0, index) + title.slice(index + windowText.length)).replace(/\s+/g, " ").trim();
+	return stripped.length > 0 ? stripped : title;
+}
+
+function formatAggregateAmount(limits: UsageLimit[], notReportedCount = 0): string {
+	const notReportedSuffix = notReportedCount > 0 ? ` · ${notReportedCount} not reported` : "";
 	const fractions = limits
 		.map(limit => resolveFraction(limit))
 		.filter((value): value is number => value !== undefined);
 	if (fractions.length === limits.length && fractions.length > 0) {
 		const sum = fractions.reduce((total, value) => total + value, 0);
 		const avgRemaining = Math.max(0, ((limits.length - sum) / limits.length) * 100);
-		return `${formatNumber(avgRemaining)}% free`;
+		return `${formatNumber(avgRemaining)}% free${notReportedSuffix}`;
 	}
 
 	const amounts = limits
@@ -2113,10 +2140,10 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 		const totalUsed = amounts.reduce((sum, amount) => sum + (amount.used ?? 0), 0);
 		const totalLimit = amounts.reduce((sum, amount) => sum + (amount.limit ?? 0), 0);
 		const remainingPct = totalLimit > 0 ? Math.max(0, 100 - (totalUsed / totalLimit) * 100) : 0;
-		return `${formatNumber(remainingPct)}% free`;
+		return `${formatNumber(remainingPct)}% free${notReportedSuffix}`;
 	}
 
-	return `${limits.length} accts`;
+	return `${limits.length + notReportedCount} accts`;
 }
 
 /**
@@ -2188,6 +2215,16 @@ function resolveColumnWidth(count: number, available: number, trailing: number):
 	return ideal;
 }
 
+/** One `/usage` row: every account that reports one quota pool at one horizon. */
+interface UsageLimitGroup {
+	label: string;
+	poolKey: string;
+	windowId: string;
+	windowLabel: string;
+	limits: UsageLimit[];
+	reports: UsageReport[];
+}
+
 export function renderUsageReports(
 	reports: UsageReport[],
 	uiTheme: typeof theme,
@@ -2220,17 +2257,31 @@ export function renderUsageReports(
 		const providerName = formatProviderName(provider);
 		const reportIndexes = new Map(providerReports.map((report, index) => [report, index]));
 
-		const limitGroups = new Map<
-			string,
-			{ label: string; windowLabel: string; limits: UsageLimit[]; reports: UsageReport[] }
-		>();
+		const displayLimits = new Map<UsageReport, UsageLimit[]>();
+		const reportedWindows = new Map<UsageReport, Set<string>>();
 		for (const report of providerReports) {
-			for (const limit of report.limits) {
+			const limits = collapseUsageLimitsForDisplay(report.limits);
+			displayLimits.set(report, limits);
+			const windows = new Set<string>();
+			for (const limit of limits) {
+				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
+				const windowLabel = limit.window?.label ?? windowId;
+				windows.add(`${usagePoolKey(formatLimitTitle(limit), windowLabel)}|${windowId}`);
+			}
+			reportedWindows.set(report, windows);
+		}
+
+		const limitGroups = new Map<string, UsageLimitGroup>();
+		for (const report of providerReports) {
+			for (const limit of displayLimits.get(report) ?? []) {
 				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
 				const key = `${formatLimitTitle(limit)}|${windowId}`;
 				const windowLabel = limit.window?.label ?? windowId;
+				const title = formatLimitTitle(limit);
 				const entry = limitGroups.get(key) ?? {
-					label: formatLimitTitle(limit),
+					label: title,
+					poolKey: usagePoolKey(title, windowLabel),
+					windowId,
 					windowLabel,
 					limits: [],
 					reports: [],
@@ -2238,6 +2289,33 @@ export function renderUsageReports(
 				entry.limits.push(limit);
 				entry.reports.push(report);
 				limitGroups.set(key, entry);
+			}
+		}
+
+		// A report that only surfaces one window of a pool — Antigravity's
+		// `fetchAvailableModels` returns just the active bottleneck window —
+		// would otherwise vanish from the sibling row, leaving only the accounts
+		// that happen to be exhausted and reading as "everyone is out". Keep the
+		// column and mark it unreported so the row stays honest.
+		const notReportedLimits = new Set<UsageLimit>();
+		for (const group of limitGroups.values()) {
+			const siblingWindowId = SIBLING_USAGE_WINDOWS[group.windowId];
+			if (!siblingWindowId) continue;
+			const siblingKey = `${group.poolKey}|${siblingWindowId}`;
+			for (const report of providerReports) {
+				const reported = reportedWindows.get(report);
+				if (!reported || reported.has(`${group.poolKey}|${group.windowId}`)) continue;
+				if (!reported.has(siblingKey)) continue;
+				const limit: UsageLimit = {
+					id: `not-reported:${group.poolKey}:${group.windowId}:${reportIndexes.get(report) ?? 0}`,
+					label: group.label,
+					scope: { provider, windowId: group.windowId },
+					amount: { unit: "percent" },
+					status: "unknown",
+				};
+				notReportedLimits.add(limit);
+				group.limits.push(limit);
+				group.reports.push(report);
 			}
 		}
 
@@ -2253,7 +2331,10 @@ export function renderUsageReports(
 				const reportIndex = reportIndexes.get(report) ?? 0;
 				return {
 					report,
-					total: report.limits.reduce((sum, limit) => sum + (resolveFraction(limit) ?? 0), 0),
+					total: collapseUsageLimitsForDisplay(report.limits).reduce(
+						(sum, limit) => sum + (resolveFraction(limit) ?? 0),
+						0,
+					),
 					label: firstLimit
 						? formatAccountLabel(firstLimit, report, reportIndex)
 						: formatUnlimitedReportLabel(report, reportIndex),
@@ -2265,7 +2346,23 @@ export function renderUsageReports(
 			accountRank.set(entry.report, rank);
 		});
 
-		const renderableGroups = Array.from(limitGroups.values()).map(group => {
+		const orderedGroups = Array.from(limitGroups.values());
+		const labelOrder = new Map<string, number>();
+		for (const group of orderedGroups) {
+			if (!labelOrder.has(group.label)) labelOrder.set(group.label, labelOrder.size);
+		}
+		const windowOrder = (windowLabel: string): number => {
+			const lower = windowLabel.toLowerCase();
+			if (lower.includes("5 hour") || lower === "5h") return 0;
+			if (lower.includes("7 day") || lower.includes("weekly") || lower === "7d") return 1;
+			return 2;
+		};
+		orderedGroups.sort((a, b) => {
+			const labelDiff = (labelOrder.get(a.label) ?? 0) - (labelOrder.get(b.label) ?? 0);
+			if (labelDiff !== 0) return labelDiff;
+			return windowOrder(a.windowLabel) - windowOrder(b.windowLabel);
+		});
+		const renderableGroups = orderedGroups.map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
@@ -2279,15 +2376,32 @@ export function renderUsageReports(
 			});
 			const sortedLimits = entries.map(entry => entry.limit);
 			const sortedReports = entries.map(entry => entry.report);
-			return { group, sortedLimits, sortedReports, amountText: formatAggregateAmount(sortedLimits) };
+			const knownLimits = sortedLimits.filter(limit => !notReportedLimits.has(limit));
+			return {
+				group,
+				sortedLimits,
+				sortedReports,
+				knownLimits,
+				notReportedCount: sortedLimits.length - knownLimits.length,
+				amountText: formatAggregateAmount(knownLimits, sortedLimits.length - knownLimits.length),
+			};
 		});
 
 		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
 		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
 		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
 
-		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
-			const status = resolveAggregateStatus(sortedLimits);
+		for (const {
+			group,
+			sortedLimits,
+			sortedReports,
+			knownLimits,
+			notReportedCount,
+			amountText,
+		} of renderableGroups) {
+			const reportedStatus = resolveAggregateStatus(knownLimits);
+			// An unreported window is missing data, not proof of exhaustion.
+			const status = reportedStatus === "exhausted" && notReportedCount > 0 ? "warning" : reportedStatus;
 			const statusIcon = resolveStatusIcon(status, uiTheme);
 
 			const windowSuffix = formatWindowSuffix(group.label, group.windowLabel, uiTheme);

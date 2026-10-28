@@ -1,4 +1,4 @@
-import type { UsageLimit, UsageReport } from "@gajae-code/ai/core";
+import { collapseUsageLimitsForDisplay, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import { sanitizeText } from "@gajae-code/utils";
 import {
 	type AccountInventoryRow,
@@ -85,7 +85,13 @@ export function collectCachedUsageReports(runtime: SlashCommandRuntime): UsageRe
 		modelRegistry,
 		sessionId: session.credentialSessionId ?? session.sessionId,
 	});
-	return snapshot.rows.flatMap(row => (row.usage ? [row.usage.report] : []));
+	return snapshot.rows.flatMap(row => {
+		if (!row.usage) return [];
+		const report = row.usage.report;
+		const identity = row.identityLabel ?? row.oauthIdentity?.label;
+		if (!identity || report.metadata?.email || report.metadata?.accountId) return [report];
+		return [{ ...report, metadata: { ...report.metadata, email: identity } }];
+	});
 }
 
 function renderAccountRows(rows: AccountInventoryRow[], nowMs: number, checked: boolean): string {
@@ -105,8 +111,14 @@ function renderAccountRows(rows: AccountInventoryRow[], nowMs: number, checked: 
 			`- ${row.id}: ${row.provider}/${row.credentialKind} (${row.sourceLabel})${identity}${marker} — ${healthLabel(row)}${cache}`,
 		);
 		if (row.usage?.report.limits.length) {
-			for (const limit of row.usage.report.limits.slice(0, 8)) {
-				lines.push(`  ${sanitizeText(limit.label)}: ${formatLimitDetail(limit, nowMs)}`);
+			for (const limit of collapseUsageLimitsForDisplay(row.usage.report.limits).slice(0, 8)) {
+				const windowLabel = limit.window?.label;
+				const showWindow =
+					windowLabel &&
+					!["default", "quota window", "usage window"].includes(windowLabel.toLowerCase()) &&
+					!limit.label.toLowerCase().includes(windowLabel.toLowerCase());
+				const title = showWindow ? `${limit.label} (${windowLabel})` : limit.label;
+				lines.push(`  ${sanitizeText(title)}: ${formatLimitDetail(limit, nowMs)}`);
 			}
 		}
 	}
