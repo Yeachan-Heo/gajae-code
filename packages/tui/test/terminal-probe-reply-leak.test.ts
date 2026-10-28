@@ -346,7 +346,7 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 		// Verify that setRawMode was called during startup
 		const setRawModeCalls = (process.stdin.setRawMode as any).mock.calls;
 		expect(setRawModeCalls.length).toBeGreaterThan(0);
-		
+
 		// Cleanup should also not throw when restoring raw mode
 		expect(() => {
 			terminal!.stop();
@@ -371,7 +371,7 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 		}).not.toThrow();
 
 		expect(terminal!.available).toBe(true);
-		
+
 		// Cleanup should also not throw even though setRawMode is unavailable
 		expect(() => {
 			terminal!.stop();
