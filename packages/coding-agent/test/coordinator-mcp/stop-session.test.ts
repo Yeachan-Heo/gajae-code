@@ -40,6 +40,7 @@ async function createServer(
 		closeFailures?: number;
 		brokerSessionsOverride?: () => Promise<Array<Record<string, unknown>>>;
 		closeHandler?: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+		platform?: NodeJS.Platform;
 	} = {},
 ) {
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
@@ -95,6 +96,7 @@ async function createServer(
 	await writeBrokerDiscovery(agentDir, discovery);
 	const server = createCoordinatorMcpServer({
 		env,
+		platform: options.platform,
 		services: {
 			getAgentDir: () => agentDir,
 			// This suite exercises coordinator stop/reap semantics, not broker
