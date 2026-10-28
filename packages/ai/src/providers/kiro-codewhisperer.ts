@@ -137,6 +137,7 @@ interface GenerateAssistantResponseRequest {
 interface AssistantResponseEvent {
 	content?: string;
 	reasoningContent?: {
+		text?: string;
 		signature?: string;
 		redactedContent?: string;
 	};
@@ -193,7 +194,6 @@ const KIRO_ORIGIN = "AI_EDITOR";
 type Block = (TextContent | ThinkingContent | ToolCall) & {
 	index?: number;
 	partialJson?: string;
-	thinkingSignature?: string;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +303,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 		const blocks = output.content as Block[];
 		const thinkingParser = createInlineThinkingParser(blocks, output, stream);
+		const nativeThinking = createNativeThinkingBlock(blocks, output, stream);
 
 		try {
 			// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
@@ -465,30 +466,16 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 								stream.push({ type: "start", partial: output });
 								started = true;
 							}
+							nativeThinking.finish();
 							thinkingParser.push(content);
 						}
-						// Capture native reasoning content: create a thinking block even without inline tags,
-						// and attach the signature for replay in next turn's history.
-						if (ev.reasoningContent) {
-							const thinkingBlocks = blocks.filter((b): b is ThinkingContent & Block => b.type === "thinking");
-							let thinkingBlock = thinkingBlocks[thinkingBlocks.length - 1];
-
-							// If there is no existing thinking block (no inline tags), create one from reasoningContent
-							if (!thinkingBlock && (ev.reasoningContent.signature || ev.reasoningContent.redactedContent)) {
-								thinkingBlock = {
-									type: "thinking",
-									thinking: ev.reasoningContent.redactedContent ?? "[reasoning]",
-									index: blocks.length,
-								};
-								blocks.push(thinkingBlock);
-								stream.push({ type: "thinking_start", contentIndex: blocks.length - 1, partial: output });
+						const reasoning = ev.reasoningContent;
+						if (reasoning && (reasoning.text || reasoning.signature)) {
+							if (!started) {
+								stream.push({ type: "start", partial: output });
+								started = true;
 							}
-
-							// Attach the signature to the thinking block for native replay
-							if (thinkingBlock && ev.reasoningContent.signature) {
-								(thinkingBlock as ThinkingContent & { thinkingSignature?: string }).thinkingSignature =
-									ev.reasoningContent.signature;
-							}
+							nativeThinking.push(reasoning.text, reasoning.signature);
 						}
 						break;
 					}
@@ -499,6 +486,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 							stream.push({ type: "start", partial: output });
 							started = true;
 						}
+						nativeThinking.finish();
 						handleToolUseEvent(ev, blocks, output, stream, toolInputAccumulator, pendingToolCalls);
 						// Clear accumulator for completed tool
 						if (ev.stop) {
@@ -541,6 +529,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				const unfinishedIds = Array.from(toolInputAccumulator.keys()).join(", ");
 				throw new Error(`Kiro CodeWhisperer stream ended with incomplete tool calls: ${unfinishedIds}`);
 			}
+			nativeThinking.finish();
 			thinkingParser.finish();
 
 			// Emit all pending tool call events (safe since no refusal occurred)
@@ -564,6 +553,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			nativeThinking.finish();
 			thinkingParser.finish();
 			for (const block of output.content) {
 				delete (block as Block).index;
@@ -613,9 +603,8 @@ function buildConversationState(
 
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
-	// Check if native fields will be sent; only prepend prefix if not
-	const nativeFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
-	const thinkingPrefix = !nativeFields ? buildKiroThinkingPrefix(options.reasoning) : "";
+	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const thinkingPrefix = additionalModelRequestFields ? "" : buildKiroThinkingPrefix(options.reasoning);
 	const baseSystemPrompt = context.systemPrompt?.join("\n") ?? "";
 	const systemPrompt = thinkingPrefix
 		? baseSystemPrompt
@@ -673,14 +662,12 @@ function buildConversationState(
 		currentMessage.userInputMessage.userInputMessageContext.tools = convertTools(context.tools);
 	}
 
-	// nativeFields already computed above for thinkingPrefix logic
-
 	return {
 		chatTriggerType: "MANUAL",
 		currentMessage,
 		history: history.length > 0 ? history : undefined,
 		profileArn: options.profileArn,
-		...(nativeFields ? { additionalModelRequestFields: nativeFields } : {}),
+		...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
 	};
 }
 
@@ -699,21 +686,15 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
-	let reasoningSignature: string | undefined;
+	let signature: string | undefined;
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
 		} else if (block.type === "thinking") {
-			// Capture the signature from the thinking block for native replay
-			const thinkingWithSig = block as ThinkingContent & { thinkingSignature?: string };
-			if (thinkingWithSig.thinkingSignature) {
-				reasoningSignature = thinkingWithSig.thinkingSignature;
-			}
-			// Include the thinking text in the message content
-			const thinkingTag = `<thinking>${block.thinking}</thinking>`;
-			textParts.unshift(thinkingTag);
+			// Native reasoning continuity travels as the signature, not as replayed text.
+			if (block.thinkingSignature) signature = block.thinkingSignature;
 		} else if (block.type === "toolCall") {
 			toolUses.push({
 				toolUseId: block.id,
@@ -726,7 +707,7 @@ function convertToWireMessage(
 		assistantResponseMessage: {
 			content: textParts.join("\n"),
 			...(toolUses.length > 0 ? { toolUses } : {}),
-			...(reasoningSignature ? { reasoningContent: { signature: reasoningSignature } } : {}),
+			...(signature ? { reasoningContent: { signature } } : {}),
 		},
 	};
 }
@@ -820,6 +801,41 @@ function handleTextDelta(
 	}
 	lastBlock.text += delta;
 	stream.push({ type: "text_delta", contentIndex: lastBlock.index!, delta, partial: output });
+}
+
+/**
+ * Streams native `reasoningContent` frames into a thinking block. `text` is the
+ * displayable reasoning; `signature` is kept on the block for history replay.
+ * `redactedContent` is an opaque payload and never becomes thinking text.
+ */
+function createNativeThinkingBlock(
+	blocks: Block[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+): { push: (text: string | undefined, signature: string | undefined) => void; finish: () => void } {
+	let block: (ThinkingContent & { index: number }) | undefined;
+	let open = false;
+	return {
+		push(text, signature) {
+			if (!open && (text || !block)) {
+				block = { type: "thinking", thinking: "", index: blocks.length };
+				blocks.push(block);
+				open = true;
+				stream.push({ type: "thinking_start", contentIndex: block.index, partial: output });
+			}
+			if (!block) return;
+			if (text) {
+				block.thinking += text;
+				stream.push({ type: "thinking_delta", contentIndex: block.index, delta: text, partial: output });
+			}
+			if (signature) block.thinkingSignature = signature;
+		},
+		finish() {
+			if (!block || !open) return;
+			open = false;
+			stream.push({ type: "thinking_end", contentIndex: block.index, content: block.thinking, partial: output });
+		},
+	};
 }
 
 function createInlineThinkingParser(

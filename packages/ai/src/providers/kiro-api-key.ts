@@ -15,7 +15,14 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	registerProviderSafetyStopModel,
 } from "../adapter-internals/provider-safety-stop";
-import { Effort } from "../model-thinking";
+import {
+	Effort,
+	isOpenAIModelAtLeast,
+	mapEffortToAnthropicAdaptiveEffort,
+	requireSupportedEffort,
+	requiresAnthropicThinkingDisableWhenOff,
+	supportsAnthropicAdaptiveThinkingDisplay,
+} from "../model-thinking";
 import type {
 	Api,
 	AssistantMessage,
@@ -440,6 +447,7 @@ function mapKiroDiscoveredModels(
 
 type KiroStreamEvent =
 	| { type: "content"; data: string }
+	| { type: "reasoning"; data: { text?: string; signature?: string } }
 	| { type: "toolUse"; data: { name: string; toolUseId: string; input: string; stop?: boolean } }
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
@@ -748,6 +756,17 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				events.push({ type: "toolUseStop", data: { stop: Boolean(parsed.stop) } });
 			}
 
+			if (parsed.reasoningContent && typeof parsed.reasoningContent === "object") {
+				const { text, signature } = parsed.reasoningContent as { text?: unknown; signature?: unknown };
+				events.push({
+					type: "reasoning",
+					data: {
+						...(typeof text === "string" ? { text } : {}),
+						...(typeof signature === "string" ? { signature } : {}),
+					},
+				});
+			}
+
 			// Check for usage first (before refusal) to ensure it gets processed even if refusal terminates the stream
 			if (parsed.usage && typeof parsed.usage === "object") {
 				const u = parsed.usage as { inputTokens?: number; outputTokens?: number };
@@ -856,62 +875,30 @@ export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined)
 }
 
 /**
- * Build native thinking fields for Kiro transport models.
- * Exported so both API-key and CodeWhisperer transports use the same builder.
- *
- * @param model The model to build fields for
- * @param reasoning The reasoning effort level requested by the caller
- * @returns Native thinking fields if supported, undefined if fallback prefix should be used
+ * Native thinking fields Kiro forwards to the upstream model, shared by the
+ * social-login (CodeWhisperer) and `ksk_` API-key transports so both send the
+ * same wire form. Returns undefined when the model has no native control; the
+ * caller then falls back to the `buildKiroThinkingPrefix` system-prompt tags.
  */
 export function buildKiroAdditionalModelRequestFields(
 	model: Model<"kiro-codewhisperer-stream">,
 	reasoning: Effort | boolean | undefined,
 ): Record<string, unknown> | undefined {
-	// reasoning=undefined (not requested) → no native fields, use fallback prefix
-	if (reasoning === undefined) return undefined;
-
-	const modelId = model.id;
-
-	// Check if this is a Claude model with adaptive thinking support (4.6+)
-	const isClaudeAdaptive = /claude-(opus|sonnet)-(4-[6-9]|4-\d{2,}|[5-9]|\d{2,})/.test(modelId);
-	if (isClaudeAdaptive) {
-		// Claude doesn't support explicit "off" for native thinking; only send fields when enabled
-		if (reasoning === false) return undefined;
-		// Map effort directly without validation (model may not have thinking metadata enriched)
-		const effortMap: Record<string, string> = {
-			true: "medium",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: "max",
-		};
-		const effort = effortMap[typeof reasoning === "string" ? reasoning : "medium"] ?? "medium";
+	const effort = reasoning === true ? Effort.Medium : reasoning || undefined;
+	if (model.thinking?.mode === "anthropic-adaptive") {
+		if (!effort) {
+			return requiresAnthropicThinkingDisableWhenOff(model.id) ? { thinking: { type: "disabled" } } : undefined;
+		}
 		return {
-			thinking: { type: "adaptive", display: "summarized" },
-			output_config: { effort },
+			thinking: supportsAnthropicAdaptiveThinkingDisplay(model.id)
+				? { type: "adaptive", display: "summarized" }
+				: { type: "adaptive" },
+			output_config: { effort: mapEffortToAnthropicAdaptiveEffort(model, effort) },
 		};
 	}
-
-	// Check if this is a GPT model with native reasoning (5.6+ or 6+)
-	const isGptWithReasoning = /gpt-([6-9]|5[.-](1[0-9]|[6-9]))\b/.test(modelId);
-	if (isGptWithReasoning) {
-		const effortMap: Record<string, string> = {
-			true: "medium",
-			false: "none",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "high",
-			max: "high",
-		};
-		const effort = effortMap[typeof reasoning === "string" ? reasoning : String(reasoning)] ?? "medium";
-		return {
-			reasoning: { effort },
-		};
+	if (isOpenAIModelAtLeast(toKiroModelId(model.id), "5.6")) {
+		return { reasoning: { effort: effort ? requireSupportedEffort(model, effort) : "none" } };
 	}
-
-	// Fallback: no native support, rely on system-prompt prefix
 	return undefined;
 }
 
@@ -921,9 +908,8 @@ function buildApiKeyRequest(
 	options: KiroCodeWhispererOptions,
 ): unknown {
 	const modelId = toKiroModelId(model.wireModelId || model.id);
-	// Check if native fields will be sent; only prepend prefix if not
-	const nativeFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
-	const prefix = !nativeFields ? buildKiroThinkingPrefix(options.reasoning) : "";
+	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const prefix = additionalModelRequestFields ? "" : buildKiroThinkingPrefix(options.reasoning);
 	let systemPrompt = context.systemPrompt?.join("\n") ?? "";
 	if (prefix) systemPrompt = systemPrompt ? `${prefix}\n${systemPrompt}` : prefix;
 
@@ -934,18 +920,13 @@ function buildApiKeyRequest(
 		if (msg.role === "assistant") {
 			let content = "";
 			const toolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
-			let reasoningContent: { thinkingSignature?: string } | undefined;
+			let signature: string | undefined;
 			for (const block of msg.content) {
 				if (typeof block === "string") content += block;
 				else if (block.type === "text") content += block.text;
 				else if (block.type === "thinking") {
-					// Replay thinking with signature if available (for multi-turn native reasoning)
-					const thinkingBlock = block as ThinkingContent & { thinkingSignature?: string };
-					if (thinkingBlock.thinkingSignature) {
-						reasoningContent = { thinkingSignature: thinkingBlock.thinkingSignature };
-					}
-					// Include the thinking text in the message content as reference
-					content = `${thinkingBlock.thinking}\n\n${content}`;
+					if (block.thinkingSignature) signature = block.thinkingSignature;
+					if (block.thinking) content = `<thinking>${block.thinking}</thinking>\n\n${content}`;
 				} else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
@@ -954,13 +935,12 @@ function buildApiKeyRequest(
 					});
 				}
 			}
-			const assistantMsg: Record<string, unknown> = {
-				content,
-				...(toolUses.length > 0 ? { toolUses } : {}),
-				...(reasoningContent ? { reasoningContent: { signature: reasoningContent.thinkingSignature } } : {}),
-			};
 			history.push({
-				assistantResponseMessage: assistantMsg,
+				assistantResponseMessage: {
+					content,
+					...(toolUses.length > 0 ? { toolUses } : {}),
+					...(signature ? { reasoningContent: { signature } } : {}),
+				},
 			});
 		} else if (msg.role === "user") {
 			let content = extractText(msg);
@@ -1018,8 +998,6 @@ function buildApiKeyRequest(
 	const uimc: Record<string, unknown> = {};
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
-
-	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
 
 	return {
 		conversationState: {
@@ -1320,6 +1298,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let inThink = false;
 			let thinkBuf = "";
 			let thinkingAccumulated = ""; // Buffer thinking until end or refusal
+			let thinkingSignature: string | undefined; // Native reasoningContent signature, replayed next turn
 
 			const consumeContent = (raw: string) => {
 				thinkBuf += raw;
@@ -1354,7 +1333,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 			// Emit accumulated thinking (from buffer)
 			const emitThinking = () => {
-				if (!thinkingAccumulated) return;
+				if (!thinkingAccumulated && !thinkingSignature) return;
 				if (thinkingIndex === undefined) {
 					if (textIndex !== undefined && !textStartDeferred) {
 						// Text_start has already been emitted (not deferred) with contentIndex.
@@ -1364,6 +1343,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						blocks.push({
 							type: "thinking",
 							thinking: thinkingAccumulated,
+							...(thinkingSignature ? { thinkingSignature } : {}),
 							index: thinkingIndex,
 						} as ThinkingContent & { index: number });
 					} else {
@@ -1373,6 +1353,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						blocks.unshift({
 							type: "thinking",
 							thinking: thinkingAccumulated,
+							...(thinkingSignature ? { thinkingSignature } : {}),
 							index: 0,
 						} as ThinkingContent & { index: number });
 						// Update indices of blocks that were shifted
@@ -1435,6 +1416,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							if (event.data === lastContent) continue;
 							lastContent = event.data;
 							consumeContent(event.data);
+						}
+					} else if (event.type === "reasoning") {
+						if (!hasTerminalEvent) {
+							if (event.data.text) thinkingAccumulated += event.data.text;
+							if (event.data.signature) thinkingSignature = event.data.signature;
 						}
 					} else if (event.type === "toolUse") {
 						if (!hasTerminalEvent) {

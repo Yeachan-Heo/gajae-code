@@ -592,6 +592,12 @@ export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boole
 	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId);
 }
 
+/** Returns true for OpenAI GPT ids (any variant) at or above `version`, e.g. `gpt-5.10-terra` ≥ "5.6". */
+export function isOpenAIModelAtLeast(modelId: string, version: string): boolean {
+	const parsed = parseOpenAIModel(getCanonicalModelId(modelId));
+	return parsed !== null && semverGte(parsed.version, version);
+}
+
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {
 	if (model.api !== "anthropic-messages") return false;
 	const parsedModel = parseKnownModel(model.id);
@@ -1168,15 +1174,10 @@ function inferThinkingControlMode<TApi extends Api>(
 			return "budget";
 
 		case "kiro-codewhisperer-stream":
-			if (parsedModel.family === "anthropic") {
-				if (semverGte(parsedModel.version, "4.6")) {
-					return "anthropic-adaptive";
-				}
-				if (semverGte(parsedModel.version, "4.5")) {
-					return "anthropic-budget-effort";
-				}
-			}
-			return "effort";
+			// Kiro forwards `additionalModelRequestFields` to Claude 4.6+ as native adaptive thinking.
+			return parsedModel.family === "anthropic" && semverGte(parsedModel.version, "4.6")
+				? "anthropic-adaptive"
+				: "effort";
 
 		default:
 			return "effort";
