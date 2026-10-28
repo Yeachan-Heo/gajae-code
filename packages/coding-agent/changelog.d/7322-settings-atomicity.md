@@ -1,6 +1,8 @@
 
 ### Fixed
 
+- Restore the last valid path owner after concurrent rejected atomic batches rather than reinstating a failed predecessor reservation, so untouched successful receipts remain restorable.
+
 - Reject unsafe paths, malformed operations and unjournaled ancestor replacements before applying atomic batches. Stage memory updates, isolate YAML builder inputs and preconditions, reject nested queue deadlocks, return independently owned inverse receipts, and preserve literal model-role keys across reload.
 - Reject nested Settings flushes that would wait on another active YAML owner, preserving deferred writes and independent FIFO operations.
 - Prevent queued or asynchronous current-value atomic builders from overtaking newer local setters or runtime override intent, including same-value/ABA writes and setters already captured by an earlier save. Preserve completed lock-only profile deletion and durable receipt ownership; keep synchronous memory publication and ordinary queued batches correctly ordered.

@@ -904,6 +904,40 @@ describe("current-value atomic batch local ownership", () => {
 	}
 });
 
+describe("failed durable reservation ownership", () => {
+	for (const count of [2, 3]) {
+		it(`preserves the last valid receipt after ${count} concurrent rejected batches`, async () => {
+			const temp = TempDir.createSync("@gjc-failed-batch-owner-");
+			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			try {
+				settings.set("temperature", 0.2);
+				await settings.flushOrThrow();
+				await settings.commitAtomicBatch([{ path: "modelRoles", op: "set", value: { custom: "scalar" } }]);
+				const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.4 }]);
+				const configPath = settings.getGlobalConfigPath()!;
+				const before = await Bun.file(configPath).text();
+				const outcomes = await Promise.allSettled(
+					Array.from({ length: count }, (_, index) =>
+						settings.commitAtomicBatch([
+							{ path: "temperature", op: "set", value: 0.6 + index / 10 },
+							{ path: "modelRoles.custom.child", op: "set", value: "invalid ancestor" },
+						]),
+					),
+				);
+				expect(outcomes.map(outcome => outcome.status)).toEqual(Array(count).fill("rejected"));
+				expect(await Bun.file(configPath).text()).toBe(before);
+				expect(settings.get("temperature")).toBe(0.4);
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(settings.get("temperature")).toBe(0.2);
+				expect(YAML.parse(await Bun.file(configPath).text())).toMatchObject({ temperature: 0.2 });
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+	}
+});
+
 describe("memory-mode receipt revisions", () => {
 	it("reports changed paths and an independently reversible inverse", async () => {
 		const settings = Settings.isolated({ temperature: 0.2 });
