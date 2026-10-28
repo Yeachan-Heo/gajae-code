@@ -256,19 +256,19 @@ try {
 			sessions: sessions.map(session => session.catalog),
 		}),
 	);
-	// Live mode borrows the developer's credential store so a real turn can be
-	// driven through the UI. The database is copied into the isolated home and its
-	// contents are never read, logged or returned.
-	if (process.env.GJC_DESKTOP_QA_LIVE === "1") {
-		const source = path.join(os.homedir(), ".gjc/agent/agent.db");
-		const target = path.join(dataDir, "agent/agent.db");
-		await fs.mkdir(path.dirname(target), { recursive: true });
-		await fs.copyFile(source, target);
-		await fs.chmod(target, 0o600);
-	}
+	// QA runs against an isolated install by default so nothing touches the user's
+	// state. Live mode instead uses the shared install (the product default), so a
+	// real turn is driven with the same credentials and default preset as the app.
+	const qaEnv: Record<string, string> = {
+		...cleanEnv,
+		// Shared mode must resolve the real install, so the real HOME is passed through.
+		HOME: process.env.GJC_DESKTOP_QA_LIVE === "1" ? os.homedir() : cleanEnv.HOME,
+		GJC_DESKTOP_DATA_DIR: dataDir,
+		...(process.env.GJC_DESKTOP_QA_LIVE === "1" ? {} : { GJC_DESKTOP_ISOLATED: "1" }),
+	};
 	host = Bun.spawn([process.execPath, path.join(root, "packages/desktop-host/src/index.ts")], {
 		cwd: temporary,
-		env: { ...cleanEnv, GJC_DESKTOP_DATA_DIR: dataDir },
+		env: qaEnv,
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",

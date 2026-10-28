@@ -22,7 +22,7 @@ import {
 import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { isolateEnvironment } from "./environment-policy";
 import { DesktopOAuthController } from "./oauth";
 import type {
@@ -348,7 +348,12 @@ export class DesktopHost {
 		return this.#dataDir;
 	}
 	get agentDir(): string {
-		return path.join(this.#dataDir, "agent");
+		// Shared install by default: the app uses the same agent directory as the
+		// terminal so credentials, model profiles and the default preset match. Tests
+		// and QA opt into an isolated directory via GJC_DESKTOP_ISOLATED.
+		const configured = process.env.GJC_CODING_AGENT_DIR?.trim();
+		if (configured) return path.resolve(configured);
+		return process.env.GJC_DESKTOP_ISOLATED === "1" ? path.join(this.#dataDir, "agent") : getAgentDir();
 	}
 	#emit: (frame: DesktopFrame) => void;
 	#createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
@@ -458,6 +463,14 @@ export class DesktopHost {
 		this.#registry = new ModelRegistry(this.#auth, path.join(this.agentDir, "models.yml"), this.#settings, {
 			agentDir: this.agentDir,
 		});
+		// The terminal refreshes the model catalog before applying the default preset;
+		// without it a configured profile such as cdx-lhigh cannot resolve models that
+		// only exist in the online catalog, and the app silently falls back.
+		try {
+			await this.#registry.refresh("online");
+		} catch {
+			await this.#registry.refresh("offline").catch(() => undefined);
+		}
 		this.#oauth = new DesktopOAuthController({
 			service: this.#auth,
 			emit: auth => this.#emit({ type: "auth", auth }),
@@ -642,6 +655,29 @@ export class DesktopHost {
 			};
 			this.#live.set(metadata.id, live);
 			result.setToolUIContext(this.#ui(live), true);
+			// The terminal applies the configured default model profile at startup; without
+			// the same step a new desktop session starts with no model (or a stale SDK
+			// default), so the first prompt fails even though the install is configured.
+			const defaultProfile = settings.get("modelProfile.default");
+			if (defaultProfile) {
+				try {
+					const applied = await result.session.activateModelProfileForControl(defaultProfile);
+					if (!applied)
+						live.notices.push({
+							id: `profile:${metadata.id}`,
+							role: "system",
+							text: `기본 모델 프로필(${defaultProfile})을 적용하지 못했습니다. 설정에서 모델을 선택하세요.`,
+							isError: true,
+						});
+				} catch (error) {
+					live.notices.push({
+						id: `profile:${metadata.id}`,
+						role: "system",
+						text: `기본 모델 프로필(${defaultProfile})을 적용하지 못했습니다: ${String(error).slice(0, 300)}`,
+						isError: true,
+					});
+				}
+			}
 			live.unsubscribe = result.session.subscribe(event => {
 				if (event.type === "message_update") live.streamingMessage = event.message;
 				if (event.type === "message_end" || event.type === "agent_end") live.streamingMessage = undefined;

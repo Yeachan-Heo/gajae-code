@@ -8,7 +8,7 @@
  * submissions with a disposition, and cancels a submission only while it is
  * still queued.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -140,6 +140,15 @@ function fakeSession(projectPath: string, dataDir: string, sessionId: string): F
 }
 
 describe("desktop streaming lifecycle", () => {
+	// The product default shares the user's install; tests must never read or write it.
+	const previousIsolated = process.env.GJC_DESKTOP_ISOLATED;
+	beforeAll(() => {
+		process.env.GJC_DESKTOP_ISOLATED = "1";
+	});
+	afterAll(() => {
+		if (previousIsolated === undefined) delete process.env.GJC_DESKTOP_ISOLATED;
+		else process.env.GJC_DESKTOP_ISOLATED = previousIsolated;
+	});
 	const cleanups: Array<() => Promise<void>> = [];
 	afterEach(async () => {
 		while (cleanups.length > 0) await cleanups.pop()?.();
