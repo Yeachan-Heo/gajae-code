@@ -2439,7 +2439,11 @@ export async function runRootCommand(
 	// defer; their connect evidence is published during session creation).
 	// ACP/print/SDK sessions connect eagerly and are not carved out here.
 	if (isInteractive) {
+		// Root TUI sessions may control conventional autoload declarations after first paint.
+		// Exact --mcp-config sessions retain their existing capability path.
 		sessionOptions.deferMcpConfigStartup = true;
+		if (sessionOptions.mcpConfigPath === undefined && sessionOptions.enableMcpAutoload !== false)
+			sessionOptions.sessionMcpControls = true;
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup

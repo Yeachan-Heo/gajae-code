@@ -4,6 +4,7 @@ import { slashCommandCapability } from "../capability/slash-command";
 import { appendInlineArgsFallback, templateUsesInlineArgPlaceholders } from "../config/prompt-templates";
 import type { SlashCommand } from "../discovery";
 import { loadCapability } from "../discovery";
+import type { AgentSession } from "../session/agent-session";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
 	type BuiltinSlashCommand,
@@ -116,8 +117,58 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<
 	return cmd;
 });
 
-export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {
+const SESSION_MCP_SUBCOMMANDS: SubcommandDef[] = [
+	{ name: "status", description: "Show MCP server status for this session" },
+	{ name: "list", description: "Alias for status" },
+	{ name: "connect", description: "Connect one server", usage: "<name>" },
+	{ name: "disconnect", description: "Disconnect one server", usage: "<name>" },
+	{ name: "reconnect", description: "Reconnect one server", usage: "<name>" },
+];
+
+/** Builtin command whose argument completions may resolve asynchronously from session state. */
+export type SessionBuiltinSlashCommand = BuiltinSlashCommand & {
+	getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
+	getInlineHint?: (argumentText: string) => string | null;
+};
+
+function getSessionMcpSlashCommands(
+	session: Pick<AgentSession, "getSessionMcpCompletionCandidates">,
+): readonly SessionBuiltinSlashCommand[] {
+	return BUILTIN_SLASH_COMMANDS.map(command => {
+		if (command.name !== "mcp") return command;
+		return {
+			...command,
+			subcommands: SESSION_MCP_SUBCOMMANDS,
+			getArgumentCompletions: async (prefix: string) => {
+				if (!prefix.includes(" ")) return buildArgumentCompletions(SESSION_MCP_SUBCOMMANDS)(prefix);
+				const match = /^(connect|disconnect|reconnect)\s+(\S*)$/.exec(prefix);
+				if (!match) return null;
+				const candidates = await session.getSessionMcpCompletionCandidates();
+				const list =
+					match[1] === "connect"
+						? candidates.connectable
+						: match[1] === "disconnect"
+							? candidates.connected
+							: candidates.reconnectable;
+				return list
+					.filter(server => server.name.startsWith(match[2]))
+					.map(server => ({
+						value: `${match[1]} ${server.name}`,
+						label: server.name,
+						description: `${server.scope} · ${server.state} · autoload ${server.autoload ? "on" : "off"}`,
+					}));
+			},
+			getInlineHint: buildSubcommandInlineHint(SESSION_MCP_SUBCOMMANDS),
+		};
+	});
+}
+
+export function getBuiltinSlashCommandsForSession(
+	hasExactMcpControls: boolean,
+	session?: Pick<AgentSession, "hasSessionMcpControls" | "getSessionMcpCompletionCandidates">,
+): readonly SessionBuiltinSlashCommand[] {
 	if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;
+	if (session?.hasSessionMcpControls) return getSessionMcpSlashCommands(session);
 	return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp");
 }
 
