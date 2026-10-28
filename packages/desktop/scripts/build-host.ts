@@ -20,7 +20,9 @@ try {
 	await run([process.execPath, "--cwd=packages/natives", "run", "embed:native"]);
 	const args = buildCompileArgs({
 		root: ".",
-		entrypoints: ["./packages/desktop-host/src/index.ts", ...releaseEntrypoints.slice(1)],
+		// `entry.ts` dispatches the SDK's internal shell-worker modes before any host
+		// setup, so the packaged binary can serve as its own worker.
+		entrypoints: ["./packages/desktop-host/src/entry.ts", ...releaseEntrypoints.slice(1)],
 		outfile: output,
 		target: "bun-darwin-arm64",
 		defines: ['process.env.PI_COMPILED="true"', 'process.env.GJC_BUILD_CHANNEL="dev"'],
