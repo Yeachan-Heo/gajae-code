@@ -118,6 +118,18 @@ function agentRoleFromSessionEntry(entry: unknown): AgentRole | undefined {
 }
 
 /**
+ * Read the project path recorded in a session header entry. Current session
+ * storage writes transcripts under opaque `v2-<digest>` directories, so the
+ * header `cwd` is the only reliable folder attribution for them; the legacy
+ * double-dash path decoding stays as the fallback for headerless files.
+ */
+function headerCwdFromEntry(entry: SessionEntry): string | undefined {
+	if (!isObject(entry) || entry.type !== "session") return undefined;
+	const cwd = (entry as { cwd?: unknown }).cwd;
+	return isNonemptyString(cwd) ? cwd : undefined;
+}
+
+/**
  * Extract plain text from a user message content payload.
  */
 function extractUserText(content: unknown): string {
@@ -246,10 +258,11 @@ function parseSessionEntriesLenient(bytes: Uint8Array): { entries: SessionEntry[
 function scanSessionMetadata(
 	bytes: Uint8Array,
 	initialAgentRole: AgentRole,
-): { serviceTier: ServiceTier | undefined; agentRole: AgentRole } {
+): { serviceTier: ServiceTier | undefined; agentRole: AgentRole; headerCwd: string | undefined } {
 	let cursor = 0;
 	let currentServiceTier: ServiceTier | undefined;
 	let currentAgentRole = initialAgentRole;
+	let headerCwd: string | undefined;
 
 	while (cursor < bytes.length) {
 		const { values, error, read, done } = Bun.JSONL.parseChunk(bytes, cursor, bytes.length);
@@ -257,6 +270,7 @@ function scanSessionMetadata(
 			if (isServiceTierChange(value)) currentServiceTier = value.serviceTier ?? undefined;
 			const agentRole = agentRoleFromSessionEntry(value);
 			if (agentRole !== undefined) currentAgentRole = agentRole;
+			if (headerCwd === undefined) headerCwd = headerCwdFromEntry(value);
 		}
 
 		if (error) {
@@ -271,7 +285,7 @@ function scanSessionMetadata(
 		if (done) break;
 	}
 
-	return { serviceTier: currentServiceTier, agentRole: currentAgentRole };
+	return { serviceTier: currentServiceTier, agentRole: currentAgentRole, headerCwd };
 }
 /**
  * Parse a session file and extract all assistant message stats.
@@ -300,7 +314,7 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 		throw err;
 	}
 
-	const folder = extractFolderFromPath(sessionPath);
+	const pathFolder = extractFolderFromPath(sessionPath);
 	const stats: ParsedMessageStats[] = [];
 	const userStats: UserMessageStats[] = [];
 	const userLinks: UserMessageLink[] = [];
@@ -311,12 +325,22 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 	const { entries, read } = parseSessionEntriesLenient(unprocessed);
 	let currentServiceTier: ServiceTier | undefined;
 	let currentAgentRole = initialAgentRole;
+	let headerCwd: string | undefined;
 	if (start > 0) {
 		const metadata = scanSessionMetadata(bytes.subarray(0, start), initialAgentRole);
 		currentServiceTier = metadata.serviceTier;
 		currentAgentRole = metadata.agentRole;
+		headerCwd = metadata.headerCwd;
 	}
 	for (const entry of entries) {
+		const entryCwd = headerCwdFromEntry(entry);
+		if (entryCwd !== undefined) {
+			headerCwd = entryCwd;
+			continue;
+		}
+		// Prefer the header-recorded project path; only headerless legacy files
+		// fall back to decoding the (legacy) directory name.
+		const folder = headerCwd ?? pathFolder;
 		if (isServiceTierChange(entry)) {
 			currentServiceTier = entry.serviceTier ?? undefined;
 			continue;

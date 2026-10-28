@@ -1,0 +1,48 @@
+{
+  "description": "Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens. Thus, limits will last longer with shorter tasks or using more cost-effective models. The 5-hour limit smooths out aggregate demand to fairly distribute global capacity across all users, while your weekly limit is tied directly to your individual tier.",
+  "groups": [
+    {
+      "buckets": [
+        {
+          "bucketId": "gemini-weekly",
+          "description": "You have used some of your weekly limit, it will fully refresh in 5 days, 10 hours.",
+          "displayName": "Weekly Limit Remaining",
+          "remainingFraction": 0.21197523,
+          "resetTime": "2026-11-02T05:26:50Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "gemini-5h",
+          "description": "You have used some of your 5-hour limit, it will fully refresh in 4 hours, 30 minutes.",
+          "displayName": "Five Hour Limit Remaining",
+          "remainingFraction": 0.9463278,
+          "resetTime": "2026-10-27T23:10:46Z",
+          "window": "5h"
+        }
+      ],
+      "description": "Models within this group: Gemini Flash, Gemini Pro",
+      "displayName": "Gemini Models"
+    },
+    {
+      "buckets": [
+        {
+          "bucketId": "3p-weekly",
+          "description": "You have used some of your weekly limit, it will fully refresh in 10 hours, 4 minutes.",
+          "displayName": "Weekly Limit Remaining",
+          "remainingFraction": 0.055549,
+          "resetTime": "2026-10-28T04:44:12Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "3p-5h",
+          "displayName": "Five Hour Limit Remaining",
+          "remainingFraction": 1,
+          "resetTime": "2026-10-27T23:39:57Z",
+          "window": "5h"
+        }
+      ],
+      "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+      "displayName": "Claude and GPT models"
+    }
+  ]
+}

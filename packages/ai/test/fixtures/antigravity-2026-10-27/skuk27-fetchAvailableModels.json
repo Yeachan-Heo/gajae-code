@@ -1,0 +1,42 @@
+{
+  "models": {
+    "chat_20706": {
+      "isInternal": true,
+      "quotaInfo": {
+        "remainingFraction": 1
+      }
+    },
+    "claude-opus-5-5-high": {
+      "displayName": "Claude Opus 5.5 (High)",
+      "quotaInfo": {
+        "remainingFraction": 0.4184348,
+        "resetTime": "2026-10-28T04:53:18Z"
+      }
+    },
+    "gemini-2.5-pro": {
+      "displayName": "Gemini 2.5 Pro",
+      "quotaInfo": {
+        "remainingFraction": 1,
+        "resetTime": "2026-10-27T23:39:52Z"
+      }
+    },
+    "gemini-4-argon-high": {
+      "displayName": "Gemini 4 Argon (High)",
+      "quotaInfo": {
+        "resetTime": "2026-10-31T04:06:51Z"
+      }
+    },
+    "gpt-oss-120b-medium": {
+      "displayName": "GPT-OSS 120B (Medium)",
+      "quotaInfo": {
+        "remainingFraction": 0.4184348,
+        "resetTime": "2026-10-28T04:53:18Z"
+      }
+    },
+    "tab_flash_lite_preview": {
+      "quotaInfo": {
+        "remainingFraction": 1
+      }
+    }
+  }
+}
