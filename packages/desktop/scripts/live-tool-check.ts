@@ -91,6 +91,7 @@ const sessionMessages = async (sessionId: string) => {
 const receipt: Record<string, unknown> = { host: hostBinary };
 try {
 	await call("bootstrap");
+	await fs.writeFile(path.join(projectDir, "note.txt"), "hello-from-file\n");
 	const project = (await call("project.open", { path: projectDir })) as { id: string };
 	const session = (await call("session.create", { projectId: project.id })) as { id: string; model?: string };
 	receipt.model = session.model ?? null;
