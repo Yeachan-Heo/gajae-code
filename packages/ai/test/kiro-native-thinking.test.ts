@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import { crc32 } from "../src/providers/aws-eventstream";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
-import type { AssistantMessage, Context, Model } from "../src/types";
+import type { AssistantMessage, Context, Model, TextContent, ThinkingContent } from "../src/types";
 
 const PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-profile";
 
@@ -268,8 +268,14 @@ describe("Kiro native thinking support", () => {
 			{ reasoning: Effort.High },
 		);
 
-		// Verify response was received
-		expect(turn1Response.content).toEqual([{ type: "text", text: "visible answer" }]);
+		// Verify response includes both text and thinking blocks with signature
+		const textBlocks = turn1Response.content.filter((b): b is TextContent => b.type === "text");
+		expect(textBlocks.some(b => b.text === "visible answer")).toBe(true);
+
+		const thinkingBlocks = turn1Response.content.filter((b): b is ThinkingContent => b.type === "thinking");
+		expect(thinkingBlocks.length).toBeGreaterThan(0);
+		const sig = (thinkingBlocks[0] as any).thinkingSignature;
+		expect(sig).toBe("sig_abc123xyz");
 
 		// Now simulate a second turn where we send the first response back as history
 		let secondTurnRequest: Record<string, unknown> | undefined;
@@ -349,5 +355,186 @@ describe("Kiro native thinking support", () => {
 				effort: expectedEffort,
 			});
 		}
+	});
+
+	test("Claude Opus model ID is recognized correctly (lexicographic fix)", async () => {
+		const model = {
+			id: "claude-opus-4-6",
+			name: "Claude Opus 4.6",
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		const { request } = await runStream(model, [encodeAssistantContentFrame("Hello")], {
+			reasoning: Effort.High,
+		});
+
+		const conversationState = request.conversationState as {
+			additionalModelRequestFields?: Record<string, unknown>;
+		};
+
+		// Opus 4.6 should get native thinking, not fall back to prompt prefix
+		expect(conversationState.additionalModelRequestFields).toBeDefined();
+		expect(conversationState.additionalModelRequestFields).toEqual({
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort: "high" },
+		});
+	});
+
+	test("GPT 5.10 is recognized (not confused with 5.6 via lexicographic comparison)", async () => {
+		const model = {
+			id: "gpt-5.10",
+			name: "GPT 5.10",
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		const { request } = await runStream(model, [encodeAssistantContentFrame("Hello")], {
+			reasoning: Effort.High,
+		});
+
+		const conversationState = request.conversationState as {
+			additionalModelRequestFields?: Record<string, unknown>;
+		};
+
+		// GPT 5.10 is >= 5.6 semantically, so should get native reasoning
+		expect(conversationState.additionalModelRequestFields).toBeDefined();
+		expect(conversationState.additionalModelRequestFields).toEqual({
+			reasoning: { effort: "high" },
+		});
+	});
+
+	test("explicit reasoning=false on GPT sends effort='none'", async () => {
+		const model = {
+			id: "gpt-6-luna",
+			name: "GPT 6 Luna",
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		const { request } = await runStream(model, [encodeAssistantContentFrame("Hello")], {
+			reasoning: false,
+		});
+
+		const conversationState = request.conversationState as {
+			additionalModelRequestFields?: Record<string, unknown>;
+		};
+
+		// Explicit off must send reasoning.effort='none', not undefined
+		expect(conversationState.additionalModelRequestFields).toBeDefined();
+		expect(conversationState.additionalModelRequestFields).toEqual({
+			reasoning: { effort: "none" },
+		});
+	});
+
+	test("parses reasoningContent without inline tags into thinking block", async () => {
+		const model = {
+			id: "claude-opus-4-6",
+			name: "Claude Opus 4.6",
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		// Stream has reasoningContent but no inline <thinking> tags
+		const { message } = await runStream(model, [encodeAssistantContentFrame("final answer", "sig_xyz")], {
+			reasoning: Effort.High,
+		});
+
+		// Even without inline tags, the response should include a thinking block
+		// with the signature captured
+		const thinkingBlocks = message.content.filter((b): b is ThinkingContent => b.type === "thinking");
+		expect(thinkingBlocks.length).toBeGreaterThan(0);
+		const sig = (thinkingBlocks[0] as any).thinkingSignature;
+		expect(sig).toBe("sig_xyz");
+	});
+
+	test("signature replayed as reasoningContent.thinkingSignature on next turn", async () => {
+		const model = {
+			id: "claude-opus-4-6",
+			name: "Claude Opus 4.6",
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		// First turn: stream with reasoning signature
+		const { message: turn1Response } = await runStream(model, [encodeAssistantContentFrame("answer", "sig_turn1")], {
+			reasoning: Effort.High,
+		});
+
+		// Second turn: use first response in history
+		let secondTurnRequest: Record<string, unknown> | undefined;
+		const mockFetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			if (!(init?.body instanceof Uint8Array)) throw new Error("expected encoded Kiro request body");
+			secondTurnRequest = JSON.parse(new TextDecoder().decode(init.body)) as Record<string, unknown>;
+			return eventStreamResponse([encodeAssistantContentFrame("second answer", "sig_turn2")]);
+		};
+		vi.spyOn(globalThis, "fetch").mockImplementation(mockFetch as unknown as typeof globalThis.fetch);
+
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "test", timestamp: 1 },
+				turn1Response,
+				{ role: "user", content: "follow up", timestamp: 2 },
+			],
+		};
+
+		for await (const _event of streamKiroCodeWhisperer(model, context, {
+			apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }),
+			reasoning: Effort.High,
+		})) {
+			// consume events
+		}
+
+		expect(secondTurnRequest).toBeDefined();
+		const secondConversationState = secondTurnRequest?.conversationState as {
+			history?: Array<{
+				assistantResponseMessage?: { content: string; reasoningContent?: Record<string, unknown> };
+			}>;
+		};
+
+		// Find the assistant message in history (should be the first response)
+		const assistantHistoryMessages = secondConversationState.history?.filter(h => h.assistantResponseMessage) ?? [];
+		expect(assistantHistoryMessages.length).toBeGreaterThan(0);
+
+		const assistantMsg = assistantHistoryMessages[0]?.assistantResponseMessage;
+		// The signature should be replayed as reasoningContent.thinkingSignature, NOT as a text tag
+		expect(assistantMsg?.reasoningContent?.thinkingSignature).toBe("sig_turn1");
+		// The content should NOT have text-based signature tags
+		expect(assistantMsg?.content).not.toContain("signature=");
 	});
 });

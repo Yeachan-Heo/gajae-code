@@ -55,6 +55,46 @@ import {
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Model version parsing (for native thinking gating)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type SemVer = { major: number; minor: number; patch: number };
+
+function parseSemVer(version: string): SemVer | null {
+	// Precomputed table for common versions (avoids allocation per-call)
+	const parsed = /^(\d+)(?:[.-](\d+))?(?:[.-](\d+))?$/.exec(version);
+	if (!parsed) return null;
+	return {
+		major: parseInt(parsed[1]!, 10),
+		minor: parseInt(parsed[2] ?? "0", 10),
+		patch: parseInt(parsed[3] ?? "0", 10),
+	};
+}
+
+function semverGte(left: SemVer | null, right: SemVer | null): boolean {
+	if (!left || !right) return !right;
+	if (left.major !== right.major) return left.major > right.major;
+	if (left.minor !== right.minor) return left.minor > right.minor;
+	return left.patch >= right.patch;
+}
+
+function parseAnthropicModel(modelId: string): { kind: "opus" | "sonnet" | "haiku" | "fable"; version: SemVer } | null {
+	const match = /claude-(opus|sonnet|fable|haiku)-(\d+(?:[.-]\d+)*)/.exec(modelId);
+	if (!match) return null;
+	const version = parseSemVer(match[2]!);
+	if (!version) return null;
+	return { kind: match[1] as "opus" | "sonnet" | "fable" | "haiku", version };
+}
+
+function parseOpenAIModel(modelId: string): { variant: string; version: SemVer } | null {
+	const match = /gpt-(\d+(?:\.\d+)*)(?:-(astra|codex|luna|sol|terra|mini|nano|max))?$/.exec(modelId);
+	if (!match) return null;
+	const version = parseSemVer(match[1]!);
+	if (!version) return null;
+	return { variant: match[2] ?? "base", version };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Provider options
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -108,6 +148,9 @@ interface WireAssistantMessage {
 	assistantResponseMessage: {
 		content: string;
 		toolUses?: WireToolUse[];
+		reasoningContent?: {
+			thinkingSignature?: string;
+		};
 	};
 }
 
@@ -463,12 +506,27 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 							}
 							thinkingParser.push(content);
 						}
-						// Capture reasoning content signature for replay in next turn
-						if (ev.reasoningContent?.signature) {
+						// Capture native reasoning content: create a thinking block even without inline tags,
+						// and attach the signature for replay in next turn's history.
+						if (ev.reasoningContent) {
 							const thinkingBlocks = blocks.filter((b): b is ThinkingContent & Block => b.type === "thinking");
-							if (thinkingBlocks.length > 0) {
-								const lastThinking = thinkingBlocks[thinkingBlocks.length - 1];
-								(lastThinking as any).thinkingSignature = ev.reasoningContent.signature;
+							let thinkingBlock = thinkingBlocks[thinkingBlocks.length - 1];
+
+							// If there is no existing thinking block (no inline tags), create one from reasoningContent
+							if (!thinkingBlock && (ev.reasoningContent.signature || ev.reasoningContent.redactedContent)) {
+								thinkingBlock = {
+									type: "thinking",
+									thinking: ev.reasoningContent.redactedContent ?? "[reasoning]",
+									index: blocks.length,
+								};
+								blocks.push(thinkingBlock);
+								stream.push({ type: "thinking_start", contentIndex: blocks.length - 1, partial: output });
+							}
+
+							// Attach the signature to the thinking block for native replay
+							if (thinkingBlock && ev.reasoningContent.signature) {
+								(thinkingBlock as ThinkingContent & { thinkingSignature?: string }).thinkingSignature =
+									ev.reasoningContent.signature;
 							}
 						}
 						break;
@@ -583,14 +641,20 @@ function buildKiroAdditionalModelRequestFields(
 	options: KiroCodeWhispererOptions,
 ): Record<string, unknown> | undefined {
 	const reasoning = options.reasoning;
-	if (!reasoning || !options.reasoning) return undefined;
+	// reasoning can be false (explicit off) or undefined (not requested)
+	if (reasoning === undefined) return undefined;
 
-	const isClaudeModel = modelId.includes("claude");
-	const isGptModel = modelId.includes("gpt-");
-	const isKimiModel = modelId.includes("kimi");
+	const claudeModel = parseAnthropicModel(modelId);
+	const gptModel = parseOpenAIModel(modelId);
 
-	// Claude (opus/sonnet 4.6+, kimi-k3) → native adaptive thinking
-	if ((isClaudeModel || isKimiModel) && modelId >= "claude-sonnet-4.6") {
+	// Claude (opus/sonnet 4.6+) → native adaptive thinking
+	if (
+		claudeModel &&
+		(claudeModel.kind === "opus" || claudeModel.kind === "sonnet") &&
+		semverGte(claudeModel.version, parseSemVer("4.6"))
+	) {
+		// Claude doesn't support explicit "off" for native thinking; only send fields when enabled
+		if (reasoning === false) return undefined;
 		const effortMap: Record<string, string> = {
 			true: "medium",
 			low: "low",
@@ -599,25 +663,25 @@ function buildKiroAdditionalModelRequestFields(
 			xhigh: "xhigh",
 			max: "max",
 		};
-		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		const effort = effortMap[typeof reasoning === "string" ? reasoning : "medium"] ?? "medium";
 		return {
 			thinking: { type: "adaptive", display: "summarized" },
 			output_config: { effort },
 		};
 	}
 
-	// GPT 5.6/6 → native reasoning with effort
-	if (isGptModel && (modelId >= "gpt-5.6" || modelId.includes("gpt-6"))) {
+	// GPT 5.6+ → native reasoning with effort
+	if (gptModel && semverGte(gptModel.version, parseSemVer("5.6"))) {
 		const effortMap: Record<string, string> = {
 			true: "medium",
-			false: "none",
+			false: "none", // Explicit off sends effort: "none"
 			low: "low",
 			medium: "medium",
 			high: "high",
 			xhigh: "high",
 			max: "high",
 		};
-		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		const effort = effortMap[typeof reasoning === "string" ? reasoning : String(reasoning)] ?? "medium";
 		return {
 			reasoning: { effort },
 		};
@@ -729,17 +793,20 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
+	let reasoningSignature: string | undefined;
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
 		} else if (block.type === "thinking") {
-			// Replay thinking as <thinking> tags with signature if available
-			const sig = (block as any).thinkingSignature;
-			const thinkingTag = sig
-				? `<thinking signature="${sig}">${block.thinking}</thinking>`
-				: `<thinking>${block.thinking}</thinking>`;
+			// Capture the signature from the thinking block for native replay
+			const thinkingWithSig = block as ThinkingContent & { thinkingSignature?: string };
+			if (thinkingWithSig.thinkingSignature) {
+				reasoningSignature = thinkingWithSig.thinkingSignature;
+			}
+			// Include the thinking text in the message content
+			const thinkingTag = `<thinking>${block.thinking}</thinking>`;
 			textParts.unshift(thinkingTag);
 		} else if (block.type === "toolCall") {
 			toolUses.push({
@@ -753,6 +820,7 @@ function convertToWireMessage(
 		assistantResponseMessage: {
 			content: textParts.join("\n"),
 			...(toolUses.length > 0 ? { toolUses } : {}),
+			...(reasoningSignature ? { reasoningContent: { thinkingSignature: reasoningSignature } } : {}),
 		},
 	};
 }
