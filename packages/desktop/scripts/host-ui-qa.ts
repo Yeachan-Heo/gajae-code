@@ -23,6 +23,13 @@ const allowed = new Set<DesktopMethod>([
 	"command.list",
 	"command.run",
 	"history.get",
+	"session.delete",
+	"queue.cancel",
+	"abort",
+	"model.set",
+	"goal.operate",
+	"session.export",
+	"session.fork",
 	"auth.providers",
 	"auth.state",
 	"tools.list",
@@ -72,6 +79,8 @@ function injection(base: string) {
 		let events;
 		let ready;
 		const dispatch = payload => {
+			// QA only: keep every frame so a test can assert protocol responses.
+			(window.__qaFrames = window.__qaFrames || []).push(payload);
 			for (const [id, listener] of listeners) {
 				if (listener.event === 'engine-frame')
 					callbacks.get(listener.handler)?.({event: 'engine-frame', id, payload});
@@ -166,9 +175,87 @@ try {
 		clearTimeout(gitTimeout);
 	}
 	await Bun.write(path.join(project, "qa-untracked.txt"), "Real isolated desktop QA untracked change.\n");
+	// Seed a realistic catalog so the UI renders a non-trivial snapshot instead of
+	// an empty workbench: three conversations, one of which is large enough that
+	// its bootstrap frame crosses the 64 KiB pipe boundary.
+	const dataDir = path.join(temporary, "desktop-data");
+	const projectId = crypto.randomUUID();
+	const seeded = [
+		{ title: "긴 대화", messages: 120, filler: "가".repeat(600) },
+		{ title: "짧은 대화", messages: 4, filler: "나".repeat(20) },
+		{ title: "즐겨찾기 대화", messages: 2, filler: "다".repeat(20), starred: true },
+	];
+	const sessions = seeded.map(entry => {
+		const id = crypto.randomUUID();
+		const relative = `${projectId}/${id}.jsonl`;
+		return {
+			id,
+			relative,
+			entry,
+			catalog: {
+				id,
+				projectId,
+				title: entry.title,
+				starred: entry.starred === true,
+				file: relative,
+			},
+		};
+	});
+	for (const session of sessions) {
+		const file = path.join(dataDir, "sessions", session.relative);
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		// Match the SDK's transcript format: a session header followed by typed
+		// message entries, so the engine loads real history instead of nothing.
+		const header = {
+			type: "session",
+			version: 5,
+			id: session.id,
+			timestamp: new Date(1_700_000_000_000).toISOString(),
+			cwd: project,
+		};
+		const entries = [JSON.stringify(header)];
+		for (let index = 0; index < session.entry.messages; index += 1) {
+			entries.push(
+				JSON.stringify({
+					type: "message",
+					id: `m${index}`,
+					parentId: index === 0 ? null : `m${index - 1}`,
+					timestamp: new Date(1_700_000_000_000 + index * 1000).toISOString(),
+					message: {
+						role: index % 2 === 0 ? "user" : "assistant",
+						content: [{ type: "text", text: `[${session.entry.title}] 메시지 ${index} ${session.entry.filler}` }],
+						// Real assistant turns always carry usage; a fixture without it is not
+						// a faithful transcript and goal accounting rejects it.
+						...(index % 2 === 0
+							? {}
+							: {
+									usage: {
+										input: 10,
+										output: 20,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: { input: 0, output: 0, total: 0 },
+									},
+									model: "qa/fixture",
+									stopReason: "stop",
+								}),
+					},
+				}),
+			);
+		}
+		await Bun.write(file, `${entries.join("\n")}\n`);
+	}
+	await Bun.write(
+		path.join(dataDir, "catalog.json"),
+		JSON.stringify({
+			version: 1,
+			projects: [{ id: projectId, name: path.basename(project), path: project }],
+			sessions: sessions.map(session => session.catalog),
+		}),
+	);
 	host = Bun.spawn([process.execPath, path.join(root, "packages/desktop-host/src/index.ts")], {
 		cwd: temporary,
-		env: { ...cleanEnv, GJC_DESKTOP_DATA_DIR: path.join(temporary, "desktop-data") },
+		env: { ...cleanEnv, GJC_DESKTOP_DATA_DIR: dataDir },
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
