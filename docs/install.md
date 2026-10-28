@@ -168,7 +168,7 @@ install or update.
 
 ## Retry configuration
 
-Provider retry budgets live in `~/.gjc/config.yml`:
+Provider retry budgets live in `~/.gjc/agent/config.yml`:
 
 ```yaml
 retry:
