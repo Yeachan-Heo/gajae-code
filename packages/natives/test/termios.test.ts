@@ -16,17 +16,6 @@ describe("ensure_raw_mode_via_termios", () => {
 		return;
 	}
 
-	it("should clear ECHO and ECHOCTL flags via termios", async () => {
-		// We need a real TTY to test this. A more thorough test would:
-		// 1. Open a real PTY
-		// 2. Set ECHO and ECHOCTL flags on
-		// 3. Call ensureRawModeViaTermios()
-		// 4. Call tcgetattr to verify flags are cleared
-		// However, this requires a real TTY in the test environment.
-		// For now, we verify the function doesn't crash on a non-TTY.
-		expect(() => ensureRawModeViaTermios()).not.toThrow();
-	});
-
 	it("should not crash on non-TTY stdin", () => {
 		// When stdin is not a TTY (as in tests), the function should gracefully do nothing
 		expect(() => ensureRawModeViaTermios()).not.toThrow();
