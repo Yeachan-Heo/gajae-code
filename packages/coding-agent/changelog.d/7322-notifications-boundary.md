@@ -5,7 +5,7 @@
 ### Fixed
 
 - Require durable settings and verified identity for active Telegram setup, preserve inactive saves and distinguish persistence from activation, reconciliation and runtime-fencing failures.
-- Redact configured cross-provider tokens and fingerprints from health/recovery diagnostics and persisted daemon metadata, including owner IDs and recovery command text.
+- Redact configured cross-provider tokens and fingerprints from health/recovery diagnostics and persisted daemon metadata, including owner IDs, removed endpoint session IDs, retained/debris path lists and recovery command text.
 
 ### Changed
 

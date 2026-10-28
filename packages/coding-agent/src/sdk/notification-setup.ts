@@ -311,6 +311,37 @@ export function createNotificationsEditorOperations(
 				});
 				return {
 					...result,
+					endpointsRemoved: result.endpointsRemoved.map(endpoint => ({
+						...endpoint,
+						sessionId: sanitize(endpoint.sessionId),
+					})),
+					...(result.endpointsDetached === undefined
+						? {}
+						: {
+								endpointsDetached: result.endpointsDetached.map(value => sanitize(value)),
+							}),
+					...(result.endpointsRetainedSuccessors === undefined
+						? {}
+						: {
+								endpointsRetainedSuccessors: result.endpointsRetainedSuccessors.map(value => sanitize(value)),
+							}),
+					...(result.endpointsRetainedPlaceholders === undefined
+						? {}
+						: {
+								endpointsRetainedPlaceholders: result.endpointsRetainedPlaceholders.map(value =>
+									sanitize(value),
+								),
+							}),
+					...(result.endpointsRetainedUnknown === undefined
+						? {}
+						: {
+								endpointsRetainedUnknown: result.endpointsRetainedUnknown.map(value => sanitize(value)),
+							}),
+					...(result.debrisRemoved === undefined
+						? {}
+						: {
+								debrisRemoved: result.debrisRemoved.map(value => sanitize(value)),
+							}),
 					daemon: redactRecoveryDaemon(result.daemon),
 				};
 			} catch (error) {

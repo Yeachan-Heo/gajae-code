@@ -41,6 +41,7 @@ import type {
 	NotificationsProviderSetupInput,
 	PreparedNotificationProviderConfiguration,
 } from "@gajae-code/coding-agent/sdk/notification-setup-contract";
+import { TempDir } from "@gajae-code/utils";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -1856,6 +1857,13 @@ describe("notification settings controller adapter", () => {
 			}),
 			recoverNotifications: async () => ({
 				...recovery(),
+				endpointsScanned: 1,
+				endpointsRemoved: [{ sessionId: sensitive.join("-"), pid: 42, reason: "stale-flag" }],
+				endpointsDetached: sensitive.map(value => `/detached/${value}.json`),
+				endpointsRetainedSuccessors: sensitive.map(value => `/successor/${value}.json`),
+				endpointsRetainedPlaceholders: sensitive.map(value => `/placeholder/${value}.json`),
+				endpointsRetainedUnknown: sensitive.map(value => `/unknown/${value}.json`),
+				debrisRemoved: sensitive.map(value => `/debris/${value}.json`),
 				daemon: {
 					...recovery().daemon,
 					ownerId,
@@ -1873,6 +1881,58 @@ describe("notification settings controller adapter", () => {
 		expect(recovered.daemon.ownerId).toContain("owner-");
 		expect(recovered.daemon.detail).toContain("detail");
 		expect(recovered.daemon.forceCommand).toContain("gjc notify stop");
+		expect(recovered.endpointsScanned).toBe(1);
+		expect(recovered.endpointsRemoved[0]).toMatchObject({ pid: 42, reason: "stale-flag" });
+		for (const paths of [
+			recovered.endpointsDetached,
+			recovered.endpointsRetainedSuccessors,
+			recovered.endpointsRetainedPlaceholders,
+			recovered.endpointsRetainedUnknown,
+			recovered.debrisRemoved,
+		]) {
+			expect(paths).toHaveLength(sensitive.length);
+			expect(paths?.every(value => value.endsWith(".json"))).toBe(true);
+		}
+	});
+
+	it("redacts configured secrets carried by real persisted stale endpoint IDs", async () => {
+		const temp = TempDir.createSync("@gjc-recovery-redaction-");
+		const secrets = [TOKEN, "discord-recovery-secret"];
+		const sensitive = [...secrets, ...secrets.map(tokenFingerprint)];
+		await Bun.write(
+			path.join(temp.path(), "config.yml"),
+			Bun.YAML.stringify({
+				notifications: { telegram: { botToken: secrets[0] }, discord: { botToken: secrets[1] } },
+			}),
+		);
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: temp.path() });
+		try {
+			for (const [index, sessionId] of sensitive.entries()) {
+				await Bun.write(
+					path.join(temp.path(), ".gjc", "state", "sdk", `endpoint-${index}.json`),
+					JSON.stringify({
+						sessionId,
+						url: "ws://127.0.0.1:1",
+						token: "endpoint-token",
+						pid: process.pid,
+						stale: true,
+					}),
+				);
+			}
+			const context = {
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => temp.path(), getSessionId: () => "session" },
+			} as unknown as NotificationsEditorAdapterContext;
+			const recovered = await createNotificationsEditorOperations(context).recover();
+			expect(recovered.endpointsScanned).toBe(sensitive.length);
+			expect(recovered.endpointsRemoved).toHaveLength(sensitive.length);
+			for (const secret of sensitive) expect(JSON.stringify(recovered)).not.toContain(secret);
+			for (const endpoint of recovered.endpointsRemoved) expect(endpoint.reason).toBe("stale-flag");
+		} finally {
+			await settings.close();
+			temp.removeSync();
+		}
 	});
 
 	it("stops the Telegram supervisor before removing its configuration", async () => {
