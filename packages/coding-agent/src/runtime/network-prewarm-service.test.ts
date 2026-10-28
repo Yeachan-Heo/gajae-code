@@ -74,7 +74,7 @@ describe("network prewarm runtime service", () => {
 		globalThis.fetch = fetchWithPreconnect;
 
 		const service = createNetworkPrewarmService(Settings.isolated());
-		const runtime = await service.get("bun-1.4.0");
+		const runtime = await service.get("bun-1.4.4");
 		runtime.preconnect("https://api.anthropic.com");
 
 		expect(calls).toEqual(["https://api.anthropic.com:443/", "http://api.anthropic.com:443/"]);

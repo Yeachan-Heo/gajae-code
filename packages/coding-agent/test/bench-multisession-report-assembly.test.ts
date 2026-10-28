@@ -17,7 +17,7 @@ const PINS = {
 	dirty: false,
 	workloadDigest: "w",
 	bootstrapDigest: "b",
-	bunVersion: "1.4.0",
+	bunVersion: "1.4.4",
 	osVersion: "macOS 26",
 	cpu: "Apple M5 Max",
 	contractDigest: "sha256:c",
