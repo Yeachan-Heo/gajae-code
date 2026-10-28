@@ -32,6 +32,10 @@ Review pane alongside conversation at >=1100px, drawer below. Sidebar collapses 
 
 The app's catalog, transcripts and logs live under its desktop data root. Agent configuration, credentials, model profiles and the default preset share the terminal installation by default; `GJC_DESKTOP_ISOLATED=1` gives tests/QA an isolated install. Initial target macOS 15+ arm64 (WebView must support Promise.withResolvers). Closing last window hides app while tasks continue; explicit Quit cancels/disposes owned work. #7322 owns upstream parity; consume public SDK, never private endpoints or terminal controllers. Expose unavailable capabilities truthfully pending upstream implementation.
 
+## Native boundary
+
+Rust is limited to `packages/desktop/src-tauri`: Tauri window integration, sidecar process lifecycle, and validated IPC transport. SDK behavior and application business logic remain in TypeScript. The repository Rust scope guard checks the `gjc-desktop` package identity and rejects Rust outside this native directory, including sibling desktop application code.
+
 ## Account authorization
 
 The app uses public AuthStorage login callbacks with a single app-owned authorization flow. Provider selection, an explicit HTTPS-only system-browser action, optional code prompts, cancellation and reopening settings are supported. Prompt answers are never persisted in frontend storage. Cancellation does not undo credentials a provider already saved; an uncooperative provider may require Quit and relaunch before another login. This is not proof of a completed real-provider login.
