@@ -22,8 +22,9 @@ import {
 import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
-import { isolateEnvironment } from "./environment-policy";
+import { prepareDesktopEnvironment } from "./environment-policy";
 import { DesktopOAuthController } from "./oauth";
 import type {
 	DesktopCapability,
@@ -398,25 +399,14 @@ export class DesktopHost {
 		return this.#init;
 	}
 	async #initialize(): Promise<void> {
-		await fs.mkdir(this.agentDir, { recursive: true, mode: 0o700 });
+		await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
 		this.#dataDir = await fs.realpath(this.#dataDir);
 		await fs.chmod(this.dataDir, 0o700);
-		// The entrypoint's environment module isolates import-time discovery first.
-		isolateEnvironment(process.env);
-		process.env.HOME = path.join(this.dataDir, "home");
-		process.env.USERPROFILE = process.env.HOME;
-		process.env.GJC_CODING_AGENT_DIR = this.agentDir;
-		process.env.PI_CODING_AGENT_DIR = this.agentDir;
-		process.env.GJC_CONFIG_DIR = ".gjc-desktop";
-		process.env.PI_CONFIG_DIR = ".gjc-desktop";
-		process.env.XDG_CONFIG_HOME = path.join(this.dataDir, "config");
-		process.env.XDG_DATA_HOME = path.join(this.dataDir, "data");
-		process.env.XDG_STATE_HOME = path.join(this.dataDir, "state");
-		process.env.XDG_CACHE_HOME = path.join(this.dataDir, "cache");
-		process.env.GJC_LOG_DIR = path.join(this.dataDir, "logs");
-
-		await fs.mkdir(process.env.HOME, { recursive: true, mode: 0o700 });
-		setAgentDir(this.agentDir);
+		const agentDir = prepareDesktopEnvironment(process.env, this.dataDir);
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		if (process.env.GJC_DESKTOP_ISOLATED === "1")
+			await fs.mkdir(path.join(this.dataDir, "home"), { recursive: true, mode: 0o700 });
+		setAgentDir(agentDir);
 		const catalogFile = Bun.file(path.join(this.dataDir, "catalog.json"));
 		if (await catalogFile.exists()) {
 			const value: unknown = await catalogFile.json();
@@ -1095,8 +1085,7 @@ export class DesktopHost {
 					this.#live.delete(metadata.id);
 					if (metadata.file) {
 						const file = this.#sessionPath(metadata.file);
-						await fs.rm(file, { force: true });
-						if (file.endsWith(".jsonl")) await fs.rm(file.slice(0, -6), { recursive: true, force: true });
+						await new FileSessionStorage().deleteSessionWithArtifacts(file);
 					}
 					this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
 					this.#publishSnapshot();
