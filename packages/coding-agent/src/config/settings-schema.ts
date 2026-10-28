@@ -1394,6 +1394,10 @@ export const SETTINGS_SCHEMA = {
 
 	// Sampling
 	temperature: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1412,6 +1416,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1430,6 +1438,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topK: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1447,6 +1459,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	minP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1463,6 +1479,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	presencePenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1480,6 +1500,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	repetitionPenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {

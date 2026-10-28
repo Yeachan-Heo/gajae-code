@@ -3022,6 +3022,8 @@ function frameUntrustedIrcInbound(from: string, message: string): string {
 	);
 }
 
+const SAMPLING_SETTING_PATHS = ["temperature", "topP", "topK", "minP", "presencePenalty", "repetitionPenalty"] as const;
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -4119,6 +4121,7 @@ export class AgentSession {
 		);
 	}
 	#unregisterSessionMemorySettings?: () => void;
+	#unregisterSamplingSettings?: () => void;
 	#unregisterDelegationHintSettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
@@ -5830,6 +5833,14 @@ export class AgentSession {
 				this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 			}
 		});
+		this.#unregisterSamplingSettings = this.settings.onChanged(settingPath => {
+			if (SAMPLING_SETTING_PATHS.some(samplingPath => samplingPath === settingPath)) {
+				for (const samplingPath of SAMPLING_SETTING_PATHS) {
+					const value = this.settings.get(samplingPath);
+					this.agent[samplingPath] = value >= 0 ? value : undefined;
+				}
+			}
+		}, "apply");
 		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
 		// Worker integration is an injected seam only: hosts that need turn-end
 		// integration supply the request, and no scheduler exists otherwise.
@@ -11516,6 +11527,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterSamplingSettings?.();
+		this.#unregisterSamplingSettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();

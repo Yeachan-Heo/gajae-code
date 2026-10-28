@@ -748,6 +748,7 @@ export class Settings implements NotificationSettingsReader {
 	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
 	#saveTimer?: NodeJS.Timeout;
 	#savePromise?: Promise<void>;
+	#changeApplications = new Set<(path: SettingPath) => void>();
 	#changeListeners = new Set<(path: SettingPath) => void>();
 	#tentativePublicationDepth = 0;
 	#pendingSaveSlot?: PendingSaveSlot;
@@ -1010,10 +1011,11 @@ export class Settings implements NotificationSettingsReader {
 		return structuredClone(this.#autoroutingEffective);
 	}
 
-	/** Observe effective-setting changes after durable and notification state is restored. */
-	onChanged(listener: (path: SettingPath) => void): () => void {
-		this.#changeListeners.add(listener);
-		return () => this.#changeListeners.delete(listener);
+	/** Synchronous live applicators finish before schema hooks and ordinary observers run. */
+	onChanged(listener: (path: SettingPath) => void, phase: "apply" | "observe" = "observe"): () => void {
+		const listeners = phase === "apply" ? this.#changeApplications : this.#changeListeners;
+		listeners.add(listener);
+		return () => listeners.delete(listener);
 	}
 
 	#publishSettingsChanges(previous: ReadonlyMap<string, unknown>): void {
@@ -1029,6 +1031,8 @@ export class Settings implements NotificationSettingsReader {
 				}
 			}
 		};
+		// Apply the complete live state before an observer can synchronously start a run.
+		notify(this.#changeApplications);
 		for (const [settingPath, previousValue] of previous) {
 			const hook =
 				this.#ownsPresentation || settingPath === "provider.appendOnlyContext"

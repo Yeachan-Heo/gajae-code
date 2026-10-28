@@ -31,7 +31,7 @@ describe("portable settings catalog", () => {
 				layers: ["global", "project"],
 				allowedLayers: ["global", "project", "runtime"],
 			},
-			application: { kind: "unclassified" },
+			application: { kind: "next-run" },
 		});
 		settings.override("temperature", 0.6);
 		expect(item(getSettingsCatalog(settings), "temperature").resolution).toMatchObject({
