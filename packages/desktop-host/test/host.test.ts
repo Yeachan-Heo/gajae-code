@@ -159,6 +159,27 @@ describe("desktop protocol validation", () => {
 		expect(huge.truncated).toBe(true);
 		expect(huge.page.reduce((total, message) => total + message.text.length, 0)).toBeLessThanOrEqual(2_000_000);
 	});
+
+	test("projects a failed assistant turn as a visible error, not an empty bubble", () => {
+		const page = projectHistoryPage(
+			[
+				{ role: "user", content: [{ type: "text", text: "안녕" }], timestamp: 1 },
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "401 The requested model does not exist or you do not have access to it.",
+					timestamp: 2,
+				},
+			],
+			0,
+			10,
+		);
+		const failure = page.page[1];
+		expect(failure?.isError).toBe(true);
+		expect(failure?.text).toContain("you do not have access");
+		expect(failure?.text).not.toBe("");
+	});
 });
 
 describe("desktop settings surface", () => {

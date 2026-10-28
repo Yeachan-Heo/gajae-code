@@ -218,7 +218,7 @@ function projectVisibleMessage(value: unknown, index: number, limit: number): De
 	const message = record(value);
 	if (!message || !["user", "assistant", "toolResult"].includes(String(message.role))) return undefined;
 	const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
-	const text =
+	const content =
 		typeof message.content === "string"
 			? message.content
 			: Array.isArray(message.content)
@@ -229,13 +229,18 @@ function projectVisibleMessage(value: unknown, index: number, limit: number): De
 						})
 						.join("\n")
 				: "";
+	// A provider failure arrives as an assistant turn with an empty body and the
+	// reason in errorMessage; dropping it renders a blank bubble the user cannot act on.
+	const failed = message.stopReason === "error";
+	const errorText = failed && typeof message.errorMessage === "string" ? message.errorMessage : "";
+	const text = content || errorText;
 	return {
 		id: `${index}:${String(message.timestamp ?? "")}`,
 		role,
 		text: text.slice(-limit),
 		...(text.length > limit ? { truncated: true } : {}),
 		...(typeof message.toolName === "string" ? { toolName: message.toolName.slice(0, 100) } : {}),
-		...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
+		...(message.isError === true || failed ? { isError: true } : {}),
 	};
 }
 
