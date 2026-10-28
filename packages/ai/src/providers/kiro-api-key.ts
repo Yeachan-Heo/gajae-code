@@ -855,6 +855,57 @@ export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined)
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
 }
 
+/**
+ * Build native thinking/reasoning fields based on model family.
+ * Claude models use output_config.effort, GPT models use reasoning.reasoning_effort.
+ * Falls back to prompt prefix if model family cannot be determined or is unsupported.
+ */
+function buildNativeThinkingFields(
+	modelId: string,
+	reasoning: Effort | boolean | undefined,
+): { output_config?: { effort?: string }; reasoning?: { reasoning_effort?: string } } {
+	if (!reasoning || reasoning === true) {
+		return {};
+	}
+
+	// Normalize effort to string
+	const effortStr = String(reasoning);
+
+	// Detect model family from model ID
+	if (modelId.startsWith("claude-")) {
+		// Claude models use output_config.effort with mapped values
+		const effortMap: Record<string, string> = {
+			minimal: "low",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "high", // Claude max is 'high'
+			max: "high",
+		};
+		const mappedEffort = effortMap[effortStr];
+		if (mappedEffort) {
+			return { output_config: { effort: mappedEffort } };
+		}
+	} else if (modelId.startsWith("gpt-")) {
+		// OpenAI GPT models use reasoning.reasoning_effort
+		const effortMap: Record<string, string> = {
+			minimal: "low",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "high", // GPT max is 'high'
+			max: "high",
+		};
+		const mappedEffort = effortMap[effortStr];
+		if (mappedEffort) {
+			return { reasoning: { reasoning_effort: mappedEffort } };
+		}
+	}
+
+	// Unknown model family falls back to prompt prefix (handled elsewhere)
+	return {};
+}
+
 function buildApiKeyRequest(
 	model: Model<"kiro-codewhisperer-stream">,
 	context: Context,
@@ -872,11 +923,22 @@ function buildApiKeyRequest(
 		if (msg.role === "assistant") {
 			let content = "";
 			const toolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
+			let thinkingContent: string | undefined;
+			let reasoningContent: string | undefined;
+
 			for (const block of msg.content) {
 				if (typeof block === "string") content += block;
 				else if (block.type === "text") content += block.text;
-				else if (block.type === "thinking") content = `<thinking>${block.thinking}</thinking>\n\n${content}`;
-				else if (block.type === "toolCall") {
+				else if (block.type === "thinking") {
+					// Replay thinking blocks with their signature for native thinking support
+					const signature = (block as { thinkingSignature?: string }).thinkingSignature;
+					if (signature === "reasoning_content") {
+						reasoningContent = (reasoningContent ?? "") + block.thinking;
+					} else {
+						// thinking_content or no signature - use thinking_content by default
+						thinkingContent = (thinkingContent ?? "") + block.thinking;
+					}
+				} else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
 						toolUseId: block.id,
@@ -888,6 +950,8 @@ function buildApiKeyRequest(
 				assistantResponseMessage: {
 					content,
 					...(toolUses.length > 0 ? { toolUses } : {}),
+					...(thinkingContent ? { thinking_content: thinkingContent } : {}),
+					...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
 				},
 			});
 		} else if (msg.role === "user") {
@@ -947,6 +1011,9 @@ function buildApiKeyRequest(
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
 
+	// Build native thinking/reasoning fields based on model family
+	const nativeThinking = buildNativeThinkingFields(modelId, options.reasoning);
+
 	return {
 		conversationState: {
 			chatTriggerType: "MANUAL",
@@ -961,6 +1028,7 @@ function buildApiKeyRequest(
 				},
 			},
 			...(history.length > 0 ? { history } : {}),
+			...nativeThinking,
 		},
 		agentMode: "vibe",
 	};

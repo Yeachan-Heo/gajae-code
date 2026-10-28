@@ -5,9 +5,23 @@ import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { AssistantMessage, Context, Model } from "../src/types";
 
 const PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-profile";
-const model = {
+const claudeModel = {
 	id: "claude-opus-4-6",
 	name: "Claude Opus 4.6",
+	api: "kiro-codewhisperer-stream",
+	provider: "kiro",
+	baseUrl: "",
+	reasoning: true,
+	input: ["text"],
+	output: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 8_192,
+} satisfies Model<"kiro-codewhisperer-stream">;
+
+const gptModel = {
+	id: "gpt-4o-reasoning",
+	name: "GPT-4o with Reasoning",
 	api: "kiro-codewhisperer-stream",
 	provider: "kiro",
 	baseUrl: "",
@@ -82,7 +96,7 @@ function eventStreamResponse(contents: readonly string[]): Response {
 
 async function runStream(
 	contents: readonly string[],
-	options: { reasoning?: Effort | boolean } = {},
+	options: { reasoning?: Effort | boolean; model?: Model<"kiro-codewhisperer-stream"> } = {},
 ): Promise<{ request: Record<string, unknown>; message: AssistantMessage; eventTypes: string[] }> {
 	let request: Record<string, unknown> | undefined;
 	const mockFetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -93,10 +107,12 @@ async function runStream(
 	vi.spyOn(globalThis, "fetch").mockImplementation(mockFetch as unknown as typeof globalThis.fetch);
 	let message: AssistantMessage | undefined;
 	const eventTypes: string[] = [];
+	const model = options.model ?? claudeModel;
+	const { model: _, ...opts } = options;
 	for await (const event of streamKiroCodeWhisperer(
 		model,
 		{ messages: [{ role: "user", content: "Summarize this", timestamp: 1 }] } satisfies Context,
-		{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), ...options },
+		{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), ...opts },
 	)) {
 		eventTypes.push(event.type);
 		if (event.type === "done") message = event.message;
@@ -148,5 +164,71 @@ describe("Kiro OAuth reasoning", () => {
 
 		const partialMarker = await runStream(["literal <think"]);
 		expect(partialMarker.message.content).toEqual([{ type: "text", text: "literal <think" }]);
+	});
+
+	test("sends native thinking effort for Claude models", async () => {
+		const { request } = await runStream(["Answer"], { reasoning: Effort.High });
+		const conversationState = request.conversationState as {
+			output_config?: { effort?: string };
+		};
+
+		// Claude models should use output_config.effort
+		expect(conversationState.output_config).toEqual({ effort: "high" });
+	});
+
+	test("maps reasoning efforts correctly for Claude models", async () => {
+		const effortTests: Array<[Effort | boolean, string | undefined]> = [
+			[Effort.Minimal, "low"],
+			[Effort.Low, "low"],
+			[Effort.Medium, "medium"],
+			[Effort.High, "high"],
+			[Effort.XHigh, "high"],
+			[Effort.Max, "high"],
+			[true, undefined],
+		];
+
+		for (const [effort, expected] of effortTests) {
+			const { request } = await runStream(["Answer"], { reasoning: effort });
+			const conversationState = request.conversationState as { output_config?: { effort?: string } };
+
+			if (expected) {
+				expect(conversationState.output_config?.effort).toBe(expected);
+			} else {
+				expect(conversationState.output_config).toBeUndefined();
+			}
+		}
+	});
+
+	test("sends native reasoning effort for GPT models", async () => {
+		const { request } = await runStream(["Answer"], { reasoning: Effort.High, model: gptModel });
+		const conversationState = request.conversationState as {
+			reasoning?: { reasoning_effort?: string };
+		};
+
+		// GPT models should use reasoning.reasoning_effort
+		expect(conversationState.reasoning).toEqual({ reasoning_effort: "high" });
+	});
+
+	test("maps reasoning efforts correctly for GPT models", async () => {
+		const effortTests: Array<[Effort | boolean, string | undefined]> = [
+			[Effort.Minimal, "low"],
+			[Effort.Low, "low"],
+			[Effort.Medium, "medium"],
+			[Effort.High, "high"],
+			[Effort.XHigh, "high"],
+			[Effort.Max, "high"],
+			[true, undefined],
+		];
+
+		for (const [effort, expected] of effortTests) {
+			const { request } = await runStream(["Answer"], { reasoning: effort, model: gptModel });
+			const conversationState = request.conversationState as { reasoning?: { reasoning_effort?: string } };
+
+			if (expected) {
+				expect(conversationState.reasoning?.reasoning_effort).toBe(expected);
+			} else {
+				expect(conversationState.reasoning).toBeUndefined();
+			}
+		}
 	});
 });

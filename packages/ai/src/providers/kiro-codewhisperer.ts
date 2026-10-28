@@ -108,6 +108,9 @@ interface WireAssistantMessage {
 	assistantResponseMessage: {
 		content: string;
 		toolUses?: WireToolUse[];
+		/** Replay thinking/reasoning content with signature for native thinking support. */
+		thinking_content?: string;
+		reasoning_content?: string;
 	};
 }
 
@@ -119,6 +122,10 @@ interface ConversationState {
 	history?: WireHistoryMessage[];
 	profileArn?: string;
 	customizationArn?: string;
+	/** Native thinking/reasoning for Claude models (output_config.effort). */
+	output_config?: { effort?: string };
+	/** Native thinking/reasoning for GPT models (reasoning.reasoning_effort). */
+	reasoning?: { reasoning_effort?: string };
 }
 
 interface GenerateAssistantResponseRequest {
@@ -131,6 +138,11 @@ interface GenerateAssistantResponseRequest {
 
 interface AssistantResponseEvent {
 	content?: string;
+}
+
+interface ReasoningContentEvent {
+	content?: string;
+	signature?: string;
 }
 
 interface ToolUseEventPayload {
@@ -456,6 +468,20 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						}
 						break;
 					}
+					case "reasoningContentEvent": {
+						const ev = payload as ReasoningContentEvent;
+						const content = ev.content;
+						if (content) {
+							if (!firstTokenTime) firstTokenTime = Date.now();
+							if (!started) {
+								stream.push({ type: "start", partial: output });
+								started = true;
+							}
+							// Create or append to thinking block with reasoning content signature
+							handleReasoningContent(blocks, output, stream, content, ev.signature);
+						}
+						break;
+					}
 					case "toolUseEvent": {
 						const ev = payload as ToolUseEventPayload;
 						if (!firstTokenTime) firstTokenTime = Date.now();
@@ -561,6 +587,57 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 // Request building
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Build native thinking/reasoning fields based on model family.
+ * Claude models use output_config.effort, GPT models use reasoning.reasoning_effort.
+ * Falls back to prompt prefix if model family cannot be determined or is unsupported.
+ */
+function buildNativeThinkingFields(
+	modelId: string,
+	reasoning: Effort | boolean | undefined,
+): { output_config?: { effort?: string }; reasoning?: { reasoning_effort?: string } } {
+	if (!reasoning || reasoning === true) {
+		return {};
+	}
+
+	// Normalize effort to string
+	const effortStr = String(reasoning);
+
+	// Detect model family from model ID
+	if (modelId.startsWith("claude-")) {
+		// Claude models use output_config.effort with mapped values
+		const effortMap: Record<string, string> = {
+			minimal: "low",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "high", // Claude max is 'high'
+			max: "high",
+		};
+		const mappedEffort = effortMap[effortStr];
+		if (mappedEffort) {
+			return { output_config: { effort: mappedEffort } };
+		}
+	} else if (modelId.startsWith("gpt-")) {
+		// OpenAI GPT models use reasoning.reasoning_effort
+		const effortMap: Record<string, string> = {
+			minimal: "low",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "high", // GPT max is 'high'
+			max: "high",
+		};
+		const mappedEffort = effortMap[effortStr];
+		if (mappedEffort) {
+			return { reasoning: { reasoning_effort: mappedEffort } };
+		}
+	}
+
+	// Unknown model family falls back to prompt prefix (handled elsewhere)
+	return {};
+}
+
 function buildConversationState(
 	context: Context,
 	model: Model<"kiro-codewhisperer-stream">,
@@ -637,11 +714,15 @@ function buildConversationState(
 		currentMessage.userInputMessage.userInputMessageContext.tools = convertTools(context.tools);
 	}
 
+	// Build native thinking/reasoning fields based on model family
+	const nativeThinking = buildNativeThinkingFields(modelId, options.reasoning);
+
 	return {
 		chatTriggerType: "MANUAL",
 		currentMessage,
 		history: history.length > 0 ? history : undefined,
 		profileArn: options.profileArn,
+		...nativeThinking,
 	};
 }
 
@@ -660,11 +741,23 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
+	let thinkingContent: string | undefined;
+	let reasoningContent: string | undefined;
+
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
+		} else if (block.type === "thinking") {
+			// Replay thinking blocks with their signature for native thinking support
+			const signature = (block as { thinkingSignature?: string }).thinkingSignature;
+			if (signature === "reasoning_content") {
+				reasoningContent = (reasoningContent ?? "") + block.thinking;
+			} else {
+				// thinking_content or no signature - use thinking_content by default
+				thinkingContent = (thinkingContent ?? "") + block.thinking;
+			}
 		} else if (block.type === "toolCall") {
 			toolUses.push({
 				toolUseId: block.id,
@@ -673,11 +766,16 @@ function convertToWireMessage(
 			});
 		}
 	}
+
+	const responseMessage: WireAssistantMessage["assistantResponseMessage"] = {
+		content: textParts.join("\n"),
+		...(toolUses.length > 0 ? { toolUses } : {}),
+		...(thinkingContent ? { thinking_content: thinkingContent } : {}),
+		...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+	};
+
 	return {
-		assistantResponseMessage: {
-			content: textParts.join("\n"),
-			...(toolUses.length > 0 ? { toolUses } : {}),
-		},
+		assistantResponseMessage: responseMessage,
 	};
 }
 
@@ -770,6 +868,44 @@ function handleTextDelta(
 	}
 	lastBlock.text += delta;
 	stream.push({ type: "text_delta", contentIndex: lastBlock.index!, delta, partial: output });
+}
+
+/**
+ * Handle reasoningContent events from native thinking/reasoning support.
+ * Creates a thinking block with the reasoning content and signature for replay.
+ */
+function handleReasoningContent(
+	blocks: Block[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	content: string,
+	signature?: string,
+): void {
+	// Find or create the last thinking block with reasoning signature
+	let lastBlock = blocks[blocks.length - 1];
+	const isReasoningBlock = lastBlock?.type === "thinking" && lastBlock.thinkingSignature === "reasoning_content";
+
+	if (!isReasoningBlock) {
+		const newBlock: (ThinkingContent & { index: number; thinkingSignature?: string }) = {
+			type: "thinking",
+			thinking: "",
+			index: blocks.length,
+			thinkingSignature: signature || "reasoning_content",
+		};
+		blocks.push(newBlock as Block);
+		lastBlock = newBlock;
+		stream.push({ type: "thinking_start", contentIndex: newBlock.index, partial: output });
+	}
+
+	if (lastBlock && lastBlock.type === "thinking") {
+		lastBlock.thinking += content;
+		stream.push({
+			type: "thinking_delta",
+			contentIndex: lastBlock.index!,
+			delta: content,
+			partial: output,
+		});
+	}
 }
 
 function createInlineThinkingParser(
