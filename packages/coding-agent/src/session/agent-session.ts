@@ -158,6 +158,11 @@ import {
 } from "./btw-contract";
 import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
+import {
+	fenceClippedCompactionText,
+	RECOVERY_GOAL_ID_MAX,
+	RECOVERY_SOURCE_HASH_MAX,
+} from "./workflow-recovery-field-fence";
 
 export interface ForkContextSeedMetadata {
 	sourceSessionId: string;
@@ -716,11 +721,16 @@ function renderWorkflowRecoveryContext(recovery: WorkflowRecoveryProjection): st
 		progressParts.push(`goals ${progress.completedGoals ?? 0}/${progress.totalGoals}`);
 	}
 	if (progress.outstandingGoals !== undefined) progressParts.push(`outstanding ${progress.outstandingGoals}`);
-	if (progress.latestCohortSourceHash) progressParts.push(`sourceHash ${progress.latestCohortSourceHash}`);
+	if (progress.latestCohortSourceHash) {
+		progressParts.push(
+			`sourceHash ${fenceClippedCompactionText(progress.latestCohortSourceHash, RECOVERY_SOURCE_HASH_MAX)}`,
+		);
+	}
 	if (progressParts.length > 0) lines.push(`Progress: ${progressParts.join(", ")}`);
-	lines.push(
-		`Next action: ${recovery.nextAction.actionClass}${recovery.nextAction.goalId ? ` (${recovery.nextAction.goalId})` : ""}`,
-	);
+	const nextGoalId = recovery.nextAction.goalId
+		? fenceClippedCompactionText(recovery.nextAction.goalId, RECOVERY_GOAL_ID_MAX)
+		: "";
+	lines.push(`Next action: ${recovery.nextAction.actionClass}${nextGoalId ? ` (${nextGoalId})` : ""}`);
 	if (recovery.provenance.sha256) lines.push(`Contract digest: ${recovery.provenance.sha256}`);
 	return lines;
 }
