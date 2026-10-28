@@ -37,12 +37,22 @@ import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
 import {
+	buildKiroAdditionalModelRequestFields,
 	buildKiroThinkingPrefix,
 	isKiroApiKey,
 	sanitizeKiroError,
 	streamKiroApiKey,
 	toKiroModelId,
 } from "./kiro-api-key";
+import {
+	closeReasoningBlock,
+	createReasoningBlockState,
+	type KiroAdditionalModelRequestFields,
+	type KiroReasoningContent,
+	kiroReasoningContentForReplay,
+	parseReasoningContentEventHelper,
+	type ReasoningBlockState,
+} from "./kiro-reasoning-parser";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -108,6 +118,7 @@ interface WireAssistantMessage {
 	assistantResponseMessage: {
 		content: string;
 		toolUses?: WireToolUse[];
+		reasoningContent?: KiroReasoningContent;
 	};
 }
 
@@ -123,6 +134,7 @@ interface ConversationState {
 
 interface GenerateAssistantResponseRequest {
 	conversationState: ConversationState;
+	additionalModelRequestFields?: KiroAdditionalModelRequestFields;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,6 +179,12 @@ interface ErrorPayload {
 		message?: string;
 		code?: string;
 	};
+}
+
+interface ReasoningContentEvent {
+	text?: string;
+	signature?: string;
+	redactedContent?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,6 +307,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		};
 
 		const blocks = output.content as Block[];
+		const reasoningState: ReasoningBlockState = createReasoningBlockState();
 		const thinkingParser = createInlineThinkingParser(blocks, output, stream);
 
 		try {
@@ -319,8 +338,10 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				...options,
 				profileArn: options.profileArn ?? credentials.profileArn,
 			});
+			const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
 			let requestBody: GenerateAssistantResponseRequest = {
 				conversationState,
+				...(additionalRequestFields && { additionalModelRequestFields: additionalRequestFields }),
 			};
 
 			const replacementPayload = await options?.onPayload?.(
@@ -447,12 +468,27 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						const ev = payload as AssistantResponseEvent;
 						const content = ev.content;
 						if (content) {
+							// Transition from reasoning to text: close active reasoning block
+							closeReasoningBlock(blocks, output, stream, reasoningState);
 							if (!firstTokenTime) firstTokenTime = Date.now();
 							if (!started) {
 								stream.push({ type: "start", partial: output });
 								started = true;
 							}
 							thinkingParser.push(content);
+						}
+						break;
+					}
+					case "reasoningContentEvent": {
+						const ev = payload as ReasoningContentEvent;
+						if (ev.text || ev.signature || ev.redactedContent) {
+							if (!firstTokenTime) firstTokenTime = Date.now();
+							if (!started) {
+								stream.push({ type: "start", partial: output });
+								started = true;
+							}
+							thinkingParser.flush();
+							parseReasoningContentEventHelper(ev, blocks, output, stream, reasoningState);
 						}
 						break;
 					}
@@ -463,6 +499,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 							stream.push({ type: "start", partial: output });
 							started = true;
 						}
+						// Transition from reasoning to tool: close active reasoning block
+						closeReasoningBlock(blocks, output, stream, reasoningState);
 						handleToolUseEvent(ev, blocks, output, stream, toolInputAccumulator, pendingToolCalls);
 						// Clear accumulator for completed tool
 						if (ev.stop) {
@@ -507,6 +545,9 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			}
 			thinkingParser.finish();
 
+			// Finalize active reasoning block if any
+			closeReasoningBlock(blocks, output, stream, reasoningState);
+
 			// Emit all pending tool call events (safe since no refusal occurred)
 			for (const { toolCall, index } of pendingToolCalls) {
 				stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
@@ -529,6 +570,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			stream.end();
 		} catch (error) {
 			thinkingParser.finish();
+			closeReasoningBlock(blocks, output, stream, reasoningState);
 			for (const block of output.content) {
 				delete (block as Block).index;
 				delete (block as Block).partialJson;
@@ -579,7 +621,8 @@ function buildConversationState(
 
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
-	const thinkingPrefix = buildKiroThinkingPrefix(options.reasoning);
+	const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const thinkingPrefix = additionalRequestFields ? "" : buildKiroThinkingPrefix(options.reasoning);
 	const baseSystemPrompt = context.systemPrompt?.join("\n") ?? "";
 	const systemPrompt = thinkingPrefix
 		? baseSystemPrompt
@@ -660,11 +703,13 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
+	const reasoningContent = kiroReasoningContentForReplay(msg.content);
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
+		} else if (block.type === "thinking") {
 		} else if (block.type === "toolCall") {
 			toolUses.push({
 				toolUseId: block.id,
@@ -677,6 +722,7 @@ function convertToWireMessage(
 		assistantResponseMessage: {
 			content: textParts.join("\n"),
 			...(toolUses.length > 0 ? { toolUses } : {}),
+			...(reasoningContent ? { reasoningContent } : {}),
 		},
 	};
 }
@@ -776,20 +822,23 @@ function createInlineThinkingParser(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
-): { push: (delta: string) => void; finish: () => void } {
+): { push: (delta: string) => void; flush: () => void; finish: () => void } {
 	const openTag = "<thinking>";
 	const closeTag = "</thinking>";
 	let pending = "";
+	// Lexical state (inside an unmatched <thinking>) is tracked separately from the emitted
+	// block so native reasoning can close the block without ending the inline region.
+	let inThinking = false;
 	let currentThinking: (ThinkingContent & { index: number }) | undefined;
 	let finished = false;
 
-	const startThinking = (): void => {
-		currentThinking = { type: "thinking", thinking: "", index: blocks.length };
-		blocks.push(currentThinking);
-		stream.push({ type: "thinking_start", contentIndex: currentThinking.index, partial: output });
-	};
 	const appendThinking = (delta: string): void => {
-		if (!currentThinking || delta.length === 0) return;
+		if (delta.length === 0) return;
+		if (!currentThinking) {
+			currentThinking = { type: "thinking", thinking: "", index: blocks.length };
+			blocks.push(currentThinking);
+			stream.push({ type: "thinking_start", contentIndex: currentThinking.index, partial: output });
+		}
 		currentThinking.thinking += delta;
 		stream.push({
 			type: "thinking_delta",
@@ -798,7 +847,7 @@ function createInlineThinkingParser(
 			partial: output,
 		});
 	};
-	const endThinking = (): void => {
+	const closeThinkingBlock = (): void => {
 		if (!currentThinking) return;
 		stream.push({
 			type: "thinking_end",
@@ -816,12 +865,12 @@ function createInlineThinkingParser(
 	};
 	const consume = (): void => {
 		while (pending.length > 0) {
-			if (!currentThinking) {
+			if (!inThinking) {
 				const start = pending.indexOf(openTag);
 				if (start >= 0) {
 					if (start > 0) handleTextDelta(pending.slice(0, start), blocks, output, stream);
 					pending = pending.slice(start + openTag.length);
-					startThinking();
+					inThinking = true;
 					continue;
 				}
 				const safeLength = pending.length - retainedSuffixLength(pending, openTag);
@@ -834,7 +883,8 @@ function createInlineThinkingParser(
 			if (end >= 0) {
 				appendThinking(pending.slice(0, end));
 				pending = pending.slice(end + closeTag.length);
-				endThinking();
+				closeThinkingBlock();
+				inThinking = false;
 				continue;
 			}
 			const safeLength = pending.length - retainedSuffixLength(pending, closeTag);
@@ -850,17 +900,26 @@ function createInlineThinkingParser(
 			pending += delta;
 			consume();
 		},
+		/** Close the emitted inline block before a native reasoning block; an open <thinking> region stays open. */
+		flush() {
+			if (finished) return;
+			if (inThinking) {
+				closeThinkingBlock();
+			} else if (pending.length > 0) {
+				handleTextDelta(pending, blocks, output, stream);
+				pending = "";
+			}
+		},
 		finish() {
 			if (finished) return;
 			finished = true;
-			if (currentThinking) {
+			if (inThinking) {
 				appendThinking(pending);
-				pending = "";
-				endThinking();
-			} else {
-				if (pending.length > 0) handleTextDelta(pending, blocks, output, stream);
-				pending = "";
+				closeThinkingBlock();
+			} else if (pending.length > 0) {
+				handleTextDelta(pending, blocks, output, stream);
 			}
+			pending = "";
 		},
 	};
 }
