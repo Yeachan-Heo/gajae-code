@@ -1277,6 +1277,7 @@ dependencies = [
 name = "gjc-desktop"
 version = "0.19.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tauri",
  "tauri-build",

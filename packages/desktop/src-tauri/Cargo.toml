@@ -18,3 +18,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+# Non-blocking pipe creation for the frame-transport regression test.
+libc = "0.2"

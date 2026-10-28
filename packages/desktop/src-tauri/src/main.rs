@@ -42,6 +42,9 @@ fn emit(app: &tauri::AppHandle, frame: Value) -> Result<(), String> {
 }
 
 fn fatal(app: &tauri::AppHandle, error: &str) {
+	// Engine failures otherwise exist only in the webview; keep them in the
+	// process log so a broken engine can be diagnosed after the app is gone.
+	eprintln!("desktop engine fatal: {error}");
 	let _ = emit(app, json!({"type": "fatal", "error": error}));
 }
 
@@ -83,6 +86,16 @@ async fn write_frame(stdin: &mut ChildStdin, bytes: &[u8]) -> Result<(), String>
 }
 
 async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle) -> String {
+	read_frames_from(stdout, |value| emit(&app, value)).await
+}
+
+/// Frame reader shared by the supervisor and its tests. `deliver` receives one
+/// complete frame at a time; the returned string is the terminal error, if any.
+async fn read_frames_from<R, F>(stdout: R, mut deliver: F) -> String
+where
+	R: tokio::io::AsyncRead + Unpin,
+	F: FnMut(Value) -> Result<(), String>,
+{
 	let mut reader = BufReader::new(stdout);
 	let mut frame = Vec::new();
 	loop {
@@ -109,9 +122,16 @@ async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle)
 					value
 				},
 				Ok(_) => return "Engine emitted an invalid frame envelope".into(),
-				Err(error) => return format!("Engine emitted invalid JSON: {error}"),
+				Err(error) => {
+					let head = String::from_utf8_lossy(&frame[..frame.len().min(160)]);
+					let tail = String::from_utf8_lossy(&frame[frame.len().saturating_sub(160)..]);
+					return format!(
+						"Engine emitted invalid JSON at {} bytes: {error}; head={head:?} tail={tail:?}",
+						frame.len()
+					);
+				},
 			};
-			if let Err(error) = emit(&app, value) {
+			if let Err(error) = deliver(value) {
 				return format!("Cannot deliver engine frame: {error}");
 			}
 			frame.clear();
@@ -379,6 +399,106 @@ async fn select_project(
 #[cfg(test)]
 mod tests {
 	use super::validate_auth_url;
+	use serde_json::{Value, json};
+	use std::pin::Pin;
+	use std::task::{Context, Poll};
+	use tokio::io::{AsyncRead, ReadBuf};
+
+	/// Feeds at most `limit` bytes per `poll_read`, the way a pipe hands the
+	/// reader an 8 KiB `BufReader` fill at a time.
+	struct Chunked {
+		data:  Vec<u8>,
+		at:    usize,
+		limit: usize,
+	}
+
+	impl AsyncRead for Chunked {
+		fn poll_read(
+			mut self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			buf: &mut ReadBuf<'_>,
+		) -> Poll<std::io::Result<()>> {
+			let remaining = self.data.len() - self.at;
+			if remaining == 0 {
+				return Poll::Ready(Ok(()));
+			}
+			let count = remaining.min(self.limit).min(buf.remaining());
+			let start = self.at;
+			let end = start + count;
+			buf.put_slice(&self.data[start..end]);
+			self.at = end;
+			Poll::Ready(Ok(()))
+		}
+	}
+
+	/// Fixture streams end with EOF, which the production reader reports as a
+	/// closed pipe; tests treat that terminator as a clean end.
+	async fn frames(input: &[u8], limit: usize) -> (String, Vec<Value>) {
+		let mut delivered = Vec::new();
+		let error = super::read_frames_from(
+			Chunked { data: input.to_vec(), at: 0, limit },
+			|value| {
+				delivered.push(value);
+				Ok(())
+			},
+		)
+		.await;
+		let error = if error == "Engine stdout closed unexpectedly" {
+			String::new()
+		} else {
+			error
+		};
+		(error, delivered)
+	}
+
+	#[tokio::test]
+	async fn delivers_a_frame_larger_than_a_pipe_buffer() {
+		let payload = "x".repeat(400_000);
+		let frame = json!({"type": "snapshot", "snapshot": {"blob": payload}});
+		let mut input = serde_json::to_vec(&frame).unwrap();
+		let expected = input.len();
+		input.push(b'\n');
+		for limit in [1024, 8192, 65_536, expected] {
+			let (error, delivered) = frames(&input, limit).await;
+			assert!(error.is_empty(), "limit {limit}: {error}");
+			assert_eq!(delivered.len(), 1, "limit {limit}");
+			assert_eq!(delivered[0], frame, "limit {limit}");
+		}
+	}
+
+	#[tokio::test]
+	async fn keeps_frame_order_and_boundaries() {
+		let first = json!({"type": "snapshot", "snapshot": {"blob": "y".repeat(200_000)}});
+		let second = json!({"type": "response", "id": "1", "ok": true, "result": null});
+		let third = json!({"type": "fatal", "error": "boom"});
+		let mut input = Vec::new();
+		for frame in [&first, &second, &third] {
+			input.extend(serde_json::to_vec(frame).unwrap());
+			input.push(b'\n');
+		}
+		let (error, delivered) = frames(&input, 8192).await;
+		assert!(error.is_empty(), "{error}");
+		assert_eq!(delivered, vec![first, second, third]);
+	}
+
+	#[tokio::test]
+	async fn rejects_truncated_json_and_unknown_envelopes() {
+		let (error, delivered) = frames(b"{\"type\":\"snapshot\",\"snapshot\":{\"blob\"\n", 8192).await;
+		assert!(error.starts_with("Engine emitted invalid JSON"), "{error}");
+		assert!(delivered.is_empty());
+		let (error, _) = frames(b"{\"type\":\"unexpected\"}\n", 8192).await;
+		assert_eq!(error, "Engine emitted an invalid frame envelope");
+	}
+
+	#[tokio::test]
+	async fn rejects_a_frame_over_the_limit() {
+		let mut input = b"{\"type\":\"fatal\",\"error\":\"".to_vec();
+		input.extend(std::iter::repeat_n(b'z', super::MAX_FRAME + 1));
+		input.extend(b"\"}");
+		let (error, delivered) = frames(&input, 65_536).await;
+		assert_eq!(error, "Engine frame exceeds 8 MiB");
+		assert!(delivered.is_empty());
+	}
 
 	#[cfg(unix)]
 	#[tokio::test]
