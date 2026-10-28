@@ -122,14 +122,16 @@ interface ConversationState {
 	history?: WireHistoryMessage[];
 	profileArn?: string;
 	customizationArn?: string;
-	/** Native thinking/reasoning for Claude models (output_config.effort). */
-	output_config?: { effort?: string };
-	/** Native thinking/reasoning for GPT models (reasoning.reasoning_effort). */
-	reasoning?: { reasoning_effort?: string };
 }
 
 interface GenerateAssistantResponseRequest {
 	conversationState: ConversationState;
+	additionalModelRequestFields?: {
+		/** Claude: native thinking configuration */
+		thinking?: { type: "adaptive"; display: "summarized" };
+		/** GPT: native reasoning effort */
+		reasoning?: { effort?: string };
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -327,12 +329,15 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			}
 
 			// Build request
+			const modelId = toKiroModelId(model.wireModelId || model.id);
 			const conversationState = buildConversationState(context, model, {
 				...options,
 				profileArn: options.profileArn ?? credentials.profileArn,
 			});
+			const additionalModelRequestFields = buildNativeThinkingFields(modelId, options.reasoning);
 			let requestBody: GenerateAssistantResponseRequest = {
 				conversationState,
+				...(additionalModelRequestFields && { additionalModelRequestFields }),
 			};
 
 			const replacementPayload = await options?.onPayload?.(
@@ -588,16 +593,43 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Build native thinking/reasoning fields based on model family.
- * Claude models use output_config.effort, GPT models use reasoning.reasoning_effort.
- * Falls back to prompt prefix if model family cannot be determined or is unsupported.
+ * Build native thinking/reasoning fields for additionalModelRequestFields.
+ * Claude models use thinking config, GPT models use reasoning.effort.
+ * Returns undefined if reasoning is not explicitly set.
  */
 function buildNativeThinkingFields(
 	modelId: string,
 	reasoning: Effort | boolean | undefined,
-): { output_config?: { effort?: string }; reasoning?: { reasoning_effort?: string } } {
-	if (!reasoning || reasoning === true) {
-		return {};
+):
+	| {
+			thinking?: { type: "adaptive"; display: "summarized" };
+			reasoning?: { effort?: string };
+	  }
+	| undefined {
+	// undefined: no field sent
+	if (reasoning === undefined) {
+		return undefined;
+	}
+
+	// Handle explicit false: reasoning disabled
+	if (reasoning === false) {
+		if (modelId.startsWith("gpt-")) {
+			// Explicitly disable reasoning for GPT
+			return { reasoning: { effort: "none" } };
+		}
+		// Claude doesn't have an explicit "disable" mechanism in the spec
+		return undefined;
+	}
+
+	if (reasoning === true) {
+		// Explicit true: enable thinking/reasoning without specific effort
+		if (modelId.startsWith("claude-")) {
+			return { thinking: { type: "adaptive", display: "summarized" } };
+		} else if (modelId.startsWith("gpt-")) {
+			// GPT with reasoning: true gets no explicit effort (service default)
+			return undefined;
+		}
+		return undefined;
 	}
 
 	// Normalize effort to string
@@ -605,7 +637,7 @@ function buildNativeThinkingFields(
 
 	// Detect model family from model ID
 	if (modelId.startsWith("claude-")) {
-		// Claude models use output_config.effort with mapped values
+		// Claude models use thinking with mapped values
 		const effortMap: Record<string, string> = {
 			minimal: "low",
 			low: "low",
@@ -616,10 +648,11 @@ function buildNativeThinkingFields(
 		};
 		const mappedEffort = effortMap[effortStr];
 		if (mappedEffort) {
-			return { output_config: { effort: mappedEffort } };
+			// Claude uses thinking config, effort is mapped but not explicitly sent
+			return { thinking: { type: "adaptive", display: "summarized" } };
 		}
 	} else if (modelId.startsWith("gpt-")) {
-		// OpenAI GPT models use reasoning.reasoning_effort
+		// OpenAI GPT models use reasoning.effort
 		const effortMap: Record<string, string> = {
 			minimal: "low",
 			low: "low",
@@ -630,12 +663,12 @@ function buildNativeThinkingFields(
 		};
 		const mappedEffort = effortMap[effortStr];
 		if (mappedEffort) {
-			return { reasoning: { reasoning_effort: mappedEffort } };
+			return { reasoning: { effort: mappedEffort } };
 		}
 	}
 
 	// Unknown model family falls back to prompt prefix (handled elsewhere)
-	return {};
+	return undefined;
 }
 
 function buildConversationState(
@@ -714,15 +747,11 @@ function buildConversationState(
 		currentMessage.userInputMessage.userInputMessageContext.tools = convertTools(context.tools);
 	}
 
-	// Build native thinking/reasoning fields based on model family
-	const nativeThinking = buildNativeThinkingFields(modelId, options.reasoning);
-
 	return {
 		chatTriggerType: "MANUAL",
 		currentMessage,
 		history: history.length > 0 ? history : undefined,
 		profileArn: options.profileArn,
-		...nativeThinking,
 	};
 }
 
@@ -886,7 +915,7 @@ function handleReasoningContent(
 	const isReasoningBlock = lastBlock?.type === "thinking" && lastBlock.thinkingSignature === "reasoning_content";
 
 	if (!isReasoningBlock) {
-		const newBlock: (ThinkingContent & { index: number; thinkingSignature?: string }) = {
+		const newBlock: ThinkingContent & { index: number; thinkingSignature?: string } = {
 			type: "thinking",
 			thinking: "",
 			index: blocks.length,

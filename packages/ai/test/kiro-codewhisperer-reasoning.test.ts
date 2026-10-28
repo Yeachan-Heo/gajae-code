@@ -166,50 +166,53 @@ describe("Kiro OAuth reasoning", () => {
 		expect(partialMarker.message.content).toEqual([{ type: "text", text: "literal <think" }]);
 	});
 
-	test("sends native thinking effort for Claude models", async () => {
+	test("sends native thinking config for Claude models", async () => {
 		const { request } = await runStream(["Answer"], { reasoning: Effort.High });
-		const conversationState = request.conversationState as {
-			output_config?: { effort?: string };
+		const additionalFields = request.additionalModelRequestFields as {
+			thinking?: { type: string; display: string };
 		};
 
-		// Claude models should use output_config.effort
-		expect(conversationState.output_config).toEqual({ effort: "high" });
+		// Claude models should use additionalModelRequestFields.thinking
+		expect(additionalFields.thinking).toEqual({ type: "adaptive", display: "summarized" });
 	});
 
-	test("maps reasoning efforts correctly for Claude models", async () => {
-		const effortTests: Array<[Effort | boolean, string | undefined]> = [
-			[Effort.Minimal, "low"],
-			[Effort.Low, "low"],
-			[Effort.Medium, "medium"],
-			[Effort.High, "high"],
-			[Effort.XHigh, "high"],
-			[Effort.Max, "high"],
-			[true, undefined],
+	test("sends thinking config for Claude models with any explicit effort", async () => {
+		const effortTests: Array<[Effort | boolean, boolean]> = [
+			[Effort.Minimal, true],
+			[Effort.Low, true],
+			[Effort.Medium, true],
+			[Effort.High, true],
+			[Effort.XHigh, true],
+			[Effort.Max, true],
+			[true, true],
+			[false, false], // explicit false: no thinking config
 		];
 
-		for (const [effort, expected] of effortTests) {
+		for (const [effort, shouldHaveThinking] of effortTests) {
 			const { request } = await runStream(["Answer"], { reasoning: effort });
-			const conversationState = request.conversationState as { output_config?: { effort?: string } };
+			const additionalFields = request.additionalModelRequestFields as {
+				thinking?: { type: string; display: string };
+			};
 
-			if (expected) {
-				expect(conversationState.output_config?.effort).toBe(expected);
+			if (shouldHaveThinking) {
+				expect(additionalFields.thinking).toEqual({ type: "adaptive", display: "summarized" });
 			} else {
-				expect(conversationState.output_config).toBeUndefined();
+				expect(additionalFields?.thinking).toBeUndefined();
 			}
 		}
 	});
 
 	test("sends native reasoning effort for GPT models", async () => {
 		const { request } = await runStream(["Answer"], { reasoning: Effort.High, model: gptModel });
-		const conversationState = request.conversationState as {
-			reasoning?: { reasoning_effort?: string };
+		const additionalFields = request.additionalModelRequestFields as {
+			reasoning?: { effort?: string };
 		};
 
-		// GPT models should use reasoning.reasoning_effort
-		expect(conversationState.reasoning).toEqual({ reasoning_effort: "high" });
+		// GPT models should use additionalModelRequestFields.reasoning.effort
+		expect(additionalFields.reasoning).toEqual({ effort: "high" });
 	});
 
-	test("maps reasoning efforts correctly for GPT models", async () => {
+	test("maps reasoning efforts correctly for GPT models and disables with effort: none", async () => {
 		const effortTests: Array<[Effort | boolean, string | undefined]> = [
 			[Effort.Minimal, "low"],
 			[Effort.Low, "low"],
@@ -217,18 +220,42 @@ describe("Kiro OAuth reasoning", () => {
 			[Effort.High, "high"],
 			[Effort.XHigh, "high"],
 			[Effort.Max, "high"],
-			[true, undefined],
+			[true, undefined], // true: no explicit effort
+			[false, "none"], // false: explicitly disable with effort: "none"
 		];
 
 		for (const [effort, expected] of effortTests) {
 			const { request } = await runStream(["Answer"], { reasoning: effort, model: gptModel });
-			const conversationState = request.conversationState as { reasoning?: { reasoning_effort?: string } };
+			const additionalFields = request.additionalModelRequestFields as {
+				reasoning?: { effort?: string };
+			};
 
 			if (expected) {
-				expect(conversationState.reasoning?.reasoning_effort).toBe(expected);
+				expect(additionalFields.reasoning?.effort).toBe(expected);
 			} else {
-				expect(conversationState.reasoning).toBeUndefined();
+				expect(additionalFields?.reasoning).toBeUndefined();
 			}
 		}
+	});
+
+	test("builds request with additionalModelRequestFields for thinking and reasoning", async () => {
+		// Test that the request is properly built with additionalModelRequestFields
+		const claudeRequest = await runStream(["Answer"], { reasoning: Effort.High });
+		expect(claudeRequest.request.additionalModelRequestFields).toBeDefined();
+		expect(claudeRequest.request.additionalModelRequestFields).toEqual({
+			thinking: { type: "adaptive", display: "summarized" },
+		});
+
+		const gptRequest = await runStream(["Answer"], { reasoning: Effort.High, model: gptModel });
+		expect(gptRequest.request.additionalModelRequestFields).toBeDefined();
+		expect(gptRequest.request.additionalModelRequestFields).toEqual({
+			reasoning: { effort: "high" },
+		});
+
+		// Test that effort: "none" is sent for GPT when reasoning is explicitly false
+		const gptDisabledRequest = await runStream(["Answer"], { reasoning: false, model: gptModel });
+		expect(gptDisabledRequest.request.additionalModelRequestFields).toEqual({
+			reasoning: { effort: "none" },
+		});
 	});
 });
