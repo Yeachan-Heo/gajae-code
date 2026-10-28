@@ -430,8 +430,11 @@ export class ProcessTerminal implements Terminal {
 		// Subscribe to Mode 2031 appearance change notifications.
 		// When the terminal reports a change, we re-query OSC 11 to get the
 		// actual background color (following Neovim convention) with 100ms debounce.
-		this.#safeWrite("\x1b[?2031h");
-		this.#stdinBuffer?.noteProbeIssued();
+		// Ensure raw mode is active before writing capability probe.
+		if (this.#ensureRawModeForProbe()) {
+			this.#safeWrite("\x1b[?2031h");
+			this.#stdinBuffer?.noteProbeIssued();
+		}
 
 		// Start periodic OSC 11 re-query for terminals without Mode 2031
 		// (Warp, Alacritty, WezTerm, iTerm2). Self-disables once Mode 2031 fires.
@@ -720,6 +723,13 @@ export class ProcessTerminal implements Terminal {
 			// that cache, so a repeated setRawMode(true) is a no-op in Node and Bun.
 			// Cycle through cooked mode synchronously to force a real raw-mode apply;
 			// no JavaScript or input callback can run between these two operations.
+			//
+			// On macOS + Warp and similar systems, after display sleep/wake or screen
+			// lock/unlock, the terminal driver's ECHO/ECHOCTL flags can be left on even
+			// though raw mode appears to be active. This forced cycle ensures the kernel
+			// re-applies raw mode with ECHO/ECHOCTL properly disabled before the probe is
+			// written. If raw mode is not re-established, the terminal's replies would be
+			// echoed in caret notation (e.g., ^[]11;rgb:...^G^[[?62c) to the screen.
 			process.stdin.setRawMode(false);
 			process.stdin.setRawMode(true);
 			// On Windows setRawMode() resets console input flags. Restore VT input so
@@ -842,6 +852,9 @@ export class ProcessTerminal implements Terminal {
 		if (!keyboardEnhancementEnabled()) {
 			return;
 		}
+		// Ensure raw mode is active before writing capability probe.
+		// After display sleep/wake, the terminal driver might have lost raw mode.
+		if (!this.#ensureRawModeForProbe()) return;
 		this.#safeWrite("\x1b[?u");
 		this.#stdinBuffer?.noteProbeIssued();
 		// Windows Terminal and Apple Terminal do not implement the Kitty keyboard
