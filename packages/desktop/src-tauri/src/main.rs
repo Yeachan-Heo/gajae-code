@@ -251,18 +251,7 @@ async fn supervise(
 	let _ = stopped.send(true);
 }
 
-#[tauri::command]
-async fn engine_request(
-	window: tauri::WebviewWindow,
-	engine: tauri::State<'_, Arc<Engine>>,
-	request: Value,
-) -> Result<(), String> {
-	if window.label() != "main" {
-		return Err("Only the main window may use the engine".into());
-	}
-	if engine.quitting.load(Ordering::Acquire) {
-		return Err("Desktop app is quitting".into());
-	}
+fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 	let object = request.as_object().ok_or("Invalid request envelope")?;
 	let id = object
 		.get("id")
@@ -303,6 +292,10 @@ async fn engine_request(
 			| "auth.answer"
 			| "auth.cancel"
 			| "question.answer"
+			| "command.list"
+			| "command.run"
+			| "history.get"
+			| "queue.cancel"
 			| "diff.get"
 			| "tools.list"
 			| "tools.set"
@@ -311,11 +304,27 @@ async fn engine_request(
 	) {
 		return Err("Unknown engine method".into());
 	}
-	let mut bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+	let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
 	if bytes.len() > MAX_FRAME {
 		return Err("Request exceeds 8 MiB".into());
 	}
 	bytes.push(b'\n');
+	Ok(bytes)
+}
+
+#[tauri::command]
+async fn engine_request(
+	window: tauri::WebviewWindow,
+	engine: tauri::State<'_, Arc<Engine>>,
+	request: Value,
+) -> Result<(), String> {
+	if window.label() != "main" {
+		return Err("Only the main window may use the engine".into());
+	}
+	if engine.quitting.load(Ordering::Acquire) {
+		return Err("Desktop app is quitting".into());
+	}
+	let bytes = encode_engine_request(&request)?;
 	let (reply, response) = oneshot::channel();
 	engine
 		.requests
@@ -398,11 +407,15 @@ async fn select_project(
 
 #[cfg(test)]
 mod tests {
-	use super::validate_auth_url;
+	use std::{
+		pin::Pin,
+		task::{Context, Poll},
+	};
+
 	use serde_json::{Value, json};
-	use std::pin::Pin;
-	use std::task::{Context, Poll};
 	use tokio::io::{AsyncRead, ReadBuf};
+
+	use super::{encode_engine_request, validate_auth_url};
 
 	/// Feeds at most `limit` bytes per `poll_read`, the way a pipe hands the
 	/// reader an 8 KiB `BufReader` fill at a time.
@@ -435,20 +448,79 @@ mod tests {
 	/// closed pipe; tests treat that terminator as a clean end.
 	async fn frames(input: &[u8], limit: usize) -> (String, Vec<Value>) {
 		let mut delivered = Vec::new();
-		let error = super::read_frames_from(
-			Chunked { data: input.to_vec(), at: 0, limit },
-			|value| {
+		let error =
+			super::read_frames_from(Chunked { data: input.to_vec(), at: 0, limit }, |value| {
 				delivered.push(value);
 				Ok(())
-			},
-		)
-		.await;
+			})
+			.await;
 		let error = if error == "Engine stdout closed unexpectedly" {
 			String::new()
 		} else {
 			error
 		};
 		(error, delivered)
+	}
+
+	#[test]
+	fn admits_every_advertised_host_method_through_the_native_encoder() {
+		let protocol = include_str!("../../../desktop-host/src/protocol.ts");
+		let methods = protocol
+			.split_once("export const DESKTOP_METHODS = [")
+			.expect("host protocol must declare its method catalog")
+			.1
+			.split_once("] as const;")
+			.expect("host method catalog must have a closing declaration")
+			.0;
+		let mut count = 0;
+		for line in methods
+			.lines()
+			.map(str::trim)
+			.filter(|line| !line.is_empty())
+		{
+			let method: String = serde_json::from_str(line.trim_end_matches(',')).unwrap();
+			let request = json!({"id": "native-contract", "method": method,
+				"params": {"sessionId": "native-owner", "text": "/usage", "offset": 0, "limit": 500}});
+			let bytes = encode_engine_request(&request).unwrap_or_else(|error| {
+				panic!("Advertised method {} was rejected: {error}", request["method"])
+			});
+			assert_eq!(bytes.last(), Some(&b'\n'));
+			assert_eq!(serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]).unwrap(), request);
+			count += 1;
+		}
+		assert!(count > 0, "method catalog must not be empty");
+	}
+
+	#[test]
+	fn refuses_unknown_methods_and_invalid_request_envelopes() {
+		assert!(
+			encode_engine_request(&json!({
+				"id": "𠮷".repeat(64), "method": "command.run", "params": {"text": "/usage"}
+			}))
+			.is_ok()
+		);
+		for (request, expected) in [
+			(
+				json!({"id": "native-contract", "method": "untrusted.execute", "params": {}}),
+				"Unknown engine method",
+			),
+			(
+				json!({"id": "native-contract", "method": "prompt", "params": []}),
+				"Request params must be an object",
+			),
+			(json!({"id": 1, "method": "prompt", "params": {}}), "Request id must be a string"),
+			(
+				json!({"id": "𠮷".repeat(65), "method": "prompt", "params": {}}),
+				"Request id exceeds 128 characters",
+			),
+			(
+				json!({"id": "native-contract", "method": "prompt", "params": {"text": "x".repeat(super::MAX_FRAME)}}),
+				"Request exceeds 8 MiB",
+			),
+			(json!([]), "Invalid request envelope"),
+		] {
+			assert_eq!(encode_engine_request(&request).err().as_deref(), Some(expected));
+		}
 	}
 
 	#[tokio::test]
@@ -483,7 +555,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn rejects_truncated_json_and_unknown_envelopes() {
-		let (error, delivered) = frames(b"{\"type\":\"snapshot\",\"snapshot\":{\"blob\"\n", 8192).await;
+		let (error, delivered) =
+			frames(b"{\"type\":\"snapshot\",\"snapshot\":{\"blob\"\n", 8192).await;
 		assert!(error.starts_with("Engine emitted invalid JSON"), "{error}");
 		assert!(delivered.is_empty());
 		let (error, _) = frames(b"{\"type\":\"unexpected\"}\n", 8192).await;
