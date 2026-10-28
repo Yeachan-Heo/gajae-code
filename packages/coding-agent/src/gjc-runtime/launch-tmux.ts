@@ -7,6 +7,7 @@ import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Args } from "../cli/args";
+import { dropProjectSuppliedHerdrBinPath } from "../main";
 import { prepareManagedDirectoryRoot } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
@@ -1528,6 +1529,8 @@ function emitOptionalProfileDiagnostics(profile: GjcTmuxProfileResult, diagnosti
 }
 
 export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
+	// Judge with this process's startup snapshot, including after a worktree chdir.
+	dropProjectSuppliedHerdrBinPath(context.env ?? process.env);
 	const env = context.env ?? process.env;
 	// Planning performs only applicability checks. It must precede both the ambient
 	// window rename and provider refusal so inapplicable root launches reach main
@@ -1636,6 +1639,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	};
 	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
 	const spawnEnv = { ...tmuxLaunchIdentityEnv(env, plan.cwd) };
+	dropProjectSuppliedHerdrBinPath(spawnEnv);
 	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	Object.assign(spawnEnv, signingEnv);

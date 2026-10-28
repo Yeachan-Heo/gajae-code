@@ -256,7 +256,9 @@ type PendingSaveSlot = {
 type DurableBatchRevision = {
 	patch: AtomicYamlPatch;
 	previousRevision: number | undefined;
+	previousReservation: DurableBatchRevision | undefined;
 	revision: number;
+	state: "pending" | "committed" | "failed";
 };
 type DurablePublication = {
 	notificationMutation: boolean;
@@ -741,6 +743,7 @@ export class Settings implements NotificationSettingsReader {
 	/** Runtime intent is separate from durable-path CAS ownership. */
 	#runtimeGeneration = 0;
 	#pathRevisions = new Map<string, number>();
+	#pendingDurableReservations = new Map<string, DurableBatchRevision>();
 	#nextRevision = 0;
 	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
 	#saveTimer?: NodeJS.Timeout;
@@ -1014,7 +1017,11 @@ export class Settings implements NotificationSettingsReader {
 		return structuredClone(this.#autoroutingEffective);
 	}
 
-	/** Synchronous live applicators finish before hooks and ordinary observers run. */
+	/**
+	 * Subscribe to effective-setting changes. The `apply` phase runs before schema hooks and
+	 * ordinary observers so a live applicator sees the restored state before an observer can
+	 * synchronously start a run.
+	 */
 	onChanged(listener: (path: SettingPath) => void, phase: "apply" | "observe" = "observe"): () => void {
 		const listeners = phase === "apply" ? this.#changeApplications : this.#changeListeners;
 		listeners.add(listener);
@@ -1034,8 +1041,6 @@ export class Settings implements NotificationSettingsReader {
 				}
 			}
 		};
-		// Publish the complete effective state to sessions before any observer can
-		// synchronously start a run, including observers installed before a session.
 		notify(this.#changeApplications);
 		for (const [settingPath, previousValue] of previous) {
 			const hook =
@@ -1485,7 +1490,14 @@ export class Settings implements NotificationSettingsReader {
 				const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 				const changes = new Map<
 					string,
-					{ before: unknown; beforeEffective: unknown; beforeHash: string; afterHash: string; revision: number }
+					{
+						before: unknown;
+						beforeEffective: unknown;
+						beforeHash: string;
+						afterHash: string;
+						beforeRevision: number;
+						revision: number;
+					}
 				>();
 				for (const patch of stagedPatches) {
 					if (!changes.has(patch.path)) {
@@ -1496,6 +1508,7 @@ export class Settings implements NotificationSettingsReader {
 								: undefined,
 							beforeHash: atomicYamlPathHash(this.#global, patch.path),
 							afterHash: "",
+							beforeRevision: this.#pathRevisions.get(patch.path) ?? 0,
 							revision: 0,
 						});
 					}
@@ -1573,7 +1586,13 @@ export class Settings implements NotificationSettingsReader {
 				);
 				let discarded = false;
 				const receipt: CasReceipt = {
-					revisions: [],
+					revisions: [...changes].map(([path, change]) => ({
+						path,
+						beforeHash: change.beforeHash,
+						afterHash: change.afterHash,
+						beforeRevision: change.beforeRevision,
+						afterRevision: change.revision,
+					})),
 					discard: () => {
 						discarded = true;
 					},
@@ -1612,12 +1631,7 @@ export class Settings implements NotificationSettingsReader {
 		this.#releasePendingSaveSlot();
 		const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 
-		const revisions = durablePatches.map(patch => ({
-			patch,
-			revision: ++this.#nextRevision,
-			previousRevision: this.#pathRevisions.get(patch.path),
-		}));
-		for (const entry of revisions) this.#pathRevisions.set(entry.patch.path, entry.revision);
+		const revisions = this.#reserveDurableBatch(durablePatches);
 
 		const commit = applyAtomicYamlPatches(this.#configPath, durablePatches, {
 			validateRoot: (root, currentPatches) =>
@@ -1633,14 +1647,10 @@ export class Settings implements NotificationSettingsReader {
 			const publication = this.#applyDurableBatch(revisions);
 			if (publication.supersededByOverlap) await this.#refreshAfterSupersededPublication();
 			this.#recordNotificationValidationBatchApply(notificationValidationGuard, publication.notificationMutation);
+			this.#settleDurableBatch(revisions, "committed");
 			return receipt;
 		} catch (error) {
-			for (const entry of revisions) {
-				if (this.#pathRevisions.get(entry.patch.path) === entry.revision) {
-					if (entry.previousRevision === undefined) this.#pathRevisions.delete(entry.patch.path);
-					else this.#pathRevisions.set(entry.patch.path, entry.previousRevision);
-				}
-			}
+			this.#settleDurableBatch(revisions, "failed");
 			await failureRefresh;
 			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 			throw error;
@@ -1714,12 +1724,7 @@ export class Settings implements NotificationSettingsReader {
 					throw changedWhilePreparing();
 				assertNonOverlappingAtomicYamlPatches(patches);
 				const durablePatches: AtomicYamlPatch[] = patches;
-				revisions = durablePatches.map(patch => ({
-					patch,
-					revision: ++this.#nextRevision,
-					previousRevision: this.#pathRevisions.get(patch.path),
-				}));
-				for (const entry of revisions) this.#pathRevisions.set(entry.patch.path, entry.revision);
+				revisions = this.#reserveDurableBatch(durablePatches);
 				return durablePatches;
 			},
 			{
@@ -1737,14 +1742,10 @@ export class Settings implements NotificationSettingsReader {
 			const publication = this.#applyDurableBatch(revisions);
 			if (publication.supersededByOverlap) await this.#refreshAfterSupersededPublication();
 			this.#recordNotificationValidationBatchApply(notificationValidationGuard, publication.notificationMutation);
+			this.#settleDurableBatch(revisions, "committed");
 			return receipt;
 		} catch (error) {
-			for (const entry of revisions) {
-				if (this.#pathRevisions.get(entry.patch.path) === entry.revision) {
-					if (entry.previousRevision === undefined) this.#pathRevisions.delete(entry.patch.path);
-					else this.#pathRevisions.set(entry.patch.path, entry.previousRevision);
-				}
-			}
+			this.#settleDurableBatch(revisions, "failed");
 			await failureRefresh;
 			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 			throw error;
@@ -1775,6 +1776,8 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	clearOverride(path: SettingPath): void {
 		const previous = this.get(path);
+		// Every explicit runtime mutation invalidates prepared builders, including a clear whose
+		// path had no own override: the caller's intent is a new runtime generation.
 		this.#runtimeGeneration++;
 		const segments = path.split(".");
 		let current: unknown = this.#overrides;
@@ -6549,6 +6552,49 @@ export class Settings implements NotificationSettingsReader {
 		if (!slot || slot.released) return;
 		slot.released = true;
 		slot.release();
+	}
+
+	#reserveDurableBatch(patches: readonly AtomicYamlPatch[]): DurableBatchRevision[] {
+		return patches.map(patch => {
+			const previousRevision = this.#pathRevisions.get(patch.path);
+			const pending = this.#pendingDurableReservations.get(patch.path);
+			const entry: DurableBatchRevision = {
+				patch,
+				previousRevision,
+				previousReservation: pending?.revision === previousRevision ? pending : undefined,
+				revision: ++this.#nextRevision,
+				state: "pending",
+			};
+			this.#pathRevisions.set(patch.path, entry.revision);
+			this.#pendingDurableReservations.set(patch.path, entry);
+			return entry;
+		});
+	}
+
+	#settleDurableBatch(revisions: readonly DurableBatchRevision[], state: "committed" | "failed"): void {
+		for (const entry of revisions) {
+			entry.state = state;
+			if (state === "committed") entry.previousReservation = undefined;
+		}
+		for (const entry of revisions) {
+			let previousRevision = entry.previousRevision;
+			let previous = entry.previousReservation;
+			// A later failed reservation must not reinstate an earlier failed one.
+			while (previous?.state === "failed") {
+				previousRevision = previous.previousRevision;
+				previous = previous.previousReservation;
+			}
+			if (state === "failed" && this.#pathRevisions.get(entry.patch.path) === entry.revision) {
+				if (previousRevision === undefined) this.#pathRevisions.delete(entry.patch.path);
+				else this.#pathRevisions.set(entry.patch.path, previousRevision);
+			}
+			if (this.#pendingDurableReservations.get(entry.patch.path) !== entry) continue;
+			if (state === "failed" && previous?.state === "pending") {
+				this.#pendingDurableReservations.set(entry.patch.path, previous);
+			} else {
+				this.#pendingDurableReservations.delete(entry.patch.path);
+			}
+		}
 	}
 
 	#applyDurableBatch(revisions: readonly DurableBatchRevision[]): DurablePublication {

@@ -2,12 +2,12 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
+import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
-import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
 
