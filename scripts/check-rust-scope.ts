@@ -144,7 +144,16 @@ if (ALLOWED_NON_CRATE_RUST_FILES.size > 0) {
 async function collectRelativeMatches(pattern: string): Promise<string[]> {
 	const glob = new Glob(pattern);
 	const matches: string[] = [];
-	for await (const match of glob.scan({ cwd: repoRoot, dot: true, onlyFiles: true })) {
+	const ignorePatterns = [
+		"artifacts/**",
+		".git/**",
+		".gjc/**",
+		".worktrees/**",
+		".wt/**",
+		"node_modules/**",
+		"target/**",
+	];
+	for await (const match of glob.scan({ cwd: repoRoot, dot: true, onlyFiles: true, ignore: ignorePatterns })) {
 		matches.push(normalizePath(match));
 	}
 	return matches.sort();
