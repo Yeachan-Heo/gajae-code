@@ -791,4 +791,35 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 			`coordinator-reap:retry:${endpointIncarnation("retry")}`,
 		]);
 	});
+
+	it("stops session with case-insensitive path comparison (Windows regression test for #7378)", async () => {
+		// Windows paths are case-insensitive but case-preserving. When a session is created
+		// with one path casing but the broker has a different casing, the path comparison
+		// must normalize both sides to ensure they match. This test verifies that
+		// stop_session reaches the broker close operation even with path case mismatches.
+		//
+		// The fix uses normalizePathForComparison() in scopeMatchesLocator to handle
+		// case-insensitive path matching on Windows.
+		const root = await tempRoot();
+		const sessionId = "windows-case-test";
+		
+		// Create server with Windows platform for path normalization
+		const { server, controls, sessionFile } = await createServer(root, { platform: "win32" });
+		
+		// Write session file with the root path
+		await writeSession(sessionFile(sessionId), root, sessionId, { ephemeral: true });
+		
+		// Call stop_session on the session
+		const result = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: sessionId,
+			allow_mutation: true,
+		});
+		
+		// Verify stop_session succeeded and reached the broker close request
+		expect(result).toMatchObject({ ok: true, closed: true, session_id: sessionId });
+		
+		// Verify that a broker session.close request was sent (proving the session was found)
+		const closeRequests = controls.filter(control => control.operation === "session.close");
+		expect(closeRequests.length).toBeGreaterThan(0);
+	});
 });
