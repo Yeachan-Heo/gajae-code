@@ -532,8 +532,8 @@ describe("Kiro native thinking support", () => {
 		expect(assistantHistoryMessages.length).toBeGreaterThan(0);
 
 		const assistantMsg = assistantHistoryMessages[0]?.assistantResponseMessage;
-		// The signature should be replayed as reasoningContent.thinkingSignature, NOT as a text tag
-		expect(assistantMsg?.reasoningContent?.thinkingSignature).toBe("sig_turn1");
+		// The signature should be replayed as reasoningContent.signature (matching the stream event format), NOT as a text tag
+		expect((assistantMsg?.reasoningContent as any)?.signature).toBe("sig_turn1");
 		// The content should NOT have text-based signature tags
 		expect(assistantMsg?.content).not.toContain("signature=");
 	});

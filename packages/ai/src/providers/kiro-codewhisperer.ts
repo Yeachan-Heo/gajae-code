@@ -37,6 +37,7 @@ import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
 import {
+	buildKiroAdditionalModelRequestFields,
 	buildKiroThinkingPrefix,
 	isKiroApiKey,
 	sanitizeKiroError,
@@ -53,46 +54,6 @@ import {
  * This trust assumption is safe in runtime contexts where globalThis.fetch is the
  * system-provided implementation and cannot be replaced after module load.
  */
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Model version parsing (for native thinking gating)
-// ─────────────────────────────────────────────────────────────────────────────
-
-type SemVer = { major: number; minor: number; patch: number };
-
-function parseSemVer(version: string): SemVer | null {
-	// Precomputed table for common versions (avoids allocation per-call)
-	const parsed = /^(\d+)(?:[.-](\d+))?(?:[.-](\d+))?$/.exec(version);
-	if (!parsed) return null;
-	return {
-		major: parseInt(parsed[1]!, 10),
-		minor: parseInt(parsed[2] ?? "0", 10),
-		patch: parseInt(parsed[3] ?? "0", 10),
-	};
-}
-
-function semverGte(left: SemVer | null, right: SemVer | null): boolean {
-	if (!left || !right) return !right;
-	if (left.major !== right.major) return left.major > right.major;
-	if (left.minor !== right.minor) return left.minor > right.minor;
-	return left.patch >= right.patch;
-}
-
-function parseAnthropicModel(modelId: string): { kind: "opus" | "sonnet" | "haiku" | "fable"; version: SemVer } | null {
-	const match = /claude-(opus|sonnet|fable|haiku)-(\d+(?:[.-]\d+)*)/.exec(modelId);
-	if (!match) return null;
-	const version = parseSemVer(match[2]!);
-	if (!version) return null;
-	return { kind: match[1] as "opus" | "sonnet" | "fable" | "haiku", version };
-}
-
-function parseOpenAIModel(modelId: string): { variant: string; version: SemVer } | null {
-	const match = /gpt-(\d+(?:\.\d+)*)(?:-(astra|codex|luna|sol|terra|mini|nano|max))?$/.exec(modelId);
-	if (!match) return null;
-	const version = parseSemVer(match[1]!);
-	if (!version) return null;
-	return { variant: match[2] ?? "base", version };
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider options
@@ -149,7 +110,7 @@ interface WireAssistantMessage {
 		content: string;
 		toolUses?: WireToolUse[];
 		reasoningContent?: {
-			thinkingSignature?: string;
+			signature?: string;
 		};
 	};
 }
@@ -634,63 +595,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Request building
-// ─────────────────────────────────────────────────────────────────────────────
-
-function buildKiroAdditionalModelRequestFields(
-	modelId: string,
-	options: KiroCodeWhispererOptions,
-): Record<string, unknown> | undefined {
-	const reasoning = options.reasoning;
-	// reasoning can be false (explicit off) or undefined (not requested)
-	if (reasoning === undefined) return undefined;
-
-	const claudeModel = parseAnthropicModel(modelId);
-	const gptModel = parseOpenAIModel(modelId);
-
-	// Claude (opus/sonnet 4.6+) → native adaptive thinking
-	if (
-		claudeModel &&
-		(claudeModel.kind === "opus" || claudeModel.kind === "sonnet") &&
-		semverGte(claudeModel.version, parseSemVer("4.6"))
-	) {
-		// Claude doesn't support explicit "off" for native thinking; only send fields when enabled
-		if (reasoning === false) return undefined;
-		const effortMap: Record<string, string> = {
-			true: "medium",
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: "max",
-		};
-		const effort = effortMap[typeof reasoning === "string" ? reasoning : "medium"] ?? "medium";
-		return {
-			thinking: { type: "adaptive", display: "summarized" },
-			output_config: { effort },
-		};
-	}
-
-	// GPT 5.6+ → native reasoning with effort
-	if (gptModel && semverGte(gptModel.version, parseSemVer("5.6"))) {
-		const effortMap: Record<string, string> = {
-			true: "medium",
-			false: "none", // Explicit off sends effort: "none"
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "high",
-			max: "high",
-		};
-		const effort = effortMap[typeof reasoning === "string" ? reasoning : String(reasoning)] ?? "medium";
-		return {
-			reasoning: { effort },
-		};
-	}
-
-	// Fallback: no native support, rely on system-prompt prefix
-	return undefined;
-}
-
 function buildConversationState(
 	context: Context,
 	model: Model<"kiro-codewhisperer-stream">,
@@ -709,7 +613,9 @@ function buildConversationState(
 
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
-	const thinkingPrefix = buildKiroThinkingPrefix(options.reasoning);
+	// Check if native fields will be sent; only prepend prefix if not
+	const nativeFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const thinkingPrefix = !nativeFields ? buildKiroThinkingPrefix(options.reasoning) : "";
 	const baseSystemPrompt = context.systemPrompt?.join("\n") ?? "";
 	const systemPrompt = thinkingPrefix
 		? baseSystemPrompt
@@ -767,14 +673,14 @@ function buildConversationState(
 		currentMessage.userInputMessage.userInputMessageContext.tools = convertTools(context.tools);
 	}
 
-	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(modelId, options);
+	// nativeFields already computed above for thinkingPrefix logic
 
 	return {
 		chatTriggerType: "MANUAL",
 		currentMessage,
 		history: history.length > 0 ? history : undefined,
 		profileArn: options.profileArn,
-		...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
+		...(nativeFields ? { additionalModelRequestFields: nativeFields } : {}),
 	};
 }
 
@@ -820,7 +726,7 @@ function convertToWireMessage(
 		assistantResponseMessage: {
 			content: textParts.join("\n"),
 			...(toolUses.length > 0 ? { toolUses } : {}),
-			...(reasoningSignature ? { reasoningContent: { thinkingSignature: reasoningSignature } } : {}),
+			...(reasoningSignature ? { reasoningContent: { signature: reasoningSignature } } : {}),
 		},
 	};
 }

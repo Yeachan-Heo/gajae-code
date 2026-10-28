@@ -117,9 +117,14 @@ describe("Kiro OAuth reasoning", () => {
 		};
 
 		expect(conversationState.profileArn).toBe(PROFILE_ARN);
+		// With native adaptive thinking support, prefix is not included (native fields are sent instead)
 		expect(conversationState.currentMessage.userInputMessage.content).toBe(
-			"<thinking_mode>enabled</thinking_mode><max_thinking_length>30000</max_thinking_length>\n\nSummarize this",
+			"Summarize this",
 		);
+		// Verify native thinking fields are sent
+		const additionalFields = conversationState.additionalModelRequestFields as any;
+		expect(additionalFields?.thinking?.type).toBe("adaptive");
+		expect(additionalFields?.output_config?.effort).toBe("high");
 		expect(message.content).toEqual([
 			{ type: "text", text: "Answer " },
 			{ type: "thinking", thinking: "private thought" },

@@ -855,19 +855,29 @@ export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined)
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
 }
 
-function buildKiroAdditionalModelRequestFields(
-	modelId: string,
-	options: KiroCodeWhispererOptions,
+/**
+ * Build native thinking fields for Kiro transport models.
+ * Exported so both API-key and CodeWhisperer transports use the same builder.
+ *
+ * @param model The model to build fields for
+ * @param reasoning The reasoning effort level requested by the caller
+ * @returns Native thinking fields if supported, undefined if fallback prefix should be used
+ */
+export function buildKiroAdditionalModelRequestFields(
+	model: Model<"kiro-codewhisperer-stream">,
+	reasoning: Effort | boolean | undefined,
 ): Record<string, unknown> | undefined {
-	const reasoning = options.reasoning;
-	if (!reasoning || !options.reasoning) return undefined;
+	// reasoning=undefined (not requested) → no native fields, use fallback prefix
+	if (reasoning === undefined) return undefined;
 
-	const isClaudeModel = modelId.includes("claude");
-	const isGptModel = modelId.includes("gpt-");
-	const isKimiModel = modelId.includes("kimi");
+	const modelId = model.id;
 
-	// Claude (opus/sonnet 4.6+, kimi-k3) → native adaptive thinking
-	if ((isClaudeModel || isKimiModel) && modelId >= "claude-sonnet-4.6") {
+	// Check if this is a Claude model with adaptive thinking support (4.6+)
+	const isClaudeAdaptive = /claude-(opus|sonnet)-(4-[6-9]|4-\d{2,}|[5-9]|\d{2,})/.test(modelId);
+	if (isClaudeAdaptive) {
+		// Claude doesn't support explicit "off" for native thinking; only send fields when enabled
+		if (reasoning === false) return undefined;
+		// Map effort directly without validation (model may not have thinking metadata enriched)
 		const effortMap: Record<string, string> = {
 			true: "medium",
 			low: "low",
@@ -876,15 +886,16 @@ function buildKiroAdditionalModelRequestFields(
 			xhigh: "xhigh",
 			max: "max",
 		};
-		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		const effort = effortMap[typeof reasoning === "string" ? reasoning : "medium"] ?? "medium";
 		return {
 			thinking: { type: "adaptive", display: "summarized" },
 			output_config: { effort },
 		};
 	}
 
-	// GPT 5.6/6 → native reasoning with effort
-	if (isGptModel && (modelId >= "gpt-5.6" || modelId.includes("gpt-6"))) {
+	// Check if this is a GPT model with native reasoning (5.6+ or 6+)
+	const isGptWithReasoning = /gpt-([6-9]|5[.-](1[0-9]|[6-9]))\b/.test(modelId);
+	if (isGptWithReasoning) {
 		const effortMap: Record<string, string> = {
 			true: "medium",
 			false: "none",
@@ -894,7 +905,7 @@ function buildKiroAdditionalModelRequestFields(
 			xhigh: "high",
 			max: "high",
 		};
-		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		const effort = effortMap[typeof reasoning === "string" ? reasoning : String(reasoning)] ?? "medium";
 		return {
 			reasoning: { effort },
 		};
@@ -910,7 +921,9 @@ function buildApiKeyRequest(
 	options: KiroCodeWhispererOptions,
 ): unknown {
 	const modelId = toKiroModelId(model.wireModelId || model.id);
-	const prefix = buildKiroThinkingPrefix(options.reasoning);
+	// Check if native fields will be sent; only prepend prefix if not
+	const nativeFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const prefix = !nativeFields ? buildKiroThinkingPrefix(options.reasoning) : "";
 	let systemPrompt = context.systemPrompt?.join("\n") ?? "";
 	if (prefix) systemPrompt = systemPrompt ? `${prefix}\n${systemPrompt}` : prefix;
 
@@ -921,16 +934,18 @@ function buildApiKeyRequest(
 		if (msg.role === "assistant") {
 			let content = "";
 			const toolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
+			let reasoningContent: { thinkingSignature?: string } | undefined;
 			for (const block of msg.content) {
 				if (typeof block === "string") content += block;
 				else if (block.type === "text") content += block.text;
 				else if (block.type === "thinking") {
-					// Replay thinking with signature if available
-					const sig = (block as any).thinkingSignature;
-					const thinkingTag = sig
-						? `<thinking signature="${sig}">${block.thinking}</thinking>`
-						: `<thinking>${block.thinking}</thinking>`;
-					content = `${thinkingTag}\n\n${content}`;
+					// Replay thinking with signature if available (for multi-turn native reasoning)
+					const thinkingBlock = block as ThinkingContent & { thinkingSignature?: string };
+					if (thinkingBlock.thinkingSignature) {
+						reasoningContent = { thinkingSignature: thinkingBlock.thinkingSignature };
+					}
+					// Include the thinking text in the message content as reference
+					content = `${thinkingBlock.thinking}\n\n${content}`;
 				} else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
@@ -939,11 +954,13 @@ function buildApiKeyRequest(
 					});
 				}
 			}
+			const assistantMsg: Record<string, unknown> = {
+				content,
+				...(toolUses.length > 0 ? { toolUses } : {}),
+				...(reasoningContent ? { reasoningContent: { signature: reasoningContent.thinkingSignature } } : {}),
+			};
 			history.push({
-				assistantResponseMessage: {
-					content,
-					...(toolUses.length > 0 ? { toolUses } : {}),
-				},
+				assistantResponseMessage: assistantMsg,
 			});
 		} else if (msg.role === "user") {
 			let content = extractText(msg);
@@ -1002,7 +1019,7 @@ function buildApiKeyRequest(
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
 
-	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(modelId, options);
+	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
 
 	return {
 		conversationState: {

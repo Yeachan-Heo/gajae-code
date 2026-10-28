@@ -1167,6 +1167,17 @@ function inferThinkingControlMode<TApi extends Api>(
 			}
 			return "budget";
 
+		case "kiro-codewhisperer-stream":
+			if (parsedModel.family === "anthropic") {
+				if (semverGte(parsedModel.version, "4.6")) {
+					return "anthropic-adaptive";
+				}
+				if (semverGte(parsedModel.version, "4.5")) {
+					return "anthropic-budget-effort";
+				}
+			}
+			return "effort";
+
 		default:
 			return "effort";
 	}
