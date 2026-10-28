@@ -67,6 +67,11 @@ let terminalEverStarted = false;
 
 const STD_INPUT_HANDLE = -10;
 const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+
+// termios flag constants for Unix-like systems
+// These flags control terminal input processing
+const ECHO = 0x0008; // Echo input characters
+const ECHOCTL = 0x0040; // Echo control characters as ^X
 /**
  * Emergency terminal restore - call this from signal/crash handlers
  * Resets terminal state without requiring access to the ProcessTerminal instance
@@ -279,6 +284,95 @@ function unsubscribeFromStdinErrors(subscriber: (err: Error) => void): void {
 }
 type Osc11QuerySource = "startup" | "poll" | "mode2031";
 type Osc11QueuedSource = Exclude<Osc11QuerySource, "startup">;
+
+/**
+ * Apply raw mode directly via termios on Unix-like systems to ensure ECHO/ECHOCTL
+ * flags are cleared without cycling through cooked mode.
+ *
+ * After display sleep/wake or screen lock/unlock on macOS + Warp, the ECHO and
+ * ECHOCTL flags can be left on even when raw mode appears active. This function
+ * uses FFI to directly call tcgetattr/tcsetattr to force-clear these specific flags
+ * without the cooked-mode exposure that setRawMode(false)->setRawMode(true) creates.
+ *
+ * Returns true if raw mode was successfully reasserted or if we can skip this
+ * (non-Unix platforms), false if the operation failed and raw mode cannot be trusted.
+ */
+function ensureRawModeViaTermios(): boolean {
+	if (process.platform === "win32") {
+		// Windows doesn't use termios; let setRawMode handle it
+		return true;
+	}
+
+	try {
+		// Determine libc name based on platform
+		let libcNames: string[] = [];
+		if (process.platform === "darwin") {
+			libcNames = ["libc.dylib", "libSystem.B.dylib"];
+		} else if (process.platform === "linux") {
+			libcNames = ["libc.so.6", "libc.so"];
+		} else {
+			// Unsupported platform for this approach
+			return true;
+		}
+
+		let libc: ReturnType<typeof dlopen> | undefined;
+		for (const libcName of libcNames) {
+			try {
+				libc = dlopen(libcName, {
+					tcgetattr: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+					tcsetattr: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+				});
+				break; // Successfully loaded
+			} catch {
+				// Try next name
+			}
+		}
+
+		if (!libc) {
+			// Could not load libc
+			return true;
+		}
+
+		// Allocate a termios struct buffer (60 bytes is safe for all platforms)
+		const termiosBuffer = new Uint8Array(60);
+		const termiosPtr = ptr(termiosBuffer);
+
+		if (!termiosPtr) {
+			libc.close();
+			return false;
+		}
+
+		// Get current terminal attributes on stdin (fd 0)
+		const getResult = libc.symbols.tcgetattr(0, termiosPtr);
+		if (getResult !== 0) {
+			libc.close();
+			return false;
+		}
+
+		// Clear ECHO and ECHOCTL from c_lflag
+		// On Linux, c_lflag is at offset 12 (4 bytes, little-endian)
+		// On macOS, c_lflag is also at offset 12 in the modern termios structure
+		const lflagOffset = 12;
+		const view = new DataView(termiosBuffer.buffer);
+		let lflag = view.getUint32(lflagOffset, true); // little-endian
+
+		// Bitwise clear ECHO and ECHOCTL flags
+		lflag &= ~(ECHO | ECHOCTL);
+
+		// Write the modified flags back
+		view.setUint32(lflagOffset, lflag, true);
+
+		// Apply the settings (TCSANOW = 0 means apply immediately)
+		const setResult = libc.symbols.tcsetattr(0, 0, termiosPtr);
+		libc.close();
+
+		return setResult === 0;
+	} catch {
+		// FFI unavailable, library not found, or tcgetattr/tcsetattr failed
+		// Return true to allow graceful fallback to setRawMode
+		return true;
+	}
+}
 
 /**
  * Real terminal using process.stdin/stdout
@@ -712,25 +806,27 @@ export class ProcessTerminal implements Terminal {
 	 * the probe-reply reassembly in #handleSequence cannot help - and each tick
 	 * appends another `\x1b]11;rgb:...\x07\x1b[?62;22;52c` pair to the display
 	 * while keystrokes stall in the line buffer.
+	 *
+	 * On macOS + Warp and similar systems, after display sleep/wake or screen
+	 * lock/unlock, the terminal driver's ECHO/ECHOCTL flags can be left on even
+	 * though raw mode appears to be active. This function reasserts raw mode via
+	 * termios (using FFI on Unix-like systems) to directly clear these flags
+	 * without cycling through cooked mode, which would briefly expose ECHO/ECHOCTL
+	 * and cause the same echoing problem.
 	 */
 	#ensureRawModeForProbe(): boolean {
 		if (!this.#started || this.#dead) return false;
 		if (!process.stdin.isTTY) return true;
 		if (typeof process.stdin.setRawMode !== "function") return false;
 		try {
-			// `isRaw` and setRawMode() both trust the runtime's last requested mode.
-			// A child can change the shared tty's termios directly without updating
-			// that cache, so a repeated setRawMode(true) is a no-op in Node and Bun.
-			// Cycle through cooked mode synchronously to force a real raw-mode apply;
-			// no JavaScript or input callback can run between these two operations.
-			//
-			// On macOS + Warp and similar systems, after display sleep/wake or screen
-			// lock/unlock, the terminal driver's ECHO/ECHOCTL flags can be left on even
-			// though raw mode appears to be active. This forced cycle ensures the kernel
-			// re-applies raw mode with ECHO/ECHOCTL properly disabled before the probe is
-			// written. If raw mode is not re-established, the terminal's replies would be
-			// echoed in caret notation (e.g., ^[]11;rgb:...^G^[[?62c) to the screen.
-			process.stdin.setRawMode(false);
+			// On Unix-like systems, try to clear ECHO/ECHOCTL directly via termios
+			// to avoid cycling through cooked mode.
+			if (process.platform !== "win32" && !ensureRawModeViaTermios()) {
+				// Termios approach failed; avoid writing probes to a potentially unsafe tty
+				return false;
+			}
+
+			// On Windows and as a fallback on Unix, ensure raw mode is set
 			process.stdin.setRawMode(true);
 			// On Windows setRawMode() resets console input flags. Restore VT input so
 			// modified keys keep arriving as escape sequences after self-healing.

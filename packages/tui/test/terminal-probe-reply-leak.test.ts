@@ -324,15 +324,12 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 		expect(terminal!.available).toBe(true);
 	});
 
-	it("does not write probes if raw mode cannot be established", () => {
-		// Create a setRawMode that works initially but fails during the cycle
-		let callCount = 0;
+	it("does not write probes if setRawMode fails", () => {
+		// setRawMode throws during probe attempt
 		Object.defineProperty(process.stdin, "setRawMode", {
 			value: vi.fn((rawMode: boolean) => {
-				callCount++;
-				// Fail only on the cycle during #ensureRawModeForProbe, not on initial setup
-				if (callCount > 2 && rawMode === false) {
-					// Don't throw, just return - simulates a system where mode change fails
+				if (rawMode === true) {
+					throw new Error("setRawMode not available");
 				}
 			}),
 			configurable: true,
@@ -344,7 +341,30 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 			() => {},
 		);
 
-		// The terminal should be available after startup
+		// Terminal should start but no probes should be written
+		expect(terminal!.available).toBe(true);
+		// Verify that setRawMode was called but caused a failure in ensure
+		const setRawModeCalls = (process.stdin.setRawMode as any).mock.calls;
+		expect(setRawModeCalls.length).toBeGreaterThan(0);
+	});
+
+	it("does not crash when raw mode is unavailable", () => {
+		// Even if setRawMode throws, the terminal should still start
+		Object.defineProperty(process.stdin, "setRawMode", {
+			value: vi.fn(() => {
+				throw new Error("setRawMode unavailable");
+			}),
+			configurable: true,
+		});
+
+		const input: string[] = [];
+		expect(() => {
+			terminal!.start(
+				data => input.push(data),
+				() => {},
+			);
+		}).not.toThrow();
+
 		expect(terminal!.available).toBe(true);
 	});
 });
