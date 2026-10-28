@@ -119,6 +119,7 @@ interface ConversationState {
 	history?: WireHistoryMessage[];
 	profileArn?: string;
 	customizationArn?: string;
+	additionalModelRequestFields?: Record<string, unknown>;
 }
 
 interface GenerateAssistantResponseRequest {
@@ -131,6 +132,10 @@ interface GenerateAssistantResponseRequest {
 
 interface AssistantResponseEvent {
 	content?: string;
+	reasoningContent?: {
+		signature?: string;
+		redactedContent?: string;
+	};
 }
 
 interface ToolUseEventPayload {
@@ -181,7 +186,11 @@ const DEFAULT_REGION = "us-east-1";
  */
 const KIRO_ORIGIN = "AI_EDITOR";
 
-type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
+type Block = (TextContent | ThinkingContent | ToolCall) & {
+	index?: number;
+	partialJson?: string;
+	thinkingSignature?: string;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Refusal handling (shared between bearer token and API-key paths)
@@ -454,6 +463,14 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 							}
 							thinkingParser.push(content);
 						}
+						// Capture reasoning content signature for replay in next turn
+						if (ev.reasoningContent?.signature) {
+							const thinkingBlocks = blocks.filter((b): b is ThinkingContent & Block => b.type === "thinking");
+							if (thinkingBlocks.length > 0) {
+								const lastThinking = thinkingBlocks[thinkingBlocks.length - 1];
+								(lastThinking as any).thinkingSignature = ev.reasoningContent.signature;
+							}
+						}
 						break;
 					}
 					case "toolUseEvent": {
@@ -561,6 +578,55 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 // Request building
 // ─────────────────────────────────────────────────────────────────────────────
 
+function buildKiroAdditionalModelRequestFields(
+	modelId: string,
+	options: KiroCodeWhispererOptions,
+): Record<string, unknown> | undefined {
+	const reasoning = options.reasoning;
+	if (!reasoning || !options.reasoning) return undefined;
+
+	const isClaudeModel = modelId.includes("claude");
+	const isGptModel = modelId.includes("gpt-");
+	const isKimiModel = modelId.includes("kimi");
+
+	// Claude (opus/sonnet 4.6+, kimi-k3) → native adaptive thinking
+	if ((isClaudeModel || isKimiModel) && modelId >= "claude-sonnet-4.6") {
+		const effortMap: Record<string, string> = {
+			true: "medium",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: "max",
+		};
+		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		return {
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort },
+		};
+	}
+
+	// GPT 5.6/6 → native reasoning with effort
+	if (isGptModel && (modelId >= "gpt-5.6" || modelId.includes("gpt-6"))) {
+		const effortMap: Record<string, string> = {
+			true: "medium",
+			false: "none",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "high",
+			max: "high",
+		};
+		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		return {
+			reasoning: { effort },
+		};
+	}
+
+	// Fallback: no native support, rely on system-prompt prefix
+	return undefined;
+}
+
 function buildConversationState(
 	context: Context,
 	model: Model<"kiro-codewhisperer-stream">,
@@ -637,11 +703,14 @@ function buildConversationState(
 		currentMessage.userInputMessage.userInputMessageContext.tools = convertTools(context.tools);
 	}
 
+	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(modelId, options);
+
 	return {
 		chatTriggerType: "MANUAL",
 		currentMessage,
 		history: history.length > 0 ? history : undefined,
 		profileArn: options.profileArn,
+		...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
 	};
 }
 
@@ -665,6 +734,13 @@ function convertToWireMessage(
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
+		} else if (block.type === "thinking") {
+			// Replay thinking as <thinking> tags with signature if available
+			const sig = (block as any).thinkingSignature;
+			const thinkingTag = sig
+				? `<thinking signature="${sig}">${block.thinking}</thinking>`
+				: `<thinking>${block.thinking}</thinking>`;
+			textParts.unshift(thinkingTag);
 		} else if (block.type === "toolCall") {
 			toolUses.push({
 				toolUseId: block.id,

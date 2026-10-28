@@ -855,6 +855,55 @@ export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined)
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
 }
 
+function buildKiroAdditionalModelRequestFields(
+	modelId: string,
+	options: KiroCodeWhispererOptions,
+): Record<string, unknown> | undefined {
+	const reasoning = options.reasoning;
+	if (!reasoning || !options.reasoning) return undefined;
+
+	const isClaudeModel = modelId.includes("claude");
+	const isGptModel = modelId.includes("gpt-");
+	const isKimiModel = modelId.includes("kimi");
+
+	// Claude (opus/sonnet 4.6+, kimi-k3) → native adaptive thinking
+	if ((isClaudeModel || isKimiModel) && modelId >= "claude-sonnet-4.6") {
+		const effortMap: Record<string, string> = {
+			true: "medium",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: "max",
+		};
+		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		return {
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort },
+		};
+	}
+
+	// GPT 5.6/6 → native reasoning with effort
+	if (isGptModel && (modelId >= "gpt-5.6" || modelId.includes("gpt-6"))) {
+		const effortMap: Record<string, string> = {
+			true: "medium",
+			false: "none",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "high",
+			max: "high",
+		};
+		const effort = effortMap[typeof reasoning === "boolean" ? String(reasoning) : (reasoning as string)] ?? "medium";
+		return {
+			reasoning: { effort },
+		};
+	}
+
+	// Fallback: no native support, rely on system-prompt prefix
+	return undefined;
+}
+
 function buildApiKeyRequest(
 	model: Model<"kiro-codewhisperer-stream">,
 	context: Context,
@@ -875,8 +924,14 @@ function buildApiKeyRequest(
 			for (const block of msg.content) {
 				if (typeof block === "string") content += block;
 				else if (block.type === "text") content += block.text;
-				else if (block.type === "thinking") content = `<thinking>${block.thinking}</thinking>\n\n${content}`;
-				else if (block.type === "toolCall") {
+				else if (block.type === "thinking") {
+					// Replay thinking with signature if available
+					const sig = (block as any).thinkingSignature;
+					const thinkingTag = sig
+						? `<thinking signature="${sig}">${block.thinking}</thinking>`
+						: `<thinking>${block.thinking}</thinking>`;
+					content = `${thinkingTag}\n\n${content}`;
+				} else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
 						toolUseId: block.id,
@@ -947,6 +1002,8 @@ function buildApiKeyRequest(
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
 
+	const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(modelId, options);
+
 	return {
 		conversationState: {
 			chatTriggerType: "MANUAL",
@@ -961,6 +1018,7 @@ function buildApiKeyRequest(
 				},
 			},
 			...(history.length > 0 ? { history } : {}),
+			...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
 		},
 		agentMode: "vibe",
 	};
