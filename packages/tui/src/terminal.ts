@@ -1,5 +1,6 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
+import { ensureRawModeViaTermios as nativeEnsureRawMode } from "@gajae-code/natives";
 import { $env, $flag, $pickenv } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
@@ -68,10 +69,6 @@ let terminalEverStarted = false;
 const STD_INPUT_HANDLE = -10;
 const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
 
-// termios flag constants for Unix-like systems
-// These flags control terminal input processing
-const ECHO = 0x0008; // Echo input characters
-const ECHOCTL = 0x0040; // Echo control characters as ^X
 /**
  * Emergency terminal restore - call this from signal/crash handlers
  * Resets terminal state without requiring access to the ProcessTerminal instance
@@ -286,12 +283,12 @@ type Osc11QuerySource = "startup" | "poll" | "mode2031";
 type Osc11QueuedSource = Exclude<Osc11QuerySource, "startup">;
 
 /**
- * Apply raw mode directly via termios on Unix-like systems to ensure ECHO/ECHOCTL
+ * Apply raw mode directly via termios on Unix-like systems to ensure ECHO/ECHOCTL/ICANON
  * flags are cleared without cycling through cooked mode.
  *
  * After display sleep/wake or screen lock/unlock on macOS + Warp, the ECHO and
  * ECHOCTL flags can be left on even when raw mode appears active. This function
- * uses FFI to directly call tcgetattr/tcsetattr to force-clear these specific flags
+ * calls the native termios handler to directly clear these specific flags
  * without the cooked-mode exposure that setRawMode(false)->setRawMode(true) creates.
  *
  * Returns true if raw mode was successfully reasserted or if we can skip this
@@ -304,73 +301,11 @@ function ensureRawModeViaTermios(): boolean {
 	}
 
 	try {
-		// Determine libc name based on platform
-		let libcNames: string[] = [];
-		if (process.platform === "darwin") {
-			libcNames = ["libc.dylib", "libSystem.B.dylib"];
-		} else if (process.platform === "linux") {
-			libcNames = ["libc.so.6", "libc.so"];
-		} else {
-			// Unsupported platform for this approach
-			return true;
-		}
-
-		let libc: ReturnType<typeof dlopen> | undefined;
-		for (const libcName of libcNames) {
-			try {
-				libc = dlopen(libcName, {
-					tcgetattr: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
-					tcsetattr: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
-				});
-				break; // Successfully loaded
-			} catch {
-				// Try next name
-			}
-		}
-
-		if (!libc) {
-			// Could not load libc
-			return true;
-		}
-
-		// Allocate a termios struct buffer (60 bytes is safe for all platforms)
-		const termiosBuffer = new Uint8Array(60);
-		const termiosPtr = ptr(termiosBuffer);
-
-		if (!termiosPtr) {
-			libc.close();
-			return false;
-		}
-
-		// Get current terminal attributes on stdin (fd 0)
-		const getResult = libc.symbols.tcgetattr(0, termiosPtr);
-		if (getResult !== 0) {
-			libc.close();
-			return false;
-		}
-
-		// Clear ECHO and ECHOCTL from c_lflag
-		// On Linux, c_lflag is at offset 12 (4 bytes, little-endian)
-		// On macOS, c_lflag is also at offset 12 in the modern termios structure
-		const lflagOffset = 12;
-		const view = new DataView(termiosBuffer.buffer);
-		let lflag = view.getUint32(lflagOffset, true); // little-endian
-
-		// Bitwise clear ECHO and ECHOCTL flags
-		lflag &= ~(ECHO | ECHOCTL);
-
-		// Write the modified flags back
-		view.setUint32(lflagOffset, lflag, true);
-
-		// Apply the settings (TCSANOW = 0 means apply immediately)
-		const setResult = libc.symbols.tcsetattr(0, 0, termiosPtr);
-		libc.close();
-
-		return setResult === 0;
-	} catch {
-		// FFI unavailable, library not found, or tcgetattr/tcsetattr failed
-		// Return true to allow graceful fallback to setRawMode
+		nativeEnsureRawMode();
 		return true;
+	} catch {
+		// Native call failed; allow graceful fallback to setRawMode
+		return false;
 	}
 }
 

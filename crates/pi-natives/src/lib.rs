@@ -65,6 +65,7 @@ pub mod recovery_fs;
 pub mod shell;
 pub mod summary;
 pub mod task;
+pub mod termios;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod text;

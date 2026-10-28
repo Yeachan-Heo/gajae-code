@@ -57,6 +57,7 @@ export const editParseApplyPatch = nativeBindings.editParseApplyPatch;
 export const editPatchApplyText = nativeBindings.editPatchApplyText;
 export const editSeekSequence = nativeBindings.editSeekSequence;
 export const encodeSixel = nativeBindings.encodeSixel;
+export const ensureRawModeViaTermios = nativeBindings.ensureRawModeViaTermios;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactReplacePath = nativeBindings.exactReplacePath;
 export const exactReplaceRetained = nativeBindings.exactReplaceRetained;

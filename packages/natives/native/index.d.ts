@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -1239,6 +1238,19 @@ export declare enum Ellipsis {
  * Returns an error if decoding, resizing, or SIXEL encoding fails.
  */
 export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, targetHeightPx: number): string
+
+/**
+ * Ensure raw mode by clearing ECHO, ECHOCTL, and ICANON flags on Unix-like systems.
+ *
+ * On Unix, directly clears the specified terminal flags via termios without
+ * cycling through cooked mode (which would briefly expose ECHO).
+ *
+ * On non-Unix platforms, does nothing.
+ *
+ * # Returns
+ * `Ok(())` on success or if not a TTY, or an error if the termios call fails.
+ */
+export declare function ensureRawModeViaTermios(): NapiResult<undefined>
 
 /**
  * Remove a directory tree only when a fresh descriptor-relative snapshot

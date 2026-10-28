@@ -588,7 +588,14 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 			rawModeCalls,
 			setRawModeMock,
 			isKernelRaw: () => kernelRaw,
-			setKernelCooked: () => (kernelRaw = false),
+			setKernelCooked: () => {
+				// When a child process changes kernel termios directly,
+				// it doesn't go through setRawMode, so runtimeRequestedRaw
+				// diverges from the kernel state. Reset it so the next
+				// setRawMode(true) call will actually update kernelRaw.
+				kernelRaw = false;
+				runtimeRequestedRaw = false; // Mismatch: request true, but runtime thinks false
+			},
 		};
 	}
 
@@ -636,7 +643,9 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 		process.stdin.emit("data", "\x1b[?1;2c");
 		vi.advanceTimersByTime(2000);
 
-		expect(rawModeCalls.slice(afterStart)).toEqual([false, true]);
+		// With native termios clearing, we no longer cycle through cooked mode,
+		// so we only see setRawMode(true) instead of [false, true].
+		expect(rawModeCalls.slice(afterStart)).toEqual([true]);
 
 		terminal.stop();
 	});
