@@ -62,6 +62,7 @@ describe("SDK package exports", () => {
 	it("loads the public SDK and bus package subpaths", () => {
 		expect(publicSdk.createAgentSession).toBeFunction();
 		expect(root.getSettingsCatalog).toBe(publicSdk.getSettingsCatalog);
+		expect(root.createNotificationsEditorOperations).toBe(publicSdk.createNotificationsEditorOperations);
 		expect(publicSdk.lifecycle.SessionLifecycleService).toBeFunction();
 		expect(publicSdk.lifecycle.SessionLifecycleService.prototype.lookup).toBeFunction();
 		expect(bus.createNotificationsExtension).toBeFunction();

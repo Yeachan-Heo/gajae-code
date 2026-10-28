@@ -1,19 +1,6 @@
 import chalk from "chalk";
 import type { CasReceipt } from "../../../src/config/atomic-yaml-patch";
 import { Settings } from "../../../src/config/settings";
-import type {
-	NotificationsConfigureCommitResult,
-	NotificationsEditorOperations,
-	NotificationsEditorPreferences,
-	NotificationsEditorSetupInput,
-	NotificationsEditorState,
-	NotificationsMutationResult,
-	NotificationsPreflightResult,
-	NotificationsProviderSetupInput,
-	NotificationsSaveInactiveResult,
-	PreparedNotificationProviderConfiguration,
-	PreparedTelegramConfiguration,
-} from "../../../src/modes/components/notifications-settings-editor";
 import { SettingsSelectorComponent } from "../../../src/modes/components/settings-selector";
 import { initTheme } from "../../../src/modes/theme/theme";
 import type { NotificationProvider } from "../../../src/sdk/bus/config";
@@ -28,6 +15,19 @@ import type {
 	NotificationSessionReconcileResult,
 	NotificationSessionStatus,
 } from "../../../src/sdk/bus/session-control";
+import type {
+	NotificationsConfigureCommitResult,
+	NotificationsEditorOperations,
+	NotificationsEditorPreferences,
+	NotificationsEditorSetupInput,
+	NotificationsEditorState,
+	NotificationsMutationResult,
+	NotificationsPreflightResult,
+	NotificationsProviderSetupInput,
+	NotificationsSaveInactiveResult,
+	PreparedNotificationProviderConfiguration,
+	PreparedTelegramConfiguration,
+} from "../../../src/sdk/notification-setup-contract";
 
 /**
  * Deterministic state contract for the Notifications settings visual-QA showcase.

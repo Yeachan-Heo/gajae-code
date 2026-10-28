@@ -30,15 +30,13 @@ import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import type { GjcRuntimeSnapshotProvider } from "../../extensibility/gjc-plugins/runtime-quarantine";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
+import type { NotificationsEditorOperations } from "../../sdk/notification-setup-contract";
 import { getTabBarTheme } from "../shared";
 import { resolveUiLanguage, type UiLanguage, uiString } from "../ui-language";
 import { DynamicBorder } from "./dynamic-border";
 import { DynamicThemeText } from "./dynamic-theme-text";
 import { GjcBundleSettingsComponent } from "./gjc-bundle-settings";
-import {
-	type NotificationsEditorOperations,
-	NotificationsSettingsEditorComponent,
-} from "./notifications-settings-editor";
+import { NotificationsSettingsEditorComponent } from "./notifications-settings-editor";
 import { createPetSelectItems, getPetUnavailableWarning, isPetAvailable } from "./pet-capability";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { normalizeProviderOrder } from "./provider-order-context";

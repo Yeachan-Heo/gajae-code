@@ -132,6 +132,34 @@ Typically you must provide only what you want to control:
   - `model` or `modelPattern` (if deterministic model selection matters)
   - `settings` (if you need isolated/test config)
 
+### Local notification setup
+
+`createNotificationsEditorOperations({ settings, session, sessionManager })` is
+the same trusted service used by the TUI. Mutations and external runtime actions
+require writable durable settings; memory-only settings cannot configure or start
+a notification daemon. Inactive saves reconcile the current session and report
+reconciliation failure separately from successful persistence.
+
+Keep prepared Telegram/provider configurations inside the trusted host. They are
+frozen, instance-bound, one-shot authority, not renderer JSON. Forward display data
+only, bind renderer actions to retained objects, discard on cancellation, and prepare
+a fresh draft after a consumed commit attempt. Forged/copied/foreign/replayed
+provider drafts return `invalid_draft` without saving bindings. Secret inputs use
+`NotificationSetupSecretValue`; never serialize them into renderer state or queries.
+
+Foreign or unknown Telegram daemon identity prevents activation, but permits an
+inactive save or discard. Active commit rechecks identity before writing without
+locking out external daemon changes. Single-file CAS restoration preserves newer
+writers; it does not make configuration and runtime activation cross-file atomic.
+Health/recovery strings and free-form daemon metadata redact configured provider
+tokens and their fingerprints. Unknown foreign secrets cannot be recognized reliably.
+
+Treat runtime-fence and restore-marker failures as degraded: a blocked reconnect
+can fail to establish a durable inactive marker. A restore-time marker conflict
+may not protect the restored identity or notify observers of retained markers, and
+a blocked reconnect after both receipts restore does not establish a marker for
+the restored identity. Successful persistence is not proof of successful activation.
+
 ## Session manager behavior (persistent vs in-memory)
 
 `AgentSession` always uses a `SessionManager`; behavior depends on which factory you use.
