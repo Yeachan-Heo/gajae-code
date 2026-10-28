@@ -71,6 +71,31 @@ If omitted, it resolves:
 - LSP integration (enabled by default)
 - `eventBus`: new `EventBus()` unless supplied
 
+### Settings catalog and layer provenance
+
+`getSettingsCatalog(settings)` returns a detached, read-only schema snapshot, not
+mutation authority or a managed operation. It includes schema paths, choices,
+scalar display values and `settings.getResolutionSnapshot()` provenance.
+Scalar origins follow `global < project < runtime`; `default` means the merged
+leaf is absent, including when a higher layer replaces its ancestor. `layers`
+lists permitted layers declaring the path, even when a higher ancestor replacement
+erases it. Object origin `layered` describes construction, not per-leaf provenance.
+`resolution.allowedLayers` describes merge policy, not filesystem write permission.
+
+All free-form strings and compound values are withheld, including endpoints,
+headers and command snippets. Secret-shaped paths are withheld using the shared
+SDK classifier. Only typed booleans, finite numbers and declared enums are displayed;
+withheld does not mean unset. UI metadata is not a promise that a terminal row is
+visible. Runtime choices report `host-required` and unaudited application timing
+reports `unclassified`. This catalog does not install a writer or replace the
+notification-atomic editor's ownership. Full settings UI parity remains incomplete.
+
+```ts
+import { getSettingsCatalog } from "@gajae-code/coding-agent/sdk";
+const catalog = getSettingsCatalog(session.settings);
+// durableStorage is storage capability, not an individual save receipt.
+```
+
 ### Atomic settings batches
 
 `settings.commitAtomicBatch(patches)` writes one file under a single-file CAS: the patch
