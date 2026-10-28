@@ -24,6 +24,7 @@ function makeComponent(
 ): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
+			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],

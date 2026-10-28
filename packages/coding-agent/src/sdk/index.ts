@@ -46,6 +46,7 @@ export * from "./notification-setup-contract";
 export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * as router from "./router";
+export * from "./routing-settings";
 export * from "./session";
 export * from "./session-directory";
 export * from "./settings-catalog";

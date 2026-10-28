@@ -19,7 +19,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { type SettingPath, settings } from "../../config/settings";
+import type { SettingPath, Settings } from "../../config/settings";
 import type {
 	SettingTab,
 	StatusLinePreset,
@@ -104,6 +104,7 @@ class SelectSubmenu extends Container {
 	#previewUpdateRequestId: number = 0;
 
 	constructor(
+		private readonly settings: Settings,
 		title: string,
 		description: string,
 		options: ReadonlyArray<SelectItem>,
@@ -128,7 +129,9 @@ class SelectSubmenu extends Container {
 		if (getPreview) {
 			this.addChild(new Spacer(1));
 			this.addChild(
-				new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
+				new DynamicThemeText(() =>
+					theme.fg("muted", uiString(this.settings.get("ui.language"), "settings.preview")),
+				),
 			);
 			this.#previewText = new Text(getPreview(), 0, 0);
 			this.addChild(this.#previewText);
@@ -143,7 +146,7 @@ class SelectSubmenu extends Container {
 		// Hint
 		this.addChild(new Spacer(1));
 		this.addChild(
-			new DynamicThemeText(() => theme.fg("dim", uiString(settings.get("ui.language"), "settings.selectHint"))),
+			new DynamicThemeText(() => theme.fg("dim", uiString(this.settings.get("ui.language"), "settings.selectHint"))),
 		);
 	}
 
@@ -282,12 +285,12 @@ function effectiveCustomSegments(
 	};
 }
 
-function getSavedUsageMode(): UsageMode {
+function getSavedUsageMode(settings: Settings): UsageMode {
 	const segmentOptions = settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
 	return segmentOptions.usage?.mode === "remaining" ? "remaining" : "used";
 }
 
-function getUsageModeSettings(mode: string): StatusLineSegmentOptions {
+function getUsageModeSettings(settings: Settings, mode: string): StatusLineSegmentOptions {
 	const normalizedMode: UsageMode = mode === "remaining" ? "remaining" : "used";
 	const segmentOptions = settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
 	return {
@@ -376,24 +379,25 @@ class StatusLineCustomEditor extends Container {
 	#textInput: TextInputSubmenu | undefined;
 
 	constructor(
+		private readonly settings: Settings,
 		private readonly callbacks: SettingsCallbacks,
 		private readonly done: (value?: string) => void,
 	) {
 		super();
-		const preset = settings.get("statusLine.preset");
+		const preset = this.settings.get("statusLine.preset");
 		const seeded = effectiveCustomSegments(
 			preset,
-			settings.get("statusLine.leftSegments"),
-			settings.get("statusLine.rightSegments"),
+			this.settings.get("statusLine.leftSegments"),
+			this.settings.get("statusLine.rightSegments"),
 		);
 		this.#draft = {
 			preset: "custom",
 			leftSegments: seeded.leftSegments,
 			rightSegments: seeded.rightSegments,
-			separator: settings.get("statusLine.separator"),
+			separator: this.settings.get("statusLine.separator"),
 			segmentOptions: effectiveSegmentOptions(
 				preset,
-				settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+				this.settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
 			),
 		};
 		this.#normalizeFocus();
@@ -1024,8 +1028,8 @@ class StatusLineCustomEditor extends Container {
 			rightSegments,
 			separator: this.#draft.separator,
 			segmentOptions: cloneSegmentOptions(this.#draft.segmentOptions),
-			sessionAccent: settings.get("statusLine.sessionAccent"),
-			maxRows: settings.get("statusLine.maxRows"),
+			sessionAccent: this.settings.get("statusLine.sessionAccent"),
+			maxRows: this.settings.get("statusLine.maxRows"),
 			previewHighlightSegment,
 			previewHighlightStyle: this.#picked ? "selected" : "focus",
 		};
@@ -1299,24 +1303,26 @@ class StatusLineCustomEditor extends Container {
 
 	#restorePreview(): void {
 		this.callbacks.onStatusLinePreview?.({
-			preset: settings.get("statusLine.preset"),
-			leftSegments: settings.get("statusLine.leftSegments"),
-			rightSegments: settings.get("statusLine.rightSegments"),
-			separator: settings.get("statusLine.separator"),
-			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
-			sessionAccent: settings.get("statusLine.sessionAccent"),
-			maxRows: settings.get("statusLine.maxRows"),
+			preset: this.settings.get("statusLine.preset"),
+			leftSegments: this.settings.get("statusLine.leftSegments"),
+			rightSegments: this.settings.get("statusLine.rightSegments"),
+			separator: this.settings.get("statusLine.separator"),
+			segmentOptions: cloneSegmentOptions(
+				this.settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+			),
+			sessionAccent: this.settings.get("statusLine.sessionAccent"),
+			maxRows: this.settings.get("statusLine.maxRows"),
 			previewHighlightSegment: undefined,
 		});
 	}
 
 	#save(): void {
-		const saved = commitInteractiveSettings(this.callbacks, () => {
-			settings.set("statusLine.preset", "custom");
-			settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
-			settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
-			settings.set("statusLine.separator", this.#draft.separator);
-			settings.set(
+		const saved = commitInteractiveSettings(this.settings, this.callbacks, () => {
+			this.settings.set("statusLine.preset", "custom");
+			this.settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
+			this.settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
+			this.settings.set("statusLine.separator", this.#draft.separator);
+			this.settings.set(
 				"statusLine.segmentOptions",
 				cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
 			);
@@ -1476,6 +1482,8 @@ function getSettingsTabs(language: UiLanguage): Tab[] {
  * Some settings (like thinking level) are managed by the session, not Settings.
  */
 export interface SettingsRuntimeContext {
+	/** Settings owned by the active session. */
+	settings: Settings;
 	/** Available thinking levels (from session) */
 	availableThinkingLevels: Effort[];
 	/** Current thinking level (from session) */
@@ -1560,7 +1568,7 @@ export interface SettingsCallbacks {
 	/** Called when settings panel is closed */
 	onCancel: () => void;
 }
-function commitInteractiveSettings(callbacks: SettingsCallbacks, commit: () => void): boolean {
+function commitInteractiveSettings(settings: Settings, callbacks: SettingsCallbacks, commit: () => void): boolean {
 	if (!settings.canWriteDurableConfig()) {
 		callbacks.onError?.(
 			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
@@ -1597,6 +1605,10 @@ export class SettingsSelectorComponent extends Container {
 	#activeSelectSubmenu: SelectSubmenu | null = null;
 	#activeModelProfileSubmenu: SelectSubmenu | null = null;
 
+	get settings(): Settings {
+		return this.context.settings;
+	}
+
 	constructor(
 		private readonly context: SettingsRuntimeContext,
 		private readonly callbacks: SettingsCallbacks,
@@ -1623,7 +1635,7 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	#language(): UiLanguage {
-		return resolveUiLanguage(settings.get("ui.language"));
+		return resolveUiLanguage(this.settings.get("ui.language"));
 	}
 
 	#createTabBar(initialIndex = 0): TabBar {
@@ -1717,7 +1729,7 @@ export class SettingsSelectorComponent extends Container {
 	 */
 	#defToItem(def: SettingDef): SettingItem | null {
 		// Check condition: applies to every variant — booleans, enums, submenus, text inputs.
-		if (def.condition && !def.condition()) {
+		if (def.condition && !def.condition(this.settings)) {
 			return null;
 		}
 
@@ -1762,7 +1774,7 @@ export class SettingsSelectorComponent extends Container {
 					id: def.path,
 					label,
 					description,
-					currentValue: `${normalizeProviderOrder(settings.getGlobal("modelProviderOrder") ?? []).length} configured`,
+					currentValue: `${normalizeProviderOrder(this.settings.getGlobal("modelProviderOrder") ?? []).length} configured`,
 					submenu: (_currentValue, done) => {
 						const editor = createEditor(() => {
 							this.#activeProviderOrderEditor = null;
@@ -1793,7 +1805,7 @@ export class SettingsSelectorComponent extends Container {
 	 * Get the current value for a setting.
 	 */
 	#getCurrentValue(def: SettingDef): unknown {
-		return settings.get(def.path);
+		return this.settings.get(def.path);
 	}
 
 	#getSubmenuCurrentValue(path: SettingPath, value: unknown): string {
@@ -1889,16 +1901,16 @@ export class SettingsSelectorComponent extends Container {
 			};
 			onPreviewEnd = endStatusLinePreview;
 			onPreviewCancel = () => {
-				const currentPreset = settings.get("statusLine.preset");
+				const currentPreset = this.settings.get("statusLine.preset");
 				const presetDef = getPreset(currentPreset);
 				const savedCustomSettings =
 					currentPreset === "custom"
 						? {
-								leftSegments: settings.get("statusLine.leftSegments"),
-								rightSegments: settings.get("statusLine.rightSegments"),
-								separator: settings.get("statusLine.separator"),
+								leftSegments: this.settings.get("statusLine.leftSegments"),
+								rightSegments: this.settings.get("statusLine.rightSegments"),
+								separator: this.settings.get("statusLine.separator"),
 								segmentOptions: cloneSegmentOptions(
-									settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+									this.settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
 								),
 							}
 						: {};
@@ -1920,7 +1932,7 @@ export class SettingsSelectorComponent extends Container {
 			};
 			onPreviewEnd = endStatusLinePreview;
 			onPreviewCancel = () => {
-				const separator = settings.get("statusLine.separator");
+				const separator = this.settings.get("statusLine.separator");
 				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
 				this.#updateStatusPreview();
 			};
@@ -1933,7 +1945,7 @@ export class SettingsSelectorComponent extends Container {
 			onPreviewEnd = endStatusLinePreview;
 			onPreviewCancel = () => {
 				this.callbacks.onStatusLinePreview?.({
-					maxRows: settings.get("statusLine.maxRows"),
+					maxRows: this.settings.get("statusLine.maxRows"),
 					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
@@ -1960,6 +1972,7 @@ export class SettingsSelectorComponent extends Container {
 			done(value);
 		};
 		submenu = new SelectSubmenu(
+			this.settings,
 			title,
 			description,
 			options,
@@ -1974,7 +1987,7 @@ export class SettingsSelectorComponent extends Container {
 					// The theme commit persists through the controller, so it must honor
 					// the same invalid-config guard as every other durable write: report
 					// the repair error and leave the submenu open instead of no-oping.
-					if (!settings.canWriteDurableConfig()) {
+					if (!this.settings.canWriteDurableConfig()) {
 						this.callbacks.onError?.(
 							"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
 						);
@@ -1992,7 +2005,7 @@ export class SettingsSelectorComponent extends Container {
 					// surface must not persist ahead of that result.
 					let accepted = false;
 					if (
-						!commitInteractiveSettings(this.callbacks, () => {
+						!commitInteractiveSettings(this.settings, this.callbacks, () => {
 							accepted = this.callbacks.onPetCommit?.(value) ?? false;
 						})
 					) {
@@ -2001,7 +2014,8 @@ export class SettingsSelectorComponent extends Container {
 					finish(accepted ? value : undefined);
 					return;
 				}
-				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
+				if (!commitInteractiveSettings(this.settings, this.callbacks, () => this.#setSettingValue(def.path, value)))
+					return;
 				this.callbacks.onChange(def.path, value);
 				if (def.path === "ui.language") this.#refreshTabBarLanguage();
 				onPreviewEnd?.();
@@ -2041,9 +2055,14 @@ export class SettingsSelectorComponent extends Container {
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
 				// Keep the stored string only when this field was never edited.
-				const stored = settings.get(def.path);
+				const stored = this.settings.get(def.path);
 				const committed = !edited && (typeof stored === "string" || typeof stored === "number") ? stored : value;
-				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, committed))) return;
+				if (
+					!commitInteractiveSettings(this.settings, this.callbacks, () =>
+						this.#setSettingValue(def.path, committed),
+					)
+				)
+					return;
 				this.callbacks.onChange(def.path, committed);
 				wrappedDone(committed, edited);
 			},
@@ -2056,17 +2075,17 @@ export class SettingsSelectorComponent extends Container {
 	 */
 	#setSettingValue(path: SettingPath, value: string): void {
 		// Handle number conversions
-		const currentValue = settings.get(path);
+		const currentValue = this.settings.get(path);
 		if (path === "compaction.thresholdPercent" && value === "default") {
-			settings.set(path, -1 as never);
+			this.settings.set(path, -1 as never);
 		} else if (path === "compaction.thresholdTokens" && value === "default") {
-			settings.set(path, -1 as never);
+			this.settings.set(path, -1 as never);
 		} else if (typeof currentValue === "number") {
-			settings.set(path, Number(value) as never);
+			this.settings.set(path, Number(value) as never);
 		} else if (typeof currentValue === "boolean") {
-			settings.set(path, (value === "true") as never);
+			this.settings.set(path, (value === "true") as never);
 		} else {
-			settings.set(path, value as never);
+			this.settings.set(path, value as never);
 		}
 	}
 
@@ -2096,10 +2115,10 @@ export class SettingsSelectorComponent extends Container {
 			getSettingsListTheme(),
 			(id, newValue) => {
 				if (id === STATUS_LINE_USAGE_MODE_ID) {
-					const segmentOptions = getUsageModeSettings(newValue);
+					const segmentOptions = getUsageModeSettings(this.settings, newValue);
 					if (
-						!commitInteractiveSettings(this.callbacks, () => {
-							settings.set("statusLine.segmentOptions", segmentOptions as Record<string, unknown>);
+						!commitInteractiveSettings(this.settings, this.callbacks, () => {
+							this.settings.set("statusLine.segmentOptions", segmentOptions as Record<string, unknown>);
 						})
 					) {
 						this.#refreshCurrentTabItems(defs);
@@ -2120,7 +2139,11 @@ export class SettingsSelectorComponent extends Container {
 
 				if (def.type === "boolean") {
 					const boolValue = newValue === "true";
-					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, boolValue as never))) {
+					if (
+						!commitInteractiveSettings(this.settings, this.callbacks, () =>
+							this.settings.set(path, boolValue as never),
+						)
+					) {
 						this.#refreshCurrentTabItems(defs);
 						return;
 					}
@@ -2130,7 +2153,11 @@ export class SettingsSelectorComponent extends Container {
 						this.#triggerStatusLinePreview();
 					}
 				} else if (def.type === "enum") {
-					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, newValue as never))) {
+					if (
+						!commitInteractiveSettings(this.settings, this.callbacks, () =>
+							this.settings.set(path, newValue as never),
+						)
+					) {
 						this.#refreshCurrentTabItems(defs);
 						return;
 					}
@@ -2153,7 +2180,7 @@ export class SettingsSelectorComponent extends Container {
 		const container = new Container();
 		container.addChild(new Spacer(1));
 		container.addChild(
-			new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
+			new DynamicThemeText(() => theme.fg("muted", uiString(this.settings.get("ui.language"), "settings.preview"))),
 		);
 		this.#statusPreviewText = new Text(this.#getStatusPreviewString(), 0, 0);
 		container.addChild(this.#statusPreviewText);
@@ -2228,7 +2255,7 @@ export class SettingsSelectorComponent extends Container {
 				currentValue: "open",
 				submenu: (_currentValue, done) => {
 					this.#hideStatusPreview();
-					return new StatusLineCustomEditor(customEditorCallbacks, value => {
+					return new StatusLineCustomEditor(this.settings, customEditorCallbacks, value => {
 						this.#showStatusPreview();
 						done(value);
 					});
@@ -2245,7 +2272,7 @@ export class SettingsSelectorComponent extends Container {
 					id: STATUS_LINE_USAGE_MODE_ID,
 					label: "Status Line Usage Mode",
 					description: "Show provider quota in the status line as used or remaining.",
-					currentValue: getSavedUsageMode(),
+					currentValue: getSavedUsageMode(this.settings),
 					values: [...USAGE_MODE_VALUES],
 				};
 				if (presetIndex >= 0) {
@@ -2281,12 +2308,14 @@ export class SettingsSelectorComponent extends Container {
 	 */
 	#triggerStatusLinePreview(): void {
 		const statusLineSettings: StatusLinePreviewSettings = {
-			preset: settings.get("statusLine.preset"),
-			leftSegments: settings.get("statusLine.leftSegments"),
-			rightSegments: settings.get("statusLine.rightSegments"),
-			separator: settings.get("statusLine.separator"),
-			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
-			sessionAccent: settings.get("statusLine.sessionAccent"),
+			preset: this.settings.get("statusLine.preset"),
+			leftSegments: this.settings.get("statusLine.leftSegments"),
+			rightSegments: this.settings.get("statusLine.rightSegments"),
+			separator: this.settings.get("statusLine.separator"),
+			segmentOptions: cloneSegmentOptions(
+				this.settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+			),
+			sessionAccent: this.settings.get("statusLine.sessionAccent"),
 			previewHighlightSegment: undefined,
 		};
 		this.callbacks.onStatusLinePreview?.(statusLineSettings);
