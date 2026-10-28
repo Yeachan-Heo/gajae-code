@@ -160,6 +160,32 @@ may not protect the restored identity or notify observers of retained markers, a
 a blocked reconnect after both receipts restore does not establish a marker for
 the restored identity. Successful persistence is not proof of successful activation.
 
+### Smart-routing intents and live sampling
+
+`createRoutingSettingsService({ settings, getCatalog, getProviderOrder, isScoped,
+activate })` exposes the same preview/apply/refresh/clear/enable intents used by the
+TUI. Keep previews inside the trusted host: their display fields are detached from
+instance-bound authority, and copied/forged/foreign/discarded previews cannot authorize
+writes. Hand-edit confirmation is bound to the exact guarded state and refresh proof;
+catalog drift or intervening edits require fresh review instead of silent replacement.
+The host must serialize scope changes through each operation's completion.
+
+Refresh regenerates global configuration from the current provider order. Effective
+project/runtime overlays remain distinct from persisted global state. Outcomes report
+`durability` and `activation` separately; activation-notification failure attempts
+single-file CAS restore, preserving newer writers. Restore conflict/failure invalidates
+shared authority on that Settings instance; opening another service over stale Settings
+does not regain write authority. Reload durable Settings before fresh review. Failed
+post-commit view refresh is not evidence that persistence failed.
+
+Sampling changes to `temperature`, `topP`, `topK`, `minP`, `presencePenalty` and
+`repetitionPenalty` now reach sessions through Settings' synchronous `apply` phase,
+before schema hooks or ordinary observers can start a run. In-flight model runs retain
+their captured sampling; later runs use the newly effective values. These six catalog
+entries therefore report `next-run`; other unaudited application timing stays
+`unclassified`. Session disposal unregisters the listener. Settings UI reads and writes
+the active session's Settings rather than a process-global singleton.
+
 ## Session manager behavior (persistent vs in-memory)
 
 `AgentSession` always uses a `SessionManager`; behavior depends on which factory you use.
