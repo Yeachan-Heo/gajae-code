@@ -384,7 +384,12 @@ export class ProcessTerminal implements Terminal {
 		// Save previous state and enable raw mode
 		this.#wasRaw = process.stdin.isRaw || false;
 		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(true);
+			try {
+				process.stdin.setRawMode(true);
+			} catch {
+				// setRawMode failed; allow terminal to start without raw mode.
+				// Probes will be skipped later in #ensureRawModeForProbe.
+			}
 		}
 		// Do NOT setEncoding("utf8"): raw stdin chunks may split a multi-byte
 		// UTF-8 character across reads, and Bun's raw-TTY string decoding does
@@ -1054,7 +1059,11 @@ export class ProcessTerminal implements Terminal {
 
 		// Restore raw mode state
 		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(this.#wasRaw);
+			try {
+				process.stdin.setRawMode(this.#wasRaw);
+			} catch {
+				// setRawMode failed; cleanup proceeds anyway.
+			}
 		}
 		flushTerminalOutput();
 	}

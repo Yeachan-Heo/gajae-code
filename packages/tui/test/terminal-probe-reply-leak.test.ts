@@ -325,7 +325,7 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 	});
 
 	it("does not write probes if setRawMode fails", () => {
-		// setRawMode throws during probe attempt
+		// setRawMode throws when enabling raw mode (called with true during startup)
 		Object.defineProperty(process.stdin, "setRawMode", {
 			value: vi.fn((rawMode: boolean) => {
 				if (rawMode === true) {
@@ -341,15 +341,20 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 			() => {},
 		);
 
-		// Terminal should start but no probes should be written
+		// Terminal should start even though setRawMode(true) failed
 		expect(terminal!.available).toBe(true);
-		// Verify that setRawMode was called but caused a failure in ensure
+		// Verify that setRawMode was called during startup
 		const setRawModeCalls = (process.stdin.setRawMode as any).mock.calls;
 		expect(setRawModeCalls.length).toBeGreaterThan(0);
+		
+		// Cleanup should also not throw when restoring raw mode
+		expect(() => {
+			terminal!.stop();
+		}).not.toThrow();
 	});
 
 	it("does not crash when raw mode is unavailable", () => {
-		// Even if setRawMode throws, the terminal should still start
+		// Even if setRawMode throws, the terminal should still start and stop
 		Object.defineProperty(process.stdin, "setRawMode", {
 			value: vi.fn(() => {
 				throw new Error("setRawMode unavailable");
@@ -366,5 +371,10 @@ describe("ProcessTerminal raw-mode probe ordering", () => {
 		}).not.toThrow();
 
 		expect(terminal!.available).toBe(true);
+		
+		// Cleanup should also not throw even though setRawMode is unavailable
+		expect(() => {
+			terminal!.stop();
+		}).not.toThrow();
 	});
 });
