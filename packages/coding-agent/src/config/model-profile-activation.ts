@@ -6,6 +6,7 @@ import type {
 	AgentSession,
 	AgentSessionProfileInstalledOverrideState,
 	DefaultFallbackRuntimeState,
+	PreparedProfileModelSelection,
 } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
@@ -91,6 +92,7 @@ type ModelProfileActivationSession = Pick<
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
 	getUserCanonicalVariantSelection?: () => UserCanonicalVariantSelection;
 	getUserModelSelectionRevision?: () => number;
+	getThinkingLevelMutationRevision?: () => number;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
@@ -129,6 +131,7 @@ type ConfiguredModelChainState = {
 type PublishedModelProfileActivationState = {
 	model: Model<Api> | undefined;
 	thinkingLevel: ThinkingLevel | undefined;
+	thinkingIntentRevision: number | undefined;
 	modelRolesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	agentModelOverridesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	defaultChainState: ConfiguredModelChainState | undefined;
@@ -195,6 +198,8 @@ export interface ApplyModelProfileActivationOptions {
 	observedOwnership?: DurableModelProfileOwnership;
 	/** Recheck request intent under the durable lock, then again before synchronous publication. */
 	validateCurrent?: (durableCommitted: boolean) => void;
+	/** Snapshot only activation-owned state, before asynchronous finishing can admit unrelated intent. */
+	onRuntimePublished?: () => void;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -241,11 +246,10 @@ export interface PreparedModelProfileActivation {
 	previousDefaultChain: readonly string[] | undefined;
 	previousDefaultChainState: ConfiguredModelChainState | undefined;
 	previousProfileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
-	preparedDefaultModelSelection:
-		| Awaited<ReturnType<NonNullable<ModelProfileActivationSession["prepareModelSelectionForProfileActivation"]>>>
-		| undefined;
+	preparedDefaultModelSelection: PreparedProfileModelSelection | undefined;
 	defaultChainPublished: boolean;
 	defaultModelPublished: boolean;
+	thinkingLevelPublished: boolean;
 	/** MRU order slot claimed when the reload publication committed the profile DEFAULT. */
 	defaultModelPublishedUsageSequence?: number;
 	publishedState: PublishedModelProfileActivationState | undefined;
@@ -1943,6 +1947,7 @@ export async function prepareModelProfileActivation(
 			preparedDefaultModelSelection,
 			defaultChainPublished: false,
 			defaultModelPublished: false,
+			thinkingLevelPublished: false,
 			publishedState: undefined,
 
 			defaultModel,
@@ -2054,6 +2059,7 @@ function capturePublishedModelProfileActivationState(
 	return {
 		model: prepared.session.model,
 		thinkingLevel: prepared.session.thinkingLevel,
+		thinkingIntentRevision: prepared.session.getThinkingLevelMutationRevision?.(),
 		modelRolesOverride: prepared.settings.getOverride("modelRoles"),
 		agentModelOverridesOverride: prepared.settings.getOverride("task.agentModelOverrides"),
 		defaultChainState: prepared.session.getConfiguredModelChainState?.("default"),
@@ -2107,6 +2113,7 @@ export function publishPreparedModelProfileActivation(
 			throw new Error("Session cannot commit a prepared profile model selection");
 		}
 		prepared.session.commitPreparedProfileModelSelection(prepared.preparedDefaultModelSelection);
+		prepared.thinkingLevelPublished = true;
 		(prepared.session.modelRegistry ?? prepared.modelRegistry).seedCanonicalVariant?.(
 			prepared.session.sessionId,
 			prepared.defaultModel!,
@@ -2115,6 +2122,7 @@ export function publishPreparedModelProfileActivation(
 	}
 	if (!prepared.defaultModel && options.thinkingLevelOverride !== undefined) {
 		prepared.session.setThinkingLevel?.(options.thinkingLevelOverride);
+		prepared.thinkingLevelPublished = true;
 	}
 	prepared.settings.override("modelRoles", {
 		...prepared.baseModelRoles,
@@ -2152,11 +2160,15 @@ export function recordPublishedModelProfileActivationUsage(prepared: PreparedMod
 	prepared.session.recordModelSelectionUsage?.(prepared.preparedDefaultModelSelection.model, sequence);
 }
 
-export async function finishPreparedModelProfileActivation(prepared: PreparedModelProfileActivation): Promise<void> {
+export async function finishPreparedModelProfileActivation(
+	prepared: PreparedModelProfileActivation,
+	options: { strictModelSelection?: boolean } = {},
+): Promise<void> {
 	if (prepared.defaultModelPublished && prepared.preparedDefaultModelSelection) {
 		try {
 			await prepared.session.finishPreparedProfileModelSelection?.(prepared.preparedDefaultModelSelection);
 		} catch (error) {
+			if (options.strictModelSelection) throw error;
 			logger.warn("Failed to refresh session tools after model profile activation", {
 				profile: prepared.profileName,
 				error: error instanceof Error ? error.message : String(error),
@@ -2276,6 +2288,7 @@ async function persistPreparedModelProfileActivation(
 		publishPreparedModelProfileActivation(prepared, options);
 		assertCurrent();
 		recordPublishedModelProfileActivationUsage(prepared);
+		options.onRuntimePublished?.();
 	} catch (error) {
 		if (prepared.committedOwnership) {
 			// dispose marks the session closed synchronously. Do not await its drain
@@ -2313,7 +2326,8 @@ export async function applyPreparedModelProfileActivation(
 		await persistPreparedModelProfileActivation(prepared, options);
 		return;
 	}
-	let activationStage = "default chain";
+	let activationStage = "model preparation";
+	let runtimePublicationStarted = false;
 	let modelMutationStarted = false;
 	let modelMutationUsageSequence: number | undefined;
 	let overridesChanged = false;
@@ -2328,6 +2342,27 @@ export async function applyPreparedModelProfileActivation(
 	let activatedResumeDefaultModel: string | undefined;
 
 	try {
+		if (
+			!options.deferRuntimePublication &&
+			!options.preserveDefaultModelSelection &&
+			!options.preserveLiveModelSelection &&
+			prepared.defaultModel
+		) {
+			prepared.preparedDefaultModelSelection = await prepared.session.prepareModelSelectionForProfileActivation?.(
+				prepared.defaultModel,
+				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
+				options.signal,
+				{ validateCredentials: true },
+			);
+			if (!prepared.preparedDefaultModelSelection || !prepared.session.commitPreparedProfileModelSelection)
+				throw new Error("Session cannot prepare a synchronous profile model selection");
+		}
+		options.signal?.throwIfAborted();
+		options.validateCurrent?.(false);
+		if (options.isCurrent?.() === false) throw new ModelProfileActivationSupersededError();
+		// No await from the first runtime mutation through the complete publication receipt.
+		runtimePublicationStarted = true;
+		activationStage = "default chain";
 		if (!options.deferRuntimePublication && !options.preserveDefaultModelSelection) {
 			const ownedDefaultChain =
 				prepared.defaultChain.length > 0
@@ -2336,6 +2371,7 @@ export async function applyPreparedModelProfileActivation(
 						(prepared.previousModel ? [formatModelString(prepared.previousModel)] : []));
 			if (ownedDefaultChain.length > 0) {
 				defaultChainChanged = true;
+				prepared.defaultChainPublished = true;
 				prepared.session.setConfiguredModelChain(
 					"default",
 					ownedDefaultChain,
@@ -2360,22 +2396,14 @@ export async function applyPreparedModelProfileActivation(
 			prepared.defaultModel
 		) {
 			activationStage = "model selection";
-			await prepared.session.setModelTemporary(
-				prepared.defaultModel,
-				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
-				{
-					cause: "profile-activation",
-					signal: options.signal,
-					shouldMutate: options.isCurrent,
-					onMutationStarted: () => {
-						modelMutationStarted = true;
-						modelMutationUsageSequence = prepared.session.beginModelSelectionUsage?.();
-					},
-				},
-			);
-			options.signal?.throwIfAborted();
-			if (options.isCurrent && !modelMutationStarted) throw new ModelProfileActivationSupersededError();
-			if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
+			const selection = prepared.preparedDefaultModelSelection;
+			if (!selection || !prepared.session.commitPreparedProfileModelSelection)
+				throw new Error("Session cannot publish a synchronous profile model selection");
+			modelMutationStarted = true;
+			prepared.defaultModelPublished = true;
+			modelMutationUsageSequence = prepared.session.beginModelSelectionUsage?.();
+			prepared.session.commitPreparedProfileModelSelection(selection);
+			prepared.thinkingLevelPublished = true;
 		}
 		if (!options.deferRuntimePublication) {
 			activationStage = "model role overrides";
@@ -2425,9 +2453,37 @@ export async function applyPreparedModelProfileActivation(
 			activatedResumeDefaultModel = `${prepared.defaultModel.provider}/${prepared.defaultModel.id}`;
 			prepared.session.recordResumeDefaultModel?.(activatedResumeDefaultModel);
 		}
+		if (!options.deferRuntimePublication && !prepared.defaultModel && options.thinkingLevelOverride !== undefined) {
+			activationStage = "role-only thinking override";
+			prepared.session.setThinkingLevel?.(options.thinkingLevelOverride);
+			prepared.thinkingLevelPublished = true;
+		}
 		prepared.publishedState = capturePublishedModelProfileActivationState(prepared);
+		if (!options.deferRuntimePublication) {
+			options.onRuntimePublished?.();
+			activationStage = "session tool refresh";
+			await finishPreparedModelProfileActivation(prepared, { strictModelSelection: true });
+			options.signal?.throwIfAborted();
+			if (options.isCurrent?.() === false) throw new ModelProfileActivationSupersededError();
+		}
 	} catch (error) {
-		const activationWasCancelled = error instanceof ModelProfileActivationSupersededError;
+		const activationWasCancelled =
+			error instanceof ModelProfileActivationSupersededError ||
+			(!runtimePublicationStarted && !options.signal?.aborted && options.isCurrent?.() === false);
+		if (!runtimePublicationStarted || prepared.publishedState) {
+			try {
+				await rollbackPreparedModelProfileActivation(prepared, {
+					...options,
+					isCurrent: runtimePublicationStarted ? options.isCurrent : () => false,
+				});
+			} catch (rollbackError) {
+				throw incompleteModelProfileRollbackError("activation", activationStage, error, [
+					{ stage: "restore runtime publication", error: rollbackError },
+				]);
+			}
+			if (activationWasCancelled) return;
+			throw error;
+		}
 		const selectionIsCurrent = () => options.isCurrent?.() !== false;
 		const shouldRestoreFallbackRuntimeState =
 			prepared.previousDefaultFallbackRuntimeState !== undefined &&
@@ -2567,7 +2623,6 @@ export async function applyPreparedModelProfileActivation(
 	// A newer choice recorded while the activation awaited keeps the MRU head.
 	if (modelMutationStarted && prepared.defaultModel && modelMutationUsageSequence !== undefined)
 		prepared.session.recordModelSelectionUsage?.(prepared.defaultModel, modelMutationUsageSequence);
-	if (!options.deferRuntimePublication) await finishPreparedModelProfileActivation(prepared);
 }
 
 /** Restore an applied activation when its enclosing settings/registry commit fails. */
@@ -2593,15 +2648,33 @@ export async function rollbackPreparedModelProfileActivation(
 			failures.push({ stage, error });
 		}
 	};
-	const selectionIsCurrent = () => options.isCurrent?.() !== false;
+	const sessionIsBound = () => {
+		const lifecycle = prepared.session.sessionLifecycle;
+		return (
+			prepared.session.sessionId === prepared.binding.sessionId &&
+			lifecycle?.generation === prepared.binding.generation &&
+			!lifecycle?.transitioning &&
+			!lifecycle?.disposed
+		);
+	};
+	const selectionIsCurrent = () => sessionIsBound() && options.isCurrent?.() !== false;
 	const publishedState = prepared.publishedState;
+	const rollbackSelectionRevision = prepared.session.getUserModelSelectionRevision?.();
+	const thinkingIsCurrent = () =>
+		publishedState !== undefined &&
+		prepared.session.thinkingLevel === publishedState.thinkingLevel &&
+		prepared.session.getThinkingLevelMutationRevision?.() === publishedState.thinkingIntentRevision;
 	const canRestorePublishedState = (current: unknown, activated: unknown): boolean =>
 		publishedState === undefined ? selectionIsCurrent() : util.isDeepStrictEqual(current, activated);
 	const canRollbackPublishedProfile = (): boolean =>
-		publishedState === undefined
+		sessionIsBound() &&
+		(publishedState === undefined
 			? selectionIsCurrent()
 			: util.isDeepStrictEqual(prepared.session.getActiveModelProfile?.(), publishedState.activeModelProfile) &&
-				util.isDeepStrictEqual(prepared.session.getActivatedModelProfile?.(), publishedState.activatedModelProfile);
+				util.isDeepStrictEqual(
+					prepared.session.getActivatedModelProfile?.(),
+					publishedState.activatedModelProfile,
+				));
 
 	const currentModelRolesOverride = prepared.settings.getOverride("modelRoles");
 	const restoredModelRolesOverride =
@@ -2642,8 +2715,57 @@ export async function rollbackPreparedModelProfileActivation(
 	if (!options.preserveDefaultModelSelection) {
 		const previousChain = prepared.previousDefaultChainState;
 		if (
+			!options.preserveLiveModelSelection &&
+			selectionIsCurrent() &&
+			canRollbackPublishedProfile() &&
+			prepared.defaultModelPublished &&
+			prepared.defaultModel &&
+			(publishedState === undefined || prepared.session.model === publishedState.model)
+		) {
+			const selectionRevision = prepared.session.getUserModelSelectionRevision?.();
+			const thinkingLevel =
+				publishedState === undefined || thinkingIsCurrent()
+					? prepared.previousThinkingLevel
+					: prepared.session.thinkingLevel;
+			await restoreAsync("restore live model", async () => {
+				if (prepared.session.restoreModelSelectionForRollback) {
+					await prepared.session.restoreModelSelectionForRollback(prepared.previousModel, thinkingLevel);
+				} else if (prepared.previousModel) {
+					await prepared.session.setModelTemporary(prepared.previousModel, thinkingLevel, {
+						cause: "rollback",
+						shouldMutate: selectionIsCurrent,
+					});
+				} else {
+					throw new Error("Model-less profile activation rollback is unavailable");
+				}
+			});
+			if (
+				selectionIsCurrent() &&
+				prepared.session.getUserModelSelectionRevision?.() === selectionRevision &&
+				canRestorePublishedState(
+					prepared.session.getSessionDefaultModelSelector?.(),
+					publishedState?.sessionDefaultModel,
+				)
+			) {
+				restore("restore session resume default", () =>
+					prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel),
+				);
+			}
+		}
+		// Chain replacement resets its controller. Check ownership after the
+		// asynchronous model restore, before performing either synchronous restore.
+		const shouldRestoreFallbackRuntimeState =
+			(prepared.defaultChainPublished || prepared.defaultModelPublished) &&
+			prepared.previousDefaultFallbackRuntimeState !== undefined &&
+			canRollbackPublishedProfile() &&
+			canRestorePublishedState(
+				prepared.session.getDefaultFallbackRuntimeState?.(),
+				publishedState?.defaultFallbackRuntimeState,
+			);
+		if (
 			prepared.defaultChainPublished &&
 			canRollbackPublishedProfile() &&
+			prepared.session.getUserModelSelectionRevision?.() === rollbackSelectionRevision &&
 			canRestorePublishedState(
 				prepared.session.getConfiguredModelChainState?.("default"),
 				publishedState?.defaultChainState,
@@ -2662,52 +2784,35 @@ export async function rollbackPreparedModelProfileActivation(
 			);
 		}
 		if (
-			!options.preserveLiveModelSelection &&
-			selectionIsCurrent() &&
-			prepared.defaultModelPublished &&
-			prepared.defaultModel
-		) {
-			await restoreAsync("restore live model", async () => {
-				if (prepared.session.restoreModelSelectionForRollback) {
-					await prepared.session.restoreModelSelectionForRollback(
-						prepared.previousModel,
-						prepared.previousThinkingLevel,
-					);
-				} else if (prepared.previousModel) {
-					await prepared.session.setModelTemporary(prepared.previousModel, prepared.previousThinkingLevel, {
-						cause: "rollback",
-						shouldMutate: selectionIsCurrent,
-					});
-				} else {
-					throw new Error("Model-less profile activation rollback is unavailable");
-				}
-			});
-			if (
-				selectionIsCurrent() &&
-				canRestorePublishedState(
-					prepared.session.getSessionDefaultModelSelector?.(),
-					publishedState?.sessionDefaultModel,
-				)
-			) {
-				restore("restore session resume default", () =>
-					prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel),
-				);
-			}
-		}
-		if (
-			(prepared.defaultChainPublished || prepared.defaultModelPublished) &&
-			prepared.previousDefaultFallbackRuntimeState &&
+			shouldRestoreFallbackRuntimeState &&
 			canRollbackPublishedProfile() &&
-			canRestorePublishedState(
-				prepared.session.getDefaultFallbackRuntimeState?.(),
-				publishedState?.defaultFallbackRuntimeState,
-			)
+			prepared.session.getUserModelSelectionRevision?.() === rollbackSelectionRevision
 		) {
 			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
 		}
 	}
+	if (
+		!prepared.defaultModelPublished &&
+		prepared.thinkingLevelPublished &&
+		selectionIsCurrent() &&
+		canRollbackPublishedProfile() &&
+		thinkingIsCurrent()
+	) {
+		restore("restore role-only thinking override", () =>
+			prepared.session.setThinkingLevel?.(prepared.previousThinkingLevel),
+		);
+	}
+	const shouldRestoreInstalledOverrides =
+		prepared.previousProfileInstalledOverrideState !== undefined &&
+		canRollbackPublishedProfile() &&
+		canRestorePublishedState(
+			prepared.session.getProfileInstalledOverrideState?.(),
+			publishedState?.profileInstalledOverrideState,
+		);
+	// Check installed ownership before changing markers, but restore it afterwards:
+	// changing profile identity clears manual tracking in the marker setter.
 	if (
 		selectionIsCurrent() &&
 		canRollbackPublishedProfile() &&
@@ -2720,14 +2825,7 @@ export async function rollbackPreparedModelProfileActivation(
 			),
 		);
 	}
-	if (
-		prepared.previousProfileInstalledOverrideState &&
-		canRollbackPublishedProfile() &&
-		canRestorePublishedState(
-			prepared.session.getProfileInstalledOverrideState?.(),
-			publishedState?.profileInstalledOverrideState,
-		)
-	) {
+	if (shouldRestoreInstalledOverrides) {
 		restore("restore installed role tracking", () =>
 			prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState!),
 		);
