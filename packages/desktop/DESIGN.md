@@ -57,6 +57,8 @@ The app uses public AuthStorage login callbacks with a single app-owned authoriz
 
 Before the SDK captures environment state, the sidecar strips inherited provider keys/tokens, routing/proxy overrides and CLI broker state. Shared mode restores the installation's HOME and resolved agent directory (including explicit agent-directory overrides); credentials remain in the SDK's shared storage, not a new Keychain implementation. `GJC_DESKTOP_ISOLATED=1` instead places HOME, agent, configuration and XDG roots under the app data directory for tests/QA. Neither mode is an execution sandbox for SDK tools.
 
-## Verification
+### Verification
+
+`bun packages/desktop/scripts/app-flow-qa.ts` walks the shipped user journeys (turn, abort, queue, model/reasoning, command search, settings, export, attachments, side chat, operator, session info, fork, delete) against the real Host and SDK and the zero-provider fixture. It is App/Host/SDK transport proof, not a live provider or native-WebView check.
 
 Fresh current-branch screenshots for implemented surfaces/states/breakpoints and scroll boundaries, CJK wrapping inspection, independent review. Compilation is not evidence of signed standalone distribution, real-provider login or full TUI parity.
