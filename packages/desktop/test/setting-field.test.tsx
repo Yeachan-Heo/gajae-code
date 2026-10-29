@@ -68,6 +68,12 @@ describe("desktop setting field control types", () => {
 		expect(control(render({}))).not.toContain("disabled");
 	});
 
+	test("a hand-edited value outside the option list stays selected", () => {
+		const html = render({ path: "tools.spill", type: "number", value: 30, choices: ["100", "200"] });
+		expect(html).toContain('<option selected="">30</option>');
+		expect(html).toContain("<option>100</option>");
+	});
+
 	test("read-only settings explain themselves on the save action", () => {
 		expect(render({ writable: false })).toContain("읽기 전용");
 		expect(render({}, true)).toContain("연결 또는 처리 대기");

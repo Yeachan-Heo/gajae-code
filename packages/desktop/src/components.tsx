@@ -387,6 +387,8 @@ export function SettingField({
 					{setting.choices.map(choice => (
 						<option key={choice}>{choice}</option>
 					))}
+					{/* A hand-edited value outside the curated options must stay visible and saveable. */}
+					{value !== "" && !setting.choices.includes(value) && <option>{value}</option>}
 				</select>
 			) : setting.type === "boolean" ? (
 				<input

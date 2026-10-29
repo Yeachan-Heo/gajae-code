@@ -13,6 +13,11 @@ describe("composer restore after a refused dispatch", () => {
 		expect(restoreDraft("", "보내지 못한 메시지")).toBe("보내지 못한 메시지");
 	});
 
+	test("an attachment-only dispatch restores newest text without blank lines", () => {
+		expect(restoreDraft("새로 쓴 메시지", "")).toBe("새로 쓴 메시지");
+		expect(restoreDraft("", "")).toBe("");
+	});
+
 	test("keeps text typed during the dispatch below the rejected text", () => {
 		expect(restoreDraft("새로 쓴 메시지", "보내지 못한 메시지")).toBe("보내지 못한 메시지\n\n새로 쓴 메시지");
 	});

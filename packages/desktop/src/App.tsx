@@ -530,10 +530,9 @@ export default function App() {
 		const queued = session.status === "running" || session.status === "waiting";
 		// A prompt request resolves only when the turn ends, so the composer clears on
 		// admission rather than on reply: keeping the sent text invites a duplicate
-		// submission. Clearing inside the action also means a send that `run` refuses
-		// to admit (locked scope) leaves the draft untouched.
-		// The original prompt request lasts for the whole turn. Queue admission
-		// must not reuse that lock or steer/follow-up submissions never reach the host.
+		// submission. Clearing inside the action means a send that `run` refuses to
+		// admit (locked scope) leaves the draft untouched. Queue admission takes its
+		// own scope, or steer/follow-up submissions would collide with the running turn.
 		void run(queued ? `enqueue:${sessionId}` : sessionId, async () => {
 			const attachments = readyDesktopAttachments(ownedAttachments);
 			const sentIds = new Set(ownedAttachments.map(draft => draft.id));
@@ -1443,6 +1442,7 @@ export default function App() {
 					}
 					onClose={closeDialog}
 				>
+					{session?.error && <ErrorBanner>{session.error}</ErrorBanner>}
 					{[settingsScope, authScope, toolsScope, "goal", selected].map(scope =>
 						scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 					)}
