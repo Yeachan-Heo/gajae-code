@@ -339,7 +339,7 @@ export function renderStateMarkdown(
 	const compactFields = compactStateFields(state);
 	if (compactFields.length) {
 		lines.push("- Compact elisions:");
-		for (const [key, value] of compactFields) lines.push(`  - ${key}: ${value}`);
+		for (const [key, value] of compactFields) lines.push(`  - ${terminalLine(key)}: ${terminalText(value)}`);
 	}
 	return `${lines.join("\n")}\n`;
 }

@@ -201,6 +201,38 @@ describe("state terminal text", () => {
 		});
 	});
 
+	it("state read prints a compact elision count and drops entry text", async () => {
+		await withSession(async cwd => {
+			await plantState(cwd, {
+				skill: "ultragoal",
+				active: true,
+				current_phase: "pending",
+				rounds: [`note${OSC52}${CSI}`, "plain-round"],
+			});
+			const read = await runNativeStateCommand(["read", "--mode", "ultragoal"], cwd);
+			expect(read.status).toBe(0);
+			assertNoTerminalControls(read.stdout);
+			expect(read.stdout).toContain("  - rounds: 2 entries (elided)");
+			expect(read.stdout).not.toContain("plain-round");
+			expect(read.stdout).not.toContain("cHdu");
+		});
+	});
+
+	it("state read keeps a plain compact elision count", async () => {
+		await withSession(async cwd => {
+			await plantState(cwd, {
+				skill: "ultragoal",
+				active: true,
+				current_phase: "pending",
+				rounds: ["alpha"],
+			});
+			const read = await runNativeStateCommand(["read", "--mode", "ultragoal"], cwd);
+			expect(read.status).toBe(0);
+			expect(read.stdout).toContain("  - rounds: 1 entries (elided)");
+			expect(read.stdout).toContain("Current phase: pending");
+		});
+	});
+
 	it("state read matches transitions on the stored phase, not the stripped text", async () => {
 		await withSession(async cwd => {
 			await plantState(cwd, { skill: "ultragoal", active: true, current_phase: "pen\u0000ding" });
@@ -475,6 +507,21 @@ describe("state terminal text", () => {
 				expect(once).toContain(`Current phase: ${shown}`);
 				expect(once).toContain(`${left}\n${right}`);
 				expect(twice).toBe(once);
+			}),
+			{ seed: PROPERTY_SEED, numRuns: PROPERTY_RUNS },
+		);
+	});
+
+	it("property: compact elision stays a count when entries carry controls", () => {
+		fc.assert(
+			fc.property(noisy, extra => {
+				const rendered = renderStateMarkdown(
+					"ultragoal",
+					{ current_phase: "pending", rounds: [`row${extra}`] },
+					manifestFor([]),
+				);
+				expect(CONTROL.test(rendered)).toBe(false);
+				expect(rendered).toContain("  - rounds: 1 entries (elided)");
 			}),
 			{ seed: PROPERTY_SEED, numRuns: PROPERTY_RUNS },
 		);
