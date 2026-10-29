@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { matchesSlashFilter } from "../src/App";
+import { matchesSlashFilter } from "../src/command-search";
 
 // The command-search box is also where users type slash commands, so the filter
 // must accept the exact "/name" form the command input accepts.
