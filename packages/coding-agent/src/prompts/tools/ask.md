@@ -6,6 +6,7 @@ Asks user when you need clarification or input during task execution.
 
 <instruction>
 - Use `recommended: <index>` to mark default (0-indexed); " (Recommended)" added automatically
+- Set `requireExplicitAnswer: true` when a timeout must not choose on the user's behalf
 - Use `questions` for multiple related questions instead of asking one at a time
 - Set `multi: true` on question to allow multiple selections
 - Every question body must contain meaningful, non-whitespace text. Never add empty `metadata`/`ignore` questions.
@@ -21,6 +22,14 @@ Asks user when you need clarification or input during task execution.
 - **If multiple choices are acceptable**, pick the most conservative/standard option and proceed; state the choice.
 - **Do NOT include the automatic custom-input control or labels that imitate it** such as "Other (type your own)", "Other (specify)", "type your own", "custom input", or "직접 입력" — UI automatically adds "Other (type your own)" to every question. A plain domain value such as "Other" is allowed when it is a genuine answer, not a request for free text. To collect free text, ask for it in the question body and rely on the automatic Other/custom-input control instead of adding a fake option.
 </critical>
+
+<answer-channel-status>
+{{#if answerChannelAvailable}}
+An interactive or remote answer channel is available for this session.
+{{else}}
+No interactive or remote answer channel is available in this session. Do not call this tool; use the non-interactive fallback.
+{{/if}}
+</answer-channel-status>
 
 <examples>
 # Single question

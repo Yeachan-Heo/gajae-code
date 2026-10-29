@@ -7,10 +7,12 @@
  * prompt-cache prefix) does not change when the implementation loads (#5992).
  */
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import architectAgent from "../prompts/agents/architect.md" with { type: "text" };
 import criticAgent from "../prompts/agents/critic.md" with { type: "text" };
 import executorAgent from "../prompts/agents/executor.md" with { type: "text" };
 import plannerAgent from "../prompts/agents/planner.md" with { type: "text" };
+import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import searchDescription from "../prompts/tools/search.md" with { type: "text" };
 import taskDescription from "../prompts/tools/task.md" with { type: "text" };
@@ -39,6 +41,13 @@ interface DescriptionSession {
 	settings: DescriptionSettings;
 	getSessionSpawns?: () => string | null;
 	hasEditTool?: boolean;
+}
+
+interface AskDescriptionSession {
+	hasUI: boolean;
+	getToolUIContext?: () => { hasUI?: boolean; ui?: unknown };
+	getAskAnswerSource?: () => unknown;
+	getWorkflowGateEmitter?: () => WorkflowGateEmitter | undefined;
 }
 
 interface BundledAgentName {
@@ -86,6 +95,18 @@ export function searchToolDescriptionForSession(session: DescriptionSession): st
 		IS_HL_MODE: displayMode.hashLines,
 		IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 	});
+}
+
+export function askAnswerChannelAvailable(session: AskDescriptionSession): boolean {
+	const toolContext = session.getToolUIContext?.();
+	const hasInteractiveUi = toolContext ? toolContext.hasUI === true && Boolean(toolContext.ui) : session.hasUI;
+	if (hasInteractiveUi || session.getAskAnswerSource?.()) return true;
+	const gateEmitter = session.getWorkflowGateEmitter?.();
+	return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() === true;
+}
+
+export function askToolDescriptionForSession(session: AskDescriptionSession): string {
+	return prompt.render(askDescription, { answerChannelAvailable: askAnswerChannelAvailable(session) });
 }
 
 export function renderTaskDescription(session: DescriptionSession): string {

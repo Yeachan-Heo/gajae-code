@@ -100,6 +100,10 @@ export interface AskSelectedAckRecoveryParticipant {
 /** SDK-native surface for emitting a workflow gate and awaiting its answer. */
 export interface WorkflowGateEmitter {
 	supportsRemoteGateAnswers(): boolean;
+	/** Whether a live adapter or client can receive and answer workflow-gate prompts. */
+	hasRemoteGateAnswerChannel?(): boolean;
+	/** Register an answer-capable polling responder that does not subscribe to gate events. */
+	registerRemoteGateAnswerChannel?(): () => void;
 	emitGate(input: OpenGateInput): Promise<unknown>;
 	onGateEmitted?(listener: (gate: WorkflowGate) => void): () => void;
 	resolveGate?(response: WorkflowGateResponse): Promise<WorkflowGateResolution>;
@@ -139,6 +143,7 @@ export interface WorkflowGateEmitter {
  */
 export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	readonly #listeners = new Set<(gate: WorkflowGate) => void>();
+	readonly #answerChannels = new Set<symbol>();
 	readonly #waiters = new Map<string, { resolve(answer: unknown): void; reject(error: Error): void }>();
 	readonly #broker: WorkflowGateBroker;
 	#terminalController: WorkflowGateTerminalController | undefined;
@@ -174,6 +179,14 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 
 	supportsRemoteGateAnswers(): boolean {
 		return true;
+	}
+	hasRemoteGateAnswerChannel(): boolean {
+		return this.#answerChannels.size > 0;
+	}
+	registerRemoteGateAnswerChannel(): () => void {
+		const channel = Symbol("workflow-gate-answer-channel");
+		this.#answerChannels.add(channel);
+		return () => this.#answerChannels.delete(channel);
 	}
 	setRuntimeTurnProvider(provider: (() => string | undefined) | null): void {
 		this.#runtimeTurnProvider = provider ?? undefined;

@@ -12,6 +12,7 @@ import {
 	autoresearchLogRun,
 	autoresearchRead,
 	autoresearchRecordCritic,
+	autoresearchRetireConclusiveMissionAfterHandoff,
 	autoresearchRunsStore,
 	autoresearchWrite,
 	getAutoresearchPaths,
@@ -83,6 +84,9 @@ Improve the tokenizer hot path without changing the public API.
 ## Constraints
 - No public API change
 - Memory under 512 MB
+
+## Assumptions
+- The tokenizer input corpus is representative of production usage.
 
 ## Deliverables
 - Benchmark report
@@ -348,6 +352,109 @@ describe("autoresearch ledger", () => {
 		expect(JSON.stringify(successor.ledger)).not.toContain("prior-mission evidence");
 	});
 
+	it("does not attach an earlier mission's critic to a successor verdict", async () => {
+		const root = await tempDir();
+		const firstMission = baseMission(root);
+		await autoresearchWrite(firstMission);
+		await autoresearchRecordCritic({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["critic evidence from the previous mission"],
+			caveats: [],
+			evaluator: "previous-critic",
+			slug: firstMission.slug,
+		});
+
+		await autoresearchWrite({
+			...firstMission,
+			objective: "Investigate a separate follow-up question",
+			slug: "successor-mission",
+		});
+		const verdict = await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["successor evidence"],
+			caveats: [],
+			evaluator: "successor-agent",
+		});
+
+		expect(verdict.criticReceipt).toBeUndefined();
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).mission?.slug).toBe("successor-mission");
+	});
+
+	it("keeps a critic receipt associated across a same-mission rewrite", async () => {
+		const root = await tempDir();
+		const initial = await autoresearchWrite(baseMission(root));
+		const critic = await autoresearchRecordCritic({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["critic evidence for this mission"],
+			caveats: [],
+			evaluator: "mission-critic",
+		});
+		await Bun.sleep(5);
+		await autoresearchWrite(baseMission(root, { assumptions: ["Use the production-like corpus"] }));
+		const rewritten = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(rewritten.mission?.createdAt).toBe(initial.mission.createdAt);
+		expect(rewritten.mission?.updatedAt).not.toBe(initial.mission.updatedAt);
+
+		const verdict = await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["mission evidence"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+		expect(verdict.criticReceipt).toEqual(critic);
+	});
+
+	it("retires a conclusive mission after its same-mission artifact is rewritten", async () => {
+		const root = await tempDir();
+		const initial = await autoresearchWrite(baseMission(root));
+		await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "conclusive" },
+			evidence: ["mission completed"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+		await Bun.sleep(5);
+		await autoresearchWrite(baseMission(root));
+		const rewritten = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(rewritten.mission?.createdAt).toBe(initial.mission.createdAt);
+		expect(rewritten.mission?.updatedAt).not.toBe(initial.mission.updatedAt);
+
+		const retired = await autoresearchRetireConclusiveMissionAfterHandoff(root, TEST_SESSION_ID);
+		expect(retired?.cleared).toBe(true);
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
+	});
+
+	it("does not retire an inconclusive mission after a handoff", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+		await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { disposition: "inconclusive" },
+			evidence: ["follow-up remains"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+
+		const retired = await autoresearchRetireConclusiveMissionAfterHandoff(root, TEST_SESSION_ID);
+		const current = await autoresearchRead(root, TEST_SESSION_ID);
+
+		expect(retired).toBeUndefined();
+		expect(current.exists).toBe(true);
+		expect(current.mission?.slug).toBe("tokenizer-mission");
+		expect(await Bun.file(current.paths.missionPath).exists()).toBe(true);
+	});
+
 	it("clear on a session with no mission is a safe no-op and creates no retired dir", async () => {
 		const root = await tempDir();
 		const clear = await autoresearchClear(root);
@@ -521,13 +628,23 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 	it("handoff intake via --spec writes the mission and asks zero questions", async () => {
 		const root = await tempDir();
 		const specPath = await writeSpec(root, HANDBOFF_SPEC);
-		const result = await runNativeAutoresearchCommand(["--spec", specPath, "--json"], root);
+		const result = await runNativeAutoresearchCommand(
+			["--spec", specPath, "--assumption", "Limit measurements to the current runtime", "--json"],
+			root,
+		);
 		expect(result.status).toBe(0);
 		expect(result.intake).toBe("handoff");
 		expect(result.missionCreated).toBe(true);
 		const payload = JSON.parse(result.stdout!) as {
 			intake: string;
-			mission: { objective: string; mode: string; slug: string; deliverables: string[]; constraints: string[] };
+			mission: {
+				objective: string;
+				mode: string;
+				slug: string;
+				deliverables: string[];
+				constraints: string[];
+				assumptions: string[];
+			};
 			mission_path: string;
 		};
 		expect(payload.intake).toBe("handoff");
@@ -536,6 +653,10 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(payload.mission.objective).toBe("Optimize the tokenizer hot path");
 		expect(payload.mission.deliverables).toEqual(["Benchmark report", "Patch series"]);
 		expect(payload.mission.constraints).toEqual(["No public API change", "Memory under 512 MB"]);
+		expect(payload.mission.assumptions).toEqual([
+			"The tokenizer input corpus is representative of production usage.",
+			"Limit measurements to the current runtime",
+		]);
 		// Zero clarification questions: no clarification signal in the receipt.
 		expect(JSON.stringify(payload)).not.toContain("clarification_required");
 
@@ -572,9 +693,15 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		const result = await runNativeAutoresearchCommand(["--json"], root);
 		expect(result.status).toBe(0);
 		expect(result.intake).toBe("cold");
-		const payload = JSON.parse(result.stdout!) as { intake: string; clarification_required: boolean };
+		const payload = JSON.parse(result.stdout!) as {
+			intake: string;
+			clarification_required: boolean;
+			next: string;
+		};
 		expect(payload.intake).toBe("cold");
 		expect(payload.clarification_required).toBe(true);
+		expect(payload.next).toContain("success criterion");
+		expect(payload.next).toContain("scope");
 		// No mission may exist: clarification must happen before research begins.
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
@@ -588,10 +715,12 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 			intake: string;
 			goal: string;
 			clarification_required: boolean;
+			next: string;
 		};
 		expect(payload.intake).toBe("cold");
 		expect(payload.goal).toBe("Optimize the tokenizer throughput");
 		expect(payload.clarification_required).toBe(true);
+		expect(payload.next).toContain("success criterion");
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
 
@@ -610,24 +739,35 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 				"Verdict",
 				"--constraint",
 				"No source edits",
+				"--assumption",
+				"Measure the existing parser workload as representative",
+				"--assumption",
+				"Treat throughput as the primary success criterion",
 				"--json",
 			],
 			root,
 		);
 		expect(write.status).toBe(0);
-		const written = JSON.parse(write.stdout!) as { mission: { slug: string; mode: string; objective: string } };
+		const written = JSON.parse(write.stdout!) as {
+			mission: { slug: string; mode: string; objective: string; assumptions: string[] };
+		};
 		expect(written.mission.slug).toBe("parser-throughput");
 		expect(written.mission.mode).toBe("data");
 		expect(written.mission.objective).toBe("Measure parser throughput");
+		expect(written.mission.assumptions).toEqual([
+			"Measure the existing parser workload as representative",
+			"Treat throughput as the primary success criterion",
+		]);
 		const read = await runNativeAutoresearchCommand(["read", "--json"], root);
 		expect(read.status).toBe(0);
 		const readPayload = JSON.parse(read.stdout!) as {
 			exists: boolean;
-			mission: { slug: string };
+			mission: { slug: string; assumptions: string[] };
 			ledger: Array<{ event: string }>;
 		};
 		expect(readPayload.exists).toBe(true);
 		expect(readPayload.mission.slug).toBe("parser-throughput");
+		expect(readPayload.mission.assumptions).toEqual(written.mission.assumptions);
 		expect(readPayload.ledger.map(entry => entry.event)).toEqual(["mission_created"]);
 		const cleared = await runNativeAutoresearchCommand(["clear", "--json"], root);
 		expect(cleared.status).toBe(0);
@@ -735,6 +875,9 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		const result = await runNativeAutoresearchCommand(["--help"], root);
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("--spec");
+		expect(result.stdout).toContain("--assumption");
+		expect(result.stdout).toContain("$ gjc autoresearch [--spec <path>] [--json] [goal...]");
+		expect(result.stdout).not.toContain("$ gjc autoresearch [--spec <path>] [--assumption");
 		expect(result.stdout).toContain("Spec intake");
 		expect(result.stdout).toContain("intake --spec");
 		expect(result.stdout).toContain("Cold intake");

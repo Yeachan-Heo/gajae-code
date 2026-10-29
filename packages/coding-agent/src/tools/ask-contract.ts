@@ -188,6 +188,10 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 			options: z.array(OptionItem).describe("available options"),
 			multi: z.boolean().describe("allow multiple selections").optional(),
 			recommended: z.number().describe("recommended option index").optional(),
+			requireExplicitAnswer: z
+				.boolean()
+				.describe("do not apply ask.timeout or synthesize a selection when no answer was received")
+				.optional(),
 			deepInterview: deepInterviewSchema.describe("optional deep-interview round metadata").optional(),
 			workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
 		})
@@ -288,6 +292,10 @@ const OrdinaryQuestionItem = z.object({
 	options: z.array(OptionItem).describe("available options"),
 	multi: z.boolean().describe("allow multiple selections").optional(),
 	recommended: z.number().describe("recommended option index").optional(),
+	requireExplicitAnswer: z
+		.boolean()
+		.describe("do not apply ask.timeout or synthesize a selection when no answer was received")
+		.optional(),
 	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
 });
 
@@ -463,7 +471,7 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
 	if (!isPlainRecord(question) || !isPlainRecord(question.deepInterview)) return arguments_;
 	const normalizedQuestion = { ...question };
 	let changed = false;
-	for (const key of ["multi", "recommended", "workflowGate"] as const) {
+	for (const key of ["multi", "recommended", "requireExplicitAnswer", "workflowGate"] as const) {
 		if (Object.hasOwn(normalizedQuestion, key) && normalizedQuestion[key] === null) {
 			delete normalizedQuestion[key];
 			changed = true;
@@ -627,7 +635,16 @@ export function recoverRoundZeroIntentContract(
 
 	const question = normalizedArguments.questions[0];
 	if (!isPlainRecord(question)) return { outcome: "reject" };
-	const questionKeys = ["id", "question", "options", "multi", "recommended", "deepInterview", "workflowGate"];
+	const questionKeys = [
+		"id",
+		"question",
+		"options",
+		"multi",
+		"recommended",
+		"requireExplicitAnswer",
+		"deepInterview",
+		"workflowGate",
+	];
 	if (!hasOnlyAllowedOwnKeys(question, questionKeys)) return { outcome: "reject" };
 	if (
 		typeof question.id !== "string" ||

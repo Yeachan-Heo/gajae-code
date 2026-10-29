@@ -186,6 +186,8 @@ export interface ToolSession {
 	cwd: string;
 	/** Whether UI is available */
 	hasUI: boolean;
+	/** Current tool UI context; unlike hasUI, this follows background and attachment transitions. */
+	getToolUIContext?: () => { hasUI?: boolean; ui?: unknown };
 	/** Whether this session will bind a workflow-gate emitter after tool construction. */
 	workflowGateEligible?: boolean;
 	/** Skip Python kernel availability check and warmup */

@@ -32,6 +32,10 @@ export class ToolContextStore {
 		};
 	}
 
+	getUIContext(): { ui: ExtensionUIContext | undefined; hasUI: boolean } {
+		return { ui: this.#uiContext, hasUI: this.#hasUI };
+	}
+
 	setUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void {
 		this.#uiContext = uiContext;
 		this.#hasUI = hasUI;

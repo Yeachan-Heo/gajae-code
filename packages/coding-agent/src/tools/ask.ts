@@ -29,7 +29,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
-import { logger, prompt, untilAborted } from "@gajae-code/utils";
+import { logger, untilAborted } from "@gajae-code/utils";
 import {
 	formatDeepInterviewSelectorPrompt,
 	isDeepInterviewAskQuestion,
@@ -61,9 +61,9 @@ import {
 	gateAnswerToResult,
 	questionToGate,
 } from "../modes/shared/agent-wire/deep-interview-gate";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
-import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
 import type {
 	AskAnswerRequest,
@@ -85,6 +85,7 @@ import {
 	recoverRoundZeroIntentContract,
 	selectAskParameters,
 } from "./ask-contract";
+import { askToolDescriptionForSession } from "./session-descriptions";
 
 export { askSchema } from "./ask-contract";
 
@@ -806,7 +807,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly description: string;
+	get description(): string {
+		return askToolDescriptionForSession(this.session);
+	}
 	get parameters(): AskParametersSchema {
 		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
 	}
@@ -822,14 +825,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	 */
 	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 	readonly loadMode = "discoverable";
-	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(askDescription);
-	}
+	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): AskTool | null {
 		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
 			? new AskTool(session)
 			: null;
+	}
+
+	#hasWorkflowGateAnswerChannel(gateEmitter: WorkflowGateEmitter | undefined): boolean {
+		return gateEmitter?.supportsRemoteGateAnswers() === true && gateEmitter.hasRemoteGateAnswerChannel?.() === true;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -993,16 +998,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			if (receipt) await receipt.settle(settlement);
 		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
-		// A durable workflow-gate emitter now exists for every session, and its
-		// supportsRemoteGateAnswers() is always true, so it can no longer signal
-		// "no local UI". The workflow gate is only the headless (non-TUI) answer
-		// path: when a real interactive UI is present, prefer it — otherwise
-		// attended TUI asks would route to emitGate() and hang forever waiting on
-		// a remote responder.
+		// The durable emitter exists before a remote host subscribes, so its general
+		// remote-answer capability alone is not proof that a responder can receive
+		// this ask. Require an active listener before entering the workflow-gate path.
 		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
 		const initialAnswerSource = this.session.getAskAnswerSource?.();
 		const canUseWorkflowGate =
-			!hasInteractiveUi && !initialAnswerSource && gateEmitter?.supportsRemoteGateAnswers() === true;
+			!hasInteractiveUi && !initialAnswerSource && this.#hasWorkflowGateAnswerChannel(gateEmitter);
 		// Headless fallback: an SDK answer source or workflow gate is the non-TUI answer path.
 		if (!hasInteractiveUi && !initialAnswerSource && !canUseWorkflowGate) {
 			context?.abort();
@@ -1289,7 +1291,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// Settings.get("ask.timeout") returns seconds (0 = disabled), convert to ms
 		const timeoutSeconds = this.session.settings.get("ask.timeout");
 		const settingsTimeout = timeoutSeconds === 0 ? null : timeoutSeconds * 1000;
-		const timeout = planModeEnabled ? null : settingsTimeout;
+		const configuredTimeout = planModeEnabled ? null : settingsTimeout;
 
 		// Send notification if waiting and not suppressed
 		this.#sendAskNotification();
@@ -1312,6 +1314,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
+			const timeout = q.requireExplicitAnswer === true ? null : configuredTimeout;
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
 			const isExecutionApprovalQuestion =
@@ -1365,6 +1368,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				});
 				let answer: unknown;
 				try {
+					if (!this.#hasWorkflowGateAnswerChannel(gateEmitter)) {
+						throw new ToolAbortError("Ask tool requires an active workflow-gate answer channel");
+					}
 					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
 				} finally {
 					stopGateObservation?.();
@@ -1468,6 +1474,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					scrollTitleRows: DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					otherOptionLabel,
 					autoSelectOnTimeout:
+						q.requireExplicitAnswer !== true &&
 						!intentContract(q.deepInterview) &&
 						!intentReview(q.deepInterview) &&
 						(q.workflowGate === undefined || q.workflowGate.kind === "question"),
@@ -1596,6 +1603,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q);
+			if (timedOut && q.requireExplicitAnswer === true) {
+				context?.abort();
+				throw new ToolAbortError("Ask timed out without an explicit user answer");
+			}
 
 			if (
 				!timedOut &&
@@ -1684,6 +1695,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q, { previous, navigation });
+			if (timedOut && q.requireExplicitAnswer === true) {
+				context?.abort();
+				throw new ToolAbortError("Ask timed out without an explicit user answer");
+			}
 
 			if (cancelled && !timedOut) {
 				context?.abort();
