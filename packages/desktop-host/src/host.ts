@@ -1428,6 +1428,9 @@ export class DesktopHost {
 		operation: () => Promise<T>,
 		retireGates = false,
 		persistSource = true,
+		// Only a failed turn describes the conversation; a refused rename, export or
+		// read-only command keeps the session idle and reports through its request.
+		recordFailure = false,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
 			throw new Error("다른 작업이 실행 중입니다. 끝난 뒤 다시 시도하세요.");
@@ -1439,7 +1442,7 @@ export class DesktopHost {
 			if (retireGates) await live.gatePresenter?.withdrawAll();
 			return await operation();
 		} catch (error) {
-			live.error = this.#error(error);
+			if (recordFailure) live.error = this.#error(error);
 			throw error;
 		} finally {
 			live.streamingMessage = undefined;
@@ -1849,11 +1852,17 @@ export class DesktopHost {
 				this.#publish(live);
 				return { queued: true, submissionId: submission.submissionId };
 			}
-			return this.#exclusive(live, async () => {
-				if (images.length) await createSessionImageInput(live.sdk).prompt(text, images);
-				else await live.sdk.prompt(text);
-				return null;
-			});
+			return this.#exclusive(
+				live,
+				async () => {
+					if (images.length) await createSessionImageInput(live.sdk).prompt(text, images);
+					else await live.sdk.prompt(text);
+					return null;
+				},
+				false,
+				true,
+				true,
+			);
 		}
 		if (method === "queue.cancel") {
 			const id = requiredString(params, "queueId", 200);
