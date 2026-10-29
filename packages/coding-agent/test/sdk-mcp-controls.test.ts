@@ -240,6 +240,7 @@ describe("public SDK generation-fenced MCP controls", () => {
 		const old = row(f.manager).target;
 		const gate = f.blockNextInitialize("alpha");
 		const pending = f.manager.controlServer(old, "reconnect");
+		const settled = Promise.allSettled([pending]);
 		try {
 			await gate.entered;
 			await expect(f.manager.controlServer(old, "suspend")).rejects.toMatchObject({ code: "stale_target" });
@@ -248,8 +249,12 @@ describe("public SDK generation-fenced MCP controls", () => {
 			});
 			await expect(f.manager.disconnectServer("alpha")).rejects.toMatchObject({ code: "busy" });
 			await expect(f.manager.connectServers(f.configs, {})).rejects.toMatchObject({ code: "busy" });
+			await expect(
+				f.manager.connectSessionServer("alpha", f.configs.alpha, f.manager.getSource("alpha")!, { restart: true }),
+			).rejects.toMatchObject({ code: "busy" });
 		} finally {
 			gate.release();
+			await settled;
 		}
 		expect(await pending).toMatchObject({ status: "reconnected", cleanup: "not_certified" });
 		expect(row(f.manager).state).toBe("connected");
