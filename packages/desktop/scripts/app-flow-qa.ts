@@ -5,10 +5,16 @@
 //
 //   bun packages/desktop/scripts/app-flow-qa.ts [scenario...]
 //
+// Manual only: needs a local Chrome (GJC_QA_CHROME overrides the macOS default),
+// a free port 1420, and no other Vite server on it. Scenarios share one created
+// conversation and therefore run in the listed order; naming scenarios runs only
+// the independent ones (boot, new-session, send-turn, abort-turn, queue-steer,
+// model-picker, reasoning-level, command-search-slash, settings-controls,
+// export-message, attachment, side-chat, operator-shell, session-info).
 // Writes artifacts/app-flow-qa/receipt.json plus failure screenshots.
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import puppeteer, { type Page } from "puppeteer-core";
+import puppeteer, { type Browser, type Page } from "puppeteer-core";
 
 const root = path.resolve(import.meta.dir, "../../..");
 const directory = path.resolve(root, "artifacts/app-flow-qa");
@@ -46,57 +52,52 @@ function expect(condition: unknown, message: string): asserts condition {
 await fs.mkdir(directory, { recursive: true });
 await Bun.write(attachmentPath, `${ATTACHMENT_TEXT}\n`);
 
-const vite = Bun.spawn(
-	[process.execPath, "x", "--no-install", "vite", "--host", "127.0.0.1", "--port", "1420", "--strictPort"],
-	{ cwd: path.join(root, "packages/desktop"), stdin: "ignore", stdout: "ignore", stderr: "inherit" },
-);
-let viteReady = false;
-for (let attempt = 0; attempt < 150; attempt++) {
-	try {
-		if ((await fetch(origin)).ok) {
-			viteReady = true;
-			break;
+let vite: Bun.Subprocess | undefined;
+let host: Bun.Subprocess | undefined;
+let browser: Browser | undefined;
+let bootstrap: Bootstrap | undefined;
+let page: Page;
+
+async function launchVite(): Promise<Bun.Subprocess> {
+	const child = Bun.spawn(
+		[process.execPath, "x", "--no-install", "vite", "--host", "127.0.0.1", "--port", "1420", "--strictPort"],
+		{ cwd: path.join(root, "packages/desktop"), stdin: "ignore", stdout: "ignore", stderr: "inherit" },
+	);
+	for (let attempt = 0; attempt < 150; attempt++) {
+		// A foreign server on port 1420 must not stand in for the owned one.
+		if (child.exitCode !== null) throw new Error("QA UI server exited; port 1420 is likely taken");
+		try {
+			if ((await fetch(origin)).ok) return child;
+		} catch {
+			/* Wait for the owned local server. */
 		}
-	} catch {
-		/* Wait for the owned local server. */
+		await Bun.sleep(100);
 	}
-	await Bun.sleep(100);
-}
-if (!viteReady) {
-	vite.kill();
+	child.kill("SIGTERM");
 	throw new Error("QA UI server did not become ready");
 }
 
-const host = Bun.spawn([process.execPath, "packages/desktop/scripts/host-ui-qa.ts"], {
-	cwd: root,
-	env: { ...process.env, GJC_DESKTOP_QA_MODEL_FIXTURE: "1" },
-	stdin: "ignore",
-	stdout: "pipe",
-	stderr: "inherit",
-});
-const reader = host.stdout.getReader();
-const decoder = new TextDecoder();
-let buffered = "";
-let bootstrap: Bootstrap | undefined;
-while (!bootstrap) {
-	const { value, done } = await reader.read();
-	if (done) throw new Error(`QA host exited before bootstrap: ${buffered}`);
-	buffered += decoder.decode(value, { stream: true });
-	const newline = buffered.indexOf("\n");
-	if (newline >= 0) bootstrap = JSON.parse(buffered.slice(0, newline)) as Bootstrap;
-}
-
-const browser = await puppeteer.launch({ executablePath: chromePath, headless: true });
-const page: Page = await browser.newPage();
-await page.setViewport({ width: 1280, height: 900 });
-const pageErrors: string[] = [];
-const watch = (target: Page) => {
-	target.on("pageerror", error => pageErrors.push(String(error)));
-	target.on("console", message => {
-		if (message.type() === "error") pageErrors.push(`console: ${message.text()}`);
+async function launchHost(): Promise<Bootstrap> {
+	const child = Bun.spawn([process.execPath, "packages/desktop/scripts/host-ui-qa.ts"], {
+		cwd: root,
+		env: { ...process.env, GJC_DESKTOP_QA_MODEL_FIXTURE: "1" },
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "inherit",
 	});
-};
-watch(page);
+	host = child;
+	const reader = child.stdout.getReader();
+	const decoder = new TextDecoder();
+	let buffered = "";
+	while (true) {
+		const { value, done } = await reader.read();
+		if (done) throw new Error(`QA host exited before bootstrap: ${buffered}`);
+		buffered += decoder.decode(value, { stream: true });
+		const newline = buffered.indexOf("\n");
+		if (newline >= 0) return JSON.parse(buffered.slice(0, newline)) as Bootstrap;
+	}
+}
+const pageErrors: string[] = [];
 
 async function text(): Promise<string> {
 	return page.evaluate(() => document.body.innerText);
@@ -207,17 +208,24 @@ async function closeDialog() {
 
 let workspace = "";
 
+/** Create one conversation through the sidebar and return its title. */
+async function createSession(): Promise<string> {
+	const before = await sessionRows();
+	await page.evaluate(() => (document.querySelector('[aria-label$="새 대화"]') as HTMLElement).click());
+	await waitFor(async () => (await sessionRows()).length > before.length, "new session row");
+	const created = (await sessionRows()).find(title => !before.includes(title));
+	expect(created, "created session is not listed");
+	await idle();
+	return created;
+}
+
 async function ensureWorkspace() {
 	if (workspace) {
 		await selectSession(workspace);
 		await idle();
 		return;
 	}
-	const before = await sessionRows();
-	await page.evaluate(() => (document.querySelector('[aria-label$="새 대화"]') as HTMLElement).click());
-	await waitFor(async () => (await sessionRows()).length > before.length, "new session row");
-	workspace = (await sessionRows()).find(title => !before.includes(title))!;
-	await idle();
+	workspace = await createSession();
 }
 
 const scenarios: { name: string; run: () => Promise<void> }[] = [
@@ -407,6 +415,40 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			const numbers = controls.filter(control => control.path === "sdk.promptDeadlineMs");
 			expect(numbers.length === 1, "expected the sdk.promptDeadlineMs setting");
 			expect(numbers[0]!.type === "number", `number setting rendered as ${numbers[0]!.type}`);
+			// The control type only matters if saving it round-trips a real boolean.
+			const toggled = await page.evaluate(() => {
+				for (const form of document.querySelectorAll(".setting-field")) {
+					if ((form.querySelector("label")?.textContent ?? "").trim() !== "startup.networkPrewarm") continue;
+					const box = form.querySelector("input") as HTMLInputElement;
+					box.click();
+					(form.querySelector("button[type=submit]") as HTMLElement).click();
+					return box.checked;
+				}
+				return null;
+			});
+			expect(toggled !== null, "startup.networkPrewarm checkbox missing");
+			await waitFor(
+				async () => (await page.$eval(".modal", node => (node as HTMLElement).innerText)).includes("저장했습니다"),
+				"settings save",
+				15000,
+			);
+			await closeDialog();
+			await Bun.sleep(400);
+			await page.evaluate(() => {
+				const button = [...document.querySelectorAll("button")].find(
+					node => (node.textContent ?? "").trim() === "설정",
+				);
+				(button as HTMLElement).click();
+			});
+			await page.waitForSelector(".setting-field", { timeout: 10000 });
+			const persisted = await page.evaluate(() => {
+				for (const form of document.querySelectorAll(".setting-field")) {
+					if ((form.querySelector("label")?.textContent ?? "").trim() !== "startup.networkPrewarm") continue;
+					return (form.querySelector("input") as HTMLInputElement).checked;
+				}
+				return null;
+			});
+			expect(persisted === toggled, `boolean setting did not persist: ${persisted}`);
 			await closeDialog();
 		},
 	},
@@ -495,6 +537,10 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);
 			expect(body.includes("작업 디렉터리"), `session info has no working directory: ${body.slice(0, 200)}`);
+			expect(
+				body.includes(bootstrap!.project),
+				`session info does not name the project path: ${body.slice(0, 300)}`,
+			);
 			await closeDialog();
 		},
 	},
@@ -533,16 +579,18 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 	},
 	{
 		name: "delete-session",
+		// Last scenario: it removes the conversation every other scenario shared.
 		async run() {
 			await ensureWorkspace();
-			const before = await sessionRows();
-			const victim = before.find(title => title.includes("fork"));
-			expect(victim, "no forked session available to delete");
-			await selectSession(victim!);
+			const victim = workspace;
+			const others = (await sessionRows()).filter(title => title !== victim);
+			expect(others.length > 0, "no other session to verify the removal against");
+			await selectSession(victim);
 			await openMenuAction("대화 삭제");
 			await clickText("대화 삭제");
-			await waitFor(async () => !(await sessionRows()).includes(victim!), "session removal");
-			expect((await sessionRows()).length > 0, "catalog emptied after deleting one session");
+			await waitFor(async () => !(await sessionRows()).includes(victim), "session removal");
+			const remaining = await sessionRows();
+			for (const title of others) expect(remaining.includes(title), `deleting one session removed ${title}`);
 		},
 	},
 ];
@@ -566,6 +614,15 @@ async function sessionQueued(): Promise<string | null> {
 }
 
 try {
+	vite = await launchVite();
+	bootstrap = await launchHost();
+	browser = await puppeteer.launch({ executablePath: chromePath, headless: true });
+	page = await browser.newPage();
+	await page.setViewport({ width: 1280, height: 900 });
+	page.on("pageerror", error => pageErrors.push(String(error)));
+	page.on("console", message => {
+		if (message.type() === "error") pageErrors.push(`console: ${message.text()}`);
+	});
 	const source = await (await fetch(bootstrap.bootstrapUrl)).text();
 	await page.evaluateOnNewDocument(source);
 	await page.goto(origin, { waitUntil: "domcontentloaded", timeout: 20000 });
@@ -592,7 +649,7 @@ try {
 			{
 				scenarios: results,
 				pageErrors,
-				project: bootstrap.project,
+				project: bootstrap?.project,
 				finishedAt: new Date().toISOString(),
 				note: "Real App/Host/SDK transport against the zero-provider fixture. No live provider, native WKWebView or full parity claim.",
 			},
@@ -606,9 +663,13 @@ try {
 		process.exitCode = 1;
 	}
 } finally {
-	await browser.close();
-	host.kill("SIGTERM");
-	await host.exited;
-	vite.kill("SIGTERM");
-	await vite.exited;
+	await browser?.close();
+	if (host && host.exitCode === null) {
+		host.kill("SIGTERM");
+		await host.exited;
+	}
+	if (vite && vite.exitCode === null) {
+		vite.kill("SIGTERM");
+		await vite.exited;
+	}
 }
