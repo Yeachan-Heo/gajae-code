@@ -59,22 +59,35 @@ let bootstrap: Bootstrap | undefined;
 let page: Page;
 
 async function launchVite(): Promise<Bun.Subprocess> {
+	// The port is a fixed global resource: a foreign server answering there would
+	// otherwise serve the whole run while the owned child died behind it.
+	if (await responds(origin)) throw new Error("Port 1420 is already serving; stop it before running the QA suite");
 	const child = Bun.spawn(
 		[process.execPath, "x", "--no-install", "vite", "--host", "127.0.0.1", "--port", "1420", "--strictPort"],
 		{ cwd: path.join(root, "packages/desktop"), stdin: "ignore", stdout: "ignore", stderr: "inherit" },
 	);
 	for (let attempt = 0; attempt < 150; attempt++) {
-		// A foreign server on port 1420 must not stand in for the owned one.
 		if (child.exitCode !== null) throw new Error("QA UI server exited; port 1420 is likely taken");
-		try {
-			if ((await fetch(origin)).ok) return child;
-		} catch {
-			/* Wait for the owned local server. */
+		if (await responds(origin)) {
+			// Vite binds only after startup, so a live child plus a live port is ours.
+			await Bun.sleep(200);
+			if (child.exitCode !== null) throw new Error("QA UI server exited after binding");
+			return child;
 		}
 		await Bun.sleep(100);
 	}
-	child.kill("SIGTERM");
+	child.kill("SIGKILL");
+	await child.exited;
 	throw new Error("QA UI server did not become ready");
+}
+
+async function responds(url: string): Promise<boolean> {
+	try {
+		await fetch(url, { signal: AbortSignal.timeout(1000) });
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 async function launchHost(): Promise<Bootstrap> {
@@ -536,11 +549,10 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			const body = await page.evaluate(
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);
+			// Assert SDK-owned data, not just a label the panel always prints.
 			expect(body.includes("작업 디렉터리"), `session info has no working directory: ${body.slice(0, 200)}`);
-			expect(
-				body.includes(bootstrap!.project),
-				`session info does not name the project path: ${body.slice(0, 300)}`,
-			);
+			expect(body.includes(".jsonl"), `session info has no transcript file: ${body.slice(0, 300)}`);
+			expect(body.includes("기록 저장 설정"), `session info has no persistence state: ${body.slice(0, 300)}`);
 			await closeDialog();
 		},
 	},
