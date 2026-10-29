@@ -1017,8 +1017,8 @@ export default function App() {
 			needsSession: true,
 			action: () => {
 				void run(selected, async () => {
-					const value = await request<unknown>("session.export", { sessionId: selected });
-					setResult(textOf(value));
+					const value = await request<{ path: string }>("session.export", { sessionId: selected });
+					setResult(`대화를 HTML 파일로 내보냈습니다.\n\n${value.path}`);
 					setDialog("result");
 				});
 			},
