@@ -54,7 +54,7 @@ export function ModelPicker({
 				className="model-trigger"
 				aria-label={`모델 선택: ${current?.name ?? selectedId ?? "선택되지 않음"}`}
 				aria-haspopup="dialog"
-				aria-expanded={open}
+				aria-expanded={open && !disabled && !pending}
 				disabled={disabled || pending}
 				title={current?.id ?? selectedId ?? "사용 가능한 모델 선택"}
 				onClick={() => {
