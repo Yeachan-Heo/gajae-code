@@ -142,6 +142,7 @@ export interface DesktopSession {
 	messages: DesktopMessage[];
 	historyTruncated?: boolean;
 	question?: DesktopQuestion;
+	/** Last failed prompt turn for this conversation; administrative refusals answer their request instead. */
 	error?: string;
 }
 

@@ -1428,10 +1428,11 @@ export class DesktopHost {
 		operation: () => Promise<T>,
 		retireGates = false,
 		persistSource = true,
-		// Only a prompt whose turn failed describes the conversation. Every other call
-		// here is an administrative mutation: `retry()` schedules a turn and answers
-		// false when it declines, so its refusal must not mark the session failed; it
-		// reports through its own request instead.
+		// Only a prompt whose turn failed describes the conversation. The other calls
+		// here either never touch the transcript or only schedule work: `retry()`
+		// answers false when it declines, and a compaction that fails is a refused
+		// maintenance step, so neither may mark the session failed. Each reports
+		// through its own request instead.
 		recordFailure = false,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())

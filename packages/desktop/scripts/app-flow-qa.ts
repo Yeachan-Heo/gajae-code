@@ -549,10 +549,16 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			const body = await page.evaluate(
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);
-			// Assert SDK-owned data, not just a label the panel always prints.
-			expect(body.includes("작업 디렉터리"), `session info has no working directory: ${body.slice(0, 200)}`);
+			// Assert values, not the labels the panel always prints.
 			expect(body.includes(".jsonl"), `session info has no transcript file: ${body.slice(0, 300)}`);
-			expect(body.includes("기록 저장 설정"), `session info has no persistence state: ${body.slice(0, 300)}`);
+			expect(
+				body.includes(bootstrap!.project),
+				`session info does not name the working directory: ${body.slice(0, 300)}`,
+			);
+			expect(
+				/기록 저장 설정\s*(켜짐|꺼짐)/u.test(body),
+				`session info does not report a persistence state: ${body.slice(0, 300)}`,
+			);
 			await closeDialog();
 		},
 	},

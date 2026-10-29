@@ -1722,7 +1722,9 @@ export default function App() {
 									실행
 								</Button>
 							</form>
-							{errors[`command:${dialogOwner}`] && <ErrorBanner>{errors[`command:${dialogOwner}`]}</ErrorBanner>}
+							{scopeError(`command:${dialogOwner}`) && (
+								<ErrorBanner>{scopeError(`command:${dialogOwner}`)}</ErrorBanner>
+							)}
 							{commandOutput && <pre className="bounded-output">{commandOutput}</pre>}
 							<div className="command-list">
 								{commands
