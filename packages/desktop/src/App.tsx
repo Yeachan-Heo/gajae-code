@@ -99,6 +99,9 @@ interface GateView {
 }
 const textOf = (value: unknown) =>
 	typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "결과 없음");
+/** Slash search accepts the leading slash users type in the command input. */
+export const matchesSlashFilter = (name: string, description: string, filter: string) =>
+	`${name} ${description}`.toLowerCase().includes(filter.trim().replace(/^\//, "").toLowerCase());
 
 export default function App() {
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
@@ -1736,9 +1739,7 @@ export default function App() {
 							<h3>GJC 슬래시 명령 {commandList.length > 0 && `(${commandList.length})`}</h3>
 							<div className="command-list">
 								{commandList
-									.filter(command =>
-										`${command.name} ${command.description}`.toLowerCase().includes(filter.toLowerCase()),
-									)
+									.filter(command => matchesSlashFilter(command.name, command.description, filter))
 									.map(command => (
 										<Button
 											key={command.name}
