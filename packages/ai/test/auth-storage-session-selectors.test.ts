@@ -209,6 +209,42 @@ describe("AuthStorage session credential selectors", () => {
 		}
 	});
 
+	test("unavailable hard pins hide eligibility without borrowing another account or an override", async () => {
+		const storage = await createStorage();
+		try {
+			storage.setSessionCredentialSelector("failed-pin", "anthropic", { kind: "email", value: "first@example.com" });
+			storage.setSessionCredentialSelector("other-pin", "anthropic", { kind: "email", value: "second@example.com" });
+			storage.markSessionCredentialUnavailable("failed-pin", "anthropic", { kind: "email", value: "first@example.com" });
+
+			expect(storage.hasAuth("anthropic", "failed-pin")).toBe(false);
+			expect(storage.hasUsableAuth("anthropic", { sessionId: "failed-pin" })).toBe(false);
+			expect(storage.getEffectiveCredentialType("anthropic", "failed-pin")).toBeUndefined();
+			expect(() => storage.getOAuthCredential("anthropic", "failed-pin")).toThrow("is unavailable");
+			expect(await storage.peekApiKey("anthropic", { sessionId: "failed-pin" })).toBeUndefined();
+			expect(storage.hasAuth("anthropic", "other-pin")).toBe(true);
+			expect(storage.hasUsableAuth("anthropic", { sessionId: "other-pin" })).toBe(true);
+			expect(storage.getOAuthCredential("anthropic", "other-pin")?.accountId).toBe("account-second");
+			expect(storage.hasAuth("anthropic")).toBe(true);
+
+			storage.setRuntimeApiKey("anthropic", "explicit-runtime-key");
+			expect(storage.hasAuth("anthropic", "failed-pin")).toBe(false);
+			await expect(storage.getApiKey("anthropic", "failed-pin")).rejects.toThrow("is unavailable");
+			storage.removeRuntimeApiKey("anthropic");
+			storage.setConfigApiKey("anthropic", "explicit-config-key");
+			expect(storage.hasUsableAuth("anthropic", { sessionId: "failed-pin" })).toBe(false);
+			await expect(storage.getApiKey("anthropic", "failed-pin")).rejects.toThrow("is unavailable");
+			storage.removeConfigApiKey("anthropic");
+
+			storage.setSessionCredentialSelector("failed-pin", "anthropic", { kind: "email", value: "second@example.com" });
+			expect(storage.hasSessionCredentialUnavailable("anthropic", "failed-pin")).toBe(false);
+			expect(storage.hasAuth("anthropic", "failed-pin")).toBe(true);
+			expect(storage.hasUsableAuth("anthropic", { sessionId: "failed-pin" })).toBe(true);
+			expect(storage.getOAuthCredential("anthropic", "failed-pin")?.accountId).toBe("account-second");
+		} finally {
+			storage.close();
+		}
+	});
+
 	test("unavailable scoped pins fail loudly and final lease release clears only that scope", async () => {
 		const storage = await createStorage();
 		try {
@@ -270,7 +306,7 @@ describe("AuthStorage session credential selectors", () => {
 		}
 	});
 
-	test("removing a selected account clears its session pin and sticky selection", async () => {
+	test("removing a selected account retains unavailability until an explicit scope choice", async () => {
 		const storage = await createStorage();
 		try {
 			storage.acquireCredentialScope("remove-session");
@@ -281,6 +317,12 @@ describe("AuthStorage session credential selectors", () => {
 			const id = storage.listCredentialInventory("anthropic").find(row => row.credentialKind === "oauth")!.id;
 			expect(storage.disableCredentialById(id, "removed by test")).toBe(true);
 			expect(storage.hasSessionCredentialSelector("anthropic", "remove-session")).toBe(false);
+			expect(storage.hasSessionCredentialUnavailable("anthropic", "remove-session")).toBe(true);
+			expect(storage.hasAuth("anthropic", "remove-session")).toBe(false);
+			expect(() => storage.getOAuthCredential("anthropic", "remove-session")).toThrow("is unavailable");
+			await expect(storage.getApiKey("anthropic", "remove-session")).rejects.toThrow("is unavailable");
+			storage.setSessionCredentialAuto("anthropic", "remove-session");
+			expect(storage.hasSessionCredentialUnavailable("anthropic", "remove-session")).toBe(false);
 			expect(storage.getOAuthCredential("anthropic", "remove-session")?.email).toBe("second@example.com");
 		} finally {
 			storage.close();
