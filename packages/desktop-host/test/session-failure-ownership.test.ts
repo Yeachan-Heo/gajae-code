@@ -105,6 +105,36 @@ test("a refused non-turn operation leaves the conversation idle", async () => {
 	expect(after?.title).toBe(created.title);
 });
 
+// A refusal is not a failure: retry() answers false when it declines to start a
+// turn, and that must leave the conversation exactly as it was.
+test("a refused retry leaves the conversation idle", async () => {
+	const { reject, open, session, results } = await launch();
+	const created = await open();
+	vi.spyOn(results[0]!.session, "retry").mockResolvedValue(false);
+
+	expect(await reject("session.retry", { sessionId: created.id })).toContain("Session cannot be retried");
+
+	const after = await session(created.id);
+	expect(after?.status).toBe("idle");
+	expect(after?.error).toBeUndefined();
+});
+
+// A builtin command that forwards a prompt starts a real turn, so the same rule
+// applies even though command.run itself is administrative.
+test("a failed forwarded prompt marks the conversation failed", async () => {
+	const { reject, open, session, results } = await launch();
+	const created = await open();
+	vi.spyOn(results[0]!.session, "prompt").mockRejectedValue(new Error("forwarded prompt failed"));
+
+	expect(await reject("command.run", { sessionId: created.id, text: "plain forwarded prompt" })).toContain(
+		"forwarded prompt failed",
+	);
+
+	const after = await session(created.id);
+	expect(after?.status).toBe("error");
+	expect(after?.error).toContain("forwarded prompt failed");
+});
+
 // The complement: a rejected turn really did run, so it stays visible on the
 // conversation even though the same text also answers the prompt request.
 test("a rejected turn marks the conversation failed", async () => {

@@ -1428,9 +1428,10 @@ export class DesktopHost {
 		operation: () => Promise<T>,
 		retireGates = false,
 		persistSource = true,
-		// Only a rejected turn (prompt or retry) describes the conversation. A refused
-		// rename, export, profile switch or read-only command keeps the session idle
-		// and reports through its own request, where the app renders it once.
+		// Only a prompt whose turn failed describes the conversation. Every other call
+		// here is an administrative mutation: `retry()` schedules a turn and answers
+		// false when it declines, so its refusal must not mark the session failed; it
+		// reports through its own request instead.
 		recordFailure = false,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
@@ -1983,9 +1984,6 @@ export class DesktopHost {
 			},
 			method === "session.delete" || method === "session.fork",
 			method !== "session.fork" && method !== "session.delete",
-			// Retry starts a turn, so its rejection is a failed turn; every other method
-			// here is an administrative mutation whose refusal the request reports.
-			method === "session.retry",
 		);
 	}
 	/** Mirror the session's own title into the desktop catalog after a command changed it. */
@@ -2082,7 +2080,16 @@ export class DesktopHost {
 				consumed = true;
 			}
 			await this.#syncTitle(live);
-			if (forwarded !== undefined) await live.sdk.prompt(forwarded);
+			if (forwarded !== undefined) {
+				// A builtin that returns a prompt starts a real turn, so its failure is the
+				// conversation's failure even though command.run itself is administrative.
+				try {
+					await live.sdk.prompt(forwarded);
+				} catch (error) {
+					live.error = this.#error(error);
+					throw error;
+				}
+			}
 			return {
 				consumed,
 				output: chunks.join("\n").trim(),
