@@ -520,20 +520,31 @@ export default function App() {
 			return;
 		}
 		const queued = session.status === "running" || session.status === "waiting";
+		// A prompt request resolves only when the turn ends, so clear the submitted
+		// draft and attachments on dispatch: the transcript already carries the text,
+		// and leaving it in the composer invites a duplicate second submission.
+		// A rejected dispatch restores exactly what was submitted.
+		const sentIds = new Set(ownedAttachments.map(draft => draft.id));
+		setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
+		changeAttachments(sessionId, current => current.filter(draft => !sentIds.has(draft.id)));
 		// The original prompt request lasts for the whole turn. Queue admission
 		// must not reuse that lock or steer/follow-up submissions never reach the host.
 		void run(queued ? `enqueue:${sessionId}` : sessionId, async () => {
 			const attachments = readyDesktopAttachments(ownedAttachments);
-			const result = await request<{ queued?: boolean }>("prompt", {
-				sessionId,
-				text,
-				...(attachments.length ? { attachments } : {}),
-				...(queued ? { deliverAs } : {}),
-			});
-			setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
-			const sentIds = new Set(ownedAttachments.map(draft => draft.id));
-			changeAttachments(sessionId, current => current.filter(draft => !sentIds.has(draft.id)));
-			if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+			try {
+				const result = await request<{ queued?: boolean }>("prompt", {
+					sessionId,
+					text,
+					...(attachments.length ? { attachments } : {}),
+					...(queued ? { deliverAs } : {}),
+				});
+				if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+			} catch (error) {
+				// Never clobber text typed while the dispatch was in flight.
+				setDrafts(previous => (previous[sessionId] ? previous : { ...previous, [sessionId]: text }));
+				changeAttachments(sessionId, current => (current.length ? current : ownedAttachments));
+				throw error;
+			}
 		});
 	};
 	const openCommands = () => {
