@@ -209,6 +209,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .setting-field small { display: block; margin: 4px 0 8px; }
 .setting-field label { font-family: var(--mono); overflow-wrap: anywhere; font-size: 0.8125rem; }
 .setting-field > .button { margin-top: 8px; }
+/* The shared input rule fills the row; a boolean checkbox keeps its native size. */
+.setting-field input[type="checkbox"] { width: auto; margin: 0; padding: 0; border: 0; background: none; accent-color: var(--accent); }
 .checkbox-label { display: flex; gap: 8px; align-items: center; }
 .checkbox-label input { width: auto; }
 .capability { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--border); }
