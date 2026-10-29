@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $which, getRemoteHostDir, getSshControlDir, isEnoent, logger, postmortem } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { $ } from "bun";
 import { buildSshTarget, sanitizeHostName } from "./utils";
 
@@ -105,12 +106,12 @@ function buildCommonArgs(host: SSHConnectionTarget, options?: SSHArgsOptions): s
 }
 
 async function runSshSync(args: string[]): Promise<{ exitCode: number | null; stderr: string }> {
-	const result = await $`ssh ${args}`.quiet().nothrow();
+	const result = await $`ssh ${args}`.env(projectSafeSpawnEnv()).quiet().nothrow();
 	return { exitCode: result.exitCode, stderr: result.stderr.toString().trim() };
 }
 
 async function runSshCaptureSync(args: string[]): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
-	const result = await $`ssh ${args}`.quiet().nothrow();
+	const result = await $`ssh ${args}`.env(projectSafeSpawnEnv()).quiet().nothrow();
 	return {
 		exitCode: result.exitCode,
 		stdout: result.stdout.toString().trim(),

@@ -128,11 +128,12 @@ describe("SessionSdkHost", () => {
 	test("lifecycle is idempotent and registers with the broker", async () => {
 		let handler: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		const registered: number[] = [];
+		let issued = 0;
 		const host = new SessionSdkHost({
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
-			allocateEventGeneration: async () => 1_000,
+			allocateEventGeneration: async (_sessionId, floor) => (issued = Math.max(issued + 1, floor)),
 			sendFrame: () => {
 				return "written";
 			},
@@ -150,38 +151,44 @@ describe("SessionSdkHost", () => {
 		});
 		expect(await host.start()).toBe("started");
 		expect(await host.start()).toBe("already");
-		expect(registered).toEqual([1_000]);
+		const firstGeneration = host.generation;
+		expect(firstGeneration).toBe(issued);
+		expect(registered).toEqual([firstGeneration]);
 		expect(handler).toBeDefined();
 		expect(await host.stop()).toBe("stopped");
 		expect(await host.stop()).toBe("already");
 		expect(await host.start()).toBe("started");
-		// A restart inside one stream advances even when the authority repeats itself.
-		expect(registered).toEqual([1_000, 1_001]);
+		expect(host.generation).toBeGreaterThan(firstGeneration);
+		expect(host.generation).toBe(issued);
+		expect(registered).toEqual([firstGeneration, host.generation]);
 	});
 
 	test("a recreated host takes its event namespace from the generation authority", async () => {
-		let issued = 5_000;
+		let issued = 0;
 		const createHost = () =>
 			new SessionSdkHost({
 				sessionId: "resumed",
 				stateRoot: "/tmp/resumed",
 				token: "t",
-				allocateEventGeneration: async () => issued++,
+				allocateEventGeneration: async (_sessionId, floor) => (issued = Math.max(issued + 1, floor)),
 				sendFrame: () => "written",
 				onFrame: () => () => {},
 			});
 		const first = createHost();
 		await first.start();
+		expect(first.generation).toBe(issued);
 		const firstEvent = first.emitEvent({ kind: "notice", payload: { type: "notice", message: "first" } });
 		await first.stop();
 		const resumed = createHost();
 		await resumed.start();
+		expect(resumed.generation).toBe(issued);
 		const resumedEvent = resumed.emitEvent({ kind: "notice", payload: { type: "notice", message: "resumed" } });
 		// Each process restarts its sequence, so only the generation keeps the
 		// resumed host's (generation, seq) coordinates apart from the closed host's.
 		expect(resumedEvent.seq).toBe(firstEvent.seq);
-		expect(firstEvent.generation).toBe(5_000);
-		expect(resumedEvent.generation).toBe(5_001);
+		expect(firstEvent.generation).toBe(first.generation);
+		expect(resumedEvent.generation).toBeGreaterThan(firstEvent.generation);
+		expect(resumedEvent.generation).toBe(resumed.generation);
 		await resumed.stop();
 
 		// Without an authority the generation only advances inside the host's own stream.
@@ -246,14 +253,16 @@ describe("SessionSdkHost", () => {
 	test("concurrent starts share one allocation and a stop during allocation stops that start", async () => {
 		const allocation = Promise.withResolvers<number>();
 		let allocations = 0;
+		let allocationFloor = 0;
 		const registered: number[] = [];
 		const unregistered: number[] = [];
 		const host = new SessionSdkHost({
 			sessionId: "pending-allocation",
 			stateRoot: "/tmp/pending-allocation",
 			token: "t",
-			allocateEventGeneration: () => {
+			allocateEventGeneration: (_sessionId, floor) => {
 				allocations++;
+				allocationFloor = floor;
 				return allocation.promise;
 			},
 			sendFrame: () => "written",
@@ -266,13 +275,13 @@ describe("SessionSdkHost", () => {
 		const first = host.start();
 		const second = host.start();
 		const stopped = host.stop();
-		allocation.resolve(7_000);
+		allocation.resolve(allocationFloor);
 		expect(await first).toBe("started");
 		expect(await second).toBe("already");
 		expect(await stopped).toBe("stopped");
 		expect(allocations).toBe(1);
-		expect(registered).toEqual([7_000]);
-		expect(unregistered).toEqual([7_000]);
+		expect(registered).toEqual([allocationFloor]);
+		expect(unregistered).toEqual([allocationFloor]);
 		expect(host.started).toBe(false);
 	});
 

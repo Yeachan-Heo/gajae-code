@@ -148,6 +148,7 @@ import {
 	type SpawnAuthorityV1,
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
+	type SpawnLifecycleOwner,
 	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -526,13 +527,22 @@ export type SpawnQ26Reconciliation = {
 	acceptedAt?: number;
 };
 
+/** Exact registration a spawn waits for, bounded by the original readiness deadline. */
+export interface SpawnRegistrationRequest {
+	childId: string;
+	cwd: string;
+	stateRoot: string;
+	/** Resolved SDK host (not the managed supervisor); registration must match it exactly. */
+	owner: SpawnLifecycleOwner;
+	effectMarker: string;
+	deadlineAt: number;
+}
+
 /** Q26-only host control seam. It never receives or returns durable request material. */
 export interface SpawnPromptLayer {
-	awaitRegistration(input: {
-		childId: string;
-		cwd: string;
-		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }>;
+	awaitRegistration(
+		input: SpawnRegistrationRequest,
+	): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }>;
 	dispatch(input: {
 		sessionId: string;
 		task: string;
@@ -658,7 +668,6 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
 
-const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
@@ -744,10 +753,15 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 /** Exact admission predicate for the child host row published after launch. */
 export function spawnRegistrationMatches(
 	candidate: IndexedSession,
-	expected: { childId: string; cwd: string; stateRoot: string },
+	expected: { childId: string; cwd: string; stateRoot: string; owner: SpawnLifecycleOwner; effectMarker: string },
 ): boolean {
 	return (
 		candidate.sessionId === expected.childId &&
+		// The registered row must be the resolved SDK host for this exact
+		// lifecycle request, never the supervisor or a same-id stranger.
+		candidate.pid === expected.owner.pid &&
+		(candidate.hostIncarnation ?? candidate.processIncarnation) === expected.owner.incarnation &&
+		candidate.lifecycleRequestId === expected.effectMarker &&
 		candidate.endpointGeneration > 0 &&
 		candidate.live &&
 		!candidate.terminal &&
@@ -2680,8 +2694,12 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
-				const { pid, processIncarnation: incarnation } = launched.proof;
-				if (pid === undefined || incarnation === undefined) {
+				if (
+					launched.proof.pid === undefined ||
+					!Number.isSafeInteger(launched.proof.pid) ||
+					launched.proof.pid <= 0 ||
+					!safeSpawnOpaque(launched.proof.processIncarnation)
+				) {
 					const failure: SpawnSubstrateFailure = {
 						substrateKind: launched.proof.substrateKind,
 						code: "substrate_proof_failed",
@@ -2777,14 +2795,74 @@ export class Broker {
 						return error("terminal_uncertain", "managed child close is unresolved after its attempt was fenced");
 					}
 				}
+				// The substrate proof names the managed supervisor (cleanup authority);
+				// the lifecycle marker and registration must name the real SDK host.
+				const resolution = await provider.resolveLifecycleOwner(launched.proof, prep.semanticReadyDeadlineAt);
+				if (!resolution.ok || Date.now() >= prep.semanticReadyDeadlineAt) {
+					const reason = resolution.ok ? "owner_deadline" : resolution.code;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "closed" || release === "gone") {
+						const failure: SpawnSubstrateFailure = {
+							substrateKind: launched.proof.substrateKind,
+							code: "lifecycle_owner_unresolved",
+							message: `session.spawn lifecycle owner resolution failed (${reason})`,
+						};
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "pre_send_rejected",
+								failure,
+							})
+						).claim;
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					}
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "uncertain",
+							failure: {
+								substrateKind: launched.proof.substrateKind,
+								code: "child_registration_release_unproven",
+								message: "session.spawn child registration could not prove substrate release",
+							},
+						})
+					).claim;
+					launchedProof = undefined;
+					return error(
+						"terminal_uncertain",
+						`session.spawn lifecycle owner resolution failed (${reason}) and substrate release could not be proven`,
+					);
+				}
+				const { pid, incarnation } = resolution.owner;
+				if (!Number.isSafeInteger(pid) || pid <= 0 || !safeSpawnOpaque(incarnation))
+					throw new Error("Invalid resolved lifecycle owner");
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle owner deadline expired");
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle marker deadline expired");
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
+					owner: resolution.owner,
+					effectMarker: prep.effectMarker,
+					deadlineAt: prep.semanticReadyDeadlineAt,
 				});
-				if (!registration.ok) {
+				if (
+					!registration.ok ||
+					Date.now() >= prep.semanticReadyDeadlineAt ||
+					registration.registration.sessionId !== prep.childId ||
+					registration.registration.pid !== pid ||
+					registration.registration.processIncarnation !== incarnation ||
+					registration.registration.lifecycleRequestId !== prep.effectMarker ||
+					!Number.isSafeInteger(registration.registration.endpointGeneration) ||
+					registration.registration.endpointGeneration <= 0 ||
+					resolveEquivalentPath(registration.registration.cwd) !== resolveEquivalentPath(prep.cwd) ||
+					resolveEquivalentPath(registration.registration.stateRoot) !== resolveEquivalentPath(prep.stateRoot)
+				) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
 					if (release === "closed" || release === "gone") {
@@ -3120,10 +3198,17 @@ export class Broker {
 		if (verdict === "gone") return "gone";
 		if (verdict !== "verified") return "unresolved";
 		try {
-			return (await provider.close(proof)).ok ? "closed" : "unresolved";
+			if ((await provider.close(proof)).ok) return "closed";
 		} catch {
-			// The substrate may survive. The caller still records uncertainty, which
-			// is the honest durable outcome for an unclosed unowned substrate.
+			// Reconciled below: the substrate may survive.
+		}
+		// An unowned substrate can exit on its own while its close runs (a host that gave
+		// up at its readiness cutoff), which fails or refuses the exact close. Its proven
+		// absence releases it exactly as before the close; anything else stays uncertain,
+		// the honest durable outcome for an unclosed unowned substrate.
+		try {
+			return (await provider.verify(proof)) === "gone" ? "gone" : "unresolved";
+		} catch {
 			return "unresolved";
 		}
 	}
@@ -3432,11 +3517,16 @@ export class Broker {
 		childId: string;
 		cwd: string;
 		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }> {
-		const deadline = Date.now() + SPAWN_HOST_REGISTRATION_TIMEOUT_MS;
+		owner: SpawnLifecycleOwner;
+		effectMarker: string;
+		deadlineAt: number;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }> {
+		const deadline = input.deadlineAt;
 		for (;;) {
+			if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false };
 			try {
 				await this.index.refresh();
+				if (Date.now() >= deadline) return { ok: false };
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
 				const row = this.index
@@ -3454,6 +3544,7 @@ export class Broker {
 								endpointGeneration: row.endpointGeneration,
 								pid: row.pid,
 								processIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
 								cwd: row.locator.cwd,
 								stateRoot: row.locator.stateRoot,
 							},
@@ -3463,8 +3554,8 @@ export class Broker {
 			} catch {
 				// A transient index read failure only delays the poll.
 			}
-			if (Date.now() > deadline) return { ok: false };
-			await Bun.sleep(SPAWN_HOST_REGISTRATION_POLL_MS);
+			if (Date.now() >= deadline) return { ok: false };
+			await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
 		}
 	}
 
@@ -5270,6 +5361,7 @@ export class Broker {
 			...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
+		const spawnOwners = this.#spawnAuthority?.spawnOwnersByChild();
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const {
 				lifecycleRequestId: _lifecycleRequestId,
@@ -5277,7 +5369,12 @@ export class Broker {
 				...publicSession
 			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
+			const spawnOwner = spawnOwners?.get(session.sessionId);
+			return {
+				...publicSession,
+				...(incarnation === undefined ? {} : { endpointIncarnation: incarnation }),
+				...(spawnOwner === undefined ? {} : { spawnedBy: { masterSessionId: spawnOwner } }),
+			};
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);

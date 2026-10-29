@@ -3032,6 +3032,61 @@ export class MCPManager {
 		});
 	}
 
+	/** Connect one ordinary session server without the startup cache fallback. */
+	async connectSessionServer(
+		name: string,
+		config: MCPServerConfig,
+		source: SourceMeta,
+		options?: { restart?: boolean },
+	): Promise<MCPServerConnection> {
+		this.#assertRawMCPAccessAllowed();
+		this.#assertConnectionSetMutable();
+		if (options?.restart && this.#connections.has(name)) {
+			await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true, preserveTools: true });
+		}
+		const existing = this.#connections.get(name);
+		if (existing) return existing;
+		if (
+			this.#pendingConnections.has(name) ||
+			this.#pendingToolLoads.has(name) ||
+			this.#pendingReconnections.has(name)
+		) {
+			throw new Error("connection already pending");
+		}
+		const validationErrors = validateServerConfig(name, config);
+		if (validationErrors.length > 0) throw new Error(validationErrors.join("; "));
+		this.#pruneSettledPendingAcquireCleanups(name);
+		await this.#closePendingConnectionCleanup(name);
+		const hadState = this.#serverConfigs.has(name) || this.#tools.some(tool => tool.mcpServerName === name);
+		this.#serverConfigs.set(name, config);
+		this.#sources.set(name, source);
+		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+		const flight = this.#connectAndWireServer(name, config, source, this.#epoch, disconnectEpoch);
+		this.#pendingConnections.set(name, flight);
+		let timer: Timer | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`MCP connection timed out: ${name}`)),
+				resolveExactConfigStartupTimeoutMs([config]),
+			);
+		});
+		try {
+			return await Promise.race([flight, timeout]);
+		} catch (error) {
+			void flight.catch(() => {});
+			if ((this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch) {
+				await this.#disconnectServer(
+					name,
+					hadState ? { preserveConfig: true, preserveSource: true, preserveTools: true } : undefined,
+				).catch(cleanupError => this.#logLeaseReleaseFailure(name, this.#connections.get(name), cleanupError));
+			}
+			throw error;
+		} finally {
+			if (timer) clearTimeout(timer);
+			if (this.#pendingConnections.get(name) === flight) this.#pendingConnections.delete(name);
+		}
+	}
+
 	#startReconnect(name: string, assertControl?: () => void): Promise<MCPServerConnection | null> {
 		assertControl?.();
 		if (this.#pendingServerControls.get(name)?.signal?.aborted) return Promise.resolve(null);

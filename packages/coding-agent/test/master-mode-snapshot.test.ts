@@ -100,6 +100,40 @@ test("collectMasterPeerSnapshot uses one scoped list, excludes self, and sorts r
 	]);
 });
 
+test("collectMasterPeerSnapshot omits both the current row and the lineage owner row after a switch", async () => {
+	const { anchor } = await gitAnchor();
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			{ id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: false, role: "master" },
+			{ id: "switched", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
+			{
+				id: "child",
+				locator: { cwd: "/c", worktreeRoot: null, stateRoot: "/s" },
+				live: true,
+				spawnedBy: { masterSessionId: "master" },
+			},
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	expect(snapshot.rows).toEqual([
+		{
+			id: "child",
+			locator: { cwd: "/c", worktreeRoot: null, stateRoot: "/s" },
+			live: true,
+			spawnedBy: { masterSessionId: "master", self: true },
+		},
+	]);
+});
+
 test("collectMasterPeerSnapshot preserves explicit empty and not-in-git-worktree results", async () => {
 	const { anchor } = await gitAnchor();
 	const emptyLifecycle = new FakeLifecycle({
