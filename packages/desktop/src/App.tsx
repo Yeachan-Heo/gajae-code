@@ -61,6 +61,7 @@ import {
 import { BtwDialog } from "./BtwDialog";
 import { request, selectProject, subscribe } from "./bridge";
 import { matchesSlashFilter } from "./command-search";
+import { restoreAttachments, restoreDraft } from "./composer-draft";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
 import { ForkPanel } from "./ForkPanel";
 import { GateDialog } from "./GateDialog";
@@ -521,17 +522,17 @@ export default function App() {
 			return;
 		}
 		const queued = session.status === "running" || session.status === "waiting";
-		// A prompt request resolves only when the turn ends, so clear the submitted
-		// draft and attachments on dispatch: the transcript already carries the text,
-		// and leaving it in the composer invites a duplicate second submission.
-		// A rejected dispatch restores exactly what was submitted.
-		const sentIds = new Set(ownedAttachments.map(draft => draft.id));
-		setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
-		changeAttachments(sessionId, current => current.filter(draft => !sentIds.has(draft.id)));
+		// A prompt request resolves only when the turn ends, so the composer clears on
+		// admission rather than on reply: keeping the sent text invites a duplicate
+		// submission. Clearing inside the action also means a send that `run` refuses
+		// to admit (locked scope) leaves the draft untouched.
 		// The original prompt request lasts for the whole turn. Queue admission
 		// must not reuse that lock or steer/follow-up submissions never reach the host.
 		void run(queued ? `enqueue:${sessionId}` : sessionId, async () => {
 			const attachments = readyDesktopAttachments(ownedAttachments);
+			const sentIds = new Set(ownedAttachments.map(draft => draft.id));
+			setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
+			changeAttachments(sessionId, current => current.filter(draft => !sentIds.has(draft.id)));
 			try {
 				const result = await request<{ queued?: boolean }>("prompt", {
 					sessionId,
@@ -541,9 +542,9 @@ export default function App() {
 				});
 				if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
 			} catch (error) {
-				// Never clobber text typed while the dispatch was in flight.
-				setDrafts(previous => (previous[sessionId] ? previous : { ...previous, [sessionId]: text }));
-				changeAttachments(sessionId, current => (current.length ? current : ownedAttachments));
+				// The host refused the dispatch, so the payload is still undelivered.
+				setDrafts(previous => ({ ...previous, [sessionId]: restoreDraft(previous[sessionId] ?? "", text) }));
+				changeAttachments(sessionId, current => restoreAttachments(current, ownedAttachments));
 				throw error;
 			}
 		});
