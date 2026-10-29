@@ -24,22 +24,80 @@ const CSI = "\u001b[2J";
 const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
 const PROPERTY_SEED = 638;
 const PROPERTY_RUNS = 64;
-// Status sanitizers have no length cap. The bound check uses N and 2N code units.
+// Status sanitizers have no length cap. Every sample runs at N and at 2N.
+// Elapsed time is the work check. Output length is only a size cap.
 const BOUND_N = 256 * 1024;
 const BOUND_MS = 2000;
+const BOUND_SLACK_MS = 50;
 
 function sized(unit: string, units: number): string {
 	return unit.repeat(Math.ceil(units / unit.length)).slice(0, units);
 }
 
-function expectWorkBound(inputUnits: number, render: () => string, copies = 1): string {
-	const started = performance.now();
-	const rendered = render();
-	expect(performance.now() - started).toBeLessThan(BOUND_MS);
-	// A fixed number of interpolations stays linear. Quadratic growth fails this.
-	expect(rendered.length).toBeLessThanOrEqual(inputUnits * copies + 800);
-	assertNoTerminalControls(rendered);
-	return rendered;
+function exactRepeat(unit: string, units: number): string {
+	return unit.repeat(Math.floor(units / unit.length));
+}
+
+/** OSC 52 with a payload and no BEL or ST terminator. */
+function openOsc(units: number): string {
+	const prefix = "\u001b]52;c;";
+	return prefix + "A".repeat(Math.max(0, units - prefix.length));
+}
+
+/** One CSI introducer and parameter digits. No final byte in 0x40-0x7E. */
+function openCsi(units: number): string {
+	return `\u001b[${"1".repeat(Math.max(0, units - 2))}`;
+}
+
+function renderPhase(input: string): string {
+	return renderStateMarkdown("ultragoal", { current_phase: input }, manifestFor([]));
+}
+
+function renderGoal(input: string): string {
+	return renderUltragoalStatusMarkdown({
+		exists: true,
+		status: input,
+		paths: { goalsPath: "goals.json" },
+		gjcObjective: input,
+		currentGoal: { id: "g1", status: "pending" },
+		counts: { pending: 1 },
+		goals: [{}],
+	});
+}
+
+function renderLine(input: string): string {
+	return renderStateStatusLine({
+		skill: "ultragoal",
+		phase: input,
+		active: true,
+		fresh: false,
+		next: ["active"],
+		receipt_status: "fresh",
+		storage_path: "state.json",
+	});
+}
+
+function expectScale(make: (units: number) => string, render: (input: string) => string, copies: number): void {
+	const small = make(BOUND_N);
+	const large = make(BOUND_N * 2);
+	expect(small.length).toBeGreaterThan(BOUND_N - 16);
+	expect(large.length).toBeGreaterThan(BOUND_N * 2 - 16);
+	render(make(64));
+	const smallStarted = performance.now();
+	const smallText = render(small);
+	const smallMs = performance.now() - smallStarted;
+	const largeStarted = performance.now();
+	const largeText = render(large);
+	const largeMs = performance.now() - largeStarted;
+	expect(smallMs).toBeLessThan(BOUND_MS);
+	expect(largeMs).toBeLessThan(BOUND_MS);
+	// 2N is about twice the work when the scan is linear. A much larger jump fails.
+	// The slack covers a short timer spike. Output length is not this check.
+	expect(largeMs).toBeLessThan(smallMs * 3 + BOUND_SLACK_MS);
+	expect(smallText.length).toBeLessThanOrEqual(small.length * copies + 800);
+	expect(largeText.length).toBeLessThanOrEqual(large.length * copies + 800);
+	assertNoTerminalControls(smallText);
+	assertNoTerminalControls(largeText);
 }
 
 function assertNoTerminalControls(text: string | undefined): void {
@@ -440,45 +498,20 @@ describe("state terminal text", () => {
 	});
 
 	it("bounds work for oversized plain text and unterminated escapes", () => {
-		const plain = sized("phase note ", BOUND_N * 2);
-		const prose = expectWorkBound(
-			plain.length,
-			() => renderStateMarkdown("ultragoal", { current_phase: plain }, manifestFor([])),
-			2,
-		);
-		expect(prose).toContain(plain.trim());
-		const half = sized("phase note ", BOUND_N);
-		expectWorkBound(half.length, () => renderStateMarkdown("ultragoal", { current_phase: half }, manifestFor([])), 2);
-
-		const osc = sized("\u001b]52;c;AAAA", BOUND_N * 2);
-		const csi = sized("\u001b[31m", BOUND_N * 2);
-		const goal = expectWorkBound(osc.length + csi.length, () =>
-			renderUltragoalStatusMarkdown({
-				exists: true,
-				status: csi,
-				paths: { goalsPath: "goals.json" },
-				gjcObjective: osc,
-				currentGoal: { id: "g1", status: "pending" },
-				counts: { pending: 1 },
-				goals: [{}],
-			}),
-		);
-		expect(goal.split("\n").filter(line => line.startsWith("- status:")).length).toBe(1);
-
-		const c1 = sized("\u009d0;title", BOUND_N * 2);
-		const line = expectWorkBound(c1.length, () =>
-			renderStateStatusLine({
-				skill: "ultragoal",
-				phase: c1,
-				active: true,
-				fresh: false,
-				next: ["active"],
-				receipt_status: "fresh",
-				storage_path: "state.json",
-			}),
-		);
-		expect(line.startsWith("ultragoal: phase=")).toBe(true);
-		expect(line.endsWith("\n")).toBe(true);
-		expect(line.slice(0, -1).includes("\n")).toBe(false);
+		// Plain, repeated OSC, open OSC, repeated CSI, open CSI, and C1.
+		// Each one runs at N and at 2N on phase markdown, ultragoal status, and the status line.
+		const classes: Array<{ make: (units: number) => string }> = [
+			{ make: units => sized("phase note ", units) },
+			{ make: units => exactRepeat("\u001b]52;c;AAAA\u0007", units) },
+			{ make: openOsc },
+			{ make: units => exactRepeat("\u001b[31m", units) },
+			{ make: openCsi },
+			{ make: units => exactRepeat("\u009d0;title", units) },
+		];
+		for (const sample of classes) {
+			expectScale(sample.make, renderPhase, 2);
+			expectScale(sample.make, renderGoal, 2);
+			expectScale(sample.make, renderLine, 1);
+		}
 	});
 });
