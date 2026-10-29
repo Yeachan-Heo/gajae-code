@@ -100,9 +100,8 @@ discovery pid is the supervised process itself.
   publication write blocks the process so the event loop cannot reach that
   same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
   TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
-  `SuccessExitStatus`. stderr includes `sdk broker: publication-liveness-timeout`
-  only when that write can finish without waiting. A full stderr pipe does
-  not postpone the SIGKILL. While the event loop is still running, the
+  `SuccessExitStatus`. The watchdog does not write a diagnostic before SIGKILL,
+  so a blocked stderr cannot postpone termination. While the event loop is still running, the
   exit-1 path above is the one that runs.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
