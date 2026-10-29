@@ -1428,11 +1428,12 @@ export class DesktopHost {
 		operation: () => Promise<T>,
 		retireGates = false,
 		persistSource = true,
-		// Only a prompt whose turn failed describes the conversation, and only the two
-		// prompt entry points pass true. No call that leaves this unset is a prompt
-		// turn: `retry()` answers false when it declines, and a compaction that fails
-		// is a refused maintenance step, so neither may mark the session failed. They
-		// report through their own request instead.
+		// Only a prompt whose turn failed describes the conversation. The `prompt`
+		// request passes true; `command.run` records the failure of the prompt it
+		// forwards itself. Leaving this unset means this helper records nothing:
+		// `retry()` returning false becomes a request error, and a failed compaction
+		// is a refused maintenance step, so neither marks the session failed and each
+		// reports through its own request.
 		recordFailure = false,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
