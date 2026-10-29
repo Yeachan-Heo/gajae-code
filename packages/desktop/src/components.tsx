@@ -49,7 +49,8 @@ export function SessionRow({
 			<button className="session-select" aria-current={selected ? "page" : undefined} onClick={onSelect}>
 				<span className="session-title">{session.title}</span>
 				<small className={`status ${session.status}`}>
-					<StatusIcon aria-hidden="true" />{statuses[session.status]}
+					<StatusIcon aria-hidden="true" />
+					{statuses[session.status]}
 				</small>
 			</button>
 			<Button
@@ -69,7 +70,9 @@ export function Message({ message }: { message: DesktopMessage }) {
 		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
 			<strong className="role-label">{labels[message.role]}</strong>
 			{message.truncated && (
-				<small className="truncation-notice">긴 메시지의 앞부분을 생략했습니다. 전체 내용은 대화 내보내기로 확인하세요.</small>
+				<small className="truncation-notice">
+					긴 메시지의 앞부분을 생략했습니다. 전체 내용은 대화 내보내기로 확인하세요.
+				</small>
 			)}
 			{message.role === "tool" ? (
 				<details className="tool-disclosure">
@@ -77,7 +80,15 @@ export function Message({ message }: { message: DesktopMessage }) {
 						<ChevronRight className="disclosure-chevron" aria-hidden="true" />
 						<span className="tool-name">{message.toolName || "도구 실행"}</span>
 						{message.excludeFromContext && <small> · 모델 컨텍스트 제외</small>}
-						{message.cancelled ? <small> · 취소됨</small> : message.isError && <span className="tool-failure"><CircleAlert aria-hidden="true" /> · 실패</span>}
+						{message.cancelled ? (
+							<small> · 취소됨</small>
+						) : (
+							message.isError && (
+								<span className="tool-failure">
+									<CircleAlert aria-hidden="true" /> · 실패
+								</span>
+							)
+						)}
 					</summary>
 					<pre className="bounded-output">{message.text}</pre>
 				</details>
@@ -170,7 +181,9 @@ export function Composer({
 				</div>
 			)}
 			<div className="composer-actions">
-				<small id={hintId} className="composer-hint">⌘ / Ctrl + Enter로 보내기</small>
+				<small id={hintId} className="composer-hint">
+					⌘ / Ctrl + Enter로 보내기
+				</small>
 				{busy && allowQueue && onDeliverAs && (
 					<div className="composer-delivery">
 						<label htmlFor={deliverId}>실행 중 입력</label>
@@ -188,7 +201,8 @@ export function Composer({
 				<div className="composer-buttons">
 					{busy && (
 						<Button onClick={onStop} disabled={disabled}>
-							<Square aria-hidden="true" />작업 중지
+							<Square aria-hidden="true" />
+							작업 중지
 						</Button>
 					)}
 					<Button type="submit" className="primary" disabled={!canSubmit}>
@@ -224,12 +238,18 @@ export function QuestionCard({
 				<CircleHelp aria-hidden="true" />
 				<h3 id={titleId}>{question.title}</h3>
 			</div>
-			{pending && <p className="question-pending"><LoaderCircle aria-hidden="true" />연결 또는 응답 처리를 기다리는 중…</p>}
+			{pending && (
+				<p className="question-pending">
+					<LoaderCircle aria-hidden="true" />
+					연결 또는 응답 처리를 기다리는 중…
+				</p>
+			)}
 			{question.message && <p>{question.message}</p>}
 			{question.kind === "confirm" ? (
 				<div className="actions">
 					<Button disabled={pending} onClick={() => onAnswer(true)}>
-						<Check aria-hidden="true" />확인
+						<Check aria-hidden="true" />
+						확인
 					</Button>
 					<Button disabled={pending} onClick={() => onAnswer(false)}>
 						아니요
@@ -308,7 +328,8 @@ export function Modal({
 			<header>
 				<h2 id={titleId}>{title}</h2>
 				<Button aria-label="닫기" onClick={onClose}>
-					<X aria-hidden="true" />닫기
+					<X aria-hidden="true" />
+					닫기
 				</Button>
 			</header>
 			{children}
@@ -367,9 +388,19 @@ export function SettingField({
 						<option key={choice}>{choice}</option>
 					))}
 				</select>
+			) : setting.type === "boolean" ? (
+				<input
+					id={id}
+					type="checkbox"
+					disabled={!setting.writable || pending}
+					checked={value === "true"}
+					onChange={event => setValue(event.target.checked ? "true" : "false")}
+				/>
 			) : (
 				<input
 					id={id}
+					type={setting.type === "number" ? "number" : "text"}
+					step={setting.type === "number" ? "any" : undefined}
 					disabled={!setting.writable || pending}
 					value={value}
 					onChange={event => setValue(event.target.value)}
