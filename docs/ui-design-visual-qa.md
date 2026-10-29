@@ -53,6 +53,15 @@ Required evidence:
 - **Independent review before done** — a reviewer or review lane that did not author the implementation must inspect the full evidence set against `DESIGN.md`, the component harness, and acceptance criteria before the work is marked complete.
 - **Evidence references** — PRs should link or attach the current evidence artifacts instead of describing them only in prose.
 
+## Desktop session-control evidence
+
+Extend the existing Desktop design system in `packages/desktop/DESIGN.md`; model, reasoning, activity, fork, and side-conversation controls are not separate redesigns.
+
+- Exercise the mounted App as well as the component showcase. Replace a session with the same catalog ID but a different control generation while catalog loads and mutations are pending. Late successes and failures must not revive a picker, expose stale errors, or unlock the replacement owner's request. Null-generation controls must remain unavailable.
+- Model search must distinguish provider/model IDs even when labels collide. Reasoning choices must come from the SDK's declared options, without optimistic selection or invented levels. Check keyboard selection, focus return, loading, unavailable, empty, error, and retry states in both themes, narrow layouts, and enlarged text.
+- Fork evidence must distinguish whole-copy and selected-entry behavior. Preserve the source draft and attachments; selected text belongs only in the child draft and must not auto-submit. Host regressions must also cover the first committed-child snapshot failing to emit, not just a later source frame: transport failure must not delete the committed child or its private transcript ancestor.
+- Record source hashes and the exact environment for each proof. Synthetic bridges, loopback-provider fixtures, native WKWebView runs, and live providers establish different boundaries. Historical screenshots, successful Host tests, and static review do not certify unexecuted SDK lifecycle scenarios or full Desktop/TUI parity.
+
 ## Terminal and TUI evidence
 
 Terminal/TUI visual work must preserve terminal semantics in future helper flows. Until Gajae-Code has a dedicated helper, terminal visual-QA evidence must document the exact helper requirements and avoid flattening away the data needed for review.

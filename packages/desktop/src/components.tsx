@@ -1,4 +1,17 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import {
+	ArrowUp,
+	Check,
+	ChevronRight,
+	Circle,
+	CircleAlert,
+	CircleHelp,
+	ListPlus,
+	LoaderCircle,
+	Square,
+	Star,
+	X,
+} from "lucide-react";
+import type { ButtonHTMLAttributes, ClipboardEventHandler, ReactNode } from "react";
 import { useEffect, useId, useRef, useState } from "react";
 import type { DesktopMessage, DesktopQuestion, DesktopSession, DesktopSetting } from "../../desktop-host/src/protocol";
 
@@ -12,11 +25,13 @@ export function Button({ children, className = "", ...props }: ButtonHTMLAttribu
 export function ErrorBanner({ children }: { children: ReactNode }) {
 	return (
 		<div className="error-banner" role="alert">
-			{children}
+			<CircleAlert aria-hidden="true" />
+			<div className="error-content">{children}</div>
 		</div>
 	);
 }
 const statuses = { idle: "대기", running: "작업 중", waiting: "응답 필요", error: "오류" };
+const statusIcons = { idle: Circle, running: LoaderCircle, waiting: CircleHelp, error: CircleAlert };
 export function SessionRow({
 	session,
 	selected,
@@ -28,18 +43,22 @@ export function SessionRow({
 	onSelect: () => void;
 	onStar: () => void;
 }) {
+	const StatusIcon = statusIcons[session.status];
 	return (
 		<div className={`session-row ${selected ? "selected" : ""}`}>
 			<button className="session-select" aria-current={selected ? "page" : undefined} onClick={onSelect}>
-				<span>{session.title}</span>
-				<small className={`status ${session.status}`}>{statuses[session.status]}</small>
+				<span className="session-title">{session.title}</span>
+				<small className={`status ${session.status}`}>
+					<StatusIcon aria-hidden="true" />{statuses[session.status]}
+				</small>
 			</button>
 			<Button
+				className="session-star"
 				aria-label={session.starred ? "즐겨찾기 해제" : "즐겨찾기"}
 				aria-pressed={session.starred}
 				onClick={onStar}
 			>
-				{session.starred ? "★" : "☆"}
+				<Star aria-hidden="true" fill={session.starred ? "currentColor" : "none"} />
 			</Button>
 		</div>
 	);
@@ -50,18 +69,23 @@ export function Message({ message }: { message: DesktopMessage }) {
 		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
 			<strong className="role-label">{labels[message.role]}</strong>
 			{message.truncated && (
-				<small>긴 메시지의 앞부분을 생략했습니다. 전체 내용은 대화 내보내기로 확인하세요.</small>
+				<small className="truncation-notice">긴 메시지의 앞부분을 생략했습니다. 전체 내용은 대화 내보내기로 확인하세요.</small>
 			)}
 			{message.role === "tool" ? (
-				<details>
+				<details className="tool-disclosure">
 					<summary>
-						{message.toolName || "도구 실행"}
-						{message.isError ? " · 실패" : ""}
+						<ChevronRight className="disclosure-chevron" aria-hidden="true" />
+						<span className="tool-name">{message.toolName || "도구 실행"}</span>
+						{message.excludeFromContext && <small> · 모델 컨텍스트 제외</small>}
+						{message.cancelled ? <small> · 취소됨</small> : message.isError && <span className="tool-failure"><CircleAlert aria-hidden="true" /> · 실패</span>}
 					</summary>
 					<pre className="bounded-output">{message.text}</pre>
 				</details>
 			) : (
-				<div className="message-text">{message.text || "응답을 기다리는 중…"}</div>
+				<div className={`message-text ${!message.text ? "message-loading" : ""}`}>
+					{!message.text && <LoaderCircle aria-hidden="true" />}
+					{message.text || "응답을 기다리는 중…"}
+				</div>
 			)}
 		</article>
 	);
@@ -76,6 +100,11 @@ export function Composer({
 	deliverAs,
 	onDeliverAs,
 	onSlash,
+	controls,
+	hasAttachments,
+	allowQueue = true,
+	sendDisabled,
+	onPaste,
 }: {
 	value: string;
 	onChange: (value: string) => void;
@@ -86,15 +115,24 @@ export function Composer({
 	deliverAs?: "steer" | "followUp";
 	onDeliverAs?: (value: "steer" | "followUp") => void;
 	onSlash?: () => void;
+	controls?: ReactNode;
+	hasAttachments?: boolean;
+	allowQueue?: boolean;
+	sendDisabled?: boolean;
+	onPaste?: ClipboardEventHandler<HTMLTextAreaElement>;
 }) {
 	const id = useId();
 	const deliverId = useId();
+	const hintId = useId();
+	const canSubmit = !disabled && !sendDisabled && (!busy || allowQueue) && !!(value.trim() || hasAttachments);
 	return (
 		<form
 			className="composer"
+			data-busy={busy || undefined}
+			data-disabled={disabled || undefined}
 			onSubmit={event => {
 				event.preventDefault();
-				onSend();
+				if (canSubmit) onSend();
 			}}
 		>
 			<label className="sr-only" htmlFor={id}>
@@ -102,11 +140,13 @@ export function Composer({
 			</label>
 			<textarea
 				id={id}
+				aria-describedby={hintId}
 				value={value}
 				onChange={event => onChange(event.target.value)}
 				placeholder="무엇을 함께 만들까요?"
 				rows={3}
 				disabled={disabled}
+				onPaste={onPaste}
 				onKeyDown={event => {
 					if (event.key === "/" && !value && onSlash && !event.nativeEvent.isComposing) {
 						event.preventDefault();
@@ -117,37 +157,45 @@ export function Composer({
 						event.key === "Enter" &&
 						(event.metaKey || event.ctrlKey) &&
 						!event.nativeEvent.isComposing &&
-						!disabled &&
-						value.trim()
+						canSubmit
 					) {
 						event.preventDefault();
 						onSend();
 					}
 				}}
 			/>
+			{controls != null && (
+				<div className="composer-controls" role="group" aria-label="메시지 작성 설정">
+					{controls}
+				</div>
+			)}
 			<div className="composer-actions">
-				<small>⌘ / Ctrl + Enter로 보내기</small>
-				{busy && onDeliverAs && (
-					<>
+				<small id={hintId} className="composer-hint">⌘ / Ctrl + Enter로 보내기</small>
+				{busy && allowQueue && onDeliverAs && (
+					<div className="composer-delivery">
 						<label htmlFor={deliverId}>실행 중 입력</label>
 						<select
 							id={deliverId}
 							value={deliverAs ?? "steer"}
+							disabled={disabled}
 							onChange={event => onDeliverAs(event.target.value === "followUp" ? "followUp" : "steer")}
 						>
 							<option value="steer">작업에 개입</option>
 							<option value="followUp">끝난 뒤 후속</option>
 						</select>
-					</>
+					</div>
 				)}
-				{busy && (
-					<Button onClick={onStop} disabled={disabled}>
-						작업 중지
+				<div className="composer-buttons">
+					{busy && (
+						<Button onClick={onStop} disabled={disabled}>
+							<Square aria-hidden="true" />작업 중지
+						</Button>
+					)}
+					<Button type="submit" className="primary" disabled={!canSubmit}>
+						{busy && allowQueue ? <ListPlus aria-hidden="true" /> : <ArrowUp aria-hidden="true" />}
+						{busy && allowQueue ? "대기열에 추가" : "보내기"}
 					</Button>
-				)}
-				<Button type="submit" className="primary" disabled={disabled || !value.trim()}>
-					{busy ? "대기열에 추가" : "보내기"}
-				</Button>
+				</div>
 			</div>
 		</form>
 	);
@@ -169,14 +217,19 @@ export function QuestionCard({
 	const value = controlledValue ?? localValue;
 	const setValue = onChange ?? setLocalValue;
 	const id = useId();
+	const titleId = useId();
 	return (
-		<section className="question-card" aria-busy={pending}>
-			<h3>{question.title}</h3>
+		<section className="question-card" aria-labelledby={titleId} aria-busy={pending}>
+			<div className="question-heading">
+				<CircleHelp aria-hidden="true" />
+				<h3 id={titleId}>{question.title}</h3>
+			</div>
+			{pending && <p className="question-pending"><LoaderCircle aria-hidden="true" />연결 또는 응답 처리를 기다리는 중…</p>}
 			{question.message && <p>{question.message}</p>}
 			{question.kind === "confirm" ? (
 				<div className="actions">
 					<Button disabled={pending} onClick={() => onAnswer(true)}>
-						확인
+						<Check aria-hidden="true" />확인
 					</Button>
 					<Button disabled={pending} onClick={() => onAnswer(false)}>
 						아니요
@@ -255,7 +308,7 @@ export function Modal({
 			<header>
 				<h2 id={titleId}>{title}</h2>
 				<Button aria-label="닫기" onClick={onClose}>
-					닫기
+					<X aria-hidden="true" />닫기
 				</Button>
 			</header>
 			{children}
@@ -279,6 +332,7 @@ export function SettingField({
 	return (
 		<form
 			className="setting-field"
+			aria-busy={pending}
 			onSubmit={event => {
 				event.preventDefault();
 				try {
@@ -322,7 +376,8 @@ export function SettingField({
 				/>
 			)}
 			<Button type="submit" disabled={!setting.writable || pending}>
-				{setting.writable ? "저장" : "읽기 전용"}
+				{pending && <LoaderCircle aria-hidden="true" />}
+				{pending ? "연결 또는 처리 대기" : setting.writable ? "저장" : "읽기 전용"}
 			</Button>
 			{error && <ErrorBanner>{error}</ErrorBanner>}
 		</form>

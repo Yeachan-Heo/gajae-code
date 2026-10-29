@@ -1,27 +1,159 @@
+import {
+	Activity,
+	Command,
+	FileDiff,
+	FolderOpen,
+	History,
+	Info,
+	MoreHorizontal,
+	Network,
+	Pencil,
+	Plus,
+	Settings2,
+	SlidersHorizontal,
+	Trash2,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+	DesktopActivityDetail,
+	DesktopActivityGateAnswer,
+	DesktopActivityOperation,
+	DesktopActivityRef,
+	DesktopActivityScope,
+} from "../../desktop-host/src/activity-protocol";
+import type { DesktopGatePresentation } from "../../desktop-host/src/gate-presentation-protocol";
+import type {
+	DesktopMcpAction,
+	DesktopMcpOperationResult,
+	DesktopMcpRef,
+	DesktopMcpSnapshot,
+} from "../../desktop-host/src/mcp-protocol";
+import type { DesktopOperatorFoldResult, DesktopOperatorOperation } from "../../desktop-host/src/operator-protocol";
+import type {
+	DesktopPreferenceAction,
+	DesktopPreferenceResult,
+	DesktopPreferences,
+} from "../../desktop-host/src/preferences-protocol";
+import type {
+	DesktopActivityUpdate,
 	DesktopCommand,
 	DesktopCommandResult,
+	DesktopCredentialSaveResult,
 	DesktopDiff,
+	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
 	DesktopMethod,
+	DesktopModel,
 	DesktopSession,
 	DesktopSetting,
 	DesktopSnapshot,
 } from "../../desktop-host/src/protocol";
+import type { DesktopSessionInfo } from "../../desktop-host/src/session-info-protocol";
+import { ActivityPanel } from "./ActivityPanel";
+import {
+	AttachmentPicker,
+	addDesktopAttachmentFiles,
+	type DesktopAttachmentDraft,
+	desktopClipboardImageFiles,
+	readyDesktopAttachments,
+} from "./AttachmentPicker";
+import { BtwDialog } from "./BtwDialog";
 import { request, selectProject, subscribe } from "./bridge";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
+import { ForkPanel } from "./ForkPanel";
+import { GateDialog } from "./GateDialog";
+import { McpPanel } from "./McpPanel";
+import { ModelPicker } from "./ModelPicker";
 import { OAuthSettings } from "./OAuthSettings";
+import { OperatorPanel } from "./OperatorPanel";
+import { PreferencesPanel } from "./PreferencesPanel";
+import { ReasoningSelect } from "./ReasoningSelect";
+import { SessionInfoPanel } from "./SessionInfoPanel";
 import "./styles.css";
 
-type Dialog = "settings" | "commands" | "history" | "rename" | "delete" | "tools" | "goal" | "result" | null;
+type Dialog =
+	| "settings"
+	| "commands"
+	| "history"
+	| "fork"
+	| "rename"
+	| "delete"
+	| "tools"
+	| "goal"
+	| "result"
+	| "activity"
+	| "activity-detail"
+	| "preferences"
+	| "session-actions"
+	| "operator"
+	| "mcp"
+	| "session-info"
+	| "btw"
+	| null;
+interface GateView {
+	sessionId: string;
+	presentation: DesktopGatePresentation;
+	presented: boolean;
+	retiring?: { nonce: string };
+}
 const textOf = (value: unknown) =>
 	typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "결과 없음");
 
 export default function App() {
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
 	const [selected, setSelected] = useState("");
+	const selectedRef = useRef(selected);
+	selectedRef.current = selected;
+	const [activity, setActivity] = useState<DesktopActivityUpdate | null>(null);
+	const [activityDetail, setActivityDetail] = useState<DesktopActivityDetail | null>(null);
+	const [preferences, setPreferences] = useState<{ sessionId: string; value: DesktopPreferences } | null>(null);
+	const [mcp, setMcp] = useState<{ sessionId: string; value: DesktopMcpSnapshot } | null>(null);
+	const [sessionInfo, setSessionInfo] = useState<{ sessionId: string; value: DesktopSessionInfo } | null>(null);
+	const [gateViews, setGateViews] = useState<Record<string, GateView>>({});
+	const [operatorDrafts, setOperatorDrafts] = useState<Record<string, string>>({});
+	const [operatorOperations, setOperatorOperations] = useState<Record<string, DesktopOperatorOperation>>({});
+	const rememberOperator = useCallback(
+		(sessionId: string, operation: DesktopOperatorOperation, expectedCurrentId?: string) => {
+			setOperatorOperations(previous => {
+				const old = previous[sessionId];
+				if (expectedCurrentId && old && old.operationId !== expectedCurrentId) return previous;
+				if (
+					old?.operationId === operation.operationId &&
+					old.status === "cancel_requested" &&
+					operation.status === "running"
+				)
+					return previous;
+				if (old && old.sessionGeneration > operation.sessionGeneration) return previous;
+				if (
+					old?.operationId === operation.operationId &&
+					old.status !== "running" &&
+					old.status !== "cancel_requested" &&
+					(operation.status === "running" || operation.status === "cancel_requested")
+				)
+					return previous;
+				return { ...previous, [sessionId]: operation };
+			});
+		},
+		[],
+	);
+	const gateViewsRef = useRef(gateViews);
+	gateViewsRef.current = gateViews;
+	const applyActivityUpdate = useCallback((update: DesktopActivityUpdate) => {
+		if (update.sessionId !== selectedRef.current) return;
+		setActivity(previous =>
+			previous?.sessionId === update.sessionId && previous.revision >= update.revision ? previous : update,
+		);
+	}, []);
+	const [modelCatalog, setModelCatalog] = useState<{
+		sessionId: string;
+		generation: number | null;
+		models: DesktopModel[];
+		loading: boolean;
+		error?: string;
+	}>({ sessionId: "", generation: null, models: [], loading: false });
+	const [modelCatalogRevision, setModelCatalogRevision] = useState(0);
+	const refreshModelCatalog = useRef(false);
 	const [connection, setConnection] = useState("호스트에 연결하는 중…");
 	const [fatal, setFatal] = useState(false);
 	const [errors, setErrors] = useState<Record<string, string>>({});
@@ -39,6 +171,17 @@ export default function App() {
 			return {};
 		}
 	});
+	const [attachmentDrafts, setAttachmentDrafts] = useState<Record<string, DesktopAttachmentDraft[]>>({});
+	const changeAttachments = useCallback(
+		(sessionId: string, update: (current: DesktopAttachmentDraft[]) => DesktopAttachmentDraft[]) => {
+			setAttachmentDrafts(previous => {
+				const current = previous[sessionId] ?? [];
+				const next = update(current);
+				return next === current ? previous : { ...previous, [sessionId]: next };
+			});
+		},
+		[],
+	);
 	const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
 	const [dialog, setDialogState] = useState<Dialog>(null);
 	const dialogGeneration = useRef(0);
@@ -53,6 +196,7 @@ export default function App() {
 	const [settingFilter, setSettingFilter] = useState("");
 	const [sessionFilter, setSessionFilter] = useState("");
 	const [provider, setProvider] = useState("");
+	const [keyProviders, setKeyProviders] = useState<string[] | null>(null);
 	const [key, setKey] = useState("");
 	const [notice, setNotice] = useState("");
 	const [editText, setEditText] = useState("");
@@ -65,6 +209,13 @@ export default function App() {
 	const [commandInput, setCommandInput] = useState("");
 	const [commandOutput, setCommandOutput] = useState("");
 	const [history, setHistory] = useState<DesktopHistory | null>(null);
+	const [forkEntryId, setForkEntryId] = useState("");
+	const [btwOwner, setBtwOwner] = useState<{
+		sessionId: string;
+		generation: number;
+		question: string;
+		composerText?: string;
+	} | null>(null);
 	const [deliverAs, setDeliverAs] = useState<"steer" | "followUp">("steer");
 	const commandInputRef = useRef<HTMLInputElement>(null);
 	const conversation = useRef<HTMLDivElement>(null);
@@ -72,6 +223,10 @@ export default function App() {
 	const session = snapshot?.sessions.find(item => item.id === selected);
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal;
+	const modelGeneration = session?.controlGeneration ?? null;
+	const modelOwner = session ? `${session.id}:${modelGeneration}` : "";
+	const modelOwnerRef = useRef(modelOwner);
+	modelOwnerRef.current = modelOwner;
 	const setDialog = useCallback(
 		(next: Dialog) => {
 			dialogGeneration.current += 1;
@@ -92,6 +247,7 @@ export default function App() {
 	const settingsScope = `settings:${dialogOwner}:${dialogGeneration.current}`;
 	const toolsScope = `tools:${dialogOwner}:${dialogGeneration.current}`;
 	const authScope = `auth:${dialogOwner}:${dialogGeneration.current}`;
+	const operatorScope = `operator:${dialogOwner}`;
 	useEffect(() => {
 		try {
 			localStorage.setItem("gjc.desktop.composer-drafts", JSON.stringify(drafts));
@@ -122,8 +278,31 @@ export default function App() {
 				failed = true;
 				setFatal(true);
 				setConnection(event.error);
+				dialogGeneration.current += 1;
+				setDialogState(null);
+				setSidebar(false);
+				setReview(false);
+				setKey("");
 			}
 			if (event.type === "snapshot") setSnapshot(event.snapshot);
+			if (event.type === "activity") applyActivityUpdate(event.update);
+			if (event.type === "operator") rememberOperator(event.sessionId, event.event.operation);
+			if (event.type === "gate") {
+				const gateEvent = event.event;
+				setGateViews(previous => {
+					if (gateEvent.type === "presented") {
+						const id = gateEvent.presentation.id;
+						if (previous[id]) return previous;
+						return {
+							...previous,
+							[id]: { sessionId: event.sessionId, presentation: gateEvent.presentation, presented: false },
+						};
+					}
+					const view = previous[gateEvent.presentationId];
+					if (!view || view.sessionId !== event.sessionId) return previous;
+					return { ...previous, [gateEvent.presentationId]: { ...view, retiring: { nonce: gateEvent.nonce } } };
+				});
+			}
 			if (event.type === "session")
 				setSnapshot(previous =>
 					previous
@@ -162,7 +341,52 @@ export default function App() {
 			alive = false;
 			unsubscribe?.();
 		};
-	}, []);
+	}, [applyActivityUpdate, rememberOperator]);
+	useEffect(() => {
+		setActivity(null);
+		if (!selected || !connected) return;
+		let alive = true;
+		void request<DesktopActivityUpdate>("activity.get", { sessionId: selected })
+			.then(update => {
+				if (alive) applyActivityUpdate(update);
+			})
+			.catch(error => {
+				if (alive)
+					setErrors(previous => ({
+						...previous,
+						[`activity:${selected}`]: error instanceof Error ? error.message : "활동 정보를 불러오지 못했습니다.",
+					}));
+			});
+		return () => {
+			alive = false;
+		};
+	}, [selected, connected, applyActivityUpdate]);
+	useEffect(() => {
+		if (!selected || !connected || modelGeneration === null) return;
+		let alive = true;
+		const owner = modelOwner;
+		setModelCatalog({ sessionId: selected, generation: modelGeneration, models: [], loading: true });
+		const refresh = refreshModelCatalog.current;
+		refreshModelCatalog.current = false;
+		void request<DesktopModel[]>("models.list", { sessionId: selected, ...(refresh ? { refresh: true } : {}) })
+			.then(models => {
+				if (alive && modelOwnerRef.current === owner)
+					setModelCatalog({ sessionId: selected, generation: modelGeneration, models, loading: false });
+			})
+			.catch(error => {
+				if (alive && modelOwnerRef.current === owner)
+					setModelCatalog({
+						sessionId: selected,
+						generation: modelGeneration,
+						models: [],
+						loading: false,
+						error: error instanceof Error ? error.message : "모델 목록을 불러오지 못했습니다.",
+					});
+			});
+		return () => {
+			alive = false;
+		};
+	}, [selected, connected, modelGeneration, modelOwner, snapshot?.models, modelCatalogRevision]);
 	useEffect(() => {
 		const media = window.matchMedia("(min-width: 1100px)");
 		const update = () => setWide(media.matches);
@@ -210,7 +434,7 @@ export default function App() {
 			setErrors(previous => ({
 				...previous,
 				[scope]: scope.startsWith("auth:")
-					? "API 키를 저장하지 못했습니다. 제공자와 키를 확인한 뒤 다시 입력하세요."
+					? "API 키 요청을 완료하지 못했습니다. 저장 여부를 확인한 뒤 다시 시도하세요."
 					: error instanceof Error
 						? error.message
 						: "요청에 실패했습니다.",
@@ -239,10 +463,17 @@ export default function App() {
 		const sessionId = selected;
 		const generation = setDialog("settings");
 		setSettings(null);
+		setKeyProviders(null);
 		setSettingFilter("");
 		void run(`settings:${sessionId}:${generation}`, async () => {
-			const value = await request<DesktopSetting[]>("settings.get", sessionId ? { sessionId } : {});
-			if (dialogGeneration.current === generation) setSettings(value);
+			const [value, providers] = await Promise.all([
+				request<DesktopSetting[]>("settings.get", sessionId ? { sessionId } : {}),
+				request<string[]>("auth.keyProviders"),
+			]);
+			if (dialogGeneration.current === generation) {
+				setSettings(value);
+				setKeyProviders(providers);
+			}
 		});
 	};
 	const saveSetting = (path: string, value: unknown) => {
@@ -265,19 +496,43 @@ export default function App() {
 			if (dialogGeneration.current === generation) setNotice("활성 도구를 저장했습니다.");
 		});
 	};
+	const openBtw = (question = "", composerText?: string) => {
+		if (!session || !connected || session.controlGeneration === null) return;
+		setBtwOwner({ sessionId: session.id, generation: session.controlGeneration, question, composerText });
+		setDialog("btw");
+	};
 	const send = () => {
 		if (!session || !connected) return;
 		const sessionId = session.id;
 		const text = drafts[sessionId] || "";
-		if (!text.trim()) return;
+		const ownedAttachments = attachmentDrafts[sessionId] ?? [];
+		if (!text.trim() && ownedAttachments.length === 0) return;
+		const sideChat = /^\s*\/btw(?:\s+([\s\S]*))?$/i.exec(text);
+		if (sideChat) {
+			if (ownedAttachments.length) {
+				setErrors(previous => ({
+					...previous,
+					[sessionId]: "별도 대화는 텍스트만 지원합니다. 첨부 파일을 제거한 뒤 다시 보내세요.",
+				}));
+				return;
+			}
+			openBtw(sideChat[1]?.trim() ?? "", text);
+			return;
+		}
 		const queued = session.status === "running" || session.status === "waiting";
-		void run(sessionId, async () => {
+		// The original prompt request lasts for the whole turn. Queue admission
+		// must not reuse that lock or steer/follow-up submissions never reach the host.
+		void run(queued ? `enqueue:${sessionId}` : sessionId, async () => {
+			const attachments = readyDesktopAttachments(ownedAttachments);
 			const result = await request<{ queued?: boolean }>("prompt", {
 				sessionId,
 				text,
+				...(attachments.length ? { attachments } : {}),
 				...(queued ? { deliverAs } : {}),
 			});
 			setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
+			const sentIds = new Set(ownedAttachments.map(draft => draft.id));
+			changeAttachments(sessionId, current => current.filter(draft => !sentIds.has(draft.id)));
 			if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
 		});
 	};
@@ -296,6 +551,11 @@ export default function App() {
 		if (!sessionId || !text.trim()) return;
 		const generation = dialogGeneration.current;
 		setNotice("");
+		const sideChat = /^\s*\/btw(?:\s+([\s\S]*))?$/i.exec(text);
+		if (sideChat) {
+			openBtw(sideChat[1]?.trim() ?? "");
+			return;
+		}
 		// Plain text belongs to the conversation, not the command dispatcher: route it
 		// through the same queue-aware prompt path as the composer so it is never
 		// dropped when a run is active.
@@ -333,13 +593,36 @@ export default function App() {
 			);
 		});
 	};
-	const openHistory = () => {
+	const openHistoryDialog = (next: "history" | "fork") => {
 		const sessionId = selected;
-		const generation = setDialog("history");
+		const generation = setDialog(next);
 		setHistory(null);
+		setForkEntryId("");
 		void run(`history:${sessionId}`, async () => {
 			const value = await request<DesktopHistory>("history.get", { sessionId, offset: 0, limit: 500 });
 			if (dialogGeneration.current === generation) setHistory(value);
+		});
+	};
+	const openHistory = () => openHistoryDialog("history");
+	const openFork = () => openHistoryDialog("fork");
+	const forkSession = (entryId?: string) => {
+		const sessionId = dialogOwner;
+		const generation = dialogGeneration.current;
+		void run(sessionId, async () => {
+			const value = await request<DesktopForkResult>("session.fork", {
+				sessionId,
+				...(entryId === undefined ? {} : { entryId }),
+			});
+			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
+			if (value.cancelled) {
+				setNotice("분기가 취소되었습니다. 원래 대화와 초안은 유지됩니다.");
+				return;
+			}
+			await request<DesktopSession>("session.select", { sessionId: value.session.id });
+			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
+			setDrafts(previous => ({ ...previous, [value.session.id]: value.selectedText }));
+			closeDialog();
+			setSelected(value.session.id);
 		});
 	};
 	const loadMoreHistory = () => {
@@ -412,7 +695,273 @@ export default function App() {
 			setActiveTools(value.active);
 		});
 	};
-	const commands: { label: string; action: () => void; needsSession?: boolean }[] = [
+	const activityScope = `activity:${dialogOwner || selected}`;
+	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
+	const preferencesScope = `preferences:${dialogOwner}:${dialogGeneration.current}`;
+	const mcpReadScope = `mcp-read:${dialogOwner}:${dialogGeneration.current}`;
+	const mcpMutationScope = `mcp-mutation:${dialogOwner}:${dialogGeneration.current}`;
+	const sessionInfoScope = `session-info:${dialogOwner}:${dialogGeneration.current}`;
+	const refreshActivity = (sessionId = selected) => {
+		void run(`activity:${sessionId}`, async () => {
+			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.get", { sessionId }));
+		});
+	};
+	const operateActivity = (ref: DesktopActivityRef, operation: DesktopActivityOperation) => {
+		const sessionId = dialogOwner || selected;
+		void run(`activity:${sessionId}`, async () => {
+			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.operate", { sessionId, ref, operation }));
+		});
+	};
+	const acknowledgeActivity = (scope: DesktopActivityScope) => {
+		const sessionId = dialogOwner || selected;
+		void run(`activity:${sessionId}`, async () => {
+			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.acknowledge", { sessionId, scope }));
+		});
+	};
+	const inspectActivity = (ref: DesktopActivityRef) => {
+		const sessionId = dialogOwner || selected;
+		const generation = setDialog("activity-detail");
+		setActivityDetail(null);
+		void run(`activity-detail:${sessionId}:${generation}`, async () => {
+			const detail = await request<DesktopActivityDetail>("activity.detail", { sessionId, ref });
+			if (dialogGeneration.current === generation) setActivityDetail(detail);
+		});
+	};
+	const loadPreferences = (sessionId: string, generation: number) => {
+		setPreferences(null);
+		void run(`preferences:${sessionId}:${generation}`, async () => {
+			const value = await request<DesktopPreferences>("preferences.get", { sessionId });
+			if (dialogGeneration.current === generation) setPreferences({ sessionId, value });
+		});
+	};
+	const openPreferences = () => {
+		if (!selected) return;
+		const generation = setDialog("preferences");
+		loadPreferences(selected, generation);
+	};
+	const applyPreferences = (action: DesktopPreferenceAction) => {
+		const sessionId = dialogOwner;
+		const generation = dialogGeneration.current;
+		void run(`preferences:${sessionId}:${generation}`, async () => {
+			const outcome = await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action });
+			if (dialogGeneration.current === generation) setPreferences({ sessionId, value: outcome.preferences });
+		});
+	};
+	const loadMcp = (sessionId: string, generation: number) => {
+		void run(`mcp-read:${sessionId}:${generation}`, async () => {
+			const value = await request<DesktopMcpSnapshot>("mcp.get", { sessionId });
+			if (dialogGeneration.current === generation) setMcp({ sessionId, value });
+		});
+	};
+	const openMcp = () => {
+		if (!selected) return;
+		const generation = setDialog("mcp");
+		setMcp(null);
+		loadMcp(selected, generation);
+	};
+	const operateMcp = (ref: DesktopMcpRef, action: DesktopMcpAction) => {
+		const sessionId = dialogOwner;
+		const generation = dialogGeneration.current;
+		void run(`mcp-mutation:${sessionId}:${generation}`, async () => {
+			const outcome = await request<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref, action });
+			if (dialogGeneration.current === generation) {
+				setMcp({ sessionId, value: outcome.snapshot });
+				setNotice("관리자 연결 변경 응답을 받았습니다. 원격 세션 종료나 자원 정산을 뜻하지 않습니다.");
+			}
+		});
+	};
+	const loadSessionInfo = (sessionId: string, generation: number) => {
+		void run(`session-info:${sessionId}:${generation}`, async () => {
+			const value = await request<DesktopSessionInfo>("session.info", { sessionId });
+			if (dialogGeneration.current === generation) setSessionInfo({ sessionId, value });
+		});
+	};
+	const openSessionInfo = () => {
+		if (!selected) return;
+		const generation = setDialog("session-info");
+		setSessionInfo(null);
+		loadSessionInfo(selected, generation);
+	};
+	const withdrawGate = useCallback(
+		(presentationId: string) => {
+			void run(`gate-withdraw:${presentationId}`, async () => {
+				const view = gateViewsRef.current[presentationId];
+				if (!view) throw new Error("승인 화면의 현재 소유권을 확인할 수 없습니다.");
+				await request("gate.withdraw", { sessionId: view.sessionId, presentationId });
+			});
+		},
+		[run],
+	);
+	const openGate = (ref: DesktopActivityRef) => {
+		const sessionId = dialogOwner || selected;
+		closeDialog();
+		void run("gate-open", async () => {
+			for (const view of Object.values(gateViewsRef.current)) {
+				await request("gate.withdraw", { sessionId: view.sessionId, presentationId: view.presentation.id });
+			}
+			// Only ordered host events publish UI. The response must not resurrect a retired surface.
+			await request("gate.present", { sessionId, ref });
+		});
+	};
+	const acknowledgeGatePresented = (presentationId: string) => {
+		void run(`gate-presented:${presentationId}`, async () => {
+			const view = gateViewsRef.current[presentationId];
+			if (!view) throw new Error("표시할 승인 화면의 소유권을 확인할 수 없습니다.");
+			await request("gate.presented", { sessionId: view.sessionId, presentationId });
+			setGateViews(previous =>
+				previous[presentationId]
+					? { ...previous, [presentationId]: { ...previous[presentationId], presented: true } }
+					: previous,
+			);
+		});
+	};
+	const acknowledgeGateRetired = (presentationId: string, nonce: string) => {
+		// Answer/withdraw requests wait for this acknowledgement; it owns a distinct UI lock.
+		void run(`gate-retired:${presentationId}`, async () => {
+			const view = gateViewsRef.current[presentationId];
+			if (!view || view.retiring?.nonce !== nonce)
+				throw new Error("철회할 승인 화면과 확인 번호가 일치하지 않습니다.");
+			await request("gate.retired", { sessionId: view.sessionId, presentationId, nonce });
+			setGateViews(previous => {
+				if (previous[presentationId]?.retiring?.nonce !== nonce) return previous;
+				const next = { ...previous };
+				delete next[presentationId];
+				return next;
+			});
+		});
+	};
+	const answerGate = (presentationId: string, answer: DesktopActivityGateAnswer) => {
+		void run(`gate:${presentationId}`, async () => {
+			const view = gateViewsRef.current[presentationId];
+			if (!view) throw new Error("응답할 승인 화면의 현재 소유권을 확인할 수 없습니다.");
+			await request("gate.answer", { sessionId: view.sessionId, presentationId, answer });
+		});
+	};
+	useEffect(() => {
+		if (!connected) return;
+		for (const view of Object.values(gateViews)) {
+			if (view.sessionId !== selected && !view.retiring) withdrawGate(view.presentation.id);
+		}
+	}, [selected, connected, gateViews, withdrawGate]);
+	const executeOperator = (text: string) => {
+		const sessionId = dialogOwner;
+		void run(`operator:${sessionId}`, async () => {
+			const operation = await request<DesktopOperatorOperation>("operator.execute", { sessionId, text });
+			rememberOperator(sessionId, operation);
+			setOperatorDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
+		});
+	};
+	const refreshOperator = (operationId: string) => {
+		const sessionId = dialogOwner;
+		void run(`operator-read:${sessionId}`, async () => {
+			const operation = await request<DesktopOperatorOperation>("operator.get", { sessionId, operationId });
+			rememberOperator(sessionId, operation, operationId);
+		});
+	};
+	const abortOperator = (operationId: string) => {
+		const sessionId = dialogOwner;
+		void run(`operator-abort:${sessionId}`, async () => {
+			rememberOperator(
+				sessionId,
+				await request<DesktopOperatorOperation>("operator.abort", { sessionId, operationId }),
+			);
+		});
+	};
+	const foldForegroundTool = () => {
+		const sessionId = dialogOwner;
+		void run(`operator-fold:${sessionId}`, async () => {
+			const result = await request<DesktopOperatorFoldResult>("operator.fold", { sessionId });
+			setNotice(
+				result.status === "unsupported"
+					? "현재 포그라운드 도구는 백그라운드 전환을 지원하지 않습니다."
+					: result.status === "already_backgrounded"
+						? "현재 도구는 이미 백그라운드로 전환되었습니다."
+						: "현재 포그라운드 도구를 백그라운드로 옮겼습니다. 실행 완료를 뜻하지 않습니다.",
+			);
+		});
+	};
+	const modelControls = (owner: DesktopSession) => {
+		const ownerKey = `${owner.id}:${owner.controlGeneration}`;
+		const modelScope = `model:${ownerKey}`;
+		const thinkingScope = `thinking:${ownerKey}`;
+		const busy = owner.status === "running" || owner.status === "waiting";
+		const changing = !!(pending[modelScope] || pending[thinkingScope]);
+		const catalog =
+			modelCatalog.sessionId === owner.id && modelCatalog.generation === owner.controlGeneration
+				? modelCatalog
+				: null;
+		const loadingModels = !catalog || catalog.loading;
+		const currentModelAvailable = catalog?.models.some(model => model.id === owner.model) === true;
+		return (
+			<div className="model-controls" key={ownerKey} aria-busy={changing}>
+				<ModelPicker
+					key={ownerKey}
+					models={catalog?.models ?? []}
+					onConfigureProviders={openSettings}
+					selectedId={owner.model}
+					disabled={!connected || busy || changing || loadingModels || !!catalog?.error}
+					pending={pending[modelScope]}
+					onSelect={modelId => {
+						if (modelOwnerRef.current === ownerKey)
+							void call("model.set", { sessionId: owner.id, modelId }, modelScope);
+					}}
+				/>
+				<ReasoningSelect
+					thinking={owner.thinking}
+					disabled={!connected || busy || changing || !currentModelAvailable}
+					pending={pending[thinkingScope]}
+					onChange={level => {
+						if (modelOwnerRef.current === ownerKey)
+							void call("thinking.set", { sessionId: owner.id, level }, thinkingScope);
+					}}
+				/>
+				<small className="model-control-status" role="status">
+					{loadingModels
+						? "프로젝트 모델 목록을 불러오고 있습니다…"
+						: changing
+							? "선택한 설정을 적용하고 있습니다…"
+							: busy
+								? "작업을 마친 뒤 모델과 추론 수준을 변경할 수 있습니다."
+								: !currentModelAvailable
+									? "제공자를 등록·연결한 뒤 사용 가능한 모델을 선택하세요."
+									: !owner.thinking?.available
+										? (owner.thinking?.reason ?? "세션을 열면 추론 지원 여부를 확인할 수 있습니다.")
+										: owner.thinking.scope === "session"
+											? "대화 전용 추론 설정 · 다음 요청에 적용"
+											: "공통 추론 설정을 상속 중 · 다음 요청에 적용"}
+				</small>
+				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
+					<Button disabled={!connected} onClick={openSettings}>
+						제공자 추가·연결
+					</Button>
+				)}
+				{catalog?.error && (
+					<div className="model-control-status">
+						<ErrorBanner>{catalog.error}</ErrorBanner>
+					</div>
+				)}
+				<Button
+					disabled={!connected || busy || changing || loadingModels}
+					onClick={() => {
+						refreshModelCatalog.current = true;
+						setModelCatalogRevision(value => value + 1);
+					}}
+				>
+					목록 다시 불러오기
+				</Button>
+				{[modelScope, thinkingScope].map(
+					scope =>
+						errors[scope] && (
+							<div className="model-control-status" key={scope}>
+								<ErrorBanner>{errors[scope]}</ErrorBanner>
+							</div>
+						),
+				)}
+			</div>
+		);
+	};
+	const commands: { label: string; action: () => void; needsSession?: boolean; allowDuringRun?: boolean }[] = [
+		{ label: "별도 대화 (/btw)", needsSession: true, allowDuringRun: true, action: () => openBtw() },
 		{
 			label: "프로젝트 열기",
 			action: () => {
@@ -422,12 +971,16 @@ export default function App() {
 		},
 		{ label: "설정 및 기능 지원 현황", action: openSettings },
 		{
-			label: "대화 분기 (fork)",
+			label: "직접 실행 (셸 · Python)",
 			needsSession: true,
 			action: () => {
-				closeDialog();
-				void call("session.fork", { sessionId: selected });
+				setDialog("operator");
 			},
+		},
+		{
+			label: "대화 분기 (fork)",
+			needsSession: true,
+			action: openFork,
 		},
 		{
 			label: "대화 압축 (compact)",
@@ -470,10 +1023,12 @@ export default function App() {
 	const sidebarContent = (
 		<>
 			<header className="sidebar-heading">
-				<strong>Gajae Code</strong>
+				<strong>
+					<Command size={18} aria-hidden="true" /> Gajae Code
+				</strong>
 			</header>
 			<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-				프로젝트 열기 / 추가
+				<FolderOpen size={16} aria-hidden="true" /> 프로젝트 열기
 			</Button>
 			<label className="sr-only" htmlFor="session-search">
 				대화 검색
@@ -503,7 +1058,7 @@ export default function App() {
 									})
 								}
 							>
-								＋
+								<Plus size={15} aria-hidden="true" />
 							</Button>
 						</div>
 						<small className="path">{item.path}</small>
@@ -535,9 +1090,11 @@ export default function App() {
 			</nav>
 			<footer>
 				<Button onClick={openSettings} disabled={!connected}>
-					설정
+					<Settings2 size={16} aria-hidden="true" /> 설정
 				</Button>
-				<Button onClick={() => setDialog("commands")}>명령 ⌘K</Button>
+				<Button onClick={openCommands} disabled={!connected}>
+					<Command size={15} aria-hidden="true" /> 명령 ⌘K
+				</Button>
 			</footer>
 		</>
 	);
@@ -588,23 +1145,33 @@ export default function App() {
 					</div>
 					{session && (
 						<>
+							<Button aria-pressed={review} disabled={!connected} onClick={() => setReview(!review)}>
+								<FileDiff size={15} aria-hidden="true" /> 변경 검토
+							</Button>
+
 							<Button
 								disabled={!connected}
 								onClick={() => {
-									setEditText(session.title);
-									setDialog("rename");
+									setDialog("activity");
+									refreshActivity();
 								}}
 							>
-								이름 변경
+								<Activity size={15} aria-hidden="true" /> 활동
+								{activity?.sessionId === selected &&
+									activity.activity.sessionState?.gates.available &&
+									activity.activity.sessionState.gates.pending.length > 0 && (
+										<span className="activity-badge">
+											응답 {activity.activity.sessionState.gates.pending.length}
+										</span>
+									)}
 							</Button>
-							<Button disabled={!connected} onClick={() => setDialog("delete")}>
-								삭제
-							</Button>
-							<Button aria-pressed={review} disabled={!connected} onClick={() => setReview(!review)}>
-								변경 검토
-							</Button>
-							<Button disabled={!connected} onClick={openHistory}>
-								전체 기록
+							<Button
+								disabled={!connected}
+								aria-label="대화 작업 메뉴"
+								title="대화 작업 메뉴"
+								onClick={() => setDialog("session-actions")}
+							>
+								<MoreHorizontal size={16} aria-hidden="true" />
 							</Button>
 						</>
 					)}
@@ -622,6 +1189,11 @@ export default function App() {
 						<p role="status">{connection}</p>
 					))}
 				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
+				{Object.entries(errors)
+					.filter(([scope, error]) => scope.startsWith("gate") && error)
+					.map(([scope, error]) => (
+						<ErrorBanner key={scope}>{error}</ErrorBanner>
+					))}
 				{session ? (
 					<>
 						<div className="session-status" role="status">
@@ -643,7 +1215,9 @@ export default function App() {
 							}}
 						>
 							{session.historyTruncated && (
-								<p className="muted">최근 기록만 표시합니다. 위의 ‘전체 기록’에서 모두 확인할 수 있습니다.</p>
+								<p className="muted">
+									최근 기록만 표시합니다. 대화 작업 메뉴의 ‘전체 대화 기록’에서 모두 확인할 수 있습니다.
+								</p>
 							)}
 							{session.messages.length > historyLimit && (
 								<Button onClick={() => setHistoryLimit(value => value + 100)}>이전 메시지 100개 더 보기</Button>
@@ -690,6 +1264,7 @@ export default function App() {
 								`question:${selected}`,
 								`abort:${selected}`,
 								`queue:${selected}`,
+								`enqueue:${selected}`,
 								// Palette dispatch closes its dialog first, so its failures and queue
 								// notices need this surface; while a dialog is open it renders there.
 								...(dialog ? [] : [`command:${selected}`]),
@@ -734,6 +1309,46 @@ export default function App() {
 						)}
 						<div className="composer-area">
 							<Composer
+								controls={
+									<>
+										{modelControls(session)}
+										<AttachmentPicker
+											sessionId={session.id}
+											attachments={attachmentDrafts[session.id] ?? []}
+											supportsImageInput={session.imageInput?.supported === true}
+											imagesBlocked={session.imageInput?.blocked}
+											disabled={!connected}
+											onChange={changeAttachments}
+										/>
+									</>
+								}
+								hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
+								allowQueue={!session.operatorRunning}
+								sendDisabled={
+									session.operatorRunning ||
+									attachmentDrafts[session.id]?.some(
+										draft =>
+											draft.status !== "ready" ||
+											(draft.attachment.kind === "image" &&
+												(!session.imageInput?.supported || session.imageInput.blocked)),
+									)
+								}
+								onPaste={event => {
+									const files = desktopClipboardImageFiles(event.clipboardData);
+									if (!files.length || !connected) return;
+									event.preventDefault();
+									addDesktopAttachmentFiles(
+										{
+											sessionId: session.id,
+											attachments: attachmentDrafts[session.id] ?? [],
+											supportsImageInput: session.imageInput?.supported === true,
+											imagesBlocked: session.imageInput?.blocked,
+											disabled: !connected,
+											onChange: changeAttachments,
+										},
+										files,
+									);
+								}}
 								value={drafts[selected] || ""}
 								onChange={value => setDrafts(previous => ({ ...previous, [selected]: value }))}
 								onSend={send}
@@ -766,18 +1381,43 @@ export default function App() {
 					</Modal>
 				</div>
 			)}
-			{dialog && (
+			{dialog === "btw" && dialogOwner === selected && btwOwner?.sessionId === selected && (
+				<BtwDialog
+					key={dialogGeneration.current}
+					sessionId={btwOwner.sessionId}
+					sessionGeneration={btwOwner.generation}
+					connected={connected}
+					initialQuestion={btwOwner.question}
+					onClose={closeDialog}
+					onAdmitted={() => {
+						const { sessionId, composerText } = btwOwner;
+						if (composerText !== undefined)
+							setDrafts(previous =>
+								previous[sessionId] === composerText ? { ...previous, [sessionId]: "" } : previous,
+							);
+					}}
+				/>
+			)}
+			{dialog && dialog !== "btw" && dialogOwner === selected && (
 				<Modal
 					title={
 						{
 							settings: "설정",
 							commands: "명령",
 							history: "전체 기록",
+							fork: "대화 분기 (fork)",
 							rename: "대화 이름 변경",
 							delete: "대화 삭제",
 							tools: "활성 도구",
 							goal: "목표 관리",
 							result: "요청 결과",
+							activity: "백그라운드 활동과 응답 요청",
+							"activity-detail": "활동 세부 정보",
+							preferences: "모델 프로필과 실행 설정",
+							operator: "직접 실행 · 셸과 Python",
+							mcp: "MCP 연결 관리",
+							"session-info": "세션 정보와 사용량",
+							"session-actions": "대화 작업",
 						}[dialog]
 					}
 					onClose={closeDialog}
@@ -786,28 +1426,152 @@ export default function App() {
 						scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>,
 					)}
 					{notice && <p role="status">{notice}</p>}
+					{dialog === "session-actions" && (
+						<nav className="command-list" aria-label="현재 대화 작업">
+							<Button onClick={openPreferences}>
+								<SlidersHorizontal aria-hidden="true" />
+								모델 프로필과 실행 설정
+							</Button>
+							<Button onClick={() => setDialog("operator")}>
+								<Command aria-hidden="true" />
+								직접 실행 · 셸과 Python
+							</Button>
+							<Button disabled={!connected || session?.controlGeneration === null} onClick={() => openBtw()}>
+								<Command aria-hidden="true" />
+								별도 대화 · /btw
+							</Button>
+							<Button onClick={openMcp}>
+								<Network aria-hidden="true" />
+								MCP 연결 관리
+							</Button>
+							<Button onClick={openSessionInfo}>
+								<Info aria-hidden="true" />
+								세션 정보와 사용량
+							</Button>
+							<Button onClick={openFork}>대화 분기 (fork)</Button>
+							<Button onClick={openHistory}>
+								<History aria-hidden="true" />
+								전체 대화 기록
+							</Button>
+							<Button
+								onClick={() => {
+									setEditText(session?.title ?? "");
+									setDialog("rename");
+								}}
+							>
+								<Pencil aria-hidden="true" />
+								이름 변경
+							</Button>
+							<Button className="danger" onClick={() => setDialog("delete")}>
+								<Trash2 aria-hidden="true" />
+								대화 삭제
+							</Button>
+						</nav>
+					)}
+					{dialog === "activity" && (
+						<ActivityPanel
+							snapshot={activity?.sessionId === dialogOwner ? activity.activity : null}
+							pending={pending[activityScope]}
+							error={errors[activityScope]}
+							onRefresh={() => refreshActivity(dialogOwner)}
+							onOperate={operateActivity}
+							onAcknowledge={acknowledgeActivity}
+							onInspect={inspectActivity}
+							onOpenGate={openGate}
+						/>
+					)}
+					{dialog === "operator" && (
+						<OperatorPanel
+							value={operatorDrafts[dialogOwner] ?? ""}
+							operation={
+								operatorOperations[dialogOwner]?.sessionGeneration ===
+								snapshot?.sessions.find(item => item.id === dialogOwner)?.controlGeneration
+									? operatorOperations[dialogOwner]!
+									: null
+							}
+							pending={pending[operatorScope]}
+							busy={snapshot?.sessions.some(
+								item => item.id === dialogOwner && (item.status === "running" || item.status === "waiting"),
+							)}
+							disabled={!connected}
+							error={
+								[
+									operatorScope,
+									`operator-read:${dialogOwner}`,
+									`operator-abort:${dialogOwner}`,
+									`operator-fold:${dialogOwner}`,
+								]
+									.map(scope => errors[scope])
+									.filter(Boolean)
+									.join(" · ") || undefined
+							}
+							onChange={value => setOperatorDrafts(previous => ({ ...previous, [dialogOwner]: value }))}
+							onExecute={executeOperator}
+							onAbort={abortOperator}
+							onRefresh={refreshOperator}
+							onFold={foldForegroundTool}
+						/>
+					)}
+					{dialog === "mcp" && (
+						<McpPanel
+							snapshot={
+								mcp?.sessionId === dialogOwner && mcp.value.sessionGeneration === session?.controlGeneration
+									? mcp.value
+									: null
+							}
+							pending={pending[mcpReadScope]}
+							busy={
+								!!pending[mcpMutationScope] || session?.status === "running" || session?.status === "waiting"
+							}
+							error={[errors[mcpReadScope], errors[mcpMutationScope]].filter(Boolean).join(" · ") || undefined}
+							onRefresh={() => loadMcp(dialogOwner, dialogGeneration.current)}
+							onOperate={operateMcp}
+						/>
+					)}
+					{dialog === "session-info" && (
+						<SessionInfoPanel
+							info={sessionInfo?.sessionId === dialogOwner ? sessionInfo.value : null}
+							pending={pending[sessionInfoScope]}
+							error={errors[sessionInfoScope]}
+							onRefresh={() => loadSessionInfo(dialogOwner, dialogGeneration.current)}
+						/>
+					)}
+					{dialog === "preferences" && (
+						<PreferencesPanel
+							preferences={preferences?.sessionId === dialogOwner ? preferences.value : null}
+							pending={pending[preferencesScope]}
+							busy={snapshot?.sessions.some(
+								item => item.id === dialogOwner && (item.status === "running" || item.status === "waiting"),
+							)}
+							error={errors[preferencesScope]}
+							onRefresh={() => loadPreferences(dialogOwner, dialogGeneration.current)}
+							onApply={applyPreferences}
+						/>
+					)}
+					{dialog === "activity-detail" &&
+						(errors[activityDetailScope] ? (
+							<ErrorBanner>{errors[activityDetailScope]}</ErrorBanner>
+						) : activityDetail ? (
+							<>
+								<h3>{activityDetail.entry.id}</h3>
+								<p>{activityDetail.entry.type}</p>
+								{activityDetail.output ? (
+									<pre className="bounded-output">
+										{activityDetail.output.text}
+										{activityDetail.output.truncated ? "\n[출력 생략]" : ""}
+									</pre>
+								) : (
+									<p className="muted">이 활동에는 읽을 수 있는 출력 미리보기가 없습니다.</p>
+								)}
+							</>
+						) : (
+							<p role="status">활동 정보를 불러오는 중…</p>
+						))}
 					{dialog === "settings" && (
 						<>
 							<section>
-								<h3>현재 대화 모델</h3>
-								<label htmlFor="model">모델</label>
-								<select
-									id="model"
-									value={session?.model || ""}
-									disabled={!session || !connected || pending[selected]}
-									onChange={event =>
-										void call("model.set", { sessionId: dialogOwner, modelId: event.target.value })
-									}
-								>
-									<option value="" disabled>
-										{session ? "모델 선택" : "대화를 먼저 선택하세요"}
-									</option>
-									{snapshot?.models.map(model => (
-										<option key={model.id} value={model.id}>
-											{model.provider} · {model.name}
-										</option>
-									))}
-								</select>
+								<h3>현재 대화 모델과 추론</h3>
+								{session ? modelControls(session) : <p className="muted">대화를 먼저 선택하세요.</p>}
 							</section>
 							<OAuthSettings key={dialogGeneration.current} connected={connected} />
 							<form
@@ -817,8 +1581,16 @@ export default function App() {
 									const generation = dialogGeneration.current;
 									setKey("");
 									void run(`auth:${dialogOwner}:${generation}`, async () => {
-										await request("auth.setKey", { provider, key: secret });
-										if (dialogGeneration.current === generation) setNotice("API 키를 저장했습니다.");
+										const saved = await request<DesktopCredentialSaveResult>("auth.setKey", {
+											provider,
+											key: secret,
+										});
+										if (dialogGeneration.current === generation)
+											setNotice(
+												saved.catalogRefreshed
+													? "API 키를 저장했습니다."
+													: "API 키는 저장했습니다. 모델 목록을 새로 고치지 못한 대화에서 목록 다시 불러오기로 재시도하세요.",
+											);
 									});
 								}}
 							>
@@ -832,7 +1604,7 @@ export default function App() {
 									required
 								/>
 								<datalist id="providers">
-									{[...new Set(snapshot?.models.map(model => model.provider))].map(name => (
+									{(keyProviders ?? []).map(name => (
 										<option key={name} value={name} />
 									))}
 								</datalist>
@@ -940,7 +1712,9 @@ export default function App() {
 											disabled={
 												!connected ||
 												(!!command.needsSession &&
-													(!session || !!pending[selected] || session.status === "running"))
+													(!session ||
+														(!command.allowDuringRun &&
+															(!!pending[selected] || session.status === "running"))))
 											}
 											onClick={command.action}
 										>
@@ -979,7 +1753,19 @@ export default function App() {
 								))}
 						</>
 					)}
-					{dialog === "history" &&
+
+					{dialog === "fork" && (
+						<ForkPanel
+							history={history}
+							selectedEntryId={forkEntryId}
+							pending={!!pending[dialogOwner] || !!pending[`history:${dialogOwner}`]}
+							disabled={!connected}
+							onSelect={setForkEntryId}
+							onFork={forkSession}
+							onLoadMore={loadMoreHistory}
+						/>
+					)}
+					{(dialog === "history" || dialog === "fork") &&
 						history === null &&
 						(errors[`history:${dialogOwner}`] ? (
 							<ErrorBanner>{errors[`history:${dialogOwner}`]}</ErrorBanner>
@@ -1110,6 +1896,23 @@ export default function App() {
 					{dialog === "result" && <pre className="bounded-output">{result}</pre>}
 				</Modal>
 			)}
+			{connected &&
+				Object.values(gateViews).map(view => (
+					<GateDialog
+						key={view.presentation.id}
+						presentation={view.presentation}
+						presented={view.presented}
+						retiring={view.retiring}
+						pending={Boolean(
+							pending[`gate:${view.presentation.id}`] || pending[`gate-withdraw:${view.presentation.id}`],
+						)}
+						error={errors[`gate:${view.presentation.id}`] || errors[`gate-withdraw:${view.presentation.id}`]}
+						onPresented={acknowledgeGatePresented}
+						onRetired={acknowledgeGateRetired}
+						onAnswer={answerGate}
+						onWithdraw={withdrawGate}
+					/>
+				))}
 		</div>
 	);
 }
