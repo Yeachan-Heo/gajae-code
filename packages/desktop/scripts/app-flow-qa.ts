@@ -555,9 +555,10 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 				body.includes(bootstrap!.project),
 				`session info does not name the working directory: ${body.slice(0, 300)}`,
 			);
+			// A session with a transcript file is file-backed, so the state is not a union.
 			expect(
-				/기록 저장 설정\s*(켜짐|꺼짐)/u.test(body),
-				`session info does not report a persistence state: ${body.slice(0, 300)}`,
+				/기록 저장 설정\s*켜짐/u.test(body),
+				`session info does not report a persisted transcript: ${body.slice(0, 300)}`,
 			);
 			await closeDialog();
 		},
