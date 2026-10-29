@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { assertDesktopAttachmentRequestSize } from "../../desktop-host/src/attachment-protocol";
 import type { DesktopFrame, DesktopMethod, DesktopRequest } from "../../desktop-host/src/protocol";
 
 interface PendingRequest {
@@ -55,9 +56,10 @@ export async function subscribe(listener: (frame: DesktopFrame) => void): Promis
 export async function request<T>(method: DesktopMethod, params: Record<string, unknown> = {}): Promise<T> {
 	await connect();
 	const id = crypto.randomUUID();
+	const envelope: DesktopRequest = { id, method, params };
+	if (method === "prompt") assertDesktopAttachmentRequestSize(envelope);
 	const result = Promise.withResolvers<unknown>();
 	pending.set(id, { resolve: result.resolve, reject: result.reject });
-	const envelope: DesktopRequest = { id, method, params };
 	try {
 		await invoke("engine_request", { request: envelope });
 	} catch (error) {

@@ -3,7 +3,11 @@ import type { OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import { DesktopOAuthController } from "../src/oauth";
 import type { DesktopAuthState } from "../src/protocol";
 
-function harness(login: (callbacks: OAuthLoginCallbacks) => Promise<void>, deadlineMs = 300_000) {
+function harness(
+	login: (callbacks: OAuthLoginCallbacks) => Promise<void>,
+	deadlineMs = 300_000,
+	onStored?: () => Promise<void>,
+) {
 	const events: DesktopAuthState[] = [];
 	const secrets = new Set<string>(["stored-access", "stored-refresh"]);
 	let stored = 0;
@@ -17,6 +21,7 @@ function harness(login: (callbacks: OAuthLoginCallbacks) => Promise<void>, deadl
 		},
 		onStored: async () => {
 			stored++;
+			await onStored?.();
 		},
 		deadlineMs,
 		joinMs: 5,
@@ -175,13 +180,90 @@ describe("desktop account authorization", () => {
 		await h.controller.close();
 	});
 
+	test("reports saved credentials separately from catalog refresh failure without disclosing secrets", async () => {
+		let calls = 0;
+		let signal: AbortSignal | undefined;
+		const h = harness(
+			async callbacks => {
+				calls++;
+				signal = callbacks.signal;
+				callbacks.onAuth({ url: "https://example.com/authorize" });
+				await callbacks.onPrompt({ message: "Enter code" });
+			},
+			300_000,
+			async () => {
+				throw new Error("raw-owner@example.invalid code-secret stored-access stored-refresh raw-token");
+			},
+		);
+		const flow = h.controller.login("test");
+		await turn();
+		h.controller.answer(flow.id, h.controller.state()!.prompt!.id, "code-secret");
+		await turn();
+		const state = h.controller.state()!;
+		expect(state.status).toBe("error");
+		expect(state.error).toBe("Credentials were saved, but model catalog refresh failed");
+		expect(state.instructions).toBe(
+			"Authorization stopped. Credentials already saved by the provider are not removed.",
+		);
+		expect(state.url).toBeUndefined();
+		expect(state.prompt).toBeUndefined();
+		expect(signal!.aborted).toBe(true);
+		expect(h.controller.isActive()).toBe(false);
+		expect(calls).toBe(1);
+		expect(h.stored()).toBe(1);
+		for (const secret of ["raw-owner@example.invalid", "code-secret", "stored-access", "stored-refresh", "raw-token"])
+			expect(JSON.stringify(h.events)).not.toContain(secret);
+		await h.controller.close();
+	});
+
+	for (const stop of ["cancel", "timeout"] as const) {
+		test(`late catalog refresh rejection cannot overwrite ${stop}`, async () => {
+			const refresh = Promise.withResolvers<void>();
+			let callbacks: OAuthLoginCallbacks | undefined;
+			let calls = 0;
+			const h = harness(
+				async value => {
+					calls++;
+					callbacks = value;
+				},
+				stop === "timeout" ? 5 : 300_000,
+				() => refresh.promise,
+			);
+			const flow = h.controller.login("test");
+			await turn();
+			expect(h.stored()).toBe(1);
+			if (stop === "cancel") h.controller.cancel(flow.id);
+			else await Bun.sleep(15);
+			const stopped = h.controller.state()!;
+			expect(stopped.status).toBe(stop === "cancel" ? "cancelled" : "error");
+			expect(stopped.error).toBe(stop === "cancel" ? undefined : "Authorization timed out");
+			expect(callbacks!.signal!.aborted).toBe(true);
+			expect(() => h.controller.login("test")).toThrow("already active");
+			const eventCount = h.events.length;
+			callbacks!.onAuth({ url: "https://example.com/late" });
+			await expect(callbacks!.onPrompt({ message: "late" })).rejects.toThrow("Authorization stopped");
+			refresh.reject(new Error("raw-owner@example.invalid stored-access stored-refresh raw-token"));
+			await turn();
+			expect(h.controller.state()).toEqual(stopped);
+			expect(h.events.length).toBe(eventCount);
+			expect(h.controller.isActive()).toBe(false);
+			expect(calls).toBe(1);
+			expect(h.stored()).toBe(1);
+			for (const secret of ["raw-owner@example.invalid", "stored-access", "stored-refresh", "raw-token"])
+				expect(JSON.stringify(h.events)).not.toContain(secret);
+			await h.controller.close();
+		});
+	}
+
 	test("hides raw provider errors and bounds shutdown of an uncooperative provider", async () => {
 		const failing = harness(async () => {
 			throw new Error("code=unknown-secret&token=raw-token");
 		});
 		failing.controller.login("test");
 		await turn();
+		expect(failing.controller.state()!.status).toBe("error");
 		expect(failing.controller.state()!.error).toBe("Authorization failed");
+		expect(failing.stored()).toBe(0);
 		expect(JSON.stringify(failing.events)).not.toContain("raw-token");
 		await failing.controller.close();
 		const deferred = Promise.withResolvers<void>();

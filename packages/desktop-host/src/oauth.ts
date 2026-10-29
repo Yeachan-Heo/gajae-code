@@ -93,6 +93,7 @@ export class DesktopOAuthController {
 		this.#publish(flow);
 		const admitted = this.state()!;
 		flow.task = Promise.resolve().then(async () => {
+			let loginSucceeded = false;
 			try {
 				if (!this.#live(flow)) return;
 				await this.#options.service.login(provider, {
@@ -124,6 +125,7 @@ export class DesktopOAuthController {
 					onPrompt: prompt => this.#prompt(flow, prompt),
 					onManualCodeInput: () => this.#prompt(flow, { message: "Paste the authorization code or redirect URL" }),
 				});
+				loginSucceeded = true;
 				// AuthStorage may persist before observing abort. Always collect new secrets.
 				await this.#options.onStored();
 				if (this.#live(flow)) {
@@ -133,7 +135,11 @@ export class DesktopOAuthController {
 					this.#publish(flow);
 				}
 			} catch {
-				this.#stop(flow, "error", "Authorization failed");
+				this.#stop(
+					flow,
+					"error",
+					loginSucceeded ? "Credentials were saved, but model catalog refresh failed" : "Authorization failed",
+				);
 			} finally {
 				clearTimeout(flow.timer);
 				flow.answers.length = 0;

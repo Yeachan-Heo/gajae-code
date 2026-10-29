@@ -1,12 +1,33 @@
 // TEST ONLY: manual Ego QA transport. Never imported by the desktop product.
 // Run with Bun; fetch bootstrapUrl from Node and pass its text as the CDP
 // Page.addScriptToEvaluateOnNewDocument `source`, then navigate to the allowed origin.
+// Zero-provider fixture: GJC_DESKTOP_QA_MODEL_FIXTURE=1 bun packages/desktop/scripts/host-ui-qa.ts
+// LIVE=1 is incompatible. Fixture metadata is printed as one JSON bootstrap line.
+// Browser controls: __qaFixture.status(), .hold(), .release(requestId),
+// .gate(sessionId, 'approval'|'question'|'execution'), .gates(sessionId).
+// Gate controls emit/wait on real SDK gates only; the app owns presentation, answers and retirement ACKs.
+// Save status before teardown: the owned request/chunk artifact is removed with the QA root.
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import * as stream from "node:stream";
 import { type DesktopMethod, MAX_FRAME_BYTES, parseRequest } from "../../desktop-host/src/protocol";
+import {
+	assertFixtureMode,
+	fixtureEnvironment,
+	fixtureLayout,
+	type ModelFixture,
+	QA_KEY,
+	QA_MODEL_IDS,
+	QA_PROVIDER,
+	readFixtureGateControl,
+	seedFixture,
+	startModelFixture,
+} from "./qa-model-fixture";
+
+const fixtureMode = process.env.GJC_DESKTOP_QA_MODEL_FIXTURE === "1";
+if (fixtureMode) assertFixtureMode(process.env);
 
 const origin = "http://127.0.0.1:1420";
 const root = path.resolve(import.meta.dir, "../../..");
@@ -26,6 +47,30 @@ const allowed = new Set<DesktopMethod>([
 	"session.delete",
 	"queue.cancel",
 	"abort",
+	"models.list",
+	"activity.get",
+	"activity.detail",
+	"activity.operate",
+	"activity.acknowledge",
+	"preferences.get",
+	"preferences.apply",
+	"gate.present",
+	"gate.presented",
+	"gate.answer",
+	"gate.withdraw",
+	"gate.retired",
+	"operator.execute",
+	"operator.get",
+	"operator.abort",
+	"operator.fold",
+	"btw.open",
+	"btw.get",
+	"btw.submit",
+	"btw.cancel",
+	"btw.close",
+	"mcp.get",
+	"mcp.operate",
+	"session.info",
 	"model.set",
 	"goal.operate",
 	"session.export",
@@ -34,15 +79,22 @@ const allowed = new Set<DesktopMethod>([
 	// provider credentials, so a prompt fails before any network call.
 	"prompt",
 	"auth.providers",
+	"auth.keyProviders",
 	"auth.state",
 	"tools.list",
 	"diff.get",
 	"shutdown",
 ]);
+if (fixtureMode) {
+	allowed.add("thinking.set");
+	allowed.add("auth.setKey");
+}
 const clients = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
 const encoder = new TextEncoder();
 let temporary: string | undefined;
 let host: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+let fixture: ModelFixture | undefined;
+let gateControl: string | undefined;
 let server: Bun.Server<undefined> | undefined;
 let timer: Timer | undefined;
 let heartbeat: Timer | undefined;
@@ -66,7 +118,11 @@ async function cleanup() {
 			clearTimeout(force);
 		}
 	}
-	if (temporary) await fs.rm(temporary, { recursive: true, force: true });
+	try {
+		await fixture?.close();
+	} finally {
+		if (temporary) await fs.rm(temporary, { recursive: true, force: true });
+	}
 }
 
 function injection(base: string) {
@@ -147,12 +203,23 @@ function injection(base: string) {
 			}
 		};
 		window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {unregisterListener: remove};
+		${
+			fixtureMode
+				? `window.__qaFixture = {
+			status: () => post('/fixture/status', {}),
+			hold: () => post('/fixture/hold', {}),
+			release: requestId => post('/fixture/release', {requestId}),
+			gate: (sessionId, kind) => post('/fixture/gate', {sessionId, kind}),
+			gates: sessionId => post('/fixture/gates', {sessionId})
+		};`
+				: ""
+		}
 		addEventListener('pagehide', () => events?.close(), {once: true});
 	})();`;
 }
 
 try {
-	temporary = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-ui-qa-"));
+	temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-ui-qa-")));
 	const project = path.join(temporary, "qa-project");
 	await fs.mkdir(project);
 	const cleanEnv = {
@@ -212,7 +279,8 @@ try {
 		const header = {
 			type: "session",
 			version: 5,
-			id: session.id,
+			// Catalog IDs belong to the Host, not the SDK transcript identity.
+			id: crypto.randomUUID(),
 			timestamp: new Date(1_700_000_000_000).toISOString(),
 			cwd: project,
 		};
@@ -266,20 +334,45 @@ try {
 		GJC_DESKTOP_DATA_DIR: dataDir,
 		...(process.env.GJC_DESKTOP_QA_LIVE === "1" ? {} : { GJC_DESKTOP_ISOLATED: "1" }),
 	};
-	host = Bun.spawn([process.execPath, path.join(root, "packages/desktop-host/src/index.ts")], {
-		cwd: temporary,
-		env: qaEnv,
-		stdin: "pipe",
-		stdout: "pipe",
-		stderr: "pipe",
-	});
+	if (fixtureMode) {
+		const layout = fixtureLayout(temporary);
+		fixture = startModelFixture(layout.artifactPath);
+		await seedFixture(layout, fixture.baseUrl, fixture.providerToken);
+	}
+	host = Bun.spawn(
+		[
+			process.execPath,
+			path.join(
+				root,
+				fixtureMode
+					? "packages/desktop-host/test/fixtures/qa-fixture-host.ts"
+					: "packages/desktop-host/src/index.ts",
+			),
+		],
+		{
+			cwd: temporary,
+			env: fixture ? fixtureEnvironment(fixtureLayout(temporary), fixture.baseUrl, fixture.providerToken) : qaEnv,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
 	const child = host;
-	// Drain diagnostics without logging credentials or unbounded output.
+	// Drain diagnostics before waiting for the backend control endpoint to start.
 	void (async () => {
 		for await (const _chunk of child.stderr) {
 			/* discard */
 		}
 	})();
+	if (fixture) {
+		const layout = fixtureLayout(temporary);
+		const deadline = Date.now() + 30000;
+		while (!(await Bun.file(layout.gateControlPath).exists())) {
+			if (child.exitCode !== null || Date.now() >= deadline) throw new Error("Fixture gate control did not start");
+			await Bun.sleep(25);
+		}
+		gateControl = await readFixtureGateControl(layout);
+	}
 	server = Bun.serve<undefined>({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -302,7 +395,16 @@ try {
 			const method =
 				url.pathname === "/events" || url.pathname === "/bootstrap.js"
 					? "GET"
-					: url.pathname === "/request" || url.pathname === "/select-project"
+					: url.pathname === "/request" ||
+							url.pathname === "/select-project" ||
+							(fixture &&
+								[
+									"/fixture/status",
+									"/fixture/hold",
+									"/fixture/release",
+									"/fixture/gate",
+									"/fixture/gates",
+								].includes(url.pathname))
 						? "POST"
 						: null;
 			if (!method) return reply("Not found", 404);
@@ -354,8 +456,49 @@ try {
 					if (text !== "{}") return reply("Invalid selection request", 400);
 					return reply(JSON.stringify(project));
 				}
+				if (fixture && url.pathname.startsWith("/fixture/")) {
+					if (url.pathname === "/fixture/gate" || url.pathname === "/fixture/gates") {
+						if (!gateControl || encoder.encode(text).byteLength > 1024) return reply("Invalid gate control", 400);
+						const response = await fetch(`${gateControl}${url.pathname.slice("/fixture".length)}`, {
+							method: "POST",
+							redirect: "error",
+							signal: AbortSignal.timeout(5000),
+							headers: { "Content-Type": "application/json", "X-Desktop-QA-Fixture": fixture.providerToken },
+							body: text,
+						});
+						return reply(await response.text(), response.status);
+					}
+					if (url.pathname === "/fixture/status" || url.pathname === "/fixture/hold") {
+						if (text !== "{}") return reply("Invalid fixture control", 400);
+						if (url.pathname === "/fixture/hold") fixture.holdNext();
+					} else {
+						const value = JSON.parse(text);
+						if (
+							!value ||
+							Object.keys(value).length !== 1 ||
+							!Number.isSafeInteger(value.requestId) ||
+							value.requestId < 1
+						)
+							return reply("Invalid fixture request ID", 400);
+						if (!fixture.release(value.requestId)) return reply("Request is not held", 409);
+					}
+					await fixture.flush();
+					return reply(JSON.stringify(fixture.snapshot()));
+				}
 				const envelope = parseRequest(text);
 				if (!allowed.has(envelope.method)) return reply("Forbidden QA method", 403);
+				if (
+					fixture &&
+					envelope.method === "model.set" &&
+					!QA_MODEL_IDS.some(id => envelope.params.modelId === `${QA_PROVIDER}/${id}`)
+				)
+					return reply("Only fixture-owned models are permitted", 403);
+				if (
+					fixture &&
+					envelope.method === "auth.setKey" &&
+					(envelope.params.provider !== QA_PROVIDER || envelope.params.key !== QA_KEY)
+				)
+					return reply("Only the fixture-only fake credential is permitted", 403);
 				if (envelope.method === "project.open" && envelope.params.path !== project)
 					return reply("Only the isolated QA project may be opened", 403);
 				child.stdin.write(`${JSON.stringify(envelope)}\n`);
@@ -404,10 +547,32 @@ try {
 	process.stdout.write(
 		`${JSON.stringify({
 			port: server.port,
+			serverUrl: `http://127.0.0.1:${server.port}`,
 			token,
 			bootstrapUrl: `http://127.0.0.1:${server.port}/bootstrap.js?token=${token}`,
 			pid: process.pid,
 			project,
+			...(fixture
+				? {
+						mode: "test-only-model-fixture",
+						modelFixture: {
+							baseUrl: fixture.baseUrl,
+							models: QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`),
+							profiles: [...QA_MODEL_IDS],
+							artifactPath: fixtureLayout(temporary).artifactPath,
+							gateArtifactPath: fixtureLayout(temporary).gateArtifactPath,
+							dataDir,
+							controls: {
+								status: "/fixture/status",
+								hold: "/fixture/hold",
+								release: "/fixture/release",
+								gate: "/fixture/gate",
+								gates: "/fixture/gates",
+							},
+							initialHold: "first completion pauses after initial SSE text until release(requestId) or abort",
+						},
+					}
+				: {}),
 		})}\n`,
 	);
 } catch (error) {

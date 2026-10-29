@@ -8,6 +8,7 @@ import type {
 	DesktopCommand,
 	DesktopCommandResult,
 	DesktopDiff,
+	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
 	DesktopMethod,
@@ -179,26 +180,31 @@ for (const isolated of [true, false]) {
 			expect(jobs.output).toContain("No background jobs running");
 			// Session lifecycle is catalog-owned: these commands refuse instead of
 			// half-applying and leaving an unreopenable transcript.
-			for (const text of ["/move /tmp", "/session delete", "/handoff", "/rename x", "/star"]) {
+			for (const text of ["/move /tmp", "/session delete", "/handoff", "/star"]) {
 				const refused = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text });
 				expect(refused.refused).toBe(true);
 				expect(refused.consumed).toBe(false);
 				expect(refused.output).not.toBe("");
 			}
-			// Refusal copy is per command: it names the control that actually exists.
-			const renameRefusal = await host.request<DesktopCommandResult>("command.run", {
+			// Regeneration reaches the canonical handler, which cannot spend a
+			// provider turn without conversation content to summarize.
+			const regenerate = await host.request<DesktopCommandResult>("command.run", {
 				sessionId: session.id,
-				text: "/rename 제목",
+				text: "/rename",
 			});
-			expect(renameRefusal.output).toContain("이름 변경");
+			expect(regenerate.consumed).toBe(true);
+			expect(regenerate.refused).not.toBe(true);
+			expect(regenerate.output).toContain("Nothing to summarize yet");
+			expect(regenerate.prompt).toBeUndefined();
 			// Refusal copy must not point at a menu the app does not have.
-			for (const text of ["/move /tmp", "/session delete", "/rename x"]) {
+			for (const text of ["/move /tmp", "/session delete"]) {
 				const refused = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text });
 				expect(refused.output).not.toContain("대화 메뉴");
 			}
 			// The palette can only offer commands the host will actually run.
 			const catalog = await host.request<{ name: string }[]>("command.list");
-			for (const name of ["move", "session", "handoff", "rename"]) {
+			expect(catalog.some(command => command.name === "rename")).toBe(true);
+			for (const name of ["move", "session", "handoff"]) {
 				expect(catalog.some(command => command.name === name)).toBe(false);
 			}
 			// Unknown slash text is refused, never sent to a provider as a prompt.
@@ -239,6 +245,17 @@ for (const isolated of [true, false]) {
 			const diff = await host.request<DesktopDiff[]>("diff.get", { sessionId: session.id });
 			expect(diff.find(file => file.path === "review.txt")?.patch).toContain("+실제 변경 내용");
 			await host.request("session.rename", { sessionId: session.id, title: "한국어 작업" });
+			const renamed = await host.request<DesktopCommandResult>("command.run", {
+				sessionId: session.id,
+				text: "/rename 명령으로 바꾼 제목",
+			});
+			expect(renamed.consumed).toBe(true);
+			expect(renamed.refused).not.toBe(true);
+			expect(renamed.output).toContain("Session renamed to 명령으로 바꾼 제목.");
+			expect(renamed.prompt).toBeUndefined();
+			expect(
+				(await host.request<DesktopSnapshot>("bootstrap")).sessions.find(item => item.id === session.id)?.title,
+			).toBe("명령으로 바꾼 제목");
 			await host.request("session.star", { sessionId: session.id, starred: true });
 			await expect(
 				host.request("question.answer", { sessionId: session.id, questionId: crypto.randomUUID(), value: true }),
@@ -246,18 +263,96 @@ for (const isolated of [true, false]) {
 			await host.request("shutdown");
 			expect(await host.child.exited).toBe(0);
 			await host.reader;
+			// Seed only after shutdown has released the genuine writer. No provider is needed.
+			const seedCatalog: { sessions: { id: string; file: string }[] } = await Bun.file(
+				path.join(dataAlias, "catalog.json"),
+			).json();
+			const sourceRow = seedCatalog.sessions.find(item => item.id === session.id)!;
+			const sourceTranscript = path.join(await fs.realpath(dataAlias), "sessions", sourceRow.file);
+			const branchText = `선택한 메시지\n${"긴 원문 ".repeat(2000)}  `;
+			// Keep the backend SDK in its own process, outside the DOM script type graph.
+			const seed = Bun.spawn(
+				[
+					process.execPath,
+					"--eval",
+					`
+					import * as path from "node:path";
+					import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+					const manager = await SessionManager.open(process.argv[1], path.dirname(process.argv[1]));
+					try {
+						manager.appendMessage({ role: "user", content: "유지할 앞 메시지", timestamp: 1 });
+						const entryId = manager.appendMessage({ role: "user", content: process.argv[2], timestamp: 2 });
+						manager.appendMessage({ role: "user", content: "제외할 뒤 메시지", timestamp: 3 });
+						await manager.flush();
+						process.stdout.write(entryId);
+					} finally {
+						const outcome = await manager.closeStrict();
+						if (outcome.kind !== "closed") throw outcome.error;
+					}
+				`,
+					sourceTranscript,
+					branchText,
+				],
+				{ cwd: path.resolve(import.meta.dir, "../../desktop-host"), stdout: "pipe", stderr: "pipe" },
+			);
+			const [selectedEntryId, seedError, seedExit] = await Promise.all([
+				new Response(seed.stdout).text(),
+				new Response(seed.stderr).text(),
+				seed.exited,
+			]);
+			expect(seedError).toBe("");
+			expect(seedExit).toBe(0);
+			expect(selectedEntryId).not.toBe("");
 			host = launch();
 			const restored = await host.request<DesktopSnapshot>("bootstrap");
-			expect(restored.sessions[0]?.title).toBe("한국어 작업");
+			expect(restored.sessions[0]?.title).toBe("명령으로 바꾼 제목");
 			expect(restored.sessions[0]?.starred).toBe(true);
 			const resumed = await host.request<DesktopSession>("session.select", { sessionId: session.id });
 			expect(resumed.id).toBe(session.id);
+			const sourceBeforeFork = await Bun.file(sourceTranscript).text();
 			const persistedCatalog: { sessions: { id: string; file: string }[] } = await Bun.file(
 				path.join(dataAlias, "catalog.json"),
 			).json();
 			const saved = persistedCatalog.sessions.find(item => item.id === session.id);
 			if (!saved) throw new Error("Session missing from persisted catalog");
 			const transcript = path.join(await fs.realpath(dataAlias), "sessions", saved.file);
+			const branchHistory = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
+			expect(branchHistory.messages.find(message => message.entryId === selectedEntryId)?.role).toBe("user");
+			const whole = await host.request<DesktopForkResult>("session.fork", { sessionId: session.id });
+			if (whole.cancelled) throw new Error("Whole-copy fork unexpectedly cancelled");
+			expect(whole.selectedText).toBe("");
+			expect(
+				(await host.request<DesktopHistory>("history.get", { sessionId: whole.session.id })).messages.map(
+					message => message.text,
+				),
+			).toEqual(branchHistory.messages.map(message => message.text));
+			await host.request("session.delete", { sessionId: whole.session.id });
+			const fork = await host.request<DesktopForkResult>("session.fork", {
+				sessionId: session.id,
+				entryId: selectedEntryId,
+			});
+			if (fork.cancelled) throw new Error("Selected-entry fork unexpectedly cancelled");
+			expect(fork.selectedText).toBe(branchText);
+			expect(fork.session.id).not.toBe(session.id);
+			expect(fork.session.messages.filter(message => message.role === "user").map(message => message.text)).toEqual([
+				"유지할 앞 메시지",
+			]);
+			expect(await Bun.file(sourceTranscript).text()).toBe(sourceBeforeFork);
+			await host.request("session.select", { sessionId: fork.session.id });
+			await host.request("shutdown");
+			expect(await host.child.exited).toBe(0);
+			await host.reader;
+			host = launch();
+			const reopenedFork = await host.request<DesktopSession>("session.select", { sessionId: fork.session.id });
+			expect(reopenedFork.messages.filter(message => message.role === "user").map(message => message.text)).toEqual([
+				"유지할 앞 메시지",
+			]);
+			const reopenedSource = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
+			expect(reopenedSource.messages.map(message => message.text)).toEqual(
+				branchHistory.messages.map(message => message.text),
+			);
+			expect(await Bun.file(sourceTranscript).text()).toBe(sourceBeforeFork);
+			await host.request("session.delete", { sessionId: fork.session.id });
 			const artifacts = transcript.slice(0, -6);
 			const sidecar = `${transcript}.spill.capture-test`;
 			const unrelated = path.join(path.dirname(transcript), "unrelated.keep");

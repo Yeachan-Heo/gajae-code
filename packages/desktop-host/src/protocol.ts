@@ -1,3 +1,10 @@
+import type { ThinkingControlMode } from "@gajae-code/ai/thinking-types";
+import type { ThinkingLevelMetadata } from "@gajae-code/coding-agent/thinking-metadata";
+import type { DesktopActivitySnapshot } from "./activity-protocol";
+import type { DesktopBtwEvent } from "./btw-protocol";
+import type { DesktopGatePresentationEvent } from "./gate-presentation-protocol";
+import type { DesktopOperatorEvent } from "./operator-protocol";
+
 export const PROTOCOL_VERSION = 1;
 
 export const DESKTOP_METHODS = [
@@ -14,11 +21,14 @@ export const DESKTOP_METHODS = [
 	"session.export",
 	"prompt",
 	"abort",
+	"models.list",
 	"model.set",
+	"thinking.set",
 	"settings.get",
 	"settings.set",
 	"auth.setKey",
 	"auth.providers",
+	"auth.keyProviders",
 	"auth.login",
 	"auth.state",
 	"auth.answer",
@@ -27,6 +37,29 @@ export const DESKTOP_METHODS = [
 	"command.list",
 	"command.run",
 	"history.get",
+	"activity.get",
+	"activity.detail",
+	"activity.operate",
+	"activity.acknowledge",
+	"preferences.get",
+	"preferences.apply",
+	"gate.present",
+	"gate.presented",
+	"gate.answer",
+	"gate.withdraw",
+	"gate.retired",
+	"operator.execute",
+	"operator.get",
+	"operator.abort",
+	"operator.fold",
+	"btw.open",
+	"btw.get",
+	"btw.submit",
+	"btw.cancel",
+	"btw.close",
+	"mcp.get",
+	"mcp.operate",
+	"session.info",
 	"queue.cancel",
 	"diff.get",
 	"tools.list",
@@ -44,9 +77,14 @@ export interface DesktopRequest {
 
 export interface DesktopMessage {
 	id: string;
+	/** Canonical persisted user-entry identity; display IDs never authorize branching. */
+	entryId?: string;
 	role: "user" | "assistant" | "tool" | "system";
 	text: string;
 	toolName?: string;
+	/** User execution remains visible but is omitted from model context. */
+	excludeFromContext?: boolean;
+	cancelled?: boolean;
 	isError?: boolean;
 	truncated?: boolean;
 }
@@ -69,6 +107,22 @@ export interface DesktopQueuedInput {
 	cancelable: boolean;
 	execution?: "joined-current-run" | "promoted-to-run" | "completed" | "removed";
 }
+export type DesktopThinkingLevel = ThinkingLevelMetadata["value"];
+export type DesktopThinkingMode = ThinkingControlMode | "toggle" | "always-on";
+export interface DesktopThinkingOption {
+	value: DesktopThinkingLevel;
+	label: string;
+	description?: string;
+}
+export interface DesktopThinking {
+	/** Live effective SDK level, not a guessed default or provider reasoning text. */
+	level: DesktopThinkingLevel | null;
+	options: DesktopThinkingOption[];
+	scope: "session" | "global config" | null;
+	available: boolean;
+	mode?: DesktopThinkingMode;
+	reason?: string;
+}
 export interface DesktopSession {
 	id: string;
 	projectId: string;
@@ -77,11 +131,23 @@ export interface DesktopSession {
 	queued?: DesktopQueuedInput[];
 	starred: boolean;
 	model?: string;
+	/** Null until the actual session is opened; display metadata grants no image authority. */
+	imageInput: { supported: boolean; blocked: boolean } | null;
+	/** True while a canonical SDK operator execution promise remains unsettled. */
+	operatorRunning: boolean;
+	/** Display sequencing only; never authorizes an SDK control. */
+	controlGeneration: number | null;
+	/** Present on host projections, including unavailable unopened/no-model sessions. */
+	thinking?: DesktopThinking;
 	messages: DesktopMessage[];
 	historyTruncated?: boolean;
 	question?: DesktopQuestion;
 	error?: string;
 }
+
+export type DesktopForkResult =
+	| { cancelled: true }
+	| { cancelled: false; session: DesktopSession; selectedText: string };
 
 export interface DesktopProject {
 	id: string;
@@ -92,6 +158,10 @@ export interface DesktopModel {
 	id: string;
 	name: string;
 	provider: string;
+	contextWindow: number;
+	reasoning: boolean;
+	/** Concrete model choices exclude inherit; only session thinking controls inherit. */
+	thinking: { options: DesktopThinkingOption[]; mode?: DesktopThinkingMode };
 }
 export interface DesktopCapability {
 	id: string;
@@ -151,6 +221,12 @@ export interface DesktopAuthProvider {
 	name: string;
 	configured?: boolean;
 }
+export interface DesktopCredentialSaveResult {
+	provider: string;
+	saved: true;
+	/** False means credentials are stored but at least one catalog needs a retry. */
+	catalogRefreshed: boolean;
+}
 export interface DesktopAuthState {
 	id: string;
 	provider: string;
@@ -160,12 +236,22 @@ export interface DesktopAuthState {
 	prompt?: { id: string; message: string; placeholder?: string; allowEmpty?: boolean };
 	error?: string;
 }
+export interface DesktopActivityUpdate {
+	sessionId: string;
+	/** Monotonic within the host's live catalog binding, not an SDK atomicity receipt. */
+	revision: number;
+	activity: DesktopActivitySnapshot;
+}
 export type DesktopFrame =
 	| { type: "response"; id: string; ok: true; result: unknown }
 	| { type: "response"; id: string; ok: false; error: string }
 	| { type: "snapshot"; snapshot: DesktopSnapshot }
 	| { type: "session"; session: DesktopSession }
 	| { type: "auth"; auth: DesktopAuthState }
+	| { type: "activity"; update: DesktopActivityUpdate }
+	| { type: "gate"; sessionId: string; event: DesktopGatePresentationEvent }
+	| { type: "operator"; sessionId: string; event: DesktopOperatorEvent }
+	| { type: "btw"; sessionId: string; sessionGeneration: number; event: DesktopBtwEvent }
 	| { type: "fatal"; error: string };
 
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;

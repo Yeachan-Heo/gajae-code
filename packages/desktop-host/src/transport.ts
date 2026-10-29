@@ -33,7 +33,13 @@ export async function serveProtocol(
 		if (
 			pending.size >= 128 &&
 			request.method !== "abort" &&
+			request.method !== "operator.abort" &&
+			request.method !== "operator.fold" &&
+			request.method !== "btw.cancel" &&
+			request.method !== "btw.close" &&
 			request.method !== "question.answer" &&
+			request.method !== "gate.presented" &&
+			request.method !== "gate.retired" &&
 			request.method !== "auth.answer" &&
 			request.method !== "auth.cancel" &&
 			request.method !== "shutdown"

@@ -116,7 +116,7 @@ where
 				Ok(value)
 					if matches!(
 						value.get("type").and_then(Value::as_str),
-						Some("response" | "snapshot" | "session" | "auth" | "fatal")
+						Some("response" | "snapshot" | "session" | "auth" | "activity" | "gate" | "operator" | "fatal")
 					) =>
 				{
 					value
@@ -282,11 +282,14 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "session.export"
 			| "prompt"
 			| "abort"
+			| "models.list"
 			| "model.set"
+			| "thinking.set"
 			| "settings.get"
 			| "settings.set"
 			| "auth.setKey"
 			| "auth.providers"
+			| "auth.keyProviders"
 			| "auth.login"
 			| "auth.state"
 			| "auth.answer"
@@ -295,6 +298,29 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "command.list"
 			| "command.run"
 			| "history.get"
+			| "activity.get"
+			| "activity.detail"
+			| "activity.operate"
+			| "activity.acknowledge"
+			| "preferences.get"
+			| "preferences.apply"
+			| "gate.present"
+			| "gate.presented"
+			| "gate.answer"
+			| "gate.withdraw"
+			| "gate.retired"
+			| "operator.execute"
+			| "operator.get"
+			| "operator.abort"
+			| "operator.fold"
+			| "btw.open"
+			| "btw.get"
+			| "btw.submit"
+			| "btw.cancel"
+			| "btw.close"
+			| "mcp.get"
+			| "mcp.operate"
+			| "session.info"
 			| "queue.cancel"
 			| "diff.get"
 			| "tools.list"
@@ -521,6 +547,33 @@ mod tests {
 		] {
 			assert_eq!(encode_engine_request(&request).err().as_deref(), Some(expected));
 		}
+	}
+
+	#[tokio::test]
+	async fn preserves_activity_gate_and_operator_frames_in_native_order() {
+		let expected = vec![
+			json!({"type": "activity", "update": {"sessionId": "owner", "revision": 2,
+				"activity": {"available": false, "reason": "unavailable"}}}),
+			json!({"type": "gate", "sessionId": "owner", "event": {"type": "presented",
+				"presentation": {"id": "surface", "gate": {"kind": "approval"}}}}),
+			json!({"type": "gate", "sessionId": "owner", "event": {"type": "retire",
+				"presentationId": "surface", "nonce": "exact-retirement"}}),
+			json!({"type": "operator", "sessionId": "owner", "event": {"type": "operator.updated",
+				"operation": {"operationId": "operation", "status": "running", "output": "확인"}}}),
+		];
+		let mut input = Vec::new();
+		for frame in &expected {
+			input.extend(serde_json::to_vec(frame).unwrap());
+			input.push(b'\n');
+		}
+		for limit in [1, 7, 64, input.len()] {
+			let (error, delivered) = frames(&input, limit).await;
+			assert!(error.is_empty(), "limit {limit}: {error}");
+			assert_eq!(delivered, expected, "limit {limit}");
+		}
+		let (error, delivered) = frames(b"{\"type\":\"untrusted.control\"}\n", 1).await;
+		assert_eq!(error, "Engine emitted an invalid frame envelope");
+		assert!(delivered.is_empty());
 	}
 
 	#[tokio::test]
