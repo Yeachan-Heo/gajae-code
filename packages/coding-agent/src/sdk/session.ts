@@ -2735,7 +2735,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionMcpFailures = new Set<string>();
 		let sessionMcpLedgerGeneration = 0;
 		let sessionMcpStartupSettled = true;
-		let sessionMcpRestoreFlight: Promise<void> | undefined;
+		let sessionMcpRestoreFlight: { manager: MCPManager; completion: Promise<boolean> } | undefined;
+		let sessionMcpRestoreDisposal: Promise<void> | undefined;
 		let sessionMcpRestoreCancelled = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const installMcpInputHandler = (manager: MCPManager): void => {
@@ -2780,6 +2781,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 				);
 			}
+			// Retire predecessor restore authority before any rescope callback can await.
+			if (sessionMcpGrant) sessionMcpLedgerGeneration += 1;
 			await session.refreshGjcSubskillTools();
 			const previousCwdCapturing = [...cwdCapturingToolNames];
 			const nextCwdCapturing: string[] = [];
@@ -2850,7 +2853,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						wireMcpManagerCallbacks(nextManager);
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
 						if (sessionMcpGrant) {
-							sessionMcpLedgerGeneration += 1;
 							sessionMcpFailures.clear();
 							for (const name of result.errors.keys()) sessionMcpFailures.add(name);
 						}
@@ -5558,48 +5560,89 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return servers;
 		};
-		const restoreSessionMcpAutoload = (names: readonly string[]): void => {
-			if (names.length === 0 || sessionMcpRestoreFlight) return;
+		const restoreSessionMcpAutoload = (names: readonly string[]): Promise<void> => {
+			if (names.length === 0) return Promise.resolve();
+			if (sessionMcpRestoreFlight)
+				return Promise.reject(new Error("Session MCP restoration is already in progress"));
+			const manager = mcpManager;
+			if (!manager) return Promise.reject(new Error("Session MCP restoration has no owning manager"));
 			const generation = sessionMcpLedgerGeneration;
-			let flight: Promise<void> | undefined;
-			flight = (async () => {
-				try {
-					const declared = await listDeclaredSessionMcpServers();
-					await Promise.allSettled(
-						names.map(async name => {
-							const server = declared.find(item => item.name === name && !item.disabled && item.autoload);
-							if (!server?.config || !server.source || !mcpManager) return;
-							try {
-								await mcpManager.connectSessionServer(name, server.config, server.source);
-								if (generation === sessionMcpLedgerGeneration && !sessionMcpRestoreCancelled)
-									sessionMcpFailures.delete(name);
-							} catch (error) {
-								logger.warn("Failed to restore session MCP server", {
-									serverName: name,
-									error: safeErrorForLog(error),
-								});
-								if (generation === sessionMcpLedgerGeneration && !sessionMcpRestoreCancelled)
-									sessionMcpFailures.add(name);
-							}
-						}),
-					);
-				} catch (error) {
-					logger.warn("Failed to restore session MCP autoload", { error: safeErrorForLog(error) });
-				} finally {
-					if (sessionMcpRestoreFlight === flight) sessionMcpRestoreFlight = undefined;
+			const ownerSessionManager = session.sessionManager;
+			const ownerSessionId = ownerSessionManager.getSessionId();
+			const ownerCwd = ownerSessionManager.getCwd();
+			const isCurrent = (): boolean =>
+				!session.isDisposed &&
+				!sessionMcpRestoreCancelled &&
+				generation === sessionMcpLedgerGeneration &&
+				mcpManager === manager &&
+				session.sessionManager === ownerSessionManager &&
+				ownerSessionManager.getSessionId() === ownerSessionId &&
+				ownerSessionManager.getCwd() === ownerCwd;
+			const flight = (async (): Promise<boolean> => {
+				const declared = await listDeclaredSessionMcpServers();
+				if (!isCurrent()) return false;
+				const failures: unknown[] = [];
+				const finish = (restored: boolean): boolean => {
+					// Later invalidation must not erase genuine connection or cleanup failures.
+					if (failures.length > 0) throw new AggregateError(failures, "Failed to restore session MCP autoload");
+					return restored;
+				};
+				// The connector reserves the manager's control ticket: restore each name in order.
+				for (const name of names) {
+					if (!isCurrent()) return finish(false);
+					const server = declared.find(item => item.name === name && !item.disabled && item.autoload);
+					if (!server?.config || !server.source) continue;
+					try {
+						await manager.connectSessionServer(name, server.config, server.source);
+					} catch (error) {
+						failures.push(error);
+						if (!isCurrent()) return finish(false);
+						logger.warn("Failed to restore session MCP server", {
+							serverName: name,
+							error: safeErrorForLog(error),
+						});
+						sessionMcpFailures.add(name);
+					}
+					if (!isCurrent()) return finish(false);
 				}
+				return finish(true);
 			})();
-			sessionMcpRestoreFlight = flight;
-			void flight.catch(() => {});
+			const owner = { manager, completion: flight };
+			sessionMcpRestoreFlight = owner;
+			void flight
+				.finally(() => {
+					if (sessionMcpRestoreFlight === owner) sessionMcpRestoreFlight = undefined;
+				})
+				.catch(() => {});
+			return flight.then(restored => {
+				if (!restored) throw new Error("Session MCP restoration ownership changed before completion");
+			});
+		};
+		const disposeSessionMcpRestoration = (): Promise<void> => {
+			if (sessionMcpRestoreDisposal) return sessionMcpRestoreDisposal;
+			sessionMcpRestoreCancelled = true;
+			sessionMcpLedgerGeneration += 1;
+			const restore = sessionMcpRestoreFlight;
+			const disposal = restore
+				? Promise.allSettled([restore.manager.disconnectAll(), restore.completion]).then(results => {
+						const failures = results.filter(result => result.status === "rejected").map(result => result.reason);
+						if (failures.length > 0) throw new AggregateError(failures, "Session MCP restoration cleanup failed");
+					})
+				: Promise.resolve();
+			sessionMcpRestoreDisposal = disposal;
+			void disposal.catch(() => {});
+			return disposal;
 		};
 		const sessionMcpControlPort: SessionMcpControlPort | undefined = sessionMcpGrant
 			? {
 					listDeclaredServers: listDeclaredSessionMcpServers,
+					getGeneration: () => sessionMcpLedgerGeneration,
 					isSettled: () => sessionMcpStartupSettled && sessionMcpRestoreFlight === undefined,
 					getFailedServers: () => sessionMcpFailures,
 					markFailed: name => sessionMcpFailures.add(name),
 					clearFailed: name => sessionMcpFailures.delete(name),
 					restoreAutoload: restoreSessionMcpAutoload,
+					disposeRestoration: disposeSessionMcpRestoration,
 				}
 			: undefined;
 
@@ -5720,6 +5763,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		// Empty-config grants can acquire session servers later, without a deferred starter.
+		// Their restores still belong to teardown, and must never disconnect a successor.
+		if (sessionMcpGrant) {
+			session.registerToolSessionCleanup(disposeSessionMcpRestoration);
+		}
 		// Defer profile activation until explicit model pin validation occurs (#5919).
 		if (!options.deferModelProfileActivation) {
 			session.setActiveModelProfile(startupActiveModelProfile);
@@ -6214,11 +6262,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			let startupPromise: Promise<DeferredMcpConfigStartupResult> | undefined;
 			session.registerToolSessionCleanup(async () => {
 				cancelled = true;
-				sessionMcpRestoreCancelled = true;
-				if (sessionMcpRestoreFlight) {
-					await mcpManager?.disconnectAll().catch(() => {});
-					await sessionMcpRestoreFlight.catch(() => {});
-				}
 				deferredMcpTurnReady?.resolve();
 				if (startupPromise) {
 					await deferredExactMcpConfig?.manager.disconnectAll().catch(() => {});
