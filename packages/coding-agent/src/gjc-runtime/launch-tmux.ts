@@ -1,12 +1,12 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Args } from "../cli/args";
+import { macOSMallocEnvUnsetArgs } from "../cli/malloc-env-guard";
 import { dropProjectSuppliedHerdrBinPath } from "../main";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
@@ -19,9 +19,14 @@ import {
 } from "./managed-owner-admission";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_LAUNCH_BASELINE_ENV,
+	MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES,
+	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_SUPERVISOR_ARG,
+	managedOwnerStateDirAccepted,
+	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
+import { prepareOwnerLifecycleRootSync } from "./owner-lifecycle-root";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	coordinatorSidecarSigningBootstrapEnv,
@@ -43,6 +48,7 @@ import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
+	canonicalManagedStateFile,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_COMMAND_ENV,
@@ -62,6 +68,7 @@ import {
 	classifyCgroup,
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
+	launchBaselineToken,
 	lifecyclePaths,
 	type ManagedOwnerPredecessorEvidence,
 	type OwnerGenerationBaseline,
@@ -510,7 +517,13 @@ function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 		const resolvedEntrypoint = pathModule.isAbsolute(entrypoint)
 			? entrypoint
 			: pathModule.resolve(context.cwd, entrypoint);
-		return [executable, resolvedEntrypoint];
+		// A macOS managed pane process must stay the pinned supervisor PID. Bun's cwd
+		// `.env` autoload could reintroduce the malloc variables the pane scrubs and
+		// make the CLI malloc guard re-exec below the pane PID, so source launches
+		// disable it like a compiled binary does.
+		return context.managedOwnerSupervisor && context.platform === "darwin"
+			? [executable, "--no-env-file", resolvedEntrypoint]
+			: [executable, resolvedEntrypoint];
 	}
 
 	const executable =
@@ -540,14 +553,13 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 		});
 	const command = resolveCurrentGjcCommand(context);
 	const childArgs = stripRootTmuxFlag(rawArgs);
-	const supervisorEnv: Record<string, string> = context.managedOwnerSupervisor
-		? { GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]) }
-		: {};
 	const invocationArgs = context.managedOwnerSupervisor
-		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]
+		? managedOwnerSupervisorInvocation(command, [...command, ...childArgs])
 		: [...command, ...childArgs];
 	const quoted = invocationArgs.map(shellQuote).join(" ");
-	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })}${
+	const unsetArgs =
+		context.managedOwnerSupervisor && context.platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
+	const invocation = `env ${unsetArgs}${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv })}${
 		context.bootstrapSecret
 			? ` ${context.bootstrapSecret.urlEnv}=${shellQuote(context.bootstrapSecret.path)} ${context.bootstrapSecret.keyIdEnv}=${shellQuote(context.bootstrapSecret.keyId)}`
 			: ""
@@ -564,14 +576,9 @@ function stageCoordinatorSidecarBootstrap(
 	const key = signingEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const keyId = signingEnv[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
 	if (!key || !keyId) return undefined;
-	let bootstrapDir = stateDir;
-	try {
-		fs.mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
-	} catch {
-		bootstrapDir = path.join(os.tmpdir(), "gjc-coordinator-bootstrap");
-		fs.mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
-	}
-	return { path: path.join(bootstrapDir, `.coordinator-sidecar-${crypto.randomUUID()}.key`), keyId };
+	// Only a unique placeholder: writeCoordinatorSidecarBootstrapFile replaces it with a
+	// loopback endpoint before launch, so staging creates nothing on disk.
+	return { path: path.join(stateDir, `.coordinator-sidecar-${crypto.randomUUID()}.key`), keyId };
 }
 
 /**
@@ -1128,9 +1135,14 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	// tmux launches with no GJC session context. Project dotenv pins are already
 	// removed from identityEnv.
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
+	const derivedStateFile = tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+	// Supervised launches verify their lifecycle root with no-follow walks, so a derived
+	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
 	const sessionStateFile =
 		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
-		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+		(platform === "linux" || platform === "darwin"
+			? canonicalManagedStateFile(cwd, derivedStateFile)
+			: derivedStateFile);
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
 	// itself stays in memory until writeCoordinatorSidecarBootstrapFile runs
@@ -1208,6 +1220,25 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	};
 }
 
+/**
+ * Linux supervised launches persist the child argv in a recoverable binding that
+ * the native owner-only reader caps at 64 KiB. JSON escaping can expand an argv
+ * that fits tmux's command limit (control characters become six bytes), so check
+ * the exact serialized command before any tmux session exists and report it as an
+ * input limit instead of failing in the supervisor after launch.
+ */
+function assertRecoverableCommandFits(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
+	const command = resolveCurrentGjcCommand({
+		cwd: plan.cwd,
+		argv: context.argv ?? process.argv,
+		execPath: context.execPath ?? process.execPath,
+		platform: plan.platform,
+	});
+	const childArgv = [...command, ...stripRootTmuxFlag(context.rawArgs)];
+	if (Buffer.byteLength(JSON.stringify(childArgv)) > MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES)
+		throw new Error("managed_owner_command_too_large: pass a large prompt through a file (@file) instead");
+}
+
 function trustedReplacementAuthority(
 	stateDir: string,
 	sessionId: string,
@@ -1223,6 +1254,11 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	const identityEnv = tmuxLaunchIdentityEnv(launchEnv, plan.cwd);
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	const supervised = plan.platform === "linux" || plan.platform === "darwin";
+	// The supervisor refuses a state directory that is not an absolute path free of `..`.
+	// Refuse such an operator pin here, before any lifecycle storage exists. It is not
+	// rewritten: lexical normalization would retarget a pin whose `..` follows a symlink.
+	if (supervised && !managedOwnerStateDirAccepted(stateDir)) throw new Error("gjc_tmux_state_file_pin_unsafe");
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
 	const generation = crypto.randomUUID();
@@ -1234,6 +1270,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	plan.ownerGeneration = generation;
 	plan.ownerRunId = runId;
 	plan.ownerIncarnation = incarnation;
+	if (plan.platform === "linux") assertRecoverableCommandFits(plan, context);
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1257,6 +1294,10 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
 				[MANAGED_OWNER_RUN_ID_ENV]: runId,
 				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+				[MANAGED_OWNER_LAUNCH_BASELINE_ENV]: launchBaselineToken(baseline),
+				// Darwin close needs only the binding identity, and owner-loss recovery is
+				// Linux-only; never persist the child argv (prompts, API keys) there.
+				...(plan.platform === "darwin" ? { [MANAGED_OWNER_REDACT_COMMAND_ENV]: "1" } : {}),
 				...(replacement
 					? {
 							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: replacement.predecessorToken,
@@ -1280,11 +1321,12 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 						keyId: plan.coordinatorSidecarBootstrap.keyId,
 					}
 				: undefined,
-			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
-			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
-			tmuxExitMarkerPath: plan.platform === "linux" ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
+			// Managed close proves the pane PID is the exact supervisor (Linux signals it,
+			// Darwin publishes a cooperative intent bound to its binding). Do not place the
+			// exit-marker shell in front of it; `buildInnerCommand` therefore execs it directly.
+			tmuxExitMarkerPath: supervised ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
 			platform: plan.platform,
-			managedOwnerSupervisor: plan.platform === "linux",
+			managedOwnerSupervisor: supervised,
 		},
 		context.rawArgs,
 	);
@@ -1421,6 +1463,16 @@ function createIsolatedTmuxSession(
 ): TmuxSpawnResult {
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	if (plan.platform === "linux" || plan.platform === "darwin") {
+		try {
+			prepareOwnerLifecycleRootSync(
+				lifecyclePaths(stateDir, sessionId, plan.ownerGeneration ?? plan.sessionName).root,
+			);
+		} catch {
+			diagnostic("tmux owner lifecycle preparation failed");
+			return { exitCode: 1, stderr: "managed_owner_storage_unsafe" };
+		}
+	}
 	const baseline = plan.ownerGenerationBaseline ?? captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	plan.ownerGenerationBaseline = baseline;
 	const ownerPlan = planTmuxOwnerIsolationSync(
@@ -1984,7 +2036,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	}
 	try {
 		const stateDir = path.dirname(plan.sessionStateFile!);
-		resolveManagedOwnerPredecessorSync(stateDir, plan.sessionId!, plan.ownerGenerationBaseline!);
 		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!);
 		providerAuthorityPublished = true;
 	} catch (error) {

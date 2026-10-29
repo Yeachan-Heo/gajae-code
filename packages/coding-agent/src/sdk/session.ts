@@ -181,7 +181,13 @@ import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state"
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
-import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } from "../session/agent-session";
+import {
+	AgentSession,
+	type ForkContextSeed,
+	isSessionDisposalIncompleteError,
+	type SessionMcpControlPort,
+	type SessionMcpDeclaredServer,
+} from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
@@ -591,6 +597,8 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
 	 */
 	deferMcpConfigStartup?: boolean;
+	/** @internal Enables session-local MCP controls for root interactive CLI sessions only. */
+	sessionMcpControls?: boolean;
 	/** Process-local master authority. Never persist or pass to lifecycle children. */
 	masterModeContext?: MasterModeContext;
 	/**
@@ -2723,6 +2731,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let ownedMcpManagerToolNames: string[] = [];
 		let ownedMcpManagerTools: readonly CustomTool[] = [];
 		let publishOwnedMcpTools = false;
+		let sessionMcpGrant = false;
+		const sessionMcpFailures = new Set<string>();
+		let sessionMcpLedgerGeneration = 0;
+		let sessionMcpStartupSettled = true;
+		let sessionMcpRestoreFlight: Promise<void> | undefined;
+		let sessionMcpRestoreCancelled = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const installMcpInputHandler = (manager: MCPManager): void => {
 			manager.setInputRequestHandler(
@@ -2822,7 +2836,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					);
 					for (const name of conventionalCacheServerNames) ownedConventionalMcpServerNames.add(name);
 					publishOwnedMcpTools = Object.keys(mergedConfigs).length > 0;
-					if (Object.keys(mergedConfigs).length > 0) {
+					if (Object.keys(mergedConfigs).length > 0 || (sessionMcpGrant && pluginNames.size === 0)) {
 						nextManager = new MCPManager(
 							to,
 							conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
@@ -2835,6 +2849,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						nextManager.setAuthStorage(authStorage);
 						wireMcpManagerCallbacks(nextManager);
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
+						if (sessionMcpGrant) {
+							sessionMcpLedgerGeneration += 1;
+							sessionMcpFailures.clear();
+							for (const name of result.errors.keys()) sessionMcpFailures.add(name);
+						}
 						const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
 						pluginMcpManagerServers.set(nextManager, new Set(pluginNames));
 						conventionalMcpManagerServers.set(nextManager, conventionalCacheServerNames);
@@ -3615,6 +3634,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			let result: MCPLoadResult;
 			try {
 				result = await owned.connectServers(mergedConfigs, mergedSources as never);
+				if (sessionMcpGrant) for (const name of result.errors.keys()) sessionMcpFailures.add(name);
 			} catch (error) {
 				if (
 					safeIsInstanceOf(error, McpManagerCleanupError) ||
@@ -3888,6 +3908,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
 				const pluginNames = new Set(Object.keys(configs));
+				const grant =
+					options.sessionMcpControls === true &&
+					options.deferMcpConfigStartup === true &&
+					options.enableMcpAutoload !== false &&
+					options.mcpManager === undefined &&
+					explicitMcpConfigPath === undefined &&
+					!isCanonicalSubSession &&
+					pluginNames.size === 0;
+				sessionMcpGrant = grant;
 				const mergedConfigs = { ...conventionalConfigs, ...configs };
 				const mergedSources = {
 					...conventionalSources,
@@ -3901,7 +3930,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Plugin-source entries omit SourceMeta.path (see connectOwnedConventionalMcp's
 				// own bypass of the same mismatch at the manager boundary).
 				const mergedSourceMetas = mergedSources as Record<string, SourceMeta>;
-				if (Object.keys(mergedConfigs).length > 0) {
+				if (Object.keys(mergedConfigs).length > 0 || grant) {
 					const conventionalCacheServerNames = new Set(
 						Object.keys(conventionalConfigs).filter(name => !pluginNames.has(name)),
 					);
@@ -3933,7 +3962,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					// Plugin-bundle servers never defer: their connect evidence feeds the
 					// GJC runtime snapshot published during creation, and a late failure
 					// would present a partial pass as a clear one.
-					if (options.deferMcpConfigStartup && pluginNames.size === 0) {
+					if (options.deferMcpConfigStartup && pluginNames.size === 0 && Object.keys(mergedConfigs).length > 0) {
+						sessionMcpStartupSettled = false;
 						deferredConventionalMcp = {
 							manager: owned,
 							cleanup: cleanupOwned,
@@ -3944,6 +3974,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// Publish the manager immediately (empty until the starter connects)
 						// so /mcp status, reconnect, and resource inspection resolve it once
 						// the deferred tools land instead of reporting no manager.
+						mcpManager = owned;
+						ownsMcpManager = true;
+					} else if (Object.keys(mergedConfigs).length === 0) {
 						mcpManager = owned;
 						ownsMcpManager = true;
 					} else {
@@ -5478,6 +5511,90 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			deferredExactMcpConfig || deferredConventionalMcp ? Promise.withResolvers<void>() : undefined;
 		if (deferredMcpTurnReady) void deferredMcpTurnReady.promise.catch(() => {});
 
+		const listDeclaredSessionMcpServers = async (): Promise<SessionMcpDeclaredServer[]> => {
+			const projectMcp = nativeProjectMcpAutoload(settings);
+			const loaded = await loadAllMCPConfigs(session?.sessionManager.getCwd() ?? cwd, {
+				agentDir,
+				enableProjectConfig: projectMcp.enableProjectConfig,
+				autoloadOnly: false,
+				includeDisabled: true,
+				nativeOnly: true,
+				settings,
+			});
+			// omitUnapprovedProjectStdio deletes the source entry too; keep a copy so
+			// an unapproved server can still be reported as disabled.
+			const sourcesBefore = { ...loaded.sources };
+			const before = Object.keys(loaded.configs);
+			omitUnapprovedProjectStdio(loaded.configs, loaded.sources, projectMcp.allowProjectStdio);
+			const servers: SessionMcpDeclaredServer[] = Object.entries(loaded.configs).map(([name, config]) => ({
+				name,
+				scope: loaded.sources[name]?.level === "project" ? "project" : "global",
+				autoload: config.autoload !== false,
+				config,
+				source: loaded.sources[name],
+			}));
+			for (const name of before) {
+				const source = sourcesBefore[name];
+				if (!loaded.configs[name] && source) {
+					servers.push({ name, scope: "project", autoload: false, disabled: "project-stdio-unapproved", source });
+				}
+			}
+			for (const [name, disabled] of Object.entries(loaded.disabled ?? {})) {
+				servers.push({
+					name,
+					scope: disabled.source.level === "project" ? "project" : "global",
+					autoload: disabled.autoload,
+					disabled: disabled.reason,
+					source: disabled.source,
+				});
+			}
+			return servers;
+		};
+		const restoreSessionMcpAutoload = (names: readonly string[]): void => {
+			if (names.length === 0 || sessionMcpRestoreFlight) return;
+			const generation = sessionMcpLedgerGeneration;
+			let flight: Promise<void> | undefined;
+			flight = (async () => {
+				try {
+					const declared = await listDeclaredSessionMcpServers();
+					await Promise.allSettled(
+						names.map(async name => {
+							const server = declared.find(item => item.name === name && !item.disabled && item.autoload);
+							if (!server?.config || !server.source || !mcpManager) return;
+							try {
+								await mcpManager.connectSessionServer(name, server.config, server.source);
+								if (generation === sessionMcpLedgerGeneration && !sessionMcpRestoreCancelled)
+									sessionMcpFailures.delete(name);
+							} catch (error) {
+								logger.warn("Failed to restore session MCP server", {
+									serverName: name,
+									error: safeErrorForLog(error),
+								});
+								if (generation === sessionMcpLedgerGeneration && !sessionMcpRestoreCancelled)
+									sessionMcpFailures.add(name);
+							}
+						}),
+					);
+				} catch (error) {
+					logger.warn("Failed to restore session MCP autoload", { error: safeErrorForLog(error) });
+				} finally {
+					if (sessionMcpRestoreFlight === flight) sessionMcpRestoreFlight = undefined;
+				}
+			})();
+			sessionMcpRestoreFlight = flight;
+			void flight.catch(() => {});
+		};
+		const sessionMcpControlPort: SessionMcpControlPort | undefined = sessionMcpGrant
+			? {
+					listDeclaredServers: listDeclaredSessionMcpServers,
+					isSettled: () => sessionMcpStartupSettled && sessionMcpRestoreFlight === undefined,
+					getFailedServers: () => sessionMcpFailures,
+					markFailed: name => sessionMcpFailures.add(name),
+					clearFailed: name => sessionMcpFailures.delete(name),
+					restoreAutoload: restoreSessionMcpAutoload,
+				}
+			: undefined;
+
 		session = new AgentSession({
 			agent,
 			thinkingLevel,
@@ -5502,6 +5619,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// subagents and callers that merely observe a manager must not (see
 			// AgentSession.dispose).
 			ownedMcpManager: ownsMcpManager ? mcpManager : undefined,
+			sessionMcpControls: sessionMcpControlPort,
 			startupTurnBarrier: deferredMcpTurnReady?.promise,
 			scopedModels: options.scopedModels,
 			promptTemplates,
@@ -6089,6 +6207,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			let startupPromise: Promise<DeferredMcpConfigStartupResult> | undefined;
 			session.registerToolSessionCleanup(async () => {
 				cancelled = true;
+				sessionMcpRestoreCancelled = true;
+				if (sessionMcpRestoreFlight) {
+					await mcpManager?.disconnectAll().catch(() => {});
+					await sessionMcpRestoreFlight.catch(() => {});
+				}
 				deferredMcpTurnReady?.resolve();
 				if (startupPromise) {
 					await deferredExactMcpConfig?.manager.disconnectAll().catch(() => {});
@@ -6203,7 +6326,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						await deferredConventionalMcp?.manager.disconnectAll().catch(() => {});
 						throw startupError;
 					}
-				})();
+				})().finally(() => {
+					sessionMcpStartupSettled = true;
+				});
 				return startupPromise;
 			};
 		}

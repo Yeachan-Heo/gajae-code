@@ -79,6 +79,12 @@ export type SpawnSubstrateProof = {
 	stateFileProof?: Readonly<Record<string, string | number>>;
 };
 
+export type SpawnLifecycleOwner = { pid: number; incarnation: string };
+
+export type SpawnLifecycleOwnerResolution =
+	| { ok: true; owner: SpawnLifecycleOwner }
+	| { ok: false; code: "owner_deadline" | "owner_unsupported" | "owner_proof_failed" | "owner_ambiguous" };
+
 export interface SpawnSubstrateProvider {
 	launch(
 		spec: SpawnSubstrateLaunchSpec,
@@ -87,6 +93,8 @@ export interface SpawnSubstrateProvider {
 		| { ok: false; code: "substrate_unavailable" | "substrate_proof_failed"; message: string }
 	>;
 	verify(proof: SpawnSubstrateProof): Promise<"verified" | "mismatch" | "gone">;
+	/** Live-only host mapping; the substrate proof remains cleanup authority. */
+	resolveLifecycleOwner(proof: SpawnSubstrateProof, deadlineAt: number): Promise<SpawnLifecycleOwnerResolution>;
 	close(proof: SpawnSubstrateProof): Promise<{ ok: boolean; code?: string }>;
 }
 

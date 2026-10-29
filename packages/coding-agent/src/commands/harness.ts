@@ -154,6 +154,7 @@ function gitDeltaFor(workspace: string): { gitDelta: GitDelta; branch: string | 
 	let branch: string | null = null;
 	try {
 		branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
@@ -163,6 +164,7 @@ function gitDeltaFor(workspace: string): { gitDelta: GitDelta; branch: string | 
 	}
 	try {
 		const porcelain = execFileSync("git", ["status", "--porcelain"], {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
@@ -206,6 +208,7 @@ function normalizeIssueOrPr(value: unknown): string | null {
 function gitOutput(workspace: string, args: string[]): string | null {
 	try {
 		return execFileSync("git", args, {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],

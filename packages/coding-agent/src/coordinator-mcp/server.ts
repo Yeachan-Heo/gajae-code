@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
@@ -1174,6 +1175,7 @@ function resolveCoordinatorWorktree(
 	// rather than a redacted lifecycle error. The argv array prevents the name
 	// from becoming shell syntax or another git option.
 	const validation = Bun.spawnSync(["git", "check-ref-format", "--branch", name], {
+		env: projectSafeSpawnEnv(),
 		stdout: "ignore",
 		stderr: "ignore",
 	});

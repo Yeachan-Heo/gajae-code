@@ -2832,9 +2832,9 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(args);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
