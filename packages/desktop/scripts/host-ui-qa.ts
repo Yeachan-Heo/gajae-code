@@ -358,17 +358,24 @@ try {
 		},
 	);
 	const child = host;
-	// Drain diagnostics before waiting for the backend control endpoint to start.
+	// Drain diagnostics before waiting for the backend control endpoint to start,
+	// keeping a tail so a child that dies before the control endpoint exists says
+	// why instead of leaving the wait to time out silently.
+	let childStderr = "";
 	void (async () => {
-		for await (const _chunk of child.stderr) {
-			/* discard */
+		for await (const chunk of child.stderr) {
+			childStderr = (childStderr + new TextDecoder().decode(chunk)).slice(-4000);
 		}
 	})();
 	if (fixture) {
 		const layout = fixtureLayout(temporary);
 		const deadline = Date.now() + 30000;
 		while (!(await Bun.file(layout.gateControlPath).exists())) {
-			if (child.exitCode !== null || Date.now() >= deadline) throw new Error("Fixture gate control did not start");
+			if (child.exitCode !== null || Date.now() >= deadline) {
+				throw new Error(
+					`Fixture gate control did not start${child.exitCode === null ? " within 30s" : ` (backend exited ${child.exitCode})`}${childStderr ? `: ${childStderr.trim()}` : ""}`,
+				);
+			}
 			await Bun.sleep(25);
 		}
 		gateControl = await readFixtureGateControl(layout);
