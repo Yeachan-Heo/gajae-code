@@ -11,7 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SourceMeta } from "../../src/capability/types";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
-import { MCPManager } from "../../src/runtime-mcp/manager";
+import { MCPManager, type MCPManagerOptions } from "../../src/runtime-mcp/manager";
+import { MCPConnectionPool, type MCPPoolLease } from "../../src/runtime-mcp/pool";
 import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 import type { MCPServerConfig } from "../../src/runtime-mcp/types";
 
@@ -20,13 +21,7 @@ const source: SourceMeta = { provider: "test", providerName: "Test", path: "/tes
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
-	for (const cleanup of cleanups.splice(0).reverse()) {
-		try {
-			await cleanup();
-		} catch {
-			/* best effort */
-		}
-	}
+	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
 function makeDir(): { base: string; log: string; flag: string } {
@@ -51,8 +46,8 @@ function spawnCount(log: string, name: string): number {
 		.filter(line => line.startsWith(`spawn ${name} `)).length;
 }
 
-function newManager(base: string, cache: MCPToolCache | null = null): MCPManager {
-	const manager = new MCPManager(base, cache);
+function newManager(base: string, cache: MCPToolCache | null = null, options: MCPManagerOptions = {}): MCPManager {
+	const manager = new MCPManager(base, cache, options);
 	cleanups.push(() => manager.disconnectAll());
 	return manager;
 }
@@ -128,6 +123,140 @@ describe("MCPManager.connectSessionServer", () => {
 		expect(spawnCount(log, "one")).toBe(2);
 		expect(manager.getConnectionStatus("one")).toBe("connected");
 		expect(toolsOf(manager, "one")).toEqual(before);
+	}, 20_000);
+
+	test("restart retires a held scoped operation before reporting the replacement", async () => {
+		const { base, log } = makeDir();
+		const manager = newManager(base);
+		const config = fakeConfig(log, "scoped");
+		const previous = await manager.connectSessionServer("scoped", config, source);
+		const entered = Promise.withResolvers<MCPPoolLease>();
+		const release = Promise.withResolvers<void>();
+		const finished = Promise.withResolvers<void>();
+		const scoped = manager.withPreparedLease("scoped", config, async lease => {
+			entered.resolve(lease);
+			try {
+				await release.promise;
+				return "late scoped completion";
+			} finally {
+				finished.resolve();
+			}
+		});
+		const outcome = scoped.then(
+			value => ({ status: "fulfilled", value }),
+			(error: unknown) => ({ status: "rejected", error }),
+		);
+		try {
+			const lease = await entered.promise;
+			expect(lease.connection).toBe(previous);
+			const replacement = await manager.connectSessionServer("scoped", config, source, { restart: true });
+			expect(lease.connectionForLease().transport.connected).toBe(false);
+			expect(replacement).not.toBe(previous);
+			expect(spawnCount(log, "scoped")).toBe(2);
+			expect(await outcome).toMatchObject({
+				status: "rejected",
+				error: { message: "MCP server reconnecting: scoped" },
+			});
+		} finally {
+			release.resolve();
+			await finished.promise;
+			await outcome;
+		}
+	}, 20_000);
+
+	test("restart rejects uncertain scoped cleanup and retains the previous connection", async () => {
+		const { base, log } = makeDir();
+		const manager = newManager(base);
+		const config = fakeConfig(log, "cleanup");
+		const previous = await manager.connectSessionServer("cleanup", config, source);
+		const entered = Promise.withResolvers<MCPPoolLease>();
+		const release = Promise.withResolvers<void>();
+		const finished = Promise.withResolvers<void>();
+		const scoped = manager.withPreparedLease("cleanup", config, async lease => {
+			entered.resolve(lease);
+			try {
+				await release.promise;
+			} finally {
+				finished.resolve();
+			}
+		});
+		const outcome = Promise.allSettled([scoped]);
+		const lease = await entered.promise;
+		const releaseLease = lease.release.bind(lease);
+		const failure = vi.spyOn(lease, "release").mockRejectedValue(new Error("SCOPED_RELEASE_FAILURE"));
+		try {
+			await expect(manager.connectSessionServer("cleanup", config, source, { restart: true })).rejects.toMatchObject(
+				{
+					code: "unknown_effect",
+				},
+			);
+			expect(manager.getConnection("cleanup")).toBe(previous);
+			expect(spawnCount(log, "cleanup")).toBe(1);
+			expect(manager.getServerControlSnapshot()[0]).toMatchObject({ state: "unknown", controls: [] });
+			expect((await outcome)[0]).toMatchObject({ status: "rejected" });
+		} finally {
+			release.resolve();
+			await finished.promise;
+			await outcome;
+			failure.mockRestore();
+			await releaseLease();
+		}
+	}, 20_000);
+
+	test("restart retires the pooled generation even when another lease retains the old transport", async () => {
+		const { base, log } = makeDir();
+		const pool = new MCPConnectionPool();
+		const sessionId = "session-connect-held-lease";
+		const manager = newManager(base, null, { pool, sessionId });
+		const config = fakeConfig(log, "retained");
+		const previous = await manager.connectSessionServer("retained", config, source);
+		const retained = await pool.acquire("retained", config, {
+			keyConfig: config,
+			sharingMode: "per-session",
+			sessionId,
+			advertiseRoots: true,
+			effectiveCwd: base,
+			capabilityProfile: "roots",
+		});
+		try {
+			expect(retained.connection).toBe(previous);
+			const replacement = await manager.connectSessionServer("retained", config, source, { restart: true });
+			expect(replacement).not.toBe(previous);
+			expect(spawnCount(log, "retained")).toBe(2);
+			expect(manager.getConnection("retained")).toBe(replacement);
+		} finally {
+			await retained.release();
+		}
+	}, 20_000);
+
+	test("publishes a control target while a first connection is held before registration", async () => {
+		const { base, log } = makeDir();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const manager = newManager(base, null, {
+			afterLeaseAcquiredForTests: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const pending = manager.connectSessionServer("pending", fakeConfig(log, "pending"), source);
+		void pending.catch(() => {});
+		let initialGeneration: number | undefined;
+		try {
+			await entered.promise;
+			const rows = manager.getServerControlSnapshot();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ target: { name: "pending" }, state: "connecting", controls: [] });
+			initialGeneration = rows[0]!.target.generation;
+			await expect(manager.controlServer(rows[0]!.target, "reconnect")).rejects.toMatchObject({ code: "busy" });
+			await expect(
+				manager.connectSessionServer("pending", fakeConfig(log, "pending"), source),
+			).rejects.toMatchObject({ code: "busy" });
+		} finally {
+			release.resolve();
+			await pending;
+		}
+		expect(manager.getServerControlSnapshot()[0]!.target.generation).toBeGreaterThan(initialGeneration!);
 	}, 20_000);
 
 	test("a failed first connect leaves no server state behind", async () => {

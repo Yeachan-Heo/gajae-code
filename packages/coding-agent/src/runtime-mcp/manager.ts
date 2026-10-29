@@ -3041,11 +3041,10 @@ export class MCPManager {
 	): Promise<MCPServerConnection> {
 		this.#assertRawMCPAccessAllowed();
 		this.#assertConnectionSetMutable();
-		if (options?.restart && this.#connections.has(name)) {
-			await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true, preserveTools: true });
-		}
+		if (this.#pendingServerControls.size) throw new MCPServerControlError("busy");
+		this.#assertScopedAdmission();
 		const existing = this.#connections.get(name);
-		if (existing) return existing;
+		if (existing && !options?.restart) return existing;
 		if (
 			this.#pendingConnections.has(name) ||
 			this.#pendingToolLoads.has(name) ||
@@ -3055,35 +3054,75 @@ export class MCPManager {
 		}
 		const validationErrors = validateServerConfig(name, config);
 		if (validationErrors.length > 0) throw new Error(validationErrors.join("; "));
-		this.#pruneSettledPendingAcquireCleanups(name);
-		await this.#closePendingConnectionCleanup(name);
-		const hadState = this.#serverConfigs.has(name) || this.#tools.some(tool => tool.mcpServerName === name);
-		this.#serverConfigs.set(name, config);
-		this.#sources.set(name, source);
-		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
-		const flight = this.#connectAndWireServer(name, config, source, this.#epoch, disconnectEpoch);
-		this.#pendingConnections.set(name, flight);
-		let timer: Timer | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() => reject(new Error(`MCP connection timed out: ${name}`)),
+		const ticket = { signal: undefined };
+		const managerEpoch = this.#epoch;
+		this.#advanceServerControlTarget(name);
+		this.#pendingServerControls.set(name, ticket);
+		const lifecycleEpoch = options?.restart ? this.#beginScopedLifecycle("reconnecting") : undefined;
+		const assertCurrent = (): void => {
+			if (
+				this.#epoch !== managerEpoch ||
+				this.#pendingServerControls.get(name) !== ticket ||
+				(lifecycleEpoch !== undefined && this.#scopedLifecycleEpoch !== lifecycleEpoch)
+			) {
+				throw new MCPServerControlError("unknown_effect");
+			}
+		};
+		try {
+			if (options?.restart) {
+				await this.#retireScopedOperations(name, new Error(`MCP server reconnecting: ${name}`));
+				assertCurrent();
+				if (this.#hasUnknownServerControlState(name)) throw new MCPServerControlError("unknown_effect");
+				const oldLease = this.#leases.get(name);
+				if (oldLease) this.#pool.retireLease(oldLease);
+				if (existing) {
+					await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true, preserveTools: true });
+					assertCurrent();
+				}
+			}
+			this.#pruneSettledPendingAcquireCleanups(name);
+			await this.#closePendingConnectionCleanup(name);
+			assertCurrent();
+			if (this.#hasUnknownServerControlState(name)) throw new MCPServerControlError("unknown_effect");
+			const hadState = this.#serverConfigs.has(name) || this.#tools.some(tool => tool.mcpServerName === name);
+			this.#serverConfigs.set(name, config);
+			this.#sources.set(name, source);
+			const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+			const flight = this.#connectAndWireServer(name, config, source, managerEpoch, disconnectEpoch);
+			this.#pendingConnections.set(name, flight);
+			const timeout = Promise.withResolvers<never>();
+			const timer = setTimeout(
+				() => timeout.reject(new Error(`MCP connection timed out: ${name}`)),
 				resolveExactConfigStartupTimeoutMs([config]),
 			);
-		});
-		try {
-			return await Promise.race([flight, timeout]);
-		} catch (error) {
-			void flight.catch(() => {});
-			if ((this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch) {
-				await this.#disconnectServer(
-					name,
-					hadState ? { preserveConfig: true, preserveSource: true, preserveTools: true } : undefined,
-				).catch(cleanupError => this.#logLeaseReleaseFailure(name, this.#connections.get(name), cleanupError));
+			try {
+				const connection = await Promise.race([flight, timeout.promise]);
+				assertCurrent();
+				return connection;
+			} catch (error) {
+				void flight.catch(() => {});
+				if (
+					this.#epoch === managerEpoch &&
+					this.#pendingServerControls.get(name) === ticket &&
+					(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch
+				) {
+					await this.#disconnectServer(
+						name,
+						hadState ? { preserveConfig: true, preserveSource: true, preserveTools: true } : undefined,
+					).catch(cleanupError => this.#logLeaseReleaseFailure(name, this.#connections.get(name), cleanupError));
+				}
+				throw error;
+			} finally {
+				clearTimeout(timer);
+				if (this.#pendingConnections.get(name) === flight) this.#pendingConnections.delete(name);
 			}
-			throw error;
 		} finally {
-			if (timer) clearTimeout(timer);
-			if (this.#pendingConnections.get(name) === flight) this.#pendingConnections.delete(name);
+			if (this.#pendingServerControls.get(name) === ticket) this.#pendingServerControls.delete(name);
+			if (lifecycleEpoch !== undefined) this.#finishScopedLifecycle(lifecycleEpoch);
+			else {
+				this.#notifyServerControlsChanged();
+				this.#drainDeferredSharedRebinds();
+			}
 		}
 	}
 
