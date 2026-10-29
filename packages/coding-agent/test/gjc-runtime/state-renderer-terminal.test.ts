@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { modeStatePath, sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { renderUltragoalStatusMarkdown as renderPublicUltragoalStatus } from "@gajae-code/coding-agent/gjc-runtime/state-renderer";
 import { sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import fc from "fast-check";
 import {
@@ -323,6 +324,35 @@ describe("state terminal text", () => {
 		});
 	});
 
+	it("public renderer strips OSC, CSI, breaks, and bidi from a counts key", () => {
+		const key = `custom${OSC52}${CSI}\n\u202e`;
+		const summary = {
+			exists: true,
+			status: "pending",
+			paths: { goalsPath: "goals.json" },
+			counts: { [key]: 3 },
+			goals: [{}, {}, {}],
+		};
+		const before = structuredClone(summary);
+		const rendered = renderPublicUltragoalStatus(summary);
+		expect(summary).toEqual(before);
+		const goalsLine = rendered.split("\n").find(line => line.startsWith("- goals: "));
+		expect(goalsLine).toBe(`- goals: 3 (${sanitizeDisplayLine(key)}=3)`);
+		expect(CONTROL.test(rendered)).toBe(false);
+		expect(rendered).not.toContain("\u202e");
+	});
+
+	it("public renderer keeps a plain custom counts key", () => {
+		const rendered = renderPublicUltragoalStatus({
+			exists: true,
+			status: "pending",
+			paths: { goalsPath: "goals.json" },
+			counts: { "needs-review": 2 },
+			goals: [{}, {}],
+		});
+		expect(rendered).toContain("- goals: 2 (needs-review=2)");
+	});
+
 	it("ultragoal status json keeps the stored objective", async () => {
 		await withSession(async cwd => {
 			const objective = `Ship the status text${OSC52}`;
@@ -460,13 +490,14 @@ describe("state terminal text", () => {
 					paths: { goalsPath: `goals${extra}.json`, ledgerPath: `ledger${extra}.jsonl` },
 					gjcObjective: `${objective}${extra}`,
 					currentGoal: { id: `G${extra}1`, status: "pending" },
-					counts: { pending: 1 },
+					counts: { [`pending${extra}`]: 1 },
 					goals: [{}],
 				};
 				const before = structuredClone(summary);
 				const rendered = renderUltragoalStatusMarkdown(summary);
 				expect(summary).toEqual(before);
 				expect(CONTROL.test(rendered)).toBe(false);
+				expect(rendered).toContain(`(${sanitizeDisplayLine(`pending${extra}`)}=1)`);
 				expect(rendered).toContain(`- objective: ${sanitizeText(`${objective}${extra}`)}`);
 				expect(rendered).toContain(`${word}\nfollow-up`);
 				const statusLine = rendered.split("\n").find(line => line.startsWith("- status: "));

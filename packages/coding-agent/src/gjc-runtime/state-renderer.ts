@@ -280,7 +280,7 @@ export function renderUltragoalStatusMarkdown(summary: {
 	if (!summary.exists)
 		return `# ultragoal status\n\n- status: missing\n- No ultragoal plan found at ${goalsPath}. Run \`gjc ultragoal create-goals --brief "..."\` first.\n`;
 	const counts = Object.entries(summary.counts)
-		.map(([key, value]) => `${key}=${value}`)
+		.map(([key, value]) => `${terminalLine(key)}=${value}`)
 		.join(" ");
 	const lines = [
 		"# ultragoal status",
