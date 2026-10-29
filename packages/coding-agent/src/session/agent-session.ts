@@ -19832,6 +19832,11 @@ export class AgentSession {
 		return this.#userModelSelectionRevision;
 	}
 
+	/** Revision fence that distinguishes even same-value thinking intent during profile rollback. */
+	getThinkingLevelMutationRevision(): number {
+		return this.#thinkingLevelMutationRevision;
+	}
+
 	/** Latest concrete user choice that seeded or cleared the session's sticky canonical variant. */
 	getUserCanonicalVariantSelection(): { revision: number; canonicalVariant: string | undefined } {
 		return {
@@ -20826,6 +20831,15 @@ export class AgentSession {
 		let prepared: PreparedModelProfileActivation | undefined;
 		let applyStarted = false;
 		let applyCompleted = false;
+		let publication: { runtime: unknown; thinkingIntentRevision: number } | undefined;
+		const selectionIsBound = () => {
+			try {
+				assertBound();
+				return true;
+			} catch {
+				return false;
+			}
+		};
 		let ancestors = [observedAtRequest];
 		try {
 			await priorSelectionFence;
@@ -20881,33 +20895,26 @@ export class AgentSession {
 						if (this.#thinkingLevelMutationRevision !== expectedThinkingIntentRevision)
 							throw new Error("Thinking intent changed before profile publication");
 					},
-					isCurrent: () => {
-						try {
-							assertBound();
-							return true;
-						} catch {
-							return false;
-						}
+					isCurrent: selectionIsBound,
+					onRuntimePublished: () => {
+						publication = {
+							runtime: captureRuntime(),
+							thinkingIntentRevision: this.#thinkingLevelMutationRevision,
+						};
 					},
 				});
 				applyCompleted = true;
 				assertBound();
 				if (this.getActiveModelProfile() !== canonical || this.getActivatedModelProfile() !== canonical)
 					throw new Error("Profile activation did not publish the requested profile");
-				if (
-					!options?.persistDefault &&
-					!prepared.defaultModel &&
-					options?.thinkingLevelOverride !== undefined
-				) {
-					this.setThinkingLevel(options.thinkingLevelOverride);
-				}
+				if (!publication) throw new Error("Profile activation did not capture its runtime publication");
 				options?.onAfterActivation?.();
 				assertBound();
 				completion.resolve({
 					ancestors,
 					ownership: prepared.committedOwnership ?? observedOwnership,
-					runtime: captureRuntime(),
-					thinkingIntentRevision: this.#thinkingLevelMutationRevision,
+					runtime: publication.runtime,
+					thinkingIntentRevision: publication.thinkingIntentRevision,
 				});
 				return { changed: true, id: canonical };
 			}, undefined, undefined, {
@@ -20926,9 +20933,13 @@ export class AgentSession {
 			}
 			if (prepared && !prepared.committedOwnership && (!applyStarted || applyCompleted)) {
 				try {
-					await rollbackPreparedModelProfileActivation(prepared, { isCurrent: () => false });
+					// Preparation cleanup never owns live state. A completed session-only
+					// apply does, but only while its session/intent and published fields match.
+					await rollbackPreparedModelProfileActivation(prepared, {
+						isCurrent: applyCompleted ? selectionIsBound : () => false,
+					});
 				} catch (rollbackError) {
-					throw new AggregateError([error, rollbackError], "Profile activation and preparation cleanup both failed");
+					throw new AggregateError([error, rollbackError], "Profile activation and rollback both failed");
 				}
 			}
 			throw error;
@@ -21304,7 +21315,7 @@ export class AgentSession {
 		const previousEditMode = this.#resolveActiveEditMode();
 		// Reload preparation is read-only: probing live credentials here could
 		// refresh OAuth or wait on a concurrent user's credential selection.
-		// Durable profile activation alone requires that probe before its CAS.
+		// Activations probe before publication (and before the CAS for durable selections).
 		if (options?.validateCredentials) {
 			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 			signal?.throwIfAborted();

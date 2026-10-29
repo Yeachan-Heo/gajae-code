@@ -1,9 +1,10 @@
 import { describe, expect, it, test, vi } from "bun:test";
-import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 
 import type { Model } from "@gajae-code/ai";
 import { hookFetch, TempDir } from "@gajae-code/utils";
+import { z } from "zod";
 import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
@@ -35,6 +36,7 @@ import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import {
 	AgentSession,
+	type AgentSessionConfig,
 	type AgentSessionProfileInstalledOverrideState,
 	type DefaultFallbackRuntimeState,
 	type PreparedProfileModelSelection,
@@ -304,7 +306,10 @@ function rejectProfileRuntimePublication(settings: Settings, onReject?: () => vo
 	});
 }
 
-function controlProfileFixture(settings = Settings.isolated({ "compaction.enabled": false })) {
+function controlProfileFixture(
+	settings = Settings.isolated({ "compaction.enabled": false }),
+	options: Pick<AgentSessionConfig, "rebuildSystemPrompt"> & { tools?: AgentTool[] } = {},
+) {
 	const tempDir = TempDir.createSync("@gjc-profile-control-");
 	const manager = SessionManager.create(tempDir.path(), tempDir.path());
 	const base = fakeRegistry({
@@ -332,11 +337,14 @@ function controlProfileFixture(settings = Settings.isolated({ "compaction.enable
 	};
 	const initial = base.getAll().find(candidate => candidate.provider === "openai-codex" && candidate.id === "gpt-5.5");
 	if (!initial) throw new Error("Expected reasoning-capable fixture model");
+	const tools = options.tools ?? [];
 	const session = new AgentSession({
-		agent: new Agent({ initialState: { model: initial, systemPrompt: [], tools: [], messages: [] } }),
+		agent: new Agent({ initialState: { model: initial, systemPrompt: [], tools, messages: [] } }),
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry as unknown as ModelRegistry,
+		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+		rebuildSystemPrompt: options.rebuildSystemPrompt,
 	});
 	return {
 		session,
@@ -348,6 +356,21 @@ function controlProfileFixture(settings = Settings.isolated({ "compaction.enable
 			await settings.close();
 			tempDir.removeSync();
 		},
+	};
+}
+
+function captureControlProfileState(session: AgentSession, settings: Settings) {
+	return {
+		model: session.model,
+		thinking: session.thinkingLevel,
+		chain: session.getConfiguredModelChainState("default"),
+		fallback: session.getDefaultFallbackRuntimeState(),
+		resumeDefault: session.getSessionDefaultModelSelector(),
+		active: session.getActiveModelProfile(),
+		activated: session.getActivatedModelProfile(),
+		modelRoles: structuredClone(settings.getOverride("modelRoles")),
+		agentOverrides: structuredClone(settings.getOverride("task.agentModelOverrides")),
+		installed: session.getProfileInstalledOverrideState(),
 	};
 }
 
@@ -852,6 +875,500 @@ describe("model profile activation", () => {
 		});
 	}
 
+	for (const profileName of ["profile-a", "roles-only"] as const) {
+		test(`session-only ${profileName} callback failure restores the complete previous runtime publication`, async () => {
+			const fixture = controlProfileFixture();
+			const failure = new Error("after activation rejected");
+			try {
+				await fixture.session.setDefaultModelProfileForControl("roles-only");
+				fixture.session.setThinkingLevel(ThinkingLevel.Low);
+				fixture.session.setConfiguredModelChain(
+					"default",
+					["openai-codex/gpt-5.5:low", "provider-c/default"],
+					"model_selection",
+				);
+				fixture.session.seedDefaultFallbackResolution(1, []);
+				fixture.session.recordResumeDefaultModel("provider-c/default");
+				fixture.settings.override("modelRoles", { critic: "provider-c/architect" });
+				fixture.settings.override("task.agentModelOverrides", {
+					...fixture.settings.get("task.agentModelOverrides"),
+					planner: "provider-c/executor",
+				});
+				fixture.session.markProfileRoleOverrideManual("modelRoles", "critic");
+				fixture.session.markProfileRoleOverrideManual("task.agentModelOverrides", "planner");
+				const previous = captureControlProfileState(fixture.session, fixture.settings);
+				const owner = readDurableModelProfileOwnership(fixture.settings);
+				const afterActivation = vi.fn(() => {
+					expect(fixture.session.getActiveModelProfile()).toBe(profileName);
+					expect(fixture.session.getActivatedModelProfile()).toBe(profileName);
+					expect(fixture.session.getConfiguredModelChainState("default")).toMatchObject({
+						origin: "profile-activation",
+						identity: profileName,
+					});
+					if (profileName === "profile-a") {
+						expect(fixture.session.model).toMatchObject({ provider: "provider-a", id: "default" });
+						expect(fixture.session.getSessionDefaultModelSelector()).toBe("provider-a/default");
+					} else {
+						expect(fixture.session.model).toBe(previous.model);
+						expect(fixture.session.thinkingLevel).toBe(ThinkingLevel.High);
+						expect(fixture.session.getSessionDefaultModelSelector()).toBe(previous.resumeDefault);
+					}
+					throw failure;
+				});
+				await expect(
+					fixture.session.setDefaultModelProfileForControl(profileName, {
+						thinkingLevelOverride: ThinkingLevel.High,
+						onAfterActivation: afterActivation,
+					}),
+				).rejects.toBe(failure);
+				expect(afterActivation).toHaveBeenCalledTimes(1);
+				expect(fixture.session.model).toBe(previous.model);
+				expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(previous);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(owner);
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+			} finally {
+				await fixture.dispose();
+			}
+		});
+
+		test(`session-only ${profileName} callback rollback preserves a newer same-value thinking intent`, async () => {
+			const fixture = controlProfileFixture();
+			const failure = new Error("callback rejected after thinking choice");
+			try {
+				fixture.session.setThinkingLevel(ThinkingLevel.Low);
+				fixture.session.setConfiguredModelChain("default", ["openai-codex/gpt-5.5:low"], "model_selection");
+				fixture.session.recordResumeDefaultModel("provider-c/default");
+				const previous = captureControlProfileState(fixture.session, fixture.settings);
+				const newerThinking = profileName === "profile-a" ? undefined : ThinkingLevel.High;
+				await expect(
+					fixture.session.setDefaultModelProfileForControl(profileName, {
+						thinkingLevelOverride: ThinkingLevel.High,
+						onAfterActivation: () => {
+							expect(fixture.session.thinkingLevel).toBe(newerThinking);
+							fixture.session.setThinkingLevel(newerThinking);
+							fixture.settings.set("modelRoles", { critic: "provider-c/architect" });
+							throw failure;
+						},
+					}),
+				).rejects.toBe(failure);
+				expect(fixture.session.model).toBe(previous.model);
+				expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual({
+					...previous,
+					thinking: newerThinking,
+				});
+				expect(fixture.settings.getGlobal("modelRoles")).toEqual({ critic: "provider-c/architect" });
+				expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+					version: 0,
+					marker: { kind: "inherit" },
+				});
+			} finally {
+				await fixture.dispose();
+			}
+		});
+
+		test(`committed ${profileName} callback failure never compensates durable or runtime ownership`, async () => {
+			const fixture = controlProfileFixture();
+			const failure = new Error("committed callback rejected");
+			const restore = vi.spyOn(fixture.session, "restoreModelSelectionForRollback");
+			try {
+				await expect(
+					fixture.session.setDefaultModelProfileForControl(profileName, {
+						persistDefault: true,
+						thinkingLevelOverride: ThinkingLevel.High,
+						onAfterActivation: () => {
+							throw failure;
+						},
+					}),
+				).rejects.toMatchObject({
+					code: "model_profile_apply_committed",
+					committedVersion: 1,
+					cause: failure,
+				});
+				expect(restore).not.toHaveBeenCalled();
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBe(profileName);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+					version: 1,
+					marker: { kind: "profile", profile: profileName },
+				});
+				expect(fixture.session.getActiveModelProfile()).toBe(profileName);
+				expect(fixture.session.getActivatedModelProfile()).toBe(profileName);
+				expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+				await fixture.session.awaitDisposeCompletion();
+			} finally {
+				restore.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const persistDefault of [false, true]) {
+		for (const firstProfile of ["profile-a", "roles-only"] as const) {
+			for (const interveningIntent of ["none", "thinking", "global roles"] as const) {
+				test(`queued B after held ${persistDefault ? "persistent" : "session-only"} ${firstProfile} finish ${interveningIntent === "none" ? "accepts owned succession" : `rejects newer ${interveningIntent}`}`, async () => {
+					const fixture = controlProfileFixture();
+					const entered = Promise.withResolvers<void>();
+					const release = Promise.withResolvers<void>();
+					const sync = fixture.session.syncEagerDelegation.bind(fixture.session);
+					const finish = vi.spyOn(fixture.session, "syncEagerDelegation").mockImplementationOnce(async () => {
+						entered.resolve();
+						await release.promise;
+						await sync();
+					});
+					const beforeSecond = vi.fn();
+					let first: Promise<unknown> | undefined;
+					let second: Promise<unknown> | undefined;
+					try {
+						fixture.session.setThinkingLevel(ThinkingLevel.Low);
+						first = fixture.session.setDefaultModelProfileForControl(firstProfile, {
+							persistDefault,
+							thinkingLevelOverride: ThinkingLevel.High,
+						});
+						void first.catch(() => undefined);
+						// Both requests observe the same pre-publication durable owner.
+						second = fixture.session.setDefaultModelProfileForControl("profile-b", {
+							persistDefault: true,
+							onBeforeActivation: beforeSecond,
+						});
+						void second.catch(() => undefined);
+						await Promise.race([
+							entered.promise,
+							first.then(() => {
+								throw new Error("Profile activation completed without reaching finish");
+							}),
+						]);
+						expect(fixture.session.getActiveModelProfile()).toBe(firstProfile);
+						expect(fixture.session.getActivatedModelProfile()).toBe(firstProfile);
+						expect(fixture.session.thinkingLevel).toBe(
+							firstProfile === "profile-a" ? undefined : ThinkingLevel.High,
+						);
+						expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+							version: persistDefault ? 1 : 0,
+							marker: persistDefault ? { kind: "profile", profile: firstProfile } : { kind: "inherit" },
+						});
+						if (interveningIntent === "thinking") {
+							// DEFAULT is non-reasoning, so this is deliberately same-value intent;
+							// role-only keeps the reasoning model and changes the effective level.
+							fixture.session.setThinkingLevel(
+								firstProfile === "profile-a" ? undefined : ThinkingLevel.Medium,
+							);
+						}
+						if (interveningIntent === "global roles") {
+							await fixture.settings.commitAtomicBatch([
+								{ path: "modelRoles", op: "set", value: { critic: "provider-c/architect" } },
+							]);
+						}
+						const owned = readDurableModelProfileOwnership(fixture.settings);
+						const newerRuntime = captureControlProfileState(fixture.session, fixture.settings);
+						const thinkingRevision = fixture.session.getThinkingLevelMutationRevision();
+						release.resolve();
+						await expect(first).resolves.toEqual({ changed: true, id: firstProfile });
+						if (interveningIntent === "none") {
+							await expect(second).resolves.toEqual({ changed: true, id: "profile-b" });
+							expect(beforeSecond).toHaveBeenCalledTimes(1);
+							expect(fixture.session.model).toMatchObject({ provider: "provider-c", id: "default" });
+							expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+								version: persistDefault ? 2 : 1,
+								marker: { kind: "profile", profile: "profile-b" },
+							});
+						} else {
+							await expect(second).rejects.toThrow("intent changed while selecting profile");
+							expect(beforeSecond).not.toHaveBeenCalled();
+							expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(newerRuntime);
+							expect(fixture.session.getThinkingLevelMutationRevision()).toBe(thinkingRevision);
+							expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(owned);
+							expect(fixture.settings.getGlobal("modelProfile.default")).toBe(
+								persistDefault ? firstProfile : undefined,
+							);
+							if (interveningIntent === "global roles")
+								expect(fixture.settings.getGlobal("modelRoles")).toEqual({ critic: "provider-c/architect" });
+						}
+						expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+					} finally {
+						release.resolve();
+						await Promise.allSettled([first, second]);
+						finish.mockRestore();
+						await fixture.dispose();
+					}
+				});
+			}
+		}
+	}
+
+	for (const interveningIntent of ["none", "thinking", "global roles"] as const) {
+		test(`queued B before session-only DEFAULT publication with held edit refresh ${interveningIntent === "none" ? "accepts owned succession" : `rejects newer ${interveningIntent}`}`, async () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let held = false;
+			const editTool: AgentTool = {
+				name: "edit",
+				label: "Edit",
+				description: "Edit files",
+				parameters: z.object({}),
+				execute: async () => ({ content: [] }),
+			};
+			const fixture = controlProfileFixture(undefined, {
+				tools: [editTool],
+				rebuildSystemPrompt: async () => {
+					if (!held) {
+						held = true;
+						entered.resolve();
+						await release.promise;
+					}
+					return { systemPrompt: ["Refreshed edit prompt"] };
+				},
+			});
+			const beforeSecond = vi.fn();
+			let first: Promise<unknown> | undefined;
+			let second: Promise<unknown> | undefined;
+			try {
+				fixture.session.setThinkingLevel(ThinkingLevel.Low);
+				const before = captureControlProfileState(fixture.session, fixture.settings);
+				expect(fixture.session.getActiveToolNames()).toContain("edit");
+				first = fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: false });
+				void first.catch(() => undefined);
+				second = fixture.session.setDefaultModelProfileForControl("profile-b", {
+					persistDefault: true,
+					onBeforeActivation: beforeSecond,
+				});
+				void second.catch(() => undefined);
+				// B is admitted against the same owner/runtime, before A can publish.
+				expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(before);
+				await Promise.race([
+					entered.promise,
+					first.then(() => {
+						throw new Error("Profile activation completed without reaching edit refresh");
+					}),
+				]);
+				expect(fixture.session.model).toMatchObject({ provider: "provider-a", id: "default" });
+				expect(fixture.session.getActiveModelProfile()).toBe("profile-a");
+				expect(fixture.session.getActivatedModelProfile()).toBe("profile-a");
+				expect(fixture.session.thinkingLevel).toBeUndefined();
+				expect(fixture.settings.getOverride("task.agentModelOverrides")?.executor).toBe("provider-b/executor");
+				expect(fixture.session.getSessionDefaultModelSelector()).toBe("provider-a/default");
+				expect(beforeSecond).not.toHaveBeenCalled();
+				if (interveningIntent === "thinking") fixture.session.setThinkingLevel(undefined);
+				if (interveningIntent === "global roles") {
+					await fixture.settings.commitAtomicBatch([
+						{ path: "modelRoles", op: "set", value: { critic: "provider-c/architect" } },
+					]);
+				}
+				const newerRuntime = captureControlProfileState(fixture.session, fixture.settings);
+				const thinkingRevision = fixture.session.getThinkingLevelMutationRevision();
+				const ownership = readDurableModelProfileOwnership(fixture.settings);
+				release.resolve();
+				await expect(first).resolves.toEqual({ changed: true, id: "profile-a" });
+				if (interveningIntent === "none") {
+					await expect(second).resolves.toEqual({ changed: true, id: "profile-b" });
+					expect(beforeSecond).toHaveBeenCalledTimes(1);
+					expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+						version: 1,
+						marker: { kind: "profile", profile: "profile-b" },
+					});
+				} else {
+					await expect(second).rejects.toThrow("intent changed while selecting profile");
+					expect(beforeSecond).not.toHaveBeenCalled();
+					expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(newerRuntime);
+					expect(fixture.session.getThinkingLevelMutationRevision()).toBe(thinkingRevision);
+					expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(ownership);
+					expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+					if (interveningIntent === "global roles")
+						expect(fixture.settings.getGlobal("modelRoles")).toEqual({ critic: "provider-c/architect" });
+				}
+				expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([first, second]);
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const newerIntent of ["thinking", "model"] as const) {
+		test(`guarded session-only preparation rejection cancels after newer ${newerIntent} intent`, async () => {
+			const fixture = controlProfileFixture();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const probe = vi.spyOn(fixture.registry, "getApiKey").mockImplementationOnce(async () => {
+				entered.resolve();
+				await release.promise;
+				return kNoAuth;
+			});
+			const publish = vi.spyOn(fixture.session, "commitPreparedProfileModelSelection");
+			let activation: Promise<void> | undefined;
+			try {
+				fixture.session.setThinkingLevel(ThinkingLevel.Low);
+				const revision = fixture.session.getUserModelSelectionRevision();
+				activation = activateModelProfile(
+					{
+						session: fixture.session,
+						modelRegistry: fixture.registry,
+						settings: fixture.settings,
+						profileName: "profile-a",
+					},
+					{ isCurrent: () => fixture.session.getUserModelSelectionRevision() === revision },
+				);
+				void activation.catch(() => undefined);
+				await Promise.race([
+					entered.promise,
+					activation.then(() => {
+						throw new Error("Profile activation completed without reaching credential preparation");
+					}),
+				]);
+				if (newerIntent === "thinking") {
+					fixture.session.setThinkingLevel(ThinkingLevel.High);
+					fixture.session.markUserModelSelection();
+				} else {
+					const nextModel = fixture.registry.getAll().find(candidate => candidate.provider === "provider-c");
+					if (!nextModel) throw new Error("Expected a newer model selection fixture");
+					await fixture.session.setModelTemporary(nextModel, undefined, { cause: "user-selection" });
+				}
+				const newer = captureControlProfileState(fixture.session, fixture.settings);
+				const thinkingRevision = fixture.session.getThinkingLevelMutationRevision();
+				const ownership = readDurableModelProfileOwnership(fixture.settings);
+				release.resolve();
+				await expect(activation).resolves.toBeUndefined();
+				expect(publish).not.toHaveBeenCalled();
+				expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(newer);
+				expect(fixture.session.getThinkingLevelMutationRevision()).toBe(thinkingRevision);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(ownership);
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([activation]);
+				probe.mockRestore();
+				publish.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const failureKind of ["current thinking drift", "current credential failure", "explicit abort"] as const) {
+		test(`guarded session-only preparation preserves rejection for ${failureKind}`, async () => {
+			const fixture = controlProfileFixture();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const failure = new Error(failureKind);
+			const controller = new AbortController();
+			const probe = vi.spyOn(fixture.registry, "getApiKey").mockImplementationOnce(async () => {
+				entered.resolve();
+				await release.promise;
+				if (failureKind === "current credential failure") throw failure;
+				return kNoAuth;
+			});
+			const publish = vi.spyOn(fixture.session, "commitPreparedProfileModelSelection");
+			let activation: Promise<void> | undefined;
+			try {
+				fixture.session.setThinkingLevel(ThinkingLevel.Low);
+				const revision = fixture.session.getUserModelSelectionRevision();
+				activation = activateModelProfile(
+					{
+						session: fixture.session,
+						modelRegistry: fixture.registry,
+						settings: fixture.settings,
+						profileName: "profile-a",
+					},
+					{
+						isCurrent: () => fixture.session.getUserModelSelectionRevision() === revision,
+						signal: controller.signal,
+					},
+				);
+				void activation.catch(() => undefined);
+				await Promise.race([
+					entered.promise,
+					activation.then(() => {
+						throw new Error("Profile activation completed without reaching credential preparation");
+					}),
+				]);
+				if (failureKind !== "current credential failure") fixture.session.setThinkingLevel(ThinkingLevel.High);
+				if (failureKind === "explicit abort") {
+					fixture.session.markUserModelSelection();
+					controller.abort(failure);
+				}
+				const beforeRelease = captureControlProfileState(fixture.session, fixture.settings);
+				const thinkingRevision = fixture.session.getThinkingLevelMutationRevision();
+				const ownership = readDurableModelProfileOwnership(fixture.settings);
+				release.resolve();
+				if (failureKind === "current thinking drift") {
+					await expect(activation).rejects.toThrow("Session changed while preparing profile model selection");
+				} else {
+					await expect(activation).rejects.toBe(failure);
+				}
+				expect(publish).not.toHaveBeenCalled();
+				expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(beforeRelease);
+				expect(fixture.session.getThinkingLevelMutationRevision()).toBe(thinkingRevision);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(ownership);
+				expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([activation]);
+				probe.mockRestore();
+				publish.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	test("session-only DEFAULT edit refresh rejection restores its complete runtime publication", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const failure = new Error("edit prompt refresh failed");
+		let rejected = false;
+		const editTool: AgentTool = {
+			name: "edit",
+			label: "Edit",
+			description: "Edit files",
+			parameters: z.object({}),
+			execute: async () => ({ content: [] }),
+		};
+		const fixture = controlProfileFixture(undefined, {
+			tools: [editTool],
+			rebuildSystemPrompt: async () => {
+				if (!rejected) {
+					rejected = true;
+					entered.resolve();
+					await release.promise;
+					throw failure;
+				}
+				return { systemPrompt: ["Restored edit prompt"] };
+			},
+		});
+		let activation: Promise<unknown> | undefined;
+		try {
+			fixture.session.setThinkingLevel(ThinkingLevel.Low);
+			fixture.session.setConfiguredModelChain("default", ["openai-codex/gpt-5.5:low"], "model_selection");
+			fixture.session.recordResumeDefaultModel("openai-codex/gpt-5.5");
+			const before = captureControlProfileState(fixture.session, fixture.settings);
+			const ownership = readDurableModelProfileOwnership(fixture.settings);
+			const after = vi.fn();
+			activation = fixture.session.setDefaultModelProfileForControl("profile-a", {
+				persistDefault: false,
+				onAfterActivation: after,
+			});
+			void activation.catch(() => undefined);
+			await Promise.race([
+				entered.promise,
+				activation.then(() => {
+					throw new Error("Profile activation completed without reaching edit refresh");
+				}),
+			]);
+			expect(fixture.session.getActiveModelProfile()).toBe("profile-a");
+			expect(fixture.session.thinkingLevel).toBeUndefined();
+			release.resolve();
+			await expect(activation).rejects.toBe(failure);
+			expect(after).not.toHaveBeenCalled();
+			expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(before);
+			expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(ownership);
+			expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+			expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([activation]);
+			await fixture.dispose();
+		}
+	});
+
 	test("role-only persistent activation applies its thinking override without inventing a DEFAULT or resume selection", async () => {
 		const fixture = controlProfileFixture();
 		const priorModel = fixture.session.model;
@@ -1154,13 +1671,7 @@ describe("model profile activation", () => {
 			getUserModelSelectionRevision: () => selectionRevision,
 			getDefaultFallbackRuntimeState: () => fallbackState,
 			restoreDefaultFallbackRuntimeState: restoreFallback,
-			setModelTemporary: async (
-				_next: Model,
-				_thinkingLevel: ThinkingLevel | undefined,
-				options?: { shouldMutate?: () => boolean; onMutationStarted?: () => void },
-			) => {
-				if (options?.shouldMutate && !options.shouldMutate()) return;
-				options?.onMutationStarted?.();
+			commitPreparedProfileModelSelection: () => {
 				throw new Error("profile model selection failed");
 			},
 			restoreModelSelectionForRollback: async (
@@ -1284,18 +1795,15 @@ describe("model profile activation", () => {
 	});
 
 	test("preserves a newer fallback chain selected during profile model activation", async () => {
-		const session = fakeSession();
-		const registry = fakeRegistry();
 		const modelMutationStarted = Promise.withResolvers<void>();
 		const allowModelMutation = Promise.withResolvers<void>();
-		session.setModelTemporary = async (next, thinkingLevel, options) => {
-			modelMutationStarted.resolve();
-			await allowModelMutation.promise;
-			options?.onMutationStarted?.();
-			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
-			session.model = next;
-			session.thinkingLevel = thinkingLevel;
-		};
+		const session = Object.assign(fakeSession(), {
+			finishPreparedProfileModelSelection: async () => {
+				modelMutationStarted.resolve();
+				await allowModelMutation.promise;
+			},
+		});
+		const registry = fakeRegistry();
 		const activation = activateModelProfile({
 			session,
 			modelRegistry: registry as never,
@@ -1303,30 +1811,41 @@ describe("model profile activation", () => {
 			profileName: "profile-a",
 		});
 
-		await modelMutationStarted.promise;
-		session.setConfiguredModelChain("default", ["provider-c/default"], "model-selection", "user-selection", true);
-		allowModelMutation.resolve();
-		await activation;
+		try {
+			await Promise.race([
+				modelMutationStarted.promise,
+				activation.then(() => {
+					throw new Error("Profile activation completed without reaching model finish");
+				}),
+			]);
+			session.setConfiguredModelChain("default", ["provider-c/default"], "model-selection", "user-selection", true);
+			allowModelMutation.resolve();
+			await activation;
 
-		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
-		expect(session.getConfiguredModelChainState("default")).toMatchObject({
-			origin: "model-selection",
-			identity: "user-selection",
-			explicitHead: true,
-		});
+			expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+			expect(session.getConfiguredModelChainState("default")).toMatchObject({
+				origin: "model-selection",
+				identity: "user-selection",
+				explicitHead: true,
+			});
+		} finally {
+			allowModelMutation.resolve();
+			await Promise.allSettled([activation]);
+		}
 	});
 
-	test("rolls back a staged fallback chain when the guarded model mutation is skipped", async () => {
+	test("leaves a newer fallback chain untouched when guarded profile preparation is superseded", async () => {
 		const session = fakeSession();
 		const registry = fakeRegistry();
 		const modelMutationStarted = Promise.withResolvers<void>();
 		const allowModelMutation = Promise.withResolvers<void>();
-		const originalSetModelTemporary = session.setModelTemporary.bind(session);
-		session.setModelTemporary = async (next, thinkingLevel, options) => {
+		const prepareSelection = session.prepareModelSelectionForProfileActivation.bind(session);
+		session.prepareModelSelectionForProfileActivation = async (next, thinkingLevel, signal) => {
 			modelMutationStarted.resolve();
 			await allowModelMutation.promise;
-			await originalSetModelTemporary(next, thinkingLevel, options);
+			return prepareSelection(next, thinkingLevel, signal);
 		};
+		const commitSelection = vi.spyOn(session, "commitPreparedProfileModelSelection");
 		let selectionIsCurrent = true;
 		const activation = activateModelProfile(
 			{
@@ -1338,16 +1857,28 @@ describe("model profile activation", () => {
 			{ isCurrent: () => selectionIsCurrent },
 		);
 
-		await modelMutationStarted.promise;
-		selectionIsCurrent = false;
-		session.setConfiguredModelChain("default", ["provider-c/selected"], "model-selection", "user-selection", true);
-		allowModelMutation.resolve();
-		await activation;
+		try {
+			await Promise.race([
+				modelMutationStarted.promise,
+				activation.then(() => {
+					throw new Error("Profile activation completed without reaching model preparation");
+				}),
+			]);
+			selectionIsCurrent = false;
+			session.setConfiguredModelChain("default", ["provider-c/selected"], "model-selection", "user-selection", true);
+			allowModelMutation.resolve();
+			await activation;
 
-		expect(session.setModelTemporaryCalls).toEqual([]);
-		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/selected"]);
-		expect(session.getConfiguredModelChainState("default")).toMatchObject({ origin: "model-selection" });
-		expect(session.getActiveModelProfile()).toBeUndefined();
+			expect(commitSelection).not.toHaveBeenCalled();
+			expect(session.setModelTemporaryCalls).toEqual([]);
+			expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/selected"]);
+			expect(session.getConfiguredModelChainState("default")).toMatchObject({ origin: "model-selection" });
+			expect(session.getActiveModelProfile()).toBeUndefined();
+		} finally {
+			allowModelMutation.resolve();
+			await Promise.allSettled([activation]);
+			commitSelection.mockRestore();
+		}
 	});
 
 	test("cancels recovered runtime bindings when selection changes during preparation", async () => {
@@ -3271,9 +3802,15 @@ describe("model profile activation", () => {
 			return originalSet(path, value);
 		}) as typeof settings.set;
 
-		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+		const commitSelection = vi.spyOn(session, "commitPreparedProfileModelSelection");
+		try {
+			await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+			expect(commitSelection).toHaveBeenCalledTimes(1);
+		} finally {
+			commitSelection.mockRestore();
+		}
 
-		expect(session.setModelTemporaryCalls).toHaveLength(1);
+		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.model?.id).toBe("default");
 		expect(settings.get("modelRoles")).toEqual({});
 		expect(settings.get("task.agentModelOverrides")).toEqual({
