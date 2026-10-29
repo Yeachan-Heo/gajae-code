@@ -223,6 +223,12 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
+	// A failed turn is published on the session itself; the request that carried it
+	// reports the same string. Render it once instead of twice.
+	const scopeError = (scope: string) => {
+		const message = errors[scope];
+		return message && message !== session?.error ? message : "";
+	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal;
 	const modelGeneration = session?.controlGeneration ?? null;
@@ -1281,7 +1287,9 @@ export default function App() {
 								// Palette dispatch closes its dialog first, so its failures and queue
 								// notices need this surface; while a dialog is open it renders there.
 								...(dialog ? [] : [`command:${selected}`]),
-							].map(scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>)}
+							].map(scope =>
+								scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
+							)}
 							{!dialog && notice && <p className="notice">{notice}</p>}
 						</div>
 						{session.queued && session.queued.length > 0 && (
@@ -1435,8 +1443,8 @@ export default function App() {
 					}
 					onClose={closeDialog}
 				>
-					{[settingsScope, authScope, toolsScope, "goal", selected].map(
-						scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>,
+					{[settingsScope, authScope, toolsScope, "goal", selected].map(scope =>
+						scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 					)}
 					{notice && <p role="status">{notice}</p>}
 					{dialog === "session-actions" && (
