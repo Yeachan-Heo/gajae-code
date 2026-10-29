@@ -35,7 +35,7 @@ export const TtyWriter = nativeBindings.TtyWriter;
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_19_1 = nativeBindings.__piNativesV0_19_1;
+export const __piNativesV0_19_2 = nativeBindings.__piNativesV0_19_2;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -103,6 +103,7 @@ export const probeWindowsJobMemory = nativeBindings.probeWindowsJobMemory;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
 export const rasterizeSvg = nativeBindings.rasterizeSvg;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
+export const readOwnerOnlyFile = nativeBindings.readOwnerOnlyFile;
 export const reassertRawTty = nativeBindings.reassertRawTty;
 export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoReplacePath;
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;

@@ -8,6 +8,7 @@ import {
 	type SdkSearchRowV1,
 	scopeRequestV1,
 	searchRowV1,
+	sessionOwnershipV1,
 } from "../broker/session-scope";
 import type { SessionBindingAuthority } from "../session-authority";
 import {
@@ -246,6 +247,8 @@ export interface SessionLifecycleListEntry {
 	readonly terminalUncertain?: boolean;
 	readonly cwd?: string;
 	readonly locator?: { readonly cwd: string; readonly worktreeRoot: string | null; readonly stateRoot: string };
+	readonly role?: "master";
+	readonly spawnedBy?: { readonly masterSessionId: string };
 }
 
 export interface SessionLifecycleListResult {
@@ -803,7 +806,9 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 			terminalUncertain?: boolean;
 			cwd?: string;
 			locator?: { cwd: string; worktreeRoot: string | null; stateRoot: string };
-		} = { sessionId: entry.sessionId, ...sessionEndpointProjection(entry) };
+			role?: "master";
+			spawnedBy?: { masterSessionId: string };
+		} = { sessionId: entry.sessionId, ...sessionEndpointProjection(entry), ...sessionOwnershipV1(entry) };
 		if (typeof entry.live === "boolean") item.live = entry.live;
 		if (typeof entry.terminalUncertain === "boolean") item.terminalUncertain = entry.terminalUncertain;
 		if (isRecord(entry.locator) && typeof entry.locator.cwd === "string") item.cwd = entry.locator.cwd;
@@ -864,6 +869,8 @@ function scopedSearchRows(sessions: readonly SessionLifecycleListEntry[]): SdkSe
 				sessionId: session.sessionId,
 				locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
 				live: session.live === true,
+				...(session.role === undefined ? {} : { role: session.role }),
+				...(session.spawnedBy === undefined ? {} : { spawnedBy: session.spawnedBy }),
 			}),
 		);
 	}

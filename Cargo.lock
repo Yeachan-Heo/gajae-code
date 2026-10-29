@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "gjc-sdk"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "futures-util",
  "hmac",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -3074,11 +3074,11 @@ dependencies = [
 
 [[package]]
 name = "pi-diff"
-version = "0.19.1"
+version = "0.19.2"
 
 [[package]]
 name = "pi-edit"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "pi-vfs"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "globset",
  "ignore",

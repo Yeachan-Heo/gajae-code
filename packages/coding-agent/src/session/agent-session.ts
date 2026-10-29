@@ -436,7 +436,9 @@ import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
 import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
 import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
+import type { SourceMeta } from "../capability/types";
 import { type ExactMcpServerControlResult, MCPManager, type PreparedExactMcpCatalog } from "../runtime-mcp/manager";
+import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	omitPluginMcpNameShadows,
 	retainPluginMcpMandatoryNames,
@@ -1145,6 +1147,8 @@ export interface AgentSessionConfig {
 	 * process-global manager **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedMcpManager?: MCPManager;
+	/** Session-local MCP control authority granted only to root interactive sessions. */
+	sessionMcpControls?: SessionMcpControlPort;
 	/** Optional startup dependency that must settle before the first provider turn. */
 	startupTurnBarrier?: Promise<void>;
 	/** Optional fork-context seed used to initialize a child session before its first prompt. */
@@ -2787,6 +2791,60 @@ export interface ExactMcpStatusSnapshot {
 
 export type ExactMcpControlAction = "suspend" | "resume" | "reconnect";
 
+export type SessionMcpScope = "global" | "project";
+export type SessionMcpServerState = "connected" | "connecting" | "disconnected" | "disabled" | "failed";
+export type SessionMcpDisabledReason = "enabled-false" | "disabled-servers" | "project-stdio-unapproved";
+export interface SessionMcpDeclaredServer {
+	readonly name: string;
+	readonly scope: SessionMcpScope;
+	readonly autoload: boolean;
+	readonly disabled?: SessionMcpDisabledReason;
+	readonly config?: MCPServerConfig;
+	readonly source?: SourceMeta;
+}
+export type SessionMcpControlAction = "connect" | "disconnect" | "reconnect";
+export type SessionMcpControlStatus =
+	| "connected"
+	| "disconnected"
+	| "reconnected"
+	| "already-connected"
+	| "still-connecting"
+	| "not-connected"
+	| "unknown-server"
+	| "undeclared"
+	| "disabled"
+	| "failed"
+	| "unavailable";
+export interface SessionMcpControlResult {
+	readonly action: SessionMcpControlAction;
+	readonly name: string;
+	readonly status: SessionMcpControlStatus;
+	readonly toolCount: number;
+	readonly disabledReason?: SessionMcpDisabledReason;
+	readonly unavailableReason?: "shared-pool";
+}
+export interface SessionMcpControlPort {
+	listDeclaredServers(): Promise<SessionMcpDeclaredServer[]>;
+	isSettled(): boolean;
+	getFailedServers(): ReadonlySet<string>;
+	markFailed(name: string): void;
+	clearFailed(name: string): void;
+	restoreAutoload(names: readonly string[]): void;
+}
+export interface SessionMcpStatusSnapshot {
+	readonly available: boolean;
+	readonly servers: readonly (SessionMcpDeclaredServer & {
+		readonly declared: boolean;
+		readonly state: SessionMcpServerState;
+		readonly toolCount: number;
+	})[];
+}
+export interface SessionMcpCompletionCandidates {
+	readonly connectable: readonly (SessionMcpDeclaredServer & { state: SessionMcpServerState })[];
+	readonly connected: readonly (SessionMcpDeclaredServer & { state: SessionMcpServerState })[];
+	readonly reconnectable: readonly (SessionMcpDeclaredServer & { state: SessionMcpServerState })[];
+}
+
 export interface ExactMcpControlResult extends ExactMcpServerControlResult {
 	readonly action: ExactMcpControlAction;
 }
@@ -4163,6 +4221,8 @@ export class AgentSession {
 	#ownedMcpManager: MCPManager | undefined;
 	#mcpManagerReplacement: Promise<void> = Promise.resolve();
 	#exactMcpRetirementCompletion: Promise<void> | undefined;
+	readonly #sessionMcpControlPort: SessionMcpControlPort | undefined;
+	#sessionMcpOverrides = new Map<string, "connected" | "disconnected">();
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
@@ -6054,6 +6114,7 @@ export class AgentSession {
 		this.#disposeAsyncJobManager = config.disposeAsyncJobManager ?? true;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
+		this.#sessionMcpControlPort = config.sessionMcpControls;
 		this.#setStartupTurnBarrier(config.startupTurnBarrier);
 		// Only arm the recovery barrier when a rescope journal is actually pending. Arming it
 		// unconditionally flips #startupTurnBarrier from absent to a (resolved) promise for
@@ -6766,6 +6827,7 @@ export class AgentSession {
 				revokeExactMcpControls(this);
 				this.#exactMcpSuspendedTools.clear();
 			}
+			this.#sessionMcpOverrides.clear();
 			this.#ownedMcpManager = next;
 			if (next && MCPManager.instance() === undefined) MCPManager.setInstance(next);
 		})();
@@ -12359,8 +12421,17 @@ export class AgentSession {
 		sessionId: string,
 		body: () => Promise<T>,
 	): Promise<T | undefined> {
+		return this.#withMcpControlAdmission(() => getExactMcpControls(this) === controls, sessionId, body);
+	}
+
+	/** Shared admission for exact-config and conventional session MCP controls. */
+	async #withMcpControlAdmission<T>(
+		holdsCapability: () => boolean,
+		sessionId: string,
+		body: () => Promise<T>,
+	): Promise<T | undefined> {
 		const isCurrent = () =>
-			!this.#isDisposed && getExactMcpControls(this) === controls && this.sessionManager.getSessionId() === sessionId;
+			!this.#isDisposed && holdsCapability() && this.sessionManager.getSessionId() === sessionId;
 		let entered = false;
 		try {
 			return await this.#withSessionAdmission("mcp-control", async () => {
@@ -12452,6 +12523,234 @@ export class AgentSession {
 
 	get hasExactMcpControls(): boolean {
 		return getExactMcpControls(this) !== undefined;
+	}
+
+	get hasSessionMcpControls(): boolean {
+		return this.#sessionMcpControlPort !== undefined && !this.hasExactMcpControls;
+	}
+
+	#sessionMcpManager(): MCPManager | undefined {
+		const manager = this.#ownedMcpManager;
+		if (!manager || manager.isToolsOnly() || manager.isConnectionSetMutationBlocked()) return undefined;
+		return manager;
+	}
+
+	#buildSessionMcpStatus(declared: readonly SessionMcpDeclaredServer[]): SessionMcpStatusSnapshot {
+		const manager = this.#sessionMcpManager();
+		const byName = new Map(declared.map(server => [server.name, server]));
+		if (!manager) return { available: false, servers: [] };
+		const tools = manager.getTools();
+		for (const name of manager.getAllServerNames()) {
+			const count = tools.filter(tool => tool.mcpServerName === name).length;
+			if (!byName.has(name) && (manager.getConnectionStatus(name) !== "disconnected" || count > 0)) {
+				const source = manager.getSource(name);
+				byName.set(name, { name, scope: source?.level === "project" ? "project" : "global", autoload: false });
+			}
+		}
+		const failed = this.#sessionMcpControlPort?.getFailedServers() ?? new Set<string>();
+		return {
+			available: true,
+			servers: [...byName.values()]
+				.map(server => {
+					const live = manager.getConnectionStatus(server.name);
+					const toolCount = tools.filter(tool => tool.mcpServerName === server.name).length;
+					const state: SessionMcpServerState = server.disabled
+						? "disabled"
+						: live === "connected" || live === "connecting"
+							? live
+							: failed.has(server.name)
+								? "failed"
+								: "disconnected";
+					return { ...server, declared: declared.some(item => item.name === server.name), state, toolCount };
+				})
+				.sort((a, b) => a.name.localeCompare(b.name)),
+		};
+	}
+
+	async getSessionMcpStatusSnapshot(): Promise<SessionMcpStatusSnapshot | undefined> {
+		const port = this.#sessionMcpControlPort;
+		if (!port || !this.hasSessionMcpControls) return undefined;
+		try {
+			return this.#buildSessionMcpStatus(await port.listDeclaredServers());
+		} catch {
+			return { available: false, servers: [] };
+		}
+	}
+
+	async getSessionMcpCompletionCandidates(): Promise<SessionMcpCompletionCandidates> {
+		const snapshot = await this.getSessionMcpStatusSnapshot();
+		const servers = snapshot?.servers ?? [];
+		return {
+			connectable: servers.filter(
+				server =>
+					server.declared && !server.disabled && (server.state === "disconnected" || server.state === "failed"),
+			),
+			connected: servers.filter(
+				server => server.state === "connected" || server.state === "connecting" || server.toolCount > 0,
+			),
+			reconnectable: servers.filter(
+				server =>
+					server.declared &&
+					!server.disabled &&
+					(server.state === "connected" || (server.state === "failed" && server.toolCount > 0)),
+			),
+		};
+	}
+
+	#assertSessionMcpControlIdle(): void {
+		const port = this.#sessionMcpControlPort;
+		if (
+			this.isStreaming ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
+			this.#handoffTransitionActive ||
+			this.#cancelAndSubmitInProgress ||
+			this.#activeSessionAdmission ||
+			this.#sessionAdmissionQueue.length > 0 ||
+			this.#sessionTransitionKind !== undefined ||
+			!port?.isSettled()
+		)
+			throw Object.assign(new AgentBusyError("MCP control is unavailable while this session is busy."), {
+				code: "busy",
+			});
+	}
+
+	async controlSessionMcpServer(
+		action: SessionMcpControlAction,
+		name: string,
+	): Promise<SessionMcpControlResult | undefined> {
+		if (!this.hasSessionMcpControls) return undefined;
+		this.#assertSessionMcpControlIdle();
+		const port = this.#sessionMcpControlPort;
+		if (!port) return undefined;
+		return this.#withMcpControlAdmission(
+			() => this.hasSessionMcpControls,
+			this.sessionManager.getSessionId(),
+			async () => {
+				const declared = await port.listDeclaredServers();
+				const server = declared.find(item => item.name === name);
+				const manager = this.#sessionMcpManager();
+				if (!manager) return { action, name, status: "unavailable", toolCount: 0 };
+				const toolCount = (): number => manager.getTools().filter(tool => tool.mcpServerName === name).length;
+				const live = manager.getConnectionStatus(name);
+				const hasState = live !== "disconnected" || toolCount() > 0;
+				if (!server && !hasState) return { action, name, status: "unknown-server", toolCount: 0 };
+				if (action === "connect") {
+					if (!server) return { action, name, status: "unknown-server", toolCount: 0 };
+					if (server.disabled)
+						return { action, name, status: "disabled", toolCount: toolCount(), disabledReason: server.disabled };
+					if (live === "connected") return { action, name, status: "already-connected", toolCount: toolCount() };
+					if (live === "connecting") return { action, name, status: "still-connecting", toolCount: toolCount() };
+					if (!server.config || !server.source) return { action, name, status: "unknown-server", toolCount: 0 };
+					try {
+						await manager.connectSessionServer(name, server.config, server.source);
+					} catch {
+						port.markFailed(name);
+						return { action, name, status: "failed", toolCount: toolCount() };
+					}
+					const snapshot = this.#captureExactMcpSessionState();
+					try {
+						const names = manager
+							.getTools()
+							.filter(tool => tool.mcpServerName === name)
+							.map(tool => tool.name);
+						await this.refreshMCPTools(manager.getTools(), {
+							selectedMCPToolNames: [...this.getSelectedMCPToolNames(), ...names],
+							activeMCPToolNames: [...this.getActiveToolNames().filter(isMCPToolName), ...names],
+							persistMCPSelection: false,
+						});
+						this.#commitSessionTransition();
+					} catch (error) {
+						this.#restoreExactMcpSessionState(snapshot);
+						await manager.disconnectServer(name).catch(() => {});
+						throw error;
+					}
+					if (server.autoload) this.#sessionMcpOverrides.delete(name);
+					else this.#sessionMcpOverrides.set(name, "connected");
+					port.clearFailed(name);
+					return { action, name, status: "connected", toolCount: toolCount() };
+				}
+				if (action === "disconnect") {
+					if (!hasState) return { action, name, status: "not-connected", toolCount: 0 };
+					const names = new Set(
+						manager
+							.getTools()
+							.filter(tool => tool.mcpServerName === name)
+							.map(tool => tool.name),
+					);
+					try {
+						await manager.disconnectServer(name);
+						await this.refreshMCPTools(manager.getTools(), {
+							selectedMCPToolNames: this.getSelectedMCPToolNames().filter(item => !names.has(item)),
+							activeMCPToolNames: this.getActiveToolNames().filter(item => !names.has(item)),
+							persistMCPSelection: false,
+						});
+					} catch (error) {
+						await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
+						throw error;
+					}
+					this.#commitSessionTransition();
+					if (server?.autoload) this.#sessionMcpOverrides.set(name, "disconnected");
+					else this.#sessionMcpOverrides.delete(name);
+					port.clearFailed(name);
+					return { action, name, status: "disconnected", toolCount: 0 };
+				}
+				if (live === "connecting") return { action, name, status: "still-connecting", toolCount: toolCount() };
+				if (!hasState) return { action, name, status: "not-connected", toolCount: 0 };
+				if (!server) return { action, name, status: "undeclared", toolCount: toolCount() };
+				if (server.disabled)
+					return { action, name, status: "disabled", toolCount: toolCount(), disabledReason: server.disabled };
+				if (server.config?.sharing === "shared")
+					return { action, name, status: "unavailable", toolCount: toolCount(), unavailableReason: "shared-pool" };
+				if (!server.config || !server.source) return { action, name, status: "undeclared", toolCount: toolCount() };
+				try {
+					await manager.connectSessionServer(name, server.config, server.source, { restart: true });
+				} catch {
+					port.markFailed(name);
+					if (server.autoload) this.#sessionMcpOverrides.set(name, "disconnected");
+					return { action, name, status: "failed", toolCount: toolCount() };
+				}
+				const snapshot = this.#captureExactMcpSessionState();
+				try {
+					await this.refreshMCPTools(manager.getTools(), {
+						selectedMCPToolNames: this.getSelectedMCPToolNames(),
+						activeMCPToolNames: this.getActiveToolNames().filter(isMCPToolName),
+						persistMCPSelection: false,
+					});
+					this.#commitSessionTransition();
+				} catch (error) {
+					this.#restoreExactMcpSessionState(snapshot);
+					throw error;
+				}
+				if (server.autoload) this.#sessionMcpOverrides.delete(name);
+				else this.#sessionMcpOverrides.set(name, "connected");
+				port.clearFailed(name);
+				return { action, name, status: "reconnected", toolCount: toolCount() };
+			},
+		);
+	}
+
+	async #prepareSessionMcpReset(): Promise<PreparedExactMcpRetirement | undefined> {
+		const port = this.#sessionMcpControlPort;
+		if (!this.hasSessionMcpControls || this.#sessionMcpOverrides.size === 0 || !port) return undefined;
+		const overrides = new Map(this.#sessionMcpOverrides);
+		return {
+			canCommit: () => true,
+			commit: async () => {
+				this.#sessionMcpOverrides.clear();
+				const manager = this.#sessionMcpManager();
+				if (!manager) return;
+				const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
+				const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
+				for (const name of disconnect) {
+					await manager.disconnectServer(name).catch(() => {});
+					port.clearFailed(name);
+				}
+				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
+				port.restoreAutoload(restore);
+			},
+			abort: async () => {},
+		};
 	}
 
 	/**
@@ -12624,7 +12923,7 @@ export class AgentSession {
 		deferIdentityRollback = false,
 	): Promise<PreparedExactMcpRetirement | undefined> {
 		const controls = getExactMcpControls(this);
-		if (!controls) return undefined;
+		if (!controls) return this.#prepareSessionMcpReset();
 		const originalSessionFile = this.sessionManager.getSessionFile();
 		const preparedSessionId = this.sessionManager.getSessionId();
 		let replacement: Promise<void>;

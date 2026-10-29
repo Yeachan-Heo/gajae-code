@@ -356,9 +356,34 @@ for (const name of PROJECT_DENIED_ENV_NAMES) {
 }
 const projectDeniedKeys = new Set<string>(PROJECT_DENIED_ENV_NAMES.map(canonicalEnvKey));
 
+/**
+ * Per-launch managed-owner context. Only a launcher or the managed-owner supervisor
+ * sets these, for one exact child; a dotenv file in any layer is not a launch. The
+ * copy below never installs them, so a process that loads this module cannot
+ * acquire owner context it did not inherit. Inherited values are left untouched.
+ */
+const LAUNCHER_ONLY_ENV_NAMES = [
+	"GJC_MANAGED_OWNER_CHILD_TOKEN",
+	"GJC_MANAGED_OWNER_RUN_ID",
+	"GJC_MANAGED_OWNER_INCARNATION",
+	"GJC_MANAGED_OWNER_LAUNCH_BASELINE",
+	"GJC_MANAGED_OWNER_REDACT_COMMAND",
+	"GJC_MANAGED_OWNER_PREDECESSOR_TOKEN",
+	"GJC_MANAGED_OWNER_PREDECESSOR_GENERATION",
+	"GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID",
+	"GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION",
+	"GJC_MANAGED_OWNER_TRANSCRIPT_PATH",
+	"GJC_TMUX_OWNER_STATE_DIR",
+	"GJC_TMUX_OWNER_GENERATION",
+	"GJC_TMUX_OWNER_SERVER_KEY",
+	"GJC_TMUX_LAUNCHED",
+] as const;
+const launcherOnlyKeys = new Set<string>(LAUNCHER_ONLY_ENV_NAMES.map(canonicalEnvKey));
+
 for (const file of [projectSnapshot.loadedValues, agentEnv, piEnv, homeEnv, homeShellEnv]) {
 	for (const key in file) {
 		if (file === projectSnapshot.loadedValues && projectDeniedKeys.has(key)) continue;
+		if (launcherOnlyKeys.has(canonicalEnvKey(key))) continue;
 		if (!Bun.env[key]) {
 			Bun.env[key] = file[key];
 		}
