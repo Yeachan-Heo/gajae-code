@@ -4520,6 +4520,8 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
+			/** Factory-owned identity shared with direct SDK image admission, never client supplied. */
+			getImageAdmissionSession?: () => object;
 			/** Definitive event-driven observation; never mutates the owning run. */
 			waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
@@ -5337,7 +5339,7 @@ export function createNotificationsExtension(
 			? new PromptImageUploadStore(connectionId => {
 					const incarnation = hostConnectionIncarnations.get(connectionId);
 					return incarnation !== undefined && !incarnation.closed;
-				})
+				}, terminalAbortSeams?.getImageAdmissionSession?.())
 			: undefined;
 
 		const configOverrides = new Map<string, unknown>();

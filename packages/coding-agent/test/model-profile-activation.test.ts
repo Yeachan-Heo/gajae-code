@@ -1,5 +1,6 @@
 import { describe, expect, it, test, vi } from "bun:test";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import * as compactionModule from "@gajae-code/agent-core/compaction";
 
 import type { Model } from "@gajae-code/ai";
 import { hookFetch, TempDir } from "@gajae-code/utils";
@@ -23,10 +24,15 @@ import {
 	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
 
+import {
+	commitDurableModelProfileOwnership,
+	readDurableModelProfileOwnership,
+	readDurableModelProfileOwnershipFromRaw,
+} from "../src/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
+import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import {
 	AgentSession,
 	type AgentSessionProfileInstalledOverrideState,
@@ -189,6 +195,40 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		modelRegistry: undefined as ModelRegistry | undefined,
+		disposed: false,
+		get sessionLifecycle() {
+			return Object.freeze({ generation: 0, transitioning: false, disposed: this.disposed });
+		},
+		async dispose() {
+			this.disposed = true;
+		},
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			return {
+				sessionId: this.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: this.model,
+				previousThinkingLevel: this.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection) {
+			selection.signal?.throwIfAborted();
+			if (this.model !== selection.previousModel || this.thinkingLevel !== selection.previousThinkingLevel)
+				throw new Error("Session changed while publishing profile");
+			this.model = selection.model;
+			this.thinkingLevel = selection.committedThinkingLevel;
+		},
+		setThinkingLevel(level: ThinkingLevel | undefined) {
+			this.thinkingLevel = level;
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		configuredModelChains: new Map<string, readonly string[]>(),
 		configuredModelChainStates: new Map<
@@ -253,7 +293,799 @@ function fakeSession(initial = model("provider-a", "initial")) {
 	};
 }
 
+function rejectProfileRuntimePublication(settings: Settings, onReject?: () => void) {
+	const override = settings.override.bind(settings);
+	return vi.spyOn(settings, "override").mockImplementation((key, value) => {
+		if (key === "task.agentModelOverrides") {
+			onReject?.();
+			throw new Error("runtime publication failed");
+		}
+		return override(key, value);
+	});
+}
+
+function controlProfileFixture(settings = Settings.isolated({ "compaction.enabled": false })) {
+	const tempDir = TempDir.createSync("@gjc-profile-control-");
+	const manager = SessionManager.create(tempDir.path(), tempDir.path());
+	const base = fakeRegistry({
+		profiles: [
+			...fakeRegistry().getModelProfiles().values(),
+			{
+				name: "profile-b",
+				requiredProviders: ["provider-c"],
+				modelMapping: { default: "provider-c/default", executor: "provider-c/executor" },
+				source: "user",
+			},
+			{
+				name: "roles-only",
+				requiredProviders: ["provider-b"],
+				modelMapping: { executor: "provider-b/executor" },
+				source: "user",
+			},
+		],
+	});
+	const registry = {
+		...base,
+		getAvailable: () => base.getAll(),
+		getApiKey: async () => kNoAuth,
+		withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+	};
+	const initial = base.getAll().find(candidate => candidate.provider === "openai-codex" && candidate.id === "gpt-5.5");
+	if (!initial) throw new Error("Expected reasoning-capable fixture model");
+	const session = new AgentSession({
+		agent: new Agent({ initialState: { model: initial, systemPrompt: [], tools: [], messages: [] } }),
+		sessionManager: manager,
+		settings,
+		modelRegistry: registry as unknown as ModelRegistry,
+	});
+	return {
+		session,
+		manager,
+		settings,
+		registry,
+		async dispose() {
+			await session.dispose();
+			await settings.close();
+			tempDir.removeSync();
+		},
+	};
+}
+
 describe("model profile activation", () => {
+	test("handoff lifecycle authority ignores notifications and fences preparation, committed cleanup, and disposal", async () => {
+		const tempDir = TempDir.createSync("@gjc-session-lifecycle-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const initialModel = model("provider-c", "default");
+		const registry = { ...fakeRegistry(), getApiKey: async () => kNoAuth };
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model: initialModel, systemPrompt: [], tools: [], messages: [] } }),
+			sessionManager: manager,
+			settings,
+			modelRegistry: registry as unknown as ModelRegistry,
+		});
+		const readLifecycle = () => session.sessionLifecycle;
+		const generated = Promise.withResolvers<string>();
+		const generationEntered = Promise.withResolvers<void>();
+		const cleanupEntered = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const generate = vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			generationEntered.resolve();
+			return generated.promise;
+		});
+		const unregisterCleanup = session.registerToolSessionTransitionCleanup(async () => {
+			cleanupEntered.resolve();
+			await releaseCleanup.promise;
+		});
+		const identityNotice = vi.fn();
+		const unsubscribe = session.subscribeSessionIdentityChanges(identityNotice);
+		let handoff: Promise<unknown> | undefined;
+		try {
+			manager.appendMessage({ role: "user", content: "First context", timestamp: 1 });
+			manager.appendMessage({ role: "user", content: "Second context", timestamp: 2 });
+			const originalId = session.sessionId;
+			const initial = readLifecycle();
+			expect(Object.isFrozen(initial)).toBe(true);
+			expect(Reflect.set(initial, "generation", initial.generation + 100)).toBe(false);
+			await session.notifySessionIdentityChanged();
+			await session.notifySessionIdentityChanged();
+			expect(identityNotice).toHaveBeenCalledTimes(2);
+			expect(readLifecycle()).toEqual(initial);
+
+			const cancelled = new AbortController();
+			cancelled.abort();
+			await expect(session.handoff(undefined, { signal: cancelled.signal })).rejects.toThrow("Handoff cancelled");
+			expect(generate).not.toHaveBeenCalled();
+			expect(readLifecycle()).toEqual(initial);
+
+			handoff = session.handoff();
+			void handoff.catch(() => undefined);
+			expect(readLifecycle()).toEqual({ ...initial, transitioning: true });
+			await Promise.race([
+				generationEntered.promise,
+				handoff.then(() => {
+					throw new Error("Handoff completed without reaching generation");
+				}),
+			]);
+			expect(session.sessionId).toBe(originalId);
+			expect(readLifecycle()).toEqual({ ...initial, transitioning: true });
+			generated.resolve("## Goal\nContinue without a provider turn");
+			await Promise.race([
+				cleanupEntered.promise,
+				handoff.then(() => {
+					throw new Error("Handoff completed without reaching committed cleanup");
+				}),
+			]);
+			expect(session.sessionId).not.toBe(originalId);
+			expect(readLifecycle()).toEqual({
+				generation: initial.generation + 1,
+				transitioning: true,
+				disposed: false,
+			});
+			releaseCleanup.resolve();
+			await expect(handoff).resolves.toMatchObject({ document: "## Goal\nContinue without a provider turn" });
+			const completed = readLifecycle();
+			expect(completed).toEqual({ generation: initial.generation + 1, transitioning: false, disposed: false });
+			expect(initial.generation).toBe(completed.generation - 1);
+			expect(initial.transitioning).toBe(false);
+			await session.notifySessionIdentityChanged();
+			expect(readLifecycle()).toEqual(completed);
+
+			const clear = session.clearContext();
+			expect(readLifecycle().transitioning).toBe(true);
+			await expect(clear).resolves.toBe(true);
+			expect(readLifecycle()).toEqual({
+				generation: completed.generation + 1,
+				transitioning: false,
+				disposed: false,
+			});
+			const beforeDisposal = readLifecycle();
+			const disposal = session.dispose();
+			expect(readLifecycle()).toEqual({ ...beforeDisposal, disposed: true });
+			await disposal;
+			expect(readLifecycle()).toEqual({ ...beforeDisposal, disposed: true });
+		} finally {
+			generated.resolve("## Goal\nContinue without a provider turn");
+			releaseCleanup.resolve();
+			await handoff?.catch(() => undefined);
+			unregisterCleanup();
+			unsubscribe();
+			generate.mockRestore();
+			await session.dispose();
+			await settings.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("trusted MCP control admission excludes competing transitions and reentry without advancing lifecycle generation", async () => {
+		const fixture = controlProfileFixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const generation = fixture.session.sessionLifecycle.generation;
+		let operation: Promise<string> | undefined;
+		try {
+			operation = fixture.session.withMcpControlAdmission(generation, async signal => {
+				expect(signal.aborted).toBe(false);
+				expect(fixture.session.sessionLifecycle).toEqual({ generation, transitioning: true, disposed: false });
+				entered.resolve();
+				await expect(fixture.session.withMcpControlAdmission(generation, async () => "nested")).rejects.toThrow();
+				await release.promise;
+				return "applied";
+			});
+			await entered.promise;
+			expect(() => fixture.session.newSession()).toThrow("mcp-control");
+			await expect(fixture.session.withMcpControlAdmission(generation, async () => "competing")).rejects.toThrow();
+			release.resolve();
+			await expect(operation).resolves.toBe("applied");
+			expect(fixture.session.sessionLifecycle).toEqual({ generation, transitioning: false, disposed: false });
+		} finally {
+			release.resolve();
+			await operation?.catch(() => undefined);
+			await fixture.dispose();
+		}
+	});
+
+	test("trusted MCP admission rejects stale identity before invoking its callback", async () => {
+		const fixture = controlProfileFixture();
+		const callback = vi.fn(async () => "must not run");
+		try {
+			const generation = fixture.session.sessionLifecycle.generation;
+			expect(await fixture.session.clearContext()).toBe(true);
+			await expect(fixture.session.withMcpControlAdmission(generation, callback)).rejects.toMatchObject({
+				code: "resource_gone",
+			});
+			expect(callback).not.toHaveBeenCalled();
+			const currentGeneration = fixture.session.sessionLifecycle.generation;
+			const admitted = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const lease = vi.spyOn(fixture.registry, "withConsumerLease").mockImplementationOnce(async body => {
+				admitted.resolve();
+				await release.promise;
+				return await body();
+			});
+			const operation = fixture.session.withMcpControlAdmission(currentGeneration, callback);
+			void operation.catch(() => undefined);
+			try {
+				await admitted.promise;
+				await fixture.manager.newSession();
+				release.resolve();
+				await expect(operation).rejects.toMatchObject({ code: "resource_gone" });
+				expect(callback).not.toHaveBeenCalled();
+			} finally {
+				release.resolve();
+				await operation.catch(() => undefined);
+				lease.mockRestore();
+			}
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	for (const cancellation of ["abort", "dispose"] as const) {
+		test(`trusted MCP admission propagates ${cancellation} without waiting on its own held lease`, async () => {
+			const fixture = controlProfileFixture();
+			const entered = Promise.withResolvers<AbortSignal>();
+			const cancelled = Promise.withResolvers<void>();
+			let operation: Promise<void> | undefined;
+			let disposal: Promise<void> | undefined;
+			try {
+				const generation = fixture.session.sessionLifecycle.generation;
+				operation = fixture.session.withMcpControlAdmission(generation, async signal => {
+					signal.addEventListener("abort", () => cancelled.resolve(), { once: true });
+					entered.resolve(signal);
+					await cancelled.promise;
+					signal.throwIfAborted();
+				});
+				void operation.catch(() => undefined);
+				const signal = await entered.promise;
+				if (cancellation === "abort") await fixture.session.abort();
+				else {
+					disposal = fixture.session.dispose();
+					void disposal.catch(() => undefined);
+				}
+				expect(signal.aborted).toBe(true);
+				await expect(operation).rejects.toBeDefined();
+				await disposal;
+				expect(fixture.session.sessionLifecycle.generation).toBe(generation);
+				expect(fixture.session.sessionLifecycle.transitioning).toBe(false);
+			} finally {
+				cancelled.resolve();
+				await operation?.catch(() => undefined);
+				await disposal;
+				await fixture.dispose();
+			}
+		});
+	}
+
+	test("reload-compatible model preparation never probes live credentials while persistent activation still validates them before CAS", async () => {
+		const fixture = controlProfileFixture();
+		const failure = new Error("held or refreshable live credential");
+		const probe = vi.spyOn(fixture.registry, "getApiKey").mockRejectedValue(failure);
+		const commit = vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent");
+		const originalModel = fixture.session.model;
+		const originalThinking = fixture.session.thinkingLevel;
+		if (!originalModel) throw new Error("Expected fixture model");
+		try {
+			const prepared = await fixture.session.prepareModelSelectionForProfileActivation(
+				originalModel,
+				originalThinking,
+			);
+			expect(prepared).toMatchObject({ model: originalModel, previousModel: originalModel });
+			expect(probe).not.toHaveBeenCalled();
+			await expect(
+				fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true }),
+			).rejects.toBe(failure);
+			expect(probe).toHaveBeenCalledTimes(1);
+			expect(commit).not.toHaveBeenCalled();
+			expect(fixture.session.model).toBe(originalModel);
+			expect(fixture.session.thinkingLevel).toBe(originalThinking);
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 0,
+				marker: { kind: "inherit" },
+			});
+		} finally {
+			probe.mockRestore();
+			commit.mockRestore();
+			await fixture.dispose();
+		}
+	});
+
+	for (const predecessorSucceeds of [true, false]) {
+		test(`queued persistent profiles use only a ${predecessorSucceeds ? "successful" : "failed"} local predecessor receipt`, async () => {
+			const fixture = controlProfileFixture();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const commit = fixture.settings.commitAtomicBatchWithCurrent.bind(fixture.settings);
+			let commits = 0;
+			const commitSpy = vi
+				.spyOn(fixture.settings, "commitAtomicBatchWithCurrent")
+				.mockImplementation(async build => {
+					if (++commits === 1) {
+						entered.resolve();
+						await release.promise;
+						if (!predecessorSucceeds) throw new Error("first commit rejected");
+					}
+					return commit(build);
+				});
+			let first: Promise<unknown> | undefined;
+			let second: Promise<unknown> | undefined;
+			try {
+				first = fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				void first.catch(() => undefined);
+				await entered.promise;
+				second = fixture.session.setDefaultModelProfileForControl("profile-b", { persistDefault: true });
+				void second.catch(() => undefined);
+				release.resolve();
+				if (predecessorSucceeds) await expect(first).resolves.toEqual({ changed: true, id: "profile-a" });
+				else await expect(first).rejects.toThrow("first commit rejected");
+				await expect(second).resolves.toEqual({ changed: true, id: "profile-b" });
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual({
+					schemaVersion: 1,
+					version: predecessorSucceeds ? 2 : 1,
+					marker: { kind: "profile", profile: "profile-b" },
+				});
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBe("profile-b");
+				expect(fixture.session.model).toMatchObject({ provider: "provider-c", id: "default" });
+				expect(commits).toBe(2);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([first, second]);
+				commitSpy.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const conflict of ["ABA", "same-version marker change"] as const) {
+		test(`persistent control rejects an observed-owner ${conflict} without refreshing its expected owner`, async () => {
+			const fixture = controlProfileFixture();
+			const observed = await commitDurableModelProfileOwnership(fixture.settings, {
+				kind: "profile",
+				profile: "profile-a",
+			});
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const idle = vi.spyOn(fixture.session, "waitForIdle").mockImplementationOnce(async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			let request: Promise<unknown> | undefined;
+			try {
+				const prior = fixture.session.model;
+				request = fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				void request.catch(() => undefined);
+				await entered.promise;
+				if (conflict === "ABA") {
+					await commitDurableModelProfileOwnership(fixture.settings, { kind: "profile", profile: "profile-b" });
+					await commitDurableModelProfileOwnership(fixture.settings, { kind: "profile", profile: "profile-a" });
+				} else {
+					await fixture.settings.commitAtomicBatch([
+						{
+							path: "modelProfile.ownership",
+							op: "set",
+							value: { ...observed, marker: { kind: "profile", profile: "profile-b" } },
+						},
+						{ path: "modelProfile.default", op: "set", value: "profile-b" },
+					]);
+				}
+				const winner = readDurableModelProfileOwnership(fixture.settings);
+				release.resolve();
+				await expect(request).rejects.toMatchObject({
+					code: "model_profile_ownership_conflict",
+					expectedVersion: observed.version,
+					actualVersion: winner.version,
+				});
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(winner);
+				expect(fixture.session.model).toBe(prior);
+				expect(fixture.settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+			} finally {
+				release.resolve();
+				await request?.catch(() => undefined);
+				idle.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	test("same-name persistent activation still performs credential preflight and cannot infer success from its active marker", async () => {
+		const fixture = controlProfileFixture();
+		const owner = await commitDurableModelProfileOwnership(fixture.settings, {
+			kind: "profile",
+			profile: "profile-a",
+		});
+		fixture.session.setActiveModelProfile("profile-a", true);
+		const probe = vi.spyOn(fixture.registry, "getApiKeyForProvider").mockResolvedValue(undefined);
+		const commit = vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent");
+		try {
+			await expect(
+				fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true }),
+			).rejects.toBeInstanceOf(ModelProfileCredentialError);
+			expect(commit).not.toHaveBeenCalled();
+			expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(owner);
+		} finally {
+			probe.mockRestore();
+			commit.mockRestore();
+			await fixture.dispose();
+		}
+	});
+
+	test("committed publication failure retains durable ownership and actually fail-closes the requesting session", async () => {
+		const fixture = controlProfileFixture();
+		const failure = new Error("publication failed");
+		const publish = vi.spyOn(fixture.session, "commitPreparedProfileModelSelection").mockImplementation(() => {
+			throw failure;
+		});
+		try {
+			await expect(
+				fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true }),
+			).rejects.toMatchObject({
+				code: "model_profile_apply_committed",
+				profileName: "profile-a",
+				committedVersion: 1,
+				cause: failure,
+			});
+			expect(readDurableModelProfileOwnership(fixture.settings)).toEqual({
+				schemaVersion: 1,
+				version: 1,
+				marker: { kind: "profile", profile: "profile-a" },
+			});
+			expect(fixture.settings.getGlobal("modelProfile.default")).toBe("profile-a");
+			expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+			await expect(
+				fixture.session.setDefaultModelProfileForControl("profile-b", { persistDefault: true }),
+			).rejects.toThrow();
+			await fixture.session.awaitDisposeCompletion();
+		} finally {
+			publish.mockRestore();
+			await fixture.dispose();
+		}
+	});
+
+	test("a newer same-value thinking intent after commit is preserved and fail-closes instead of publishing the stale profile", async () => {
+		const fixture = controlProfileFixture();
+		const priorModel = fixture.session.model;
+		const priorThinking = fixture.session.thinkingLevel;
+		const commit = fixture.settings.commitAtomicBatchWithCurrent.bind(fixture.settings);
+		const commitSpy = vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			const receipt = await commit(build);
+			fixture.session.setThinkingLevel(priorThinking);
+			return receipt;
+		});
+		try {
+			await expect(
+				fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true }),
+			).rejects.toMatchObject({ code: "model_profile_apply_committed", committedVersion: 1 });
+			expect(fixture.session.model).toBe(priorModel);
+			expect(fixture.session.thinkingLevel).toBe(priorThinking);
+			expect(fixture.session.getActiveModelProfile()).toBeUndefined();
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 1,
+				marker: { kind: "profile", profile: "profile-a" },
+			});
+			expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+			await fixture.session.awaitDisposeCompletion();
+		} finally {
+			commitSpy.mockRestore();
+			await fixture.dispose();
+		}
+	});
+
+	for (const newerIntent of ["thinking", "concrete", "manual roles"] as const) {
+		test(`locked profile validation preserves a newer ${newerIntent} choice without patches or compensation`, async () => {
+			const fixture = controlProfileFixture();
+			const before = readDurableModelProfileOwnership(fixture.settings);
+			const commit = fixture.settings.commitAtomicBatchWithCurrent.bind(fixture.settings);
+			const chosen = model("provider-c", "default");
+			const commitSpy = vi
+				.spyOn(fixture.settings, "commitAtomicBatchWithCurrent")
+				.mockImplementation(async build => {
+					if (newerIntent === "thinking") fixture.session.setThinkingLevel(ThinkingLevel.Medium);
+					if (newerIntent === "concrete")
+						await fixture.session.setModelTemporary(chosen, ThinkingLevel.Off, { cause: "user-selection" });
+					if (newerIntent === "manual roles")
+						fixture.settings.override("task.agentModelOverrides", { executor: "provider-c/executor" });
+					return commit(build);
+				});
+			try {
+				await expect(
+					fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true }),
+				).rejects.toThrow(/changed|supersed/i);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(before);
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(fixture.session.getActiveModelProfile()).toBeUndefined();
+				if (newerIntent === "thinking") expect(fixture.session.thinkingLevel).toBe(ThinkingLevel.Medium);
+				if (newerIntent === "concrete") expect(fixture.session.model).toBe(chosen);
+				if (newerIntent === "manual roles")
+					expect(fixture.settings.getOverride("task.agentModelOverrides")).toEqual({
+						executor: "provider-c/executor",
+					});
+				expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+			} finally {
+				commitSpy.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const cancellation of ["abort", "dispose"] as const) {
+		test(`${cancellation} during profile credential preflight leaves ownership and runtime unmodified`, async () => {
+			const fixture = controlProfileFixture();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const getKey = fixture.registry.getApiKeyForProvider;
+			const probe = vi.spyOn(fixture.registry, "getApiKeyForProvider").mockImplementation(async provider => {
+				if (provider === "provider-a") {
+					entered.resolve();
+					await release.promise;
+				}
+				return getKey(provider);
+			});
+			const prior = fixture.session.model;
+			const commit = vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent");
+			let request: Promise<unknown> | undefined;
+			let disposal: Promise<void> | undefined;
+			try {
+				request = fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				void request.catch(() => undefined);
+				await entered.promise;
+				if (cancellation === "abort") await fixture.session.abort();
+				else {
+					disposal = fixture.session.dispose();
+					void disposal.catch(() => undefined);
+				}
+				release.resolve();
+				await expect(request).rejects.toThrow(/changed|supersed|abort/i);
+				expect(fixture.session.model).toBe(prior);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+					version: 0,
+					marker: { kind: "inherit" },
+				});
+				expect(commit).not.toHaveBeenCalled();
+			} finally {
+				release.resolve();
+				await request?.catch(() => undefined);
+				await disposal;
+				probe.mockRestore();
+				commit.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	test("role-only persistent activation applies its thinking override without inventing a DEFAULT or resume selection", async () => {
+		const fixture = controlProfileFixture();
+		const priorModel = fixture.session.model;
+		const priorResume = fixture.manager.buildSessionContext().models.default;
+		try {
+			await expect(
+				fixture.session.setDefaultModelProfileForControl("roles-only", {
+					persistDefault: true,
+					thinkingLevelOverride: ThinkingLevel.High,
+				}),
+			).resolves.toEqual({ changed: true, id: "roles-only" });
+			expect(fixture.session.model).toBe(priorModel);
+			expect(fixture.session.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(fixture.manager.buildSessionContext().models.default).toBe(priorResume);
+			expect(fixture.settings.getGlobal("defaultThinkingLevel")).toBeUndefined();
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 1,
+				marker: { kind: "profile", profile: "roles-only" },
+			});
+			expect(fixture.settings.getOverride("task.agentModelOverrides")?.executor).toBe("provider-b/executor");
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	for (const persistDefault of [false, true]) {
+		test(`${persistDefault ? "persistent" : "session-only"} successful DEFAULT records MRU in the injected storage, failed activation does not`, async () => {
+			const scope = TempDir.createSync("@gjc-profile-injected-storage-");
+			const settings = await Settings.loadForScope({ cwd: scope.path(), agentDir: scope.path() });
+			const fixture = controlProfileFixture(settings);
+			const storage = settings.getStorage();
+			if (!storage) throw new Error("Expected injected scoped storage");
+			const usage = vi.spyOn(storage, "recordModelUsage");
+			const load = vi.spyOn(Settings, "loadForScope");
+			try {
+				await fixture.session.setDefaultModelProfileForControl("profile-b", { persistDefault });
+				expect(usage).toHaveBeenCalledTimes(1);
+				expect(usage).toHaveBeenCalledWith("provider-c/default");
+				expect(load).not.toHaveBeenCalled();
+				if (persistDefault) {
+					const raw = Bun.YAML.parse(await Bun.file(`${scope.path()}/config.yml`).text()) as Record<
+						string,
+						unknown
+					>;
+					expect(readDurableModelProfileOwnershipFromRaw(raw)).toEqual(readDurableModelProfileOwnership(settings));
+				} else {
+					expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+						version: 0,
+						marker: { kind: "inherit" },
+					});
+				}
+				const failure = vi
+					.spyOn(settings, "commitAtomicBatchWithCurrent")
+					.mockRejectedValueOnce(new Error("commit rejected"));
+				try {
+					await expect(
+						fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true }),
+					).rejects.toThrow("commit rejected");
+					expect(usage).toHaveBeenCalledTimes(1);
+				} finally {
+					failure.mockRestore();
+				}
+			} finally {
+				load.mockRestore();
+				usage.mockRestore();
+				await fixture.dispose();
+				scope.removeSync();
+			}
+		});
+	}
+
+	test("persistent activation preserves runtime profile overrides and manual role baselines on injected settings", async () => {
+		const settings = Settings.isolated(
+			{},
+			{
+				overrides: {
+					"modelProfile.default": "runtime-shadow",
+					modelRoles: { critic: "provider-c/architect" },
+					"task.agentModelOverrides": { planner: "provider-c/executor" },
+				},
+			},
+		);
+		const fixture = controlProfileFixture(settings);
+		try {
+			await fixture.session.setDefaultModelProfileForControl("profile-b", { persistDefault: true });
+			expect(fixture.session.settings).toBe(settings);
+			expect(settings.getGlobal("modelProfile.default")).toBe("profile-b");
+			expect(settings.get("modelProfile.default")).toBe("runtime-shadow");
+			expect(settings.getOverride("modelRoles")?.critic).toBe("provider-c/architect");
+			expect(settings.getOverride("task.agentModelOverrides")?.planner).toBe("provider-c/executor");
+			expect(settings.getGlobal("modelRoles")).toEqual({});
+			expect(settings.getGlobal("task.agentModelOverrides")).toEqual({});
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("persistent canonical activation advances versioned ownership and its default projection together", async () => {
+		const settings = Settings.isolated();
+		const prior = await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-a" });
+		const profileB: ModelProfileDefinition = {
+			name: "profile-b",
+			requiredProviders: ["provider-c"],
+			modelMapping: { default: "provider-c/default", executor: "provider-c/executor" },
+			source: "user",
+		};
+		const registry = fakeRegistry({ profiles: [...fakeRegistry().getModelProfiles().values(), profileB] });
+		const session = fakeSession();
+		try {
+			await activateModelProfile(
+				{ session, modelRegistry: registry, settings, profileName: profileB.name },
+				{ persistDefault: true },
+			);
+
+			expect(readDurableModelProfileOwnership(settings)).toEqual({
+				schemaVersion: 1,
+				version: prior.version + 1,
+				marker: { kind: "profile", profile: profileB.name },
+			});
+			expect(settings.getGlobal("modelProfile.default")).toBe(profileB.name);
+			expect(session.getActiveModelProfile()).toBe(profileB.name);
+		} finally {
+			await settings.close();
+		}
+	});
+
+	for (const profileKind of ["DEFAULT", "role-only"] as const) {
+		for (const transition of ["new-session", "same-ID context clear", "session ID return"] as const) {
+			test(`rejects an idle-wait ${profileKind} profile request after ${transition} without successor effects`, async () => {
+				const tempDir = TempDir.createSync("@gjc-profile-idle-transition-");
+				const manager = SessionManager.create(tempDir.path(), tempDir.path());
+				const settings = Settings.isolated({ "compaction.enabled": false });
+				const profile: ModelProfileDefinition = {
+					name: "idle-profile",
+					requiredProviders: ["provider-a", "provider-b"],
+					modelMapping:
+						profileKind === "DEFAULT"
+							? { default: "provider-a/default", executor: "provider-b/executor" }
+							: { executor: "provider-b/executor" },
+					source: "user",
+				};
+				const baseRegistry = fakeRegistry({ profiles: [profile] });
+				const registry = {
+					...baseRegistry,
+					getAvailable: () => baseRegistry.getAll(),
+					getApiKey: async () => kNoAuth,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+				};
+				const session = new AgentSession({
+					agent: new Agent({
+						initialState: { model: model("provider-c", "default"), systemPrompt: [], tools: [], messages: [] },
+					}),
+					sessionManager: manager,
+					settings,
+					modelRegistry: registry as unknown as ModelRegistry,
+				});
+				const idleEntered = Promise.withResolvers<void>();
+				const releaseIdle = Promise.withResolvers<void>();
+				const waitForIdle = vi.spyOn(session, "waitForIdle").mockImplementationOnce(async () => {
+					idleEntered.resolve();
+					await releaseIdle.promise;
+				});
+				const beforeActivation = vi.fn();
+				const afterActivation = vi.fn();
+				let request: Promise<{ status: "fulfilled" | "rejected"; error?: unknown }> | undefined;
+				try {
+					manager.appendModelChange("provider-c/default");
+					await manager.ensureOnDisk();
+					await manager.flush();
+					const originalId = session.sessionId;
+					const originalFile = manager.getSessionFile();
+					if (!originalFile) throw new Error("Expected persisted predecessor session");
+					request = session
+						.setDefaultModelProfileForControl(profile.name, {
+							persistDefault: true,
+							onBeforeActivation: beforeActivation,
+							onAfterActivation: afterActivation,
+						})
+						.then(
+							() => ({ status: "fulfilled" as const }),
+							error => ({ status: "rejected" as const, error }),
+						);
+					await idleEntered.promise;
+					if (transition === "same-ID context clear") {
+						expect(await session.clearContext()).toBe(true);
+						expect(session.sessionId).toBe(originalId);
+					} else {
+						expect(await session.newSession()).toBe(true);
+						expect(session.sessionId).not.toBe(originalId);
+						if (transition === "session ID return") {
+							expect(await session.switchSession(originalFile)).toBe(true);
+							expect(session.sessionId).toBe(originalId);
+						}
+					}
+					const successorModel = session.model;
+					const successorThinking = session.thinkingLevel;
+					const successorContext = manager.buildSessionContext();
+					const successorRoles = settings.getOverride("modelRoles");
+					const successorAgentOverrides = settings.getOverride("task.agentModelOverrides");
+					releaseIdle.resolve();
+					const outcome = await request;
+
+					expect(outcome.status).toBe("rejected");
+					expect(outcome.error).toEqual(
+						expect.objectContaining({
+							message: expect.stringMatching(/session.*changed|supersed|abort|cancel/i),
+						}),
+					);
+					expect(beforeActivation).not.toHaveBeenCalled();
+					expect(afterActivation).not.toHaveBeenCalled();
+					expect(session.model).toBe(successorModel);
+					expect(session.thinkingLevel).toBe(successorThinking);
+					expect(manager.buildSessionContext()).toEqual(successorContext);
+					expect(session.getActiveModelProfile()).toBeUndefined();
+					expect(settings.getOverride("modelRoles")).toEqual(successorRoles);
+					expect(settings.getOverride("task.agentModelOverrides")).toEqual(successorAgentOverrides);
+					expect(readDurableModelProfileOwnership(settings)).toEqual({
+						schemaVersion: 1,
+						version: 0,
+						marker: { kind: "inherit" },
+					});
+					expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+				} finally {
+					releaseIdle.resolve();
+					await request;
+					waitForIdle.mockRestore();
+					await session.dispose();
+					await settings.close();
+					tempDir.removeSync();
+				}
+			});
+		}
+	}
+
 	test("prepared activation resolves default and agent selectors", async () => {
 		const prepared = await prepareModelProfileActivation({
 			session: fakeSession(),
@@ -380,7 +1212,8 @@ describe("model profile activation", () => {
 				committedThinkingLevel: thinkingLevel,
 				previousModel: baseSession.model,
 				previousThinkingLevel: baseSession.thinkingLevel,
-				previousEditMode: "default" as never,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
 				signal,
 			}),
 			commitPreparedProfileModelSelection: (selection: PreparedProfileModelSelection) => {
@@ -1915,12 +2748,13 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
-
-		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
-		);
-		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		const reject = rejectProfileRuntimePublication(settings);
+		try {
+			await expect(applyPreparedModelProfileActivation(prepared)).rejects.toThrow("runtime publication failed");
+			expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		} finally {
+			reject.mockRestore();
+		}
 	});
 
 	test("rollback restores the previous live model even when its credentials are unavailable", async () => {
@@ -1945,13 +2779,14 @@ describe("model profile activation", () => {
 				settings,
 				profileName: "profile-a",
 			});
-			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("forward flush failed"));
-
-			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-				"forward flush failed",
-			);
-			expect(session.model).toBe(previousModel);
-			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+			const reject = rejectProfileRuntimePublication(settings);
+			try {
+				await expect(applyPreparedModelProfileActivation(prepared)).rejects.toThrow("runtime publication failed");
+				expect(session.model).toBe(previousModel);
+				expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+			} finally {
+				reject.mockRestore();
+			}
 		} finally {
 			await manager.close();
 			tempDir.removeSync();
@@ -1968,13 +2803,14 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
-
-		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
-		);
-		expect(session.model).toBeUndefined();
-		expect(session.resumeDefaultSelectors).toEqual([]);
+		const reject = rejectProfileRuntimePublication(settings);
+		try {
+			await expect(applyPreparedModelProfileActivation(prepared)).rejects.toThrow("runtime publication failed");
+			expect(session.model).toBeUndefined();
+			expect(session.resumeDefaultSelectors).toEqual([]);
+		} finally {
+			reject.mockRestore();
+		}
 	});
 
 	test("does not disturb the old session when target authentication fails before mutation", async () => {
@@ -2043,22 +2879,23 @@ describe("model profile activation", () => {
 				settings,
 				profileName: profile.name,
 			});
-			vi.spyOn(settings, "flushOrThrow").mockImplementationOnce(async () => {
+			const reject = rejectProfileRuntimePublication(settings, () => {
 				expect(agent.appendOnlyContext).toBeDefined();
-				throw new Error("forward flush failed");
 			});
-			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-				"forward flush failed",
-			);
-			expect(session.model).toBeUndefined();
-			expect(agent.appendOnlyContext).toBeUndefined();
+			try {
+				await expect(applyPreparedModelProfileActivation(prepared)).rejects.toThrow("runtime publication failed");
+				expect(session.model).toBeUndefined();
+				expect(agent.appendOnlyContext).toBeUndefined();
+			} finally {
+				reject.mockRestore();
+			}
 		} finally {
 			await manager.close();
 			tempDir.removeSync();
 		}
 	});
 
-	test("reports a second settings flush failure without claiming durable recovery", async () => {
+	test("retains the original atomic commit error without compensating unchanged durable state", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
 		const prepared = await prepareModelProfileActivation({
@@ -2068,11 +2905,9 @@ describe("model profile activation", () => {
 			profileName: "profile-a",
 		});
 		const firstFailure = new Error("forward secret-settings-value");
-		const secondFailure = new Error("rollback secret-settings-value");
-		const flush = vi
-			.spyOn(settings, "flushOrThrow")
-			.mockRejectedValueOnce(firstFailure)
-			.mockRejectedValueOnce(secondFailure);
+		const commit = vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(firstFailure);
+		const flush = vi.spyOn(settings, "flushOrThrow");
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
 
 		let failure: unknown;
 		try {
@@ -2080,14 +2915,11 @@ describe("model profile activation", () => {
 		} catch (error) {
 			failure = error;
 		}
-		expect(failure).toBeInstanceOf(AggregateError);
-		const aggregate = failure as AggregateError;
-		expect((aggregate.errors as Error[]).map(stage => stage.cause)).toEqual([firstFailure, secondFailure]);
-		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
-		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
-		expect(aggregate.message).toContain("Prior state may be unverified");
-		expect(aggregate.message).not.toContain("secret-settings-value");
-		expect(flush).toHaveBeenCalledTimes(2);
+		expect(failure).toBe(firstFailure);
+		expect(commit).toHaveBeenCalledTimes(1);
+		expect(flush).not.toHaveBeenCalled();
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(readDurableModelProfileOwnership(settings)).toEqual(prepared.observedOwnership);
 		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
 		expect(session.model?.id).toBe("initial");
 	});
@@ -2102,45 +2934,45 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		const original = new Error("forward flush token-secret-123");
+		const original = new Error("forward override token-secret-123");
 		const modelRollback = new Error("rollback model token-secret-123");
-		const rollbackFlush = new Error("rollback flush token-secret-123");
-		const flush = vi
-			.spyOn(settings, "flushOrThrow")
-			.mockRejectedValueOnce(original)
-			.mockRejectedValueOnce(rollbackFlush);
+		const overrideRollback = new Error("rollback override token-secret-123");
+		const override = settings.override.bind(settings);
+		vi.spyOn(settings, "override").mockImplementation((key, value) => {
+			if (key === "task.agentModelOverrides") throw original;
+			return override(key, value);
+		});
+		vi.spyOn(settings, "clearOverride").mockImplementation(() => {
+			throw overrideRollback;
+		});
 		session.restoreModelSelectionForRollback = async () => {
 			throw modelRollback;
 		};
 
 		let failure: unknown;
 		try {
-			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+			await applyPreparedModelProfileActivation(prepared);
 		} catch (error) {
 			failure = error;
 		}
 		expect(failure).toBeInstanceOf(AggregateError);
 		const aggregate = failure as AggregateError;
 		const stages = aggregate.errors as Error[];
-		expect(stages.map(stage => stage.cause)).toEqual([original, modelRollback, rollbackFlush]);
+		expect(stages.map(stage => stage.cause)).toEqual([original, overrideRollback, modelRollback]);
 		expect(stages.map(stage => stage.message)).toEqual([
-			"forward settings flush (settings write failed)",
+			"agent role overrides (operation failed)",
+			"restore model role overrides (operation failed)",
 			"restore live model (operation failed)",
-			"restore settings flush (settings write failed)",
 		]);
-		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
-		expect(aggregate.message).toContain("restore live model (operation failed)");
-		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
 		expect(aggregate.message).toContain("Prior state may be unverified");
 		expect(aggregate.message).not.toContain("token-secret-123");
-		expect(flush).toHaveBeenCalledTimes(2);
 		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
 		// The failed live-model restore leaves a different runtime model despite the restored settings.
 		expect(session.model?.id).toBe("default");
 	});
 
-	test("rolls back partial synchronous persistent writes before durable flush", async () => {
+	test("atomic rejection leaves all persisted assignments intact without raw writes or resume lineage", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated();
 		settings.set("modelRoles", { default: "provider-c/default" });
@@ -2152,15 +2984,9 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		const originalSet = settings.set.bind(settings);
-		let rejected = false;
-		settings.set = ((path: never, value: never) => {
-			if (path === "task.agentModelOverrides" && !rejected) {
-				rejected = true;
-				throw new Error("set failed");
-			}
-			return originalSet(path, value);
-		}) as typeof settings.set;
+		const set = vi.spyOn(settings, "set");
+		const unset = vi.spyOn(settings, "unset");
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("set failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
 			"set failed",
@@ -2170,9 +2996,11 @@ describe("model profile activation", () => {
 		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
 		expect(session.model?.id).toBe("initial");
 		expect(session.resumeDefaultSelectors).toEqual([]);
+		expect(set).not.toHaveBeenCalled();
+		expect(unset).not.toHaveBeenCalled();
 	});
 
-	test("rollback from an unconfigured session restores its concrete chain without inventing a resume default", async () => {
+	test("atomic rejection from an unconfigured session creates neither a chain nor a resume default", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-chain-rollback-");
 		try {
 			const previousModel = model("provider-c", "default");
@@ -2191,12 +3019,12 @@ describe("model profile activation", () => {
 				settings,
 				profileName: "profile-a",
 			});
-			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+			vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("flush failed"));
 
 			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
 				"flush failed",
 			);
-			expect(manager.buildSessionContext().configuredModelChains.default?.entries).toEqual(["provider-c/default"]);
+			expect(manager.buildSessionContext().configuredModelChains.default).toBeUndefined();
 
 			await manager.ensureOnDisk();
 			await manager.flush();
@@ -2207,9 +3035,7 @@ describe("model profile activation", () => {
 			const reopened = await SessionManager.open(sessionFile);
 			try {
 				expect(reopened.buildSessionContext().models.default).toBeUndefined();
-				expect(reopened.buildSessionContext().configuredModelChains.default?.entries).toEqual([
-					"provider-c/default",
-				]);
+				expect(reopened.buildSessionContext().configuredModelChains.default).toBeUndefined();
 			} finally {
 				await reopened.close();
 			}
@@ -2478,7 +3304,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("flush failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
 			"flush failed",
@@ -3209,34 +4035,58 @@ describe("model profile activation", () => {
 		}
 	});
 
-	test("--default persists profile default, clears persisted assignments, and flushes", async () => {
+	test("--default commits ownership, projection, cleared assignments, and effective thinking in one atomic batch without raw writes", async () => {
 		const session = fakeSession();
-		const settings = Settings.isolated();
-		const setCalls: string[] = [];
-		const originalSet = settings.set.bind(settings);
-		settings.set = ((path: never, value: never) => {
-			setCalls.push(path);
-			return originalSet(path, value);
-		}) as typeof settings.set;
-		let flushCount = 0;
-		settings.flushOrThrow = async () => {
-			flushCount += 1;
-		};
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-c/default" },
+			"task.agentModelOverrides": { critic: "provider-c/architect" },
+		});
+		const set = vi.spyOn(settings, "set");
+		const unset = vi.spyOn(settings, "unset");
+		const flush = vi.spyOn(settings, "flushOrThrow");
+		const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		const batches: Array<readonly SettingsAtomicPatch[]> = [];
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(build =>
+			commit(async current => {
+				expect(session.model?.id).toBe("initial");
+				expect(session.getActiveModelProfile()).toBeUndefined();
+				const patches = await build(current);
+				batches.push(patches);
+				return patches;
+			}),
+		);
 
 		await activateModelProfile(
 			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
-			{ persistDefault: true },
+			{ persistDefault: true, thinkingLevelOverride: ThinkingLevel.Low },
 		);
 
-		expect(setCalls).toEqual([
-			"modelRoles",
-			"task.agentModelOverrides",
-			"defaultThinkingLevel",
-			"modelProfile.default",
+		expect(batches).toEqual([
+			[
+				{
+					path: "modelProfile.ownership",
+					op: "set",
+					value: { schemaVersion: 1, version: 1, marker: { kind: "profile", profile: "profile-a" } },
+				},
+				{ path: "modelProfile.default", op: "set", value: "profile-a" },
+				{ path: "modelRoles", op: "set", value: {} },
+				{ path: "task.agentModelOverrides", op: "set", value: {} },
+				{ path: "defaultThinkingLevel", op: "set", value: ThinkingLevel.Low },
+			],
 		]);
-		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
-		expect(settings.get("modelProfile.default")).toBe("profile-a");
-		expect(flushCount).toBe(1);
+		expect(set).not.toHaveBeenCalled();
+		expect(unset).not.toHaveBeenCalled();
+		expect(flush).not.toHaveBeenCalled();
+		expect(settings.getGlobal("modelRoles")).toEqual({});
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({});
+		expect(settings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 1,
+			marker: { kind: "profile", profile: "profile-a" },
+		});
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
@@ -3256,10 +4106,10 @@ describe("model profile activation", () => {
 		});
 		const selectedModel = model("provider-c", "selected");
 		let selectionRevision = 0;
-		let flushCount = 0;
-		settings.flushOrThrow = async () => {
-			flushCount += 1;
-			if (flushCount !== 1) return;
+		let commitCount = 0;
+		const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			commitCount += 1;
 			selectionRevision += 1;
 			session.model = selectedModel;
 			session.thinkingLevel = ThinkingLevel.Medium;
@@ -3269,12 +4119,15 @@ describe("model profile activation", () => {
 			settings.setAgentModelOverride("executor", "provider-c/selected-executor");
 			settings.unset("modelProfile.default");
 			session.setConfiguredModelChain("default", ["provider-c/selected"], "model_selection");
-		};
-
-		await applyPreparedModelProfileActivation(prepared, {
-			persistDefault: true,
-			isCurrent: () => selectionRevision === 0,
+			return commit(build);
 		});
+
+		await expect(
+			applyPreparedModelProfileActivation(prepared, {
+				persistDefault: true,
+				isCurrent: () => selectionRevision === 0,
+			}),
+		).rejects.toThrow(/changed|supersed|concurrent/i);
 
 		expect(session.model).toBe(selectedModel);
 		expect(session.getConfiguredModelChainState("default")?.origin).toBe("model_selection");
@@ -3291,7 +4144,7 @@ describe("model profile activation", () => {
 		expect(settings.getOverride("modelRoles")).toBeUndefined();
 		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
-		expect(flushCount).toBe(2);
+		expect(commitCount).toBe(1);
 	});
 
 	test("missing credentials hard-block before mutation", async () => {
@@ -3484,7 +4337,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("flush failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
 			"flush failed",
@@ -4045,7 +4898,7 @@ describe("preset-equivalent profile activation", () => {
 		expect(clearCanonicalVariant).toHaveBeenCalledWith(session.sessionId);
 		expect(sticky.has(session.sessionId)).toBe(false);
 
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("flush failed"));
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
 			"flush failed",
 		);

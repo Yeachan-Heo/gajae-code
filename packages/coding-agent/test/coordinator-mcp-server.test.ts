@@ -283,7 +283,7 @@ function sharedAskGate(
 				clarification_action: "clarify",
 			},
 		},
-		options: labels.map(label => ({ value: label, label })),
+		options: labels.map(label => ({ value: { selected: [label] }, label })),
 	};
 }
 
