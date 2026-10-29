@@ -5,7 +5,8 @@ import type { DesktopAttachmentDraft } from "./AttachmentPicker";
  * Text typed while the request was in flight stays below the restored text:
  * dropping either side would lose input the user cannot recover.
  */
-export const restoreDraft = (current: string, submitted: string) => (current ? `${submitted}\n\n${current}` : submitted);
+export const restoreDraft = (current: string, submitted: string) =>
+	current ? `${submitted}\n\n${current}` : submitted;
 
 /** Re-add only the attachments that were sent and are no longer selected. */
 export const restoreAttachments = (current: DesktopAttachmentDraft[], submitted: DesktopAttachmentDraft[]) => {

@@ -61,8 +61,8 @@ import {
 import { BtwDialog } from "./BtwDialog";
 import { request, selectProject, subscribe } from "./bridge";
 import { matchesSlashFilter } from "./command-search";
-import { restoreAttachments, restoreDraft } from "./composer-draft";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
+import { restoreAttachments, restoreDraft } from "./composer-draft";
 import { ForkPanel } from "./ForkPanel";
 import { GateDialog } from "./GateDialog";
 import { McpPanel } from "./McpPanel";
