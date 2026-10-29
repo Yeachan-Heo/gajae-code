@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopModel, DesktopThinking } from "../../desktop-host/src/protocol";
-import { filterDesktopModels } from "../src/ModelPicker";
+import { filterDesktopModels, ModelPicker } from "../src/ModelPicker";
 import { ReasoningSelect } from "../src/ReasoningSelect";
 
 const models: DesktopModel[] = [
@@ -33,6 +33,18 @@ describe("desktop model and reasoning controls", () => {
 	test("treats punctuation as literal search text and preserves empty-catalog state", () => {
 		expect(filterDesktopModels(models, ".*")).toEqual([]);
 		expect(filterDesktopModels([], "shared")).toEqual([]);
+	});
+
+	test("preserves configured model identity when its catalog entry is unavailable", () => {
+		for (const catalog of [[], models]) {
+			const html = renderToStaticMarkup(<ModelPicker models={catalog} selectedId="unlisted/configured" disabled onSelect={() => {}} />);
+			expect(html).toContain('aria-label="모델 선택: unlisted/configured"');
+			expect(html).toContain('title="unlisted/configured"');
+			expect(html).toContain(">unlisted/configured</span>");
+			expect(html).not.toContain("선택되지 않음");
+		}
+		const absent = renderToStaticMarkup(<ModelPicker models={[]} onSelect={() => {}} />);
+		expect(absent).toContain('aria-label="모델 선택: 선택되지 않음"');
 	});
 
 	test("renders only SDK-declared discrete reasoning choices and actual selected value", () => {

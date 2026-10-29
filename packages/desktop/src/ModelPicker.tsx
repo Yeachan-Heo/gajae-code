@@ -44,16 +44,19 @@ export function ModelPicker({
 		// A session switch must never leave a picker attached to the previous owner.
 		setOpen(false);
 	}, [selectedId]);
+	useEffect(() => {
+		if (disabled || pending) setOpen(false);
+	}, [disabled, pending]);
 
 	return (
 		<>
 			<Button
 				className="model-trigger"
-				aria-label={`모델 선택: ${current?.name ?? "선택되지 않음"}`}
+				aria-label={`모델 선택: ${current?.name ?? selectedId ?? "선택되지 않음"}`}
 				aria-haspopup="dialog"
 				aria-expanded={open}
 				disabled={disabled || pending}
-				title={current?.id ?? "사용 가능한 모델 선택"}
+				title={current?.id ?? selectedId ?? "사용 가능한 모델 선택"}
 				onClick={() => {
 					setQuery("");
 					setLimit(PAGE_SIZE);
@@ -61,10 +64,10 @@ export function ModelPicker({
 				}}
 			>
 				<Cpu size={15} aria-hidden="true" />
-				<span>{pending ? "모델 적용 중…" : (current?.name ?? "모델 선택")}</span>
+				<span>{pending ? "모델 적용 중…" : (current?.name ?? selectedId ?? "모델 선택")}</span>
 				<ChevronDown size={13} aria-hidden="true" />
 			</Button>
-			{open && (
+			{open && !disabled && !pending && (
 				<Modal title="모델 선택" className="model-dialog" onClose={() => setOpen(false)}>
 					<p className="muted">등록·연결된 제공자에서 이 대화에 사용할 수 있는 모델만 표시합니다.</p>
 					<label className="model-search">
@@ -86,9 +89,15 @@ export function ModelPicker({
 							}}
 						/>
 					</label>
-					<p className="muted" role="status">{filtered.length}개 모델{visible.length < filtered.length ? ` · ${visible.length}개 표시` : ""}</p>
+					<p className="muted" role="status">
+						{filtered.length}개 모델{visible.length < filtered.length ? ` · ${visible.length}개 표시` : ""}
+					</p>
 					{filtered.length === 0 ? (
-						<div className="empty model-empty">{models.length === 0 ? "사용 가능한 모델이 없습니다. 설정에서 제공자를 추가하거나 계정을 연결하세요." : "일치하는 모델이 없습니다. 다른 이름이나 제공자를 검색하세요."}</div>
+						<div className="empty model-empty">
+							{models.length === 0
+								? "사용 가능한 모델이 없습니다. 설정에서 제공자를 추가하거나 계정을 연결하세요."
+								: "일치하는 모델이 없습니다. 다른 이름이나 제공자를 검색하세요."}
+						</div>
 					) : (
 						<ul
 							ref={results}
@@ -100,7 +109,15 @@ export function ModelPicker({
 								const index = buttons.findIndex(button => button === document.activeElement);
 								if (index < 0) return;
 								event.preventDefault();
-								const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)));
+								const next =
+									event.key === "Home"
+										? 0
+										: event.key === "End"
+											? buttons.length - 1
+											: Math.max(
+													0,
+													Math.min(buttons.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)),
+												);
 								buttons[next]?.focus();
 							}}
 						>
@@ -115,15 +132,34 @@ export function ModelPicker({
 											setOpen(false);
 										}}
 									>
-										<span className="model-option-main"><strong>{model.name}</strong><small>{model.provider} · {model.id}</small></span>
+										<span className="model-option-main">
+											<strong>{model.name}</strong>
+											<small>
+												{model.provider} · {model.id}
+											</small>
+										</span>
 										{selectedId === model.id && <Check size={16} aria-hidden="true" />}
 									</Button>
 								</li>
 							))}
 						</ul>
 					)}
-					{visible.length < filtered.length && <Button onClick={() => setLimit(previous => previous + PAGE_SIZE)}>모델 더 보기</Button>}
-					{onConfigureProviders && <div className="model-provider-actions"><Button disabled={disabled || pending} onClick={() => { setOpen(false); onConfigureProviders(); }}>제공자 추가·연결</Button></div>}
+					{visible.length < filtered.length && (
+						<Button onClick={() => setLimit(previous => previous + PAGE_SIZE)}>모델 더 보기</Button>
+					)}
+					{onConfigureProviders && (
+						<div className="model-provider-actions">
+							<Button
+								disabled={disabled || pending}
+								onClick={() => {
+									setOpen(false);
+									onConfigureProviders();
+								}}
+							>
+								제공자 추가·연결
+							</Button>
+						</div>
+					)}
 				</Modal>
 			)}
 		</>
