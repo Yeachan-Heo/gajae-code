@@ -1428,8 +1428,9 @@ export class DesktopHost {
 		operation: () => Promise<T>,
 		retireGates = false,
 		persistSource = true,
-		// Only a failed turn describes the conversation; a refused rename, export or
-		// read-only command keeps the session idle and reports through its request.
+		// Only a rejected turn (prompt or retry) describes the conversation. A refused
+		// rename, export, profile switch or read-only command keeps the session idle
+		// and reports through its own request, where the app renders it once.
 		recordFailure = false,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
@@ -1982,6 +1983,9 @@ export class DesktopHost {
 			},
 			method === "session.delete" || method === "session.fork",
 			method !== "session.fork" && method !== "session.delete",
+			// Retry starts a turn, so its rejection is a failed turn; every other method
+			// here is an administrative mutation whose refusal the request reports.
+			method === "session.retry",
 		);
 	}
 	/** Mirror the session's own title into the desktop catalog after a command changed it. */

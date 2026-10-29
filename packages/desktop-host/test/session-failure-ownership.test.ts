@@ -4,7 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { type CreateAgentSessionOptions, createAgentSession } from "@gajae-code/coding-agent/sdk";
+import {
+	type CreateAgentSessionOptions,
+	type CreateAgentSessionResult,
+	createAgentSession,
+} from "@gajae-code/coding-agent/sdk";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
 import {
@@ -43,12 +47,15 @@ async function launch() {
 	await setModelPresetRegistryDisabled({ agentDir: path.join(dataDir, "agent"), disabled: true });
 	const frames: DesktopFrame[] = [];
 	const captures: CreateAgentSessionOptions[] = [];
+	const results: CreateAgentSessionResult[] = [];
 	const host = new DesktopHost({
 		dataDir,
 		emit: frame => frames.push(frame),
 		createSession: async options => {
 			captures.push(options);
-			return createAgentSession(options);
+			const result = await createAgentSession(options);
+			results.push(result);
+			return result;
 		},
 	});
 	cleanups.push(async () => {
@@ -80,7 +87,7 @@ async function launch() {
 		const snapshot = await call<DesktopSnapshot>("bootstrap");
 		return snapshot.sessions.find(item => item.id === sessionId);
 	};
-	return { call, reject, open, session, captures };
+	return { call, reject, open, session, results };
 }
 
 // A refused administrative operation is an operation error, not a failed
@@ -98,15 +105,16 @@ test("a refused non-turn operation leaves the conversation idle", async () => {
 	expect(after?.title).toBe(created.title);
 });
 
-test("a refused queued-input cancellation leaves the conversation idle", async () => {
-	const { reject, open, session } = await launch();
+// The complement: a rejected turn really did run, so it stays visible on the
+// conversation even though the same text also answers the prompt request.
+test("a rejected turn marks the conversation failed", async () => {
+	const { reject, open, session, results } = await launch();
 	const created = await open();
+	vi.spyOn(results[0]!.session, "prompt").mockRejectedValue(new Error("provider unavailable"));
 
-	expect(await reject("queue.cancel", { sessionId: created.id, queueId: "missing" })).toContain(
-		"Queued input not found",
-	);
+	expect(await reject("prompt", { sessionId: created.id, text: "hello" })).toContain("provider unavailable");
 
 	const after = await session(created.id);
-	expect(after?.status).toBe("idle");
-	expect(after?.error).toBeUndefined();
+	expect(after?.status).toBe("error");
+	expect(after?.error).toContain("provider unavailable");
 });
