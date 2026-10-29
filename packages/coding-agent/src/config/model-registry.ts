@@ -489,6 +489,25 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 	)?.api as Api | undefined;
 }
 
+/**
+ * A catalog that mixes chat rows with image, audio, video or embedding rows
+ * opts into `discovery.outputModalities`: only rows whose advertised
+ * `output_modalities` all fall inside that list are admitted, so non-chat
+ * entries never become chat-completion models. Rows without the field are
+ * not admitted either, because they cannot be classified. Providers without
+ * the setting keep admitting every safe row.
+ */
+function admitsDiscoveredOutputModalities(discovery: ProviderDiscovery, item: Record<string, unknown>): boolean {
+	const allowed = discovery.outputModalities;
+	if (allowed === undefined) return true;
+	const advertised = item.output_modalities;
+	return (
+		Array.isArray(advertised) &&
+		advertised.length > 0 &&
+		advertised.every(modality => typeof modality === "string" && allowed.includes(modality))
+	);
+}
+
 function resolveModelApiOverrideFromDiscovery(
 	providerApi: Api,
 	discovery: ProviderDiscovery,
@@ -1296,6 +1315,9 @@ function fingerprintConfiguredDiscoveryRequestShape(
 		api: providerConfig.api,
 		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
 		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+		...(providerConfig.discovery.outputModalities
+			? { outputModalities: [...providerConfig.discovery.outputModalities].sort() }
+			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
@@ -5969,6 +5991,7 @@ export class ModelRegistry {
 			// check, so IDs that appear only between requests cannot enter
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			if (!admitsDiscoveredOutputModalities(providerConfig.discovery, item)) continue;
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same
