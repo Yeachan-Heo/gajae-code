@@ -1,3 +1,4 @@
+import type * as stream from "node:stream";
 import type { DesktopFrame } from "./protocol";
 import { MAX_FRAME_BYTES } from "./protocol";
 
@@ -27,6 +28,30 @@ export interface FrameWriterOptions {
 	/** Maximum number of bytes waiting behind the sink before the writer gives up. */
 	maxBacklogBytes?: number;
 	onError?: (error: unknown) => void;
+}
+
+export function createWritableFrameSink(writable: stream.Writable): (bytes: Uint8Array) => Promise<void> {
+	const write = writable.write.bind(writable);
+	return bytes => {
+		const result = Promise.withResolvers<void>();
+		const onError = (error: Error) => result.reject(error);
+		writable.once("error", onError);
+		try {
+			write(bytes, error => {
+				if (error) {
+					// Node can call back before emitting the corresponding error event.
+					result.reject(error);
+				} else {
+					writable.removeListener("error", onError);
+					result.resolve();
+				}
+			});
+		} catch (error) {
+			writable.removeListener("error", onError);
+			result.reject(error);
+		}
+		return result.promise;
+	};
 }
 
 const DEFAULT_BACKLOG_BYTES = 64 * 1024 * 1024;

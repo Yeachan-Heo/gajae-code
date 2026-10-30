@@ -9,7 +9,7 @@
 - Retain uncertain deliveries across reloads for explicit recovery without automatic replay; keep acknowledgment failures from blocking later draft edits and sends.
 - Scope known-unsent repair and disposal to the exact delivery, so one failed local write cannot re-arm an already accepted message or permanently block the session.
 - Preserve definitive queued SDK refusals and causal error ownership instead of treating all removed queue items as delivered or duplicating unrelated errors.
-- Register owned SDK teardown and final protocol flushing with the shared bounded signal-exit policy; drain intentional QA shutdown and redact fixture tokens from failure diagnostics.
+- Register owned SDK teardown and final protocol flushing with the shared bounded signal-exit policy; drain intentional QA shutdown and redact fixture tokens from failure diagnostics. Write native host frames through the captured stdout stream to prevent pipe-pressure corruption.
 - Find slash commands by the form users type: the command search now accepts `/model`, not only `model`.
 - Report a completed conversation export as a message with its HTML path instead of the raw protocol object.
 - Render boolean settings as checkboxes and numeric settings as decimal inputs instead of free-text fields.

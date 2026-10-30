@@ -1,19 +1,16 @@
 import "./environment";
-import { createFrameWriter } from "./frame-writer";
+import { createFrameWriter, createWritableFrameSink } from "./frame-writer";
 import { DesktopHost } from "./host";
 import { registerDesktopProcessShutdown } from "./process-lifecycle";
 import type { DesktopFrame, DesktopRequest } from "./protocol";
 import { serveProtocol } from "./transport";
 
 export async function main(): Promise<void> {
-	// Reserve stdout for frames, including when SDK dependencies use console/stdout diagnostics.
+	// Capture the frame channel before redirecting diagnostics away from stdout.
+	const writeFrame = createWritableFrameSink(process.stdout);
 	process.stdout.write = process.stderr.write.bind(process.stderr);
-	// stdout is a non-blocking pipe owned by the desktop app: write frames
-	// asynchronously so a frame larger than the pipe buffer is never truncated.
 	const frames = createFrameWriter({
-		write: async bytes => {
-			await Bun.write(Bun.stdout, bytes);
-		},
+		write: writeFrame,
 		onError: error => {
 			// The frame channel is gone; report it and stop pretending to serve.
 			process.stderr.write(`desktop host frame channel failed: ${String(error)}\n`);
