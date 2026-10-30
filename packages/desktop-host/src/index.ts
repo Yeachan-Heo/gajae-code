@@ -1,6 +1,7 @@
 import "./environment";
 import { createFrameWriter } from "./frame-writer";
 import { DesktopHost } from "./host";
+import { registerDesktopProcessShutdown } from "./process-lifecycle";
 import type { DesktopFrame, DesktopRequest } from "./protocol";
 import { serveProtocol } from "./transport";
 
@@ -33,26 +34,34 @@ export async function main(): Promise<void> {
 					close: () => host.close(),
 				}
 			: host;
-	const stop = () => {
-		void host
-			.close()
-			.catch(() => {
-				process.exitCode = 1;
-			})
-			.finally(() => process.stdin.destroy());
-	};
-	process.once("SIGINT", stop);
-	process.once("SIGTERM", stop);
+	const drained = Promise.withResolvers<void>();
+	let stopping = false;
+	const unregisterShutdown = registerDesktopProcessShutdown({
+		close: () => {
+			stopping = true;
+			return host.close();
+		},
+		flush: () => drained.promise,
+		onError: () => {
+			process.stderr.write("desktop host shutdown failed\n");
+			process.exitCode = 1;
+		},
+	});
 	try {
 		await serveProtocol(process.stdin, traced, emit);
 	} catch {
-		emit({ type: "fatal", error: "Desktop host transport failed" });
-		process.exitCode = 1;
+		if (!stopping) {
+			emit({ type: "fatal", error: "Desktop host transport failed" });
+			process.exitCode = 1;
+		}
 	} finally {
-		process.removeListener("SIGINT", stop);
-		process.removeListener("SIGTERM", stop);
-		// Frames queued behind a slow parent must reach it before exit.
-		await frames.flush();
+		try {
+			// Frames queued behind a slow parent must reach it before exit.
+			await frames.flush();
+		} finally {
+			drained.resolve();
+			unregisterShutdown();
+		}
 	}
 }
 
