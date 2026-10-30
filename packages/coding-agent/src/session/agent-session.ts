@@ -98,6 +98,7 @@ import {
 } from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
+	AssistantMessageEvent,
 	AttemptScopeRef,
 	Context,
 	DeveloperMessage,
@@ -236,7 +237,7 @@ import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
 import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/config-hot-reload";
 import {
-	activateModelProfile,
+	applyPreparedModelProfileActivation,
 	applyModelProfileRuntimeBindings,
 	finishPreparedModelProfileActivation,
 	materializeActiveModelProfileAssignment,
@@ -255,7 +256,9 @@ import {
 } from "../config/model-profile-contract";
 import {
 	commitDurableModelProfileOwnership,
+	type DurableModelProfileOwnership,
 	InvalidModelProfileOwnershipError,
+	ModelProfileApplyCommittedError,
 	ModelProfileOwnershipConflictError,
 	readDurableModelProfileOwnership,
 } from "../config/model-profile-ownership";
@@ -982,6 +985,16 @@ export interface RetainedMemorySample {
 	tuiCachedRenderBytes?: number;
 }
 
+/** Read-only lifecycle authority, independent of UI identity notifications. */
+export interface AgentSessionLifecycleState {
+	/** Committed session-transition generation; catalog-preserving compaction leaves it unchanged. */
+	readonly generation: number;
+	/** True throughout transition preparation and cleanup, including handoff. */
+	readonly transitioning: boolean;
+	/** True as soon as disposal starts, including incomplete or failed teardown. */
+	readonly disposed: boolean;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -1238,6 +1251,9 @@ export interface PromptOptions {
 	 * agent execution begins. SDK bus installs a closure that fsyncs acceptance.
 	 */
 	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Ordinary model prompt's core acceptance observer, before agent_start; observer errors are contained.
+	 * Does not fire for locally handled commands or skill invocations. Not a persistence fence. */
+	onRunAccepted?: (handle: AttemptRunHandle) => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
@@ -1809,6 +1825,16 @@ export type EphemeralTurnArgs =
 interface EphemeralTurnResult {
 	replyText: string;
 	assistantMessage: AssistantMessage;
+}
+
+/** Cancellation alone cannot prove that the provider iterator has closed. */
+class BtwTurnCleanupError extends Error {
+	readonly code = "unknown_effect";
+
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "BtwTurnCleanupError";
+	}
 }
 
 /**
@@ -2802,12 +2828,13 @@ export interface SessionMcpControlResult {
 }
 export interface SessionMcpControlPort {
 	listDeclaredServers(): Promise<SessionMcpDeclaredServer[]>;
+	getGeneration(): number;
 	isSettled(): boolean;
 	getFailedServers(): ReadonlySet<string>;
 	markFailed(name: string): void;
 	clearFailed(name: string): void;
-	/** Reconnect autoload servers in the background; settles after their tools are published. */
 	restoreAutoload(names: readonly string[]): Promise<void>;
+	disposeRestoration(): Promise<void>;
 }
 export interface SessionMcpStatusSnapshot {
 	readonly available: boolean;
@@ -2955,6 +2982,7 @@ export interface PreparedProfileModelSelection {
 	readonly committedThinkingLevel: ThinkingLevel | undefined;
 	readonly previousModel: Model | undefined;
 	readonly previousThinkingLevel: ThinkingLevel | undefined;
+	readonly previousThinkingLevelMutationRevision: number;
 	readonly previousEditMode: EditMode;
 	readonly signal: AbortSignal | undefined;
 }
@@ -3152,6 +3180,13 @@ export class AgentSession {
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#userModelSelectionRevision = 0;
+	#pendingProfileSelectionIntents = new Set<{ current: boolean }>();
+	#profileSelectionPredecessor: Promise<{
+		ancestors: DurableModelProfileOwnership[];
+		ownership: DurableModelProfileOwnership;
+		runtime: unknown;
+		thinkingIntentRevision: number;
+	} | undefined> = Promise.resolve(undefined);
 	/** Mutation-order sequence for model choices that may enter the model MRU. */
 	#modelSelectionUsageSequence = 0;
 	/** Sequence of the newest choice this session recorded in the model MRU. */
@@ -4683,6 +4718,12 @@ export class AgentSession {
 	#sessionTransitionKind: string | undefined;
 	// Detects transitions that commit while an async preflight is staging.
 	#sessionTransitionGeneration = 0;
+	readonly #btwScopes = new WeakMap<BtwConversationScope, { generation: number; sessionId: string }>();
+	#btwGeneration = 0;
+	#btwAbortController = new AbortController();
+	/** Actual execution/iterator owners, not the abort-raced public promises. */
+	readonly #btwTurns = new Set<Promise<void>>();
+	readonly #btwCleanupFailures: unknown[] = [];
 	#sessionTransitionCommitted = false;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
@@ -4771,15 +4812,30 @@ export class AgentSession {
 		const completion = Promise.withResolvers<void>();
 		this.#sessionTransitionCompletion = completion.promise;
 		this.#resolveSessionTransitionCompletion = completion.resolve;
+		if (kind !== "mcp-control" && kind !== "compact" && kind !== "auto-compaction") {
+			// Fence already-admitted preflight/stream callbacks before transition awaits.
+			// A cancelled transition keeps its scopes valid, but not its aborted work.
+			this.#btwAbortController.abort(new Error("The /btw session was retired."));
+			this.#btwAbortController = new AbortController();
+		}
 		this.#coordinatorPersistGeneration += 1;
 		this.#wakeFollowUpReservationTransitionWaiters();
 	}
 
+	async #settleBtwForSessionTransition(): Promise<void> {
+		// Call only after cancellation gates and main-agent abort, but before any
+		// predecessor history/identity mutation. A bounded failure retains the real
+		// work owner and leaves the predecessor generation valid.
+		await awaitBtwSettlement(this.#joinBtwTurns());
+	}
+
 	#commitSessionTransition(): void {
-		if (this.#sessionTransitionCommitted) return;
-		this.#sessionTransitionCommitted = true;
-		this.#sessionTransitionGeneration += 1;
-		this.#discoveredToolActivationChain = Promise.resolve();
+		if (!this.#sessionTransitionCommitted) {
+			this.#sessionTransitionCommitted = true;
+			this.#sessionTransitionGeneration += 1;
+			this.#discoveredToolActivationChain = Promise.resolve();
+			if (this.#sessionTransitionKind !== "mcp-control") this.#btwGeneration += 1;
+		}
 	}
 
 	#commitCatalogPreservingTransition(): void {
@@ -7621,6 +7677,11 @@ export class AgentSession {
 
 	/** Notify UI projections after a committed session-identity transition. */
 	async notifySessionIdentityChanged(): Promise<void> {
+		const registry = this.#agentRegistry;
+		const agentId = this.#agentId;
+		if (registry && agentId !== undefined && registry.get(agentId)?.session === this) {
+			registry.attachSession(agentId, this, this.sessionManager.getSessionFile() ?? null);
+		}
 		for (const listener of [...this.#sessionIdentityChangeListeners]) {
 			try {
 				await listener();
@@ -11431,7 +11492,8 @@ export class AgentSession {
 
 	/** Join the retained teardown owner without allocating another public deadline. */
 	awaitDisposeCompletion(): Promise<void> {
-		return this.#disposeRunPromise ?? this.dispose();
+		if (!this.#disposeRunPromise) void this.dispose().catch(() => {});
+		return this.#disposeRunPromise!;
 	}
 
 	setDisposeTimeoutForTests(timeoutMs: number): void {
@@ -11493,8 +11555,12 @@ export class AgentSession {
 				await Promise.allSettled([...this.#coordinatorEventHandlers]);
 			}
 		};
+		// A reset can await restoration metadata or connector work. Start cancellation
+		// before joining admission/retirement, not from later tool cleanup.
+		const restorationDisposal = this.#sessionMcpControlPort?.disposeRestoration();
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		await awaitDisposeStep("session admission close", admissionClosed);
+		await awaitDisposeStep("session MCP restoration", restorationDisposal ?? Promise.resolve(), true);
 		if (this.#sessionTransitionKind === "mcp-control") {
 			await awaitDisposeStep("active MCP control", this.#sessionTransitionCompletion, true);
 		}
@@ -11535,6 +11601,9 @@ export class AgentSession {
 		if (!disposeIdleSettled) {
 			this.#forceSessionRecovery();
 		}
+		// The public disposal deadline is bounded; this retained owner keeps joining
+		// side preflight/iterator work without delaying the main-agent abort above.
+		await awaitDisposeStep("/btw turns", this.#joinBtwTurns(), true);
 		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep(
 			"active auto-compaction",
@@ -11868,6 +11937,8 @@ export class AgentSession {
 				await this.#waitForPostPromptTasksBeforeSelectionFence(ignoreSelectionFenceGeneration);
 			}
 			await this.#waitForSessionSettlement(ignoreSelectionFenceGeneration);
+			// Model/config selections must not wait on a frozen side conversation.
+			if (ignoreSelectionFenceGeneration === undefined) await awaitBtwSettlement(this.#joinBtwTurns());
 			const hasBlockingPostPromptTasks =
 				ignoreSelectionFenceGeneration === undefined
 					? this.#postPromptTasks.size > 0
@@ -11881,7 +11952,8 @@ export class AgentSession {
 				!this.#retryPromise &&
 				!this.#ttsrResumePromise &&
 				!hasBlockingPostPromptTasks &&
-				!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)
+				!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration) &&
+				(ignoreSelectionFenceGeneration !== undefined || this.#btwTurns.size === 0)
 			)
 				return;
 			if (ignoreSelectionFenceGeneration === undefined && hasBlockingPostPromptTasks && this.#postPromptTasksPromise)
@@ -12421,6 +12493,72 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Run a trusted Host-JS MCP mutation under the existing control admission and
+	 * transition exclusion. This grants neither renderer authority nor resource
+	 * settlement proof; the callback must validate its manager's exact target.
+	 */
+	async withMcpControlAdmission<T>(
+		expectedGeneration: number,
+		body: (signal: AbortSignal) => Promise<T>,
+	): Promise<T> {
+		this.#assertExternalSessionIngress();
+		if (this.#activeSessionAdmission || this.#pendingSelectionFences > 0)
+			throw this.#sessionAdmissionBusyError();
+		const sessionManager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerSessionId = sessionManager.getSessionId();
+		const sessionFile = sessionManager.getSessionFile();
+		const manager = this.#ownedMcpManager;
+		const replacement = this.#mcpManagerReplacement;
+		let transitionCompletion = this.#sessionTransitionCompletion;
+		const abortEpoch = this.#abortAdmissionEpoch;
+		const promptGeneration = this.#promptGeneration;
+		const selectionGeneration = this.#selectionFenceGeneration;
+		const userSelectionRevision = this.#userModelSelectionRevision;
+		const signal = AbortSignal.any([
+			this.#disposeAbortController.signal,
+			this.#promptPreflightAbortController.signal,
+		]);
+		const assertCurrent = (entered = false) => {
+			signal.throwIfAborted();
+			this.#assertSessionAdmissionOpen();
+			if (
+				!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0 ||
+				this.#sessionTransitionGeneration !== expectedGeneration ||
+				this.sessionManager !== sessionManager || this.sessionId !== sessionId ||
+				sessionManager.getSessionId() !== managerSessionId ||
+				sessionManager.getSessionFile() !== sessionFile ||
+				this.#ownedMcpManager !== manager || this.#mcpManagerReplacement !== replacement ||
+				this.#sessionTransitionCompletion !== transitionCompletion ||
+				this.#abortAdmissionEpoch !== abortEpoch || this.#promptGeneration !== promptGeneration ||
+				this.#selectionFenceGeneration !== selectionGeneration ||
+				this.#userModelSelectionRevision !== userSelectionRevision
+			) {
+				throw Object.assign(new Error("Session changed before MCP control could complete."), { code: "resource_gone" });
+			}
+			if (this.#handoffTransitionActive ||
+				this.#sessionTransitionKind !== (entered ? "mcp-control" : undefined))
+				throw this.#sessionAdmissionBusyError();
+		};
+		assertCurrent();
+		return this.#withSessionAdmission("mcp-control", async () => {
+			await awaitPromptInvocationPreflight(replacement, signal);
+			assertCurrent();
+			this.#beginSessionTransition("mcp-control");
+			transitionCompletion = this.#sessionTransitionCompletion;
+			try {
+				assertCurrent(true);
+				const result = await body(signal);
+				assertCurrent(true);
+				return result;
+			} finally {
+				// No committed session transition: MCP mutation does not advance identity.
+				this.#endSessionTransition();
+			}
+		}, signal);
+	}
+
 	get hasExactMcpControls(): boolean {
 		return getExactMcpControls(this) !== undefined;
 	}
@@ -12639,24 +12777,82 @@ export class AgentSession {
 	async #prepareSessionMcpReset(): Promise<PreparedExactMcpRetirement | undefined> {
 		const port = this.#sessionMcpControlPort;
 		if (!this.hasSessionMcpControls || this.#sessionMcpOverrides.size === 0 || !port) return undefined;
+		const manager = this.#sessionMcpManager();
+		if (!manager) return undefined;
 		const overrides = new Map(this.#sessionMcpOverrides);
+		const portGeneration = port.getGeneration();
+		const completion = Promise.withResolvers<void>();
+		this.#exactMcpRetirementCompletion = completion.promise;
+		let finished = false;
+		const canCommit = (): boolean =>
+			!finished &&
+			!this.#isDisposed &&
+			manager === this.#sessionMcpManager() &&
+			port.getGeneration() === portGeneration &&
+			overrides.size === this.#sessionMcpOverrides.size &&
+			[...overrides].every(([name, value]) => this.#sessionMcpOverrides.get(name) === value);
+		const assertCurrent = (): void => {
+			if (!canCommit()) throw new Error("Session MCP reset ownership changed before completion");
+		};
+		const finish = (): void => {
+			finished = true;
+			if (this.#exactMcpRetirementCompletion === completion.promise) this.#exactMcpRetirementCompletion = undefined;
+			completion.resolve();
+		};
+		const sessionManager = this.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const sessionFile = sessionManager.getSessionFile();
+		const cwd = sessionManager.getCwd();
+		const generation = this.#sessionTransitionGeneration;
+		const predecessorIsCurrent = (): boolean =>
+			canCommit() &&
+			this.sessionManager === sessionManager &&
+			sessionManager.getSessionId() === sessionId &&
+			sessionManager.getSessionFile() === sessionFile &&
+			sessionManager.getCwd() === cwd &&
+			this.#sessionTransitionGeneration === generation;
+		const assertResetOwner = (): void => {
+			assertCurrent();
+			if (!predecessorIsCurrent()) throw new Error("Session identity changed while resetting MCP controls");
+		};
+		try {
+			// Complete fallible work while the caller still owns its pre-adoption identity.
+			// Keep intent until synchronous commit, so a later adoption failure stays retryable.
+			assertResetOwner();
+			const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
+			const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
+			for (const name of disconnect) {
+				await manager.disconnectServer(name);
+				assertResetOwner();
+			}
+			await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false });
+			assertResetOwner();
+			await port.restoreAutoload(restore);
+			assertResetOwner();
+			if (restore.length > 0) {
+				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false });
+				assertResetOwner();
+			}
+		} catch (error) {
+			if (predecessorIsCurrent()) for (const name of overrides.keys()) port.markFailed(name);
+			finish();
+			throw error;
+		}
 		return {
-			canCommit: () => true,
+			canCommit: predecessorIsCurrent,
 			commit: async () => {
-				this.#sessionMcpOverrides.clear();
-				const manager = this.#sessionMcpManager();
-				if (!manager) return;
-				const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
-				const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
-				for (const name of disconnect) {
-					await manager.disconnectServer(name).catch(() => {});
-					port.clearFailed(name);
+				try {
+					assertCurrent();
+					for (const name of overrides.keys()) {
+						port.clearFailed(name);
+						this.#sessionMcpOverrides.delete(name);
+					}
+				} finally {
+					finish();
 				}
-				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
-				// The replacement session's first turn waits for the restored tools.
-				if (restore.length > 0) this.extendStartupTurnBarrier(port.restoreAutoload(restore));
+
 			},
-			abort: async () => {},
+			abort: async () => finish(),
 		};
 	}
 
@@ -14360,6 +14556,15 @@ export class AgentSession {
 		return this.#providerSessionId ?? this.sessionManager.getSessionId();
 	}
 
+	/** Frozen snapshot of existing session-transition and disposal state. */
+	get sessionLifecycle(): AgentSessionLifecycleState {
+		return Object.freeze({
+			generation: this.#sessionTransitionGeneration,
+			transitioning: this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive,
+			disposed: this.#isDisposed,
+		});
+	}
+
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;
@@ -15293,7 +15498,17 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		try {
-			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
+			const observer = options?.onRunAccepted;
+			await this.#promptInternal(text, observer ? {
+				...options,
+				onRunAccepted: handle => {
+					try {
+						const result: unknown = observer(handle);
+						if (result !== undefined) void Promise.resolve(result).catch(() => logger.warn("Prompt run acceptance observer failed"));
+					}
+					catch { logger.warn("Prompt run acceptance observer failed"); }
+				},
+			} : options, releaseStartupPromptWaiter);
 			// Agent-core converts listener failures into an aborted response. Keep a
 			// rejected persistence fence typed at the public prompt boundary instead
 			// of reporting the misleading provider-level "Request was aborted".
@@ -15383,13 +15598,13 @@ export class AgentSession {
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
-			const handled = await this.#tryExecuteExtensionCommand(text);
+			const handled = await this.#tryExecuteExtensionCommand(text, hasUsableImage);
 			if (handled) {
 				return;
 			}
 
 			// Try custom commands (TypeScript slash commands)
-			const customResult = await this.#tryExecuteCustomCommand(text);
+			const customResult = await this.#tryExecuteCustomCommand(text, hasUsableImage);
 			if (customResult !== null) {
 				if (customResult === "") {
 					return;
@@ -16296,7 +16511,7 @@ export class AgentSession {
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
-	async #tryExecuteExtensionCommand(text: string): Promise<boolean> {
+	async #tryExecuteExtensionCommand(text: string, hasImages: boolean): Promise<boolean> {
 		if (!this.#extensionRunner) return false;
 
 		// Parse command name and args
@@ -16306,6 +16521,7 @@ export class AgentSession {
 
 		const command = this.#extensionRunner.getCommand(commandName);
 		if (!command) return false;
+		if (hasImages) throw Object.assign(new Error("Local slash commands do not accept image attachments."), { code: "invalid_input" });
 
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this.#extensionRunner.createCommandContext();
@@ -16450,7 +16666,7 @@ export class AgentSession {
 	 * Try to execute a custom command. Returns the prompt string if found, null otherwise.
 	 * If the command returns void, returns empty string to indicate it was handled.
 	 */
-	async #tryExecuteCustomCommand(text: string): Promise<string | null> {
+	async #tryExecuteCustomCommand(text: string, hasImages: boolean): Promise<string | null> {
 		if (this.#customCommands.length === 0 && this.#mcpPromptCommands.length === 0) return null;
 
 		// Parse command name and args
@@ -16463,6 +16679,7 @@ export class AgentSession {
 			this.#customCommands.find(c => c.command.name === commandName) ??
 			this.#mcpPromptCommands.find(c => c.command.name === commandName);
 		if (!loaded) return null;
+		if (hasImages) throw Object.assign(new Error("Local slash commands do not accept image attachments."), { code: "invalid_input" });
 
 		// Get command context from extension runner (includes session control methods)
 		const baseCtx = this.#createCommandContext();
@@ -17839,12 +18056,19 @@ export class AgentSession {
 				preflightSignal: options?.preflightSignal,
 			} as InternalPromptOptions);
 		} finally {
-			// A preflight fence or queue admission error can occur after the tracked
-			// state is allocated but before a queue callback binds its exact message.
-			// No handle escaped in that case, so discard the unreachable state rather
-			// than retaining an unresolved submission forever.
-			if (trackedQueuedInput?.message === undefined) {
-				if (trackedQueuedInput) this.#settleTrackedQueuedInputRemoved(trackedQueuedInput, "removed");
+			// Only discard an unreachable, unadmitted state. Execution settlement
+			// deliberately clears message too; own-run promotion can already own the
+			// state before it receives an attempt scope. Neither is queue removal.
+			if (
+				trackedQueuedInput &&
+				trackedQueuedInput.message === undefined &&
+				!trackedQueuedInput.executionSettled &&
+				!trackedQueuedInput.terminalSettled &&
+				!this.#trackedQueuedInputsAwaitingOwnRun.has(trackedQueuedInput) &&
+				trackedQueuedInput.attemptScope === undefined &&
+				trackedQueuedInput.logicalRunId === undefined
+			) {
+				this.#settleTrackedQueuedInputRemoved(trackedQueuedInput, "removed");
 			}
 			releaseFollowUpReservation();
 		}
@@ -19381,6 +19605,7 @@ export class AgentSession {
 		this.#beginSessionTransition("new-session");
 		const previousSessionId = this.sessionId;
 		const transition = this.#runNewSessionTransition(options).finally(async () => {
+			if (!this.#isDisposed) this.#reconnectToAgent();
 			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		});
 		this.#newSessionTransition = transition;
@@ -19440,12 +19665,12 @@ export class AgentSession {
 					await Bun.sleep(10);
 				}
 			}
+			await this.#settleBtwForSessionTransition();
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
-			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
@@ -19470,6 +19695,7 @@ export class AgentSession {
 				await exactRetirement?.abort();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
+			this.agent.reset();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -19524,6 +19750,7 @@ export class AgentSession {
 				return false;
 			}
 
+			await this.#settleBtwForSessionTransition();
 			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId))) {
 				throw new Error("Owned async deliveries did not settle before session replacement.");
 			}
@@ -19682,6 +19909,7 @@ export class AgentSession {
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
 			await this.abort();
+			await this.#settleBtwForSessionTransition();
 			this.#cancelOwnAsyncJobs();
 			this.#suppressOwnAsyncJobDeliveries();
 			this.yieldQueue.clear();
@@ -19709,9 +19937,9 @@ export class AgentSession {
 			this.#todoReminderCount = 0;
 			this.#planReferenceSent = false;
 			this.#planReferencePath = "local://PLAN.md";
-			this.#reconnectToAgent();
 			return true;
 		} finally {
+			if (!this.#isDisposed) this.#reconnectToAgent();
 			this.#endSessionTransition();
 		}
 	}
@@ -19764,6 +19992,7 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
+			await this.#settleBtwForSessionTransition();
 
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
@@ -20018,6 +20247,11 @@ export class AgentSession {
 		return this.#userModelSelectionRevision;
 	}
 
+	/** Revision fence that distinguishes even same-value thinking intent during profile rollback. */
+	getThinkingLevelMutationRevision(): number {
+		return this.#thinkingLevelMutationRevision;
+	}
+
 	/** Latest concrete user choice that seeded or cleared the session's sticky canonical variant. */
 	getUserCanonicalVariantSelection(): { revision: number; canonicalVariant: string | undefined } {
 		return {
@@ -20029,6 +20263,7 @@ export class AgentSession {
 	/** Fence deferred startup profile recovery before an explicit control-surface selection. */
 	markUserModelSelection(): void {
 		this.#userModelSelectionRevision++;
+		for (const intent of this.#pendingProfileSelectionIntents) intent.current = false;
 	}
 
 	getConfigurationPaths(): ConfigHotReloadPaths | undefined {
@@ -20910,16 +21145,7 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
-		this.markUserModelSelection();
-		await this.withSdkControlMutation(() =>
-			activateModelProfile({
-				session: this,
-				modelRegistry: this.#modelRegistry,
-				settings: this.settings,
-				profileName,
-			}),
-		);
-		return this.getActiveModelProfile() === profileName;
+		return (await this.setDefaultModelProfileForControl(profileName)).changed;
 	}
 
 	/**
@@ -20954,45 +21180,197 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
-		this.markUserModelSelection();
-		// Do not hold selection admission while waiting for a scheduled continuation:
-		// the continuation may need prompt admission to settle the current turn.
-		await this.waitForIdle();
-		const canonicalName = await this.#withSessionAdmission("selection", async () => {
-			const profiles = this.#modelRegistry.getModelProfiles();
-			let canonical: string;
-			try {
-				canonical = validateModelProfileName(profileName, profiles, this.#modelRegistry.getError?.());
-			} catch (error) {
-				if (error instanceof UnknownModelProfileError || error instanceof ModelProfileRegistryError)
-					throw Object.assign(new Error(error.message), { code: "invalid_input" });
-				throw error;
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		this.#assertSessionAdmissionOpen();
+		const expectedSessionId = this.sessionId;
+		const expectedTransitionGeneration = this.#sessionTransitionGeneration;
+		const expectedAbortEpoch = this.#abortAdmissionEpoch;
+		const disposalSignal = this.#disposeAbortController.signal;
+		// Observe before any queue/idle/preflight yield. Never refresh after a conflict.
+		let observedOwnership = readDurableModelProfileOwnership(this.settings);
+		const observedAtRequest = observedOwnership;
+		const captureRuntime = () => ({
+			model: this.model,
+			thinkingRevision: this.#thinkingLevelLiveMutationRevision,
+			thinkingIntentRevision: this.#thinkingLevelMutationRevision,
+			modelRoles: structuredClone(this.settings.getOverride("modelRoles")),
+			agentOverrides: structuredClone(this.settings.getOverride("task.agentModelOverrides")),
+			globalRoles: structuredClone(this.settings.getGlobal("modelRoles")),
+			globalAgentOverrides: structuredClone(this.settings.getGlobal("task.agentModelOverrides")),
+			globalThinking: this.settings.getGlobal("defaultThinkingLevel"),
+			installed: this.getProfileInstalledOverrideState(),
+		});
+		let expectedRuntime: unknown = captureRuntime();
+		let expectedThinkingIntentRevision = this.#thinkingLevelMutationRevision;
+		const intent = { current: true };
+		// A queued local profile is a causal successor, not a cancellation of its
+		// predecessor. Concrete user intent invalidates these tokens via markUserModelSelection.
+		this.#userModelSelectionRevision++;
+		this.#pendingProfileSelectionIntents.add(intent);
+		const predecessor = this.#profileSelectionPredecessor;
+		const completion = Promise.withResolvers<{
+			ancestors: DurableModelProfileOwnership[];
+			ownership: DurableModelProfileOwnership;
+			runtime: unknown;
+			thinkingIntentRevision: number;
+		} | undefined>();
+		this.#profileSelectionPredecessor = completion.promise;
+		const selectionTransaction = Symbol("model-profile-selection");
+		const priorSelectionFence = this.#selectionFenceTail;
+		const selectionFence = Promise.withResolvers<void>();
+		const selectionFenceGeneration = ++this.#selectionFenceGeneration;
+		this.#pendingSelectionFences++;
+		if (this.#oldestPendingSelectionFenceGeneration === 0)
+			this.#oldestPendingSelectionFenceGeneration = selectionFenceGeneration;
+		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
+		void this.#selectionFenceTail.catch(() => {});
+		const assertBound = () => {
+			disposalSignal.throwIfAborted();
+			if (
+				!intent.current ||
+				this.sessionId !== expectedSessionId ||
+				this.#sessionTransitionGeneration !== expectedTransitionGeneration ||
+				this.#abortAdmissionEpoch !== expectedAbortEpoch ||
+				this.#sessionTransitionKind !== undefined ||
+				this.#handoffTransitionActive
+			) {
+				throw new Error("Session changed or profile activation was superseded");
 			}
-			const priorModel = this.model;
-			options?.onBeforeActivation?.();
-			await activateModelProfile(
-				{
+		};
+		const assertRuntime = () => {
+			assertBound();
+			if (!util.isDeepStrictEqual(captureRuntime(), expectedRuntime))
+				throw new Error("Session model, thinking, or role intent changed while selecting profile");
+		};
+		let prepared: PreparedModelProfileActivation | undefined;
+		let applyStarted = false;
+		let applyCompleted = false;
+		let publication: { runtime: unknown; thinkingIntentRevision: number } | undefined;
+		const selectionIsBound = () => {
+			try {
+				assertBound();
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		let ancestors = [observedAtRequest];
+		try {
+			await priorSelectionFence;
+			const receipt = await predecessor;
+			assertBound();
+			if (receipt?.ancestors.some(ancestor => util.isDeepStrictEqual(ancestor, observedAtRequest))) {
+				observedOwnership = receipt.ownership;
+				expectedRuntime = receipt.runtime;
+				expectedThinkingIntentRevision = receipt.thinkingIntentRevision;
+				ancestors = [...receipt.ancestors, receipt.ownership];
+			}
+			assertRuntime();
+			this.#selectionAwaitingMutationTransaction = selectionTransaction;
+			// Idle draining must remain outside the held mutation admission.
+			await awaitPromptInvocationPreflight(this.waitForIdle(selectionFenceGeneration), disposalSignal);
+			assertRuntime();
+			return await this.#withSessionAdmission("selection", async () => {
+				assertRuntime();
+				let canonical: string;
+				try {
+					canonical = validateModelProfileName(
+						profileName,
+						this.#modelRegistry.getModelProfiles(),
+						this.#modelRegistry.getError?.(),
+					);
+				} catch (error) {
+					if (error instanceof UnknownModelProfileError || error instanceof ModelProfileRegistryError)
+						throw Object.assign(new Error(error.message), { code: "invalid_input" });
+					throw error;
+				}
+				options?.onBeforeActivation?.();
+				assertRuntime();
+				prepared = await prepareModelProfileActivation({
 					session: this,
 					modelRegistry: this.#modelRegistry,
 					settings: this.settings,
 					profileName: canonical,
-				},
-				{
+					signal: disposalSignal,
+				});
+				assertRuntime();
+				applyStarted = true;
+				await applyPreparedModelProfileActivation(prepared, {
 					persistDefault: options?.persistDefault ?? false,
 					thinkingLevelOverride: options?.thinkingLevelOverride,
-				},
-			);
-			options?.onAfterActivation?.();
-			// A role-only profile has no default model, so the activation never
-			// calls `setModelTemporary` — the only place that consumes the
-			// thinking override. Apply the override to the existing model so the
-			// typed synthetic result (e.g. `off`) is honest.
-			if (options?.thinkingLevelOverride !== undefined && this.model === priorModel) {
-				this.setThinkingLevel(options.thinkingLevelOverride);
+					observedOwnership,
+					signal: disposalSignal,
+					validateCurrent: durableCommitted => {
+						if (!durableCommitted) {
+							assertRuntime();
+							return;
+						}
+						assertBound();
+						if (this.#thinkingLevelMutationRevision !== expectedThinkingIntentRevision)
+							throw new Error("Thinking intent changed before profile publication");
+					},
+					isCurrent: selectionIsBound,
+					onRuntimePublished: () => {
+						publication = {
+							runtime: captureRuntime(),
+							thinkingIntentRevision: this.#thinkingLevelMutationRevision,
+						};
+					},
+				});
+				applyCompleted = true;
+				assertBound();
+				if (this.getActiveModelProfile() !== canonical || this.getActivatedModelProfile() !== canonical)
+					throw new Error("Profile activation did not publish the requested profile");
+				if (!publication) throw new Error("Profile activation did not capture its runtime publication");
+				options?.onAfterActivation?.();
+				assertBound();
+				completion.resolve({
+					ancestors,
+					ownership: prepared.committedOwnership ?? observedOwnership,
+					runtime: publication.runtime,
+					thinkingIntentRevision: publication.thinkingIntentRevision,
+				});
+				return { changed: true, id: canonical };
+			}, undefined, undefined, {
+				selectionTransaction,
+			});
+		} catch (error) {
+			if (prepared?.committedOwnership && !(error instanceof ModelProfileApplyCommittedError)) {
+				try {
+					void this.dispose().catch(disposalError => {
+						logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+					});
+				} catch (disposalError) {
+					logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+				}
+				throw new ModelProfileApplyCommittedError(prepared.profileName, prepared.committedOwnership.version, error);
 			}
-			return canonical;
-		});
-		return { changed: this.getActiveModelProfile() === canonicalName, id: canonicalName };
+			if (prepared && !prepared.committedOwnership && (!applyStarted || applyCompleted)) {
+				try {
+					// Preparation cleanup never owns live state. A completed session-only
+					// apply does, but only while its session/intent and published fields match.
+					await rollbackPreparedModelProfileActivation(prepared, {
+						isCurrent: applyCompleted ? selectionIsBound : () => false,
+					});
+				} catch (rollbackError) {
+					throw new AggregateError([error, rollbackError], "Profile activation and rollback both failed");
+				}
+			}
+			throw error;
+		} finally {
+			completion.resolve(undefined);
+			if (this.#profileSelectionPredecessor === completion.promise)
+				this.#profileSelectionPredecessor = Promise.resolve(undefined);
+			this.#pendingProfileSelectionIntents.delete(intent);
+			if (this.#selectionAwaitingMutationTransaction === selectionTransaction)
+				this.#selectionAwaitingMutationTransaction = undefined;
+			selectionFence.resolve();
+			this.#pendingSelectionFences--;
+			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration)
+				this.#oldestPendingSelectionFenceGeneration = 0;
+			this.#resolveSessionSettlement();
+		}
 	}
 
 	/**
@@ -21342,12 +21720,30 @@ export class AgentSession {
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
 		signal?: AbortSignal,
+		options?: { validateCredentials: boolean },
 	): Promise<PreparedProfileModelSelection> {
 		signal?.throwIfAborted();
 		const sessionId = this.sessionId;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
+		const previousThinkingLevelMutationRevision = this.#thinkingLevelMutationRevision;
 		const previousEditMode = this.#resolveActiveEditMode();
+		// Reload preparation is read-only: probing live credentials here could
+		// refresh OAuth or wait on a concurrent user's credential selection.
+		// Activations probe before publication (and before the CAS for durable selections).
+		if (options?.validateCredentials) {
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+			signal?.throwIfAborted();
+			if (
+				this.sessionId !== sessionId ||
+				this.model !== previousModel ||
+				this.thinkingLevel !== previousThinkingLevel ||
+				this.#thinkingLevelMutationRevision !== previousThinkingLevelMutationRevision
+			) {
+				throw new Error("Session changed while preparing profile model selection");
+			}
+			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
 		const committedThinkingLevel = resolveThinkingLevelForModel(
 			model,
 			thinkingLevel ?? model.thinking?.defaultLevel ?? previousThinkingLevel,
@@ -21360,6 +21756,7 @@ export class AgentSession {
 			committedThinkingLevel,
 			previousModel,
 			previousThinkingLevel,
+			previousThinkingLevelMutationRevision,
 			previousEditMode,
 			signal,
 		};
@@ -21381,7 +21778,8 @@ export class AgentSession {
 		if (
 			this.sessionId !== prepared.sessionId ||
 			this.model !== prepared.previousModel ||
-			this.thinkingLevel !== prepared.previousThinkingLevel
+			this.thinkingLevel !== prepared.previousThinkingLevel ||
+			this.#thinkingLevelMutationRevision !== prepared.previousThinkingLevelMutationRevision
 		) {
 			throw new Error("Session model changed while preparing profile activation");
 		}
@@ -23288,6 +23686,17 @@ export class AgentSession {
 				);
 			}
 
+			try {
+				await this.#settleBtwForSessionTransition();
+			} catch (error) {
+				// Retirement can refuse before the transaction owns rollback. Preserve
+				// the generated document without wrapping its unknown-effect error.
+				throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+					handoffDocument: handoffText,
+				});
+			}
+			if (handoffSignal.aborted) throw new Error("Handoff cancelled");
+
 			// Start a new session transactionally. Capture restore state before the
 			// switch so a persistence, injection, display, or extension failure
 			// after the switch is non-destructive: the current session stays active
@@ -23478,10 +23887,11 @@ export class AgentSession {
 				});
 			}
 		} catch (error) {
-			// Genuine handoff-signal cancellation maps to a cancellation error.
+			// Genuine handoff-signal cancellation maps to a cancellation error, but
+			// bounded BTW cleanup uncertainty must retain its unknown-effect error.
 			// Errors surfaced by the inner transaction (which already rolled back
 			// and, for non-aborts, attached the generated document) pass through.
-			if (handoffSignal.aborted && !(error instanceof AggregateError)) {
+			if (handoffSignal.aborted && !(error instanceof AggregateError) && !(error instanceof BtwTurnCleanupError)) {
 				throw new Error("Handoff cancelled");
 			}
 			throw error;
@@ -29125,10 +29535,11 @@ export class AgentSession {
 	}
 
 	createBtwConversationScope(instruction: string): BtwConversationScope {
+		this.#assertExternalSessionIngress();
 		const model = this.model;
 		if (!model) throw new Error("No active model on session");
 		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
-		return {
+		const scope: BtwConversationScope = {
 			model,
 			systemPrompt: [...this.systemPrompt, instruction],
 			messages: this.#projectBtwVisibleText(this.buildDisplaySessionContext().messages),
@@ -29139,6 +29550,8 @@ export class AgentSession {
 			providerAffinitySessionId,
 			sideSessionId: `${providerAffinitySessionId}:btw:${crypto.randomUUID()}`,
 		};
+		this.#btwScopes.set(scope, { generation: this.#btwGeneration, sessionId: this.sessionId });
+		return scope;
 	}
 
 	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
@@ -29182,11 +29595,13 @@ export class AgentSession {
 	 * Run a single ephemeral side-channel turn without modifying session history.
 	 * Background turns retain IRC/session behavior. `/btw` turns require a
 	 * pre-frozen, visible-text-only scope and bypass extension context transforms,
-	 * provider observability hooks, and session persistence surfaces.
+	 * provider observability hooks, and session persistence surfaces. Scopes are
+	 * session/identity-generation bound. Cancellation joins actual side work with
+	 * a bounded deadline; code `unknown_effect` means cleanup is not certified.
 	 */
 	async runEphemeralTurn(args: EphemeralTurnArgs): Promise<EphemeralTurnResult> {
 		args.signal?.throwIfAborted();
-		if (args.purpose === "btw") return await this.#runBtwTurn(args);
+		if (args.purpose === "btw") return await this.#runOwnedBtwTurn(args);
 
 		const callerOwnsRosterClaim = args.ircRosterClaim !== undefined;
 		const rosterClaim = callerOwnsRosterClaim ? args.ircRosterClaim : this.#claimIrcRosterCandidate();
@@ -29285,6 +29700,66 @@ export class AgentSession {
 		}
 	}
 
+	#retainBtwTurn(pending: Promise<void>, retainFailure = false): void {
+		this.#btwTurns.add(pending);
+		void pending.then(
+			() => this.#btwTurns.delete(pending),
+			error => {
+				this.#btwTurns.delete(pending);
+				if (retainFailure) this.#btwCleanupFailures.push(error);
+			},
+		);
+	}
+
+	async #joinBtwTurns(): Promise<void> {
+		while (this.#btwTurns.size > 0) await Promise.allSettled([...this.#btwTurns]);
+		if (this.#btwCleanupFailures.length > 0) {
+			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.", {
+				cause: new AggregateError(this.#btwCleanupFailures),
+			});
+		}
+	}
+
+	async #runOwnedBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
+		this.#assertExternalSessionIngress();
+		const scope = args.turn.scope;
+		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");
+		const issuer = this.#btwScopes.get(scope);
+		if (!issuer || issuer.generation !== this.#btwGeneration || issuer.sessionId !== this.sessionId) {
+			throw new Error("The /btw conversation scope belongs to another session or a retired generation.");
+		}
+		const signal = AbortSignal.any([
+			this.#disposeAbortController.signal,
+			this.#btwAbortController.signal,
+			...(args.signal ? [args.signal] : []),
+		]);
+		const turnArgs = {
+			...args,
+			turn: { question: args.turn.question, scope },
+			contextExchanges: boundBtwExchanges(args.contextExchanges ?? []),
+			signal,
+		};
+		signal.throwIfAborted();
+		// Admit synchronously, including reentrant disposal from credential lookup.
+		const settlement = Promise.withResolvers<void>();
+		this.#retainBtwTurn(settlement.promise);
+		const execution = this.#runBtwTurn(turnArgs);
+		void execution.then(
+			() => settlement.resolve(),
+			error => {
+				if (error instanceof BtwTurnCleanupError) settlement.reject(error);
+				else settlement.resolve();
+			},
+		);
+		try {
+			return await awaitEphemeralAbort(execution, signal);
+		} finally {
+			// Cancellation is prompt, but success/error settlement is not certified
+			// until preflight and iterator cleanup join, or an explicit unknown effect.
+			await awaitBtwSettlement(settlement.promise);
+		}
+	}
+
 	async #runBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 		const model = args.turn.scope?.model;
 		const credentialSessionId = args.turn.scope?.credentialSessionId;
@@ -29292,7 +29767,9 @@ export class AgentSession {
 		if (utf8ByteLength(args.turn.question) > BTW_MAX_QUESTION_UTF8_BYTES) {
 			throw new RangeError(`/btw questions are limited to ${BTW_MAX_QUESTION_UTF8_BYTES} UTF-8 bytes.`);
 		}
-		const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, credentialSessionId), args.signal);
+		// Retain the real lookup, not an abort race that loses its settlement owner.
+		const apiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
+		args.signal?.throwIfAborted();
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 		const sideAttempt = this.agent.mintSideAttemptScope();
 		this.#attemptRecordStore.register(sideAttempt.scope);
@@ -29307,7 +29784,7 @@ export class AgentSession {
 			role: message.role,
 			content: [{ type: "text" as const, text: message.text }],
 		})) as Message[];
-		for (const exchange of boundBtwExchanges(args.contextExchanges ?? [])) {
+		for (const exchange of args.contextExchanges ?? []) {
 			messages.push({
 				role: "user",
 				content: [{ type: "text", text: exchange.question }],
@@ -29337,7 +29814,8 @@ export class AgentSession {
 			streamFirstEventTimeoutMs: 0,
 			attemptScope: sideAttempt.scope,
 		};
-		const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
+		let iterator: AsyncIterator<AssistantMessageEvent> | undefined;
+		let consumption: Promise<void> | undefined;
 		let replyText = "";
 		let completed = false;
 		let active = true;
@@ -29362,9 +29840,10 @@ export class AgentSession {
 		);
 		totalTimer.unref?.();
 		resetIdleTimer();
-		const consume = async () => {
+		const consume = async (streamIterator: AsyncIterator<AssistantMessageEvent>) => {
 			while (active) {
-				const result = await iterator.next();
+				const result = await streamIterator.next();
+				requestSignal.throwIfAborted();
 				if (result.done || !active) break;
 				resetIdleTimer();
 				const event = result.value;
@@ -29382,7 +29861,10 @@ export class AgentSession {
 			}
 		};
 		try {
-			await awaitEphemeralAbort(consume(), requestSignal);
+			requestSignal.throwIfAborted();
+			iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
+			consumption = consume(iterator);
+			await awaitEphemeralAbort(consumption, requestSignal);
 			requestSignal.throwIfAborted();
 			if (!completed) throw new Error("Ephemeral turn ended without a final message");
 			const finalText = replyText.trim();
@@ -29394,9 +29876,26 @@ export class AgentSession {
 			context.messages = [];
 			if (idleTimer) clearTimeout(idleTimer);
 			clearTimeout(totalTimer);
-			void iterator.return?.().catch(() => undefined);
-			sideAttempt.dispose();
-			this.#attemptRecordStore.retire(sideAttempt.scope);
+			if (!completed && !requestSignal.aborted) {
+				timeoutAbort.abort(new Error("The /btw turn ended before provider completion."));
+			}
+			// Retain next() and return() separately from their bounded public join.
+			// Attempt authority is retired only when the real iterator work settles.
+			const returned = Promise.resolve().then(() => iterator?.return?.());
+			const cleanup = Promise.allSettled([consumption, returned]).then(([, result]) => {
+				try {
+					if (result.status === "rejected") {
+						throw new BtwTurnCleanupError("The /btw provider iterator could not be closed; effects are unknown.", {
+							cause: result.reason,
+						});
+					}
+				} finally {
+					sideAttempt.dispose();
+					this.#attemptRecordStore.retire(sideAttempt.scope);
+				}
+			});
+			this.#retainBtwTurn(cleanup, true);
+			await awaitBtwSettlement(cleanup);
 		}
 	}
 
@@ -29551,7 +30050,7 @@ export class AgentSession {
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
-			const switchingToDifferentSession = previousSessionFile
+			let switchingToDifferentSession = previousSessionFile
 				? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 				: true;
 			// Emit session_before_switch event (can be cancelled)
@@ -29567,6 +30066,27 @@ export class AgentSession {
 				}
 			}
 			options?.onTransitionMutationStarted?.();
+
+			// A conventional same-path reload can replace the logical identity.
+			// Discover that before admitting owner shutdown and keep the expected
+			// target id fenced through load, without adopting the captured transcript.
+			let preflightSessionId: string | undefined;
+			if (
+				!switchingToDifferentSession &&
+				!getExactMcpControls(this) &&
+				this.hasSessionMcpControls &&
+				this.#sessionMcpOverrides.size > 0
+			) {
+				const captured = SessionManager.captureTranscriptStrict(sessionPath);
+				if (captured.kind !== "captured")
+					throw new Error(`Session MCP reload preflight failed: ${captured.reason}`);
+				try {
+					preflightSessionId = captured.snapshot.identity.sessionId;
+					switchingToDifferentSession = preflightSessionId !== this.sessionManager.getSessionId();
+				} finally {
+					captured.snapshot.close();
+				}
+			}
 
 			const asyncManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 			const ownerId = this.#agentId;
@@ -29594,7 +30114,7 @@ export class AgentSession {
 				while (this.isCompacting) await Bun.sleep(10);
 			}
 
-			this.#disconnectFromAgent();
+			await this.#settleBtwForSessionTransition();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
 			const previousSessionState = await this.sessionManager.captureRollbackState();
@@ -29638,6 +30158,7 @@ export class AgentSession {
 				: undefined;
 			const previousExplicitMCPToolSelectionPersistsForContext =
 				this.#committedExplicitMCPToolSelectionPersistsForContext;
+			const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 			const previousTools = [...this.agent.state.tools];
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -29651,27 +30172,45 @@ export class AgentSession {
 			const previousActiveAttemptScope = this.#activeAttemptScope;
 			const previousActiveLogicalRunId = this.#activeLogicalRunId;
 
-			// Once session state starts changing, resumes are safe only after rollback completes.
-			ownerShutdownCanDrainResumes = false;
-			this.#steeringMessages = [];
-			this.#followUpMessages = [];
-			this.#pendingNextTurnMessages = [];
-			this.#scheduledHiddenNextTurnGeneration = undefined;
-			const suspendedWorkflowGateEmitter = switchingToDifferentSession
-				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
-				: undefined;
+			// Conventional reset work must finish while the predecessor still owns its
+			// identity, history, queues, and workflow emitter.
+			let conventionalRetirement: PreparedExactMcpRetirement | undefined;
+			if (
+				switchingToDifferentSession &&
+				!getExactMcpControls(this) &&
+				this.hasSessionMcpControls &&
+				this.#sessionMcpOverrides.size > 0
+			) {
+				conventionalRetirement = await this.#prepareSessionMcpReset();
+			}
+			let suspendedWorkflowGateEmitter: WorkflowGateEmitter | undefined;
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
 			let recoveredThinkingLevel: ThinkingLevel | undefined;
 			let durableDefaultRecoveryError: string | undefined;
 			let transitionCleanupCommitted = false;
-			let exactRetirement: PreparedExactMcpRetirement | undefined;
+			let sessionIdentityRekeyed = false;
+			let exactRetirement: PreparedExactMcpRetirement | undefined = conventionalRetirement;
 			let exactOwnershipChanged = switchingToDifferentSession;
 
 			try {
+				// Once session state starts changing, resumes are safe only after rollback completes.
+				ownerShutdownCanDrainResumes = false;
+				this.#disconnectFromAgent();
+				this.#steeringMessages = [];
+				this.#followUpMessages = [];
+				this.#pendingNextTurnMessages = [];
+				this.#scheduledHiddenNextTurnGeneration = undefined;
+				suspendedWorkflowGateEmitter = switchingToDifferentSession
+					? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
+					: undefined;
+				if (conventionalRetirement && !conventionalRetirement.canCommit())
+					throw new Error("Session MCP reset ownership changed before session switch load");
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				if (preflightSessionId !== undefined && this.sessionManager.getSessionId() !== preflightSessionId)
+					throw new Error("Session MCP reload identity changed after preflight");
 				const loadedSessionFile = this.sessionManager.getSessionFile();
 				exactOwnershipChanged =
 					this.sessionManager.getSessionId() !== previousSessionState.sessionId ||
@@ -29684,6 +30223,7 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, previousSessionState.sessionFile, {
 					retirePredecessorRegistrations: false,
 				});
+				sessionIdentityRekeyed = true;
 				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
@@ -29929,11 +30469,17 @@ export class AgentSession {
 				}
 
 				if (exactOwnershipChanged) {
-					exactRetirement = await this.#prepareExactMcpControlRetirement(previousSessionState.sessionId, true);
-					if (exactRetirement && !exactRetirement.canCommit())
-						throw new Error("Exact MCP control retirement changed before session switch commit");
+					if (!conventionalRetirement && getExactMcpControls(this)) {
+						exactRetirement = await this.#prepareExactMcpControlRetirement(previousSessionState.sessionId, true);
+						if (exactRetirement && !exactRetirement.canCommit())
+							throw new Error("Exact MCP control retirement changed before session switch commit");
+					}
+					// Conventional predecessor validity was checked before loading. Its
+					// commit checks manager/ledger/override ownership after adoption.
 					await exactRetirement?.commit();
 					revokeExactMcpControls(this);
+				} else {
+					await conventionalRetirement?.abort();
 				}
 				if (switchingToDifferentSession) {
 					const predecessorEndpointId = this.#asyncJobEndpointId(
@@ -30064,11 +30610,16 @@ export class AgentSession {
 					previousSessionState.sessionId,
 					previousSessionState.sessionFile,
 				);
-				const rekeyed = AsyncJobManager.rekeyForEndpoint(
-					successorEndpointId,
-					predecessorEndpointId,
-					AsyncJobManager.forEndpoint(successorEndpointId),
-				);
+				// Preflight rejection happens before endpoint registration moves. Do not
+				// rekey an unrelated manager that owns the unaccepted target identity.
+				let rekeyed = true;
+				if (sessionIdentityRekeyed) {
+					rekeyed = AsyncJobManager.rekeyForEndpoint(
+						successorEndpointId,
+						predecessorEndpointId,
+						AsyncJobManager.forEndpoint(successorEndpointId),
+					);
+				}
 				if (!rekeyed) {
 					revokeExactMcpControls(this);
 					// Another top-level session claimed the freed predecessor endpoint
@@ -30131,14 +30682,16 @@ export class AgentSession {
 				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
 				this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
 				this.#commitExplicitMCPToolSelectionAuthority();
-				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.#activeToolSelectionRevision++;
-				this.agent.setTools(previousTools);
-				this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
-				this.#baseSystemPrompt = previousBaseSystemPrompt;
-				this.agent.setSystemPrompt(previousSystemPrompt);
-				this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
-				this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+				if (!conventionalRetirement) {
+					this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+					this.#activeToolSelectionRevision++;
+					this.agent.setTools(previousTools);
+					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+					this.#baseSystemPrompt = previousBaseSystemPrompt;
+					this.agent.setSystemPrompt(previousSystemPrompt);
+					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+				}
 				this.agent.replaceMessages(previousAgentMessages, {
 					historyRewrite: {
 						reason: switchingToDifferentSession ? "session-switch-rollback" : "conversation-reload-rollback",
@@ -30168,10 +30721,39 @@ export class AgentSession {
 				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
 				this.agent.serviceTier = previousServiceTier;
 				this.#syncTodoPhasesFromBranch();
-				this.#reconnectToAgent();
-				const rollbackErrors = [exactRetirementAbortError, sessionRestoreError, restoreMcpError].filter(
-					value => value !== undefined,
-				);
+				let reconcileMcpError: unknown;
+				if (conventionalRetirement) {
+					try {
+						if (this.#isDisposed) throw new Error("Session disposed before MCP rollback reconciliation");
+						// Reset changed physical connections, not just selection. Keep its live
+						// MCP projection and retryable override intent; never revive old wrappers.
+						// Rebuild after restoring the predecessor's model and history as well.
+						this.#pruneSelectedMCPToolNames();
+						this.#lastAppliedToolSignature = undefined;
+						this.#pendingAppliedToolSignature = undefined;
+						const appliedRevision = await this.#applyActiveToolsByName(
+							[
+								...previousTools.filter(tool => !isMCPToolName(tool.name)).map(tool => tool.name),
+								...this.getActiveMCPToolNames(),
+							],
+							{
+								persistMCPSelection: false,
+								nextSelectedDiscoveredBuiltinToolNames: previousSelectedDiscoveredBuiltinToolNames,
+							},
+						);
+						if (this.#isDisposed || appliedRevision === undefined)
+							throw new Error("Session MCP rollback reconciliation was superseded");
+					} catch (reconcileError) {
+						reconcileMcpError = reconcileError;
+					}
+				}
+				if (!this.#isDisposed) this.#reconnectToAgent();
+				const rollbackErrors = [
+					exactRetirementAbortError,
+					sessionRestoreError,
+					restoreMcpError,
+					reconcileMcpError,
+				].filter(value => value !== undefined);
 				if (rollbackErrors.length > 0) {
 					if (rollbackErrors.length > 1) {
 						throw new AggregateError(
@@ -30259,6 +30841,7 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
+			await this.#settleBtwForSessionTransition();
 
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flush();
@@ -30496,6 +31079,8 @@ export class AgentSession {
 				// Non-user message: leaf = selected node
 				newLeafId = targetId;
 			}
+
+			await this.#settleBtwForSessionTransition();
 
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
@@ -31294,6 +31879,25 @@ export class AgentSession {
 	 */
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
+	}
+}
+
+async function awaitBtwSettlement(pending: Promise<void>): Promise<void> {
+	const deadline = Promise.withResolvers<never>();
+	const timer = setTimeout(
+		() =>
+			deadline.reject(
+				new BtwTurnCleanupError(
+					"The /btw cleanup deadline expired; credential or provider work may still be unwinding (unknown effect).",
+				),
+			),
+		SIGNAL_TEARDOWN_TIMEOUT_MS,
+	);
+	timer.unref?.();
+	try {
+		await Promise.race([pending, deadline.promise]);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 

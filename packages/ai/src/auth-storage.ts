@@ -3531,6 +3531,15 @@ export class AuthStorage {
 		options?: AuthApiKeyOptions,
 		sessionId?: string,
 	): IndexedStoredCredential | undefined {
+		const unavailableSelector =
+			sessionId && !options?.credentialSelector
+				? this.#sessionCredentialUnavailable.get(sessionId)?.get(resolveOAuthStorageProvider(provider))
+				: undefined;
+		if (unavailableSelector) {
+			throw new Error(
+				`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+			);
+		}
 		const selector = this.#getCredentialSelector(provider, options, sessionId);
 		if (!selector) return undefined;
 		this.#assertCredentialSelectorUsable(resolveOAuthStorageProvider(provider), selector, options?.owner);
@@ -6266,15 +6275,7 @@ export class AuthStorage {
 		options?: AuthApiKeyOptions,
 		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
-		const unavailableSelector =
-			sessionId && !options?.credentialSelector
-				? this.#sessionCredentialUnavailable.get(sessionId)?.get(resolveOAuthStorageProvider(provider))
-				: undefined;
-		if (unavailableSelector) {
-			throw new Error(
-				`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
-			);
-		}
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 		if (reloadsUsed > MAX_OAUTH_RESOLUTION_RELOADS) {
 			logger.warn("OAuth credential resolution exhausted its reload budget", {
 				provider,
@@ -6282,7 +6283,6 @@ export class AuthStorage {
 			});
 			return undefined;
 		}
-		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 		const sessionSelector =
 			sessionId && !options?.credentialSelector && selectedCredential?.credential.type === "oauth"
 				? { kind: "id" as const, value: String(selectedCredential.id) }
@@ -7353,15 +7353,6 @@ export class AuthStorage {
 			if (storedApiKey) return storedApiKey;
 			return configKey;
 		}
-		if (sessionId && !options?.credentialSelector) {
-			const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
-			if (unavailableSelector) {
-				throw new Error(
-					`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
-				);
-			}
-		}
-
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
 			const apiKey = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);

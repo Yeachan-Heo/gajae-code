@@ -470,6 +470,32 @@ Related APIs:
 - `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`
 - `abort()`
 
+### Bounded image input and durable acceptance
+
+`createSessionImageInput(session)` returns a generation-owned controller for
+canonical user-selected image bytes. Its `prompt(text, images, options)` and
+`submitUserMessage(text, images, options)` share the session's image admission
+budget; creating another controller does not reset that budget. The queued
+method returns the same tracked submission receipt described above. For direct
+`prompt` local dispatch, image-bearing extension/custom/MCP slash commands are
+rejected before their handler can run or discard the attached bytes. Queued
+`submitUserMessage` retains the slash text as queued message input; it does not
+execute a local command handler.
+
+Both methods accept `onPreflightAcceptCommit?: () => void | Promise<void>`.
+The SDK awaits this callback before admitting the input. A rejected callback
+prevents admission and releases only that invocation's image reservation.
+Cancellation and controller ownership are rechecked after an awaited callback.
+Use this fence to persist an embedder-owned delivery record before execution
+can begin, not as proof that execution or transcript persistence has happened:
+subsequent cancellation or ingress checks can still prevent a run.
+
+Retain the original text and attachment payload independently of redacted
+presentation DTOs until a correlated outcome is known. `removed` and its
+`reason` are meaningful terminal outcomes, not successful delivery. After a
+crash without a conclusive receipt, preserve an unknown outcome and require an
+explicit user decision; do not automatically replay potentially executed input.
+
 ## Tools integration
 
 ### Built-ins and filtering
