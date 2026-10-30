@@ -3508,6 +3508,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		toolSession.getAgentModelOverrides = () =>
+			session?.getAgentModelOverrides() ?? settings.get("task.agentModelOverrides");
+		toolSession.hasSessionAgentModelOverride = role => session?.hasSessionAgentModelOverride(role) ?? false;
 		// Live parent profile accessor for task/subagent dispatch: profile-owned
 		// persisted model overrides may resolve through preset-equivalent aliases
 		// only while an active profile claims them (see task/executor.ts).
@@ -4941,6 +4944,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			return resolveEagerTaskDelegation({
 				settings,
 				profile: resolvedProfileName ? persistedProfiles.get(resolvedProfileName) : undefined,
+				agentModelOverrides: session?.getAgentModelOverrides(),
 			}).eagerTasks;
 		};
 		const eagerTasks = resolveEagerTasks();

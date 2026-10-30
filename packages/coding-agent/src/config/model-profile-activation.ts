@@ -7,6 +7,7 @@ import type {
 	AgentSessionProfileInstalledOverrideState,
 	DefaultFallbackRuntimeState,
 	PreparedProfileModelSelection,
+	SessionAgentModelOverrideState,
 } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
@@ -86,6 +87,9 @@ type ModelProfileActivationSession = Pick<
 	/** Profile-installed baselines, preserved when a refreshed profile drops an assignment. */
 	getProfileInstalledOverrideState?: () => AgentSessionProfileInstalledOverrideState;
 	restoreProfileInstalledOverrideState?: (state: AgentSessionProfileInstalledOverrideState) => void;
+	getSessionAgentModelOverrideState?: AgentSession["getSessionAgentModelOverrideState"];
+	retireSessionAgentModelOverrides?: AgentSession["retireSessionAgentModelOverrides"];
+	restoreSessionAgentModelOverrides?: AgentSession["restoreSessionAgentModelOverrides"];
 	/** Re-apply vendor-separated delegation (task tool + prompt) after the role layer changed. */
 	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
@@ -246,6 +250,9 @@ export interface PreparedModelProfileActivation {
 	previousDefaultChain: readonly string[] | undefined;
 	previousDefaultChainState: ConfiguredModelChainState | undefined;
 	previousProfileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
+	previousSessionAgentModelOverrides: SessionAgentModelOverrideState | undefined;
+	preserveSessionAgentModelOverrides: boolean;
+	retiredSessionAgentModelRevision?: number;
 	preparedDefaultModelSelection: PreparedProfileModelSelection | undefined;
 	defaultChainPublished: boolean;
 	defaultModelPublished: boolean;
@@ -1565,6 +1572,30 @@ function selectorValuesEqual(left: ModelSelectorValue | undefined, right: ModelS
 	);
 }
 
+function sameSessionAgentModelIdentity(
+	left: SessionAgentModelOverrideState | undefined,
+	right: SessionAgentModelOverrideState | undefined,
+): boolean {
+	return left === undefined || right === undefined
+		? left === right
+		: left.manager === right.manager &&
+				left.identityGeneration === right.identityGeneration &&
+				left.managerId === right.managerId &&
+				left.file === right.file;
+}
+
+function profileSessionIdentityIsCurrent(prepared: PreparedModelProfileActivation): boolean {
+	return sameSessionAgentModelIdentity(
+		prepared.previousSessionAgentModelOverrides,
+		prepared.session.getSessionAgentModelOverrideState?.(),
+	);
+}
+
+function assertProfileSessionIdentity(prepared: PreparedModelProfileActivation): void {
+	if (!profileSessionIdentityIsCurrent(prepared))
+		throw new Error("Session identity changed while preparing profile activation");
+}
+
 function restoreCanonicalVariantAfterPreparation(
 	modelRegistry: Partial<Pick<ModelRegistry, "restoreSessionCanonicalVariant" | "clearCanonicalVariant">>,
 	session: ModelProfileActivationSession,
@@ -1572,8 +1603,14 @@ function restoreCanonicalVariantAfterPreparation(
 	previousUserSelection: UserCanonicalVariantSelection | undefined,
 	expectedSessionId = session.sessionId,
 	expectedGeneration = session.sessionLifecycle?.generation,
+	expectedIdentity = session.getSessionAgentModelOverrideState?.(),
 ): void {
-	if (session.sessionId !== expectedSessionId || session.sessionLifecycle?.generation !== expectedGeneration) return;
+	if (
+		session.sessionId !== expectedSessionId ||
+		session.sessionLifecycle?.generation !== expectedGeneration ||
+		!sameSessionAgentModelIdentity(expectedIdentity, session.getSessionAgentModelOverrideState?.())
+	)
+		return;
 	const currentUserSelection = session.getUserCanonicalVariantSelection?.();
 	const userSelectionChanged =
 		previousUserSelection !== undefined &&
@@ -1596,6 +1633,7 @@ export async function prepareModelProfileActivation(
 
 	const previousModel = options.session.model;
 	const previousThinkingLevel = options.session.thinkingLevel;
+	const previousSessionAgentModelOverrides = options.session.getSessionAgentModelOverrideState?.();
 	const applySettings = options.settingsForApply ?? (options.settings as Settings);
 	const binding = {
 		sessionId: options.session.sessionId,
@@ -1915,6 +1953,14 @@ export async function prepareModelProfileActivation(
 			throw new Error("Session cannot prepare a synchronous profile model selection");
 		}
 		options.signal?.throwIfAborted();
+		if (
+			!sameSessionAgentModelIdentity(
+				previousSessionAgentModelOverrides,
+				options.session.getSessionAgentModelOverrideState?.(),
+			)
+		) {
+			throw new Error("Session identity changed while preparing profile activation");
+		}
 		const nextModelRoles = { ...modelRoles };
 		const nextAgentModelOverrides = { ...agentModelOverrides };
 		for (const role of manualModelRoleOverrides) delete nextModelRoles[role];
@@ -1944,6 +1990,8 @@ export async function prepareModelProfileActivation(
 			previousDefaultChain: options.session.getConfiguredModelChain("default"),
 			previousDefaultChainState: options.session.getConfiguredModelChainState?.("default"),
 			previousProfileInstalledOverrideState: installedState,
+			previousSessionAgentModelOverrides,
+			preserveSessionAgentModelOverrides: options.preserveManualOverrides === true,
 			preparedDefaultModelSelection,
 			defaultChainPublished: false,
 			defaultModelPublished: false,
@@ -1973,6 +2021,7 @@ export async function prepareModelProfileActivation(
 				previousUserCanonicalVariantSelection,
 				binding.sessionId,
 				binding.generation,
+				previousSessionAgentModelOverrides,
 			);
 		} catch (rollbackError) {
 			throw incompleteModelProfileRollbackError("preparation", "profile preflight", error, [
@@ -2071,6 +2120,33 @@ function capturePublishedModelProfileActivationState(
 	};
 }
 
+function retireSessionAgentModelsForActivation(prepared: PreparedModelProfileActivation): void {
+	assertProfileSessionIdentity(prepared);
+	if (prepared.preserveSessionAgentModelOverrides || !prepared.previousSessionAgentModelOverrides) return;
+	const lifecycle = prepared.session.sessionLifecycle;
+	if (
+		prepared.session.sessionId !== prepared.binding.sessionId ||
+		lifecycle?.generation !== prepared.binding.generation ||
+		lifecycle?.transitioning ||
+		lifecycle?.disposed ||
+		prepared.session.getSessionAgentModelOverrideState?.().revision !==
+			prepared.previousSessionAgentModelOverrides.revision
+	) {
+		throw new Error("Session agent role intent changed while preparing profile activation");
+	}
+	prepared.session.retireSessionAgentModelOverrides?.();
+	prepared.retiredSessionAgentModelRevision = prepared.session.getSessionAgentModelOverrideState?.().revision;
+}
+
+function restoreSessionAgentModelsForActivation(prepared: PreparedModelProfileActivation): void {
+	if (prepared.previousSessionAgentModelOverrides && prepared.retiredSessionAgentModelRevision !== undefined) {
+		prepared.session.restoreSessionAgentModelOverrides?.(
+			prepared.previousSessionAgentModelOverrides,
+			prepared.retiredSessionAgentModelRevision,
+		);
+	}
+}
+
 /** Publish the prepared model selection and role layer without awaiting. */
 export function publishPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
@@ -2079,6 +2155,7 @@ export function publishPreparedModelProfileActivation(
 		"preserveDefaultModelSelection" | "preserveLiveModelSelection" | "thinkingLevelOverride"
 	> = {},
 ): void {
+	retireSessionAgentModelsForActivation(prepared);
 	if (!options.preserveDefaultModelSelection && (prepared.preparedDefaultModelSelection || !prepared.defaultModel)) {
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
@@ -2195,6 +2272,7 @@ async function persistPreparedModelProfileActivation(
 		const lifecycle = session.sessionLifecycle;
 		if (
 			session.sessionId !== prepared.binding.sessionId ||
+			!profileSessionIdentityIsCurrent(prepared) ||
 			lifecycle?.generation !== prepared.binding.generation ||
 			lifecycle?.transitioning ||
 			lifecycle?.disposed ||
@@ -2208,6 +2286,9 @@ async function persistPreparedModelProfileActivation(
 	const assertPreparedCurrent = () => {
 		assertCurrent();
 		if (
+			(!prepared.preserveSessionAgentModelOverrides &&
+				session.getSessionAgentModelOverrideState?.().revision !==
+					prepared.previousSessionAgentModelOverrides?.revision) ||
 			session.model !== prepared.previousModel ||
 			session.thinkingLevel !== prepared.previousThinkingLevel ||
 			!util.isDeepStrictEqual(settings.getOverride("modelRoles"), prepared.previousModelRolesOverride) ||
@@ -2360,8 +2441,10 @@ export async function applyPreparedModelProfileActivation(
 		options.signal?.throwIfAborted();
 		options.validateCurrent?.(false);
 		if (options.isCurrent?.() === false) throw new ModelProfileActivationSupersededError();
+		assertProfileSessionIdentity(prepared);
 		// No await from the first runtime mutation through the complete publication receipt.
 		runtimePublicationStarted = true;
+		if (!options.deferRuntimePublication) retireSessionAgentModelsForActivation(prepared);
 		activationStage = "default chain";
 		if (!options.deferRuntimePublication && !options.preserveDefaultModelSelection) {
 			const ownedDefaultChain =
@@ -2463,6 +2546,7 @@ export async function applyPreparedModelProfileActivation(
 			options.onRuntimePublished?.();
 			activationStage = "session tool refresh";
 			await finishPreparedModelProfileActivation(prepared, { strictModelSelection: true });
+			assertProfileSessionIdentity(prepared);
 			options.signal?.throwIfAborted();
 			if (options.isCurrent?.() === false) throw new ModelProfileActivationSupersededError();
 		}
@@ -2484,7 +2568,17 @@ export async function applyPreparedModelProfileActivation(
 			if (activationWasCancelled) return;
 			throw error;
 		}
-		const selectionIsCurrent = () => options.isCurrent?.() !== false;
+		const identityIsCurrent = () => profileSessionIdentityIsCurrent(prepared);
+		const selectionIsCurrent = () => identityIsCurrent() && options.isCurrent?.() !== false;
+		if (
+			selectionIsCurrent() &&
+			prepared.session.sessionId === prepared.binding.sessionId &&
+			prepared.session.sessionLifecycle?.generation === prepared.binding.generation &&
+			!prepared.session.sessionLifecycle?.transitioning &&
+			!prepared.session.sessionLifecycle?.disposed
+		) {
+			restoreSessionAgentModelsForActivation(prepared);
+		}
 		const shouldRestoreFallbackRuntimeState =
 			prepared.previousDefaultFallbackRuntimeState !== undefined &&
 			(selectionIsCurrent() ||
@@ -2501,6 +2595,7 @@ export async function applyPreparedModelProfileActivation(
 		};
 		if (
 			modelRolesChanged &&
+			identityIsCurrent() &&
 			(selectionIsCurrent() ||
 				sameSerializedValue(prepared.settings.getOverride("modelRoles"), activatedModelRolesOverride))
 		) {
@@ -2512,6 +2607,7 @@ export async function applyPreparedModelProfileActivation(
 		}
 		if (
 			overridesChanged &&
+			identityIsCurrent() &&
 			(selectionIsCurrent() ||
 				sameSerializedValue(
 					prepared.settings.getOverride("task.agentModelOverrides"),
@@ -2556,6 +2652,7 @@ export async function applyPreparedModelProfileActivation(
 		}
 		if (
 			defaultChainChanged &&
+			identityIsCurrent() &&
 			(selectionIsCurrent() ||
 				sameSerializedValue(prepared.session.getConfiguredModelChainState?.("default"), activatedDefaultChainState))
 		) {
@@ -2576,7 +2673,7 @@ export async function applyPreparedModelProfileActivation(
 			modelRollbackSelectionRevision !== undefined
 				? prepared.session.getUserModelSelectionRevision?.() !== modelRollbackSelectionRevision
 				: modelRollbackSelectionWasCurrent && !selectionIsCurrent();
-		if (shouldRestoreFallbackRuntimeState && !userSelectionChangedDuringModelRollback) {
+		if (identityIsCurrent() && shouldRestoreFallbackRuntimeState && !userSelectionChangedDuringModelRollback) {
 			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
@@ -2591,6 +2688,7 @@ export async function applyPreparedModelProfileActivation(
 		}
 		if (
 			prepared.previousProfileInstalledOverrideState &&
+			identityIsCurrent() &&
 			(selectionIsCurrent() ||
 				(activatedProfileInstalledOverrideState !== undefined &&
 					util.isDeepStrictEqual(
@@ -2610,6 +2708,7 @@ export async function applyPreparedModelProfileActivation(
 				prepared.previousUserCanonicalVariantSelection,
 				prepared.binding.sessionId,
 				prepared.binding.generation,
+				prepared.previousSessionAgentModelOverrides,
 			),
 		);
 		if (rollbackErrors.length > 0) {
@@ -2652,6 +2751,7 @@ export async function rollbackPreparedModelProfileActivation(
 		const lifecycle = prepared.session.sessionLifecycle;
 		return (
 			prepared.session.sessionId === prepared.binding.sessionId &&
+			profileSessionIdentityIsCurrent(prepared) &&
 			lifecycle?.generation === prepared.binding.generation &&
 			!lifecycle?.transitioning &&
 			!lifecycle?.disposed
@@ -2659,6 +2759,7 @@ export async function rollbackPreparedModelProfileActivation(
 	};
 	const selectionIsCurrent = () => sessionIsBound() && options.isCurrent?.() !== false;
 	const publishedState = prepared.publishedState;
+	if (selectionIsCurrent()) restoreSessionAgentModelsForActivation(prepared);
 	const rollbackSelectionRevision = prepared.session.getUserModelSelectionRevision?.();
 	const thinkingIsCurrent = () =>
 		publishedState !== undefined &&
@@ -2838,8 +2939,18 @@ export async function rollbackPreparedModelProfileActivation(
 			prepared.previousUserCanonicalVariantSelection,
 			prepared.binding.sessionId,
 			prepared.binding.generation,
+			prepared.previousSessionAgentModelOverrides,
 		),
 	);
+	if (
+		selectionIsCurrent() &&
+		prepared.retiredSessionAgentModelRevision !== undefined &&
+		prepared.session.getSessionAgentModelOverrideState?.().revision === prepared.retiredSessionAgentModelRevision + 1
+	) {
+		await restoreAsync("restore eager delegation", async () => {
+			await prepared.session.syncEagerDelegation?.();
+		});
+	}
 	if (failures.length > 0) {
 		throw new AggregateError(
 			failures.map(failure => failure.error),
@@ -3138,6 +3249,7 @@ export async function activateModelProfile(
 			prepared.previousUserCanonicalVariantSelection,
 			prepared.binding.sessionId,
 			prepared.binding.generation,
+			prepared.previousSessionAgentModelOverrides,
 		);
 		return;
 	}
@@ -3161,6 +3273,7 @@ export async function applyModelProfileRuntimeBindings(
 	let activatedAgentModelOverridesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	try {
 		if (isCurrent && !isCurrent()) return;
+		assertProfileSessionIdentity(prepared);
 		prepared.settings.override("modelRoles", {
 			...prepared.baseModelRoles,
 			...prepared.modelRoles,
@@ -3180,6 +3293,7 @@ export async function applyModelProfileRuntimeBindings(
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		assertProfileSessionIdentity(prepared);
 		if (isCurrent && !isCurrent()) {
 			const restoredModelRolesOverride = restoreConcurrentProfileOverrides(
 				previousModelRolesOverride,
@@ -3228,15 +3342,24 @@ export async function applyModelProfileRuntimeBindings(
 			prepared.defaultChain,
 		);
 	} finally {
-		if (isCurrent && !isCurrent()) {
-			restoreCanonicalVariantAfterPreparation(
-				prepared.modelRegistry,
-				prepared.session,
-				prepared.previousCanonicalVariant,
-				prepared.previousUserCanonicalVariantSelection,
-			);
-		} else {
-			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+		if (profileSessionIdentityIsCurrent(prepared)) {
+			if (isCurrent && !isCurrent()) {
+				restoreCanonicalVariantAfterPreparation(
+					prepared.modelRegistry,
+					prepared.session,
+					prepared.previousCanonicalVariant,
+					prepared.previousUserCanonicalVariantSelection,
+					prepared.binding.sessionId,
+					prepared.binding.generation,
+					prepared.previousSessionAgentModelOverrides,
+				);
+			} else {
+				restoreCanonicalVariant(
+					prepared.modelRegistry,
+					prepared.session.sessionId,
+					prepared.previousCanonicalVariant,
+				);
+			}
 		}
 	}
 }
