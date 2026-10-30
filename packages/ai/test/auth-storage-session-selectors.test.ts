@@ -214,7 +214,10 @@ describe("AuthStorage session credential selectors", () => {
 		try {
 			storage.setSessionCredentialSelector("failed-pin", "anthropic", { kind: "email", value: "first@example.com" });
 			storage.setSessionCredentialSelector("other-pin", "anthropic", { kind: "email", value: "second@example.com" });
-			storage.markSessionCredentialUnavailable("failed-pin", "anthropic", { kind: "email", value: "first@example.com" });
+			storage.markSessionCredentialUnavailable("failed-pin", "anthropic", {
+				kind: "email",
+				value: "first@example.com",
+			});
 
 			expect(storage.hasAuth("anthropic", "failed-pin")).toBe(false);
 			expect(storage.hasUsableAuth("anthropic", { sessionId: "failed-pin" })).toBe(false);
@@ -235,7 +238,10 @@ describe("AuthStorage session credential selectors", () => {
 			await expect(storage.getApiKey("anthropic", "failed-pin")).rejects.toThrow("is unavailable");
 			storage.removeConfigApiKey("anthropic");
 
-			storage.setSessionCredentialSelector("failed-pin", "anthropic", { kind: "email", value: "second@example.com" });
+			storage.setSessionCredentialSelector("failed-pin", "anthropic", {
+				kind: "email",
+				value: "second@example.com",
+			});
 			expect(storage.hasSessionCredentialUnavailable("anthropic", "failed-pin")).toBe(false);
 			expect(storage.hasAuth("anthropic", "failed-pin")).toBe(true);
 			expect(storage.hasUsableAuth("anthropic", { sessionId: "failed-pin" })).toBe(true);
