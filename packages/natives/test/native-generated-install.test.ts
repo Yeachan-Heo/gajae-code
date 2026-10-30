@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -99,10 +100,10 @@ async function loadFixture(nativeTarget?: string): Promise<Fixture> {
 	const inst = await import(pathToFileURL(buildPath).href);
 	return {
 		native,
-		generateEnumExports: () => gen.generateEnumExports(native),
+		generateEnumExports: () => gen.generateEnumExports(),
 		cleanupStaleTemps: (dir: string) => inst.cleanupStaleTemps(dir),
 		installBinary: (src: string, dest: string) => inst.installBinary(src, dest),
-		installGeneratedBindings: (outputDir: string) => inst.installGeneratedBindings(outputDir, native),
+		installGeneratedBindings: (outputDir: string) => inst.installGeneratedBindings(outputDir),
 		ensurePublishDiagnosticDeclaration: () => inst.ensurePublishDiagnosticDeclaration(),
 		normalizeGeneratedDeclarationSpacing: () => inst.normalizeGeneratedDeclarationSpacing(),
 		dispose: () => fs.rm(root, { recursive: true, force: true }),

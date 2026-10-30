@@ -11,8 +11,8 @@ const declaration =
 	'export declare const enum Color {\n\tRed = "red",\n}\nexport declare function editFindMatch(): void\n';
 
 type Gen = {
-	generateEnumExports: (root?: string) => Promise<void>;
-	writeReplacingDestination?: (dest: string, contents: string) => Promise<void>;
+	generateEnumExports: () => Promise<void>;
+	writeReplacingDestination: (dest: string, contents: string) => Promise<void>;
 };
 
 function freshMode(): number {
@@ -132,7 +132,7 @@ test("new destination is created mode 0644 subject to umask", async () => {
 		const write = (await importCopy(root)).writeReplacingDestination;
 		expect(typeof write).toBe("function");
 		const created = path.join(root, "index.js");
-		await write!(created, "new");
+		await write(created, "new");
 		expect(fssync.readFileSync(created, "utf8")).toBe("new");
 		if (process.platform !== "win32") expect(fssync.statSync(created).mode & 0o777).toBe(freshMode());
 	} finally {
@@ -150,7 +150,7 @@ test.skipIf(!canSymlink())("replaced symlink destination is not followed", async
 		fssync.chmodSync(target, 0o644);
 		const link = path.join(root, "index.js");
 		fssync.symlinkSync(target, link);
-		await write!(link, "replaced");
+		await write(link, "replaced");
 		expect(fssync.lstatSync(link).isSymbolicLink()).toBe(false);
 		expect(fssync.readFileSync(link, "utf8")).toBe("replaced");
 		expect(fssync.readFileSync(target, "utf8")).toBe("secret");
