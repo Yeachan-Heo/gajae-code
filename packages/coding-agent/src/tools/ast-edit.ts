@@ -11,7 +11,7 @@ import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
 import { wrapUntrustedContent } from "../session/messages";
 import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-mutation-guard";
-import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import {
@@ -22,6 +22,7 @@ import {
 import { assertEditableFile } from "./auto-generated-guard";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
+import { renderGroupedFileTree } from "./grouped-file-tree";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope } from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
@@ -535,53 +536,15 @@ export const astEditToolRenderer = {
 		return createCachedComponent(
 			() => options.expanded,
 			width => {
-				const searchBase = details?.searchPath;
-				const changeLines = renderTreeList(
-					{
-						items: changeGroups,
-						expanded: options.expanded,
-						maxCollapsed: changeGroups.length,
-						maxCollapsedLines: COLLAPSED_CHANGE_LIMIT,
-						itemType: "change",
-						renderItem: group => {
-							let contextDir = searchBase ?? "";
-							return group.map(line => {
-								if (line.startsWith("## ")) {
-									// Strip ` (3 replacements)` suffix attached by formatGroupedFiles.
-									const fileName = line
-										.slice(3)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const absPath = contextDir && fileName ? path.join(contextDir, fileName) : undefined;
-									const styled = uiTheme.fg("dim", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								if (line.startsWith("# ")) {
-									const raw = line
-										.slice(2)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const isDirectory = raw.endsWith("/");
-									const name = raw.replace(/\/$/, "");
-									if (isDirectory) {
-										if (searchBase) {
-											contextDir = name === "." ? searchBase : path.join(searchBase, name);
-										}
-										return uiTheme.fg("accent", line);
-									}
-									// Root-level file with optional suffix, e.g. `# foo.ts (3 replacements)`.
-									const absPath = searchBase && name ? path.join(searchBase, name) : undefined;
-									const styled = uiTheme.fg("accent", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								if (line.startsWith("+")) return uiTheme.fg("toolDiffAdded", line);
-								if (line.startsWith("-")) return uiTheme.fg("toolDiffRemoved", line);
-								return uiTheme.fg("toolOutput", line);
-							});
-						},
-					},
+				const changeLines = renderGroupedFileTree({
+					groups: changeGroups,
+					expanded: options.expanded,
+					maxCollapsedLines: COLLAPSED_CHANGE_LIMIT,
+					itemType: "change",
 					uiTheme,
-				);
+					searchPath: details?.searchPath,
+					diff: true,
+				});
 				return [header, ...changeLines, ...extraLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
 			},
 		);
