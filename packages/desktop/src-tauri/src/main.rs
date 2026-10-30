@@ -85,6 +85,28 @@ async fn write_frame(stdin: &mut ChildStdin, bytes: &[u8]) -> Result<(), String>
 		.map_err(|error| format!("Engine write failed; request outcome is unknown: {error}"))
 }
 
+fn valid_delivery_receipt(value: &Value) -> bool {
+	let Some(receipt) = value.as_object() else {
+		return false;
+	};
+	receipt.get("id").is_some_and(Value::is_string)
+		&& receipt.get("sessionId").is_some_and(Value::is_string)
+		&& matches!(
+			receipt.get("disposition").and_then(Value::as_str),
+			Some(
+				"pending"
+					| "accepted"
+					| "queued" | "completed"
+					| "failed" | "removed"
+					| "cancelled"
+					| "refused"
+					| "unknown"
+			)
+		) && ["sdkSubmissionId", "error"]
+		.iter()
+		.all(|key| receipt.get(*key).is_none_or(Value::is_string))
+}
+
 async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle) -> String {
 	read_frames_from(stdout, |value| emit(&app, value)).await
 }
@@ -114,10 +136,18 @@ where
 		if newline.is_some() {
 			let value = match serde_json::from_slice::<Value>(&frame) {
 				Ok(value)
-					if matches!(
-						value.get("type").and_then(Value::as_str),
-						Some("response" | "snapshot" | "session" | "auth" | "activity" | "gate" | "operator" | "fatal")
-					) =>
+					if match value.get("type").and_then(Value::as_str) {
+						Some("delivery") => value.get("receipt").is_some_and(valid_delivery_receipt),
+						Some("response") => value.get("deliveryDisposition").is_none_or(|disposition| {
+							value.get("ok") == Some(&Value::Bool(false))
+								&& matches!(disposition.as_str(), Some("refused" | "failed" | "unknown"))
+						}),
+						Some(
+							"snapshot" | "session" | "auth" | "activity" | "gate" | "operator" | "btw"
+							| "fatal",
+						) => true,
+						_ => false,
+					} =>
 				{
 					value
 				},
@@ -322,6 +352,7 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "mcp.operate"
 			| "session.info"
 			| "queue.cancel"
+			| "delivery.ack"
 			| "diff.get"
 			| "tools.list"
 			| "tools.set"
@@ -329,6 +360,14 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "shutdown"
 	) {
 		return Err("Unknown engine method".into());
+	}
+	if method == "delivery.ack" {
+		let delivery_id = object["params"].get("deliveryId").and_then(Value::as_str);
+		if !delivery_id.is_some_and(|id| {
+			!id.trim().is_empty() && id.encode_utf16().count() <= 128 && !id.contains('\0')
+		}) {
+			return Err("Invalid deliveryId".into());
+		}
 	}
 	let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
 	if bytes.len() > MAX_FRAME {
@@ -506,7 +545,7 @@ mod tests {
 		{
 			let method: String = serde_json::from_str(line.trim_end_matches(',')).unwrap();
 			let request = json!({"id": "native-contract", "method": method,
-				"params": {"sessionId": "native-owner", "text": "/usage", "offset": 0, "limit": 500}});
+				"params": {"sessionId": "native-owner", "deliveryId": "delivery", "text": "/usage", "offset": 0, "limit": 500}});
 			let bytes = encode_engine_request(&request).unwrap_or_else(|error| {
 				panic!("Advertised method {} was rejected: {error}", request["method"])
 			});
@@ -549,6 +588,115 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn encodes_delivery_ack_and_rejects_invalid_delivery_ids() {
+		let request =
+			json!({"id": "ack", "method": "delivery.ack", "params": {"deliveryId": "delivery-1"}});
+		let bytes = encode_engine_request(&request).unwrap();
+		assert_eq!(bytes.last(), Some(&b'\n'));
+		assert_eq!(serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]).unwrap(), request);
+		assert!(
+			encode_engine_request(
+				&json!({"id": "ack", "method": "delivery.ack", "params": {"deliveryId": "𠮷".repeat(64)}})
+			)
+			.is_ok()
+		);
+		for params in [
+			json!({}),
+			json!({"deliveryId": null}),
+			json!({"deliveryId": 1}),
+			json!({"deliveryId": "  "}),
+			json!({"deliveryId": "bad\0id"}),
+			json!({"deliveryId": "𠮷".repeat(65)}),
+		] {
+			assert_eq!(
+				encode_engine_request(
+					&json!({"id": "ack", "method": "delivery.ack", "params": params})
+				)
+				.err()
+				.as_deref(),
+				Some("Invalid deliveryId")
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn delivers_receipts_and_continues_processing_following_frames() {
+		let mut expected = vec![json!({"type": "snapshot", "snapshot": {
+			"deliveries": [{"id": "delivery", "sessionId": "owner", "disposition": "unknown"}],
+			"sessions": [{"id": "owner", "errorOwner": "delivery"}]
+		}})];
+		for disposition in [
+			"pending",
+			"accepted",
+			"queued",
+			"completed",
+			"failed",
+			"removed",
+			"cancelled",
+			"refused",
+			"unknown",
+		] {
+			expected.push(json!({"type": "delivery", "receipt": {"id": "delivery", "sessionId": "owner", "disposition": disposition, "sdkSubmissionId": "sdk-id", "error": "detail"}}));
+		}
+		expected.push(json!({"type": "delivery", "receipt": {"id": "minimal", "sessionId": "owner", "disposition": "pending"}}));
+		for disposition in ["refused", "failed", "unknown"] {
+			expected.push(json!({"type": "response", "id": "delivery", "ok": false, "error": "failed", "deliveryDisposition": disposition}));
+		}
+		expected.push(json!({"type": "response", "id": "other", "ok": false, "error": "failed"}));
+		let mut input = Vec::new();
+		for frame in &expected {
+			input.extend(serde_json::to_vec(frame).unwrap());
+			input.push(b'\n');
+		}
+		for limit in [1, 7, 8192] {
+			let (error, delivered) = frames(&input, limit).await;
+			assert!(error.is_empty(), "limit {limit}: {error}");
+			assert_eq!(delivered, expected, "limit {limit}");
+		}
+	}
+
+	#[tokio::test]
+	async fn rejects_malformed_response_delivery_dispositions() {
+		for frame in [
+			json!({"type": "response", "id": "delivery", "ok": false, "error": "failed", "deliveryDisposition": null}),
+			json!({"type": "response", "id": "delivery", "ok": false, "error": "failed", "deliveryDisposition": 1}),
+			json!({"type": "response", "id": "delivery", "ok": false, "error": "failed", "deliveryDisposition": "pending"}),
+			json!({"type": "response", "id": "delivery", "ok": true, "result": null, "deliveryDisposition": "failed"}),
+			json!({"type": "response", "id": "delivery", "error": "failed", "deliveryDisposition": "unknown"}),
+		] {
+			let mut input = serde_json::to_vec(&frame).unwrap();
+			input.push(b'\n');
+			let (error, delivered) = frames(&input, 7).await;
+			assert_eq!(error, "Engine emitted an invalid frame envelope");
+			assert!(delivered.is_empty());
+		}
+	}
+
+	#[tokio::test]
+	async fn rejects_malformed_delivery_receipts() {
+		for receipt in [
+			json!(null),
+			json!([]),
+			json!({}),
+			json!({"id": 1, "sessionId": "owner", "disposition": "pending"}),
+			json!({"id": "delivery", "sessionId": null, "disposition": "pending"}),
+			json!({"id": "delivery", "sessionId": "owner", "disposition": "invalid"}),
+			json!({"id": "delivery", "sessionId": "owner", "disposition": "pending", "sdkSubmissionId": null}),
+			json!({"id": "delivery", "sessionId": "owner", "disposition": "pending", "error": false}),
+		] {
+			let mut input =
+				serde_json::to_vec(&json!({"type": "delivery", "receipt": receipt})).unwrap();
+			input.push(b'\n');
+			let (error, delivered) = frames(&input, 7).await;
+			assert_eq!(error, "Engine emitted an invalid frame envelope");
+			assert!(delivered.is_empty());
+		}
+		let (error, delivered) = frames(b"{\"type\":\"delivery\"}\n", 7).await;
+		assert_eq!(error, "Engine emitted an invalid frame envelope");
+		assert!(delivered.is_empty());
+	}
+
 	#[tokio::test]
 	async fn preserves_activity_gate_and_operator_frames_in_native_order() {
 		let expected = vec![
@@ -560,6 +708,7 @@ mod tests {
 				"presentationId": "surface", "nonce": "exact-retirement"}}),
 			json!({"type": "operator", "sessionId": "owner", "event": {"type": "operator.updated",
 				"operation": {"operationId": "operation", "status": "running", "output": "확인"}}}),
+			json!({"type": "btw", "sessionId": "owner", "sessionGeneration": 1, "event": {"type": "updated"}}),
 		];
 		let mut input = Vec::new();
 		for frame in &expected {

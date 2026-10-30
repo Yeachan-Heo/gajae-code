@@ -66,7 +66,7 @@ async function launch() {
 		const id = crypto.randomUUID();
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));
 		const response = frames.find(frame => frame.type === "response" && frame.id === id);
-		if (!response || response.type !== "response") throw new Error("Missing response");
+		if (response?.type !== "response") throw new Error("Missing response");
 		if (!response.ok) throw new Error(response.error);
 		return response.result as T;
 	};
@@ -74,7 +74,7 @@ async function launch() {
 		const id = crypto.randomUUID();
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));
 		const response = frames.find(frame => frame.type === "response" && frame.id === id);
-		if (!response || response.type !== "response" || response.ok) throw new Error("Expected a rejected request");
+		if (response?.type !== "response" || response.ok) throw new Error("Expected a rejected request");
 		return response.error;
 	};
 	const open = async () => {
@@ -119,9 +119,8 @@ test("a refused retry leaves the conversation idle", async () => {
 	expect(after?.error).toBeUndefined();
 });
 
-// A builtin command that forwards a prompt starts a real turn, so the same rule
-// applies even though command.run itself is administrative.
-test("a failed forwarded prompt marks the conversation failed", async () => {
+// A forwarded prompt rejected before admission has not started a turn.
+test("a pre-run forwarded prompt refusal leaves the conversation idle", async () => {
 	const { reject, open, session, results } = await launch();
 	const created = await open();
 	vi.spyOn(results[0]!.session, "prompt").mockRejectedValue(new Error("forwarded prompt failed"));
@@ -131,13 +130,13 @@ test("a failed forwarded prompt marks the conversation failed", async () => {
 	);
 
 	const after = await session(created.id);
-	expect(after?.status).toBe("error");
-	expect(after?.error).toContain("forwarded prompt failed");
+	expect(after?.status).toBe("idle");
+	expect(after?.error).toBeUndefined();
+	expect(after?.errorOwner).toBeUndefined();
 });
 
-// The complement: a rejected turn really did run, so it stays visible on the
-// conversation even though the same text also answers the prompt request.
-test("a rejected turn marks the conversation failed", async () => {
+// An immediate rejection before the SDK accepts a run is a refusal, not a failed turn.
+test("a pre-run prompt refusal leaves the conversation idle", async () => {
 	const { reject, open, session, results } = await launch();
 	const created = await open();
 	vi.spyOn(results[0]!.session, "prompt").mockRejectedValue(new Error("provider unavailable"));
@@ -145,6 +144,7 @@ test("a rejected turn marks the conversation failed", async () => {
 	expect(await reject("prompt", { sessionId: created.id, text: "hello" })).toContain("provider unavailable");
 
 	const after = await session(created.id);
-	expect(after?.status).toBe("error");
-	expect(after?.error).toContain("provider unavailable");
+	expect(after?.status).toBe("idle");
+	expect(after?.error).toBeUndefined();
+	expect(after?.errorOwner).toBeUndefined();
 });

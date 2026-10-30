@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
+import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
+import type { ImageContent } from "@gajae-code/ai/core";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { getUi, SETTINGS_SCHEMA, type SettingPath } from "@gajae-code/coding-agent/config/settings-schema";
@@ -10,7 +12,12 @@ import {
 	clearPluginRootsAndCaches,
 	resolveActiveProjectRegistryPath,
 } from "@gajae-code/coding-agent/discovery/helpers";
-import type { ExtensionUIContext, ExtensionUIDialogOptions } from "@gajae-code/coding-agent/extensibility/extensions";
+import type {
+	ExtensionUIContext,
+	ExtensionUIDialogOptions,
+	InputEventResult,
+} from "@gajae-code/coding-agent/extensibility/extensions";
+import { initializeExtensions } from "@gajae-code/coding-agent/modes/runtime-init";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import {
 	ACP_BUILTIN_SLASH_COMMANDS,
@@ -36,6 +43,7 @@ import type {
 } from "./activity-protocol";
 import { prepareDesktopAttachmentInput } from "./attachment-input";
 import { createDesktopBtwController, type DesktopBtwController } from "./btw-controls";
+import { DeliveryJournal } from "./delivery-journal";
 import { prepareDesktopEnvironment } from "./environment-policy";
 import {
 	createDesktopGatePresenter,
@@ -57,6 +65,7 @@ import type {
 	DesktopCapability,
 	DesktopCommand,
 	DesktopCommandResult,
+	DesktopDeliveryReceipt,
 	DesktopDiff,
 	DesktopForkResult,
 	DesktopFrame,
@@ -77,6 +86,8 @@ import { createDesktopStreamRedactor } from "./stream-redactor";
 const HISTORY_LIMIT = 160;
 const VISIBLE_MESSAGE_ROLES = new Set(["user", "assistant", "toolResult", "bashExecution", "pythonExecution"]);
 const TEXT_LIMIT = 8_000;
+const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
+	JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
 const FULL_TEXT_LIMIT = 32_000;
 /** Owned controllers redact complete display fields before producing these DTOs. */
 const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
@@ -431,6 +442,7 @@ interface Catalog {
 interface TrackedQueuedInput {
 	dto: DesktopQueuedInput;
 	submission: QueuedInputSubmission;
+	deliveryId: string;
 }
 interface SessionCandidate {
 	sdk: AgentSession;
@@ -446,6 +458,17 @@ interface LiveSession extends SessionCandidate {
 	unsubscribeIdentity: () => void;
 	busy: boolean;
 	error?: string;
+	errorOwner?: string;
+	queuedAdmissionOrder?: number;
+	errorEpoch?: number;
+	errorScopeGeneration?: number;
+	errorScopeKey?: string;
+	scopeOwners: Map<string, { id: string; order: number }>;
+	startup?: Promise<void>;
+	startupGeneration?: number;
+	startupPending?: boolean;
+	extensionRunner?: AgentSession["extensionRunner"];
+	extensionUI?: ExtensionUIContext;
 	timer?: Timer;
 	unsubscribe: () => void;
 	activity: DesktopActivityController;
@@ -493,6 +516,7 @@ export class DesktopHost {
 	#emit: (frame: DesktopFrame, projected?: boolean) => void;
 	#createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	#catalog: Catalog = { version: 1, projects: [], sessions: [] };
+	#deliveries!: DeliveryJournal;
 	#live = new Map<string, LiveSession>();
 	/** Unpublished SDK ownership, retained until publication or proven disposal. */
 	#candidates = new Set<SessionCandidate>();
@@ -529,9 +553,20 @@ export class DesktopHost {
 				? JSON.stringify(frame)
 				: JSON.stringify(frame, (key, value: unknown) =>
 						typeof value === "string" &&
-						!["id", "entryId", "sessionId", "projectId", "type", "status", "kind", "role", "provider"].includes(
-							key,
-						)
+						![
+							"id",
+							"entryId",
+							"sessionId",
+							"projectId",
+							"deliveryId",
+							"sdkSubmissionId",
+							"errorOwner",
+							"type",
+							"status",
+							"kind",
+							"role",
+							"provider",
+						].includes(key)
 							? this.#redact(value)
 							: value,
 					);
@@ -554,6 +589,8 @@ export class DesktopHost {
 		await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
 		this.#dataDir = await fs.realpath(this.#dataDir);
 		await fs.chmod(this.dataDir, 0o700);
+		this.#deliveries = new DeliveryJournal(this.dataDir);
+		await this.#deliveries.initialize();
 		const agentDir = prepareDesktopEnvironment(process.env, this.dataDir);
 		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		if (process.env.GJC_DESKTOP_ISOLATED === "1")
@@ -739,7 +776,7 @@ export class DesktopHost {
 			...(live && live.sdk.messages.length + live.notices.length > HISTORY_LIMIT ? { historyTruncated: true } : {}),
 			...(question ? { question } : {}),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
-			...(live?.error ? { error: live.error } : {}),
+			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
 		};
 	}
 	snapshot(): DesktopSnapshot {
@@ -768,6 +805,7 @@ export class DesktopHost {
 				}),
 			models: this.#registry?.getAvailable().map(projectDesktopModel) ?? [],
 			capabilities: CAPABILITIES.map(capability => ({ ...capability })),
+			deliveries: this.#deliveries.list(),
 		};
 	}
 	#publishSnapshot(): void {
@@ -896,7 +934,6 @@ export class DesktopHost {
 				hasUI: true,
 				notificationHostModeSupported: false,
 				sdkHostModeSupported: false,
-				disableExtensionDiscovery: true,
 			});
 			createdSession = result.session;
 			const candidate: SessionCandidate = {
@@ -905,7 +942,12 @@ export class DesktopHost {
 				metadata,
 				settings,
 				registry,
-				notices: [],
+				notices: result.extensionsResult.errors.map(error => ({
+					id: crypto.randomUUID(),
+					role: "system" as const,
+					text: `Extension discovery failed: ${this.#redact(error.error).slice(0, TEXT_LIMIT)}`,
+					isError: true,
+				})),
 			};
 			this.#candidates.add(candidate);
 			// The terminal applies the configured default model profile at startup; without
@@ -978,12 +1020,12 @@ export class DesktopHost {
 			activityPublishedRevision: 0,
 			busy: false,
 			queued: new Map(),
+			scopeOwners: new Map(),
 		};
 		this.#live.set(live.metadata.id, live);
 		this.#attachGatePresenter(live);
 		this.#attachOperatorController(live);
 		this.#attachBtwController(live);
-		live.factory.setToolUIContext(this.#ui(live), true);
 		live.unsubscribe = live.sdk.subscribe(event => {
 			if (event.type === "message_update") live.streamingMessage = event.message;
 			if (event.type === "message_end" || event.type === "agent_end") live.streamingMessage = undefined;
@@ -991,8 +1033,71 @@ export class DesktopHost {
 		});
 		live.unsubscribeActivity = live.activity.onChange(() => this.#scheduleActivity(live));
 		live.unsubscribeIdentity = live.sdk.subscribeSessionIdentityChanges(() => this.#schedule(live));
+		this.#initializeLiveExtensions(live);
 		this.#candidates.delete(candidate);
 		return live;
+	}
+	#initializeLiveExtensions(live: LiveSession): void {
+		const generation = live.sdk.sessionLifecycle.generation;
+		const currentUI = this.#ui(live, generation);
+		live.extensionUI = currentUI;
+		live.factory.setToolUIContext(currentUI, true);
+		const runner = live.sdk.extensionRunner;
+		if (live.startup && live.extensionRunner === runner) {
+			runner?.setUIContext(currentUI);
+			live.startupGeneration = generation;
+			return;
+		}
+		live.extensionRunner = runner;
+		// Install the fence synchronously, but let publication and the transport response
+		// proceed: session_start is allowed to wait for an interactive answer.
+		live.startupPending = true;
+		const startup = Promise.resolve()
+			.then(async () => {
+				if (live.sdk.sessionLifecycle.generation !== generation)
+					throw new Error("Session changed before extension initialization");
+				if (this.#closed || this.#live.get(live.metadata.id) !== live || this.#retiredLive.has(live))
+					throw new Error("Session retired before extension initialization");
+				await initializeExtensions(live.sdk, {
+					uiContext: currentUI,
+					reportSendError: (action, error) =>
+						live.extensionUI?.notify(`Extension ${action}: ${error.message}`, "error"),
+					reportRuntimeError: error =>
+						live.extensionUI?.notify(`Extension ${error.event}: ${error.error}`, "error"),
+				});
+			})
+			.catch(error => {
+				if (
+					!this.#closed &&
+					this.#live.get(live.metadata.id) === live &&
+					!this.#retiredLive.has(live) &&
+					live.sdk.sessionLifecycle.generation === generation
+				) {
+					live.error = this.#error(error);
+					live.errorOwner = undefined;
+					currentUI.notify(`Extension initialization failed: ${this.#error(error)}`, "error");
+				}
+				throw error;
+			})
+			.finally(() => {
+				if (live.extensionRunner === runner) live.startupPending = false;
+			});
+		live.startup = startup;
+		live.startupGeneration = generation;
+		void startup.catch(() => {});
+	}
+	async #awaitStartup(live: LiveSession): Promise<void> {
+		const generation = live.sdk.sessionLifecycle.generation;
+		await live.startup;
+		if (
+			this.#closed ||
+			this.#live.get(live.metadata.id) !== live ||
+			this.#retiredLive.has(live) ||
+			live.gateMutation ||
+			live.sdk.sessionLifecycle.generation !== generation ||
+			live.startupGeneration !== generation
+		)
+			throw new Error("Session changed during extension initialization");
 	}
 	async #disposeCandidate(candidate: SessionCandidate): Promise<void> {
 		// dispose() has a caller deadline, not a lifetime guarantee. Start and observe
@@ -1247,7 +1352,9 @@ export class DesktopHost {
 			connectionGeneration: this.#connectionGeneration,
 			redact: text => this.#redact(text),
 		});
+		this.#cancelQuestions(live.metadata.id);
 		live.serviceGeneration = lifecycle.generation;
+		this.#initializeLiveExtensions(live);
 		live.activityUpdate = undefined;
 		live.activitySerialized = undefined;
 		this.#attachGatePresenter(live);
@@ -1258,6 +1365,7 @@ export class DesktopHost {
 	}
 	async #disposeLive(live: LiveSession): Promise<void> {
 		this.#retiredLive.add(live);
+		this.#cancelQuestions(live.metadata.id);
 		const failures: unknown[] = [];
 		const attempt = async (operation: () => unknown | Promise<unknown>) => {
 			try {
@@ -1331,9 +1439,17 @@ export class DesktopHost {
 	async #ask(
 		live: LiveSession,
 		question: Omit<DesktopQuestion, "id" | "sessionId">,
+		generation: number,
 		options?: ExtensionUIDialogOptions,
 	): Promise<string | boolean | null> {
-		if (this.#closed || options?.signal?.aborted) return null;
+		if (
+			this.#closed ||
+			this.#live.get(live.metadata.id) !== live ||
+			this.#retiredLive.has(live) ||
+			live.sdk.sessionLifecycle.generation !== generation ||
+			options?.signal?.aborted
+		)
+			return null;
 		if ([...this.#questions.values()].some(item => item.question.sessionId === live.metadata.id))
 			throw new Error("Session already has a pending question");
 		const deferred = Promise.withResolvers<string | boolean | null>();
@@ -1369,7 +1485,7 @@ export class DesktopHost {
 		this.#publish(live);
 		return deferred.promise;
 	}
-	#ui(live: LiveSession): ExtensionUIContext {
+	#ui(live: LiveSession, generation: number): ExtensionUIContext {
 		const unsupported = (): never => {
 			throw new Error("Terminal-only UI is unavailable in desktop");
 		};
@@ -1379,19 +1495,26 @@ export class DesktopHost {
 			initialValue?: string,
 			options?: ExtensionUIDialogOptions,
 		) => {
-			const value = await this.#ask(live, { kind, title, initialValue }, options);
+			const value = await this.#ask(live, { kind, title, initialValue }, generation, options);
 			return typeof value === "string" ? value : undefined;
 		};
 		return {
 			select: async (title, options, dialogOptions) => {
-				const value = await this.#ask(live, { kind: "select", title, options }, dialogOptions);
+				const value = await this.#ask(live, { kind: "select", title, options }, generation, dialogOptions);
 				return typeof value === "string" ? value : undefined;
 			},
 			confirm: async (title, message, options) =>
-				(await this.#ask(live, { kind: "confirm", title, message }, options)) === true,
+				(await this.#ask(live, { kind: "confirm", title, message }, generation, options)) === true,
 			input: (title, placeholder, options) => textQuestion("input", title, placeholder, options),
 			editor: (title, prefill, options) => textQuestion("editor", title, prefill, options),
 			notify: (message, type) => {
+				if (
+					this.#closed ||
+					this.#live.get(live.metadata.id) !== live ||
+					this.#retiredLive.has(live) ||
+					live.sdk.sessionLifecycle.generation !== generation
+				)
+					return;
 				live.notices.push({
 					id: crypto.randomUUID(),
 					role: "system",
@@ -1423,30 +1546,184 @@ export class DesktopHost {
 			setToolsExpanded: unsupported,
 		};
 	}
+	async #delivery(
+		id: string,
+		changes: Partial<Pick<DesktopDeliveryReceipt, "disposition" | "sdkSubmissionId" | "error">>,
+	): Promise<void> {
+		try {
+			await this.#deliveries.update(id, changes);
+		} catch (error) {
+			const receipt = this.#deliveries.list().find(item => item.id === id);
+			if (receipt) this.#emit({ type: "delivery", receipt });
+			throw error;
+		}
+		const receipt = this.#deliveries.list().find(item => item.id === id);
+		if (receipt) this.#emit({ type: "delivery", receipt });
+	}
+	async #beginDelivery(id: string, sessionId: string): Promise<void> {
+		await this.#deliveries.begin(id, sessionId);
+		this.#emit({ type: "delivery", receipt: this.#deliveries.list().find(item => item.id === id)! });
+	}
+	#observeDelivery(operation: Promise<void>): void {
+		void operation.catch(error => {
+			try {
+				this.#emit({ type: "fatal", error: `Delivery journal: ${this.#error(error)}` });
+			} catch {
+				/* The observer must not reject. */
+			}
+		});
+	}
+	async #extensionInput(
+		live: LiveSession,
+		id: string,
+		text: string,
+		images: ImageContent[],
+		allowGateMutation = false,
+	): Promise<{ handled: boolean; text: string; images: ImageContent[] }> {
+		const runner = live.sdk.extensionRunner;
+		if (!runner?.hasHandlers("input")) return { handled: false, text, images };
+		await this.#delivery(id, { disposition: "accepted" });
+		const generation = live.sdk.sessionLifecycle.generation;
+		let result: InputEventResult;
+		try {
+			result = await runner.emitInput(text, images.length ? images : undefined, "interactive");
+		} catch (error) {
+			await this.#delivery(id, { disposition: "unknown", error: "Extension input outcome unknown" });
+			throw error;
+		}
+		if (
+			this.#closed ||
+			this.#live.get(live.metadata.id) !== live ||
+			live.sdk.sessionLifecycle.generation !== generation ||
+			(live.gateMutation && !allowGateMutation)
+		) {
+			await this.#delivery(id, { disposition: "unknown", error: "Session changed during extension input" });
+			throw new Error("Session changed during extension input");
+		}
+		if (result.handled) {
+			await this.#delivery(id, { disposition: "completed" });
+			return { handled: true, text, images };
+		}
+		return { handled: false, text: result.text ?? text, images: result.images ?? images };
+	}
+	async #promptDelivery(
+		live: LiveSession,
+		id: string,
+		text: string,
+		images: ImageContent[],
+		alreadyBegun = false,
+	): Promise<void> {
+		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
+		let accepted = false;
+		const input = await this.#extensionInput(live, id, text, images, !alreadyBegun);
+		if (input.handled) return;
+		accepted = this.#deliveries.list().some(receipt => receipt.id === id && receipt.disposition === "accepted");
+		text = input.text;
+		images = input.images;
+		const run: { started?: AttemptRunHandle } = {};
+		const terminals = new Map<string, { reason: string | undefined; assistant: string | undefined }>();
+		const unsubscribe = live.sdk.subscribe(event => {
+			if (event.type !== "agent_end" || !event.scope) return;
+			const assistant = event.messages.filter(message => message.role === "assistant").at(-1);
+			terminals.set(scopeKey(event.scope), { reason: event.stopReason, assistant: assistant?.stopReason });
+		});
+		let journalFailed = false;
+		const options: {
+			onPreflightAcceptCommit: () => Promise<void>;
+			onRunAccepted: (handle: AttemptRunHandle) => void;
+		} = {
+			onRunAccepted: handle => {
+				run.started = handle;
+				live.scopeOwners.set(scopeKey(handle.scope), { id, order: 0 });
+			},
+			onPreflightAcceptCommit: async () => {
+				try {
+					await this.#delivery(id, { disposition: "accepted" });
+				} catch (error) {
+					journalFailed = true;
+					throw error;
+				}
+				accepted = true;
+			},
+		};
+		try {
+			if (images.length) await createSessionImageInput(live.sdk).prompt(text, images, options);
+			else await live.sdk.prompt(text, options);
+		} catch (error) {
+			await this.#delivery(
+				id,
+				journalFailed
+					? { disposition: "unknown", error: "Delivery journal unavailable" }
+					: {
+							disposition: run.started ? "failed" : accepted ? "unknown" : "refused",
+							error: run.started ? "Prompt failed" : accepted ? "Prompt outcome unknown" : "Prompt refused",
+						},
+			);
+			throw error;
+		} finally {
+			unsubscribe();
+		}
+		const owned = run.started ? terminals.get(scopeKey(run.started.scope)) : undefined;
+		if (owned?.assistant === "error" || owned?.assistant === "aborted" || owned?.reason === "cancelled") {
+			await this.#delivery(id, {
+				disposition: owned.assistant === "error" ? "failed" : "unknown",
+				error: owned.assistant === "error" ? "Prompt failed" : "Prompt outcome unknown",
+			});
+			if (owned.assistant === "error" && run.started) this.#recordScopeFailure(live, run.started.scope, id);
+			throw new Error(owned.assistant === "error" ? "Prompt failed" : "Prompt outcome unknown");
+		}
+		await this.#delivery(id, {
+			disposition: accepted && owned?.reason === "completed" && owned.assistant ? "completed" : "unknown",
+		});
+	}
+	#recordScopeFailure(
+		live: LiveSession,
+		scope: { lineage: string; generation: number; attemptId: string },
+		fallback: string,
+	): void {
+		if (this.#live.get(live.metadata.id) !== live || scope.generation < (live.errorScopeGeneration ?? -1)) return;
+		live.errorScopeGeneration = scope.generation;
+		live.errorScopeKey = scopeKey(scope);
+		live.error = "Prompt failed";
+		live.errorOwner = live.scopeOwners.get(scopeKey(scope))?.id ?? fallback;
+		this.#publish(live);
+	}
 	async #exclusive<T>(
 		live: LiveSession,
 		operation: () => Promise<T>,
 		retireGates = false,
 		persistSource = true,
 		// Only a prompt whose turn failed describes the conversation. The `prompt`
-		// request passes true; `command.run` records the failure of the prompt it
+		// request passes its id; `command.run` records the failure of the prompt it
 		// forwards itself. Leaving this unset means this helper records nothing:
 		// `retry()` returning false becomes a request error, and a failed compaction
 		// is a refused maintenance step, so neither marks the session failed and each
 		// reports through its own request.
-		recordFailure = false,
+		recordFailure?: string,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
 			throw new Error("다른 작업이 실행 중입니다. 끝난 뒤 다시 시도하세요.");
 		live.busy = true;
 		live.gateMutation = retireGates;
 		live.error = undefined;
+		live.errorOwner = undefined;
+		live.errorScopeGeneration = undefined;
+		live.errorScopeKey = undefined;
+		live.scopeOwners.clear();
+		live.errorEpoch = (live.errorEpoch ?? 0) + 1;
 		this.#publish(live);
 		try {
 			if (retireGates) await live.gatePresenter?.withdrawAll();
 			return await operation();
 		} catch (error) {
-			if (recordFailure) live.error = this.#error(error);
+			if (
+				recordFailure &&
+				!live.errorOwner &&
+				this.#deliveries.list().some(receipt => receipt.id === recordFailure && receipt.disposition === "failed")
+			) {
+				live.error = this.#error(error);
+				live.errorOwner = recordFailure;
+			}
 			throw error;
 		} finally {
 			live.streamingMessage = undefined;
@@ -1464,10 +1741,19 @@ export class DesktopHost {
 		}
 	}
 	async handle(request: DesktopRequest): Promise<void> {
+		let promptBegun = false;
+		let promptAdmissionAttempted = false;
 		try {
 			if (this.#closed && request.method !== "shutdown") throw new Error("Host is closed");
 			await this.initialize();
 			if (this.#closed && request.method !== "shutdown") throw new Error("Host is closed");
+			if (request.method === "prompt") {
+				prepareDesktopAttachmentInput(request);
+				const metadata = this.#metadata(request.params);
+				promptAdmissionAttempted = true;
+				await this.#beginDelivery(request.id, metadata.id);
+				promptBegun = true;
+			}
 			const task = this.#dispatch(request);
 			if (request.method !== "shutdown") this.#tasks.add(task);
 			let result: unknown;
@@ -1481,7 +1767,32 @@ export class DesktopHost {
 				PROJECTED_CONTROL_METHODS.has(request.method),
 			);
 		} catch (error) {
-			this.#emit({ type: "response", id: request.id, ok: false, error: this.#error(error) });
+			let receipt = this.#deliveries?.list().find(item => item.id === request.id);
+			if (request.method === "prompt" && promptBegun && receipt?.disposition === "pending") {
+				try {
+					await this.#delivery(request.id, { disposition: "refused", error: "Prompt refused" });
+				} catch {
+					/* The journal exposes unknown when persistence fails. */
+				}
+				receipt = this.#deliveries.list().find(item => item.id === request.id);
+			}
+			const deliveryDisposition =
+				request.method !== "prompt"
+					? undefined
+					: receipt?.disposition === "refused"
+						? "refused"
+						: receipt?.disposition === "failed"
+							? "failed"
+							: receipt || promptAdmissionAttempted || this.#deliveries?.hasAcknowledged(request.id)
+								? "unknown"
+								: "refused";
+			this.#emit({
+				type: "response",
+				id: request.id,
+				ok: false,
+				error: this.#error(error),
+				...(deliveryDisposition ? { deliveryDisposition } : {}),
+			});
 		}
 	}
 	async #dispatch(request: DesktopRequest): Promise<unknown> {
@@ -1491,6 +1802,10 @@ export class DesktopHost {
 			const snapshot = this.snapshot();
 			this.#emit({ type: "snapshot", snapshot });
 			return snapshot;
+		}
+		if (method === "delivery.ack") {
+			await this.#deliveries.ack(requiredString(params, "deliveryId", 128));
+			return null;
 		}
 		if (method === "shutdown") {
 			await this.close();
@@ -1618,7 +1933,8 @@ export class DesktopHost {
 				),
 				{ name: "btw", description: "기존 대화와 분리된 텍스트 전용 별도 대화", hint: "<question>" },
 			];
-		if (method === "command.run") return this.#command(this.#metadata(params), requiredString(params, "text"));
+		if (method === "command.run")
+			return this.#command(this.#metadata(params), requiredString(params, "text"), request.id);
 		if (method === "history.get") {
 			const live = await this.#open(this.#metadata(params));
 			const offset = params.offset === undefined ? 0 : params.offset;
@@ -1680,6 +1996,17 @@ export class DesktopHost {
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
 		const live = await this.#open(metadata);
+		if (method === "session.delete" && live.startupPending) {
+			if (live.gateMutation) throw new Error("Session change already in progress");
+			live.gateMutation = true;
+			try {
+				this.#cancelQuestions(metadata.id);
+				await live.sdk.abort();
+				return await this.#deleteSession(live, metadata);
+			} finally {
+				live.gateMutation = false;
+			}
+		}
 		if (method === "session.select") {
 			this.#publish(live);
 			return this.#dto(metadata);
@@ -1693,7 +2020,9 @@ export class DesktopHost {
 				return null;
 			}
 			this.#cancelQuestions(metadata.id);
-			for (const tracked of live.queued.values()) tracked.submission.cancel();
+			for (const tracked of live.queued.values()) {
+				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
+			}
 			await live.sdk.abort();
 			this.#publish(live);
 			return null;
@@ -1813,23 +2142,79 @@ export class DesktopHost {
 			return { available: live.sdk.getAllToolNames(), active: live.sdk.getActiveToolNames() };
 		if (method === "diff.get") return this.#diff(metadata.projectId);
 		if (method === "prompt") {
+			if (live.gateMutation) throw new Error("세션 변경이 끝난 뒤 메시지를 보내세요.");
+			await this.#awaitStartup(live);
 			if (!attachmentInput) throw new Error("Prompt attachment envelope was not validated");
-			const { text, images } = attachmentInput;
+			let { text, images } = attachmentInput;
 			if (live.gateMutation) throw new Error("세션 변경이 끝난 뒤 메시지를 보내세요.");
 			if (live.operator?.isBusy()) throw new Error("명령 실행이 끝난 뒤 메시지를 보내세요.");
 			if (live.busy || live.sdk.isStreaming) {
+				const input = await this.#extensionInput(live, request.id, text, images);
+				if (input.handled) return null;
+				text = input.text;
+				images = input.images;
 				// TUI parity: an active run accepts steering or a follow-up instead of rejecting input.
 				const deliverAs = params.deliverAs === "followUp" ? "followUp" : "steer";
-				const submission = images.length
-					? await createSessionImageInput(live.sdk).submitUserMessage(text, images, { deliverAs })
-					: await live.sdk.submitUserMessage(text, { deliverAs, trackSubmission: true });
+				live.queuedAdmissionOrder = (live.queuedAdmissionOrder ?? 0) + 1;
+				const admissionOrder = live.queuedAdmissionOrder;
+				const errorEpoch = live.errorEpoch;
+				let accepted = this.#deliveries
+					.list()
+					.some(receipt => receipt.id === request.id && receipt.disposition === "accepted");
+				let journalFailed = false;
+				const options: { deliverAs: "steer" | "followUp"; onPreflightAcceptCommit: () => Promise<void> } = {
+					deliverAs,
+					onPreflightAcceptCommit: async () => {
+						try {
+							await this.#delivery(request.id, { disposition: "accepted" });
+						} catch (error) {
+							journalFailed = true;
+							throw error;
+						}
+						accepted = true;
+					},
+				};
+				const terminalEvents = new Map<string, { reason: string | undefined; assistant: string | undefined }>();
+				const unsubscribeTerminal = live.sdk.subscribe(event => {
+					if (event.type !== "agent_end" || !event.scope) return;
+					const assistant = event.messages.filter(message => message.role === "assistant").at(-1);
+					terminalEvents.set(scopeKey(event.scope), {
+						reason: event.stopReason,
+						assistant: assistant?.stopReason,
+					});
+				});
+				let submission: QueuedInputSubmission;
+				try {
+					submission = images.length
+						? await createSessionImageInput(live.sdk).submitUserMessage(text, images, options)
+						: await live.sdk.submitUserMessage(text, { ...options, trackSubmission: true });
+				} catch (error) {
+					unsubscribeTerminal();
+					await this.#delivery(
+						request.id,
+						journalFailed
+							? { disposition: "unknown", error: "Delivery journal unavailable" }
+							: {
+									disposition: accepted ? "unknown" : "refused",
+									error: accepted ? "Submission outcome unknown" : "Submission refused",
+								},
+					);
+					throw error;
+				}
+				const queuedPersisted = this.#delivery(request.id, {
+					disposition: "queued",
+					sdkSubmissionId: submission.submissionId,
+				}).catch(error => {
+					unsubscribeTerminal();
+					throw error;
+				});
 				const dto: DesktopQueuedInput = {
 					id: submission.submissionId,
 					text: this.#redact(text).slice(0, TEXT_LIMIT),
 					deliverAs,
 					cancelable: true,
 				};
-				live.queued.set(dto.id, { dto, submission });
+				live.queued.set(dto.id, { dto, submission, deliveryId: request.id });
 				const settle = (execution?: DesktopQueuedInput["execution"]) => {
 					const tracked = live.queued.get(dto.id);
 					if (!tracked) return;
@@ -1838,34 +2223,102 @@ export class DesktopHost {
 					tracked.dto.cancelable = false;
 					this.#publish(live);
 				};
-				void submission.execution.then(
-					outcome => settle(outcome.disposition),
-					() => settle("removed"),
+				this.#observeDelivery(
+					submission.execution.then(
+						async outcome => {
+							if (outcome.disposition !== "removed" && live.errorEpoch === errorEpoch) {
+								const key = scopeKey(outcome.attemptScope);
+								const owner = live.scopeOwners.get(key);
+								if (!owner || admissionOrder < owner.order) {
+									live.scopeOwners.set(key, { id: request.id, order: admissionOrder });
+									if (live.errorScopeKey === key)
+										this.#recordScopeFailure(live, outcome.attemptScope, request.id);
+								}
+							}
+							await queuedPersisted;
+							settle(outcome.disposition);
+							if (outcome.disposition === "removed")
+								await this.#delivery(request.id, {
+									disposition:
+										outcome.reason === "cancelled"
+											? "cancelled"
+											: outcome.reason === "refused"
+												? "refused"
+												: "removed",
+								});
+							else await this.#delivery(request.id, { disposition: "accepted" });
+						},
+						async () => {
+							await queuedPersisted;
+							settle();
+							await this.#delivery(request.id, {
+								disposition: "unknown",
+								error: "Submission lifecycle unavailable",
+							});
+						},
+					),
 				);
-				void submission.terminal.then(
-					outcome => {
-						live.queued.delete(dto.id);
-						void outcome;
-						this.#publish(live);
-					},
-					() => {
-						live.queued.delete(dto.id);
-						this.#publish(live);
-					},
+				this.#observeDelivery(
+					submission.terminal.then(
+						async outcome => {
+							await queuedPersisted;
+							unsubscribeTerminal();
+							live.queued.delete(dto.id);
+							this.#publish(live);
+							const terminal =
+								outcome.disposition === "completed"
+									? terminalEvents.get(scopeKey(outcome.attemptScope))
+									: undefined;
+							const disposition =
+								outcome.disposition === "removed"
+									? outcome.reason === "cancelled"
+										? "cancelled"
+										: outcome.reason === "refused"
+											? "refused"
+											: "removed"
+									: terminal?.assistant === "error"
+										? "failed"
+										: terminal?.reason === "completed" &&
+												terminal.assistant &&
+												terminal.assistant !== "aborted"
+											? "completed"
+											: "unknown";
+							await this.#delivery(request.id, {
+								disposition,
+								...(disposition === "failed" ? { error: "Prompt failed" } : {}),
+							});
+							if (
+								disposition === "failed" &&
+								outcome.disposition === "completed" &&
+								live.errorEpoch === errorEpoch
+							)
+								this.#recordScopeFailure(live, outcome.attemptScope, request.id);
+						},
+						async () => {
+							await queuedPersisted;
+							unsubscribeTerminal();
+							live.queued.delete(dto.id);
+							this.#publish(live);
+							await this.#delivery(request.id, {
+								disposition: "unknown",
+								error: "Submission lifecycle unavailable",
+							});
+						},
+					),
 				);
+				await queuedPersisted;
 				this.#publish(live);
 				return { queued: true, submissionId: submission.submissionId };
 			}
 			return this.#exclusive(
 				live,
 				async () => {
-					if (images.length) await createSessionImageInput(live.sdk).prompt(text, images);
-					else await live.sdk.prompt(text);
+					await this.#promptDelivery(live, request.id, text, images, true);
 					return null;
 				},
 				false,
 				true,
-				true,
+				request.id,
 			);
 		}
 		if (method === "queue.cancel") {
@@ -1873,6 +2326,7 @@ export class DesktopHost {
 			const tracked = live.queued.get(id);
 			if (!tracked) throw new Error("Queued input not found");
 			const removed = tracked.submission.cancel();
+			if (removed) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			// Either way this queue id is settled: keeping it would leave a cancelable
 			// chip whose delivery already happened.
 			live.queued.delete(id);
@@ -1895,28 +2349,8 @@ export class DesktopHost {
 						metadata.starred = params.starred;
 						this.#publishSnapshot();
 						return null;
-					case "session.delete": {
-						this.#cancelQuestions(metadata.id);
-						live.queued.clear();
-						await this.#disposeLive(live);
-						this.#live.delete(metadata.id);
-						const index = this.#catalog.sessions.indexOf(metadata);
-						this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
-						try {
-							await this.#save();
-						} catch (error) {
-							// Persistence is uncertain: keep the transcript and a recoverable catalog entry.
-							this.#catalog.sessions.splice(index, 0, metadata);
-							throw error;
-						}
-						// Removal is committed. Artifact cleanup failure must not resurrect this entry.
-						if (metadata.file) {
-							const file = this.#sessionPath(metadata.file);
-							await new FileSessionStorage().deleteSessionWithArtifacts(file);
-						}
-						this.#publishSnapshot();
-						return null;
-					}
+					case "session.delete":
+						return this.#deleteSession(live, metadata);
 					case "session.fork":
 						return this.#fork(live, params);
 					case "session.compact":
@@ -1988,6 +2422,23 @@ export class DesktopHost {
 			method !== "session.fork" && method !== "session.delete",
 		);
 	}
+	async #deleteSession(live: LiveSession, metadata: SavedSession): Promise<null> {
+		this.#cancelQuestions(metadata.id);
+		live.queued.clear();
+		await this.#disposeLive(live);
+		this.#live.delete(metadata.id);
+		const index = this.#catalog.sessions.indexOf(metadata);
+		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
+		try {
+			await this.#save();
+		} catch (error) {
+			this.#catalog.sessions.splice(index, 0, metadata);
+			throw error;
+		}
+		if (metadata.file) await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(metadata.file));
+		this.#publishSnapshot();
+		return null;
+	}
 	/** Mirror the session's own title into the desktop catalog after a command changed it. */
 	async #syncTitle(live: LiveSession): Promise<void> {
 		const title = live.sdk.sessionManager.getSessionName?.();
@@ -2005,8 +2456,9 @@ export class DesktopHost {
 	 * executes exactly the same handlers as text/ACP mode. Commands that only
 	 * exist as TUI modals are not advertised and cannot reach this path.
 	 */
-	async #command(metadata: SavedSession, text: string): Promise<DesktopCommandResult> {
+	async #command(metadata: SavedSession, text: string, requestId: string): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
+		await this.#awaitStartup(live);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 		if (/^\s*\/btw(?:\s|$)/i.test(text)) {
 			const question = text
@@ -2027,9 +2479,9 @@ export class DesktopHost {
 			// would report success and an unknown name would spend a provider turn.
 			return { consumed: false, refused: true, output: DESKTOP_UNAVAILABLE };
 		// Commands mutate the same session as prompts, so they take the same lock.
-		return this.#exclusive(live, () => this.#runCommand(live, text), true);
+		return this.#exclusive(live, () => this.#runCommand(live, text, requestId), true);
 	}
-	async #runCommand(live: LiveSession, text: string): Promise<DesktopCommandResult> {
+	async #runCommand(live: LiveSession, text: string, requestId: string): Promise<DesktopCommandResult> {
 		const chunks: string[] = [];
 		let written = 0;
 		let dropped = false;
@@ -2086,9 +2538,15 @@ export class DesktopHost {
 				// A builtin that returns a prompt starts a real turn, so its failure is the
 				// conversation's failure even though command.run itself is administrative.
 				try {
-					await live.sdk.prompt(forwarded);
+					await this.#promptDelivery(live, requestId, forwarded, []);
 				} catch (error) {
-					live.error = this.#error(error);
+					if (
+						!live.errorOwner &&
+						this.#deliveries.list().some(receipt => receipt.id === requestId && receipt.disposition === "failed")
+					) {
+						live.error = this.#error(error);
+						live.errorOwner = requestId;
+					}
 					throw error;
 				}
 			}

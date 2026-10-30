@@ -61,6 +61,7 @@ export const DESKTOP_METHODS = [
 	"mcp.operate",
 	"session.info",
 	"queue.cancel",
+	"delivery.ack",
 	"diff.get",
 	"tools.list",
 	"tools.set",
@@ -97,6 +98,23 @@ export interface DesktopQuestion {
 	message?: string;
 	options?: string[];
 	initialValue?: string;
+}
+
+export interface DesktopDeliveryReceipt {
+	id: string;
+	sessionId: string;
+	disposition:
+		| "pending"
+		| "accepted"
+		| "queued"
+		| "completed"
+		| "failed"
+		| "removed"
+		| "cancelled"
+		| "refused"
+		| "unknown";
+	sdkSubmissionId?: string;
+	error?: string;
 }
 
 export interface DesktopQueuedInput {
@@ -144,6 +162,7 @@ export interface DesktopSession {
 	question?: DesktopQuestion;
 	/** Last failed prompt turn for this conversation; administrative refusals answer their request instead. */
 	error?: string;
+	errorOwner?: string;
 }
 
 export type DesktopForkResult =
@@ -176,6 +195,7 @@ export interface DesktopSnapshot {
 	sessions: DesktopSession[];
 	models: DesktopModel[];
 	capabilities: DesktopCapability[];
+	deliveries: DesktopDeliveryReceipt[];
 }
 export interface DesktopSetting {
 	path: string;
@@ -245,9 +265,10 @@ export interface DesktopActivityUpdate {
 }
 export type DesktopFrame =
 	| { type: "response"; id: string; ok: true; result: unknown }
-	| { type: "response"; id: string; ok: false; error: string }
+	| { type: "response"; id: string; ok: false; error: string; deliveryDisposition?: "refused" | "failed" | "unknown" }
 	| { type: "snapshot"; snapshot: DesktopSnapshot }
 	| { type: "session"; session: DesktopSession }
+	| { type: "delivery"; receipt: DesktopDeliveryReceipt }
 	| { type: "auth"; auth: DesktopAuthState }
 	| { type: "activity"; update: DesktopActivityUpdate }
 	| { type: "gate"; sessionId: string; event: DesktopGatePresentationEvent }

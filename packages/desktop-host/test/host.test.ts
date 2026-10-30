@@ -630,7 +630,8 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			expect(String((await outcome).error)).toContain("Source session changed while forking");
 			expect(h.sessions[1]!.session.sessionLifecycle.disposed).toBe(true);
 			expect(await Bun.file(h.sessions[1]!.session.sessionFile!).exists()).toBe(false);
-			expect(h.uiBindings).toHaveLength(1);
+			expect(h.uiBindings).toEqual([previousIdentity, h.sdk.sessionId]);
+			expect(h.uiBindings).not.toContain(h.sessions[1]!.session.sessionId);
 			expect((await h.call<DesktopSnapshot>("bootstrap")).sessions.map(session => session.id)).toEqual([
 				h.source.id,
 			]);

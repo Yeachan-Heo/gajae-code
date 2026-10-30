@@ -10,9 +10,9 @@ import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
-	createAgentSession,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
+	createAgentSession,
 } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
@@ -55,16 +55,25 @@ beforeEach(() => {
 	delete process.env.GJC_CODING_AGENT_DIR;
 	delete process.env.GJC_DESKTOP_AGENT_DIR;
 	delete process.env.GJC_DESKTOP_SERVICE_UNUSED_API_KEY;
-	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(function (this: ModelRegistry, _strategy, sessionId) {
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(function (
+		this: ModelRegistry,
+		_strategy,
+		sessionId,
+	) {
 		return originalRefresh.call(this, "offline", sessionId);
 	});
-	const blocked: typeof fetch = Object.assign(async (input: string | URL | Request) => {
-		forbiddenNetwork.push(String(input));
-		throw new Error("Service transport permits only its owned MCP loopback origin");
-	}, { preconnect: (url: string | URL) => {
-		forbiddenNetwork.push(String(url));
-		throw new Error("Service transport forbids network preconnect");
-	} });
+	const blocked: typeof fetch = Object.assign(
+		async (input: string | URL | Request) => {
+			forbiddenNetwork.push(String(input));
+			throw new Error("Service transport permits only its owned MCP loopback origin");
+		},
+		{
+			preconnect: (url: string | URL) => {
+				forbiddenNetwork.push(String(url));
+				throw new Error("Service transport forbids network preconnect");
+			},
+		},
+	);
 	vi.spyOn(globalThis, "fetch").mockImplementation(blocked);
 });
 
@@ -110,7 +119,9 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 	const gates = new Map<string, { entered(): void; wait: Promise<void> }>();
 	const releases = new Set<() => void>();
 	let host: DesktopHost | undefined;
-	const loopback = Bun.serve({ hostname: "127.0.0.1", port: 0,
+	const loopback = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
 		async fetch(request) {
 			const name = new URL(request.url).pathname.slice(1);
 			if (name !== "server0" && name !== "server1") return new Response(null, { status: 404 });
@@ -120,25 +131,52 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 				counts.set(name, counter);
 			}
 			counter.httpMethods[request.method] = (counter.httpMethods[request.method] ?? 0) + 1;
-			if (request.method === "DELETE") { counter.deletes++; return new Response(null, { status: 204 }); }
+			if (request.method === "DELETE") {
+				counter.deletes++;
+				return new Response(null, { status: 204 });
+			}
 			if (request.method !== "POST") return new Response(null, { status: 405 });
-			const body = await request.json() as { id?: number | string; method: string };
-			const method = typeof body.method === "string" && /^[A-Za-z0-9_./-]{1,80}$/.test(body.method) ? body.method : "invalid";
+			const body = (await request.json()) as { id?: number | string; method: string };
+			const method =
+				typeof body.method === "string" && /^[A-Za-z0-9_./-]{1,80}$/.test(body.method) ? body.method : "invalid";
 			counter.rpcMethods[method] = (counter.rpcMethods[method] ?? 0) + 1;
 			if (body.id === undefined) return new Response(null, { status: 202 });
 			if (body.method === "initialize") {
 				counter.initializes++;
 				const gate = gates.get(name);
-				if (gate) { gates.delete(name); gate.entered(); await gate.wait; }
-				return Response.json({ jsonrpc: "2.0", id: body.id, result: {
-					protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name, version: "1" },
-				} }, { headers: { "Mcp-Session-Id": `${name}-${counter.initializes}` } });
+				if (gate) {
+					gates.delete(name);
+					gate.entered();
+					await gate.wait;
+				}
+				return Response.json(
+					{
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							protocolVersion: "2025-03-26",
+							capabilities: { tools: {} },
+							serverInfo: { name, version: "1" },
+						},
+					},
+					{ headers: { "Mcp-Session-Id": `${name}-${counter.initializes}` } },
+				);
 			}
 			if (body.method === "tools/list") {
 				counter.lists++;
-				return Response.json({ jsonrpc: "2.0", id: body.id, result: {
-					tools: [{ name: "hello", description: configSecret, inputSchema: { type: "object", properties: {} } }],
-				} });
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						tools: [
+							{
+								name: name === "server0" ? "hello_alpha" : "hello_beta",
+								description: configSecret,
+								inputSchema: { type: "object", properties: {} },
+							},
+						],
+					},
+				});
 			}
 			return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "Method not found" } });
 		},
@@ -146,7 +184,10 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 	cleanups.push(async () => {
 		for (const release of releases) release();
 		try {
-			for (const capture of captures) { capture.session.abortBash(); capture.session.abortEval(); }
+			for (const capture of captures) {
+				capture.session.abortBash();
+				capture.session.abortEval();
+			}
 			await host?.close();
 			for (const capture of captures) expect(capture.session.agent.streamFn).not.toHaveBeenCalled();
 		} finally {
@@ -157,45 +198,101 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 	// Scope discovery roots before AuthStorage, Settings or factory initialization.
 	process.env.HOME = path.join(dataDir, "home");
 	process.env.USERPROFILE = process.env.HOME;
-	for (const [key, leaf] of Object.entries({ XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_STATE_HOME: "state", XDG_CACHE_HOME: "cache" }))
+	for (const [key, leaf] of Object.entries({
+		XDG_CONFIG_HOME: "config",
+		XDG_DATA_HOME: "data",
+		XDG_STATE_HOME: "state",
+		XDG_CACHE_HOME: "cache",
+	}))
 		process.env[key] = path.join(dataDir, leaf);
 	await fs.mkdir(projectPath, { recursive: true });
 	await fs.mkdir(process.env.HOME, { recursive: true });
-	const allowedFetch: typeof fetch = Object.assign(async (input: string | URL | Request, init?: BunFetchRequestInit) => {
-		const url = new URL(input instanceof Request ? input.url : String(input));
-		if (url.origin !== loopback.url.origin || !["/server0", "/server1"].includes(url.pathname)) {
-			forbiddenNetwork.push(url.href);
-			throw new Error("External HTTP is forbidden in service transport fixtures");
-		}
-		return originalFetch(input, init);
-	}, { preconnect: (url: string | URL) => {
-		forbiddenNetwork.push(String(url));
-		throw new Error("Service transport forbids network preconnect");
-	} });
+	const allowedFetch: typeof fetch = Object.assign(
+		async (input: string | URL | Request, init?: BunFetchRequestInit) => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			if (url.origin !== loopback.url.origin || !["/server0", "/server1"].includes(url.pathname)) {
+				forbiddenNetwork.push(url.href);
+				throw new Error("External HTTP is forbidden in service transport fixtures");
+			}
+			return originalFetch(input, init);
+		},
+		{
+			preconnect: (url: string | URL) => {
+				forbiddenNetwork.push(String(url));
+				throw new Error("Service transport forbids network preconnect");
+			},
+		},
+	);
 	vi.spyOn(globalThis, "fetch").mockImplementation(allowedFetch);
 	await setModelPresetRegistryDisabled({ agentDir, disabled: true });
-	await Bun.write(path.join(agentDir, "config.yml"), [
-		"shellPath: /bin/sh", "startup:", "  networkPrewarm: false", "mcp:", "  enableProjectConfig: false",
-		"compaction:", "  enabled: false", "retry:", "  enabled: false", "todo:", "  enabled: false", "",
-	].join("\n"));
-	const configs = Object.fromEntries(["server0", "server1"].map(name => [name, {
-		type: "http", protocol: "legacy", autoload: true, sharing: "per-session", timeout: 5_000,
-		url: `${loopback.url}${name}?token=${configSecret}`, headers: { Authorization: `Bearer ${configSecret}` },
-	}]));
+	await Bun.write(
+		path.join(agentDir, "config.yml"),
+		[
+			"shellPath: /bin/sh",
+			"startup:",
+			"  networkPrewarm: false",
+			"mcp:",
+			"  enableProjectConfig: false",
+			"compaction:",
+			"  enabled: false",
+			"retry:",
+			"  enabled: false",
+			"todo:",
+			"  enabled: false",
+			"",
+		].join("\n"),
+	);
+	const configs = Object.fromEntries(
+		["server0", "server1"].map(name => [
+			name,
+			{
+				type: "http",
+				protocol: "legacy",
+				autoload: true,
+				sharing: "per-session",
+				timeout: 5_000,
+				url: `${loopback.url}${name}?token=${configSecret}`,
+				headers: { Authorization: `Bearer ${configSecret}` },
+			},
+		]),
+	);
 	await Bun.write(path.join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: configs }));
-	await Bun.write(path.join(agentDir, "models.yml"), JSON.stringify({ providers: { [provider]: {
-		api: "openai-completions", baseUrl: `https://example.invalid/${configSecret}`,
-		apiKeyEnv: "GJC_DESKTOP_SERVICE_UNUSED_API_KEY", models: [{
-			id: "base", name: "Service fixture", reasoning: false, input: ["text"], contextWindow: 32_768, maxTokens: 1024,
-		}],
-	} } }));
+	await Bun.write(
+		path.join(agentDir, "models.yml"),
+		JSON.stringify({
+			providers: {
+				[provider]: {
+					api: "openai-completions",
+					baseUrl: `https://example.invalid/${configSecret}`,
+					apiKeyEnv: "GJC_DESKTOP_SERVICE_UNUSED_API_KEY",
+					models: [
+						{
+							id: "base",
+							name: "Service fixture",
+							reasoning: false,
+							input: ["text"],
+							contextWindow: 32_768,
+							maxTokens: 1024,
+						},
+					],
+				},
+			},
+		}),
+	);
 	const auth = await AuthStorage.create(path.join(agentDir, "agent.db"));
-	try { await auth.set(provider, { type: "api_key", key: credential }); }
-	finally { auth.close(); }
+	try {
+		await auth.set(provider, { type: "api_key", key: credential });
+	} finally {
+		auth.close();
+	}
 	const allowMoveSession = options.moveSession === true;
 	const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
-		if (!(options.authStorage instanceof AuthStorage) || !(options.modelRegistry instanceof ModelRegistry) ||
-			!(options.settings instanceof Settings) || !options.sessionManager)
+		if (
+			!(options.authStorage instanceof AuthStorage) ||
+			!(options.modelRegistry instanceof ModelRegistry) ||
+			!(options.settings instanceof Settings) ||
+			!options.sessionManager
+		)
 			throw new Error("DesktopHost must supply genuine scoped SDK services");
 		const model = options.modelRegistry.find(provider, "base");
 		if (!model) throw new Error("Owned configured model was not loaded by the real registry");
@@ -205,32 +302,77 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 		options.settings.override("bash.autoBackground.enabled", false);
 		// Owned recorded transcript evidence, not a fabricated provider response/turn.
 		const message: AssistantMessage = {
-			role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: 1_700_000_000_000,
-			content: [{ type: "text", text: `private fixture transcript ${secret}` }], stopReason: "stop",
-			usage: { input: 41, output: 7, cacheRead: 3, cacheWrite: 2, totalTokens: 53,
-				cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.02, total: 0.35 } },
+			role: "assistant",
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: 1_700_000_000_000,
+			content: [{ type: "text", text: `private fixture transcript ${secret}` }],
+			stopReason: "stop",
+			usage: {
+				input: 41,
+				output: 7,
+				cacheRead: 3,
+				cacheWrite: 2,
+				totalTokens: 53,
+				cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.02, total: 0.35 },
+			},
 		};
 		options.sessionManager.appendMessage(message);
 		const result = await createAgentSession({
-			...options, model, agentId: crypto.randomUUID(), providerSessionId: crypto.randomUUID(), credentialSessionId: crypto.randomUUID(),
-			extensions: [], additionalExtensionPaths: [], hookPaths: [], disableExtensionDiscovery: true,
-			toolNames: allowMoveSession ? ["move_session"] : [], skills: [], rules: [], contextFiles: [], promptTemplates: [], slashCommands: [],
-			...(allowMoveSession ? {} : {
-				workspaceTree: { rootPath: projectPath, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
-			}),
-			enableMcpAutoload: true, enableLsp: false, skipPythonPreflight: true, deferOptionalModelRefresh: true,
+			...options,
+			model,
+			agentId: crypto.randomUUID(),
+			providerSessionId: crypto.randomUUID(),
+			credentialSessionId: crypto.randomUUID(),
+			extensions: [],
+			additionalExtensionPaths: [],
+			hookPaths: [],
+			disableExtensionDiscovery: true,
+			toolNames: allowMoveSession ? ["move_session"] : [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			...(allowMoveSession
+				? {}
+				: {
+						workspaceTree: {
+							rootPath: projectPath,
+							rendered: "",
+							truncated: false,
+							totalLines: 0,
+							agentsMdFiles: [],
+						},
+					}),
+			enableMcpAutoload: true,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			deferOptionalModelRefresh: true,
 		});
 		vi.spyOn(result.session.agent, "streamFn").mockImplementation(() => {
 			throw new Error("Provider turns are forbidden in service transport fixtures");
 		});
 		captures.push(result);
 		if (!result.mcpManager)
-			throw new Error(`Public factory must return its actual autoloaded MCP manager; safe method counts: ${JSON.stringify([...counts])}`);
+			throw new Error(
+				`Public factory must return its actual autoloaded MCP manager; safe method counts: ${JSON.stringify([...counts])}`,
+			);
 		return result;
 	};
-	host = new DesktopHost({ dataDir, createSession, emit: frame => { frames.push(frame); } });
+	host = new DesktopHost({
+		dataDir,
+		createSession,
+		emit: frame => {
+			frames.push(frame);
+		},
+	});
 	const ownedHost = host;
-	const response = async (method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<ResponseFrame> => {
+	const response = async (
+		method: DesktopRequest["method"],
+		params: Record<string, unknown> = {},
+	): Promise<ResponseFrame> => {
 		const id = crypto.randomUUID();
 		await ownedHost.handle(parseRequest(`${JSON.stringify({ id, method, params })}\n`));
 		const frame = frames.find((value): value is ResponseFrame => value.type === "response" && value.id === id);
@@ -257,7 +399,20 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 		return value;
 	};
 	const counters = () => structuredClone([...counts]);
-	return { directory, projectPath, loopbackOrigin: loopback.url.origin, frames, first, captures, counts, call, response, open, snapshot, info, counters,
+	return {
+		directory,
+		projectPath,
+		loopbackOrigin: loopback.url.origin,
+		frames,
+		first,
+		captures,
+		counts,
+		call,
+		response,
+		open,
+		snapshot,
+		info,
+		counters,
 		blockInitialize(name = "server0") {
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
@@ -277,26 +432,43 @@ describe("desktop service public SDK transport", () => {
 		const initial = await f.snapshot();
 		expect(initial).toMatchObject({ available: true, scope: "factory_manager_may_be_shared", truncated: false });
 		expect(initial.servers).toHaveLength(2);
-		expect(server(initial)).toMatchObject({ state: "connected", transport: "http", sharing: "per-session", toolCount: 1 });
+		expect(server(initial)).toMatchObject({
+			state: "connected",
+			transport: "http",
+			sharing: "per-session",
+			toolCount: 1,
+		});
 		const alpha = manager.getConnection("server0");
 		const beta = manager.getConnection("server1");
 		expect(alpha).toBeDefined();
 		expect(beta).toBeDefined();
 		const betaCounters = structuredClone(f.counts.get("server1"));
 		const before = f.counts.get("server0")!.initializes;
-		const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: server(initial).ref, action: "suspend" });
+		const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: server(initial).ref,
+			action: "suspend",
+		});
 		expect(suspended).toMatchObject({ status: "suspended", cleanup: "not_certified" });
 		expect(server(suspended.snapshot)).toMatchObject({ state: "suspended", controls: ["resume"], toolCount: 0 });
 		expect(manager.getConnection("server0")).toBeUndefined();
 		expect(f.counts.get("server0")!.initializes).toBe(before);
-		const resumed = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: server(suspended.snapshot).ref, action: "resume" });
+		const resumed = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: server(suspended.snapshot).ref,
+			action: "resume",
+		});
 		expect(resumed).toMatchObject({ status: "resumed", cleanup: "not_certified" });
 		expect(server(resumed.snapshot)).toMatchObject({ state: "connected", toolCount: 1 });
 		const resumedConnection = manager.getConnection("server0");
 		expect(resumedConnection).toBeDefined();
 		expect(resumedConnection).not.toBe(alpha);
 		expect(f.counts.get("server0")!.initializes).toBe(before + 1);
-		const reconnected = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: server(resumed.snapshot).ref, action: "reconnect" });
+		const reconnected = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: server(resumed.snapshot).ref,
+			action: "reconnect",
+		});
 		expect(reconnected).toMatchObject({ status: "reconnected", cleanup: "not_certified" });
 		expect(manager.getConnection("server0")).toBeDefined();
 		expect(manager.getConnection("server0")).not.toBe(resumedConnection);
@@ -310,7 +482,15 @@ describe("desktop service public SDK transport", () => {
 				expect(result).not.toHaveProperty(field);
 		}
 		const serialized = JSON.stringify(f.frames);
-		for (const value of [secret, configSecret, "Authorization", "Bearer", f.loopbackOrigin, "binding", manager.getServerControlSnapshot()[0]!.target.binding])
+		for (const value of [
+			secret,
+			configSecret,
+			"Authorization",
+			"Bearer",
+			f.loopbackOrigin,
+			"binding",
+			manager.getServerControlSnapshot()[0]!.target.binding,
+		])
 			expect(serialized).not.toContain(value);
 	}, 30_000);
 
@@ -339,7 +519,9 @@ describe("desktop service public SDK transport", () => {
 		expect(foreignControl).not.toHaveBeenCalled();
 		expect(f.counters()).toEqual(before);
 		const generation = f.first.sdk.sessionLifecycle.generation;
-		expect(await f.call<DesktopCommandResult>("command.run", { sessionId, text: "/clear" })).toMatchObject({ consumed: true });
+		expect(await f.call<DesktopCommandResult>("command.run", { sessionId, text: "/clear" })).toMatchObject({
+			consumed: true,
+		});
 		expect(f.first.sdk.sessionLifecycle.generation).toBeGreaterThan(generation);
 		const current = await f.snapshot();
 		expect(current.sessionGeneration).toBe(f.first.sdk.sessionLifecycle.generation);
@@ -368,7 +550,8 @@ describe("desktop service public SDK transport", () => {
 		expect(current.sessionGeneration).toBeGreaterThan(oldRef.sessionGeneration);
 		expect(server(current).ref.key).not.toBe(oldRef.key);
 		const initialControl = vi.spyOn(initialManager, "controlServer");
-		const currentControl = currentManager === initialManager ? initialControl : vi.spyOn(currentManager, "controlServer");
+		const currentControl =
+			currentManager === initialManager ? initialControl : vi.spyOn(currentManager, "controlServer");
 		const successorFile = f.first.sdk.sessionManager.getSessionFile();
 		if (!successorFile) throw new Error("Expected the genuine SDK successor's reserved transcript path");
 		expect(successorFile).not.toBe(predecessorFile);
@@ -385,12 +568,24 @@ describe("desktop service public SDK transport", () => {
 		const firstLine = (await Bun.file(successorFile).text()).split("\n")[0];
 		if (!firstLine) throw new Error("Materialized SDK transcript has no session header");
 		const header: unknown = JSON.parse(firstLine);
-		expect(header).toMatchObject({ type: "session", id: f.first.sdk.sessionManager.getSessionId(), cwd: f.first.sdk.sessionManager.getCwd() });
-		expect(f.first.sdk.sessionManager.getHeader()).toMatchObject({ type: "session", id: f.first.sdk.sessionManager.getSessionId() });
+		expect(header).toMatchObject({
+			type: "session",
+			id: f.first.sdk.sessionManager.getSessionId(),
+			cwd: f.first.sdk.sessionManager.getCwd(),
+		});
+		expect(f.first.sdk.sessionManager.getHeader()).toMatchObject({
+			type: "session",
+			id: f.first.sdk.sessionManager.getSessionId(),
+		});
 		const catalog: unknown = await Bun.file(path.join(f.directory, "desktop", "catalog.json")).json();
-		expect(catalog).toMatchObject({ sessions: expect.arrayContaining([expect.objectContaining({
-			id: sessionId, file: path.relative(path.join(f.directory, "desktop", "sessions"), successorFile),
-		})]) });
+		expect(catalog).toMatchObject({
+			sessions: expect.arrayContaining([
+				expect.objectContaining({
+					id: sessionId,
+					file: path.relative(path.join(f.directory, "desktop", "sessions"), successorFile),
+				}),
+			]),
+		});
 		expect(await Bun.file(predecessorFile).exists()).toBe(true);
 		expect(initialControl).not.toHaveBeenCalled();
 		expect(currentControl).not.toHaveBeenCalled();
@@ -398,12 +593,20 @@ describe("desktop service public SDK transport", () => {
 		const beta = currentManager.getConnection("server1");
 		const betaCounters = structuredClone(f.counts.get("server1"));
 		const initializes = f.counts.get("server0")!.initializes;
-		const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: server(current).ref, action: "suspend" });
+		const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: server(current).ref,
+			action: "suspend",
+		});
 		expect(suspended).toMatchObject({ status: "suspended", cleanup: "not_certified" });
 		expect(currentControl).toHaveBeenCalledTimes(1);
 		expect(currentManager.getConnection("server0")).toBeUndefined();
 		expect(f.counts.get("server0")!.initializes).toBe(initializes);
-		const resumed = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: server(suspended.snapshot).ref, action: "resume" });
+		const resumed = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: server(suspended.snapshot).ref,
+			action: "resume",
+		});
 		expect(resumed).toMatchObject({ status: "resumed", cleanup: "not_certified" });
 		expect(currentControl).toHaveBeenCalledTimes(2);
 		expect(currentManager.getConnection("server0")).toBeDefined();
@@ -413,7 +616,12 @@ describe("desktop service public SDK transport", () => {
 		if (currentManager !== initialManager) expect(initialControl).not.toHaveBeenCalled();
 		const info = await f.info();
 		expect(info.metadata.catalogSessionId).toBe(sessionId);
-		for (const identity of [f.first.sdk.sessionId, f.first.sdk.sessionManager.getSessionId(), f.first.sdk.credentialSessionId, f.first.sdk.getAgentId()!])
+		for (const identity of [
+			f.first.sdk.sessionId,
+			f.first.sdk.sessionManager.getSessionId(),
+			f.first.sdk.credentialSessionId,
+			f.first.sdk.getAgentId()!,
+		])
 			expect(JSON.stringify(info.metadata)).not.toContain(identity);
 	}, 30_000);
 
@@ -441,9 +649,14 @@ describe("desktop service public SDK transport", () => {
 		const beta = currentManager.getConnection("server1");
 		const betaCounters = structuredClone(f.counts.get("server1"));
 		const beforeReconnect = f.counts.get("server0")!.initializes;
-		const targetRef = currentManager.getServerControlSnapshot().find(value => value.target.name === "server0")?.target;
+		const targetRef = currentManager
+			.getServerControlSnapshot()
+			.find(value => value.target.name === "server0")?.target;
 		if (!targetRef) throw new Error("Successor manager lacks its genuine loopback server target");
-		expect(await currentManager.controlServer(targetRef, "reconnect")).toMatchObject({ status: "reconnected", cleanup: "not_certified" });
+		expect(await currentManager.controlServer(targetRef, "reconnect")).toMatchObject({
+			status: "reconnected",
+			cleanup: "not_certified",
+		});
 		expect(f.counts.get("server0")!.initializes).toBe(beforeReconnect + 1);
 		expect(currentManager.getConnection("server1")).toBe(beta);
 		expect(f.counts.get("server1")).toEqual(betaCounters);
@@ -466,8 +679,14 @@ describe("desktop service public SDK transport", () => {
 		expect(info.metadata.sessionFileDisplay).toContain("[session]");
 		expect(info.metadata).not.toHaveProperty("sessionId");
 		expect(info.metadata).not.toHaveProperty("sessionFile");
-		expect(measured(info.recordedTotals)).toMatchObject({ source: "transcript_aggregate", tokens: { input: 41, output: 7, cacheRead: 3, cacheWrite: 2, total: 53 } });
-		expect(measured(info.activeTotals)).toMatchObject({ source: "active_messages", cost: { amount: 0.35, source: "sdk_recorded_cost" } });
+		expect(measured(info.recordedTotals)).toMatchObject({
+			source: "transcript_aggregate",
+			tokens: { input: 41, output: 7, cacheRead: 3, cacheWrite: 2, total: 53 },
+		});
+		expect(measured(info.activeTotals)).toMatchObject({
+			source: "active_messages",
+			cost: { amount: 0.35, source: "sdk_recorded_cost" },
+		});
 		expect(measured(info.activeTotals).tokens.input).toBe(sdk.getSessionStats().tokens.input);
 		expect(measured(info.recordedTotals).tokens.input).toBe(sdk.sessionManager.getUsageStatistics().input);
 		expect(info.liveProgress.available).toBe(false);
@@ -476,7 +695,16 @@ describe("desktop service public SDK transport", () => {
 		expect(info.accountQuota).toMatchObject({ available: false });
 		expect(info.actualBilledCost).toMatchObject({ available: false });
 		const serialized = JSON.stringify(info);
-		for (const value of [...identities, secret, configSecret, "Authorization", "baseUrl", "apiKey", "credentialSessionId", "owner"])
+		for (const value of [
+			...identities,
+			secret,
+			configSecret,
+			"Authorization",
+			"baseUrl",
+			"apiKey",
+			"credentialSessionId",
+			"owner",
+		])
 			expect(serialized).not.toContain(value);
 		expect(f.counters()).toEqual(before);
 	}, 30_000);
@@ -490,13 +718,27 @@ describe("desktop service public SDK transport", () => {
 		const connection = f.first.manager.getConnection("server0");
 		const marker = "native_service_shell_started";
 		const operation = await f.call<DesktopOperatorOperation>("operator.execute", {
-			sessionId, text: "! printf 'native_service_shell_started_with_enough_safe_padding_after_the_marker_to_release_stream_redaction_overlap_and_show_real_native_output\\n'; sleep 30; printf 'must_not_complete\\n'",
+			sessionId,
+			text: "! printf 'native_service_shell_started_with_enough_safe_padding_after_the_marker_to_release_stream_redaction_overlap_and_show_real_native_output\\n'; sleep 30; printf 'must_not_complete\\n'",
 		});
 		try {
-			await waitFor(() => f.first.sdk.isBashRunning && f.frames.some(frame => frame.type === "operator" &&
-				frame.event.operation.operationId === operation.operationId && frame.event.operation.output.includes(marker)));
+			await waitFor(
+				() =>
+					f.first.sdk.isBashRunning &&
+					f.frames.some(
+						frame =>
+							frame.type === "operator" &&
+							frame.event.operation.operationId === operation.operationId &&
+							frame.event.operation.output.includes(marker),
+					),
+			);
 			const info = await f.info();
-			expect(info.run).toMatchObject({ state: "running", bashRunning: true, pythonRunning: false, streaming: false });
+			expect(info.run).toMatchObject({
+				state: "running",
+				bashRunning: true,
+				pythonRunning: false,
+				streaming: false,
+			});
 			expect(info.run.bashRunning).toBe(f.first.sdk.isBashRunning);
 			expect(info.run.pythonRunning).toBe(f.first.sdk.isEvalRunning);
 			expect(await f.snapshot()).toMatchObject({ available: true });
@@ -506,16 +748,31 @@ describe("desktop service public SDK transport", () => {
 			expect(f.counters()).toEqual(before);
 			expect(f.first.manager.getConnection("server0")).toBe(connection);
 			expect(f.first.sdk.isBashRunning).toBe(true);
-			const abort = await f.call<DesktopOperatorOperation>("operator.abort", { sessionId, operationId: operation.operationId });
+			const abort = await f.call<DesktopOperatorOperation>("operator.abort", {
+				sessionId,
+				operationId: operation.operationId,
+			});
 			expect(abort.status).toBe("cancel_requested");
-			await waitFor(() => f.frames.some(frame => frame.type === "operator" &&
-				frame.event.operation.operationId === operation.operationId && frame.event.operation.status === "cancelled"));
+			await waitFor(() =>
+				f.frames.some(
+					frame =>
+						frame.type === "operator" &&
+						frame.event.operation.operationId === operation.operationId &&
+						frame.event.operation.status === "cancelled",
+				),
+			);
 			expect((await f.info()).run).toMatchObject({ bashRunning: false, pythonRunning: false, state: "idle" });
-			const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref, action: "suspend" });
+			const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+				sessionId,
+				ref,
+				action: "suspend",
+			});
 			expect(suspended.status).toBe("suspended");
 			expect(control).toHaveBeenCalledTimes(1);
 			expect(f.first.manager.getConnection("server0")).toBeUndefined();
-		} finally { f.first.sdk.abortBash(); }
+		} finally {
+			f.first.sdk.abortBash();
+		}
 	}, 30_000);
 
 	test("session.info and mcp.get remain nonexclusive during a genuine held loopback reconnect", async () => {
@@ -525,21 +782,30 @@ describe("desktop service public SDK transport", () => {
 		const gate = f.blockInitialize();
 		const operation = f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref, action: "reconnect" });
 		try {
-			await Promise.race([gate.entered, operation.then(() => {
-				throw new Error("Reconnect completed without reaching the owned initialize gate");
-			})]);
+			await Promise.race([
+				gate.entered,
+				operation.then(() => {
+					throw new Error("Reconnect completed without reaching the owned initialize gate");
+				}),
+			]);
 			// The SDK marks MCP control as transitioning. Read honestly without waiting
 			// for the held mutation or manufacturing an available telemetry state.
-			expect(await f.call<DesktopSessionInfo>("session.info", { sessionId })).toMatchObject({ available: false, code: "transitioning" });
-			expect(await f.snapshot()).toMatchObject({ available: true, servers: [
-				expect.objectContaining({ controls: [] }), expect.objectContaining({ controls: [] }),
-			] });
+			expect(await f.call<DesktopSessionInfo>("session.info", { sessionId })).toMatchObject({
+				available: false,
+				code: "transitioning",
+			});
+			expect(await f.snapshot()).toMatchObject({
+				available: true,
+				servers: [expect.objectContaining({ controls: [] }), expect.objectContaining({ controls: [] })],
+			});
 			const before = f.counters();
 			const control = vi.spyOn(f.first.manager, "controlServer");
 			expect((await f.response("mcp.operate", { sessionId, ref, action: "suspend" })).ok).toBe(false);
 			expect(control).not.toHaveBeenCalled();
 			expect(f.counters()).toEqual(before);
-		} finally { gate.release(); }
+		} finally {
+			gate.release();
+		}
 		expect(await operation).toMatchObject({ status: "reconnected", cleanup: "not_certified" });
 		expect(f.first.manager.getConnection("server0")).toBeDefined();
 	}, 30_000);
@@ -551,11 +817,19 @@ describe("desktop service public SDK transport", () => {
 		const target = server(snapshot);
 		const before = f.counts.get("server0")!.initializes;
 		// Use the emitted reference at the real manager fence, not an equality-only test.
-		const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: target.ref, action: "suspend" });
+		const suspended = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: target.ref,
+			action: "suspend",
+		});
 		expect(suspended).toMatchObject({ status: "suspended", cleanup: "not_certified" });
 		expect(f.first.manager.getConnection("server0")).toBeUndefined();
 		expect(f.counts.get("server0")!.initializes).toBe(before);
-		const resumed = await f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref: server(suspended.snapshot).ref, action: "resume" });
+		const resumed = await f.call<DesktopMcpOperationResult>("mcp.operate", {
+			sessionId,
+			ref: server(suspended.snapshot).ref,
+			action: "resume",
+		});
 		expect(resumed.status).toBe("resumed");
 		expect(f.counts.get("server0")!.initializes).toBe(before + 1);
 		const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -568,15 +842,34 @@ describe("desktop service public SDK transport", () => {
 		expect(info.metadata.catalogSessionId).toMatch(uuid);
 		expect(info.run.state).toBe("idle");
 		expect(info.context.source).toBe(f.first.sdk.getContextUsage()!.source);
-		const operation = await f.call<DesktopOperatorOperation>("operator.execute", { sessionId, text: "!! printf 'visible-secret-value\\n'" });
+		const operation = await f.call<DesktopOperatorOperation>("operator.execute", {
+			sessionId,
+			text: "!! printf 'visible-secret-value\\n'",
+		});
 		expect(operation.operationId).toMatch(uuid);
-		await waitFor(() => f.frames.some(frame => frame.type === "operator" &&
-			frame.event.operation.operationId === operation.operationId && frame.event.operation.status === "completed"));
-		const completed = await f.call<DesktopOperatorOperation>("operator.get", { sessionId, operationId: operation.operationId });
+		await waitFor(() =>
+			f.frames.some(
+				frame =>
+					frame.type === "operator" &&
+					frame.event.operation.operationId === operation.operationId &&
+					frame.event.operation.status === "completed",
+			),
+		);
+		const completed = await f.call<DesktopOperatorOperation>("operator.get", {
+			sessionId,
+			operationId: operation.operationId,
+		});
 		expect(completed).toMatchObject({ status: "completed", exitCode: 0 });
 		expect(completed.output).toContain("visible[redacted]secret[redacted]value");
 		expect(completed.output).not.toContain("visible-secret-value");
-		for (const value of [configSecret, "Authorization", "Bearer", f.loopbackOrigin, "https://example.invalid/", "visible-secret-value"])
+		for (const value of [
+			configSecret,
+			"Authorization",
+			"Bearer",
+			f.loopbackOrigin,
+			"https://example.invalid/",
+			"visible-secret-value",
+		])
 			expect(JSON.stringify(f.frames)).not.toContain(value);
 	}, 30_000);
 });
