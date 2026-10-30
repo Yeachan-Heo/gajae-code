@@ -336,7 +336,9 @@ When no explicit `model`/`modelPattern` is provided:
 2. settings default model role (`default`)
 3. first available model with valid auth
 
-If restore fails, `modelFallbackMessage` explains fallback.
+If restore fails, `modelFallbackMessage` explains the outcome. Without a usable
+explicit key, an unavailable saved credential pin leaves the model unselected
+with an actionable diagnostic rather than silently switching model or provider.
 
 ### Auth priority
 
@@ -346,6 +348,12 @@ If restore fails, `modelFallbackMessage` explains fallback.
 2. stored credentials in `agent.db`
 3. provider environment variables
 4. custom-provider resolver fallback (if configured)
+
+An unavailable saved credential pin blocks implicit fallback to another stored
+account. An explicit runtime key or literal provider key registered by the
+current model registry can override that availability failure without clearing
+the unavailable-pin marker. Another registry's key or an `apiKeyEnv` indirection
+must not authorize selection of a different stored account.
 
 ## Event subscription model
 
@@ -492,7 +500,9 @@ subsequent cancellation or ingress checks can still prevent a run.
 
 Retain the original text and attachment payload independently of redacted
 presentation DTOs until a correlated outcome is known. `removed` and its
-`reason` are meaningful terminal outcomes, not successful delivery. After a
+`reason` are meaningful terminal outcomes, not successful delivery. In particular,
+`reason: "refused"` records a positive core decision not to start the queued run;
+a provider failure after run acceptance is not a refusal. After a
 crash without a conclusive receipt, preserve an unknown outcome and require an
 explicit user decision; do not automatically replay potentially executed input.
 

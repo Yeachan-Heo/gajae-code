@@ -2062,10 +2062,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const configuredPins = startupAuthConfig?.credentialPins ?? {};
 		const persistedPinStoreMatches =
 			startupAuthConfig?.credentialPinStoreIdentity === startupAuthConfig?.credentialStoreIdentity;
-		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
-		// discarded durable pin identity local to this credential scope so startup
-		// config cannot immediately replace it with a different account; later
-		// request-time resolution for this provider remains ordinary AUTO ranking.
+		// Keep stale durable pins from being replaced by startup configuration;
+		// AuthStorage retains their unavailable markers for request-time resolution.
 		const staleDurableCredentialPins = new Set<string>();
 		if (options.credentialSelector) {
 			const provider = options.credentialSelector.provider ?? options.model?.provider;
@@ -2181,8 +2179,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const pin = record.pin as { auto?: unknown; kind?: unknown; value?: unknown } | undefined;
 			// Durable replay must never abort session startup: a pinned account may
 			// have been removed, disabled, or deduplicated since the pin was written.
-			// Pin identity is preserved by leaving the provider unpinned on failure —
-			// never silently retarget to another account; the user re-pins or picks AUTO.
+			// Preserve an unavailable marker on failure rather than silently retargeting
+			// to another account; the user re-pins or picks AUTO.
 			try {
 				if (pin?.auto === true) {
 					authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
@@ -2348,7 +2346,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let startupActiveModelProfile =
 			acceptedInheritedProfileName ??
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+		// Auth-filtered catalogs hide models whose durable pin is unavailable.
+		// Distinguish those registered selectors from genuinely missing models before
+		// deciding whether recovery or a generic missing-model warning applies.
+		const markUnavailableSavedSelectors = (skips: Array<{ selector: string; reason: string }>): void => {
+			for (const skip of skips) {
+				if (skip.reason !== "unknown_model") continue;
+				const parsed = parseModelString(skip.selector);
+				if (
+					parsed &&
+					isCredentialPinBlocking(parsed.provider) &&
+					modelRegistry.find(parsed.provider, parsed.id, credentialSessionId)
+				) {
+					skip.reason = "credential_unavailable";
+				}
+			}
+		};
+		// A saved chain's head is an identity boundary when its credential pin is
+		// unavailable, even if the head is not registered until extensions load.
+		const savedHeadPinBlocked = (): boolean => {
+			const head = defaultModelEntries[0] ? parseModelString(defaultModelEntries[0]) : undefined;
+			return head !== undefined && isCredentialPinBlocking(head.provider);
+		};
 		let savedDefaultWasUnresolved = false;
+		let savedDefaultCredentialUnavailable = false;
 		let deferredMissingSessionRecovery = false;
 		let retainedRecoveryBindingsAfterLateRestore = false;
 		let recoveredSessionDefault:
@@ -2366,7 +2387,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
 			await logger.time("restoreSessionModel", async () => {
 				const restoredDefaultResolution = await resolveModelChainWithAuth(
-					defaultModelEntries,
+					savedHeadPinBlocked() ? defaultModelEntries.slice(0, 1) : defaultModelEntries,
 					modelRegistry,
 					settings,
 					credentialSessionId,
@@ -2377,8 +2398,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 					},
 				);
+				markUnavailableSavedSelectors(restoredDefaultResolution.skips);
+				if (savedHeadPinBlocked()) {
+					restoredDefaultResolution.model = undefined;
+					restoredDefaultResolution.skips = [
+						{ selector: defaultModelEntries[0], reason: "credential_unavailable" },
+					];
+				}
 				model = restoredDefaultResolution.model;
-				if (restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+				savedDefaultCredentialUnavailable =
+					!model && restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable");
+				if (savedDefaultCredentialUnavailable) {
 					modelFallbackMessage =
 						"Saved session credential is unavailable. Re-pin a credential or select AUTO explicitly.";
 				}
@@ -2427,6 +2457,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (
 			!hasExplicitModel &&
 			!model &&
+			!savedDefaultCredentialUnavailable &&
 			defaultRoleSpec.model &&
 			!isCredentialPinBlocking(defaultRoleSpec.model.provider) &&
 			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
@@ -4454,7 +4485,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// catalog before retaining a durable runtime fallback.
 		if (savedDefaultWasUnresolved && defaultModelEntries.length > 0) {
 			const restoredAfterExtensions = await resolveModelChainWithAuth(
-				defaultModelEntries,
+				savedHeadPinBlocked() ? defaultModelEntries.slice(0, 1) : defaultModelEntries,
 				modelRegistry,
 				settings,
 				credentialSessionId,
@@ -4465,6 +4496,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 				},
 			);
+			markUnavailableSavedSelectors(restoredAfterExtensions.skips);
+			if (savedHeadPinBlocked()) {
+				restoredAfterExtensions.model = undefined;
+				restoredAfterExtensions.skips = [{ selector: defaultModelEntries[0], reason: "credential_unavailable" }];
+			}
+			savedDefaultCredentialUnavailable =
+				!restoredAfterExtensions.model &&
+				restoredAfterExtensions.skips.some(skip => skip.reason === "credential_unavailable");
+			if (savedDefaultCredentialUnavailable) model = undefined;
 			if (
 				restoredAfterExtensions.model &&
 				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
@@ -4543,6 +4583,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					recoveredSessionDefault = undefined;
 					startupActiveModelProfile = undefined;
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+				}
+				if (!lateRecoveryAccepted && savedDefaultCredentialUnavailable) {
+					modelFallbackMessage =
+						"Saved session credential is unavailable. Re-pin a credential or select AUTO explicitly.";
 				}
 			}
 		}
@@ -4623,6 +4667,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (
 			!model &&
 			!options.modelPattern &&
+			!savedDefaultCredentialUnavailable &&
 			!startupCredentialModelRejected &&
 			(configuredDefaultPatterns.length === 0 || preferredCredentialProvider !== undefined)
 		) {
