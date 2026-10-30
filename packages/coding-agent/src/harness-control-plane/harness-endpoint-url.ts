@@ -28,7 +28,7 @@ export function isHarnessLoopbackEndpointUrl(raw: string): boolean {
 	if (host !== "localhost" && host !== "::1" && !ipv4Loopback) return false;
 	if (url.username !== "" || url.password !== "") return false;
 	if (url.search !== "" || url.hash !== "") return false;
-	// An empty "?" or "#" is dropped from search/hash but still makes the WebSocket URL invalid.
+	// An empty "?" or "#" is absent from search and hash after parsing. The origin-only policy still rejects it.
 	if (url.href.includes("?") || url.href.includes("#")) return false;
 	if (url.pathname !== "/" && url.pathname !== "") return false;
 	if (url.port !== "") {

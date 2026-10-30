@@ -110,27 +110,29 @@ describe("harness discovery url", () => {
 		fc.assert(
 			fc.property(fc.string({ maxLength: 180 }), raw => {
 				const allowed = isHarnessLoopbackEndpointUrl(raw);
-				expect(isHarnessLoopbackEndpointUrl(raw)).toBe(allowed);
-				if (!allowed) return;
-				const url = new URL(raw);
-				const parsed = url.hostname
-					.toLowerCase()
-					.replace(/^\[|\]$/g, "")
-					.replace(/\.$/, "");
-				const v4 = parsed.split(".");
-				const ipv4Loopback =
-					v4.length === 4 &&
-					v4.every(part => /^[0-9]{1,3}$/.test(part) && Number(part) <= 255) &&
-					Number(v4[0]) === 127;
-				expect(url.protocol === "ws:" || url.protocol === "wss:").toBe(true);
-				expect(ipv4Loopback || parsed === "localhost" || parsed === "::1").toBe(true);
-				expect(url.username).toBe("");
-				expect(url.password).toBe("");
-				expect(url.search).toBe("");
-				expect(url.hash).toBe("");
-				expect(url.href.includes("?")).toBe(false);
-				expect(url.href.includes("#")).toBe(false);
-				expect(url.pathname === "/" || url.pathname === "").toBe(true);
+				if (allowed) {
+					const url = new URL(raw);
+					const parsed = url.hostname
+						.toLowerCase()
+						.replace(/^\[|\]$/g, "")
+						.replace(/\.$/, "");
+					const v4 = parsed.split(".");
+					const ipv4Loopback =
+						v4.length === 4 &&
+						v4.every(part => /^[0-9]{1,3}$/.test(part) && Number(part) <= 255) &&
+						Number(v4[0]) === 127;
+					expect(url.protocol === "ws:" || url.protocol === "wss:").toBe(true);
+					expect(ipv4Loopback || parsed === "localhost" || parsed === "::1").toBe(true);
+					expect(url.username).toBe("");
+					expect(url.password).toBe("");
+					expect(url.search).toBe("");
+					expect(url.hash).toBe("");
+					expect(url.href.includes("?")).toBe(false);
+					expect(url.href.includes("#")).toBe(false);
+					expect(url.pathname === "/" || url.pathname === "").toBe(true);
+				} else {
+					expect(isHarnessLoopbackEndpointUrl(raw)).toBe(false);
+				}
 			}),
 			{ seed: SEED, numRuns: RUNS },
 		);
