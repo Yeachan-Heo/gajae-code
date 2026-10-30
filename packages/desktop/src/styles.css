@@ -342,7 +342,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-toolbar { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
 .model-toolbar > .model-search { flex: 1; min-width: 0; }
 .model-refresh { flex: none; width: 34px; height: 34px; padding: 0; }
-.preset-roles { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 0.75rem; color: var(--muted); }
+.preset-roles { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 0.75rem; color: var(--muted); }
+.preset-roles > span + span::before { content: "·"; margin-right: 6px; opacity: 0.7; }
 .theme-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin: 8px 0 16px; }
 .theme-option { justify-content: flex-start; gap: 10px; }
 .theme-option[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
