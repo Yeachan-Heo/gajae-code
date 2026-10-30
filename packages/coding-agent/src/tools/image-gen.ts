@@ -1,7 +1,5 @@
 import * as fs from "node:fs";
-import * as http from "node:http";
-import * as https from "node:https";
-import * as net from "node:net";
+import type * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel, getEnvApiKey, type Model } from "@gajae-code/ai/core";
@@ -29,7 +27,8 @@ import { type ModelRoleSettings, resolveModelRoleValue } from "../config/model-r
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
-import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
+import { openPinnedResponse, readResponseBody, validateResponseFraming, withAbortSignal } from "../web/hardened-http";
+import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import { resolveReadPath } from "./path-utils";
 
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
@@ -644,25 +643,6 @@ function toDataUrl(image: InlineImageData): string {
 	return `data:${image.mimeType};base64,${image.data}`;
 }
 
-function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-	if (!signal) return operation;
-	if (signal.aborted) return Promise.reject(signal.reason);
-	const deferred = Promise.withResolvers<T>();
-	const abort = () => deferred.reject(signal.reason);
-	signal.addEventListener("abort", abort, { once: true });
-	operation.then(deferred.resolve, deferred.reject).finally(() => signal.removeEventListener("abort", abort));
-	return deferred.promise;
-}
-
-function normalizePeerAddress(address: string): string {
-	const normalized = address.toLowerCase();
-	return normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
-}
-
-function normalizeUrlHostname(hostname: string): string {
-	return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-}
-
 function responseHeaderByteLength(response: http.IncomingMessage): number {
 	let bytes = Buffer.byteLength(
 		`HTTP/${response.httpVersion} ${response.statusCode ?? ""}${response.statusMessage ? ` ${response.statusMessage}` : ""}\r\n`,
@@ -682,87 +662,28 @@ function openImageResponse(
 	addresses: string[],
 	signal: AbortSignal | undefined,
 ): Promise<http.IncomingMessage> {
-	const hostname = normalizeUrlHostname(url.hostname);
-	const approved = addresses.map(address => ({ address, family: net.isIP(address) }));
-	const approvedPeers = new Set(approved.map(record => normalizePeerAddress(record.address)));
-	const lookup: net.LookupFunction = (requestedHostname, options, callback) => {
-		const requestedFamily = options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : (options.family ?? 0);
-		const matching = approved.filter(record => requestedFamily === 0 || record.family === requestedFamily);
-		if (normalizeUrlHostname(requestedHostname) !== hostname || matching.length === 0) {
-			const error = Object.assign(new Error("No approved address for image host"), { code: "ENOTFOUND" });
-			callback(error, options.all ? [] : "", 0);
-			return;
-		}
-		if (options.all) callback(null, matching);
-		else callback(null, matching[0].address, matching[0].family);
-	};
-	const deferred = Promise.withResolvers<http.IncomingMessage>();
-	const options: https.RequestOptions = {
-		protocol: url.protocol,
-		hostname,
-		port: url.port || undefined,
-		path: `${url.pathname}${url.search}`,
-		method: "GET",
-		headers: { Accept: "image/*", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
-		agent: false,
-		insecureHTTPParser: false,
-		lookup,
-		maxHeaderSize: MAX_IMAGE_HEADER_SIZE,
+	return openPinnedResponse({
+		url,
+		addresses,
 		signal,
-		...(url.protocol === "https:"
-			? { rejectUnauthorized: true, servername: net.isIP(hostname) === 0 ? hostname : undefined }
-			: {}),
-	};
-	const requestFn = url.protocol === "https:" ? https.request : http.request;
-	const request = requestFn(options, response => {
-		if (responseHeaderByteLength(response) > MAX_IMAGE_HEADER_SIZE) {
-			response.destroy();
-			deferred.reject(new Error("Image response headers exceed the maximum size of 16 KiB"));
-			return;
-		}
-		const peer = response.socket.remoteAddress;
-		if (peer && (isPrivateOrSpecialAddress(peer) || !approvedPeers.has(normalizePeerAddress(peer)))) {
-			response.destroy();
-			deferred.reject(new Error("Refusing image response from an unapproved connected peer"));
-			return;
-		}
-		deferred.resolve(response);
+		headers: { Accept: "image/*", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
+		maxHeaderBytes: MAX_IMAGE_HEADER_SIZE,
+		rejectMissingPeer: false,
+		lookupErrorMessage: "No approved address for image host",
+		unapprovedPeerMessage: () => "Refusing image response from an unapproved connected peer",
+		maxResponseHeaderBytes: MAX_IMAGE_HEADER_SIZE,
+		responseHeaderBytes: responseHeaderByteLength,
+		responseHeaderTooLargeMessage: "Image response headers exceed the maximum size of 16 KiB",
 	});
-	request.once("error", deferred.reject);
-	const abort = () => {
-		request.destroy(signal?.reason);
-		deferred.reject(signal?.reason);
-	};
-	if (signal?.aborted) abort();
-	else signal?.addEventListener("abort", abort, { once: true });
-	request.once("close", () => signal?.removeEventListener("abort", abort));
-	request.end();
-	return deferred.promise;
 }
 
 function validateImageResponseFraming(response: http.IncomingMessage): void {
-	const rawContentLengths: string[] = [];
-	let hasTransferEncoding = false;
-	for (let index = 0; index < response.rawHeaders.length; index += 2) {
-		const name = response.rawHeaders[index]?.toLowerCase();
-		if (name === "content-length") rawContentLengths.push(response.rawHeaders[index + 1] ?? "");
-		if (name === "transfer-encoding") hasTransferEncoding = true;
-	}
-	if (rawContentLengths.length > 1 || (rawContentLengths.length > 0 && hasTransferEncoding)) {
-		response.destroy();
-		throw new Error("Image response has ambiguous framing");
-	}
-	const contentLength = response.headers["content-length"];
-	if (contentLength === undefined) return;
-	const declaredBytes = typeof contentLength === "string" && /^\d+$/.test(contentLength) ? Number(contentLength) : NaN;
-	if (!Number.isSafeInteger(declaredBytes)) {
-		response.destroy();
-		throw new Error("Image response has an invalid Content-Length");
-	}
-	if (declaredBytes > MAX_IMAGE_SIZE) {
-		response.destroy();
-		throw new Error("Image response exceeds the maximum size of 35 MiB");
-	}
+	validateResponseFraming(response, {
+		ambiguousMessage: "Image response has ambiguous framing",
+		invalidContentLengthMessage: "Image response has an invalid Content-Length",
+		maxBytes: MAX_IMAGE_SIZE,
+		oversizeMessage: "Image response exceeds the maximum size of 35 MiB",
+	});
 }
 
 async function readImageResponse(
@@ -770,32 +691,14 @@ async function readImageResponse(
 	maxBytes: number,
 	signal: AbortSignal | undefined,
 ): Promise<Buffer> {
-	const abort = () => response.destroy(signal?.reason);
-	if (signal?.aborted) {
-		abort();
-		throw signal.reason;
-	}
-	signal?.addEventListener("abort", abort, { once: true });
-	const chunks: Buffer[] = [];
-	let receivedBytes = 0;
-	try {
-		for await (const chunk of response) {
-			const bytes = Buffer.from(chunk);
-			receivedBytes += bytes.byteLength;
-			if (receivedBytes > maxBytes) {
-				response.destroy();
-				throw new Error(
-					maxBytes === MAX_IMAGE_SIZE
-						? "Image response exceeds the maximum size of 35 MiB"
-						: "Image download error response exceeded the preview limit",
-				);
-			}
-			chunks.push(bytes);
-		}
-		return Buffer.concat(chunks, receivedBytes);
-	} finally {
-		signal?.removeEventListener("abort", abort);
-	}
+	return await readResponseBody(response, {
+		maxBytes,
+		signal,
+		oversizeMessage:
+			maxBytes === MAX_IMAGE_SIZE
+				? "Image response exceeds the maximum size of 35 MiB"
+				: "Image download error response exceeded the preview limit",
+	});
 }
 
 async function loadImageFromUrl(
