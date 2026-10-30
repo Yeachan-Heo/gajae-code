@@ -170,11 +170,7 @@ export class BtwController {
 		request.activeTurn = undefined;
 		request.contextExchanges.splice(0);
 		request.inFlight = false;
-		if (request.conversationScope) {
-			request.conversationScope.messages.splice(0);
-			request.conversationScope.systemPrompt.splice(0);
-			request.conversationScope = undefined;
-		}
+		request.conversationScope = undefined;
 		abortController?.abort();
 		request.component.close();
 		this.ctx.editor?.setText("");

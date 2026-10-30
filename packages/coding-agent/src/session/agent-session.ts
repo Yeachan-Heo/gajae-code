@@ -1768,7 +1768,10 @@ export interface BtwRoleTextMessage {
 export interface BtwConversationScope {
 	model: Model;
 	systemPrompt: string[];
-	messages: BtwRoleTextMessage[];
+	/** Full agent messages including tool calls and results (cut at last complete assistant turn). */
+	messages: readonly AgentMessage[];
+	/** Tool definitions available in the main session (for cache identity; toolChoice will be 'none'). */
+	tools: readonly AgentTool[];
 	thinkingLevel: ThinkingLevel;
 	hideThinkingSummary: boolean;
 	serviceTier: ServiceTier | undefined;
@@ -29172,10 +29175,14 @@ export class AgentSession {
 		const model = this.model;
 		if (!model) throw new Error("No active model on session");
 		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
+		const displayContext = this.buildDisplaySessionContext();
+		const messages = this.#cutBtwMessagesAtLastCompleteAssistantTurn(displayContext.messages);
+		const tools = this.agent.state.tools;
 		return {
 			model,
-			systemPrompt: [...this.systemPrompt, instruction],
-			messages: this.#projectBtwVisibleText(this.buildDisplaySessionContext().messages),
+			systemPrompt: this.systemPrompt,
+			messages,
+			tools,
 			thinkingLevel: this.thinkingLevel ?? ThinkingLevel.Off,
 			hideThinkingSummary: this.agent.hideThinkingSummary ?? false,
 			serviceTier: this.serviceTier,
@@ -29185,22 +29192,126 @@ export class AgentSession {
 		};
 	}
 
-	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
-		const projected: BtwRoleTextMessage[] = [];
-		for (const message of messages) {
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = (
-				typeof message.content === "string"
-					? message.content
-					: message.content
-							.filter((block): block is TextContent => block.type === "text")
-							.map(block => block.text)
-							.join("")
-			).trim();
-			if (!text) continue;
-			projected.push({ role: message.role, text });
+	/**
+	 * Cut the messages at the last complete assistant turn.
+	 * A complete assistant turn has all tool_use calls answered by tool_result messages.
+	 * In-flight tool calls (without results) are excluded, keeping only complete exchanges.
+	 */
+	#cutBtwMessagesAtLastCompleteAssistantTurn(messages: readonly AgentMessage[]): readonly AgentMessage[] {
+		const pendingToolCalls = new Set<string>();
+
+		for (let i = 0; i < messages.length; i++) {
+			const msg = messages[i];
+
+			if (msg.role === "assistant") {
+				const assistant = msg as AssistantMessage;
+				if (Array.isArray(assistant.content)) {
+					for (const block of assistant.content) {
+						if ((block as any).type === "toolCall") {
+						pendingToolCalls.add((block as any).id);
+						}
+					}
+				}
+			}
+
+			if (msg.role === "toolResult") {
+				const toolResult = msg as ToolResultMessage;
+				pendingToolCalls.delete(toolResult.toolCallId);
+			}
 		}
-		return projected;
+
+		// If there are no pending tool calls, include all messages.
+		// Otherwise, find the last message index before any incomplete tool exchanges.
+		if (pendingToolCalls.size === 0) {
+			return messages;
+		}
+
+		// Walk backwards to find the last complete message before pending tool calls
+		let cutIndex = messages.length;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "toolResult") {
+				const toolResult = msg as ToolResultMessage;
+				if (pendingToolCalls.has(toolResult.toolCallId)) {
+					cutIndex = i;
+				}
+			} else if (msg.role === "assistant") {
+				const assistant = msg as AssistantMessage;
+				const hasUnresolvedToolCall = Array.isArray(assistant.content)
+					? assistant.content.some((c: any) => c.type === "toolCall" && pendingToolCalls.has(c.id))
+					: false;
+				if (hasUnresolvedToolCall) {
+					cutIndex = i;
+				}
+			}
+		}
+
+		return messages.slice(0, cutIndex);
+	}
+
+	/**
+	 * Convert AgentMessage[] to provider Message[], preserving tool calls and results.
+	 * This maintains cache identity by keeping the exact same message structure.
+	 */
+	#convertBtwMessagesToProvider(agentMessages: readonly AgentMessage[]): Message[] {
+		const providerMessages: Message[] = [];
+
+		for (const msg of agentMessages) {
+			if (msg.role === "user") {
+				const userMsg = msg as typeof msg & { role: "user" };
+				const content = typeof userMsg.content === "string"
+					? [{ type: "text" as const, text: userMsg.content }]
+					: Array.isArray(userMsg.content)
+					? userMsg.content
+					: [{ type: "text" as const, text: "" }];
+				providerMessages.push({ role: "user", content } as Message);
+			} else if (msg.role === "assistant") {
+				const assistantMsg = msg as AssistantMessage;
+				// Assistant messages may include text and tool calls
+				const content: any[] = [];
+				if (Array.isArray(assistantMsg.content)) {
+					for (const block of assistantMsg.content) {
+						if ((block as any).type === "text") {
+							content.push(block);
+						} else if ((block as any).type === "toolCall") {
+							// Include tool call for cache identity but sanitize arguments (security)
+							const call = block as ToolCall;
+							content.push({
+								type: "toolCall",
+								id: call.id,
+								name: call.name,
+								// Note: arguments are excluded for security; toolChoice: "none" prevents execution
+							} as ToolCall);
+						}
+					}
+				} else if (typeof assistantMsg.content === "string") {
+					content.push({ type: "text", text: assistantMsg.content });
+				}
+				providerMessages.push({ role: "assistant", content } as Message);
+			} else if (msg.role === "toolResult") {
+				const toolResultMsg = msg as ToolResultMessage;
+				// Convert tool result to provider format
+				const content = Array.isArray(toolResultMsg.content)
+					? toolResultMsg.content
+					: [{ type: "text", text: typeof toolResultMsg.content === "string" ? toolResultMsg.content : "" }];
+				providerMessages.push({
+					role: "user",
+					content: [
+						{
+							type: "toolResult",
+							toolUseId: toolResultMsg.toolCallId,
+							content: (content as any[])
+								.map(c => (typeof c === "string" ? { type: "text", text: c } : c))
+								.filter(c => c.type === "text")
+								.map(c => (c as any).text)
+								.join("")
+						}
+					] as any[]
+				} as Message);
+			}
+		}
+
+		return providerMessages;
 	}
 
 	#buildBtwAssistantMessage(text: string): AssistantMessage {
@@ -29347,10 +29458,11 @@ export class AgentSession {
 			this.#attemptRecordStore.retire(sideAttempt.scope);
 			throw new Error("The /btw conversation scope was scrubbed.");
 		}
-		const messages = scope.messages.map(message => ({
-			role: message.role,
-			content: [{ type: "text" as const, text: message.text }],
-		})) as Message[];
+
+		// Convert full AgentMessage[] to provider Message[], preserving tool calls and results
+		const messages = this.#convertBtwMessagesToProvider(scope.messages);
+
+		// Add bounded contextual exchanges and the new question
 		for (const exchange of boundBtwExchanges(args.contextExchanges ?? [])) {
 			messages.push({
 				role: "user",
@@ -29365,7 +29477,12 @@ export class AgentSession {
 			role: "user",
 			content: [{ type: "text", text: args.turn.question }],
 		} as Message);
-		const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
+
+		// Fork the provider-bound prefix: keep system prompt and tools for cache identity
+		// but never execute tools (toolChoice: "none")
+		const tools = [...scope.tools];
+		const context: Context = { systemPrompt: scope.systemPrompt, messages, tools };
+
 		const timeoutAbort = new AbortController();
 		const requestSignal = args.signal ? AbortSignal.any([args.signal, timeoutAbort.signal]) : timeoutAbort.signal;
 		const options: SimpleStreamOptions = {
@@ -29381,17 +29498,20 @@ export class AgentSession {
 			streamFirstEventTimeoutMs: 0,
 			attemptScope: sideAttempt.scope,
 		};
+
 		const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
 		let replyText = "";
 		let completed = false;
 		let active = true;
 		let onTextDelta = args.onTextDelta;
 		let idleTimer: NodeJS.Timeout | undefined;
+
 		const timeout = (message: string) => {
 			const error = new Error(message);
 			error.name = "TimeoutError";
 			timeoutAbort.abort(error);
 		};
+
 		const resetIdleTimer = () => {
 			if (idleTimer) clearTimeout(idleTimer);
 			idleTimer = setTimeout(
@@ -29400,18 +29520,21 @@ export class AgentSession {
 			);
 			idleTimer.unref?.();
 		};
+
 		const totalTimer = setTimeout(
 			() => timeout(`/btw provider exceeded ${BTW_STREAM_TOTAL_TIMEOUT_MS / 1000} seconds`),
 			BTW_STREAM_TOTAL_TIMEOUT_MS,
 		);
 		totalTimer.unref?.();
 		resetIdleTimer();
+
 		const consume = async () => {
 			while (active) {
 				const result = await iterator.next();
 				if (result.done || !active) break;
 				resetIdleTimer();
 				const event = result.value;
+
 				if (event.type === "text_delta") {
 					const bounded = truncateUtf8(replyText + event.delta, BTW_MAX_ANSWER_UTF8_BYTES);
 					const delta = bounded.slice(replyText.length);
@@ -29425,6 +29548,7 @@ export class AgentSession {
 				}
 			}
 		};
+
 		try {
 			await awaitEphemeralAbort(consume(), requestSignal);
 			requestSignal.throwIfAborted();

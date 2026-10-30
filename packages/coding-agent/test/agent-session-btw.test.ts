@@ -222,6 +222,15 @@ describe("AgentSession /btw isolation", () => {
 			],
 			providerPayload: { private: "PRIVATE_PROVIDER_SENTINEL" } as never,
 		});
+		// New design: resolve the tool call so it's included in /btw context
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "private-tool",
+			toolName: "read",
+			content: [{ type: "text", text: "tool result" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
 		const committedEntriesBefore = structuredClone(harness.sessionManager.getEntries());
 
 		const turn = harness.session.runEphemeralTurn({
@@ -286,7 +295,8 @@ describe("AgentSession /btw isolation", () => {
 		key.resolve("test-key");
 		await turn;
 
-		expect(harness.model.calls[0]?.context.systemPrompt).toEqual(["system", "btw test instruction"]);
+		// New design: system prompt is kept identical for cache identity (no instruction added)
+		expect(harness.model.calls[0]?.context.systemPrompt).toEqual(["system"]);
 	});
 
 	it("keeps the model and provider generation frozen for the open side-chat scope", async () => {
