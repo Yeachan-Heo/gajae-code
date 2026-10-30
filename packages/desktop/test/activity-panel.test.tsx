@@ -39,8 +39,8 @@ function sessionState(): DesktopActivitySessionState {
 		gates: {
 			available: true,
 			pending: [
-				{ ref: ref("gate-question"), kind: "question", stage: "설계 검토", createdAt: "2026-10-28T18:00:00Z", answerable: true },
-				{ ref: ref("gate-approval"), kind: "approval", stage: "ralplan", createdAt: "2026-10-28T18:01:00Z", answerable: false, reason: "원격 응답을 지원하지 않는 생산자" },
+				{ ref: ref("gate-question"), kind: "question", stage: "Design review", createdAt: "2026-10-28T18:00:00Z", answerable: true },
+				{ ref: ref("gate-approval"), kind: "approval", stage: "ralplan", createdAt: "2026-10-28T18:01:00Z", answerable: false, reason: "Producer that does not support remote answers" },
 			],
 			truncated: false,
 		},
@@ -62,64 +62,64 @@ describe("desktop activity panel", () => {
 	test("renders only declared controls, even when status alone would suggest a different action", () => {
 		const value = snapshot();
 		value.jobs = [
-			{ type: "job", ref: ref("job-readonly"), id: "job-1", kind: "shell", label: "실행 중이지만 읽기 전용", status: "running", controls: [], backgrounded: true, deliveryState: "pending", outputAvailable: false, reason: "공개 제어를 제공하지 않음" },
-			{ type: "job", ref: ref("job-cancel"), id: "job-2", kind: "shell", label: "취소 가능한 작업", status: "queued", controls: ["cancel"], backgrounded: false, deliveryState: "delivered", outputAvailable: true },
+			{ type: "job", ref: ref("job-readonly"), id: "job-1", kind: "shell", label: "Running but read only", status: "running", controls: [], backgrounded: true, deliveryState: "pending", outputAvailable: false, reason: "No public control was declared" },
+			{ type: "job", ref: ref("job-cancel"), id: "job-2", kind: "shell", label: "Cancelable job", status: "queued", controls: ["cancel"], backgrounded: false, deliveryState: "delivered", outputAvailable: true },
 		];
 		value.tasks = [{ type: "task", ref: ref("task-resume"), id: "task-1", status: "paused", controls: ["resume"], requestedModel: "requested/model", effectiveModel: "effective/model" }];
 		value.crons = [{ type: "cron", ref: ref("cron-delete"), id: "cron-1", schedule: "0 * * * *", controls: ["delete"], recurring: true, firing: false }];
 		const html = render(value);
-		expect(button(html, "취소")).not.toContain('disabled=""');
-		expect(button(html, "재개")).not.toContain('disabled=""');
-		expect(button(html, "삭제")).not.toContain('disabled=""');
-		expect(html).not.toContain(">중지</button>");
-		expect(html).not.toContain(">일시 정지</button>");
-		expect(html).toContain("제공된 제어 없음 · 읽기 전용");
-		expect(html).toContain("공개 제어를 제공하지 않음");
+		expect(button(html, "Cancel")).not.toContain('disabled=""');
+		expect(button(html, "Resume")).not.toContain('disabled=""');
+		expect(button(html, "Delete")).not.toContain('disabled=""');
+		expect(html).not.toContain(">Stop</button>");
+		expect(html).not.toContain(">Pause</button>");
+		expect(html).toContain("No controls provided · Read only");
+		expect(html).toContain("No public control was declared");
 		expect(html).toContain("effective/model");
-		expect(html).toContain("출력 확인 가능");
-		expect(html).toContain("제공된 출력 없음");
-		expect(html).not.toContain("작업 취소 완료");
+		expect(html).toContain("Output available");
+		expect(html).toContain("No output provided");
+		expect(html).not.toContain("Cancellation completed");
 	});
 
 	test("uses distinct stop and pause labels and disables every operation while pending", () => {
 		const value = snapshot();
-		value.jobs = [{ type: "job", ref: ref("stop-job"), id: "job", kind: "shell", label: "중지 제어", status: "running", controls: ["stop"], backgrounded: false, deliveryState: "failed-visible", outputAvailable: false }];
-		value.tasks = [{ type: "task", ref: ref("pause-task"), id: "task", status: "running", controls: ["pause", "cancel"], reason: "SDK가 선언한 제어" }];
+		value.jobs = [{ type: "job", ref: ref("stop-job"), id: "job", kind: "shell", label: "Stop control", status: "running", controls: ["stop"], backgrounded: false, deliveryState: "failed-visible", outputAvailable: false }];
+		value.tasks = [{ type: "task", ref: ref("pause-task"), id: "task", status: "running", controls: ["pause", "cancel"], reason: "Controls declared by the SDK" }];
 		value.failedUnacknowledged = true;
 		value.sessionState = sessionState();
 		const html = render(value, { pending: true });
-		for (const label of ["새로고침", "상세 보기", "중지", "일시 정지", "취소", "실패 알림 확인", "요청 내용 보기"]) {
+		for (const label of ["Refresh", "View details", "Stop", "Pause", "Cancel", "Acknowledge failures", "View request"]) {
 			expect(button(html, label)).toContain('disabled=""');
 		}
 		expect(html).toContain('aria-busy="true"');
-		expect(html).toContain("전달 실패 표시됨");
-		expect(html).toContain("아래는 마지막으로 받은 정보입니다.");
-		expect(html).not.toContain("응답을 보냈습니다");
+		expect(html).toContain("delivery failure shown");
+		expect(html).toContain("The information below is the last received.");
+		expect(html).not.toContain("Answer sent");
 	});
 
 	test("separates disconnected, pending, error and unavailable from observed empty lists", () => {
 		const disconnected = render(null);
-		expect(disconnected).toContain("활동 정보가 연결되지 않았습니다.");
-		expect(disconnected).not.toContain("표시할 항목이 없습니다.");
+		expect(disconnected).toContain("Activity information is not connected.");
+		expect(disconnected).not.toContain("No entries to show.");
 		const pending = render(null, { pending: true });
-		expect(pending).toContain("활동 조회·처리 또는 연결을 기다리는 중…");
-		expect(pending).not.toContain("표시할 항목이 없습니다.");
-		const failed = render(null, { error: "연결 실패" });
+		expect(pending).toContain("Waiting for activity reads, operations or the connection…");
+		expect(pending).not.toContain("No entries to show.");
+		const failed = render(null, { error: "Connection failed" });
 		expect(failed).toContain('role="alert"');
-		expect(failed).toContain("연결 실패");
-		expect(failed).not.toContain("표시할 항목이 없습니다.");
-		const unavailable = render({ ...scope, available: false, reason: "관찰 기능 미지원" });
-		expect(unavailable).toContain("작업 관찰을 사용할 수 없습니다");
-		expect(unavailable).toContain("관찰 기능 미지원");
-		expect(unavailable).not.toContain("실행 중 모니터 0개");
-		expect(unavailable).not.toContain("표시할 항목이 없습니다.");
+		expect(failed).toContain("Connection failed");
+		expect(failed).not.toContain("No entries to show.");
+		const unavailable = render({ ...scope, available: false, reason: "Observation unsupported" });
+		expect(unavailable).toContain("Job observation is unavailable");
+		expect(unavailable).toContain("Observation unsupported");
+		expect(unavailable).not.toContain("0 running monitors");
+		expect(unavailable).not.toContain("No entries to show.");
 		const empty = render(snapshot());
-		expect(empty.match(/표시할 항목이 없습니다\./gu)).toHaveLength(3);
-		expect(empty).not.toContain("작업 관찰을 사용할 수 없습니다");
-		const stale = render(snapshot(), { error: "새로고침 실패" });
-		expect(stale).toContain("마지막 조회에 표시된 항목이 없습니다.");
-		expect(stale).not.toContain("표시할 항목이 없습니다.");
-		expect(stale).toContain("변경 성공을 뜻하지 않습니다.");
+		expect(empty.match(/No entries to show\./gu)).toHaveLength(3);
+		expect(empty).not.toContain("Job observation is unavailable");
+		const stale = render(snapshot(), { error: "Refresh failed" });
+		expect(stale).toContain("The last read showed no entries.");
+		expect(stale).not.toContain("No entries to show.");
+		expect(stale).toContain("It does not mean the change succeeded.");
 	});
 
 	test("keeps canonical monitor and cron counts separate from overlapping visible rows", () => {
@@ -128,50 +128,50 @@ describe("desktop activity panel", () => {
 		value.activeCronCount = 3;
 		value.worstState = "failed";
 		value.failedUnacknowledged = true;
-		value.jobs = [{ type: "job", ref: ref("job"), id: "same-work", label: "관찰된 실패", kind: "task", status: "failed", controls: [], backgrounded: true, deliveryState: "delivered", outputAvailable: false, error: "실제 오류 요약" }];
+		value.jobs = [{ type: "job", ref: ref("job"), id: "same-work", label: "Observed failure", kind: "task", status: "failed", controls: [], backgrounded: true, deliveryState: "delivered", outputAvailable: false, error: "Actual error summary" }];
 		value.tasks = [{ type: "task", ref: ref("task"), id: "same-work", status: "failed", controls: [] }];
 		value.truncated.jobs = true;
 		const html = render(value);
-		expect(html).toContain("실행 중 모니터 7개 · 활성 예약 3개");
-		expect(html).toContain("관찰 상태: 실패");
-		expect(html.match(/표시된 항목 1개/gu)).toHaveLength(2);
-		expect(html).toContain("합산하지 않습니다.");
-		expect(html).toContain("위 숫자는 전체 개수가 아닙니다.");
-		expect(html).toContain("실제 오류 요약");
-		expect(button(html, "실패 알림 확인")).not.toContain('disabled=""');
-		expect(render({ ...value, failedUnacknowledged: false })).not.toContain("실패 알림 확인");
+		expect(html).toContain("7 running monitors · 3 active schedules");
+		expect(html).toContain("Observed state: Failed");
+		expect(html.match(/1 shown/gu)).toHaveLength(2);
+		expect(html).toContain("not added together.");
+		expect(html).toContain("The counts above are not totals.");
+		expect(html).toContain("Actual error summary");
+		expect(button(html, "Acknowledge failures")).not.toContain('disabled=""');
+		expect(render({ ...value, failedUnacknowledged: false })).not.toContain("Acknowledge failures");
 	});
 
 	test("shows goal, workflow and gates even when job observation is unavailable", () => {
 		const html = render({ ...scope, available: false, reason: "No public job observation", sessionState: sessionState() });
-		expect(html).toContain("목표 모드 켜짐 · 일시 정지됨 · 사용 토큰 123 · 사용 시간 42초");
+		expect(html).toContain("Goal mode on · Paused · tokens used 123 · time used 42s");
 		expect(html).toContain("ralplan");
-		expect(html).toContain("표시된 요청 2개");
-		expect(html).toContain("질문 ·");
-		expect(html).toContain("승인 요청 ·");
-		expect(html.match(/요청 내용 보기<\/button>/gu)).toHaveLength(2);
-		expect(button(html, "요청 내용 보기")).not.toContain('disabled=""');
-		expect(html).toContain("원격 응답은 지원되지 않습니다.");
-		expect(html).toContain("내용을 열어 확인한 뒤 응답할 수 있습니다.");
-		expect(html).not.toContain("승인</button>");
+		expect(html).toContain("2 shown");
+		expect(html).toContain("Question ·");
+		expect(html).toContain("Approval request ·");
+		expect(html.match(/View request<\/button>/gu)).toHaveLength(2);
+		expect(button(html, "View request")).not.toContain('disabled=""');
+		expect(html).toContain("Remote answers are not supported.");
+		expect(html).toContain("Open the details to review it, then answer.");
+		expect(html).not.toContain("Approval request</button>");
 		expect(html).not.toContain("gate-approval");
 		expect(html).not.toContain("session-fixture");
-		expect(html).not.toContain("실패 알림 확인");
+		expect(html).not.toContain("Acknowledge failures");
 	});
 
 	test("does not confuse unavailable or absent gate summaries with no pending gates", () => {
 		const value = snapshot();
-		expect(render(value)).toContain("응답 요청 정보를 제공받지 못했습니다.");
+		expect(render(value)).toContain("No input request information was provided.");
 		value.sessionState = { goal: null, workflow: null, gates: { available: false, reason: "Gate emitter unavailable" } };
 		const unavailable = render(value);
-		expect(unavailable).toContain("응답 요청 조회 불가");
+		expect(unavailable).toContain("Input request read unavailable");
 		expect(unavailable).toContain("Gate emitter unavailable");
-		expect(unavailable).not.toContain("대기 중인 응답 요청이 없습니다.");
+		expect(unavailable).not.toContain("No input requests are pending.");
 		value.sessionState.gates = { available: true, pending: [], truncated: true };
 		const empty = render(value);
-		expect(empty).toContain("대기 중인 응답 요청이 없습니다.");
-		expect(empty).toContain("일부 응답 요청이 생략되었습니다.");
-		expect(render(value, { pending: true })).toContain("마지막 조회에 응답 요청이 없습니다.");
+		expect(empty).toContain("No input requests are pending.");
+		expect(empty).toContain("Some input requests are omitted because the display limit was reached.");
+		expect(render(value, { pending: true })).toContain("The last read showed no input requests.");
 	});
 
 	test("bounds long Korean/CJK and unbroken fields and escapes producer HTML as text", () => {
@@ -183,7 +183,7 @@ describe("desktop activity panel", () => {
 		if (value.sessionState.gates.available) value.sessionState.gates.pending[0]!.reason = "artifact:///private/plan.html";
 		const html = render(value, { error: `${hostile}${"e".repeat(5000)}` });
 		expect(html).toContain("긴 한국어 日本語 中文");
-		expect(html).toContain("긴 내용 생략");
+		expect(html).toContain("content truncated");
 		expect(html).not.toContain("가".repeat(241));
 		expect(html).not.toContain("x".repeat(1025));
 		expect(html).not.toContain("r".repeat(1025));

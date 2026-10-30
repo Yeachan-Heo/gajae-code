@@ -104,7 +104,9 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .sidebar footer { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border); }
 .sidebar-heading, .project-heading, .toolbar, .modal header, .review-pane header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .sidebar-heading { padding: 4px; }
-.sidebar-heading strong { font-weight: 600; }
+.sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.brand-mark { width: 26px; height: 26px; flex: none; border-radius: 7px; }
+
 .project-group { margin: 16px 0 24px; }
 .project-heading h2 { margin: 0; min-width: 0; font-size: 0.8125rem; }
 .project-heading .button { flex-shrink: 0; }
@@ -216,6 +218,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .empty h2 { color: var(--text); margin-bottom: 8px; }
 .empty p:last-child { margin-bottom: 0; }
 .empty > svg { width: 24px; height: 24px; margin-bottom: 12px; stroke-width: 1.5; }
+.empty-brand { width: 88px; height: 88px; margin-bottom: 14px; border-radius: 22px; image-rendering: auto; }
 .question-card { border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 14px; background: var(--card); padding: 16px; margin: 16px 0; min-width: 0; }
 .question-heading { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
 .question-heading > svg { margin-top: 3px; color: var(--accent); }
@@ -407,6 +410,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 .showcase { max-width: 960px; height: 100%; overflow: auto; overscroll-behavior: contain; margin: 0 auto; padding: 32px 24px; }
 .showcase-heading { padding: 12px 0 24px; }
+.showcase-brand { width: 40px; height: 40px; border-radius: 11px; margin-bottom: 10px; }
 .showcase-heading h1 { font-size: 1.25rem; margin-top: 8px; }
 .showcase-heading p { max-width: 640px; color: var(--muted); }
 .showcase-eyebrow { font-size: 0.75rem; color: var(--muted); }

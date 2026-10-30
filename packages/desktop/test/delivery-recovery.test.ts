@@ -28,14 +28,14 @@ test("recovery notices distinguish actionable outcomes from routine bookkeeping"
 		expect(recoveryNotice({ ...entry, disposition }, false)).toBeNull();
 	}
 	const unknown = recoveryNotice({ ...entry, disposition: "unknown" }, false);
-	expect(unknown).toContain("이미 실행되었을 수 있습니다");
-	expect(unknown).toContain("자동으로 다시 보내지 않습니다");
+	expect(unknown).toContain("It may already have run");
+	expect(unknown).toContain("will not resend it automatically");
 	const failed = recoveryNotice({ ...entry, disposition: "failed" }, false);
-	expect(failed).toContain("실패했습니다");
-	expect(failed).toContain("이미 실행되었을 수 있습니다");
+	expect(failed).toContain("delivery failed");
+	expect(failed).toContain("Some work may already have run");
 	expect(recoveryNotice({ ...entry, disposition: "failed", finalizing: true }, false)).toBeNull();
 	for (const changes of [{ prepared: true }, { restored: true }, { finalizing: true }]) {
-		expect(recoveryNotice({ ...entry, ...changes }, true)).toContain("저장 복구를 다시 시도");
+		expect(recoveryNotice({ ...entry, ...changes }, true)).toContain("Retry restoring the saved draft");
 	}
 });
 

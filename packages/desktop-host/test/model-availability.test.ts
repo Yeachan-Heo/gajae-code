@@ -214,11 +214,11 @@ describe("desktop canonical model availability", () => {
 		const result = await call<DesktopCredentialSaveResult>("auth.setKey", { provider, key });
 		expect(result).toEqual({ provider, saved: true, catalogRefreshed: false });
 		expect(JSON.stringify(sdk.modelRegistry.authStorage.getAll()[provider])).toContain(key);
-		await expect(list(first.id)).rejects.toThrow("모델 목록을 새로 고치지 못했습니다");
+		await expect(list(first.id)).rejects.toThrow("Model list refresh failed");
 		expect(ids(await list(second.id))).toEqual(eligibleIds);
 		const select = vi.spyOn(sdk, "setDefaultModelSelection");
 		await expect(call("model.set", { sessionId: first.id, modelId: eligibleIds[0] })).rejects.toThrow(
-			"모델 목록을 새로 고치지 못했습니다",
+			"Model list refresh failed",
 		);
 		expect(select).not.toHaveBeenCalled();
 		await expect(call("models.list", { sessionId: first.id, refresh: "offline" })).rejects.toThrow(
@@ -341,7 +341,7 @@ describe("desktop canonical model availability", () => {
 		expect(sdk.model?.id).toBe("registered-only");
 		await expect(
 			call("model.set", { sessionId: second.id, modelId: "desktop-runtime/registered-only" }),
-		).rejects.toThrow("등록된 제공자에서 사용할 수 없는 모델");
+		).rejects.toThrow("This model is not available from a registered provider");
 	});
 
 	test("session credential pins fail closed without leaking another scope's eligible models", async () => {
@@ -378,7 +378,7 @@ describe("desktop canonical model availability", () => {
 		expect(ids(host.snapshot().models)).toEqual(eligibleIds);
 		const selection = vi.spyOn(sdkA, "setDefaultModelSelection");
 		await expect(call("model.set", { sessionId: first.id, modelId: eligibleIds[0] })).rejects.toThrow(
-			"등록된 제공자에서 사용할 수 없는 모델",
+			"This model is not available from a registered provider",
 		);
 		expect(selection).not.toHaveBeenCalled();
 		expect(sdkA.model).toBeUndefined();
@@ -416,7 +416,7 @@ describe("desktop canonical model availability", () => {
 		const roles = structuredClone(sdk.settings.getGlobal("modelRoles"));
 		const level = sdk.thinkingLevel;
 		await expect(call("model.set", { sessionId: first.id, modelId: eligibleIds[0] })).rejects.toThrow(
-			"등록된 제공자에서 사용할 수 없는 모델",
+			"This model is not available from a registered provider",
 		);
 		expect(selection).not.toHaveBeenCalled();
 		expect(sdk.model).toBeUndefined();
@@ -439,7 +439,7 @@ describe("desktop canonical model availability", () => {
 		const selection = vi.spyOn(sdk, "setDefaultModelSelection");
 		for (const modelId of ["anthropic/not-a-registered-model", `${provider}/forged`, `${otherProvider}/hidden`])
 			await expect(call("model.set", { sessionId: first.id, modelId, thinkingLevel: "high" })).rejects.toThrow(
-				"등록된 제공자에서 사용할 수 없는 모델",
+				"This model is not available from a registered provider",
 			);
 		expect(selection).not.toHaveBeenCalled();
 		expect(sdk.model).toBe(before.model);
@@ -521,7 +521,7 @@ describe("desktop canonical model availability", () => {
 		if (refreshFails) {
 			expect(settled.error).toContain("Credentials were saved");
 			expect(sessions[0]!.modelRegistry.authStorage.hasAuth(oauthProvider)).toBe(true);
-			await expect(list(first.id)).rejects.toThrow("모델 목록을 새로 고치지 못했습니다");
+			await expect(list(first.id)).rejects.toThrow("Model list refresh failed");
 			await call("models.list", { sessionId: first.id, refresh: true });
 		}
 		expect(login).toHaveBeenCalledTimes(1);

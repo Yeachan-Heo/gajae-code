@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun run icons && bun scripts/dev.ts",
-    "icons": "tauri icon icon.svg --output src-tauri/icons",
+    "icons": "tauri icon icon.png --output src-tauri/icons",
     "dev:ui": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build:ui": "vite build",
     "build:host": "bun scripts/build-host.ts",

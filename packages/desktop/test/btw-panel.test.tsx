@@ -7,9 +7,9 @@ import { BtwPanel, type BtwPanelProps } from "../src/BtwPanel";
 
 function turn(overrides: Partial<DesktopBtwTurn> = {}): DesktopBtwTurn {
 	return {
-		turnId: "opaque:btw/turn <&> ?=29\n끝",
-		question: "주 작업은 그대로 두고 질문합니다.\n  frozen context를 설명해 주세요.\n",
-		answer: "여기까지 받은 부분 답변입니다.\n  한국어와 TypeScript 설명\n",
+		turnId: "opaque:btw/turn <&> ?=29\nend",
+		question: "Ask a question while the main work stays as it is.\n  Explain the frozen context.\n",
+		answer: "A partial answer received so far.\n  English and TypeScript notes\n",
 		status: "running",
 		answerTruncated: false,
 		...overrides,
@@ -23,7 +23,7 @@ function conversation(turns: DesktopBtwTurn[] = [turn()]): DesktopBtwConversatio
 function props(overrides: Partial<BtwPanelProps> = {}): BtwPanelProps {
 	return {
 		conversation: null,
-		draft: "  후속 질문입니다.\n  기존 초안을 보존하세요.\n",
+		draft: "  Follow-up question.\n  Keep the existing draft.\n",
 		disabled: false,
 		pending: false,
 		onDraftChange: () => { throw new Error("Rendering must not change the draft"); },
@@ -107,7 +107,7 @@ function key(tree: ReactNode, options: { key?: string; metaKey?: boolean; ctrlKe
 }
 
 function cancel(tree: ReactNode) {
-	const handler = node(tree, element => element.props.children === "곁대화 중지 요청").props.onClick;
+	const handler = node(tree, element => element.props.children === "Request side chat stop").props.onClick;
 	if (!handler) throw new Error("Missing side-turn cancel handler");
 	handler();
 }
@@ -116,19 +116,19 @@ describe("desktop BTW side-chat presentation", () => {
 	test("explains frozen text-only isolation and provides a labeled controlled draft without owning a dialog", () => {
 		for (const value of [null, conversation([])]) {
 			const html = render({ conversation: value });
-			expect(html).toContain("시작할 때 고정한 문맥(frozen context)");
-			expect(html).toContain("텍스트 전용 곁대화");
-			expect(html).toContain("도구를 사용하지 않으며");
-			expect(html).toContain("주 대화 기록에 쓰이지 않습니다");
-			expect(html).toContain("주 작업과 입력창은 별개입니다");
-			expect(html).toContain("아직 곁대화가 없습니다");
-			expect(html).toMatch(/<label for="[^"]+">곁대화 질문<\/label>/u);
+			expect(html).toContain("A text-only side chat");
+			expect(html).toContain("context frozen when it started");
+			expect(html).toContain("It does not use tools");
+			expect(html).toContain("not written to the main conversation");
+			expect(html).toContain("composer stay separate");
+			expect(html).toContain("No side chat yet.");
+			expect(html).toMatch(/<label for="[^"]+">Side chat question<\/label>/u);
 			expect(html).toMatch(/<textarea[^>]*aria-describedby="[^"]+"[^>]*rows="3"/u);
 			expect(html).toContain(props().draft);
-			expect(html).toContain("Enter는 줄바꿈");
+			expect(html).toContain("Enter for a new line");
 			expect(html).not.toContain("<dialog");
-			expect(html).not.toContain("곁대화 중지 요청");
-			expect(button(html, "곁대화 보내기")).not.toContain('disabled=""');
+			expect(html).not.toContain("Request side chat stop");
+			expect(button(html, "Send side chat")).not.toContain('disabled=""');
 		}
 	});
 
@@ -136,31 +136,31 @@ describe("desktop BTW side-chat presentation", () => {
 		const hostile = '<script>alert("fixture")</script>\n  <img src=x onerror=alert(1)>\n';
 		const html = render({ conversation: conversation([
 			turn({ turnId: "first", status: "completed" }),
-			turn({ turnId: "second", question: "두 번째 질문\n  들여쓰기", answer: hostile, status: "cancelled", answerTruncated: true }),
+			turn({ turnId: "second", question: "Second question\n  indented", answer: hostile, status: "cancelled", answerTruncated: true }),
 		]) });
-		expect(html).toContain('class="btw-history" role="region" aria-label="곁대화 질문과 답변" tabindex="0"');
+		expect(html).toContain('class="btw-history" role="region" aria-label="Side chat questions and answers" tabindex="0"');
 		expect(html).toContain('class="btw-turn-list"');
 		expect(html).toContain(turn().question);
 		expect(html).toContain(turn().answer);
-		expect(html.indexOf(turn().question)).toBeLessThan(html.indexOf("두 번째 질문"));
+		expect(html.indexOf(turn().question)).toBeLessThan(html.indexOf("Second question"));
 		expect(html).toContain("&lt;script&gt;alert(&quot;fixture&quot;)&lt;/script&gt;\n  &lt;img");
 		expect(html).not.toContain("<script");
 		expect(html).not.toContain("<img");
-		expect(html).toContain("취소됨 · 받은 답변 보존");
-		expect(html).toContain("표시된 답변은 전체가 아닙니다");
-		expect(html).not.toContain("곁대화 중지 요청");
-		expect(button(html, "곁대화 보내기")).not.toContain('disabled=""');
+		expect(html).toContain("Cancelled · received answer kept");
+		expect(html).toContain("The answer shown is not complete");
+		expect(html).not.toContain("Request side chat stop");
+		expect(button(html, "Send side chat")).not.toContain('disabled=""');
 	});
 
 	test("submits the exact draft without clearing it and reports edits without mutating controlled text", () => {
 		const changes: string[] = [];
 		const sends: string[] = [];
-		const draft = "  원래 초안\n    공백을 보존합니다.\n";
+		const draft = "  Original draft\n    Keep the whitespace.\n";
 		const tree = capture({ draft, onDraftChange: value => changes.push(value), onSend: value => sends.push(value) });
 		expect(submit(tree)).toBe(true);
 		expect(sends).toEqual([draft]);
 		expect(changes).toEqual([]);
-		const edited = "\n  다음 질문 초안";
+		const edited = "\n  Next question draft";
 		change(tree, edited);
 		expect(changes).toEqual([edited]);
 		expect(sends).toEqual([draft]);
@@ -194,17 +194,17 @@ describe("desktop BTW side-chat presentation", () => {
 			const sends: string[] = [];
 			const tree = capture({ ...state, onDraftChange: value => changes.push(value), onSend: value => sends.push(value) });
 			const html = render(state);
-			expect(button(html, "곁대화 보내기")).toContain('disabled=""');
+			expect(button(html, "Send side chat")).toContain('disabled=""');
 			expect(submit(tree)).toBe(true);
 			expect(key(tree, { metaKey: true })).toBe(false);
 			expect(key(tree, { ctrlKey: true })).toBe(false);
 			expect(sends).toEqual([]);
-			change(tree, "보존할 다음 초안\n  후속 질문");
-			expect(changes).toEqual(["보존할 다음 초안\n  후속 질문"]);
+			change(tree, "Draft to keep\n  follow-up question");
+			expect(changes).toEqual(["Draft to keep\n  follow-up question"]);
 			expect(html.match(/<textarea[^>]*>/u)?.[0]).not.toContain('disabled=""');
 		}
-		expect(render({ pending: true })).toContain("응답을 기다리는 중");
-		expect(render({ disabled: true })).toContain("연결 또는 세션을 사용할 수 없습니다");
+		expect(render({ pending: true })).toContain("Waiting for a response");
+		expect(render({ disabled: true })).toContain("The connection or session is unavailable");
 		expect(render({ disabled: true })).toContain(props().draft);
 	});
 
@@ -216,39 +216,39 @@ describe("desktop BTW side-chat presentation", () => {
 		cancel(tree);
 		expect(cancellations).toEqual([active.turnId]);
 		const html = render({ conversation: conversation() });
-		expect(button(html, "곁대화 중지 요청")).not.toContain('disabled=""');
-		expect(html).toContain("이 곁대화 응답만 대상으로");
-		expect(html).toContain("즉시 종료를 보장하지 않습니다");
+		expect(button(html, "Request side chat stop")).not.toContain('disabled=""');
+		expect(html).toContain("only to this side chat response");
+		expect(html).toContain("does not guarantee an immediate exit");
 		for (const state of [{ pending: true }, { disabled: true }, { conversation: conversation([turn({ status: "cancel_requested" })]) }]) {
 			const locked = { conversation: conversation(), ...state };
-			expect(button(render(locked), "곁대화 중지 요청")).toContain('disabled=""');
+			expect(button(render(locked), "Request side chat stop")).toContain('disabled=""');
 			cancel(capture(locked));
 		}
 		const cancelling = render({ conversation: conversation([turn({ status: "cancel_requested" })]) });
-		expect(cancelling).toContain("중지 요청됨 · 종료 확인 대기");
-		expect(cancelling).not.toContain("취소됨");
+		expect(cancelling).toContain("Stop requested · waiting for exit");
+		expect(cancelling).not.toContain("Cancelled ·");
 		expect(cancelling).toContain(active.answer);
 	});
 
 	test("exposes each terminal result, preserves partial failures and re-enables follow-up without inventing output", () => {
-		for (const [status, label] of [["completed", "응답 완료"], ["cancelled", "취소됨 · 받은 답변 보존"], ["failed", "응답 실패"]] as const) {
+		for (const [status, label] of [["completed", "Responded"], ["cancelled", "Cancelled · received answer kept"], ["failed", "Response failed"]] as const) {
 			const html = render({ conversation: conversation([turn({ status })]) });
 			expect(html).toContain(`data-status="${status}"`);
 			expect(html).toContain(`role="status">${label}</p>`);
 			expect(html).toContain(turn().answer);
-			expect(html).not.toContain("곁대화 중지 요청");
-			expect(button(html, "곁대화 보내기")).not.toContain('disabled=""');
+			expect(html).not.toContain("Request side chat stop");
+			expect(button(html, "Send side chat")).not.toContain('disabled=""');
 			const sends: string[] = [];
 			submit(capture({ conversation: conversation([turn({ status })]), onSend: value => sends.push(value) }));
 			expect(sends).toEqual([props().draft]);
 		}
-		const failed = render({ conversation: conversation([turn({ status: "failed", error: { code: "provider_failure", message: "응답 연결이 끊겼습니다.\n  받은 내용은 보존됩니다." } })]) });
+		const failed = render({ conversation: conversation([turn({ status: "failed", error: { code: "provider_failure", message: "The response connection dropped.\n  Received content is kept." } })]) });
 		expect(failed).toContain('role="alert"');
-		expect(failed).toContain("provider_failure: 응답 연결이 끊겼습니다.\n  받은 내용은 보존됩니다.");
+		expect(failed).toContain("provider_failure: The response connection dropped.\n  Received content is kept.");
 		expect(failed).toContain(turn().answer);
 		const empty = render({ conversation: conversation([turn({ status: "cancelled", answer: "" })]) });
-		expect(empty).toContain("아직 받은 답변이 없습니다");
-		expect(empty).not.toContain('aria-label="곁대화 답변"');
-		expect(empty).not.toContain("응답 완료");
+		expect(empty).toContain("No answer yet.");
+		expect(empty).not.toContain('aria-label="Side chat answer"');
+		expect(empty).not.toContain("Responded");
 	});
 });

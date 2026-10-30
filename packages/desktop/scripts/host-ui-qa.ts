@@ -265,13 +265,15 @@ try {
 	await Bun.write(path.join(project, "qa-untracked.txt"), "Real isolated desktop QA untracked change.\n");
 	// Seed a realistic catalog so the UI renders a non-trivial snapshot instead of
 	// an empty workbench: three conversations, one of which is large enough that
-	// its bootstrap frame crosses the 64 KiB pipe boundary.
+	// its bootstrap frame crosses the 64 KiB pipe boundary. The long conversation
+	// keeps a CJK-width filler on purpose: it is the sample that exercises
+	// wide-character width/wrapping while still crossing that boundary.
 	const dataDir = path.join(temporary, "desktop-data");
 	const projectId = crypto.randomUUID();
 	const seeded = [
-		{ title: "긴 대화", messages: 120, filler: "가".repeat(600) },
-		{ title: "짧은 대화", messages: 4, filler: "나".repeat(20) },
-		{ title: "즐겨찾기 대화", messages: 2, filler: "다".repeat(20), starred: true },
+		{ title: "Long conversation", messages: 120, filler: "가".repeat(600) },
+		{ title: "Short conversation", messages: 4, filler: "short fixture text" },
+		{ title: "Starred conversation", messages: 2, filler: "starred fixture text", starred: true },
 	];
 	const sessions = seeded.map(entry => {
 		const id = crypto.randomUUID();
@@ -312,7 +314,9 @@ try {
 					timestamp: new Date(1_700_000_000_000 + index * 1000).toISOString(),
 					message: {
 						role: index % 2 === 0 ? "user" : "assistant",
-						content: [{ type: "text", text: `[${session.entry.title}] 메시지 ${index} ${session.entry.filler}` }],
+						content: [
+							{ type: "text", text: `[${session.entry.title}] Message ${index} ${session.entry.filler}` },
+						],
 						// Real assistant turns always carry usage; a fixture without it is not
 						// a faithful transcript and goal accounting rejects it.
 						...(index % 2 === 0

@@ -97,7 +97,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		const w = window as unknown as FixtureWindow;
 		if (observeRecoveryNotices) {
 			new MutationObserver(() => {
-				if ([...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 복구")))
+				if ([...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("Delivery recovery:")))
 					sessionStorage.setItem("sawRecoveryNotice", "yes");
 			}).observe(document, { subtree: true, childList: true, characterData: true });
 		}
@@ -215,7 +215,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 	}, observeRecoveryNotices);
 	await step(page, "open app", () => page.goto(origin));
 	await step(page, "bootstrap session list", () => page.waitForSelector(".session-select"));
-	await step(page, "bootstrap connection", () => page.waitForFunction(() => !document.body.textContent?.includes("호스트에 연결하는 중")));
+	await step(page, "bootstrap connection", () => page.waitForFunction(() => !document.body.textContent?.includes("Connecting to the host")));
 	return { context, page };
 	} catch (error) {
 		await context.close();
@@ -331,9 +331,9 @@ const deferralPreferences: DesktopPreferences = {
 };
 
 async function openPreferences(page: Page) {
-	await page.click('button[title="대화 작업 메뉴"]');
-	await page.waitForSelector('[aria-label="현재 대화 작업"]');
-	await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="현재 대화 작업"] button')].find(button => button.textContent?.includes("모델 프로필과 실행 설정"))?.click());
+	await page.click('button[title="Conversation actions menu"]');
+	await page.waitForSelector('[aria-label="Conversation actions"]');
+	await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.includes("Model profiles and run settings"))?.click());
 	await page.waitForSelector(".preferences-panel");
 }
 
@@ -359,10 +359,10 @@ describe("mounted preference ownership", () => {
 				return committed.promise;
 			});
 			expect(await page.$(".profile-option")).toBeNull();
-			await page.evaluate(() => document.querySelector<HTMLButtonElement>('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]')?.click());
+			await page.evaluate(() => document.querySelector<HTMLButtonElement>('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]')?.click());
 			expect((await page.evaluate(() => window.fixture.requests())).some(request => request.method === "preferences.apply")).toBe(false);
 			for (const request of current) await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: request.id, result: profilePreferences });
-			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]:not([disabled])');
+			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]:not([disabled])');
 			expect(await page.$eval(".profile-option h4", element => element.textContent)).toBe("Focused profile");
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -380,8 +380,8 @@ describe("mounted preference ownership", () => {
 			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length > count, {}, before.filter(request => request.method === "preferences.get").length);
 			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
 			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: profilePreferences });
-			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]:not([disabled])');
-			await page.click('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]');
+			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]:not([disabled])');
+			await page.click('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]');
 			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
 			const apply = (await page.evaluate(() => window.fixture.requests())).find(request => request.method === "preferences.apply")!;
 			expect(apply.params).toEqual({ sessionId: "a", action: { type: "profile.select", name: "focused", scope: "session" } });
@@ -394,10 +394,10 @@ describe("mounted preference ownership", () => {
 			expect(refreshModel.params.sessionId).toBe("a");
 			expect(refreshRead.params.sessionId).toBe("a");
 			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: refreshRead.id, result: refreshedPreferences });
-			await page.click('.modal-close[aria-label="닫기"]');
+			await page.click('.modal-close[aria-label="Close"]');
 			await page.waitForSelector(".model-trigger:not([disabled])");
 			await page.click(".model-trigger");
-			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("모델"))?.click());
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("Models"))?.click());
 			await page.waitForFunction(() => document.querySelector('.model-option-hit[data-model-id="fixture/model-one"] .model-role-tags')?.textContent?.includes("Executor"));
 			await page.click('.model-option-hit[data-model-id="fixture/model-one"]');
 			await page.waitForSelector(".model-role-choice");
@@ -436,11 +436,11 @@ describe("mounted model selection deferral", () => {
 					},
 				}),
 			);
-			await page.waitForFunction(() => document.body.textContent?.includes("작업 중"));
+			await page.waitForFunction(() => document.body.textContent?.includes("Working"));
 			await page.click(".model-trigger");
 			await page.waitForSelector(".model-dialog");
 			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("모델"))?.click(),
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("Models"))?.click(),
 			);
 			await page.click('.model-option-hit[data-model-id="fixture/model-two"]');
 			await page.waitForSelector(".model-role-choice");
@@ -448,10 +448,9 @@ describe("mounted model selection deferral", () => {
 				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
 			);
 			await page.click(".model-role-option");
-			await page.waitForFunction(() => document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
-			expect(
-				(await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set"),
-			).toHaveLength(0);
+			// The chosen model shows immediately; nothing is sent and no prose explains the wait.
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
+			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
 			await page.evaluate(() =>
 				window.fixture.emit({
 					type: "session",
@@ -466,7 +465,18 @@ describe("mounted model selection deferral", () => {
 			expect(applied).toHaveLength(1);
 			expect(applied[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two" });
 			await page.evaluate(({ id }) => window.fixture.response(id, true), { id: applied[0]!.id });
-			await page.waitForFunction(() => !document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+			// The host reflects the applied model; the picker follows the host, not its own intent.
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a", title: "Session A", projectId: "p", status: "done", starred: false,
+						imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+						model: "fixture/model-two", messages: [],
+					},
+				}),
+			);
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 });
@@ -483,7 +493,7 @@ describe("mounted deferred selection intent", () => {
 							id: "a", title: "Session A", projectId: "p", status, starred: false,
 							imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
 							model: "fixture/model-one",
-							thinking: { level: "low", options: [{ value: "low", label: "낮음" }, { value: "high", label: "높음" }], available: true, scope: "session", mode: "effort" },
+							thinking: { level: "low", options: [{ value: "low", label: "Low" }, { value: "high", label: "High" }], available: true, scope: "session", mode: "effort" },
 							messages: [],
 							queued,
 						},
@@ -493,8 +503,8 @@ describe("mounted deferred selection intent", () => {
 		try {
 			await page.evaluate(() =>
 				window.fixture.setModels([
-					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: true, thinking: { options: [{ value: "low", label: "낮음" }, { value: "high", label: "높음" }] } },
-					{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: true, thinking: { options: [{ value: "low", label: "낮음" }, { value: "high", label: "높음" }] } },
+					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: true, thinking: { options: [{ value: "low", label: "Low" }, { value: "high", label: "High" }] } },
+					{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: true, thinking: { options: [{ value: "low", label: "Low" }, { value: "high", label: "High" }] } },
 				]),
 			);
 			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
@@ -505,11 +515,11 @@ describe("mounted deferred selection intent", () => {
 				{ id: read.id, result: deferralPreferences },
 			);
 			await sessionFrame("running", []);
-			await page.waitForFunction(() => document.body.textContent?.includes("작업 중"));
+			await page.waitForFunction(() => document.body.textContent?.includes("Working"));
 			await page.click(".model-trigger");
 			await page.waitForSelector(".model-dialog");
 			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("모델"))?.click(),
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("Models"))?.click(),
 			);
 			await page.click('.model-option-hit[data-model-id="fixture/model-two"]');
 			await page.waitForSelector(".model-role-choice");
@@ -517,17 +527,17 @@ describe("mounted deferred selection intent", () => {
 				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
 			);
 			await page.click(".model-role-option");
-			await page.waitForFunction(() => document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 			// A reasoning choice made while busy must merge, not replace, the model choice.
 			await page.click(".reasoning-control .select-trigger");
 			await page.waitForSelector(".select-menu .select-option:not([disabled])");
 			await page.evaluate(() => {
 				const option = [...document.querySelectorAll<HTMLButtonElement>(".select-menu .select-option")].find(
-					item => item.textContent?.includes("높음"),
+					item => item.textContent?.includes("High"),
 				);
 				option?.click();
 			});
-			await page.waitForFunction(() => document.body.textContent?.includes("추론 수준을 작업이 끝난 뒤 적용합니다"));
+			await page.waitForFunction(() => document.querySelector(".reasoning-control .select-trigger")?.textContent?.includes("High"));
 			// A settled session that still owns queued input is not settled.
 			await sessionFrame("done", [{ id: "q1", text: "queued follow up", deliverAs: "followUp", cancelable: true }]);
 			await Bun.sleep(300);
@@ -540,7 +550,134 @@ describe("mounted deferred selection intent", () => {
 			expect(applied).toHaveLength(1);
 			expect(applied[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two", thinkingLevel: "high" });
 			await page.evaluate(({ id }) => window.fixture.response(id, true), { id: applied[0]!.id });
-			await page.waitForFunction(() => !document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+			await sessionFrame("done", []);
+			// The intent is cleared: the picker returns to the host's own model and sends nothing more.
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model One"));
+			await Bun.sleep(200);
+			expect(
+				(await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set"),
+			).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("applies a preset and a role change chosen during a run once the session settles", async () => {
+		const { context, page } = await fixture();
+		const sessionFrame = (status: DesktopSession["status"]) =>
+			page.evaluate(
+				({ status }) =>
+					window.fixture.emit({
+						type: "session",
+						session: {
+							id: "a", title: "Session A", projectId: "p", status, starred: false,
+							imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+							model: "fixture/model-one", messages: [],
+						},
+					}) as unknown as Promise<void>,
+				{ status },
+			);
+		try {
+			await page.evaluate(() =>
+				window.fixture.setModels([
+					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+				]),
+			);
+			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
+			await select(page);
+			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(
+				({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }),
+				{ id: read.id, result: profilePreferences },
+			);
+			await sessionFrame("running");
+			await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+			await page.click(".model-trigger");
+			await page.waitForSelector(".model-dialog");
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-roles");
+			await page.click('.model-option-hit[aria-label="Apply the Focused profile profile to this conversation"]');
+			await Bun.sleep(300);
+			// A preset chosen mid-run is held, not refused and not written while streaming.
+			expect(
+				(await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.apply"),
+			).toHaveLength(0);
+			await sessionFrame("done");
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
+			await Bun.sleep(200);
+			const applied = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.apply");
+			expect(applied).toHaveLength(1);
+			expect(applied[0]!.params).toEqual({
+				sessionId: "a",
+				action: { type: "profile.select", name: "focused", scope: "session" },
+			});
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a rejected deferred change restores the host value and shows the host error", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() =>
+				window.fixture.setModels([
+					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+					{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+				]),
+			);
+			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
+			await select(page);
+			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(
+				({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }),
+				{ id: read.id, result: deferralPreferences },
+			);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a", title: "Session A", projectId: "p", status: "running", starred: false,
+						imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+						model: "fixture/model-one", messages: [],
+					},
+				}),
+			);
+			await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+			await page.click(".model-trigger");
+			await page.waitForSelector(".model-dialog");
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][1]!.click());
+			await page.click('.model-option-hit[data-model-id="fixture/model-two"]');
+			await page.waitForSelector(".model-role-choice");
+			await page.waitForFunction(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
+			);
+			await page.click(".model-role-option");
+			// The chosen model stays visible while the session is still running.
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a", title: "Session A", projectId: "p", status: "done", starred: false,
+						imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+						model: "fixture/model-one", messages: [],
+					},
+				}),
+			);
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set"));
+			const write = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set").at(-1)!;
+			await page.evaluate(
+				({ id }) => window.fixture.response(id, false, "The selected model is not available."),
+				{ id: write.id },
+			);
+			// The host value returns and the refusal is visible instead of the old value looking applied.
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model One"));
+			// The fixture answers an unhandled method with its own refusal; either message proving
+			// the host answered must reach the user, so accept the rendered alert rather than one wording.
+			await page.waitForFunction(() =>
+				[...document.querySelectorAll('.model-control-status [role="alert"]')].some(node =>
+					/(not available|Unsupported fixture method)/iu.test(node.textContent ?? ""),
+				),
+			);
+			expect(
+				(await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set"),
+			).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 });
@@ -554,13 +691,13 @@ describe("mounted composer delivery recovery", () => {
 			await select(page);
 			const prompt = await send(page, "recover this payload");
 			await receipt(page, prompt, "failed");
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"] button')].some(button => button.textContent?.includes("초안 복원")));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"] button')].some(button => button.textContent?.includes("Restore draft")));
 			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [], queued: Array.from({ length: 30 }, (_, index) => ({ id: `queue-${index}`, text: `queued ${index} ${"long".repeat(100)}`, deliverAs: "followUp" as const, cancelable: true })) } }));
 			await page.waitForSelector(".queued-input:nth-child(31)");
 			const layout = await page.evaluate(() => {
 				const queue = document.querySelector<HTMLElement>(".queued-inputs")!;
 				const pane = document.querySelector<HTMLElement>(".main-pane")!;
-				const recovery = [...document.querySelectorAll<HTMLButtonElement>('[role="status"] button')].find(button => button.textContent?.includes("초안 복원"))!;
+				const recovery = [...document.querySelectorAll<HTMLButtonElement>('[role="status"] button')].find(button => button.textContent?.includes("Restore draft"))!;
 				const composer = document.querySelector<HTMLTextAreaElement>(".composer textarea")!;
 				const reachable = (element: HTMLElement) => {
 					element.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -597,8 +734,8 @@ describe("mounted composer delivery recovery", () => {
 		try {
 			await select(page); await send(page, "missing receipt payload");
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
-			expect(await page.evaluate(() => document.body.textContent?.includes("초안 복원"))).toBe(true);
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
+			expect(await page.evaluate(() => document.body.textContent?.includes("Restore draft"))).toBe(true);
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -612,8 +749,8 @@ describe("mounted composer delivery recovery", () => {
 			await waitStoredDisposition(page, request.id, "unknown");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Restore draft"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "unconfirmed bootstrap payload");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
@@ -635,7 +772,7 @@ describe("mounted composer delivery recovery", () => {
 			await waitStoredDisposition(page, request.id, "failed");
 			if (mode !== "normal") await page.reload();
 			await select(page);
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("delivery failed")));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -665,9 +802,9 @@ describe("mounted composer delivery recovery", () => {
 			await page.reload(); await select(page);
 			await waitStoredDisposition(page, "a-unknown", "pending");
 			await waitStoredDisposition(page, "b-accepted", "accepted");
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
-			expect(await page.evaluate(() => document.body.textContent?.includes("저장 복구 다시 시도"))).toBe(false);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
+			expect(await page.evaluate(() => document.body.textContent?.includes("Retry recovery"))).toBe(false);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Restore draft"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "exact uncertain payload");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(0);
 			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "delivery.ack"))).toBe(false);
@@ -704,16 +841,16 @@ describe("mounted composer delivery recovery", () => {
 			await page.reload(); await select(page);
 			await waitStoredDisposition(page, "b-missing", "unknown");
 			await waitStoredDisposition(page, "c-accepted", "accepted");
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
-			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].filter(el => el.textContent?.includes("전송 복구")).length)).toBe(1);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
+			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].filter(el => el.textContent?.includes("Delivery recovery:")).length)).toBe(1);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Restore draft"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "exact missing payload");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(0);
 			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === "c-accepted"))).toBe(false);
 			await select(page, 1);
-			await page.waitForFunction(() => document.body.textContent?.includes("저장 복구 다시 시도"));
-			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복구 항목 버리기"))?.disabled)).toBe(true);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("저장 복구 다시 시도"))?.click());
+			await page.waitForFunction(() => document.body.textContent?.includes("Retry recovery"));
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard recovery record"))?.disabled)).toBe(true);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Retry recovery"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "refused payload");
 			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === "a-refused"));
 			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "delivery.ack" && (r.params.deliveryId === "b-missing" || r.params.deliveryId === "c-accepted")))).toBe(false);
@@ -772,11 +909,11 @@ describe("mounted composer delivery recovery", () => {
 			await page.type(".composer textarea", "repair twice");
 			await page.evaluate(() => window.fixture.failPostHandoffDraftSave(2));
 			await page.click('.composer button[type="submit"]');
-			await page.waitForFunction(() => document.body.textContent?.includes("저장 복구 다시 시도"));
-			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복구 항목 버리기"))?.disabled)).toBe(true);
+			await page.waitForFunction(() => document.body.textContent?.includes("Retry recovery"));
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard recovery record"))?.disabled)).toBe(true);
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(0);
 			expect(await page.$eval('.composer button[type="submit"]', (el: HTMLButtonElement) => el.disabled)).toBe(true);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("저장 복구 다시 시도"))?.click());
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Retry recovery"))?.click());
 			await page.waitForFunction(() => !(document.querySelector('.composer button[type="submit"]') as HTMLButtonElement).disabled);
 			await page.click('.composer button[type="submit"]');
 			await page.waitForFunction(() => window.fixture.lastPrompt());
@@ -794,18 +931,18 @@ describe("mounted composer delivery recovery", () => {
 			await page.type(".composer textarea", "unsent second");
 			await page.evaluate(() => window.fixture.failPostHandoffDraftSave(2));
 			await page.click('.composer button[type="submit"]');
-			await page.waitForFunction(() => document.body.textContent?.includes("저장 복구 다시 시도"));
+			await page.waitForFunction(() => document.body.textContent?.includes("Retry recovery"));
 			const panels = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')]
-				.filter(el => el.textContent?.includes("전송 복구"))
-				.map(el => ({ text: el.textContent ?? "", repairs: [...el.querySelectorAll("button")].filter(button => button.textContent?.includes("저장 복구 다시 시도")).length })));
+				.filter(el => el.textContent?.includes("Delivery recovery:"))
+				.map(el => ({ text: el.textContent ?? "", repairs: [...el.querySelectorAll("button")].filter(button => button.textContent?.includes("Retry recovery")).length })));
 			expect(panels).toHaveLength(1);
 			expect(panels[0]?.repairs).toBe(1);
-			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복구 항목 버리기"))?.disabled)).toBe(true);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("저장 복구 다시 시도"))?.click());
-			await page.waitForFunction(() => !document.body.textContent?.includes("저장 복구 다시 시도"));
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard recovery record"))?.disabled)).toBe(true);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Retry recovery"))?.click());
+			await page.waitForFunction(() => !document.body.textContent?.includes("Retry recovery"));
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("unsent second");
 			expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), first.id)).toBe(false);
-			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 복구")))).toBe(false);
+			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("Delivery recovery:")))).toBe(false);
 			await waitStoredDisposition(page, first.id, "accepted");
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -846,12 +983,12 @@ describe("mounted composer delivery recovery", () => {
 			try {
 				await select(page); const request = await send(page, "do not replay");
 				await page.evaluate(({ id, disposition }) => window.fixture.response(id, false, "same error", disposition), { id: request.id, disposition });
-				await page.waitForFunction(copy => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes(copy)), {}, disposition === "failed" ? "전송 처리에 실패했습니다" : "전송 결과를 확인할 수 없습니다");
+				await page.waitForFunction(copy => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes(copy)), {}, disposition === "failed" ? "delivery failed" : "the outcome is unknown");
 				expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("");
-				const panel = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].find(el => el.textContent?.includes("전송 복구"))?.textContent ?? "");
-				expect(panel).toContain("이미 실행되었을 수 있습니다");
-				expect(panel).toContain("초안 복원");
-				expect(panel).toContain(disposition === "failed" ? "복구 항목 버리기" : "자동으로 다시 보내지 않습니다");
+				const panel = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].find(el => el.textContent?.includes("Delivery recovery:"))?.textContent ?? "");
+				expect(panel).toContain(disposition === "failed" ? "Some work may already have run." : "It may already have run.");
+				expect(panel).toContain("Restore draft");
+				expect(panel).toContain(disposition === "failed" ? "Discard recovery record" : "Restoring the draft will not resend it automatically");
 			} finally { await closeFixture(context, page); }
 		}
 	}, 30000);
@@ -863,7 +1000,7 @@ describe("mounted composer delivery recovery", () => {
 			for (const disposition of ["pending", "accepted", "queued"] as const) {
 				await receipt(page, request, disposition);
 				await waitStoredDisposition(page, request.id, disposition);
-				expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 복구")))).toBe(false);
+				expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("Delivery recovery:")))).toBe(false);
 				expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), request.id)).toBe(false);
 			}
 			await receipt(page, request, "completed");
@@ -888,10 +1025,10 @@ describe("mounted composer delivery recovery", () => {
 			await page.waitForFunction(() => !(document.querySelector('.composer button[type="submit"]') as HTMLButtonElement).disabled);
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await waitStoredDisposition(page, request.id, "unknown");
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
 			expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), request.id)).toBe(false);
 			await page.evaluate(() => window.fixture.failNextAck("error"));
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Restore draft"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "queued disconnect payload\n\nnewer draft");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
@@ -903,9 +1040,9 @@ describe("mounted composer delivery recovery", () => {
 			await select(page); const first = await send(page, "ack failure payload");
 			await page.evaluate(() => window.fixture.failNextAck("error"));
 			await receipt(page, first, "removed");
-			await page.waitForFunction(() => document.body.textContent?.includes("전송 확인 오류"));
+			await page.waitForFunction(() => document.body.textContent?.includes("Delivery acknowledgement error"));
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "ack failure payload");
-			expect(await page.evaluate(() => document.body.textContent?.includes("저장 복구 다시 시도"))).toBe(false);
+			expect(await page.evaluate(() => document.body.textContent?.includes("Retry recovery"))).toBe(false);
 			await page.evaluate((id: string) => window.fixture.response(id, true), first.id);
 			await page.waitForFunction(() => !(document.querySelector('.composer button[type="submit"]') as HTMLButtonElement).disabled);
 			await page.click('.composer button[type="submit"]');
@@ -931,15 +1068,15 @@ describe("mounted composer delivery recovery", () => {
 				expect(next?.params.attachments).toHaveLength(1);
 				if (!next) throw new Error("Second prompt was not recorded");
 				await receipt(page, next, "failed");
-				await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
+				await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("delivery failed")));
 			}
 			await receipt(page, request, "accepted");
 			await page.reload(); await select(page);
 			await page.waitForFunction(() => window.fixture.requests().filter(r => r.method === "delivery.ack").length >= 2);
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe(mode === "lost" ? "" : "restore once");
 			if (mode === "lost") {
-				await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
-				await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+				await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("delivery failed")));
+				await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Restore draft"))?.click());
 				await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "restore once newer");
 				expect(await page.$$(".attachment-ready")).toHaveLength(1);
 			}
@@ -960,7 +1097,7 @@ describe("mounted composer delivery recovery", () => {
 			await page.waitForFunction(() => [...document.querySelectorAll('.error-banner')].filter(el => el.textContent?.includes('same error')).length === 2);
 			await page.evaluate((id: string) => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "error", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [], error: "same error", errorOwner: id } }), request.id);
 			await page.waitForFunction(() => [...document.querySelectorAll('.error-banner')].filter(el => el.textContent?.includes('same error')).length === 1);
-			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('.desktop-sidebar button')].find(button => button.textContent?.trim() === '설정')?.click());
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('.desktop-sidebar button')].find(button => button.textContent?.trim() === 'Settings')?.click());
 			await page.waitForSelector('dialog[open]');
 			expect(await page.evaluate(() => [...document.querySelectorAll('.error-banner')].filter(el => el.textContent?.includes('same error')).length)).toBe(1);
 		} finally { await closeFixture(context, page); }
@@ -971,11 +1108,11 @@ describe("mounted composer delivery recovery", () => {
 		try {
 			await select(page); const request = await send(page, "uncertain"); await receipt(page, request, "accepted");
 			await receipt(page, request, "failed");
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("delivery failed")));
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("");
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("delivery failed")));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -1000,13 +1137,13 @@ describe("mounted composer delivery recovery", () => {
 			await select(page); await send(page, "unknown disposable");
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
-			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복원한 기록 지우기"))?.disabled)).toBe(true);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard restored record"))?.disabled)).toBe(true);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Restore draft"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "unknown disposable");
-			await page.waitForFunction(() => ![...document.querySelectorAll("button")].find(button => button.textContent?.includes("복원한 기록 지우기"))?.disabled);
-			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복원한 기록 지우기"))?.click());
-			await page.waitForFunction(() => !document.body.textContent?.includes("전송 복구"));
+			await page.waitForFunction(() => ![...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard restored record"))?.disabled);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard restored record"))?.click());
+			await page.waitForFunction(() => !document.body.textContent?.includes("Delivery recovery:"));
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("unknown disposable");
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -1017,7 +1154,7 @@ describe("mounted composer delivery recovery", () => {
 			await select(page); await send(page, "unknown payload");
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);

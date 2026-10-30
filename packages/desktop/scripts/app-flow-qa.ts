@@ -9,8 +9,9 @@
 // a free port 1420, and no other Vite server on it. Scenarios share one created
 // conversation and therefore run in the listed order; naming scenarios runs only
 // the independent ones (boot, new-session, send-turn, abort-turn, queue-steer,
-// model-picker, reasoning-level, command-search-slash, settings-controls,
-// export-message, attachment, side-chat, operator-shell, session-info).
+// model-picker, reasoning-level, deferred-model-change, command-search-slash,
+// settings-controls, export-message, attachment, side-chat, operator-shell,
+// session-info).
 // Writes artifacts/app-flow-qa/receipt.json plus failure screenshots.
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -111,6 +112,8 @@ async function launchHost(): Promise<Bootstrap> {
 	}
 }
 const pageErrors: string[] = [];
+/** model.set params the App wrote to the host, captured from the bridge POST /request envelopes. */
+const modelSetWrites: { modelId?: string }[] = [];
 
 async function text(): Promise<string> {
 	return page.evaluate(() => document.body.innerText);
@@ -133,7 +136,7 @@ async function status(): Promise<string> {
 	return page.evaluate(() => document.querySelector(".session-status")?.textContent?.trim() ?? "");
 }
 async function idle() {
-	await waitFor(async () => (await status()).includes("대기"), "idle session status");
+	await waitFor(async () => (await status()).includes("Idle"), "idle session status");
 }
 /** Click the last element whose trimmed text equals the label. */
 async function clickText(label: string) {
@@ -148,6 +151,19 @@ async function clickText(label: string) {
 	expect(clicked, `no clickable element labelled ${JSON.stringify(label)}`);
 	await Bun.sleep(120);
 }
+/** Click a role option in the model picker's role step by its visible label. */
+async function clickRole(label: string) {
+	const clicked = await page.evaluate(target => {
+		const option = [...document.querySelectorAll<HTMLButtonElement>(".model-role-choice .model-role-option")].find(
+			node => !node.disabled && (node.textContent ?? "").trim().startsWith(target),
+		);
+		if (!option) return false;
+		option.click();
+		return true;
+	}, label);
+	expect(clicked, `no role option labelled ${JSON.stringify(label)}`);
+	await Bun.sleep(120);
+}
 async function composerValue(): Promise<string> {
 	return page.evaluate(
 		() => (document.querySelector(".composer textarea") as HTMLTextAreaElement | null)?.value ?? "",
@@ -160,7 +176,7 @@ async function typeComposer(value: string) {
 	await (field as NonNullable<typeof field>).type(value);
 }
 async function send() {
-	await clickText("보내기");
+	await clickText("Send");
 }
 async function hold() {
 	await page.evaluate(() => (window as never as { __qaFixture: { hold(): Promise<unknown> } }).__qaFixture.hold());
@@ -191,7 +207,9 @@ async function selectSession(title: string) {
 	await Bun.sleep(200);
 }
 async function openMenu() {
-	await page.evaluate(() => (document.querySelector('[aria-label="대화 작업 메뉴"]') as HTMLElement).click());
+	await page.evaluate(() =>
+		(document.querySelector('[aria-label="Conversation actions menu"]') as HTMLElement).click(),
+	);
 	await page.waitForSelector(".modal", { timeout: 8000 });
 }
 async function openMenuAction(label: string) {
@@ -206,7 +224,7 @@ async function openMenuAction(label: string) {
 	await Bun.sleep(600);
 }
 async function openPalette() {
-	await clickText("명령");
+	await clickText("Commands");
 	await page.waitForSelector("#command-search", { timeout: 8000 });
 	await Bun.sleep(300);
 }
@@ -224,7 +242,7 @@ let workspace = "";
 /** Create one conversation through the sidebar and return its title. */
 async function createSession(): Promise<string> {
 	const before = await sessionRows();
-	await page.evaluate(() => (document.querySelector('[aria-label$="새 대화"]') as HTMLElement).click());
+	await page.evaluate(() => (document.querySelector('[aria-label^="New conversation in"]') as HTMLElement).click());
 	await waitFor(async () => (await sessionRows()).length > before.length, "new session row");
 	const created = (await sessionRows()).find(title => !before.includes(title));
 	expect(created, "created session is not listed");
@@ -256,7 +274,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		async run() {
 			await ensureWorkspace();
 			expect((await sessionRows()).includes(workspace), "created session is not listed");
-			expect((await status()).includes("대기"), `new session is not idle: ${await status()}`);
+			expect((await status()).includes("Idle"), `new session is not idle: ${await status()}`);
 			const header = await page.evaluate(() => document.querySelector(".toolbar-title h1")?.textContent ?? "");
 			expect(header === workspace, `toolbar does not show the created session: ${header}`);
 		},
@@ -269,7 +287,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			const before = (await fixture()).requests.length;
 			await typeComposer("flow-qa hello");
 			await send();
-			await waitFor(async () => (await status()).includes("작업 중"), "running status");
+			await waitFor(async () => (await status()).includes("Working"), "running status");
 			// The transcript owns the message; the composer must not invite a resend.
 			expect((await composerValue()) === "", "submitted draft stayed in the composer");
 			await waitFor(async () => (await fixture()).requests.length > before, "fixture request");
@@ -289,9 +307,9 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await hold();
 			await typeComposer("flow-qa abort");
 			await send();
-			await waitFor(async () => (await status()).includes("작업 중"), "running status");
+			await waitFor(async () => (await status()).includes("Working"), "running status");
 			await waitText("Fixture turn");
-			await clickText("작업 중지");
+			await clickText("Stop");
 			await idle();
 			await waitFor(
 				async () => (await fixture()).requests.at(-1)!.state === "aborted",
@@ -308,11 +326,11 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await hold();
 			await typeComposer("flow-qa first turn");
 			await send();
-			await waitFor(async () => (await status()).includes("작업 중"), "running status");
+			await waitFor(async () => (await status()).includes("Working"), "running status");
 			const held = (await fixture()).requests.at(-1)!;
 			await typeComposer("flow-qa queued turn");
-			await clickText("대기열에 추가");
-			await waitText("대기열 1건");
+			await clickText("Add to queue");
+			await waitText("1 queued");
 			expect((await composerValue()) === "", "queued draft stayed in the composer");
 			await release(held.id);
 			await waitFor(
@@ -338,7 +356,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await page.waitForSelector(".model-dialog", { timeout: 8000 });
 			await page.evaluate(() =>
 				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")]
-					.find(tab => tab.textContent?.includes("모델"))
+					.find(tab => tab.textContent?.includes("Models"))
 					?.click(),
 			);
 			await page.waitForSelector(".model-result-list .model-option-hit", { timeout: 8000 });
@@ -354,7 +372,10 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 				nodes.map(node => (node.textContent ?? "").trim()),
 			);
 			expect(filtered.length === 1 && filtered[0]!.includes("qa-plain"), `search filter wrong: ${filtered}`);
+			// The model row only records the choice; the role step dispatches it.
 			await page.click(".model-option-hit");
+			await page.waitForSelector(".model-role-choice", { timeout: 8000 });
+			await clickRole("Default");
 			await waitFor(
 				async () =>
 					!(await page.evaluate(() => Boolean(document.querySelector(".model-dialog")))) &&
@@ -374,11 +395,15 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await page.waitForSelector(".model-dialog", { timeout: 8000 });
 			await page.evaluate(() =>
 				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")]
-					.find(tab => tab.textContent?.includes("모델"))
+					.find(tab => tab.textContent?.includes("Models"))
 					?.click(),
 			);
 			await page.waitForSelector(".model-result-list .model-option-hit", { timeout: 8000 });
-			await page.click(".model-result-list li:first-child .model-option-hit");
+			// Target the intended model by id: ordering depends on the default selected earlier.
+			await page.waitForSelector('.model-option-hit[data-model-id$="/qa-reasoning"]', { timeout: 8000 });
+			await page.click('.model-option-hit[data-model-id$="/qa-reasoning"]');
+			await page.waitForSelector(".model-role-choice", { timeout: 8000 });
+			await clickRole("Default");
 			await waitFor(
 				async () => (await text()).includes("qa-reasoning") && !(await page.$(".model-dialog")),
 				"reasoning model selected",
@@ -389,13 +414,13 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await page.waitForSelector(".select-menu .select-option:not([disabled])", { timeout: 8000 });
 			await page.evaluate(() => {
 				const option = [...document.querySelectorAll<HTMLButtonElement>(".select-menu .select-option")].find(item =>
-					/high|높음/iu.test(item.textContent ?? ""),
+					/high/iu.test(item.textContent ?? ""),
 				);
 				option?.click();
 			});
 			await waitFor(
 				async () =>
-					/high|높음/iu.test(
+					/high/iu.test(
 						await page.$eval(".reasoning-control .select-trigger", element => element.textContent ?? ""),
 					),
 				"reasoning level applied",
@@ -405,6 +430,74 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 				request.body.reasoning_effort === "high",
 				`reasoning effort not applied: ${request.body.reasoning_effort}`,
 			);
+		},
+	},
+	{
+		name: "deferred-model-change",
+		// The picker defers a model change while a turn runs; the write must land exactly once, after idle.
+		async run() {
+			await ensureWorkspace();
+			await hold();
+			const requests = (await fixture()).requests.length;
+			await typeComposer("flow-qa deferred model");
+			await send();
+			await waitFor(async () => (await status()).includes("Working"), "running status");
+			await waitFor(async () => (await fixture()).requests.length > requests, "fixture request");
+			const held = (await fixture()).requests.at(-1)!;
+			expect(held.state === "held", `fixture request not held: ${held.state}`);
+			const writesBefore = modelSetWrites.length;
+			await page.waitForSelector(".model-trigger", { timeout: 10000 });
+			await page.evaluate(() => (document.querySelector(".model-trigger") as HTMLElement).click());
+			await page.waitForSelector(".model-dialog", { timeout: 8000 });
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")]
+					.find(tab => tab.textContent?.includes("Models"))
+					?.click(),
+			);
+			await page.waitForSelector(".model-result-list .model-option-hit", { timeout: 8000 });
+			const current = await page.evaluate(() => {
+				const selected = document.querySelector(
+					".model-option[aria-current] .model-option-hit",
+				) as HTMLElement | null;
+				return selected?.dataset.modelId ?? "";
+			});
+			const chosen = await page.evaluate(selected => {
+				const option = [...document.querySelectorAll<HTMLElement>(".model-option-hit")].find(
+					node => node.dataset.modelId !== selected,
+				);
+				if (!option) return null;
+				const name = (option.querySelector("strong")?.textContent ?? "").trim();
+				return { id: option.dataset.modelId ?? "", name };
+			}, current);
+			expect(chosen, "no other fixture model to defer");
+			expect(chosen.id && chosen.name, "fixture model row has no id or name");
+			await page.click(`.model-option-hit[data-model-id="${chosen.id}"]`);
+			await page.waitForSelector(".model-role-choice", { timeout: 8000 });
+			expect(
+				modelSetWrites.length === writesBefore,
+				`model row click wrote to the host: ${JSON.stringify(modelSetWrites.slice(writesBefore))}`,
+			);
+			await clickRole("Default");
+			await waitFor(
+				async () => !(await page.evaluate(() => Boolean(document.querySelector(".model-dialog")))),
+				"model dialog close",
+			);
+			const trigger = await page.$eval(".model-trigger", node => (node.textContent ?? "").trim());
+			expect(trigger.includes(chosen.name), `deferred model not shown: ${trigger}`);
+			// The turn is still held: the deferred choice must stay out of the host.
+			await Bun.sleep(500);
+			expect(
+				modelSetWrites.length === writesBefore,
+				`model change was written during the run: ${JSON.stringify(modelSetWrites.slice(writesBefore))}`,
+			);
+			await release(held.id);
+			await waitFor(async () => (await fixture()).requests.at(-1)!.state === "completed", "turn completion");
+			await idle();
+			await waitFor(async () => modelSetWrites.length > writesBefore, "deferred model write");
+			await Bun.sleep(300);
+			const dispatched = modelSetWrites.slice(writesBefore);
+			expect(dispatched.length === 1, `expected one model change after the run, saw ${dispatched.length}`);
+			expect(dispatched[0]!.modelId === chosen.id, `deferred model change wrote ${JSON.stringify(dispatched[0])}`);
 		},
 	},
 	{
@@ -433,7 +526,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await ensureWorkspace();
 			await page.evaluate(() => {
 				const button = [...document.querySelectorAll("button")].find(
-					node => (node.textContent ?? "").trim() === "설정",
+					node => (node.textContent ?? "").trim() === "Settings",
 				);
 				if (!button) throw new Error("settings button missing");
 				(button as HTMLElement).click();
@@ -468,7 +561,8 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			});
 			expect(toggled !== null, "startup.networkPrewarm checkbox missing");
 			await waitFor(
-				async () => (await page.$eval(".modal", node => (node as HTMLElement).innerText)).includes("저장했습니다"),
+				async () =>
+					(await page.$eval(".modal", node => (node as HTMLElement).innerText)).includes("Settings saved"),
 				"settings save",
 				15000,
 			);
@@ -476,7 +570,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await Bun.sleep(400);
 			await page.evaluate(() => {
 				const button = [...document.querySelectorAll("button")].find(
-					node => (node.textContent ?? "").trim() === "설정",
+					node => (node.textContent ?? "").trim() === "Settings",
 				);
 				(button as HTMLElement).click();
 			});
@@ -499,13 +593,13 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await openPalette();
 			await page.evaluate(() => {
 				const entry = [...document.querySelectorAll(".modal .command-list button")].find(node =>
-					(node.textContent ?? "").includes("대화 내보내기"),
+					(node.textContent ?? "").includes("Export conversation"),
 				);
 				if (!entry) throw new Error("export command missing");
 				(entry as HTMLElement).click();
 			});
 			await page.waitForSelector(".modal h2", { timeout: 15000 });
-			await waitText("내보냈습니다", 15000);
+			await waitText("Exported the conversation", 15000);
 			const body = await page.evaluate(
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);
@@ -537,12 +631,12 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "side-chat",
 		async run() {
 			await ensureWorkspace();
-			await openMenuAction("별도 대화");
+			await openMenuAction("Side chat");
 			await page.waitForSelector(".modal textarea", { timeout: 8000 });
 			const field = await page.$(".modal textarea");
 			await (field as NonNullable<typeof field>).type("flow-qa side question");
-			await clickText("곁대화 보내기");
-			await waitText("응답 완료", 20000);
+			await clickText("Send side chat");
+			await waitText("Responded", 20000);
 			const body = await page.evaluate(
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);
@@ -554,11 +648,11 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "operator-shell",
 		async run() {
 			await ensureWorkspace();
-			await openMenuAction("직접 실행");
+			await openMenuAction("Direct execution");
 			await page.waitForSelector(".modal textarea", { timeout: 8000 });
 			const field = await page.$(".modal textarea");
 			await (field as NonNullable<typeof field>).type("!echo flow-qa-operator");
-			await clickText("실행");
+			await clickText("Run");
 			await waitText("flow-qa-operator", 20000);
 			const output = await page.evaluate(() =>
 				[...document.querySelectorAll(".modal pre")].map(node => node.textContent ?? "").join("\n"),
@@ -571,8 +665,8 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "session-info",
 		async run() {
 			await ensureWorkspace();
-			await openMenuAction("세션 정보");
-			await waitText("세션 정보 새로고침", 10000);
+			await openMenuAction("Session info");
+			await waitText("Refresh session information", 10000);
 			const body = await page.evaluate(
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);
@@ -584,7 +678,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			);
 			// A session with a transcript file is file-backed, so the state is not a union.
 			expect(
-				/기록 저장 설정\s*켜짐/u.test(body),
+				/Transcript persistence\s*On/u.test(body),
 				`session info does not report a persisted transcript: ${body.slice(0, 300)}`,
 			);
 			await closeDialog();
@@ -594,7 +688,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "fork",
 		async run() {
 			await ensureWorkspace();
-			await openMenuAction("대화 분기");
+			await openMenuAction("Fork conversation");
 			await page.waitForSelector(".modal select", { timeout: 10000 });
 			const option = await page.evaluate(() => {
 				const select = document.querySelector(".modal select") as HTMLSelectElement | null;
@@ -607,7 +701,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			const before = await sessionRows();
 			await page.evaluate(() => {
 				const action = [...document.querySelectorAll(".modal button")].find(node =>
-					(node.textContent ?? "").includes("선택한 메시지 직전에서 분기"),
+					(node.textContent ?? "").includes("Fork before the selected message"),
 				);
 				if (!action) throw new Error("fork action missing");
 				(action as HTMLElement).click();
@@ -632,8 +726,8 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			const others = (await sessionRows()).filter(title => title !== victim);
 			expect(others.length > 0, "no other session to verify the removal against");
 			await selectSession(victim);
-			await openMenuAction("대화 삭제");
-			await clickText("대화 삭제");
+			await openMenuAction("Delete conversation");
+			await clickText("Delete conversation");
 			await waitFor(async () => !(await sessionRows()).includes(victim), "session removal");
 			const remaining = await sessionRows();
 			for (const title of others) expect(remaining.includes(title), `deleting one session removed ${title}`);
@@ -668,6 +762,19 @@ try {
 	page.on("pageerror", error => pageErrors.push(String(error)));
 	page.on("console", message => {
 		if (message.type() === "error") pageErrors.push(`console: ${message.text()}`);
+	});
+	page.on("request", request => {
+		if (request.method() !== "POST") return;
+		if (!new URL(request.url()).pathname.endsWith("/request")) return;
+		try {
+			const body = request.postData();
+			if (!body) return;
+			const envelope = JSON.parse(body) as { method?: unknown; params?: unknown };
+			if (envelope.method !== "model.set" || !envelope.params || typeof envelope.params !== "object") return;
+			modelSetWrites.push(envelope.params as { modelId?: string });
+		} catch {
+			// Not a JSON envelope: only host requests carry a method.
+		}
 	});
 	const source = await (await fetch(bootstrap.bootstrapUrl)).text();
 	await page.evaluateOnNewDocument(source);

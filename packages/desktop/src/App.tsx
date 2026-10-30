@@ -53,6 +53,7 @@ import type {
 	DesktopSession,
 	DesktopSetting,
 	DesktopSnapshot,
+	DesktopThinkingLevel,
 } from "../../desktop-host/src/protocol";
 import type { DesktopSessionInfo } from "../../desktop-host/src/session-info-protocol";
 import { ActivityPanel } from "./ActivityPanel";
@@ -63,6 +64,7 @@ import {
 	desktopClipboardImageFiles,
 	readyDesktopAttachments,
 } from "./AttachmentPicker";
+import gajaeMark from "./assets/gajae-mark.png";
 import { BtwDialog } from "./BtwDialog";
 import { DesktopRequestError, request, selectProject, subscribe, validateDesktopRequest } from "./bridge";
 import { matchesSlashFilter } from "./command-search";
@@ -80,6 +82,7 @@ import {
 } from "./delivery-recovery";
 import { ForkPanel } from "./ForkPanel";
 import { GateDialog } from "./GateDialog";
+import { t, useLocale } from "./i18n";
 import { McpPanel } from "./McpPanel";
 import { ModelPicker } from "./ModelPicker";
 import { OAuthSettings } from "./OAuthSettings";
@@ -124,11 +127,15 @@ interface GateView {
 	retiring?: { nonce: string };
 }
 const textOf = (value: unknown) =>
-	typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "결과 없음");
+	typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? t("shell.noResult"));
 const isFinalDelivery = (disposition: DesktopDeliveryReceipt["disposition"]) =>
 	["completed", "cancelled", "refused", "removed", "failed"].includes(disposition);
+/** The host accepts a selection or preference write once the session is no longer live. */
+const isSettled = (session: DesktopSession) =>
+	!["running", "waiting"].includes(session.status) && !session.operatorRunning && (session.queued?.length ?? 0) === 0;
 
 export default function App() {
+	useLocale();
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
 	const [selected, setSelected] = useState("");
 	const selectedRef = useRef(selected);
@@ -189,7 +196,7 @@ export default function App() {
 	const [theme, setTheme] = useState<DesktopThemeId>(readThemePreference);
 	const [modelCatalogRevision, setModelCatalogRevision] = useState(0);
 	const refreshModelCatalog = useRef(false);
-	const [connection, setConnection] = useState("호스트에 연결하는 중…");
+	const [connection, setConnection] = useState(t("shell.connecting"));
 	const [fatal, setFatal] = useState(false);
 	const [errors, setErrors] = useState<Record<string, string>>({});
 	const [errorOwners, setErrorOwners] = useState<Record<string, { requestId: string; sessionId: string }>>({});
@@ -308,7 +315,9 @@ export default function App() {
 		recoveryWork.current = recoveryWork.current.then(work).catch(error => {
 			setErrors(previous => ({
 				...previous,
-				global: `복구 저장소 오류: ${error instanceof Error ? error.message : String(error)}`,
+				global: t("shell.recoveryStorageError", {
+					detail: error instanceof Error ? error.message : String(error),
+				}),
 			}));
 		});
 	}, []);
@@ -358,7 +367,7 @@ export default function App() {
 			ackFlights.current.add(entry.id);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const timeout = Promise.withResolvers<never>();
-			timer = setTimeout(() => timeout.reject(new Error("전송 확인 응답 시간이 초과되었습니다.")), 5000);
+			timer = setTimeout(() => timeout.reject(new Error(t("shell.deliveryAckTimeout"))), 5000);
 			void Promise.race([request("delivery.ack", { deliveryId: entry.id }), timeout.promise])
 				.then(() => {
 					enqueueRecovery(async () => {
@@ -371,7 +380,9 @@ export default function App() {
 				.catch(error => {
 					setErrors(previous => ({
 						...previous,
-						global: `전송 확인 오류: ${error instanceof Error ? error.message : String(error)}`,
+						global: t("shell.deliveryAckError", {
+							detail: error instanceof Error ? error.message : String(error),
+						}),
 					}));
 				})
 				.finally(() => {
@@ -553,7 +564,7 @@ export default function App() {
 		} catch {
 			setErrors(previous => ({
 				...previous,
-				global: "초안을 기기에 저장하지 못했습니다. 종료 전 필요한 내용을 복사하세요.",
+				global: t("shell.draftSaveFailed"),
 			}));
 		}
 	}, [drafts]);
@@ -573,7 +584,9 @@ export default function App() {
 			} catch (error) {
 				setErrors(previous => ({
 					...previous,
-					global: `복구 저장소 오류: ${error instanceof Error ? error.message : String(error)}`,
+					global: t("shell.recoveryStorageError", {
+						detail: error instanceof Error ? error.message : String(error),
+					}),
 				}));
 			}
 		};
@@ -720,7 +733,7 @@ export default function App() {
 					if (!failed && !bootstrapped) settleFailedBootstrap();
 					failed = true;
 					setFatal(true);
-					setConnection(error instanceof Error ? error.message : "호스트 연결 실패");
+					setConnection(error instanceof Error ? error.message : t("shell.hostConnectionFailed"));
 				}
 			}
 		})();
@@ -741,7 +754,7 @@ export default function App() {
 				if (alive)
 					setErrors(previous => ({
 						...previous,
-						[`activity:${selected}`]: error instanceof Error ? error.message : "활동 정보를 불러오지 못했습니다.",
+						[`activity:${selected}`]: error instanceof Error ? error.message : t("shell.activityLoadFailed"),
 					}));
 			});
 		return () => {
@@ -777,7 +790,7 @@ export default function App() {
 						generation: modelGeneration,
 						models: [],
 						loading: false,
-						error: error instanceof Error ? error.message : "모델 목록을 불러오지 못했습니다.",
+						error: error instanceof Error ? error.message : t("shell.modelsLoadFailed"),
 					});
 			});
 		return () => {
@@ -830,7 +843,8 @@ export default function App() {
 	const [deferredSelection, setDeferredSelection] = useState<{
 		ownerKey: string;
 		modelId?: string;
-		thinkingLevel?: string;
+		thinkingLevel?: DesktopThinkingLevel;
+		preference?: DesktopPreferenceAction;
 	} | null>(null);
 	const run = useCallback(async (scope: string, action: () => Promise<void>) => {
 		if (locks.current.has(scope)) return;
@@ -854,10 +868,10 @@ export default function App() {
 			setErrors(previous => ({
 				...previous,
 				[scope]: scope.startsWith("auth:")
-					? "API 키 요청을 완료하지 못했습니다. 저장 여부를 확인한 뒤 다시 시도하세요."
+					? t("shell.apiKeyRequestFailed")
 					: error instanceof Error
 						? error.message
-						: "요청에 실패했습니다.",
+						: t("shell.requestFailed"),
 			}));
 		} finally {
 			locks.current.delete(scope);
@@ -873,31 +887,41 @@ export default function App() {
 		if (!session) return;
 		if (`${session.id}:${session.controlGeneration}` !== target.ownerKey) {
 			setDeferredSelection(null);
-			setNotice("대화 상태가 바뀌어 선택한 모델 설정을 적용하지 않았습니다.");
+			setNotice(t("shell.deferredOwnerChanged"));
 			return;
 		}
-		const settled =
-			!["running", "waiting", "error"].includes(session.status) &&
-			!session.operatorRunning &&
-			(session.queued?.length ?? 0) === 0;
-		if (!settled) return;
-		const scope = target.modelId === undefined ? `thinking:${target.ownerKey}` : `model:${target.ownerKey}`;
+		if (!isSettled(session)) return;
+		const scope = `selection:${target.ownerKey}`;
 		// Another request owns the scope; keep the intent so it retries when the scope frees.
 		if (locks.current.has(scope) || pending[scope]) return;
 		const sessionId = session.id;
-		const { modelId, thinkingLevel } = target;
+		const { modelId, thinkingLevel, preference } = target;
 		// A level only merges into model.set when the target model declares it, so an
 		// incompatible or inherited level cannot reject the model change wholesale.
 		const targetModel = modelId === undefined ? undefined : modelCatalog.models.find(item => item.id === modelId);
-		const merged =
+		const declaresLevel =
 			thinkingLevel !== undefined &&
-			targetModel?.thinking.options.some(option => option.value === thinkingLevel) === true
-				? thinkingLevel
-				: undefined;
+			targetModel?.thinking.options.some(option => option.value === thinkingLevel) === true;
+		const merged = modelId !== undefined && thinkingLevel !== undefined && declaresLevel ? thinkingLevel : undefined;
 		const followUp =
 			modelId !== undefined && thinkingLevel !== undefined && merged === undefined ? thinkingLevel : undefined;
-		setDeferredSelection(null);
 		void run(scope, async () => {
+			// A profile or role change lands first so an explicit model choice is not
+			// overwritten by the mapping the profile reintroduces.
+			if (preference !== undefined) {
+				const outcome = await request<DesktopPreferenceResult>("preferences.apply", {
+					sessionId,
+					action: preference,
+				});
+				if (modelOwnerRef.current === target.ownerKey) {
+					setModelCatalogRevision(value => value + 1);
+					setPreferences(previous =>
+						previous?.sessionId === sessionId && previous.owner === target.ownerKey
+							? { ...previous, value: outcome.preferences }
+							: previous,
+					);
+				}
+			}
 			if (modelId !== undefined)
 				await request("model.set", { sessionId, modelId, ...(merged ? { thinkingLevel: merged } : {}) });
 			else if (thinkingLevel !== undefined) {
@@ -907,6 +931,10 @@ export default function App() {
 			// The model change is committed first; a level it does not declare is offered
 			// to the host afterwards so the real reason surfaces instead of being dropped.
 			if (followUp !== undefined) await request("thinking.set", { sessionId, level: followUp });
+		}).finally(() => {
+			// The optimistic value stays visible until the host answers; then the host value
+			// takes over, and a rejection leaves its error on this same scope.
+			setDeferredSelection(current => (current === target ? null : current));
 		});
 	}, [deferredSelection, session, pending]);
 	const call = (method: DesktopMethod, params: Record<string, unknown> = {}, scope = selected || "global") =>
@@ -949,7 +977,7 @@ export default function App() {
 			const values = await request<DesktopSetting[]>("settings.get", sessionId ? { sessionId } : {});
 			if (dialogGeneration.current === generation) {
 				setSettings(values);
-				setNotice("설정을 저장했습니다.");
+				setNotice(t("shell.settingsSaved"));
 			}
 		});
 	};
@@ -958,7 +986,7 @@ export default function App() {
 		const generation = dialogGeneration.current;
 		void run(toolsScope, async () => {
 			await request("tools.set", { sessionId, names: activeTools });
-			if (dialogGeneration.current === generation) setNotice("활성 도구를 저장했습니다.");
+			if (dialogGeneration.current === generation) setNotice(t("shell.toolsSaved"));
 		});
 	};
 	const openBtw = (question = "", composerText?: string) => {
@@ -977,7 +1005,7 @@ export default function App() {
 			if (ownedAttachments.length) {
 				setErrors(previous => ({
 					...previous,
-					[sessionId]: "별도 대화는 텍스트만 지원합니다. 첨부 파일을 제거한 뒤 다시 보내세요.",
+					[sessionId]: t("shell.sideChatTextOnly"),
 				}));
 				return;
 			}
@@ -1067,7 +1095,7 @@ export default function App() {
 			await commit;
 			try {
 				const result = await request<{ queued?: boolean }>("prompt", params, id);
-				if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+				if (result?.queued) setNotice(t("shell.addedToQueue"));
 			} catch (error) {
 				enqueueRecovery(async () => {
 					const current = recoveriesRef.current.find(item => item.id === id);
@@ -1124,7 +1152,7 @@ export default function App() {
 				closeDialog();
 				try {
 					const result = await request<{ queued?: boolean }>("prompt", params, id);
-					if (result.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+					if (result.queued) setNotice(t("shell.addedToQueue"));
 				} catch (error) {
 					enqueueRecovery(async () => {
 						const current = recoveriesRef.current.find(item => item.id === id);
@@ -1150,14 +1178,14 @@ export default function App() {
 				[
 					result.output,
 					result.refused
-						? "실행하지 않았습니다."
+						? t("shell.commandNotRun")
 						: result.prompt
-							? `모델로 전달한 입력: ${result.prompt}`
+							? t("shell.commandPrompt", { prompt: result.prompt })
 							: result.consumed
 								? result.outputTruncated
-									? "명령을 실행했습니다. 출력이 길어 일부만 표시했습니다."
-									: "명령을 실행했습니다."
-								: "내장 명령이 아니므로 모델에 메시지로 전달했습니다.",
+									? t("shell.commandRanTruncated")
+									: t("shell.commandRan")
+								: t("shell.commandSentToModel"),
 				]
 					.filter(Boolean)
 					.join("\n\n"),
@@ -1186,7 +1214,7 @@ export default function App() {
 			});
 			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
 			if (value.cancelled) {
-				setNotice("분기가 취소되었습니다. 원래 대화와 초안은 유지됩니다.");
+				setNotice(t("shell.forkCancelled"));
 				return;
 			}
 			await request<DesktopSession>("session.select", { sessionId: value.session.id });
@@ -1233,7 +1261,7 @@ export default function App() {
 				if (alive)
 					setErrors(previous => ({
 						...previous,
-						diff: error instanceof Error ? error.message : "변경 내용을 불러오지 못했습니다.",
+						diff: error instanceof Error ? error.message : t("shell.diffLoadFailed"),
 					}));
 			})
 			.finally(() => {
@@ -1261,7 +1289,7 @@ export default function App() {
 				!value.available.every(item => typeof item === "string") ||
 				!value.active.every(item => typeof item === "string")
 			)
-				throw new Error("도구 목록 응답 형식을 확인할 수 없습니다.");
+				throw new Error(t("shell.toolListInvalid"));
 			setToolNames(value.available);
 			setActiveTools(value.active);
 		});
@@ -1315,6 +1343,17 @@ export default function App() {
 		const generation = dialogGeneration.current;
 		const owner = modelOwnerRef.current;
 		if (preferences?.sessionId !== sessionId || preferences.owner !== owner) return;
+		const dialogSession = snapshot?.sessions.find(item => item.id === sessionId);
+		if (dialogSession && !isSettled(dialogSession)) {
+			// Same rule as the picker: hold the choice and dispatch it when the session settles.
+			setDeferredSelection(previous =>
+				previous?.ownerKey === owner
+					? { ...previous, preference: action }
+					: { ownerKey: owner, preference: action },
+			);
+			return;
+		}
+		setDeferredSelection(previous => (previous?.ownerKey === owner ? null : previous));
 		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
 			const outcome = await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action });
 			if (modelOwnerRef.current === owner) {
@@ -1346,7 +1385,7 @@ export default function App() {
 			const outcome = await request<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref, action });
 			if (dialogGeneration.current === generation) {
 				setMcp({ sessionId, value: outcome.snapshot });
-				setNotice("관리자 연결 변경 응답을 받았습니다. 원격 세션 종료나 자원 정산을 뜻하지 않습니다.");
+				setNotice(t("shell.administratorChangeAcknowledged"));
 			}
 		});
 	};
@@ -1366,7 +1405,7 @@ export default function App() {
 		(presentationId: string) => {
 			void run(`gate-withdraw:${presentationId}`, async () => {
 				const view = gateViewsRef.current[presentationId];
-				if (!view) throw new Error("승인 화면의 현재 소유권을 확인할 수 없습니다.");
+				if (!view) throw new Error(t("shell.gateWithdrawOwnerUnknown"));
 				await request("gate.withdraw", { sessionId: view.sessionId, presentationId });
 			});
 		},
@@ -1386,7 +1425,7 @@ export default function App() {
 	const acknowledgeGatePresented = (presentationId: string) => {
 		void run(`gate-presented:${presentationId}`, async () => {
 			const view = gateViewsRef.current[presentationId];
-			if (!view) throw new Error("표시할 승인 화면의 소유권을 확인할 수 없습니다.");
+			if (!view) throw new Error(t("shell.gatePresentedOwnerUnknown"));
 			await request("gate.presented", { sessionId: view.sessionId, presentationId });
 			setGateViews(previous =>
 				previous[presentationId]
@@ -1399,8 +1438,7 @@ export default function App() {
 		// Answer/withdraw requests wait for this acknowledgement; it owns a distinct UI lock.
 		void run(`gate-retired:${presentationId}`, async () => {
 			const view = gateViewsRef.current[presentationId];
-			if (!view || view.retiring?.nonce !== nonce)
-				throw new Error("철회할 승인 화면과 확인 번호가 일치하지 않습니다.");
+			if (!view || view.retiring?.nonce !== nonce) throw new Error(t("shell.gateRetiredNonceMismatch"));
 			await request("gate.retired", { sessionId: view.sessionId, presentationId, nonce });
 			setGateViews(previous => {
 				if (previous[presentationId]?.retiring?.nonce !== nonce) return previous;
@@ -1413,7 +1451,7 @@ export default function App() {
 	const answerGate = (presentationId: string, answer: DesktopActivityGateAnswer) => {
 		void run(`gate:${presentationId}`, async () => {
 			const view = gateViewsRef.current[presentationId];
-			if (!view) throw new Error("응답할 승인 화면의 현재 소유권을 확인할 수 없습니다.");
+			if (!view) throw new Error(t("shell.gateAnswerOwnerUnknown"));
 			await request("gate.answer", { sessionId: view.sessionId, presentationId, answer });
 		});
 	};
@@ -1453,10 +1491,10 @@ export default function App() {
 			const result = await request<DesktopOperatorFoldResult>("operator.fold", { sessionId });
 			setNotice(
 				result.status === "unsupported"
-					? "현재 포그라운드 도구는 백그라운드 전환을 지원하지 않습니다."
+					? t("shell.foldUnsupported")
 					: result.status === "already_backgrounded"
-						? "현재 도구는 이미 백그라운드로 전환되었습니다."
-						: "현재 포그라운드 도구를 백그라운드로 옮겼습니다. 실행 완료를 뜻하지 않습니다.",
+						? t("shell.foldAlreadyBackgrounded")
+						: t("shell.foldMoved"),
 			);
 		});
 	};
@@ -1464,18 +1502,34 @@ export default function App() {
 		const ownerKey = `${owner.id}:${owner.controlGeneration}`;
 		const modelScope = `model:${ownerKey}`;
 		const thinkingScope = `thinking:${ownerKey}`;
-		const changing = !!(pending[modelScope] || pending[thinkingScope]);
-		// A running turn cannot take the selection yet; remember it and apply on idle.
-		const busy = owner.status === "running" || owner.status === "waiting" || owner.operatorRunning;
 		const deferred = deferredSelection?.ownerKey === ownerKey ? deferredSelection : null;
+		// The deferred dispatch is a real write: show it as applying and keep the chosen
+		// value on screen until the host answers.
+		const selectionScope = `selection:${ownerKey}`;
+		const changing = !!(pending[modelScope] || pending[thinkingScope] || pending[selectionScope]);
+		// Every write goes through one rule: settled now, dispatch now; otherwise hold it.
+		const settled = isSettled(owner);
 		const deferModel = (modelId: string) =>
 			setDeferredSelection(previous =>
 				previous?.ownerKey === ownerKey ? { ...previous, modelId } : { ownerKey, modelId },
 			);
-		const deferThinking = (thinkingLevel: string) =>
+		const deferThinking = (thinkingLevel: DesktopThinkingLevel) =>
 			setDeferredSelection(previous =>
 				previous?.ownerKey === ownerKey ? { ...previous, thinkingLevel } : { ownerKey, thinkingLevel },
 			);
+		const deferPreference = (preference: DesktopPreferenceAction) =>
+			setDeferredSelection(previous =>
+				previous?.ownerKey === ownerKey ? { ...previous, preference } : { ownerKey, preference },
+			);
+		const route = (dispatch: () => void, defer: () => void) => {
+			// A direct write retires any earlier intent so a stale choice cannot win later.
+			if (settled) {
+				setDeferredSelection(previous => (previous?.ownerKey === ownerKey ? null : previous));
+				dispatch();
+			} else defer();
+		};
+		const routePreference = (preference: DesktopPreferenceAction, runNow: () => void) =>
+			route(runNow, () => deferPreference(preference));
 		const catalog =
 			modelCatalog.sessionId === owner.id && modelCatalog.generation === owner.controlGeneration
 				? modelCatalog
@@ -1490,9 +1544,8 @@ export default function App() {
 					roles={catalog?.roles ?? []}
 					profiles={catalog?.profiles}
 					onConfigureProviders={openSettings}
-					selectedId={owner.model}
+					selectedId={deferred?.modelId ?? owner.model}
 					disabled={!connected || changing}
-					busy={busy}
 					onRefresh={() => {
 						refreshModelCatalog.current = true;
 						setModelCatalogRevision(value => value + 1);
@@ -1500,70 +1553,77 @@ export default function App() {
 					refreshing={catalog?.loading === true}
 					onApplyProfile={profileId => {
 						if (modelOwnerRef.current !== ownerKey) return;
-						void run(modelScope, async () => {
-							await request<DesktopPreferenceResult>("preferences.apply", {
-								sessionId: owner.id,
-								action: { type: "profile.select", name: profileId, scope: "session" },
-							});
-							if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
-						});
+						const action: DesktopPreferenceAction = { type: "profile.select", name: profileId, scope: "session" };
+						routePreference(
+							action,
+							() =>
+								void run(modelScope, async () => {
+									await request<DesktopPreferenceResult>("preferences.apply", { sessionId: owner.id, action });
+									if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+								}),
+						);
 					}}
 					pending={pending[modelScope]}
 					applying={changing}
 					onSelect={modelId => {
 						if (modelOwnerRef.current !== ownerKey) return;
-						if (busy) {
-							deferModel(modelId);
-							return;
-						}
-						void call("model.set", { sessionId: owner.id, modelId }, modelScope);
+						route(
+							() => void call("model.set", { sessionId: owner.id, modelId }, modelScope),
+							() => deferModel(modelId),
+						);
 					}}
 					onAssign={(role, modelId) => {
 						if (modelOwnerRef.current !== ownerKey) return;
-						if (role === "default" && modelId !== null && busy) {
-							deferModel(modelId);
+						if (role === "default" && modelId !== null) {
+							route(
+								() =>
+									void run(modelScope, async () => {
+										await request("model.set", { sessionId: owner.id, modelId });
+										if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+									}),
+								() => deferModel(modelId),
+							);
 							return;
 						}
-						void run(modelScope, async () => {
-							if (role === "default" && modelId !== null) {
-								await request("model.set", { sessionId: owner.id, modelId });
-							} else {
-								await request<DesktopPreferenceResult>("preferences.apply", {
-									sessionId: owner.id,
-									action: { type: "role.set", role, modelId },
-								});
-							}
-							if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
-						});
+						const action: DesktopPreferenceAction = { type: "role.set", role, modelId };
+						routePreference(
+							action,
+							() =>
+								void run(modelScope, async () => {
+									await request<DesktopPreferenceResult>("preferences.apply", { sessionId: owner.id, action });
+									if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+								}),
+						);
 					}}
 				/>
 				<ReasoningSelect
-					thinking={owner.thinking}
+					thinking={
+						deferred?.thinkingLevel !== undefined && owner.thinking
+							? { ...owner.thinking, level: deferred.thinkingLevel }
+							: owner.thinking
+					}
 					disabled={!connected || changing || !currentModelAvailable}
 					pending={pending[thinkingScope]}
 					onChange={level => {
 						if (modelOwnerRef.current !== ownerKey) return;
-						if (busy) {
-							deferThinking(level);
-							return;
-						}
-						void call("thinking.set", { sessionId: owner.id, level }, thinkingScope);
+						route(
+							() => void call("thinking.set", { sessionId: owner.id, level }, thinkingScope),
+							() => deferThinking(level),
+						);
 					}}
 				/>
 				<small className="model-control-status" role="status">
 					{loadingModels
-						? "모델 목록을 불러오는 중…"
-						: deferred
-							? `${deferred.modelId !== undefined && deferred.thinkingLevel !== undefined ? "모델과 추론 수준" : deferred.modelId !== undefined ? "모델" : "추론 수준"}을 작업이 끝난 뒤 적용합니다.`
-							: changing
-								? "선택한 설정을 적용하는 중…"
-								: !currentModelAvailable
-									? "제공자를 등록·연결한 뒤 모델을 선택하세요."
-									: null}
+						? t("shell.modelsLoading")
+						: changing
+							? t("models.applyingSelection")
+							: !currentModelAvailable
+								? t("shell.providerRequired")
+								: null}
 				</small>
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
 					<Button disabled={!connected} onClick={openSettings}>
-						제공자 추가·연결
+						{t("shell.addProvider")}
 					</Button>
 				)}
 				{catalog?.error && (
@@ -1571,7 +1631,7 @@ export default function App() {
 						<ErrorBanner>{catalog.error}</ErrorBanner>
 					</div>
 				)}
-				{[modelScope, thinkingScope].map(
+				{[modelScope, thinkingScope, selectionScope].map(
 					scope =>
 						errors[scope] && (
 							<div className="model-control-status" key={scope}>
@@ -1583,29 +1643,29 @@ export default function App() {
 		);
 	};
 	const commands: { label: string; action: () => void; needsSession?: boolean; allowDuringRun?: boolean }[] = [
-		{ label: "별도 대화 (/btw)", needsSession: true, allowDuringRun: true, action: () => openBtw() },
+		{ label: t("shell.sideChatCommand"), needsSession: true, allowDuringRun: true, action: () => openBtw() },
 		{
-			label: "프로젝트 열기",
+			label: t("shell.openProject"),
 			action: () => {
 				closeDialog();
 				void openProject();
 			},
 		},
-		{ label: "설정 및 기능 지원 현황", action: openSettings },
+		{ label: t("shell.settingsAndCapabilities"), action: openSettings },
 		{
-			label: "직접 실행 (셸 · Python)",
+			label: t("shell.directExecution"),
 			needsSession: true,
 			action: () => {
 				setDialog("operator");
 			},
 		},
 		{
-			label: "대화 분기 (fork)",
+			label: t("shell.forkConversation"),
 			needsSession: true,
 			action: openFork,
 		},
 		{
-			label: "대화 압축 (compact)",
+			label: t("shell.compactConversation"),
 			needsSession: true,
 			action: () => {
 				closeDialog();
@@ -1613,7 +1673,7 @@ export default function App() {
 			},
 		},
 		{
-			label: "응답 재시도 (retry)",
+			label: t("shell.retryResponse"),
 			needsSession: true,
 			action: () => {
 				closeDialog();
@@ -1621,19 +1681,19 @@ export default function App() {
 			},
 		},
 		{
-			label: "대화 내보내기 (export)",
+			label: t("shell.exportConversation"),
 			needsSession: true,
 			action: () => {
 				void run(selected, async () => {
 					const value = await request<{ path: string }>("session.export", { sessionId: selected });
-					setResult(`대화를 HTML 파일로 내보냈습니다.\n\n${value.path}`);
+					setResult(t("shell.exportedConversation", { path: value.path }));
 					setDialog("result");
 				});
 			},
 		},
-		{ label: "활성 도구 관리", needsSession: true, action: openTools },
+		{ label: t("shell.manageActiveTools"), needsSession: true, action: openTools },
 		{
-			label: "목표 관리 (goal)",
+			label: t("shell.manageGoal"),
 			needsSession: true,
 			action: () => {
 				setEditText("");
@@ -1646,29 +1706,29 @@ export default function App() {
 		<>
 			<header className="sidebar-heading">
 				<strong>
-					<Command size={18} aria-hidden="true" /> Gajae Code
+					<img className="brand-mark" src={gajaeMark} alt="" aria-hidden="true" /> Gajae Code
 				</strong>
 			</header>
 			<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-				<FolderOpen size={16} aria-hidden="true" /> 프로젝트 열기
+				<FolderOpen size={16} aria-hidden="true" /> {t("shell.openProject")}
 			</Button>
 			<label className="sr-only" htmlFor="session-search">
-				대화 검색
+				{t("shell.searchConversations")}
 			</label>
 			<input
 				id="session-search"
 				className="session-search"
 				value={sessionFilter}
-				placeholder="대화 검색"
+				placeholder={t("shell.searchConversations")}
 				onChange={event => setSessionFilter(event.target.value)}
 			/>
-			<nav aria-label="프로젝트와 대화">
+			<nav aria-label={t("shell.projectsAndConversations")}>
 				{snapshot?.projects.map(item => (
 					<section className="project-group" key={item.id}>
 						<div className="project-heading">
 							<h2 title={item.path}>{item.name}</h2>
 							<Button
-								aria-label={`${item.name} 새 대화`}
+								aria-label={t("shell.newConversationIn", { project: item.name })}
 								disabled={!connected || pending[`project:${item.id}`]}
 								onClick={() =>
 									void run(`project:${item.id}`, async () => {
@@ -1705,14 +1765,14 @@ export default function App() {
 								/>
 							))}
 						{!snapshot.sessions.some(chat => chat.projectId === item.id) && (
-							<p className="muted">새 대화를 시작하세요.</p>
+							<p className="muted">{t("shell.startNewConversation")}</p>
 						)}
 					</section>
 				))}
 			</nav>
 			<footer>
 				<Button onClick={openSettings} disabled={!connected}>
-					<Settings2 size={16} aria-hidden="true" /> 설정
+					<Settings2 size={16} aria-hidden="true" /> {t("shell.settings")}
 				</Button>
 			</footer>
 		</>
@@ -1721,18 +1781,18 @@ export default function App() {
 		<>
 			{wide && (
 				<header>
-					<h2>변경 검토</h2>
-					<Button aria-label="변경 검토 닫기" onClick={() => setReview(false)}>
+					<h2>{t("shell.reviewChanges")}</h2>
+					<Button aria-label={t("shell.closeReviewChanges")} onClick={() => setReview(false)}>
 						<X aria-hidden="true" />
 					</Button>
 				</header>
 			)}
 			{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
 			{diffLoading ? (
-				<p role="status">변경 내용 불러오는 중…</p>
+				<p role="status">{t("shell.loadingChanges")}</p>
 			) : diffs.length ? (
 				<>
-					<label htmlFor="diff-file">파일</label>
+					<label htmlFor="diff-file">{t("shell.file")}</label>
 					<select id="diff-file" value={diffPath} onChange={event => setDiffPath(event.target.value)}>
 						{diffs.map(file => (
 							<option key={file.path} value={file.path}>
@@ -1743,7 +1803,7 @@ export default function App() {
 					<pre className="diff-output">{diffs.find(file => file.path === diffPath)?.patch}</pre>
 				</>
 			) : (
-				<p className="muted">표시할 변경 내용이 없습니다.</p>
+				<p className="muted">{t("shell.noChanges")}</p>
 			)}
 		</>
 	);
@@ -1752,7 +1812,7 @@ export default function App() {
 		const restorationFailure = restorationFailures.current.get(item.id);
 		const copy =
 			restorationFailure?.sessionId === item.sessionId
-				? "전송 복구: 초안을 복원하거나 저장하지 못했습니다. 저장 복구를 다시 시도하세요."
+				? t("shell.recoveryRestoreFailed")
 				: recoveryNotice(item, unsentRepairs.current.get(item.id) === item.sessionId);
 		return copy ? (
 			<div className="notice" key={item.id} role="status">
@@ -1778,7 +1838,7 @@ export default function App() {
 							})
 						}
 					>
-						저장 복구 다시 시도
+						{t("shell.retryRecovery")}
 					</Button>
 				)}
 				<Button
@@ -1792,7 +1852,7 @@ export default function App() {
 						})
 					}
 				>
-					초안 복원
+					{t("shell.restoreDraft")}
 				</Button>
 				<Button
 					disabled={
@@ -1819,7 +1879,7 @@ export default function App() {
 						})
 					}
 				>
-					{item.disposition === "unknown" ? "복원한 기록 지우기" : "복구 항목 버리기"}
+					{item.disposition === "unknown" ? t("shell.discardRestoredRecord") : t("shell.discardRecoveryRecord")}
 				</Button>
 			</div>
 		) : null;
@@ -1828,23 +1888,27 @@ export default function App() {
 		<div className="app-shell">
 			<aside className="sidebar desktop-sidebar">{sidebarContent}</aside>
 			{sidebar && (
-				<Modal title="프로젝트와 대화" className="sidebar-drawer" onClose={() => setSidebar(false)}>
+				<Modal
+					title={t("shell.projectsAndConversations")}
+					className="sidebar-drawer"
+					onClose={() => setSidebar(false)}
+				>
 					{sidebarContent}
 				</Modal>
 			)}
 			<main className="main-pane">
 				<header className="toolbar">
 					<Button className="mobile-only" onClick={() => setSidebar(true)}>
-						프로젝트
+						{t("shell.projects")}
 					</Button>
 					<div className="toolbar-title">
-						<small>{project?.name || "Gajae Code"}</small>
-						<h1>{session?.title || "프로젝트에서 시작하세요"}</h1>
+						{project && <small>{project.name}</small>}
+						<h1>{session?.title || t("shell.startInProject")}</h1>
 					</div>
 					{session && (
 						<>
 							<Button aria-pressed={review} disabled={!connected} onClick={() => setReview(!review)}>
-								<FileDiff size={15} aria-hidden="true" /> 변경 검토
+								<FileDiff size={15} aria-hidden="true" /> {t("shell.reviewChanges")}
 							</Button>
 
 							<Button
@@ -1854,19 +1918,21 @@ export default function App() {
 									refreshActivity();
 								}}
 							>
-								<Activity size={15} aria-hidden="true" /> 활동
+								<Activity size={15} aria-hidden="true" /> {t("shell.activity")}
 								{activity?.sessionId === selected &&
 									activity.activity.sessionState?.gates.available &&
 									activity.activity.sessionState.gates.pending.length > 0 && (
 										<span className="activity-badge">
-											응답 {activity.activity.sessionState.gates.pending.length}
+											{t("shell.needsInputCount", {
+												count: activity.activity.sessionState.gates.pending.length,
+											})}
 										</span>
 									)}
 							</Button>
 							<Button
 								disabled={!connected}
-								aria-label="대화 작업 메뉴"
-								title="대화 작업 메뉴"
+								aria-label={t("shell.conversationActionsMenu")}
+								title={t("shell.conversationActionsMenu")}
 								onClick={() => setDialog("session-actions")}
 							>
 								<MoreHorizontal size={16} aria-hidden="true" />
@@ -1874,11 +1940,15 @@ export default function App() {
 						</>
 					)}
 					<Button disabled={!connected} onClick={openCommands}>
-						명령
+						{t("shell.commands")}
 					</Button>
 				</header>
 				{connection &&
-					(fatal ? <ErrorBanner>연결 끊김: {connection}</ErrorBanner> : <p role="status">{connection}</p>)}
+					(fatal ? (
+						<ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>
+					) : (
+						<p role="status">{connection}</p>
+					))}
 				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
 				{!session && recoveries.map(recoveryPanel)}
 				{Object.entries(errors)
@@ -1890,14 +1960,14 @@ export default function App() {
 					<>
 						<div className="session-status" role="status">
 							{session.status === "running"
-								? "작업 중"
+								? t("support.statusRunning")
 								: session.status === "waiting"
-									? "응답 필요"
+									? t("support.statusWaiting")
 									: session.status === "error"
-										? "오류"
+										? t("support.statusError")
 										: session.status === "done"
-											? "완료"
-											: "대기"}
+											? t("support.statusDone")
+											: t("support.statusIdle")}
 						</div>
 						<div
 							className="conversation"
@@ -1907,17 +1977,13 @@ export default function App() {
 								follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
 							}}
 						>
-							{session.historyTruncated && (
-								<p className="muted">
-									최근 기록만 표시합니다. 대화 작업 메뉴의 ‘전체 대화 기록’에서 모두 확인할 수 있습니다.
-								</p>
-							)}
+							{session.historyTruncated && <p className="muted">{t("shell.historyTruncated")}</p>}
 							{session.messages.length > historyLimit && (
-								<Button onClick={() => setHistoryLimit(value => value + 100)}>이전 메시지 100개 더 보기</Button>
+								<Button onClick={() => setHistoryLimit(value => value + 100)}>
+									{t("shell.showOlderMessages")}
+								</Button>
 							)}
-							{session.messages.length === 0 && (
-								<div className="empty">이 프로젝트에서 할 일을 메시지로 보내세요.</div>
-							)}
+							{session.messages.length === 0 && <div className="empty">{t("shell.emptyConversation")}</div>}
 							{session.messages.slice(-historyLimit).map(message => (
 								<Message key={message.id} message={message} />
 							))}
@@ -1968,18 +2034,19 @@ export default function App() {
 						</div>
 						{session.queued && session.queued.length > 0 && (
 							<div className="queued-inputs">
-								<strong>대기열 {session.queued.length}건</strong>
+								<strong>{t("shell.queuedCount", { count: session.queued.length })}</strong>
 								{session.queued.map(item => (
 									<div className="queued-input" key={item.id}>
 										<span>
-											{item.deliverAs === "steer" ? "개입" : "후속"} · {item.text.slice(0, 120)}
+											{item.deliverAs === "steer" ? t("shell.queueSteer") : t("shell.queueFollowUp")} ·{" "}
+											{item.text.slice(0, 120)}
 										</span>
 										<small>
 											{item.execution === "joined-current-run" || item.execution === "promoted-to-run"
-												? "실행에 반영됨"
+												? t("shell.queueApplied")
 												: item.cancelable
-													? "대기 중"
-													: "처리 중"}
+													? t("shell.queueWaiting")
+													: t("shell.queueProcessing")}
 										</small>
 										{item.cancelable && (
 											<Button
@@ -1990,12 +2057,11 @@ export default function App() {
 															sessionId: selected,
 															queueId: item.id,
 														});
-														if (!outcome.removed)
-															setNotice("이미 실행에 반영된 입력이라 취소하지 못했습니다.");
+														if (!outcome.removed) setNotice(t("shell.queueCancelTooLate"));
 													})
 												}
 											>
-												취소
+												{t("support.cancel")}
 											</Button>
 										)}
 									</div>
@@ -2058,11 +2124,10 @@ export default function App() {
 					</>
 				) : (
 					<div className="empty">
-						<h2>
-							{snapshot?.projects.length ? "대화를 선택하거나 새로 시작하세요" : "프로젝트를 열어 시작하세요"}
-						</h2>
+						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+						<h2>{snapshot?.projects.length ? t("shell.selectConversation") : t("shell.openProjectToStart")}</h2>
 						<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-							프로젝트 폴더 선택
+							{t("shell.chooseProjectFolder")}
 						</Button>
 					</div>
 				)}
@@ -2070,7 +2135,7 @@ export default function App() {
 			{review && wide && <aside className="review-pane">{reviewContent}</aside>}
 			{review && !wide && (
 				<div className="review-drawer">
-					<Modal title="변경 검토" onClose={() => setReview(false)}>
+					<Modal title={t("shell.reviewChanges")} onClose={() => setReview(false)}>
 						{reviewContent}
 					</Modal>
 				</div>
@@ -2094,22 +2159,22 @@ export default function App() {
 				<Modal
 					title={
 						{
-							settings: "설정",
-							commands: "명령",
-							history: "전체 기록",
-							fork: "대화 분기 (fork)",
-							rename: "대화 이름 변경",
-							delete: "대화 삭제",
-							tools: "활성 도구",
-							goal: "목표 관리",
-							result: "요청 결과",
-							activity: "백그라운드 활동과 응답 요청",
-							"activity-detail": "활동 세부 정보",
-							preferences: "모델 프로필과 실행 설정",
-							operator: "직접 실행 · 셸과 Python",
-							mcp: "MCP 연결 관리",
-							"session-info": "세션 정보와 사용량",
-							"session-actions": "대화 작업",
+							settings: t("shell.settings"),
+							commands: t("shell.commands"),
+							history: t("shell.dialogHistory"),
+							fork: t("shell.dialogFork"),
+							rename: t("shell.dialogRename"),
+							delete: t("shell.dialogDelete"),
+							tools: t("shell.dialogTools"),
+							goal: t("shell.dialogGoal"),
+							result: t("shell.dialogResult"),
+							activity: t("shell.dialogActivity"),
+							"activity-detail": t("shell.dialogActivityDetail"),
+							preferences: t("shell.dialogPreferences"),
+							operator: t("shell.dialogOperator"),
+							mcp: t("shell.dialogMcp"),
+							"session-info": t("shell.dialogSessionInfo"),
+							"session-actions": t("shell.conversationActions"),
 						}[dialog]
 					}
 					onClose={closeDialog}
@@ -2119,31 +2184,31 @@ export default function App() {
 					)}
 					{notice && <p role="status">{notice}</p>}
 					{dialog === "session-actions" && (
-						<nav className="command-list" aria-label="현재 대화 작업">
+						<nav className="command-list" aria-label={t("shell.conversationActions")}>
 							<Button onClick={openPreferences}>
 								<SlidersHorizontal aria-hidden="true" />
-								모델 프로필과 실행 설정
+								{t("shell.dialogPreferences")}
 							</Button>
 							<Button onClick={() => setDialog("operator")}>
 								<Command aria-hidden="true" />
-								직접 실행 · 셸과 Python
+								{t("shell.dialogOperator")}
 							</Button>
 							<Button disabled={!connected || session?.controlGeneration === null} onClick={() => openBtw()}>
 								<Command aria-hidden="true" />
-								별도 대화 · /btw
+								{t("shell.sideChatCommand")}
 							</Button>
 							<Button onClick={openMcp}>
 								<Network aria-hidden="true" />
-								MCP 연결 관리
+								{t("shell.dialogMcp")}
 							</Button>
 							<Button onClick={openSessionInfo}>
 								<Info aria-hidden="true" />
-								세션 정보와 사용량
+								{t("shell.dialogSessionInfo")}
 							</Button>
-							<Button onClick={openFork}>대화 분기 (fork)</Button>
+							<Button onClick={openFork}>{t("shell.dialogFork")}</Button>
 							<Button onClick={openHistory}>
 								<History aria-hidden="true" />
-								전체 대화 기록
+								{t("shell.fullHistory")}
 							</Button>
 							<Button
 								onClick={() => {
@@ -2152,11 +2217,11 @@ export default function App() {
 								}}
 							>
 								<Pencil aria-hidden="true" />
-								이름 변경
+								{t("shell.rename")}
 							</Button>
 							<Button className="danger" onClick={() => setDialog("delete")}>
 								<Trash2 aria-hidden="true" />
-								대화 삭제
+								{t("shell.dialogDelete")}
 							</Button>
 						</nav>
 					)}
@@ -2182,9 +2247,6 @@ export default function App() {
 									: null
 							}
 							pending={pending[operatorScope]}
-							busy={snapshot?.sessions.some(
-								item => item.id === dialogOwner && (item.status === "running" || item.status === "waiting"),
-							)}
 							disabled={!connected}
 							error={
 								[
@@ -2235,11 +2297,8 @@ export default function App() {
 									? preferences.value
 									: null
 							}
-							pending={pending[preferencesScope]}
-							busy={snapshot?.sessions.some(
-								item => item.id === dialogOwner && (item.status === "running" || item.status === "waiting"),
-							)}
-							error={errors[preferencesScope]}
+							pending={pending[preferencesScope] || pending[`selection:${modelOwner}`]}
+							error={errors[preferencesScope] || errors[`selection:${modelOwner}`]}
 							onRefresh={() => loadPreferences(dialogOwner, dialogGeneration.current)}
 							onApply={applyPreferences}
 						/>
@@ -2254,25 +2313,25 @@ export default function App() {
 								{activityDetail.output ? (
 									<pre className="bounded-output">
 										{activityDetail.output.text}
-										{activityDetail.output.truncated ? "\n[출력 생략]" : ""}
+										{activityDetail.output.truncated ? `\n${t("shell.outputOmitted")}` : ""}
 									</pre>
 								) : (
-									<p className="muted">이 활동에는 읽을 수 있는 출력 미리보기가 없습니다.</p>
+									<p className="muted">{t("shell.noActivityOutput")}</p>
 								)}
 							</>
 						) : (
-							<p role="status">활동 정보를 불러오는 중…</p>
+							<p role="status">{t("shell.activityLoading")}</p>
 						))}
 					{dialog === "settings" && (
 						<>
 							<section>
 								<h3>
-									<Palette aria-hidden="true" /> 테마
+									<Palette aria-hidden="true" /> {t("shell.theme")}
 								</h3>
 								<div
 									className="theme-options"
 									role="radiogroup"
-									aria-label="테마"
+									aria-label={t("shell.theme")}
 									onKeyDown={event => {
 										const radios = [
 											...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
@@ -2304,8 +2363,7 @@ export default function App() {
 											tabIndex={theme === id ? 0 : -1}
 											onClick={() => {
 												setTheme(id);
-												if (!writeThemePreference(id))
-													setNotice("테마를 저장하지 못했습니다. 이번 실행에만 적용됩니다.");
+												if (!writeThemePreference(id)) setNotice(t("shell.themeSaveFailed"));
 											}}
 										>
 											<span
@@ -2321,8 +2379,12 @@ export default function App() {
 								</div>
 							</section>
 							<section>
-								<h3>현재 대화 모델과 추론</h3>
-								{session ? modelControls(session) : <p className="muted">대화를 먼저 선택하세요.</p>}
+								<h3>{t("shell.currentModelAndReasoning")}</h3>
+								{session ? (
+									modelControls(session)
+								) : (
+									<p className="muted">{t("shell.selectConversationFirst")}</p>
+								)}
 							</section>
 							<OAuthSettings key={dialogGeneration.current} connected={connected} />
 							<form
@@ -2338,15 +2400,13 @@ export default function App() {
 										});
 										if (dialogGeneration.current === generation)
 											setNotice(
-												saved.catalogRefreshed
-													? "API 키를 저장했습니다."
-													: "API 키는 저장했습니다. 모델 목록은 모델 선택 창에서 새로 고칠 수 있습니다.",
+												saved.catalogRefreshed ? t("shell.apiKeySaved") : t("shell.apiKeySavedNoRefresh"),
 											);
 									});
 								}}
 							>
-								<h3>API 키</h3>
-								<label htmlFor="provider">제공자</label>
+								<h3>{t("shell.apiKey")}</h3>
+								<label htmlFor="provider">{t("shell.provider")}</label>
 								<input
 									id="provider"
 									list="providers"
@@ -2359,7 +2419,7 @@ export default function App() {
 										<option key={name} value={name} />
 									))}
 								</datalist>
-								<label htmlFor="api-key">API 키 (저장 후 표시하지 않음)</label>
+								<label htmlFor="api-key">{t("shell.apiKeyHidden")}</label>
 								<input
 									id="api-key"
 									type="password"
@@ -2372,29 +2432,32 @@ export default function App() {
 									type="submit"
 									disabled={!connected || pending[authScope] || !provider.trim() || !key.trim()}
 								>
-									키 저장
+									{t("shell.saveKey")}
 								</Button>
 							</form>
 							<section>
-								<h3>안전한 설정</h3>
+								<h3>{t("shell.safeSettings")}</h3>
 								{settings === null ? (
-									<p>설정 불러오는 중…</p>
+									<p>{t("shell.loadingSettings")}</p>
 								) : settings.length === 0 ? (
-									<p>공개된 설정이 없습니다.</p>
+									<p>{t("shell.noExposedSettings")}</p>
 								) : (
 									<>
-										<label htmlFor="setting-search">설정 검색</label>
+										<label htmlFor="setting-search">{t("shell.searchSettings")}</label>
 										<input
 											id="setting-search"
 											value={settingFilter}
-											placeholder="compaction, retry, todo…"
+											placeholder={t("shell.searchSettingsPlaceholder")}
 											onChange={event => setSettingFilter(event.target.value)}
 										/>
 										<p className="muted">
-											{filteredSettings.length}개 일치 / 전체 {settings.length}개
-											{filteredSettings.length > 200 && " · 처음 200개만 표시"}
+											{t("shell.settingsMatchCount", {
+												count: filteredSettings.length,
+												total: settings.length,
+											})}
+											{filteredSettings.length > 200 && t("shell.settingsLimitNotice")}
 										</p>
-										{filteredSettings.length === 0 && <p>일치하는 설정이 없습니다.</p>}
+										{filteredSettings.length === 0 && <p>{t("shell.noMatchingSettings")}</p>}
 										{filteredSettings.slice(0, 200).map(setting => (
 											<SettingField
 												key={`${setting.path}:${textOf(setting.value)}`}
@@ -2407,11 +2470,11 @@ export default function App() {
 								)}
 							</section>
 							<section>
-								<h3>기능 지원 현황</h3>
+								<h3>{t("shell.capabilityStatus")}</h3>
 								{snapshot?.capabilities.map(capability => (
 									<div className="capability" key={capability.id}>
 										<strong>{capability.label}</strong>
-										<span>{capability.available ? "지원됨" : "사용 불가"}</span>
+										<span>{capability.available ? t("shell.supported") : t("shell.unavailable")}</span>
 										{capability.reason && <small>{capability.reason}</small>}
 									</div>
 								))}
@@ -2420,7 +2483,7 @@ export default function App() {
 					)}
 					{dialog === "commands" && (
 						<>
-							<label htmlFor="command-search">명령 검색</label>
+							<label htmlFor="command-search">{t("shell.searchCommands")}</label>
 							<input id="command-search" value={filter} onChange={event => setFilter(event.target.value)} />
 							<form
 								className="command-run"
@@ -2429,7 +2492,7 @@ export default function App() {
 									runCommand(commandInput);
 								}}
 							>
-								<label htmlFor="command-input">명령 실행</label>
+								<label htmlFor="command-input">{t("shell.runCommand")}</label>
 								<input
 									id="command-input"
 									ref={commandInputRef}
@@ -2443,7 +2506,7 @@ export default function App() {
 										!connected || !selected || !commandInput.trim() || !!pending[`command:${dialogOwner}`]
 									}
 								>
-									실행
+									{t("shell.run")}
 								</Button>
 							</form>
 							{scopeError(`command:${dialogOwner}`) && (
@@ -2469,7 +2532,9 @@ export default function App() {
 										</Button>
 									))}
 							</div>
-							<h3>GJC 슬래시 명령 {commandList.length > 0 && `(${commandList.length})`}</h3>
+							<h3>
+								{t("shell.slashCommands")} {commandList.length > 0 && `(${commandList.length})`}
+							</h3>
 							<div className="command-list">
 								{commandList
 									.filter(command => matchesSlashFilter(command.name, command.description, filter))
@@ -2492,8 +2557,10 @@ export default function App() {
 								.filter(capability => !capability.available)
 								.map(capability => (
 									<div className="capability" key={capability.id}>
-										<strong>{capability.label} · 사용 불가</strong>
-										<small>{capability.reason || "공개 SDK 지원 대기 · #7322"}</small>
+										<strong>
+											{capability.label} · {t("shell.unavailable")}
+										</strong>
+										<small>{capability.reason || t("shell.sdkSupportPending")}</small>
 									</div>
 								))}
 						</>
@@ -2515,12 +2582,12 @@ export default function App() {
 						(errors[`history:${dialogOwner}`] ? (
 							<ErrorBanner>{errors[`history:${dialogOwner}`]}</ErrorBanner>
 						) : (
-							<p>전체 기록 불러오는 중…</p>
+							<p>{t("shell.loadingFullHistory")}</p>
 						))}
 					{dialog === "history" && history !== null && (
 						<>
 							<p className="muted">
-								전체 {history.total}개 중 {history.messages.length}개를 표시합니다.
+								{t("shell.historyShown", { shown: history.messages.length, total: history.total })}
 							</p>
 							<div className="history-list">
 								{history.messages.map(message => (
@@ -2529,7 +2596,7 @@ export default function App() {
 							</div>
 							{history.truncated && (
 								<Button disabled={pending[`history:${dialogOwner}`]} onClick={loadMoreHistory}>
-									다음 500개 불러오기
+									{t("shell.loadMoreHistory")}
 								</Button>
 							)}
 						</>
@@ -2544,16 +2611,16 @@ export default function App() {
 								});
 							}}
 						>
-							<label htmlFor="session-title">대화 이름</label>
+							<label htmlFor="session-title">{t("shell.conversationName")}</label>
 							<input id="session-title" value={editText} onChange={event => setEditText(event.target.value)} />
 							<Button type="submit" disabled={!connected || pending[selected] || !editText.trim()}>
-								저장
+								{t("support.save")}
 							</Button>
 						</form>
 					)}
 					{dialog === "delete" && (
 						<>
-							<p>“{session?.title}” 대화를 삭제할까요? 이 작업은 되돌릴 수 없습니다.</p>
+							<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>
 							<Button
 								className="danger"
 								disabled={!connected || pending[selected]}
@@ -2564,16 +2631,16 @@ export default function App() {
 									})
 								}
 							>
-								대화 삭제
+								{t("shell.dialogDelete")}
 							</Button>
 						</>
 					)}
 					{dialog === "tools" && (
 						<>
 							{pending[toolsScope] ? (
-								<p>도구 불러오는 중…</p>
+								<p>{t("shell.loadingTools")}</p>
 							) : toolNames.length === 0 ? (
-								<p>사용 가능한 도구가 없습니다.</p>
+								<p>{t("shell.noTools")}</p>
 							) : (
 								toolNames.map(name => (
 									<label className="checkbox-label" key={name}>
@@ -2593,13 +2660,13 @@ export default function App() {
 								))
 							)}
 							<Button disabled={!connected || pending[toolsScope] || !!errors[toolsScope]} onClick={saveTools}>
-								도구 저장
+								{t("shell.saveTools")}
 							</Button>
 						</>
 					)}
 					{dialog === "goal" && (
 						<>
-							<label htmlFor="objective">목표</label>
+							<label htmlFor="objective">{t("shell.objective")}</label>
 							<textarea
 								id="objective"
 								rows={4}
@@ -2609,12 +2676,12 @@ export default function App() {
 							<div className="actions">
 								{(
 									[
-										["create", "생성"],
-										["get", "조회"],
-										["resume", "재개"],
-										["pause", "일시 중지"],
-										["complete", "완료"],
-										["drop", "목표 해제"],
+										["create", t("shell.goalCreate")],
+										["get", t("shell.goalGet")],
+										["resume", t("shell.goalResume")],
+										["pause", t("shell.goalPause")],
+										["complete", t("shell.goalComplete")],
+										["drop", t("shell.goalDrop")],
 									] as const
 								).map(([op, label]) => (
 									<Button

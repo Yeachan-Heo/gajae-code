@@ -114,7 +114,7 @@ describe("frame writer", () => {
 	test("delivers a frame larger than a pipe buffer without splitting it", async () => {
 		const chunks: Uint8Array[] = [];
 		const writer = createFrameWriter({ write: sinkThatChunks(chunks, 0) });
-		const frame: DesktopFrame = { type: "response", id: "large", ok: true, result: "한글🙂".repeat(10_000) };
+		const frame: DesktopFrame = { type: "response", id: "large", ok: true, result: "gajae🙂".repeat(10_000) };
 		const expected = Buffer.from(`${JSON.stringify(frame)}\n`);
 		expect(expected.length).toBeGreaterThan(64 * 1024);
 		writer.write(frame);

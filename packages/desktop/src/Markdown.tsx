@@ -1,6 +1,7 @@
 import { decodeHTMLStrict } from "entities";
 import { Marked, type MarkedToken, type Token, type Tokens } from "marked";
 import { Fragment, type ReactNode, useState } from "react";
+import { t } from "./i18n";
 
 const markdown = new Marked({ gfm: true, breaks: false });
 
@@ -13,7 +14,7 @@ function safeLink(href: string): boolean {
 
 function CodeBlock({ token, code }: { token: Tokens.Code; code: string }) {
 	const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
-	const language = token.lang?.split(/\s+/u)[0] || "텍스트";
+	const language = token.lang?.split(/\s+/u)[0] || t("support.markdownPlainText");
 	async function copy() {
 		try {
 			await navigator.clipboard.writeText(code);
@@ -27,10 +28,14 @@ function CodeBlock({ token, code }: { token: Tokens.Code; code: string }) {
 			<div className="markdown-code-header">
 				<span className="markdown-code-language">{language}</span>
 				<button type="button" className="markdown-code-copy" onClick={copy}>
-					코드 복사
+					{t("support.markdownCopyCode")}
 				</button>
 				<span className="markdown-code-status" role="status">
-					{status === "copied" ? "복사됨" : status === "failed" ? "복사 실패" : ""}
+					{status === "copied"
+						? t("support.markdownCopied")
+						: status === "failed"
+							? t("support.markdownCopyFailed")
+							: ""}
 				</span>
 			</div>
 			<pre className="markdown-code-content" style={{ overflow: "auto", maxHeight: "24rem" }}>
@@ -80,7 +85,7 @@ function renderToken(input: Token): ReactNode {
 							type="checkbox"
 							checked={!!item.checked}
 							disabled
-							aria-label={item.checked ? "완료" : "미완료"}
+							aria-label={item.checked ? t("support.markdownTaskDone") : t("support.markdownTaskOpen")}
 						/>
 					)}
 					{renderTokens(item.tokens)}

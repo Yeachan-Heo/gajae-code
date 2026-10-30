@@ -137,13 +137,15 @@ const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
 const DESKTOP_OWNED_COMMANDS = new Set(["move", "session", "star", "unstar", "handoff"]);
 /** Refusal copy names the app control that does the job, because one generic hint fits none. */
 const DESKTOP_OWNED_REFUSALS: Record<string, string> = {
-	move: "/move는 세션 파일 경로를 바꾸므로 지원하지 않습니다. 프로젝트 목록의 '새 대화'로 세션을 시작하세요.",
-	session: "/session은 지원하지 않습니다. 대화 목록에서 세션을 선택하거나 상단 '삭제' 버튼을 사용하세요.",
-	star: "즐겨찾기는 대화 목록의 별표 버튼으로 설정하세요.",
-	unstar: "즐겨찾기 해제는 대화 목록의 별표 버튼으로 설정하세요.",
-	handoff: "/handoff는 세션 정체성을 바꾸므로 앱에서 지원하지 않습니다. 새 대화로 이어가세요.",
+	move: "/move changes the session file path, so it is not supported. Start a session with 'New conversation' in the project list.",
+	session:
+		"/session is not supported. Select a session in the conversation list, or use the 'Delete' button at the top.",
+	star: "Use the star button in the conversation list to star a conversation.",
+	unstar: "Use the star button in the conversation list to unstar a conversation.",
+	handoff: "/handoff changes the session identity, so the app does not support it. Continue in a new conversation.",
 };
-const DESKTOP_UNAVAILABLE = "이 명령은 데스크톱 앱에서 사용할 수 없습니다. 일반 메시지는 슬래시 없이 보내세요.";
+const DESKTOP_UNAVAILABLE =
+	"This command is not available in the desktop app. Send ordinary messages without a leading slash.";
 /** Commands the palette advertises; everything else is refused before dispatch. */
 const ADVERTISED_COMMANDS = new Set(
 	ACP_BUILTIN_SLASH_COMMANDS.filter(command => !DESKTOP_OWNED_COMMANDS.has(command.name)).map(command => command.name),
@@ -161,7 +163,7 @@ export const CAPABILITIES: DesktopCapability[] = [
 		reason: "Terminal-only SDK UI cannot be rendered by the desktop protocol.",
 	},
 	{
-		id: "upstream-7322",
+		id: "upstream-selectors",
 		label: "Terminal-only selectors and remaining runtime parity",
 		available: false,
 		reason: "TUI modal commands and private controllers are not exposed as SDK operations yet.",
@@ -171,7 +173,7 @@ export const CAPABILITIES: DesktopCapability[] = [
 		label: "CLI subprocess workers and daemon reentry",
 		available: false,
 		reason:
-			"The standalone desktop entrypoint has no CLI subcommand dispatcher; worker/daemon reentry requires #7322 embedding support.",
+			"The standalone desktop entrypoint has no CLI subcommand dispatcher; worker and daemon reentry need embedding support the public SDK does not expose yet.",
 	},
 	{
 		id: "oauth",
@@ -273,7 +275,7 @@ export function desktopSettings(settings: Settings): DesktopSetting[] {
 				value: settings.get(path),
 				type: definition.type,
 				description: TERMINAL_ONLY_SETTING.test(path)
-					? `${ui?.description ?? ""} (터미널 전용: 데스크톱 앱 화면에는 영향을 주지 않습니다.)`.trim()
+					? `${ui?.description ?? ""} (Terminal only: does not affect the desktop app UI.)`.trim()
 					: (ui?.description ?? "Application-wide setting; persisted to the desktop config."),
 				...(choices && choices.length > 0 ? { choices } : {}),
 				writable: settings.canPersistDurableConfig() && !TERMINAL_ONLY_SETTING.test(path),
@@ -576,9 +578,7 @@ export class DesktopHost {
 	}
 	#assertModelCatalogReady(registry: ModelRegistry): void {
 		if (this.#failedCatalogRefreshes.has(registry))
-			throw new Error(
-				"모델 목록을 새로 고치지 못했습니다. 목록 다시 불러오기로 재시도하세요. 저장된 자격 증명은 유지됩니다.",
-			);
+			throw new Error("Model list refresh failed. Retry by reloading the list; saved credentials are preserved.");
 	}
 	#rememberCredentials(): void {
 		for (const entries of Object.values(this.#auth!.getAll())) {
@@ -641,7 +641,7 @@ export class DesktopHost {
 								? block
 								: {
 										type: "image-unavailable" as const,
-										reason: "보안상의 이유로 이미지를 미리 볼 수 없습니다.",
+										reason: "Image preview is unavailable for security reasons.",
 									};
 						}),
 					}),
@@ -715,7 +715,7 @@ export class DesktopHost {
 			activity.sessionState.gates.pending = activity.sessionState.gates.pending.map(gate => ({
 				...gate,
 				answerable: false,
-				reason: live.gateUnavailable ?? "이 세션에는 승인 화면 제어기가 연결되지 않았습니다.",
+				reason: live.gateUnavailable ?? "No approval UI controller is connected to this session.",
 			}));
 		}
 		const serialized = JSON.stringify(activity);
@@ -856,14 +856,14 @@ export class DesktopHost {
 						candidate.notices.push({
 							id: `profile:${metadata.id}`,
 							role: "system",
-							text: `기본 모델 프로필(${defaultProfile})을 적용하지 못했습니다. 설정에서 모델을 선택하세요.`,
+							text: `Could not apply the default model profile (${defaultProfile}). Choose a model in settings.`,
 							isError: true,
 						});
 				} catch (error) {
 					candidate.notices.push({
 						id: `profile:${metadata.id}`,
 						role: "system",
-						text: `기본 모델 프로필(${defaultProfile})을 적용하지 못했습니다: ${String(error).slice(0, 300)}`,
+						text: `Could not apply the default model profile (${defaultProfile}): ${String(error).slice(0, 300)}`,
 						isError: true,
 					});
 				}
@@ -1600,7 +1600,7 @@ export class DesktopHost {
 		recordFailure?: string,
 	): Promise<T> {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
-			throw new Error("다른 작업이 실행 중입니다. 끝난 뒤 다시 시도하세요.");
+			throw new Error("Another operation is running. Try again when it finishes.");
 		live.busy = true;
 		live.gateMutation = retireGates;
 		live.error = undefined;
@@ -1829,7 +1829,11 @@ export class DesktopHost {
 							...(command.input?.hint ? { hint: command.input.hint } : {}),
 						}) satisfies DesktopCommand,
 				),
-				{ name: "btw", description: "기존 대화와 분리된 텍스트 전용 별도 대화", hint: "<question>" },
+				{
+					name: "btw",
+					description: "Text-only side chat separate from the existing conversation",
+					hint: "<question>",
+				},
 			];
 		if (method === "command.run")
 			return this.#command(this.#metadata(params), requiredString(params, "text"), request.id);
@@ -1915,7 +1919,9 @@ export class DesktopHost {
 		if (method === "abort") {
 			if (live.operator?.isBusy()) {
 				if (!live.operatorCurrentId)
-					throw new Error("이전 명령의 정산을 기다리고 있습니다. 현재 대화에서 중지를 증명할 수 없습니다.");
+					throw new Error(
+						"Waiting for the previous command to settle. Stop cannot be proven for this conversation.",
+					);
 				live.operator.abort({ operationId: live.operatorCurrentId });
 				this.#publish(live);
 				return null;
@@ -1931,12 +1937,12 @@ export class DesktopHost {
 		if (method.startsWith("btw.")) {
 			this.#refreshSessionServices(live);
 			const controller = live.btw;
-			if (!controller) throw new Error("이 대화의 별도 대화 제어기가 연결되지 않았습니다.");
+			if (!controller) throw new Error("No side-chat controller is connected to this conversation.");
 			const { sessionId: _sessionId, sessionGeneration, ...input } = params;
 			if (!Number.isSafeInteger(sessionGeneration) || sessionGeneration !== live.sdk.sessionLifecycle.generation)
-				throw new Error("세션이 변경되었습니다. 별도 대화를 다시 여세요.");
+				throw new Error("The session changed. Open the side chat again.");
 			if ((method === "btw.open" || method === "btw.submit") && live.gateMutation)
-				throw new Error("세션 변경이 끝난 뒤 별도 대화를 다시 여세요.");
+				throw new Error("Open the side chat again after the session change finishes.");
 			switch (method) {
 				case "btw.get":
 					if (Object.keys(input).length) throw new Error("Invalid side-chat read parameters");
@@ -1954,7 +1960,7 @@ export class DesktopHost {
 		}
 		if (method.startsWith("operator.")) {
 			const operator = live.operator;
-			if (!operator) throw new Error("이 대화의 명령 실행 제어기가 연결되지 않았습니다.");
+			if (!operator) throw new Error("No command execution controller is connected to this conversation.");
 			const allowed =
 				method === "operator.execute"
 					? ["sessionId", "text"]
@@ -2002,7 +2008,9 @@ export class DesktopHost {
 			if (!presenter) throw new Error(live.gateUnavailable ?? "No owned gate presenter for this session");
 			if (method === "gate.present") {
 				if (live.gateMutation)
-					throw new Error("세션 변경 전에 기존 승인 화면을 닫고 있습니다. 변경 완료 후 다시 여세요.");
+					throw new Error(
+						"Existing approval screens are closing before the session change. Open this one again after the change finishes.",
+					);
 				return presenter.present(readActivityRef(params.ref));
 			}
 			const id = requiredString(params, "presentationId", 128);
@@ -2043,12 +2051,12 @@ export class DesktopHost {
 			return { available: live.sdk.getAllToolNames(), active: live.sdk.getActiveToolNames() };
 		if (method === "diff.get") return this.#diff(metadata.projectId);
 		if (method === "prompt") {
-			if (live.gateMutation) throw new Error("세션 변경이 끝난 뒤 메시지를 보내세요.");
+			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
 			await this.#awaitStartup(live);
 			if (!attachmentInput) throw new Error("Prompt attachment envelope was not validated");
 			let { text, images } = attachmentInput;
-			if (live.gateMutation) throw new Error("세션 변경이 끝난 뒤 메시지를 보내세요.");
-			if (live.operator?.isBusy()) throw new Error("명령 실행이 끝난 뒤 메시지를 보내세요.");
+			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
+			if (live.operator?.isBusy()) throw new Error("Send the message after the command finishes.");
 			if (live.busy || live.sdk.isStreaming) {
 				const input = await this.#extensionInput(live, request.id, text, images);
 				if (input.handled) return null;
@@ -2279,7 +2287,9 @@ export class DesktopHost {
 							.getAvailable(live.sdk.credentialSessionId)
 							.find(model => `${model.provider}/${model.id}` === modelId);
 						if (!model)
-							throw new Error("등록된 제공자에서 사용할 수 없는 모델입니다. 제공자 등록과 인증을 확인하세요.");
+							throw new Error(
+								"This model is not available from a registered provider. Check provider registration and authentication.",
+							);
 						const level =
 							params.thinkingLevel === undefined
 								? undefined
@@ -2418,11 +2428,15 @@ export class DesktopHost {
 				.replace(/^\/btw(?:\s+|$)/i, "")
 				.trim();
 			if (!question)
-				return { consumed: false, refused: true, output: "별도 대화 메뉴를 열거나 /btw <질문>을 입력하세요." };
+				return { consumed: false, refused: true, output: "Open the side-chat menu or type /btw <question>." };
 			this.#refreshSessionServices(live);
-			if (live.gateMutation || !live.btw) throw new Error("세션 변경이 끝난 뒤 별도 대화를 다시 여세요.");
+			if (live.gateMutation || !live.btw)
+				throw new Error("Open the side chat again after the session change finishes.");
 			live.btw.open({ question });
-			return { consumed: true, output: "별도 대화 요청을 접수했습니다. 기존 대화 기록에는 추가하지 않습니다." };
+			return {
+				consumed: true,
+				output: "Side-chat request accepted. It is not added to the existing conversation history.",
+			};
 		}
 		if (DESKTOP_OWNED_COMMANDS.has(name))
 			return { consumed: false, refused: true, output: DESKTOP_OWNED_REFUSALS[name] ?? DESKTOP_UNAVAILABLE };
@@ -2473,7 +2487,8 @@ export class DesktopHost {
 					return {
 						consumed: false,
 						refused: true,
-						output: "이 명령은 데스크톱 앱에서 사용할 수 없습니다. 일반 메시지는 슬래시 없이 보내세요.",
+						output:
+							"This command is not available in the desktop app. Send ordinary messages without a leading slash.",
 					};
 				} else {
 					// Plain text: forward as a prompt, matching ACP mode.

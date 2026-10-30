@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { assertDesktopAttachmentRequestSize } from "../../desktop-host/src/attachment-protocol";
 import type { DesktopFrame, DesktopMethod, DesktopRequest } from "../../desktop-host/src/protocol";
+import { t } from "./i18n";
 
 export class DesktopRequestError extends Error {
 	constructor(
@@ -55,8 +56,7 @@ function receive(frame: DesktopFrame): void {
 }
 
 async function connect(): Promise<void> {
-	if (!isTauri())
-		throw new Error("데스크톱 앱에서 실행해 주세요. 브라우저에서는 ?showcase로 디자인을 확인할 수 있습니다.");
+	if (!isTauri()) throw new Error(t("support.desktopOnly"));
 	if (!connection) {
 		connection = listen<DesktopFrame>("engine-frame", event => receive(event.payload))
 			.then(() => undefined)
@@ -102,8 +102,7 @@ export async function request<T>(
 
 export async function openAuthUrl(url: string): Promise<void> {
 	const parsed = new URL(url);
-	if (parsed.protocol !== "https:" || parsed.username || parsed.password)
-		throw new Error("안전한 HTTPS 인증 주소만 열 수 있습니다.");
+	if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error(t("support.secureAuthUrl"));
 	await connect();
 	await invoke("open_auth_url", { url });
 }

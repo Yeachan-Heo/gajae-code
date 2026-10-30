@@ -94,7 +94,7 @@ describe("desktop Markdown clipboard", () => {
 				Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => { document.body.dataset.copied = text; } } });
 			});
 			await page.click("#markdown-clipboard-fixture .markdown-code-copy");
-			await page.waitForFunction(() => document.querySelector('#markdown-clipboard-fixture [role="status"]')?.textContent === "복사됨");
+			await page.waitForFunction(() => document.querySelector('#markdown-clipboard-fixture [role="status"]')?.textContent === "Copied");
 			expect(await page.evaluate(() => document.body.dataset.copied)).toBe('  const x = "<tag>";\n');
 			expect(await page.evaluate(() => document.body.dataset.copied)).toBe(await page.$eval('#markdown-clipboard-fixture pre code', element => element.textContent));
 			await page.evaluate(text => {
@@ -106,7 +106,7 @@ describe("desktop Markdown clipboard", () => {
 				Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("denied"); } } });
 			});
 			await page.click("#markdown-clipboard-fixture .markdown-code-copy");
-			await page.waitForFunction(() => document.querySelector('#markdown-clipboard-fixture [role="status"]')?.textContent === "복사 실패");
+			await page.waitForFunction(() => document.querySelector('#markdown-clipboard-fixture [role="status"]')?.textContent === "Copy failed");
 			await page.evaluate(text => {
 				document.querySelector('#markdown-clipboard-fixture')?.dispatchEvent(new CustomEvent('markdown-update', { detail: text }));
 			}, initial);

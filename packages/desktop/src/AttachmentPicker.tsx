@@ -10,6 +10,7 @@ import {
 	validateDesktopAttachmentText,
 } from "../../desktop-host/src/attachment-protocol";
 import { Button } from "./components";
+import { t } from "./i18n";
 
 type DraftIdentity = { id: string; name: string; size: number };
 export type DesktopAttachmentDraft = DraftIdentity &
@@ -64,7 +65,7 @@ export async function readDesktopAttachmentFile(
 	options: { supportsImageInput: boolean; imagesBlocked?: boolean },
 ): Promise<DesktopAttachment> {
 	validateDesktopAttachmentName(file.name);
-	if (file.size > DESKTOP_ATTACHMENT_REQUEST_BYTES) throw new Error("파일이 8 MiB 요청 한도를 초과합니다.");
+	if (file.size > DESKTOP_ATTACHMENT_REQUEST_BYTES) throw new Error(t("support.attachmentFileTooLarge"));
 	const declaredMime = file.type.toLowerCase();
 	const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
 	const mimeType =
@@ -73,29 +74,29 @@ export async function readDesktopAttachmentFile(
 			: declaredMime;
 	const image = mimeType.startsWith("image/");
 	if (image) {
-		if (!file.size) throw new Error("빈 이미지는 첨부할 수 없습니다.");
-		if (!isDesktopAttachmentImageMime(mimeType)) throw new Error("PNG, JPEG, GIF, WebP 이미지만 지원합니다.");
-		if (!options.supportsImageInput) throw new Error("선택한 모델은 이미지 입력을 지원하지 않습니다.");
-		if (options.imagesBlocked) throw new Error("SDK 설정에서 이미지 입력이 차단되어 있습니다.");
+		if (!file.size) throw new Error(t("support.attachmentEmptyImage"));
+		if (!isDesktopAttachmentImageMime(mimeType)) throw new Error(t("support.attachmentUnsupportedImage"));
+		if (!options.supportsImageInput) throw new Error(t("support.attachmentModelNoImage"));
+		if (options.imagesBlocked) throw new Error(t("support.attachmentImagesBlocked"));
 		if (Math.ceil(file.size / 3) * 4 > DESKTOP_ATTACHMENT_REQUEST_BYTES)
-			throw new Error("이미지의 base64 데이터가 8 MiB 요청 한도를 초과합니다.");
+			throw new Error(t("support.attachmentImageTooLarge"));
 	} else if (
 		mimeType &&
 		mimeType !== "application/octet-stream" &&
 		!mimeType.startsWith("text/") &&
 		!TEXT_APPLICATION_MIMES.has(mimeType)
 	) {
-		throw new Error("UTF-8 텍스트·코드 파일과 지원되는 이미지만 첨부할 수 있습니다.");
+		throw new Error(t("support.attachmentUnsupportedType"));
 	}
 	const bytes = new Uint8Array(await file.arrayBuffer());
-	if (bytes.byteLength !== file.size) throw new Error("파일 읽기를 완료하지 못했습니다. 다시 선택하세요.");
+	if (bytes.byteLength !== file.size) throw new Error(t("support.attachmentReadIncomplete"));
 	if (image && isDesktopAttachmentImageMime(mimeType))
 		return { kind: "image", name: file.name, mimeType, data: encodeBase64(bytes) };
 	let text: string;
 	try {
 		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
 	} catch {
-		throw new Error("올바른 UTF-8 텍스트 파일이 아닙니다.");
+		throw new Error(t("support.attachmentInvalidUtf8"));
 	}
 	validateDesktopAttachmentText(text);
 	return { kind: "text", name: file.name, text };
@@ -103,13 +104,12 @@ export async function readDesktopAttachmentFile(
 
 /** Parent must call before sending: pending/error chips cannot become silent attachment drops. */
 export function readyDesktopAttachments(drafts: DesktopAttachmentDraft[]): DesktopAttachment[] {
-	if (drafts.some(draft => draft.status === "reading")) throw new Error("첨부 파일 읽기가 끝날 때까지 기다리세요.");
-	if (drafts.some(draft => draft.status === "error"))
-		throw new Error("오류가 있는 첨부 파일을 제거하고 다시 선택하세요.");
-	if (drafts.length > DESKTOP_ATTACHMENT_MAX_COUNT) throw new Error("첨부 파일은 최대 16개까지 선택할 수 있습니다.");
+	if (drafts.some(draft => draft.status === "reading")) throw new Error(t("support.attachmentWaitForRead"));
+	if (drafts.some(draft => draft.status === "error")) throw new Error(t("support.attachmentRemoveErrors"));
+	if (drafts.length > DESKTOP_ATTACHMENT_MAX_COUNT) throw new Error(t("support.attachmentTooMany"));
 	const attachments = drafts.flatMap(draft => (draft.status === "ready" ? [draft.attachment] : []));
 	if (desktopAttachmentJsonBytes(attachments) > DESKTOP_ATTACHMENT_REQUEST_BYTES)
-		throw new Error("첨부 파일 데이터가 8 MiB 요청 한도를 초과합니다.");
+		throw new Error(t("support.attachmentTotalTooLarge"));
 	return attachments;
 }
 
@@ -130,7 +130,7 @@ export function settleDesktopAttachmentDraft(
 							name: draft.name,
 							size: draft.size,
 							status: "error",
-							error: "첨부 파일의 합계가 8 MiB 요청 한도를 초과합니다.",
+							error: t("support.attachmentTotalTooLarge"),
 						}
 					: draft,
 			);
@@ -179,10 +179,10 @@ export function addDesktopAttachmentFiles(
 			DESKTOP_ATTACHMENT_REQUEST_BYTES;
 	const selectionError: DesktopAttachmentDraft = {
 		id: `selection-error-${crypto.randomUUID()}`,
-		name: "첨부 선택",
+		name: t("support.attachmentSelectionName"),
 		size: 0,
 		status: "error",
-		error: "최대 16개 파일, 합계 8 MiB 미만으로 선택하세요. base64·요청 정보도 한도에 포함됩니다.",
+		error: t("support.attachmentSelectionLimit"),
 	};
 	const showSelectionError = (current: DesktopAttachmentDraft[]) => [
 		...current.filter(draft => !draft.id.startsWith("selection-error-")),
@@ -207,7 +207,7 @@ export function addDesktopAttachmentFiles(
 					name: draft.name,
 					size: draft.size,
 					status: "error",
-					error: error instanceof Error ? error.message : "파일을 읽지 못했습니다. 다시 선택하세요.",
+					error: error instanceof Error ? error.message : t("support.attachmentReadFailed"),
 				};
 			}
 			onChange(owner, current => settleDesktopAttachmentDraft(current, result));
@@ -232,14 +232,14 @@ export function AttachmentPicker({
 			files,
 		);
 	return (
-		<div className="attachment-picker" role="group" aria-label="첨부 파일" aria-busy={pending}>
+		<div className="attachment-picker" role="group" aria-label={t("support.attachments")} aria-busy={pending}>
 			<input
 				ref={input}
 				type="file"
 				multiple
 				hidden
 				tabIndex={-1}
-				aria-label="UTF-8 텍스트·코드 또는 이미지 파일 선택"
+				aria-label={t("support.attachmentChooseFile")}
 				disabled={disabled}
 				onChange={event => {
 					addFiles([...(event.currentTarget.files ?? [])]);
@@ -249,19 +249,19 @@ export function AttachmentPicker({
 			<Button
 				className="attachment-trigger"
 				disabled={disabled}
-				aria-label="파일 첨부"
+				aria-label={t("support.attachmentAttachFile")}
 				onClick={() => input.current?.click()}
 			>
 				<Paperclip size={15} aria-hidden="true" />
 			</Button>
 			{!imagesAvailable && (
 				<small className="attachment-hint">
-					{imagesBlocked ? "SDK 설정에서 이미지 입력 차단됨" : "선택한 모델은 이미지 입력 미지원"}
+					{imagesBlocked ? t("support.attachmentImagesBlockedShort") : t("support.attachmentModelNoImageShort")}
 				</small>
 			)}
-			{pending && <small role="status">첨부 파일 읽는 중… 완료 전에는 보낼 수 없습니다.</small>}
+			{pending && <small role="status">{t("support.attachmentReading")}</small>}
 			{attachments.length > 0 && (
-				<ul className="attachment-list" aria-label="선택한 첨부 파일">
+				<ul className="attachment-list" aria-label={t("support.attachmentSelected")}>
 					{attachments.map(draft => {
 						const unavailable = draft.status === "ready" && draft.attachment.kind === "image" && !imagesAvailable;
 						return (
@@ -271,20 +271,16 @@ export function AttachmentPicker({
 							>
 								<span className="attachment-name">{draft.name}</span>
 								<small>{formatSize(draft.size)}</small>
-								{draft.status === "reading" && <small>읽는 중…</small>}
+								{draft.status === "reading" && <small>{t("support.attachmentReadingShort")}</small>}
 								{draft.status === "error" && <small role="alert">{draft.error}</small>}
-								{unavailable && (
-									<small role="alert">
-										이미지 입력을 사용할 수 없습니다. 이미지를 제거하거나 모델·설정을 변경하세요.
-									</small>
-								)}
+								{unavailable && <small role="alert">{t("support.attachmentImageUnavailable")}</small>}
 								<Button
-									aria-label={`${draft.name} 첨부 제거`}
+									aria-label={t("support.attachmentRemove", { name: draft.name })}
 									disabled={disabled}
 									onClick={() => onChange(sessionId, current => current.filter(item => item.id !== draft.id))}
 								>
 									<X size={13} aria-hidden="true" />
-									제거
+									{t("support.remove")}
 								</Button>
 							</li>
 						);

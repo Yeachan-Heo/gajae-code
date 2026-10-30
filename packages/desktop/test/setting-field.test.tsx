@@ -75,7 +75,7 @@ describe("desktop setting field control types", () => {
 	});
 
 	test("read-only settings explain themselves on the save action", () => {
-		expect(render({ writable: false })).toContain("읽기 전용");
-		expect(render({}, true)).toContain("연결 또는 처리 대기");
+		expect(render({ writable: false })).toContain("Read only");
+		expect(render({}, true)).toContain("Waiting for the connection");
 	});
 });

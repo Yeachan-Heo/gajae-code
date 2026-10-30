@@ -12,9 +12,11 @@ import type {
 } from "../../desktop-host/src/protocol";
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "../../desktop-host/src/session-info-protocol";
 import { AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
+import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
 import { ForkPanel, type ForkPanelProps } from "./ForkPanel";
+import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
@@ -30,9 +32,11 @@ const fixtureModels: DesktopModel[] = Array.from(
 	(_, index): DesktopModel => ({
 		id: `design-fixture-${index % 2 === 0 ? "a" : "b"}/model-${index + 1}`,
 		name:
+			// Retained CJK width fixture: the only Hangul left in the showcase, kept so model-name
+			// truncation and mixed-script layout stay covered.
 			index === 0
 				? "한국어와 TypeScript를 함께 검토하는 긴 이름의 디자인 예시 모델"
-				: `디자인 예시 모델 ${index + 1}`,
+				: t("showcase.modelFixtureName", { index: index + 1 }),
 		provider: index % 2 === 0 ? "design-fixture-a" : "design-fixture-b",
 		contextWindow: 128000,
 		reasoning: index !== 83,
@@ -42,8 +46,16 @@ const fixtureModels: DesktopModel[] = Array.from(
 				: {
 						mode: "effort",
 						options: [
-							{ value: "medium", label: "기본 예시", description: "실제 추론 설정이 아닌 디자인 예시입니다." },
-							{ value: "high", label: "깊이 검토하는 예시", description: "긴 선택지의 줄바꿈을 검토합니다." },
+							{
+								value: "medium",
+								label: t("showcase.reasoningOptionMediumLabel"),
+								description: t("showcase.reasoningOptionMediumDescription"),
+							},
+							{
+								value: "high",
+								label: t("showcase.reasoningOptionHighLabel"),
+								description: t("showcase.reasoningOptionHighDescription"),
+							},
 						],
 					},
 	}),
@@ -89,7 +101,7 @@ function FixtureControls({
 	const profiles: DesktopModelProfile[] = [
 		{
 			id: "design-fixture-default",
-			name: "기본 프로필",
+			name: t("showcase.profileDefaultName"),
 			description: null,
 			source: "builtin",
 			active: appliedProfile === "design-fixture-default",
@@ -109,7 +121,7 @@ function FixtureControls({
 		},
 		{
 			id: "design-fixture-review",
-			name: "리뷰 집중 프로필",
+			name: t("showcase.profileReviewName"),
 			description: null,
 			source: "configured",
 			active: appliedProfile === "design-fixture-review",
@@ -124,7 +136,7 @@ function FixtureControls({
 			],
 			capabilities: {
 				selectSession: { available: true, reason: null },
-				persistDefault: { available: false, reason: "디자인 예시" },
+				persistDefault: { available: false, reason: t("showcase.profileDefaultUnavailable") },
 			},
 		},
 	];
@@ -137,7 +149,7 @@ function FixtureControls({
 		scope: selectedModel ? "session" : null,
 		available: selectedModel?.reasoning ?? false,
 		mode: selectedModel?.thinking.mode,
-		reason: selectedModel?.reasoning ? undefined : "디자인 예시 · 사용할 추론 옵션이 없습니다.",
+		reason: selectedModel?.reasoning ? undefined : t("showcase.reasoningUnavailable"),
 	};
 	return (
 		<div className="model-controls">
@@ -165,8 +177,8 @@ function FixtureControls({
 			<ReasoningSelect thinking={thinking} disabled={disabled} pending={pending} onChange={setLevel} />
 			<small className="model-control-status fixture-note">
 				{running
-					? "실행 중 디자인 예시 · 실제 요청 없음"
-					: `디자인 전용 · 실제 모델 아님${appliedProfileName ? ` · 프로필 ${appliedProfileName}` : ""}${refreshes > 0 ? ` · 새로고침 ${refreshes}회` : ""}`}
+					? t("showcase.modelControlsRunning")
+					: `${t("showcase.modelControlsIdle")}${appliedProfileName ? t("showcase.modelControlsProfile", { name: appliedProfileName }) : ""}${refreshes > 0 ? t("showcase.modelControlsRefreshes", { count: refreshes }) : ""}`}
 			</small>
 		</div>
 	);
@@ -189,7 +201,7 @@ const fixtureMcpSnapshot: DesktopMcpSnapshot = {
 				sessionGeneration: 0,
 				key: "DESIGN-ONLY-server",
 			},
-			label: "DESIGN-ONLY · 한국어와日本語と中文이 함께 있는 아주 긴 프로젝트 문서 검색 관리자 연결 예시",
+			label: t("showcase.mcpServerLabel"),
 			state: "connected",
 			transport: "stdio",
 			sharing: "per-session",
@@ -198,11 +210,11 @@ const fixtureMcpSnapshot: DesktopMcpSnapshot = {
 		},
 	],
 };
-const fixtureMcpConnected: McpFixture = { label: "연결됨", snapshot: fixtureMcpSnapshot };
+const fixtureMcpConnected: McpFixture = { label: t("showcase.mcpStateConnected"), snapshot: fixtureMcpSnapshot };
 const fixtureMcpStates: McpFixture[] = [
 	fixtureMcpConnected,
 	{
-		label: "일시 중지",
+		label: t("showcase.mcpStateSuspended"),
 		snapshot: {
 			...fixtureMcpSnapshot,
 			servers: fixtureMcpSnapshot.servers.map(
@@ -211,21 +223,21 @@ const fixtureMcpStates: McpFixture[] = [
 		},
 	},
 	{
-		label: "제어 없음",
+		label: t("showcase.mcpStateNoControls"),
 		snapshot: {
 			...fixtureMcpSnapshot,
 			servers: fixtureMcpSnapshot.servers.map((server): DesktopMcpServer => ({ ...server, controls: [] })),
 		},
 	},
 	{
-		label: "공유 관리자",
+		label: t("showcase.mcpStateShared"),
 		snapshot: {
 			...fixtureMcpSnapshot,
 			servers: fixtureMcpSnapshot.servers.map((server): DesktopMcpServer => ({ ...server, sharing: "shared" })),
 		},
 	},
 	{
-		label: "알 수 없음",
+		label: t("showcase.mcpStateUnknown"),
 		snapshot: {
 			...fixtureMcpSnapshot,
 			servers: fixtureMcpSnapshot.servers.map(
@@ -240,54 +252,47 @@ const fixtureMcpStates: McpFixture[] = [
 		},
 	},
 	{
-		label: "사용 불가",
+		label: t("showcase.mcpStateUnavailable"),
 		snapshot: {
 			...fixtureMcpSnapshot,
 			available: false,
 			servers: [],
 			error: {
 				code: "unavailable",
-				message: "DESIGN-ONLY · 관리자 기능 제공 불가 예시입니다. 서버 종료나 자원 정산을 뜻하지 않습니다.",
+				message: t("showcase.mcpUnavailableMessage"),
 			},
 		},
 	},
 	{
-		label: "효과 불명 오류",
+		label: t("showcase.mcpStateUnknownEffect"),
 		snapshot: {
 			...fixtureMcpSnapshot,
 			error: {
 				code: "unknown_effect",
-				message: "DESIGN-ONLY · 연결 변경 결과를 확인하지 못한 오류 예시입니다. 재개 성공을 뜻하지 않습니다.",
+				message: t("showcase.mcpUnknownEffectMessage"),
 			},
 		},
-		error: "디자인 전용 · 전송 오류와 마지막 관리자 정보 표시 예시",
+		error: t("showcase.mcpTransportError"),
 	},
-	{ label: "요청 대기", snapshot: fixtureMcpSnapshot, pending: true },
-	{ label: "작업 중 · 조회 가능", snapshot: fixtureMcpSnapshot, busy: true },
-	{ label: "아직 정보 없음", snapshot: null },
+	{ label: t("showcase.mcpStatePending"), snapshot: fixtureMcpSnapshot, pending: true },
+	{ label: t("showcase.mcpStateBusy"), snapshot: fixtureMcpSnapshot, busy: true },
+	{ label: t("showcase.mcpStateEmpty"), snapshot: null },
 ];
 
 function FixtureMcpPanel() {
 	const [fixture, setFixture] = useState(fixtureMcpConnected);
-	const [notice, setNotice] = useState(
-		"DESIGN-ONLY · 버튼은 설명만 표시합니다. 실제 연결·도구 카탈로그·서버 상태를 변경하지 않습니다.",
-	);
+	const [notice, setNotice] = useState(t("showcase.mcpNoticeInitial"));
 	return (
 		<>
-			<p className="fixture-note muted">
-				디자인 전용 · 실제 McpPanel에 가상 표시 정보만 전달합니다. 관리자 연결·카탈로그 효과는 원격 자원 정산, 세션
-				종료 또는 세션 도구 레지스트리 동기화를 보증하지 않습니다.
-			</p>
-			<div className="actions" role="group" aria-label="MCP 디자인 예시 상태">
+			<p className="fixture-note muted">{t("showcase.mcpNote")}</p>
+			<div className="actions" role="group" aria-label={t("showcase.mcpStatesLabel")}>
 				{fixtureMcpStates.map(state => (
 					<Button
 						key={state.label}
 						aria-pressed={fixture === state}
 						onClick={() => {
 							setFixture(state);
-							setNotice(
-								`DESIGN-ONLY · ${state.label} 표시 예시를 선택했습니다. SDK 요청이나 실제 연결 변경은 없습니다.`,
-							);
+							setNotice(t("showcase.mcpNoticeSelected", { label: state.label }));
 						}}
 					>
 						{state.label}
@@ -299,14 +304,8 @@ function FixtureMcpPanel() {
 			</p>
 			<McpPanel
 				{...fixture}
-				onRefresh={() =>
-					setNotice("DESIGN-ONLY · 새로고침 버튼 검토입니다. SDK 조회를 보내지 않았으며 예시 정보는 그대로입니다.")
-				}
-				onOperate={(_ref, action) =>
-					setNotice(
-						`DESIGN-ONLY · ${action} 버튼 검토입니다. SDK 호출 없음 · 서버를 중지·재개·재연결하지 않았습니다. 표시 상태와 정리 보증은 바뀌지 않습니다.`,
-					)
-				}
+				onRefresh={() => setNotice(t("showcase.mcpNoticeRefresh"))}
+				onOperate={(_ref, action) => setNotice(t("showcase.mcpNoticeOperate", { action }))}
 			/>
 		</>
 	);
@@ -319,53 +318,53 @@ interface SessionInfoFixture extends Pick<SessionInfoPanelProps, "info" | "pendi
 const fixtureRecordedUsage: DesktopSessionInfoUsage = {
 	available: true,
 	source: "transcript_aggregate",
-	note: "DESIGN-ONLY · 비활성 분기를 포함하는 가상 기록입니다. 활성 목록과 스트림 일부를 더하지 않습니다. 저장 완료 증명이 아닙니다.",
+	note: t("showcase.infoRecordedNote"),
 	tokens: { input: 2400, output: 400, cacheRead: 600, cacheWrite: 0, total: 2800 },
 	premiumRequests: null,
 	cost: {
 		amount: 0.012,
 		source: "sdk_recorded_cost",
-		reason: "디자인 전용 가상 SDK 기록 값 · 통화·실제 청구·잔액·할당량을 뜻하지 않습니다.",
+		reason: t("showcase.infoRecordedCostReason"),
 	},
 };
 const fixtureActiveUsage: DesktopSessionInfoUsage = {
 	...fixtureRecordedUsage,
 	source: "active_messages",
-	note: "DESIGN-ONLY · 기록 집계와 겹치는 활성 목록입니다. 스트림 일부는 제외하며 별도 합산하지 않습니다.",
+	note: t("showcase.infoActiveNote"),
 	tokens: { input: 1600, output: 200, cacheRead: 400, cacheWrite: 0, total: 1800 },
 	cost: {
 		amount: 0.008,
 		source: "sdk_recorded_cost",
-		reason: "디자인 전용 가상 SDK 기록 비용 · 전체 기록 비용에 더하지 않습니다.",
+		reason: t("showcase.infoActiveCostReason"),
 	},
 };
 const fixtureLiveUsage: DesktopSessionInfoUsage = {
 	...fixtureRecordedUsage,
 	source: "stream_partial",
-	note: "DESIGN-ONLY · 진행 중인 가상 스트림 일부입니다. 잠정·미청구이며 다른 집계와 합산하지 않습니다.",
+	note: t("showcase.infoLiveNote"),
 	tokens: { input: null, output: 70, cacheRead: null, cacheWrite: null, total: null },
 	cost: {
 		amount: 0.0003,
 		source: "live_partial_cost",
-		reason: "디자인 전용 잠정 값 · 청구 확정이나 최종 합계가 아닙니다.",
+		reason: t("showcase.infoLiveCostReason"),
 	},
 };
 const fixtureSessionInfo: AvailableFixtureInfo = {
 	available: true,
 	metadata: {
 		catalogSessionId: "DESIGN-ONLY-catalog-not-a-real-session",
-		name: "DESIGN-ONLY · 긴 한국어 프로젝트의 문맥과 실행 정보를 검토하는 日本語・中文 혼합 세션 이름",
-		sessionFileDisplay: "/DESIGN-ONLY/[가림]/아주-긴-한국어-日本語-中文-프로젝트/기록/표시-전용-세션.jsonl",
-		cwd: "/DESIGN-ONLY/표시-전용/한국어-日本語-中文-프로젝트/packages/아주-긴-작업-디렉터리",
+		name: t("showcase.infoSessionName"),
+		sessionFileDisplay: t("showcase.infoSessionFile"),
+		cwd: t("showcase.infoSessionCwd"),
 		createdAt: null,
 		persisted: false,
 	},
 	model: {
 		provider: "design-fixture",
 		id: "DESIGN-ONLY/model",
-		name: "디자인 전용 · 실제 연결 없는 한국어와日本語 모델 표시 예시",
+		name: t("showcase.infoModelName"),
 	},
-	thinkingLevel: "디자인 전용 사고 수준 표시",
+	thinkingLevel: t("showcase.infoThinkingLevel"),
 	run: {
 		state: "running",
 		streaming: true,
@@ -385,37 +384,37 @@ const fixtureSessionInfo: AvailableFixtureInfo = {
 		contextWindow: 128000,
 		percent: 37.5,
 		source: "provider_anchor",
-		note: "DESIGN-ONLY · 가상 공급자 기준점에 후속 휴리스틱 추정을 더한 문맥 예시입니다. 정확한 실측값이 아닙니다.",
+		note: t("showcase.infoContextNote"),
 	},
-	accountQuota: { available: false, reason: "디자인 전용 · 계정 할당량은 제공되지 않습니다." },
-	actualBilledCost: { available: false, reason: "디자인 전용 · 실제 청구액은 제공되지 않습니다." },
+	accountQuota: { available: false, reason: t("showcase.infoQuotaUnavailable") },
+	actualBilledCost: { available: false, reason: t("showcase.infoBilledUnavailable") },
 };
 const fixtureZeroUsage: DesktopSessionInfoUsage = {
 	...fixtureRecordedUsage,
-	note: "DESIGN-ONLY · 명시적으로 알려진 0의 표시 예시입니다. 누락·알 수 없음과 구별합니다.",
+	note: t("showcase.infoZeroNote"),
 	tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	premiumRequests: 0,
 	cost: {
 		amount: 0,
 		source: "sdk_recorded_cost",
-		reason: "디자인 전용 · 가격 출처가 있는 명시적 기록 비용 0을 가정한 예시입니다. 실제 청구액이 아닙니다.",
+		reason: t("showcase.infoZeroCostReason"),
 	},
 };
 const fixtureUnknownUsage: DesktopSessionInfoUsage = {
 	...fixtureRecordedUsage,
-	note: "DESIGN-ONLY · 누락된 카운터 예시입니다. 알 수 없음은 0이 아닙니다.",
+	note: t("showcase.infoUnknownNote"),
 	tokens: { input: null, output: null, cacheRead: null, cacheWrite: null, total: null },
 	cost: {
 		amount: null,
 		source: "sdk_recorded_cost",
-		reason: "디자인 전용 · 가격 출처가 없으므로 비용을 알 수 없습니다.",
+		reason: t("showcase.infoUnknownCostReason"),
 	},
 };
-const fixtureInfoOverlap: SessionInfoFixture = { label: "겹치는 집계 · 공급자 기준점", info: fixtureSessionInfo };
+const fixtureInfoOverlap: SessionInfoFixture = { label: t("showcase.infoStateOverlap"), info: fixtureSessionInfo };
 const fixtureSessionInfoStates: SessionInfoFixture[] = [
 	fixtureInfoOverlap,
 	{
-		label: "알려진 0",
+		label: t("showcase.infoStateKnownZero"),
 		info: {
 			...fixtureSessionInfo,
 			tools: { available: 0, pending: 0, calls: 0, results: 0 },
@@ -427,7 +426,7 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				cost: {
 					amount: 0,
 					source: "live_partial_cost",
-					reason: "DESIGN-ONLY · 명시적 잠정 비용 0의 예시 · 미청구이며 기록 비용에 더하지 않습니다.",
+					reason: t("showcase.infoStateLiveZeroCostReason"),
 				},
 			},
 			context: {
@@ -435,12 +434,12 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				contextWindow: 128000,
 				percent: 0,
 				source: "heuristic",
-				note: "DESIGN-ONLY · 알려진 0의 휴리스틱 추정 예시입니다.",
+				note: t("showcase.infoStateKnownZeroContextNote"),
 			},
 		},
 	},
 	{
-		label: "알 수 없음 ≠ 0",
+		label: t("showcase.infoStateUnknownNotZero"),
 		info: {
 			...fixtureSessionInfo,
 			model: null,
@@ -459,12 +458,12 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				contextWindow: null,
 				percent: null,
 				source: "unknown",
-				note: "DESIGN-ONLY · 문맥 출처와 값을 알 수 없는 예시입니다.",
+				note: t("showcase.infoStateUnknownContextNote"),
 			},
 		},
 	},
 	{
-		label: "휴리스틱 문맥",
+		label: t("showcase.infoStateHeuristicContext"),
 		info: {
 			...fixtureSessionInfo,
 			context: {
@@ -472,21 +471,21 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				contextWindow: 128000,
 				percent: 25,
 				source: "heuristic",
-				note: "DESIGN-ONLY · 공급자 기준점 없이 휴리스틱만 사용한 가상 추정입니다. 청구 사용량이 아닙니다.",
+				note: t("showcase.infoStateHeuristicNote"),
 			},
 		},
 	},
 	{
-		label: "집계 제공 불가",
+		label: t("showcase.infoStateTotalsUnavailable"),
 		info: {
 			...fixtureSessionInfo,
-			recordedTotals: { available: false, reason: "DESIGN-ONLY · 기록 집계 제공 불가 예시" },
-			activeTotals: { available: false, reason: "DESIGN-ONLY · 활성 집계 제공 불가 예시" },
-			liveProgress: { available: false, reason: "DESIGN-ONLY · 스트림 일부 제공 불가 예시" },
+			recordedTotals: { available: false, reason: t("showcase.infoStateRecordedUnavailable") },
+			activeTotals: { available: false, reason: t("showcase.infoStateActiveUnavailable") },
+			liveProgress: { available: false, reason: t("showcase.infoStateLiveUnavailable") },
 		},
 	},
 	{
-		label: "작업 중 읽기 · 셸/Python",
+		label: t("showcase.infoStateWorkingReads"),
 		info: {
 			...fixtureSessionInfo,
 			run: {
@@ -501,43 +500,36 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 		},
 	},
 	{
-		label: "세션 정보 사용 불가",
+		label: t("showcase.infoStateSessionUnavailable"),
 		info: {
 			available: false,
 			code: "backend_failure",
-			reason: "DESIGN-ONLY · 세션 정보 조회 불가 예시입니다. 값이 0이거나 작업이 종료되었다는 뜻은 아닙니다.",
+			reason: t("showcase.infoStateSessionUnavailableReason"),
 		},
 	},
-	{ label: "조회 대기 · 마지막 정보", info: fixtureSessionInfo, pending: true },
+	{ label: t("showcase.infoStatePending"), info: fixtureSessionInfo, pending: true },
 	{
-		label: "조회 오류 · 마지막 정보",
+		label: t("showcase.infoStateError"),
 		info: fixtureSessionInfo,
-		error: "DESIGN-ONLY · 읽기 요청 실패 예시입니다. 마지막 표시 정보는 현재 상태를 보증하지 않습니다.",
+		error: t("showcase.infoStateErrorMessage"),
 	},
-	{ label: "아직 정보 없음", info: null },
+	{ label: t("showcase.infoStateEmpty"), info: null },
 ];
 
 function FixtureSessionInfoPanel() {
 	const [fixture, setFixture] = useState(fixtureInfoOverlap);
-	const [notice, setNotice] = useState(
-		"DESIGN-ONLY · 경로와 ID는 가상 표시 문자열입니다. 파일 열기·기록 저장·네이티브 기능·모델 요청이 없습니다.",
-	);
+	const [notice, setNotice] = useState(t("showcase.infoNoticeInitial"));
 	return (
 		<>
-			<p className="fixture-note muted">
-				디자인 전용 · 실제 SessionInfoPanel에 가상 값만 전달합니다. 기록·활성 목록·잠정 스트림은 겹치므로 합산하지
-				않습니다. 알 수 없음은 0이 아니며 비용은 실제 청구·계정 잔액·할당량이 아닙니다.
-			</p>
-			<div className="actions" role="group" aria-label="세션 정보 디자인 예시 상태">
+			<p className="fixture-note muted">{t("showcase.infoNote")}</p>
+			<div className="actions" role="group" aria-label={t("showcase.infoStatesLabel")}>
 				{fixtureSessionInfoStates.map(state => (
 					<Button
 						key={state.label}
 						aria-pressed={fixture === state}
 						onClick={() => {
 							setFixture(state);
-							setNotice(
-								`DESIGN-ONLY · ${state.label} 표시 예시를 선택했습니다. SDK·파일·네트워크에 접근하지 않았습니다.`,
-							);
+							setNotice(t("showcase.infoNoticeSelected", { label: state.label }));
 						}}
 					>
 						{state.label}
@@ -547,14 +539,7 @@ function FixtureSessionInfoPanel() {
 			<p className="showcase-result" role="status">
 				{notice}
 			</p>
-			<SessionInfoPanel
-				{...fixture}
-				onRefresh={() =>
-					setNotice(
-						"DESIGN-ONLY · 작업 중에도 활성인 읽기 전용 버튼 검토입니다. SDK 조회·모델 요청 없음 · 가상 정보는 그대로이며 새로 읽은 결과가 아닙니다.",
-					)
-				}
-			/>
+			<SessionInfoPanel {...fixture} onRefresh={() => setNotice(t("showcase.infoNoticeRefresh"))} />
 		</>
 	);
 }
@@ -563,10 +548,8 @@ interface BtwFixture extends Pick<BtwPanelProps, "conversation" | "disabled" | "
 	label: string;
 }
 
-const fixtureBtwQuestion =
-	"주 작업은 그대로 두고, frozen context의 의미만 설명해 주세요.\n  한국어와 TypeScript / 日本語 / 中文이 섞인 문장도 원래 줄바꿈을 유지하나요?";
-const fixtureBtwAnswer =
-	"DESIGN-ONLY · 곁대화를 열 때 고정한 문맥으로 답하는 예시입니다.\n\n주 대화에 새 메시지가 생겨도 이 문맥은 바뀌지 않습니다. 도구를 실행하거나 주 대화 기록에 답변을 쓰지 않습니다.\n  들여쓰기가 있는 설명도 그대로 표시합니다.\n\n긴 경로 예시: /DESIGN-ONLY/한국어와-English가-섞인-프로젝트/packages/desktop/src/아주긴단일토큰경로와followUpContextOwnershipBoundary.ts";
+const fixtureBtwQuestion = t("showcase.btwQuestion");
+const fixtureBtwAnswer = t("showcase.btwAnswer");
 const fixtureBtwCompletedTurn: DesktopBtwTurn = {
 	turnId: "DESIGN-ONLY-btw-turn-1",
 	question: fixtureBtwQuestion,
@@ -580,17 +563,22 @@ const fixtureBtwConversation: DesktopBtwConversation = {
 	revision: 1,
 	turns: [fixtureBtwCompletedTurn],
 };
-const fixtureBtwEmpty: BtwFixture = { label: "빈 곁대화", conversation: null, disabled: false, pending: false };
+const fixtureBtwEmpty: BtwFixture = {
+	label: t("showcase.btwStateEmpty"),
+	conversation: null,
+	disabled: false,
+	pending: false,
+};
 const fixtureBtwStates: BtwFixture[] = [
 	fixtureBtwEmpty,
 	{
-		label: "응답 중 · 부분 출력",
+		label: t("showcase.btwStateRunning"),
 		conversation: {
 			...fixtureBtwConversation,
 			turns: [
 				{
 					...fixtureBtwCompletedTurn,
-					answer: "DESIGN-ONLY · 고정한 문맥을 바탕으로 답하고 있습니다.\n\n두 번째 설명은 아직 작성 중이며",
+					answer: t("showcase.btwRunningAnswer"),
 					status: "running",
 				},
 			],
@@ -599,14 +587,13 @@ const fixtureBtwStates: BtwFixture[] = [
 		pending: false,
 	},
 	{
-		label: "중지 요청 · 종료 미확인",
+		label: t("showcase.btwStateCancelRequested"),
 		conversation: {
 			...fixtureBtwConversation,
 			turns: [
 				{
 					...fixtureBtwCompletedTurn,
-					answer:
-						"DESIGN-ONLY · 여기까지 받은 부분 답변입니다.\n중지 요청 뒤에도 종료를 확인할 때까지 응답 중입니다.",
+					answer: t("showcase.btwCancelRequestedAnswer"),
 					status: "cancel_requested",
 				},
 			],
@@ -615,13 +602,13 @@ const fixtureBtwStates: BtwFixture[] = [
 		pending: false,
 	},
 	{
-		label: "취소됨 · 부분 출력 보존",
+		label: t("showcase.btwStateCancelled"),
 		conversation: {
 			...fixtureBtwConversation,
 			turns: [
 				{
 					...fixtureBtwCompletedTurn,
-					answer: "DESIGN-ONLY · 취소 전에 받은 부분 답변을 보존합니다.\n  이어 쓰지 못한 문장도 그대로 남습니다.",
+					answer: t("showcase.btwCancelledAnswer"),
 					status: "cancelled",
 				},
 			],
@@ -630,16 +617,15 @@ const fixtureBtwStates: BtwFixture[] = [
 		pending: false,
 	},
 	{
-		label: "완료 · 후속 질문",
+		label: t("showcase.btwStateDone"),
 		conversation: {
 			...fixtureBtwConversation,
 			turns: [
 				fixtureBtwCompletedTurn,
 				{
 					turnId: "DESIGN-ONLY-btw-turn-2",
-					question: "그럼 방금 설명한 frozen context로 후속 질문도 이어지나요?",
-					answer:
-						"DESIGN-ONLY · 네. 이 곁대화의 앞선 질문과 답변을 이어 보며 답합니다. 주 대화의 새 기록과는 별개입니다.",
+					question: t("showcase.btwFollowUpQuestion"),
+					answer: t("showcase.btwFollowUpAnswer"),
 					status: "completed",
 					answerTruncated: false,
 				},
@@ -649,17 +635,17 @@ const fixtureBtwStates: BtwFixture[] = [
 		pending: false,
 	},
 	{
-		label: "실패 · 받은 출력 보존",
+		label: t("showcase.btwStateFailed"),
 		conversation: {
 			...fixtureBtwConversation,
 			turns: [
 				{
 					...fixtureBtwCompletedTurn,
-					answer: "DESIGN-ONLY · 실패 전에 받은 답변 일부입니다.",
+					answer: t("showcase.btwFailedAnswer"),
 					status: "failed",
 					error: {
 						code: "provider_failure",
-						message: "DESIGN-ONLY · 응답 연결 오류 예시입니다. 다시 질문하기 전 초안을 검토하세요.",
+						message: t("showcase.btwFailedMessage"),
 					},
 				},
 			],
@@ -668,13 +654,13 @@ const fixtureBtwStates: BtwFixture[] = [
 		pending: false,
 	},
 	{
-		label: "출력 생략 · 긴 내용",
+		label: t("showcase.btwStateTruncated"),
 		conversation: {
 			...fixtureBtwConversation,
 			turns: [
 				{
 					...fixtureBtwCompletedTurn,
-					answer: `${fixtureBtwAnswer}\n\n${"한국어 의미 단위와 mixed-language 줄바꿈을 확인하는 긴 답변 예시입니다.\n".repeat(18)}`,
+					answer: `${fixtureBtwAnswer}\n\n${t("showcase.btwLongAnswerRepeat").repeat(18)}`,
 					answerTruncated: true,
 				},
 			],
@@ -682,35 +668,28 @@ const fixtureBtwStates: BtwFixture[] = [
 		disabled: false,
 		pending: false,
 	},
-	{ label: "연결 끊김 · 초안 보존", conversation: fixtureBtwConversation, disabled: true, pending: false },
-	{ label: "요청 처리 대기 · 초안 보존", conversation: fixtureBtwConversation, disabled: false, pending: true },
+	{ label: t("showcase.btwStateDisconnected"), conversation: fixtureBtwConversation, disabled: true, pending: false },
+	{ label: t("showcase.btwStatePending"), conversation: fixtureBtwConversation, disabled: false, pending: true },
 ];
 
 function FixtureBtwPanel() {
 	const [fixture, setFixture] = useState(fixtureBtwEmpty);
-	const [draft, setDraft] = useState(
-		"주 작업과 별개로 궁금한 점을 적어 둡니다.\n  이 초안은 예시 상태를 바꿔도 유지됩니다.",
-	);
-	const [notice, setNotice] = useState(
-		"DESIGN-ONLY · 실제 BtwPanel의 로컬 상태 예시입니다. 모델·SDK·네트워크 요청이나 주 대화 변경은 없습니다.",
-	);
+	const [draft, setDraft] = useState(t("showcase.btwDraft"));
+	const [notice, setNotice] = useState(t("showcase.btwNoticeInitial"));
 	const active = fixture.conversation?.turns.find(
 		turn => turn.status === "running" || turn.status === "cancel_requested",
 	);
 	return (
 		<>
-			<p className="fixture-note muted">
-				디자인 전용 · 아래 버튼으로 모든 표시 상태를 선택하세요. 보내기는 가상 질문을 접수하고, 중지 요청과 완료
-				확인은 서로 다른 로컬 단계입니다.
-			</p>
-			<div className="actions" role="group" aria-label="BTW 곁대화 디자인 예시 상태">
+			<p className="fixture-note muted">{t("showcase.btwNote")}</p>
+			<div className="actions" role="group" aria-label={t("showcase.btwStatesLabel")}>
 				{fixtureBtwStates.map(state => (
 					<Button
 						key={state.label}
 						aria-pressed={fixture.label === state.label}
 						onClick={() => {
 							setFixture(state);
-							setNotice(`DESIGN-ONLY · ${state.label} 표시 예시입니다. 입력한 초안은 바꾸지 않습니다.`);
+							setNotice(t("showcase.btwNoticeSelected", { label: state.label }));
 						}}
 					>
 						{state.label}
@@ -729,7 +708,7 @@ function FixtureBtwPanel() {
 				onSend={question => {
 					const conversation = fixture.conversation ?? { ...fixtureBtwConversation, turns: [], revision: 0 };
 					setFixture({
-						label: "로컬 질문 접수",
+						label: t("showcase.btwLocalLabel"),
 						disabled: false,
 						pending: false,
 						conversation: {
@@ -748,9 +727,7 @@ function FixtureBtwPanel() {
 						},
 					});
 					setDraft("");
-					setNotice(
-						"DESIGN-ONLY · 로컬 접수를 모사한 뒤 fixture가 초안을 비웠습니다. 부분 답변 추가와 응답 완료 예시를 눌러 이어 보세요.",
-					);
+					setNotice(t("showcase.btwNoticeSent"));
 				}}
 				onCancel={turnId => {
 					setFixture(current => ({
@@ -764,13 +741,11 @@ function FixtureBtwPanel() {
 							),
 						},
 					}));
-					setNotice(
-						"DESIGN-ONLY · 이 곁대화 턴의 중지 요청만 모사했습니다. 취소 완료 예시를 누르기 전에는 종료 상태가 아닙니다.",
-					);
+					setNotice(t("showcase.btwNoticeCancelRequested"));
 				}}
 			/>
 			{active && (
-				<div className="actions" role="group" aria-label="BTW 로컬 응답 진행 예시">
+				<div className="actions" role="group" aria-label={t("showcase.btwLocalControlsLabel")}>
 					<Button
 						disabled={active.status !== "running"}
 						onClick={() => {
@@ -783,7 +758,7 @@ function FixtureBtwPanel() {
 										turn.turnId === active.turnId
 											? {
 													...turn,
-													answer: `${turn.answer}\nDESIGN-ONLY · 추가로 받은 부분 답변입니다. 한국어와 TypeScript 설명을 이어 갑니다.`,
+													answer: `${turn.answer}\n${t("showcase.btwAppendedAnswer")}`,
 												}
 											: turn,
 									),
@@ -791,7 +766,7 @@ function FixtureBtwPanel() {
 							}));
 						}}
 					>
-						부분 답변 추가 예시
+						{t("showcase.btwAddPartial")}
 					</Button>
 					<Button
 						onClick={() => {
@@ -809,16 +784,18 @@ function FixtureBtwPanel() {
 														answer:
 															active.status === "cancel_requested"
 																? turn.answer
-																: turn.answer || "DESIGN-ONLY · 로컬 완료 답변입니다.",
+																: turn.answer || t("showcase.btwLocalDoneAnswer"),
 													}
 												: turn,
 									),
 								},
 							}));
-							setNotice("DESIGN-ONLY · 로컬 종료 확인 예시입니다. 다음 질문을 같은 곁대화에 이어 보세요.");
+							setNotice(t("showcase.btwNoticeCompleted"));
 						}}
 					>
-						{active.status === "cancel_requested" ? "취소 완료 예시" : "응답 완료 예시"}
+						{active.status === "cancel_requested"
+							? t("showcase.btwCompleteCancelled")
+							: t("showcase.btwCompleteDone")}
 					</Button>
 				</div>
 			)}
@@ -830,7 +807,7 @@ interface ForkFixture extends Pick<ForkPanelProps, "history" | "selectedEntryId"
 	label: string;
 }
 
-const fixtureForkLongText = `DESIGN-ONLY · 한국어와 TypeScript / 日本語 / 中文 원문을 검토합니다.\n  들여쓰기와 줄바꿈은 보존됩니다.\n\n${"긴 미리보기에서 의미 단위 줄바꿈과 내부 스크롤을 확인합니다.\n".repeat(18)}/DESIGN-ONLY/아주긴단일토큰경로와originalSelectedTextMustComeFromSdkTransaction.ts`;
+const fixtureForkLongText = `${t("showcase.forkLongTextLead")}${t("showcase.forkLongTextRepeat").repeat(18)}${t("showcase.forkLongTextTail")}`;
 const fixtureForkHistory: DesktopHistory = {
 	sessionId: "DESIGN-ONLY-fork-session",
 	total: 4,
@@ -838,55 +815,63 @@ const fixtureForkHistory: DesktopHistory = {
 	truncated: false,
 	messages: [
 		{ id: "DESIGN-ONLY-display-1", entryId: "DESIGN-ONLY-entry-long", role: "user", text: fixtureForkLongText },
-		{ id: "DESIGN-ONLY-display-2", role: "assistant", text: "DESIGN-ONLY · 사용자 선택지에 나오지 않는 응답입니다." },
+		{ id: "DESIGN-ONLY-display-2", role: "assistant", text: t("showcase.forkAssistantText") },
 		{
 			id: "DESIGN-ONLY-display-3",
 			entryId: "DESIGN-ONLY-entry-duplicate-a",
 			role: "user",
-			text: "DESIGN-ONLY · 같은 텍스트도 서로 다른 사용자 기록입니다.",
+			text: t("showcase.forkDuplicateText"),
 		},
 		{
 			id: "DESIGN-ONLY-display-4",
 			entryId: "DESIGN-ONLY-entry-duplicate-b",
 			role: "user",
-			text: "DESIGN-ONLY · 같은 텍스트도 서로 다른 사용자 기록입니다.",
+			text: t("showcase.forkDuplicateText"),
 		},
 	],
 };
 const fixtureForkSelected: ForkFixture = {
-	label: "긴 원문 선택",
+	label: t("showcase.forkStateLongSource"),
 	history: fixtureForkHistory,
 	selectedEntryId: "DESIGN-ONLY-entry-long",
 	pending: false,
 	disabled: false,
 };
 const fixtureForkStates: ForkFixture[] = [
-	{ ...fixtureForkSelected, label: "기록 불러오는 중", history: null, selectedEntryId: "" },
+	{ ...fixtureForkSelected, label: t("showcase.forkStateLoading"), history: null, selectedEntryId: "" },
 	{
 		...fixtureForkSelected,
-		label: "빈 기록",
+		label: t("showcase.forkStateEmpty"),
 		history: { ...fixtureForkHistory, total: 0, messages: [] },
 		selectedEntryId: "",
 	},
-	{ ...fixtureForkSelected, label: "선택 전", selectedEntryId: "" },
+	{ ...fixtureForkSelected, label: t("showcase.forkStateBeforeSelection"), selectedEntryId: "" },
 	fixtureForkSelected,
-	{ ...fixtureForkSelected, label: "동일 텍스트 · 두 번째 기록", selectedEntryId: "DESIGN-ONLY-entry-duplicate-b" },
-	{ ...fixtureForkSelected, label: "알 수 없는 선택", selectedEntryId: "DESIGN-ONLY-no-longer-present" },
 	{
 		...fixtureForkSelected,
-		label: "요청 처리 대기",
+		label: t("showcase.forkStateDuplicate"),
+		selectedEntryId: "DESIGN-ONLY-entry-duplicate-b",
+	},
+	{
+		...fixtureForkSelected,
+		label: t("showcase.forkStateUnknownSelection"),
+		selectedEntryId: "DESIGN-ONLY-no-longer-present",
+	},
+	{
+		...fixtureForkSelected,
+		label: t("showcase.forkStatePending"),
 		pending: true,
 		history: { ...fixtureForkHistory, total: 5, truncated: true },
 	},
 	{
 		...fixtureForkSelected,
-		label: "연결 끊김",
+		label: t("showcase.forkStateDisconnected"),
 		disabled: true,
 		history: { ...fixtureForkHistory, total: 5, truncated: true },
 	},
 	{
 		...fixtureForkSelected,
-		label: "미리보기 생략 · 다음 기록",
+		label: t("showcase.forkStateTruncatedPreview"),
 		history: {
 			...fixtureForkHistory,
 			total: 5,
@@ -900,22 +885,18 @@ const fixtureForkStates: ForkFixture[] = [
 
 function FixtureForkPanel() {
 	const [fixture, setFixture] = useState(fixtureForkSelected);
-	const [notice, setNotice] = useState(
-		"DESIGN-ONLY · 실제 ForkPanel의 로컬 표시 예시입니다. SDK·네트워크 호출, 새 대화 생성, 초안·첨부 변경은 없습니다.",
-	);
+	const [notice, setNotice] = useState(t("showcase.forkNoticeInitial"));
 	return (
 		<>
-			<p className="fixture-note muted">
-				디자인 전용 · 상태와 사용자 메시지 선택, 복사/분기, 다음 기록 버튼은 아래 로컬 예시에만 적용됩니다.
-			</p>
-			<div className="actions" role="group" aria-label="대화 분기 디자인 예시 상태">
+			<p className="fixture-note muted">{t("showcase.forkNote")}</p>
+			<div className="actions" role="group" aria-label={t("showcase.forkStatesLabel")}>
 				{fixtureForkStates.map(state => (
 					<Button
 						key={state.label}
 						aria-pressed={fixture.label === state.label}
 						onClick={() => {
 							setFixture(state);
-							setNotice(`DESIGN-ONLY · ${state.label} 로컬 표시입니다. 실제 대화와 초안은 바뀌지 않습니다.`);
+							setNotice(t("showcase.forkNoticeSelected", { label: state.label }));
 						}}
 					>
 						{state.label}
@@ -932,15 +913,13 @@ function FixtureForkPanel() {
 				disabled={fixture.disabled}
 				onSelect={entryId => {
 					setFixture(current => ({ ...current, selectedEntryId: entryId }));
-					setNotice(
-						`DESIGN-ONLY · 로컬 canonical entryId 선택: ${entryId || "선택 없음"}. 분기나 전송은 하지 않았습니다.`,
-					);
+					setNotice(t("showcase.forkNoticeEntry", { entry: entryId || t("showcase.forkNoSelection") }));
 				}}
 				onFork={entryId =>
 					setNotice(
 						entryId === undefined
-							? "DESIGN-ONLY · 전체 대화 복사 버튼의 로컬 동작 확인입니다. 새 대화 생성이나 SDK 요청은 없습니다."
-							: `DESIGN-ONLY · 선택 분기 버튼의 로컬 entryId: ${entryId}. 새 대화·초안 변경이나 전송은 없습니다.`,
+							? t("showcase.forkNoticeCopyAll")
+							: t("showcase.forkNoticeForkEntry", { entry: entryId }),
 					)
 				}
 				onLoadMore={() => {
@@ -955,28 +934,25 @@ function FixtureForkPanel() {
 									id: "DESIGN-ONLY-display-next",
 									entryId: "DESIGN-ONLY-entry-next",
 									role: "user",
-									text: "DESIGN-ONLY · 로컬로 추가한 다음 사용자 기록입니다.",
+									text: t("showcase.forkAddedMessage"),
 								},
 							],
 						},
 					}));
-					setNotice(
-						"DESIGN-ONLY · 로컬 fixture에 다음 기록 하나만 추가했습니다. 호스트 조회나 네트워크 요청은 없습니다.",
-					);
+					setNotice(t("showcase.forkNoticeLoadMore"));
 				}}
 			/>
-			{fixture.history === null && <p>DESIGN-ONLY · 전체 기록 불러오는 중… (App 소유 로딩 표시 예시)</p>}
+			{fixture.history === null && <p>{t("showcase.forkLoading")}</p>}
 		</>
 	);
 }
 
 export default function Showcase() {
+	useLocale();
 	const [draft, setDraft] = useState("");
 	const [attachments, setAttachments] = useState<DesktopAttachmentDraft[]>([]);
-	const [populatedDraft, setPopulatedDraft] = useState(
-		"기존 구조를 유지하면서 한국어와 TypeScript 변경 사항을 검토해 주세요.",
-	);
-	const [runningDraft, setRunningDraft] = useState("실행 중에도 다음 메시지를 작성할 수 있습니다.");
+	const [populatedDraft, setPopulatedDraft] = useState(t("showcase.draftPopulated"));
+	const [runningDraft, setRunningDraft] = useState(t("showcase.draftRunning"));
 	const [deliverAs, setDeliverAs] = useState<"steer" | "followUp">("steer");
 	const [dialog, setDialog] = useState(false);
 	const [answer, setAnswer] = useState("");
@@ -985,7 +961,7 @@ export default function Showcase() {
 	const session: DesktopSession = {
 		id: "showcase",
 		projectId: "fixture",
-		title: "한국어와 TypeScript 프로젝트 검토 — 긴 대화 이름",
+		title: t("showcase.sessionTitle"),
 		starred: false,
 		status: "idle",
 		imageInput: null,
@@ -996,30 +972,26 @@ export default function Showcase() {
 	return (
 		<main className="showcase">
 			<header className="showcase-heading">
-				<span className="showcase-eyebrow">GJC / 디자인 시스템</span>
-				<h1>작업에 집중하는 대화 공간</h1>
-				<p>
-					모든 내용은 디자인 검토용 예시입니다. 실제 프로젝트, 모델, 연결 상태가 아니며 외부 요청을 보내지
-					않습니다.
-				</p>
-				<nav className="showcase-index" aria-label="디자인 예시 탐색">
-					<a href="#showcase-sessions">대화</a>
-					<a href="#showcase-messages">메시지</a>
-					<a href="#showcase-questions">질문</a>
-					<a href="#showcase-models">모델</a>
-					<a href="#showcase-mcp">MCP 관리자</a>
-					<a href="#showcase-session-info">세션 정보</a>
-					<a href="#showcase-btw">BTW 곁대화</a>
-					<a href="#showcase-fork">대화 분기</a>
-					<a href="#showcase-composers">입력</a>
-					<a href="#showcase-settings">설정</a>
+				<img className="brand-mark showcase-brand" src={gajaeMark} alt="" aria-hidden="true" />
+				<span className="showcase-eyebrow">{t("showcase.eyebrow")}</span>
+				<h1>{t("showcase.title")}</h1>
+				<p>{t("showcase.intro")}</p>
+				<nav className="showcase-index" aria-label={t("showcase.navLabel")}>
+					<a href="#showcase-sessions">{t("showcase.navSessions")}</a>
+					<a href="#showcase-messages">{t("showcase.navMessages")}</a>
+					<a href="#showcase-questions">{t("showcase.navQuestions")}</a>
+					<a href="#showcase-models">{t("showcase.navModels")}</a>
+					<a href="#showcase-mcp">{t("showcase.navMcp")}</a>
+					<a href="#showcase-session-info">{t("showcase.navSessionInfo")}</a>
+					<a href="#showcase-btw">{t("showcase.navBtw")}</a>
+					<a href="#showcase-fork">{t("showcase.navFork")}</a>
+					<a href="#showcase-composers">{t("showcase.navComposers")}</a>
+					<a href="#showcase-settings">{t("showcase.navSettings")}</a>
 				</nav>
 			</header>
 			<section id="showcase-sessions">
-				<h2>대화 · 선택과 백그라운드 상태</h2>
-				<p className="muted">
-					선택, 즐겨찾기, 실행 상태는 각각 독립적입니다. 아래 동작은 이 예시 화면에만 적용됩니다.
-				</p>
+				<h2>{t("showcase.sessionsHeading")}</h2>
+				<p className="muted">{t("showcase.sessionsNote")}</p>
 				{(["idle", "done", "running", "waiting", "error"] as const).map(status => (
 					<SessionRow
 						key={status}
@@ -1035,42 +1007,41 @@ export default function Showcase() {
 				))}
 			</section>
 			<section id="showcase-toolbar">
-				<h2>도구 모음 · 기본 / 불러오는 중 / 비활성</h2>
+				<h2>{t("showcase.toolbarHeading")}</h2>
 				<div className="actions">
 					<Button onClick={() => setDialog(true)}>
 						<Settings2 aria-hidden="true" />
-						설정 열기
+						{t("showcase.openSettings")}
 					</Button>
 					<Button disabled>
 						<LoaderCircle aria-hidden="true" />
-						불러오는 중…
+						{t("showcase.loading")}
 					</Button>
-					<Button className="primary" onClick={() => setAnswer("새 대화 디자인 예시를 선택했습니다.")}>
-						<Plus aria-hidden="true" />새 대화 예시
+					<Button className="primary" onClick={() => setAnswer(t("showcase.answerNewConversation"))}>
+						<Plus aria-hidden="true" />
+						{t("showcase.newConversation")}
 					</Button>
 					<Button disabled>
 						<Command aria-hidden="true" />
-						사용할 수 없음
+						{t("showcase.unavailable")}
 					</Button>
 				</div>
-				<p className="path">
-					/Users/developer/Projects/아주-긴-한국어-프로젝트/packages/coding-agent/src/session/long-running-background-session.ts
-				</p>
+				<p className="path">{t("showcase.longPath")}</p>
 			</section>
 			<section id="showcase-messages">
-				<h2>메시지와 도구 · 펼친 출력의 끝까지 검토</h2>
+				<h2>{t("showcase.messagesHeading")}</h2>
 				<Message
 					message={{
 						id: "1",
 						role: "user",
-						text: "변경 사항을 검토하고 안전하게 정리해 주세요. English와 한국어가 함께 있어도 읽기 편해야 합니다.",
+						text: t("showcase.userMessage"),
 					}}
 				/>
 				<Message
 					message={{
 						id: "2",
 						role: "assistant",
-						text: '## 변경 사항\n\n기존 구현을 유지하면서 **안전하게** 정리했습니다.\n\n- 한국어와 TypeScript를 함께 검토\n- 日本語の文章と 中文内容도 명확하게 표시\n\n```ts\nconst message = "안녕하세요";\nconsole.info(message);\n```\n\n| 확인 | 결과 |\n| --- | --- |\n| 코드 복사 | 원본 코드만 복사 |\n| 실행 소유권 | 변경 없음 |',
+						text: t("showcase.assistantMarkdown"),
 					}}
 				/>
 				<Message
@@ -1078,9 +1049,8 @@ export default function Showcase() {
 						id: "3",
 						role: "tool",
 						toolName: "read",
-						text: Array.from(
-							{ length: 100 },
-							(_, index) => `${index + 1}: 긴 출력과 경로 /packages/example/src/한국어-file.ts`,
+						text: Array.from({ length: 100 }, (_, index) =>
+							t("showcase.toolLongOutputLine", { line: index + 1 }),
 						).join("\n"),
 						truncated: true,
 					}}
@@ -1091,15 +1061,15 @@ export default function Showcase() {
 						role: "tool",
 						toolName: "bash",
 						isError: true,
-						text: "권한이 없어 명령을 실행하지 못했습니다.\n비밀 값: [REDACTED]\n다시 시도하기 전에 프로젝트 권한을 확인하세요.",
+						text: t("showcase.toolErrorOutput"),
 					}}
 				/>
 				<div id="showcase-message-empty-assistant">
-					<p className="muted">디자인 예시 · 도구 호출만 있는 빈 응답은 표시하지 않습니다.</p>
+					<p className="muted">{t("showcase.emptyAssistantNote")}</p>
 					<Message message={{ id: "5", role: "assistant", text: "" }} />
 				</div>
 				<div id="showcase-message-thinking">
-					<p className="muted">디자인 예시 · 생각 과정만 있는 응답</p>
+					<p className="muted">{t("showcase.thinkingOnlyNote")}</p>
 					<Message
 						message={{
 							id: "thinking",
@@ -1108,14 +1078,14 @@ export default function Showcase() {
 							blocks: [
 								{
 									type: "thinking",
-									text: "### 검토 기준\n\n1. **기존 동작**을 먼저 확인합니다.\n2. `sessionId`와 결과의 소유권을 비교합니다.\n\n```ts\nif (owner !== current) return;\n```",
+									text: t("showcase.thinkingOnlyMarkdown"),
 								},
 							],
 						}}
 					/>
 				</div>
 				<div id="showcase-message-image-only">
-					<p className="muted">디자인 예시 · 이미지만 있는 사용자 메시지</p>
+					<p className="muted">{t("showcase.imageOnlyNote")}</p>
 					<Message
 						message={{
 							id: "image",
@@ -1126,23 +1096,23 @@ export default function Showcase() {
 					/>
 				</div>
 				<div id="showcase-message-mixed">
-					<p className="muted">디자인 예시 · 텍스트, 생각 과정, 이미지 순서</p>
+					<p className="muted">{t("showcase.mixedNote")}</p>
 					<Message
 						message={{
 							id: "mixed",
 							role: "assistant",
 							text: "",
 							blocks: [
-								{ type: "text", text: "이미지 앞의 설명입니다." },
-								{ type: "thinking", text: "제공된 이미지와 설명을 살펴봅니다." },
+								{ type: "text", text: t("showcase.mixedBefore") },
+								{ type: "thinking", text: t("showcase.mixedThinking") },
 								{ type: "image", mimeType: "image/png", data: transcriptPreviewImage },
-								{ type: "text", text: "이미지 뒤의 설명입니다." },
+								{ type: "text", text: t("showcase.mixedAfter") },
 							],
 						}}
 					/>
 				</div>
 				<div id="showcase-message-tool-image">
-					<p className="muted">디자인 예시 · 이미지가 포함된 도구 출력</p>
+					<p className="muted">{t("showcase.toolImageNote")}</p>
 					<Message
 						message={{
 							id: "tool-image",
@@ -1150,21 +1120,21 @@ export default function Showcase() {
 							toolName: "read",
 							text: "",
 							blocks: [
-								{ type: "text", text: "이미지 출력" },
+								{ type: "text", text: t("showcase.toolImageText") },
 								{ type: "image", mimeType: "image/png", data: transcriptPreviewImage },
 							],
 						}}
 					/>
 				</div>
 				<div id="showcase-message-image-unavailable">
-					<p className="muted">디자인 예시 · 사용할 수 없거나 읽기 실패한 이미지</p>
+					<p className="muted">{t("showcase.imageUnavailableNote")}</p>
 					<Message
 						message={{
 							id: "unavailable",
 							role: "assistant",
 							text: "",
 							blocks: [
-								{ type: "image-unavailable", reason: "지원하지 않는 이미지 형식입니다." },
+								{ type: "image-unavailable", reason: t("showcase.imageUnavailableReason") },
 								{ type: "image", mimeType: "image/png", data: "AAAA" },
 							],
 						}}
@@ -1174,12 +1144,12 @@ export default function Showcase() {
 					message={{
 						id: "6",
 						role: "system",
-						text: "연결되지 않은 상태의 디자인 예시입니다. 실행 성공을 의미하지 않습니다.",
+						text: t("showcase.systemMessage"),
 					}}
 				/>
 			</section>
 			<section id="showcase-questions">
-				<h2>질문 · 선택 / 확인 / 입력 / 편집 / 전송 중</h2>
+				<h2>{t("showcase.questionsHeading")}</h2>
 				{(["select", "confirm", "input", "editor"] as const).map(kind => (
 					<QuestionCard
 						key={kind}
@@ -1187,12 +1157,16 @@ export default function Showcase() {
 							id: kind,
 							sessionId: "showcase",
 							kind,
-							title: `${kind} · 진행 방법을 선택하세요`,
-							options: ["기존 구조 유지", "변경 검토", "한국어와 English를 함께 검토하는 긴 선택지"],
-							initialValue: kind === "editor" ? "여러 줄 편집\n검토 내용" : "",
-							message: "디자인 예시입니다. 답변은 이 화면에서만 표시됩니다.",
+							title: t("showcase.questionTitle", { kind }),
+							options: [
+								t("showcase.questionOptionKeep"),
+								t("showcase.questionOptionReview"),
+								t("showcase.questionOptionLong"),
+							],
+							initialValue: kind === "editor" ? t("showcase.questionEditorValue") : "",
+							message: t("showcase.questionMessage"),
 						}}
-						onAnswer={value => setAnswer(`질문 디자인 예시: ${String(value)}`)}
+						onAnswer={value => setAnswer(t("showcase.questionAnswerNotice", { value: String(value) }))}
 					/>
 				))}
 				<QuestionCard
@@ -1200,42 +1174,39 @@ export default function Showcase() {
 						id: "pending",
 						sessionId: "showcase",
 						kind: "input",
-						title: "답변을 보내는 중인 디자인 예시",
-						initialValue: "보존된 답변",
-						message: "중복 답변은 비활성 상태입니다.",
+						title: t("showcase.questionPendingTitle"),
+						initialValue: t("showcase.questionPendingValue"),
+						message: t("showcase.questionPendingMessage"),
 					}}
 					pending
 					onAnswer={() => {}}
 				/>
 			</section>
 			<section id="showcase-feedback">
-				<h2>오류 / 빈 상태 / 명시적 사용 불가</h2>
-				<ErrorBanner>호스트 연결이 끊어졌습니다. 입력한 초안은 유지됩니다.</ErrorBanner>
+				<h2>{t("showcase.feedbackHeading")}</h2>
+				<ErrorBanner>{t("showcase.disconnectedBanner")}</ErrorBanner>
 				<div className="empty">
 					<MessageSquare aria-hidden="true" />
-					<h2>아직 대화가 없습니다</h2>
-					<p>프로젝트에서 새 대화를 시작하세요. 이 화면은 빈 상태 디자인 예시입니다.</p>
+					<h2>{t("showcase.emptyTitle")}</h2>
+					<p>{t("showcase.emptyBody")}</p>
 				</div>
 				<p className="notice">
 					<CircleHelp aria-hidden="true" />
-					지원되지 않음 · 공개 SDK 지원 대기 · 디자인 예시
+					{t("showcase.noticeUnsupported")}
 				</p>
 			</section>
 			<section id="showcase-models">
-				<h2>실제 컴포넌트 · 모델과 추론 디자인 예시</h2>
-				<p className="muted">
-					프리셋/모델 탭, 84개 명시적 디자인 모델 검색, 역할 태그, 즐겨찾기, 새로고침 아이콘과 방향키를 검토하세요.
-					실제 제공자 연결이나 요청은 없습니다.
-				</p>
-				<h3>활성 · 긴 모델 이름 / 두 예시 제공자 / 로컬 선택</h3>
+				<h2>{t("showcase.modelsHeading")}</h2>
+				<p className="muted">{t("showcase.modelsNote")}</p>
+				<h3>{t("showcase.modelsActiveHeading")}</h3>
 				<FixtureControls />
-				<h3>비활성 · 선택값 보존</h3>
+				<h3>{t("showcase.modelsDisabledHeading")}</h3>
 				<FixtureControls disabled />
-				<h3>적용 중 디자인 예시 · 중복 조작 비활성</h3>
+				<h3>{t("showcase.modelsPendingHeading")}</h3>
 				<FixtureControls pending />
-				<h3>결과 없음 · 빈 예시 목록의 검색창 열기</h3>
+				<h3>{t("showcase.modelsEmptyHeading")}</h3>
 				<FixtureControls empty />
-				<h3>항상 켜진 추론 · 변경할 수 없는 상태의 디자인 예시</h3>
+				<h3>{t("showcase.reasoningAlwaysOnHeading")}</h3>
 				<ReasoningSelect
 					thinking={{
 						level: null,
@@ -1243,33 +1214,31 @@ export default function Showcase() {
 						scope: "session",
 						available: false,
 						mode: "always-on",
-						reason: "디자인 예시 · 추론은 항상 켜져 있습니다.",
+						reason: t("showcase.reasoningAlwaysOnReason"),
 					}}
 					onChange={() => {}}
 				/>
 			</section>
 			<section id="showcase-mcp">
-				<h2>실제 컴포넌트 · MCP 관리자 DESIGN-ONLY</h2>
+				<h2>{t("showcase.mcpHeading")}</h2>
 				<FixtureMcpPanel />
 			</section>
 			<section id="showcase-session-info">
-				<h2>실제 컴포넌트 · 세션 정보 DESIGN-ONLY</h2>
+				<h2>{t("showcase.sessionInfoHeading")}</h2>
 				<FixtureSessionInfoPanel />
 			</section>
 			<section id="showcase-btw">
-				<h2>실제 컴포넌트 · BTW 격리된 곁대화 DESIGN-ONLY</h2>
+				<h2>{t("showcase.btwHeading")}</h2>
 				<FixtureBtwPanel />
 			</section>
 			<section id="showcase-fork">
-				<h2>실제 컴포넌트 · 대화 분기 DESIGN-ONLY</h2>
+				<h2>{t("showcase.forkHeading")}</h2>
 				<FixtureForkPanel />
 			</section>
 			<section id="showcase-composers">
-				<h2>입력과 컨트롤 슬롯</h2>
-				<p className="muted">
-					예시 선택값과 버튼은 디자인 검토용 로컬 상태입니다. 실제 모델 설정이나 작업을 변경하지 않습니다.
-				</p>
-				<h3>빈 초안 · 입력과 예시 컨트롤 활성</h3>
+				<h2>{t("showcase.composersHeading")}</h2>
+				<p className="muted">{t("showcase.composersNote")}</p>
+				<h3>{t("showcase.composerEmptyHeading")}</h3>
 				<Composer
 					value={draft}
 					onChange={setDraft}
@@ -1282,35 +1251,35 @@ export default function Showcase() {
 						/>
 					}
 					hasAttachments={attachments.length > 0}
-					onSend={() => setAnswer("빈 초안 디자인 예시에서 전송했습니다.")}
+					onSend={() => setAnswer(t("showcase.answerEmptySent"))}
 					onStop={() => {}}
-					onSlash={() => setAnswer("슬래시 명령 디자인 예시입니다.")}
+					onSlash={() => setAnswer(t("showcase.answerSlash"))}
 					busy={false}
 					controls={<FixtureControls />}
 				/>
-				<h3>작성된 초안 · 줄바꿈과 키보드 전송</h3>
+				<h3>{t("showcase.composerPopulatedHeading")}</h3>
 				<Composer
 					value={populatedDraft}
 					onChange={setPopulatedDraft}
-					onSend={() => setAnswer("작성된 초안 디자인 예시에서 전송했습니다.")}
+					onSend={() => setAnswer(t("showcase.answerPopulatedSent"))}
 					onStop={() => {}}
 					busy={false}
 					controls={<FixtureControls />}
 				/>
-				<h3>실행 중 · 전달 방식 / 중지 / 대기열</h3>
+				<h3>{t("showcase.composerRunningHeading")}</h3>
 				<Composer
 					value={runningDraft}
 					onChange={setRunningDraft}
-					onSend={() => setAnswer("대기열 추가 디자인 예시입니다.")}
-					onStop={() => setAnswer("작업 중지 디자인 예시입니다.")}
+					onSend={() => setAnswer(t("showcase.answerQueued"))}
+					onStop={() => setAnswer(t("showcase.answerStopped"))}
 					busy
 					deliverAs={deliverAs}
 					onDeliverAs={setDeliverAs}
 					controls={<FixtureControls running />}
 				/>
-				<h3>연결 실패 · 초안 보존 / 컨트롤 비활성</h3>
+				<h3>{t("showcase.composerDisconnectedHeading")}</h3>
 				<Composer
-					value="연결 실패 후 보존된 초안"
+					value={t("showcase.composerDisconnectedDraft")}
 					onChange={() => {}}
 					onSend={() => {}}
 					onStop={() => {}}
@@ -1318,17 +1287,17 @@ export default function Showcase() {
 					disabled
 					controls={<FixtureControls disabled />}
 				/>
-				<h3>추가 컨트롤 없는 기본 입력</h3>
+				<h3>{t("showcase.composerPlainHeading")}</h3>
 				<Composer
 					value={draft}
 					onChange={setDraft}
-					onSend={() => setAnswer("기본 입력 디자인 예시에서 전송했습니다.")}
+					onSend={() => setAnswer(t("showcase.answerPlainSent"))}
 					onStop={() => {}}
 					busy={false}
 				/>
 			</section>
 			<section id="showcase-settings">
-				<h2>설정 필드 · 편집 / 읽기 전용 / 저장 중</h2>
+				<h2>{t("showcase.settingsHeading")}</h2>
 				<SettingField
 					setting={{
 						path: "example.mode",
@@ -1336,31 +1305,36 @@ export default function Showcase() {
 						type: "string",
 						writable: true,
 						choices: ["safe", "review"],
-						description: "로컬 디자인 예시의 선택값입니다.",
+						description: t("showcase.settingDescription"),
 					}}
-					onSave={value => setAnswer(`설정 디자인 예시: ${String(value)}`)}
+					onSave={value => setAnswer(t("showcase.answerSetting", { value: String(value) }))}
 				/>
 				<SettingField
 					setting={{ path: "example.readonly", value: true, type: "boolean", writable: false }}
 					onSave={() => {}}
 				/>
 				<SettingField
-					setting={{ path: "example.pending", value: "보존된 설정값", type: "string", writable: true }}
+					setting={{
+						path: "example.pending",
+						value: t("showcase.settingPendingValue"),
+						type: "string",
+						writable: true,
+					}}
 					pending
 					onSave={() => {}}
 				/>
 			</section>
 			<p className="showcase-result" role="status">
-				{answer || "디자인 예시 동작 결과가 여기에 표시됩니다."}
+				{answer || t("showcase.answerIdle")}
 			</p>
 			{dialog && (
-				<Modal title="설정 · 키보드 포커스 검토" onClose={() => setDialog(false)}>
-					<p>디자인 예시입니다. Tab 순환, Escape 닫기, 트리거 포커스 복원을 확인하세요.</p>
+				<Modal title={t("showcase.modalTitle")} onClose={() => setDialog(false)}>
+					<p>{t("showcase.modalBody")}</p>
 					<label>
-						예시 비밀 입력
+						{t("showcase.modalFieldLabel")}
 						<input type="password" autoComplete="off" />
 					</label>
-					<Button onClick={() => setDialog(false)}>닫기</Button>
+					<Button onClick={() => setDialog(false)}>{t("showcase.modalClose")}</Button>
 				</Modal>
 			)}
 		</main>

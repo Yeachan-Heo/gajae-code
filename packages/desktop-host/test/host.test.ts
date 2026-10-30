@@ -184,7 +184,7 @@ describe("desktop protocol validation", () => {
 	test("projects a failed assistant turn as a visible error, not an empty bubble", () => {
 		const page = projectHistoryPage(
 			[
-				{ role: "user", content: [{ type: "text", text: "안녕" }], timestamp: 1 },
+				{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 },
 				{
 					role: "assistant",
 					content: [],
@@ -286,7 +286,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		const uiBindings: string[] = [];
 		const entryIds: string[] = [];
 		let assistantId = "";
-		const texts = ["같은 원문", "선택할 원문\n공백도 유지  ", "같은 원문"];
+		const texts = ["same source", "selected source\ntrailing spaces kept  ", "same source"];
 		const createHost = () =>
 			new DesktopHost({
 				dataDir,
@@ -304,7 +304,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 							if (index === 0) {
 								const assistant: AssistantMessage = {
 									role: "assistant",
-									content: [{ type: "text", text: "첫 응답" }],
+									content: [{ type: "text", text: "first response" }],
 									api: "openai-completions",
 									provider: "fixture",
 									model: "fixture",
@@ -485,7 +485,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		]) {
 			expect(message.blocks).toEqual([
 				{ type: "thinking", text: "secret [redacted]" },
-				{ type: "image-unavailable", reason: "보안상의 이유로 이미지를 미리 볼 수 없습니다." },
+				{ type: "image-unavailable", reason: "Image preview is unavailable for security reasons." },
 				{ type: "image", mimeType: "image/png", data: "QkJC" },
 			]);
 			expect(JSON.stringify(message)).not.toContain("signature-secret");
@@ -654,7 +654,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			]);
 			expect(h.uiBindings).toHaveLength(1);
 			await expect(h.call("prompt", { sessionId: h.source.id, text: "must not queue" })).rejects.toThrow(
-				"세션 변경",
+				"session change",
 			);
 			releaseBranch.resolve();
 			await bounded(disposing.promise, "candidate disposal entry");
@@ -1199,13 +1199,13 @@ describe("concurrent JSONL transport", () => {
 			async close() {},
 		};
 		const bytes = new TextEncoder().encode(
-			`null\n${JSON.stringify({ id: "utf8", method: "prompt", params: { text: "가재" } })}`,
+			`null\n${JSON.stringify({ id: "utf8", method: "prompt", params: { text: "🦀" } })}`,
 		);
 		async function* input() {
 			for (const byte of bytes) yield Uint8Array.of(byte);
 		}
 		await serveProtocol(input(), host, frame => frames.push(frame));
 		expect(frames).toEqual([{ type: "fatal", error: "Invalid protocol request" }]);
-		expect(commands[0]?.params.text).toBe("가재");
+		expect(commands[0]?.params.text).toBe("🦀");
 	});
 });

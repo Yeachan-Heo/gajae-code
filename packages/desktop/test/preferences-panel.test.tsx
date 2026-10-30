@@ -9,7 +9,7 @@ function preferences(): DesktopPreferences {
 		profiles: [
 			{
 				id: "configured-review",
-				name: "공통 검토 프로필",
+				name: "Shared review profile",
 				description: null,
 				source: "configured",
 				active: true,
@@ -22,7 +22,7 @@ function preferences(): DesktopPreferences {
 			},
 			{
 				id: "builtin-review",
-				name: "공통 검토 프로필",
+				name: "Shared review profile",
 				description: null,
 				source: "builtin",
 				active: false,
@@ -35,8 +35,8 @@ function preferences(): DesktopPreferences {
 			},
 			{
 				id: "unavailable-profile",
-				name: "연결 대기 프로필",
-				description: "설정에 있는 프로필 설명",
+				name: "Waiting for connection profile",
+				description: "Profile description from settings",
 				source: "configured",
 				active: false,
 				default: false,
@@ -50,9 +50,9 @@ function preferences(): DesktopPreferences {
 		roles: [
 			{
 				id: "executor",
-				name: "실행 담당",
+				name: "Executor role",
 				configured: true,
-				model: { id: "shared-model", provider: "provider-a", name: "공통 모델" },
+				model: { id: "shared-model", provider: "provider-a", name: "Shared model" },
 				thinkingLevel: "high",
 				configurationResolution: { origin: "layered", layers: ["global", "project", "runtime"] },
 				canApply: { available: true, reason: null },
@@ -61,9 +61,9 @@ function preferences(): DesktopPreferences {
 			},
 			{
 				id: "critic",
-				name: "검토 담당",
+				name: "Reviewer role",
 				configured: false,
-				model: { id: "shared-model", provider: "provider-b", name: "공통 모델" },
+				model: { id: "shared-model", provider: "provider-b", name: "Shared model" },
 				thinkingLevel: null,
 				configurationResolution: { origin: "default", layers: [] },
 				canApply: { available: false, reason: "Role unavailable." },
@@ -131,53 +131,53 @@ describe("desktop preferences presentation", () => {
 		const [active, savedDefault, unavailable] = profileOptions(html);
 		expect(active).toContain('data-active="true"');
 		expect(active).not.toContain('data-default="true"');
-		expect(active).toContain("이 대화에서 사용 중");
-		expect(active).toContain("사용자 설정");
+		expect(active).toContain("In use in this conversation");
+		expect(active).toContain("Configured");
 		expect(active).toContain("<code>configured-review</code>");
 		expect(savedDefault).toContain('data-default="true"');
 		expect(savedDefault).not.toContain('data-active="true"');
-		expect(savedDefault).toContain("저장된 기본 프로필");
-		expect(savedDefault).toContain("기본 제공");
+		expect(savedDefault).toContain("Saved default profile");
+		expect(savedDefault).toContain("Built-in");
 		expect(savedDefault).toContain("<code>builtin-review</code>");
-		expect(active).toContain("공통 검토 프로필 (configured-review): 이 대화에 적용");
-		expect(savedDefault).toContain("공통 검토 프로필 (builtin-review): 이 대화에 적용");
+		expect(active).toContain("Shared review profile (configured-review): apply to this conversation");
+		expect(savedDefault).toContain("Shared review profile (builtin-review): apply to this conversation");
 		expect(unavailable).not.toContain('data-active="true"');
 		expect(unavailable).not.toContain('data-default="true"');
-		expect(unavailable).toContain("설정에 있는 프로필 설명");
+		expect(unavailable).toContain("Profile description from settings");
 	});
 
 	test("disables unsupported scope actions with their original scoped reasons, without withholding session selection", () => {
 		const html = render();
 		const [active, savedDefault, unavailable] = profileOptions(html);
-		const sessionButton = savedDefault?.match(/<button[^>]*aria-label="[^"]*: 이 대화에 적용"[^>]*>/u)?.[0];
+		const sessionButton = savedDefault?.match(/<button[^>]*aria-label="[^"]*: apply to this conversation"[^>]*>/u)?.[0];
 		expect(sessionButton).toBeDefined();
 		expect(sessionButton).not.toContain('disabled=""');
-		expect(active).toMatch(/<button[^>]*aria-label="[^"]*: 기본 프로필로 저장"[^>]*disabled=""/u);
-		expect(unavailable).toMatch(/<button[^>]*aria-label="[^"]*: 이 대화에 적용"[^>]*disabled=""/u);
-		expect(unavailable).toMatch(/<button[^>]*aria-label="[^"]*: 기본 프로필로 저장"[^>]*disabled=""/u);
-		expect(unavailable).toContain("이 대화: Session selection requires an available host.");
-		expect(unavailable).toContain("기본값 저장: Default-profile ownership CAS is unavailable.");
-		expect(html).not.toContain("최근 사용 모델(MRU) 기록");
-		expect(html).toContain("이 대화에 적용");
+		expect(active).toMatch(/<button[^>]*aria-label="[^"]*: save as default profile"[^>]*disabled=""/u);
+		expect(unavailable).toMatch(/<button[^>]*aria-label="[^"]*: apply to this conversation"[^>]*disabled=""/u);
+		expect(unavailable).toMatch(/<button[^>]*aria-label="[^"]*: save as default profile"[^>]*disabled=""/u);
+		expect(unavailable).toContain("This conversation: Session selection requires an available host.");
+		expect(unavailable).toContain("Saving the default: Default-profile ownership CAS is unavailable.");
+		expect(html).not.toContain("Most recently used model (MRU) history");
+		expect(html).toContain("Apply to this conversation");
 	});
 
 	test("renders resolved role identities, configuration state, thinking and map provenance as read-only", () => {
 		const [executor, critic] = preferenceRows(render());
-		expect(executor).toContain("명시적으로 설정됨");
-		expect(executor).toContain("공통 모델");
+		expect(executor).toContain("Explicitly configured");
+		expect(executor).toContain("Shared model");
 		expect(executor).toContain("provider-a / shared-model");
-		expect(executor).toContain("<dt>추론 수준</dt><dd>high</dd>");
-		expect(executor).toContain("여러 계층 (layered)");
-		expect(executor).toContain("전역 (global) → 프로젝트 (project) → 실행 중 (runtime)");
-		expect(executor).toContain("모델 선택에서 변경 · 현재 대화에만 적용");
+		expect(executor).toContain("<dt>Reasoning level</dt><dd>high</dd>");
+		expect(executor).toContain("Multiple layers");
+		expect(executor).toContain("Global → Project → Runtime");
+		expect(executor).toContain("Change in model selection · applies to this conversation only");
 		expect(executor).not.toContain("<button");
-		expect(critic).toContain("상속 또는 기본값");
+		expect(critic).toContain("Inherited or default");
 		expect(critic).toContain("provider-b / shared-model");
-		expect(critic).toContain("<dt>추론 수준</dt><dd>설정 없음</dd>");
-		expect(critic).toContain("기본값 (default)");
-		expect(critic).toContain("변경 불가: Role unavailable.");
+		expect(critic).toContain("<dt>Reasoning level</dt><dd>Not set</dd>");
+		expect(critic).toContain("Default");
+		expect(critic).toContain("Cannot change: Role unavailable.");
 		expect(critic).not.toContain("<button");
-		expect(render()).not.toContain("역할 맵의 출처");
+		expect(render()).not.toContain("Role map provenance");
 	});
 
 	test("labels durable default model capability without adding another role editor", () => {
@@ -186,89 +186,84 @@ describe("desktop preferences presentation", () => {
 		data.roles[0]!.scope = "default";
 		data.roles[0]!.canClear = { available: false, reason: "The default model cannot be cleared." };
 		const row = preferenceRows(render({ preferences: data }))[0];
-		expect(row).toContain("모델 선택에서 변경 · 공통 설정에 저장");
+		expect(row).toContain("Change in model selection · saved to shared settings");
 		expect(row).not.toContain("<button");
 	});
 
 	test("preserves zero, provider-default -1, invalid values and next-run semantics without inferring provider support", () => {
 		const html = render();
 		const [, , zero, sentinel, invalid] = preferenceRows(html);
-		expect(zero).toContain("<dt>병합된 설정 값</dt><dd>0</dd>");
-		expect(zero).toContain("<dt>다음 실행 옵션 값</dt><dd>0</dd>");
-		expect(zero).toContain("실행 중 (runtime)");
-		expect(sentinel).toContain("<dd>-1 · 제공자 기본값 (-1)</dd>");
-		expect(sentinel).toContain("<dt>다음 실행 옵션 값</dt><dd>명시적 옵션 값 없음</dd>");
-		expect(sentinel).toContain("프로젝트 (project)");
-		expect(invalid).toContain("값 없음 · 유효하지 않은 설정");
-		expect(invalid).not.toContain("제공자 기본값 (-1)");
+		expect(zero).toContain("<dt>Merged setting value</dt><dd>0</dd>");
+		expect(zero).toContain("<dt>Next run option value</dt><dd>0</dd>");
+		expect(zero).toContain("Runtime · Layers: Global → Runtime");
+		expect(sentinel).toContain("<dd>-1 · Provider default</dd>");
+		expect(sentinel).toContain("<dt>Next run option value</dt><dd>No explicit option value</dd>");
+		expect(sentinel).toContain("Project · Layers: Global → Project");
+		expect(invalid).toContain("No value · Invalid setting");
+		expect(invalid).not.toContain("Provider default");
 		for (const row of [zero, sentinel, invalid]) {
-			expect(row).toContain("알 수 없음 (unknown)");
+			expect(row).toContain("Unknown");
 			expect(row).toContain("Sampling validation and model capabilities are unavailable.");
-			expect(row).toMatch(/<button[^>]*disabled=""[^>]*>샘플링 변경 불가<\/button>/u);
+			expect(row).toMatch(/<button[^>]*disabled=""[^>]*>Sampling is read-only<\/button>/u);
 		}
-		expect(html).toContain("다음 실행에 적용됩니다.");
-		expect(html).toContain("모델별 지원 여부는 알 수 없습니다.");
+		expect(html).toContain("Applies to the next run.");
+		expect(html).toContain("Per-model support is unknown.");
 		expect(html).not.toContain("<input");
 		expect(html).not.toContain("<select");
 	});
 
 	test("distinguishes unloaded, loading, failed, empty and idle states without optimistic application notices", () => {
 		const unloaded = render({ preferences: null });
-		expect(unloaded).toContain("환경설정 정보가 없습니다.");
+		expect(unloaded).toContain("No preference information.");
 		expect(unloaded).not.toContain('role="status"');
 		const loading = render({ preferences: null, pending: true });
 		expect(loading).toContain('aria-busy="true"');
 		expect(loading).toContain('role="status"');
-		expect(loading).toContain("환경설정을 불러오는 중…");
-		expect(loading).not.toContain("환경설정 정보가 없습니다.");
-		const failed = render({ preferences: null, error: "호스트 응답을 받지 못했습니다." });
+		expect(loading).toContain("Loading preferences…");
+		expect(loading).not.toContain("No preference information.");
+		const failed = render({ preferences: null, error: "No host response was received." });
 		expect(failed).toContain('role="alert"');
-		expect(failed).toContain("호스트 응답을 받지 못했습니다.");
-		expect(failed).not.toContain("불러오는 중");
-		expect(failed).not.toContain("환경설정 정보가 없습니다.");
+		expect(failed).toContain("No host response was received.");
+		expect(failed).not.toContain("Loading");
+		expect(failed).not.toContain("No preference information.");
 		const empty = render({ preferences: { profiles: [], roles: [], sampling: [] } });
-		expect(empty).toContain("사용 가능한 모델 프로필이 없습니다.");
-		expect(empty).toContain("역할별 모델 정보가 없습니다.");
-		expect(empty).toContain("샘플링 설정 정보가 없습니다.");
+		expect(empty).toContain("No model profiles available.");
+		expect(empty).toContain("No per-role model information.");
+		expect(empty).toContain("No sampling settings information.");
 		const idle = render();
 		expect(idle).toContain('aria-busy="false"');
 		expect(idle).not.toContain('role="status"');
 		expect(idle).not.toContain('role="alert"');
-		expect(idle).not.toContain("적용 완료");
+		expect(idle).not.toContain("Applied successfully");
 	});
 
 	test("locks every action while pending and retains authoritative values and visible errors", () => {
-		const html = render({ pending: true, error: "프로필 변경 요청이 거부되었습니다." });
+		const html = render({ pending: true, error: "The profile change request was rejected." });
 		const buttons = html.match(/<button\b[^>]*>/gu) ?? [];
 		expect(buttons.length).toBeGreaterThan(0);
 		for (const button of buttons) expect(button).toContain('disabled=""');
-		expect(html).toContain("설정 연결 또는 요청 처리를 기다리는 중…");
-		expect(html).toContain("프로필 변경 요청이 거부되었습니다.");
-		expect(html).toContain("아래는 마지막으로 받은 값입니다.");
+		expect(html).toContain("Waiting for the settings connection or a request…");
+		expect(html).toContain("The profile change request was rejected.");
+		expect(html).toContain("The values below are the last received.");
 		expect(profileOptions(html)[0]).toContain('data-active="true"');
 		expect(profileOptions(html)[1]).not.toContain('data-active="true"');
-		expect(html).not.toContain("설정이 적용되었습니다");
+		expect(html).not.toContain("Settings were applied");
 	});
 
-	test("blocks profile writes while the selected session is busy without blocking refresh or read-only inspection", () => {
-		const html = render({ busy: true });
-		const refreshButton = html.match(/<button\b[^>]*>[\s\S]*?새로고침<\/button>/u)?.[0];
+	test("keeps profile actions available so a change made during a run still reaches the host", () => {
+		const html = render();
+		const refreshButton = html.match(/<button\b[^>]*>[\s\S]*?Refresh<\/button>/u)?.[0];
 		expect(refreshButton).toBeDefined();
 		expect(refreshButton).not.toContain('disabled=""');
 		expect(html).toContain('aria-busy="false"');
-		expect(html).not.toContain("설정 연결 또는 요청 처리를 기다리는 중");
-		expect(html).toContain("실행 중에는 프로필을 변경할 수 없습니다.");
-		expect(html).toContain("실행 중에는 프로필을 변경할 수 없습니다.");
-		for (const profile of profileOptions(html)) {
-			const buttons = profile.match(/<button\b[^>]*>/gu) ?? [];
-			expect(buttons).toHaveLength(2);
-			for (const button of buttons) {
-				expect(button).toContain('disabled=""');
-				expect(button).toMatch(/aria-describedby="[^"]* [^"]*-busy"/u);
-			}
-		}
-		expect(preferenceRows(html)).toEqual(preferenceRows(render()));
-		expect(render({ busy: true, pending: true })).toMatch(/<button\b[^>]*disabled=""[^>]*>[\s\S]*?새로고침<\/button>/u);
+		expect(html).not.toContain("Profiles cannot be changed while a run is active.");
+		const profiles = profileOptions(html);
+		expect(profiles).toHaveLength(3);
+		// The active conversation profile and the unavailable one refuse their own apply
+		// button; a running turn never enters that decision.
+		const applyDisabled = profiles.map(profile => (profile.match(/<button\b[^>]*>/gu) ?? [])[0]!.includes('disabled=""'));
+		expect(applyDisabled).toEqual([true, false, true]);
+		expect(preferenceRows(html)).toEqual(preferenceRows(render({ pending: false })));
 	});
 
 	test("does not invent active/default profiles or resolved models when the DTO has none", () => {
@@ -281,9 +276,9 @@ describe("desktop preferences presentation", () => {
 		const html = render({ preferences: data });
 		expect(html).not.toContain('data-active="true"');
 		expect(html).not.toContain('data-default="true"');
-		expect(html).not.toContain("이 대화에서 사용 중");
-		expect(html).not.toContain("저장된 기본 프로필</span>");
-		expect(preferenceRows(html)[0]).toContain("해석된 모델 없음");
+		expect(html).not.toContain("In use in this conversation");
+		expect(html).not.toContain("Saved default profile</span>");
+		expect(preferenceRows(html)[0]).toContain("No resolved model");
 		expect(preferenceRows(html)[0]).not.toContain("provider-a");
 	});
 

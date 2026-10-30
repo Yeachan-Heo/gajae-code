@@ -332,7 +332,7 @@ describe("desktop streaming lifecycle", () => {
 
 	test("a run reports running, accepts a steer, and abort clears it", async () => {
 		const { call, snapshot, session, sdk, control, frames } = await launch();
-		const running = call("prompt", { sessionId: session.id, text: "긴 작업" });
+		const running = call("prompt", { sessionId: session.id, text: "long task" });
 		await Promise.race([
 			control.started,
 			running.then(() => {
@@ -341,24 +341,31 @@ describe("desktop streaming lifecycle", () => {
 		]);
 		expect(sdk.isStreaming).toBe(true);
 		expect(control.prompts).toHaveLength(1);
-		expect(control.prompts[0]).toContain("긴 작업");
+		expect(control.prompts[0]).toContain("long task");
 		expect((await snapshot()).sessions[0]?.status).toBe("running");
 		expect((await snapshot()).sessions[0]?.messages.map(message => message.text)).toContain("working");
-		await expect(call("command.run", { sessionId: session.id, text: "/tools" })).rejects.toThrow("실행 중");
+		await expect(call("command.run", { sessionId: session.id, text: "/tools" })).rejects.toThrow(
+			"Another operation is running",
+		);
 
 		const steer = await call<{ queued: boolean; submissionId: string }>(
 			"prompt",
 			{
 				sessionId: session.id,
-				text: "방향 전환",
+				text: "change direction",
 				deliverAs: "steer",
 			},
 			"steer-delivery",
 		);
 		expect(steer.queued).toBe(true);
-		expect(sdk.getQueuedMessages().steering).toEqual(["방향 전환"]);
+		expect(sdk.getQueuedMessages().steering).toEqual(["change direction"]);
 		expect((await snapshot()).sessions[0]?.queued).toEqual([
-			expect.objectContaining({ id: steer.submissionId, text: "방향 전환", deliverAs: "steer", cancelable: true }),
+			expect.objectContaining({
+				id: steer.submissionId,
+				text: "change direction",
+				deliverAs: "steer",
+				cancelable: true,
+			}),
 		]);
 		expect(
 			await call<{ removed: boolean }>("queue.cancel", { sessionId: session.id, queueId: steer.submissionId }),
@@ -373,8 +380,8 @@ describe("desktop streaming lifecycle", () => {
 			}),
 		);
 
-		await call("prompt", { sessionId: session.id, text: "두번째", deliverAs: "followUp" }, "followup-delivery");
-		expect(sdk.getQueuedMessages().followUp).toEqual(["두번째"]);
+		await call("prompt", { sessionId: session.id, text: "second turn", deliverAs: "followUp" }, "followup-delivery");
+		expect(sdk.getQueuedMessages().followUp).toEqual(["second turn"]);
 		expect((await snapshot()).sessions[0]?.queued ?? []).toHaveLength(1);
 		await call("abort", { sessionId: session.id });
 		await expect(running).rejects.toThrow("Prompt outcome unknown");
@@ -608,7 +615,7 @@ describe("desktop streaming lifecycle", () => {
 
 	test("a completed turn returns the session to idle and keeps its genuine transcript", async () => {
 		const { call, snapshot, session, sdk, control, project } = await launch();
-		const running = call("prompt", { sessionId: session.id, text: "짧은 작업" }, "prompt-delivery");
+		const running = call("prompt", { sessionId: session.id, text: "short task" }, "prompt-delivery");
 		await Promise.race([
 			control.started,
 			running.then(() => {
@@ -616,10 +623,10 @@ describe("desktop streaming lifecycle", () => {
 			}),
 		]);
 		await expect(call("delivery.ack", { deliveryId: "prompt-delivery" })).rejects.toThrow("not final");
-		await expect(call("prompt", { sessionId: session.id, text: "다른 작업" }, "prompt-delivery")).rejects.toThrow(
+		await expect(call("prompt", { sessionId: session.id, text: "another task" }, "prompt-delivery")).rejects.toThrow(
 			"Duplicate delivery id",
 		);
-		control.finishTurn("echo: 짧은 작업");
+		control.finishTurn("echo: short task");
 		await running;
 		expect((await snapshot()).deliveries).toContainEqual(
 			expect.objectContaining({ id: "prompt-delivery", disposition: "completed" }),
@@ -629,13 +636,13 @@ describe("desktop streaming lifecycle", () => {
 		const done = (await snapshot()).sessions[0];
 		// A settled session that finished a turn reports "done"; a never-used session stays "idle".
 		expect(done?.status).toBe("done");
-		expect(done?.messages.map(message => message.text)).toContain("echo: 짧은 작업");
+		expect(done?.messages.map(message => message.text)).toContain("echo: short task");
 		const history = await call<DesktopHistory>("history.get", { sessionId: session.id });
-		expect(history.messages.map(message => message.text)).toContain("짧은 작업");
-		expect(history.messages.map(message => message.text)).toContain("echo: 짧은 작업");
+		expect(history.messages.map(message => message.text)).toContain("short task");
+		expect(history.messages.map(message => message.text)).toContain("echo: short task");
 		const transcript = await Bun.file(sdk.sessionFile!).text();
-		expect(transcript).toContain("짧은 작업");
-		expect(transcript).toContain("echo: 짧은 작업");
+		expect(transcript).toContain("short task");
+		expect(transcript).toContain("echo: short task");
 		expect(sdk.sessionManager.getCwd()).toBe(project.path);
 		expect(await call<DesktopCommandResult>("command.run", { sessionId: session.id, text: "/jobs" })).toMatchObject({
 			consumed: true,

@@ -178,7 +178,7 @@ describe("mounted compact composer", () => {
 		const { context, page } = await fixture();
 		try {
 			const attachment = await page.$eval('.composer-input', element => {
-				const button = element.querySelector('button[aria-label="파일 첨부"]');
+				const button = element.querySelector('button[aria-label="Attach file"]');
 				return { iconOnly: button?.textContent === '', beforeTextarea: !!button && !!(button.compareDocumentPosition(element.querySelector('textarea')!) & Node.DOCUMENT_POSITION_FOLLOWING), input: !!element.querySelector('input[type=file][hidden]') };
 			});
 			expect(attachment).toEqual({ iconOnly: true, beforeTextarea: true, input: true });
@@ -187,7 +187,7 @@ describe("mounted compact composer", () => {
 			expect(await page.$eval('.attachment-picker input[type=file]', input => input.getAttribute('data-clicked'))).toBe('yes');
 			await page.click('#open');
 			await page.waitForSelector('dialog[open] .modal-content #inside');
-			expect(await page.$eval('dialog', dialog => !!dialog.querySelector(':scope > header .modal-close[aria-label="닫기"]') && !!dialog.querySelector(':scope > .modal-content #inside'))).toBe(true);
+			expect(await page.$eval('dialog', dialog => !!dialog.querySelector(':scope > header .modal-close[aria-label="Close"]') && !!dialog.querySelector(':scope > .modal-content #inside'))).toBe(true);
 			expect(await page.$eval('.modal-close', button => button.textContent)).toBe('');
 			await page.focus('#inside');
 			for (const key of ['Tab', 'Tab'] as const) {

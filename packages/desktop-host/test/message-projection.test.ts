@@ -60,13 +60,13 @@ describe("desktop message projection", () => {
 				content: [
 					{ type: "thinking", thinking: "t".repeat(12_000) },
 					{ type: "text", text: "old".repeat(4_000) },
-					{ type: "text", text: "최종 답변" },
+					{ type: "text", text: "final answer" },
 				],
 			},
 		])[0]!;
 		expect(message.blocks?.map(block => block.type)).toEqual(["thinking", "text", "text"]);
 		expect(message.blocks?.[0]).toEqual({ type: "thinking", text: "t".repeat(8_000) });
-		expect(message.text.endsWith("최종 답변")).toBe(true);
+		expect(message.text.endsWith("final answer")).toBe(true);
 		expect(message.truncated).toBe(true);
 	});
 
@@ -75,8 +75,8 @@ describe("desktop message projection", () => {
 			{
 				role: "assistant",
 				content: [
-					{ type: "thinking", thinking: "생각".repeat(4_000) },
-					{ type: "text", text: `${"앞부분".repeat(3_000)}최종 답변` },
+					{ type: "thinking", thinking: "想法".repeat(4_000) },
+					{ type: "text", text: `${"前部分".repeat(3_000)}final answer` },
 				],
 			},
 		]);
@@ -86,7 +86,7 @@ describe("desktop message projection", () => {
 		expect(fitted.messages).toHaveLength(1);
 		const message = fitted.messages[0]!;
 		expect(message.truncated).toBe(true);
-		expect(message.text.endsWith("최종 답변")).toBe(true);
+		expect(message.text.endsWith("final answer")).toBe(true);
 		expect(
 			message.blocks
 				?.filter(block => block.type === "text")
@@ -94,18 +94,18 @@ describe("desktop message projection", () => {
 				.join("\n"),
 		).toBe(message.text);
 		expect(Buffer.byteLength(JSON.stringify(message)) + 1).toBeLessThanOrEqual(budget);
-		const plain = fitMessages([{ id: "id", role: "assistant", text: `${'한"'.repeat(1000)}끝` }], 120);
+		const plain = fitMessages([{ id: "id", role: "assistant", text: `${'漢"'.repeat(1000)}end` }], 120);
 		expect(plain.truncated).toBe(true);
-		expect(plain.messages[0]?.text.endsWith("끝")).toBe(true);
+		expect(plain.messages[0]?.text.endsWith("end")).toBe(true);
 		expect(Buffer.byteLength(JSON.stringify(plain.messages[0])) + 1).toBeLessThanOrEqual(120);
 	});
 
 	test("accounts for array brackets at the exact serialized boundary", () => {
-		const message = { id: "array-boundary", role: "assistant" as const, text: `${"한".repeat(100)}끝` };
+		const message = { id: "array-boundary", role: "assistant" as const, text: `${"漢".repeat(100)}end` };
 		const budget = Buffer.byteLength(JSON.stringify([message])) - 1;
 		const fitted = fitMessages([message], budget);
 		expect(fitted.truncated).toBe(true);
-		expect(fitted.messages[0]?.text.endsWith("끝")).toBe(true);
+		expect(fitted.messages[0]?.text.endsWith("end")).toBe(true);
 		expect(Buffer.byteLength(JSON.stringify(fitted.messages))).toBeLessThanOrEqual(budget);
 	});
 
@@ -113,16 +113,16 @@ describe("desktop message projection", () => {
 		const message = {
 			id: "0:",
 			role: "assistant" as const,
-			text: "끝",
+			text: "end",
 			blocks: [
-				{ type: "text" as const, text: "끝" },
-				{ type: "image-unavailable" as const, reason: "이미지를 미리 볼 수 없습니다." },
+				{ type: "text" as const, text: "end" },
+				{ type: "image-unavailable" as const, reason: "Image preview is unavailable." },
 			],
 		};
 		const result = fitMessages([message], 120);
 		expect(result.truncated).toBe(true);
-		expect(result.messages[0]?.text).toBe("끝");
-		expect(result.messages[0]?.blocks).toEqual([{ type: "text", text: "끝" }]);
+		expect(result.messages[0]?.text).toBe("end");
+		expect(result.messages[0]?.blocks).toEqual([{ type: "text", text: "end" }]);
 		expect(result.messages[0]?.truncated).toBe(true);
 		expect(Buffer.byteLength(JSON.stringify(result.messages[0])) + 1).toBeLessThanOrEqual(120);
 	});
@@ -151,7 +151,7 @@ describe("desktop message projection", () => {
 		const input = Array.from({ length: 40 }, () => ({
 			role: "user",
 			content: [
-				{ type: "text", text: '한"'.repeat(4000) },
+				{ type: "text", text: '漢"'.repeat(4000) },
 				{ type: "image", mimeType: "image/png", data },
 			],
 		}));

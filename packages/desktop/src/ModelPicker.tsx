@@ -8,19 +8,23 @@ import type {
 } from "../../desktop-host/src/preferences-protocol";
 import type { DesktopModel } from "../../desktop-host/src/protocol";
 import { Button, Modal } from "./components";
+import { t } from "./i18n";
 
 export type PickerModelRole = "default" | "executor" | "planner" | "critic" | "architect";
 type PickerTab = "presets" | "models";
 const TAB_ORDER: PickerTab[] = ["presets", "models"];
 const ROLE_ORDER: PickerModelRole[] = ["default", "executor", "planner", "critic", "architect"];
-const ROLE_LABELS: Record<PickerModelRole, string> = {
-	default: "Default",
-	executor: "Executor",
-	planner: "Planner",
-	critic: "Critic",
-	architect: "Architect",
+const ROLE_LABELS: Record<PickerModelRole, () => string> = {
+	default: () => t("models.roleDefault"),
+	executor: () => t("models.roleExecutor"),
+	planner: () => t("models.rolePlanner"),
+	critic: () => t("models.roleCritic"),
+	architect: () => t("models.roleArchitect"),
 };
-const PROFILE_ROLE_LABELS: Record<DesktopModelRoleId, string> = { ...ROLE_LABELS, image: "Image" };
+const PROFILE_ROLE_LABELS: Record<DesktopModelRoleId, () => string> = {
+	...ROLE_LABELS,
+	image: () => t("models.roleImage"),
+};
 const FAVORITES_KEY = "gjc.desktop.model-favorites";
 
 function searchTerms(query: string): string[] {
@@ -48,7 +52,7 @@ function filterProfiles(profiles: DesktopModelProfile[], query: string): Desktop
 
 function profileRoleEntries(profile: DesktopModelProfile): { id: DesktopModelRoleId; label: string; model: string }[] {
 	return profile.roles.flatMap(role =>
-		role.model ? [{ id: role.id, label: PROFILE_ROLE_LABELS[role.id], model: role.model }] : [],
+		role.model ? [{ id: role.id, label: PROFILE_ROLE_LABELS[role.id](), model: role.model }] : [],
 	);
 }
 
@@ -100,8 +104,6 @@ export interface ModelPickerProps {
 	onApplyProfile?: (profileId: string) => void;
 	onRefresh?: () => void;
 	refreshing?: boolean;
-	/** Profile and role preferences need a settled session; model and reasoning picks are deferred instead. */
-	busy?: boolean;
 }
 
 export function ModelPicker({
@@ -118,10 +120,8 @@ export function ModelPicker({
 	onApplyProfile,
 	onRefresh,
 	refreshing,
-	busy = false,
 }: ModelPickerProps) {
 	const tabId = useId();
-	const busyReasonId = useId();
 	const [open, setOpen] = useState(false);
 	const [tab, setTab] = useState<PickerTab>("models");
 	const [modelQuery, setModelQuery] = useState("");
@@ -244,23 +244,27 @@ export function ModelPicker({
 		<>
 			<Button
 				className="model-trigger"
-				aria-label={`모델 선택: ${current?.name ?? selectedId ?? "선택되지 않음"}`}
+				aria-label={t("models.triggerLabel", {
+					model: current?.name ?? selectedId ?? t("models.notSelected"),
+				})}
 				aria-haspopup="dialog"
 				aria-expanded={open}
 				disabled={disabled || pending || applying}
-				title={current?.id ?? selectedId ?? "사용 가능한 모델 선택"}
+				title={current?.id ?? selectedId ?? t("models.triggerFallbackTitle")}
 				onClick={openDialog}
 			>
 				<Cpu size={15} aria-hidden="true" />
-				<span>{pending ? "모델 적용 중…" : (current?.name ?? selectedId ?? "모델 선택")}</span>
+				<span>
+					{pending ? t("models.applyingModel") : (current?.name ?? selectedId ?? t("models.selectModel"))}
+				</span>
 				<ChevronDown size={13} aria-hidden="true" />
 			</Button>
 			{open && (
-				<Modal title="모델 선택" className="model-dialog" onClose={closeDialog}>
+				<Modal title={t("models.selectModel")} className="model-dialog" onClose={closeDialog}>
 					<div
 						className="model-tabs"
 						role="tablist"
-						aria-label="모델 선택 탭"
+						aria-label={t("models.tabsLabel")}
 						ref={tabs}
 						onKeyDown={handleTabKeyDown}
 					>
@@ -273,7 +277,7 @@ export function ModelPicker({
 							tabIndex={tab === "presets" ? 0 : -1}
 							onClick={() => showTab("presets")}
 						>
-							프리셋
+							{t("models.tabPresets")}
 						</Button>
 						<Button
 							role="tab"
@@ -284,29 +288,24 @@ export function ModelPicker({
 							tabIndex={tab === "models" ? 0 : -1}
 							onClick={() => showTab("models")}
 						>
-							모델
+							{t("models.tabModels")}
 						</Button>
 					</div>
-					{busy && (
-						<p className="model-busy-reason muted" id={busyReasonId}>
-							작업이 끝난 뒤 프로필을 변경할 수 있습니다.
-						</p>
-					)}
 					{applying && (
 						<p className="model-busy-reason muted" role="status">
-							선택한 설정을 적용하는 중…
+							{t("models.applyingSelection")}
 						</p>
 					)}
 					{tab === "presets" ? (
 						<div role="tabpanel" id={`${tabId}-presets-panel`} aria-labelledby={`${tabId}-presets-tab`}>
 							<div className="model-toolbar">
 								<label className="model-search">
-									<span className="sr-only">프리셋 검색</span>
+									<span className="sr-only">{t("models.searchPresets")}</span>
 									<Search size={16} aria-hidden="true" />
 									<input
 										ref={presetInput}
 										value={presetQuery}
-										placeholder="프리셋 이름 검색"
+										placeholder={t("models.searchPresetsPlaceholder")}
 										onChange={event => setPresetQuery(event.target.value)}
 										onKeyDown={event => {
 											if (event.key !== "ArrowDown") return;
@@ -317,19 +316,17 @@ export function ModelPicker({
 								</label>
 							</div>
 							<p className="muted" role="status">
-								{filteredProfiles.length}개 프리셋
+								{t("models.presetCount", { count: filteredProfiles.length })}
 							</p>
 							{profileList.length === 0 ? (
-								<div className="empty model-empty">사용 가능한 프리셋이 없습니다.</div>
+								<div className="empty model-empty">{t("models.noPresets")}</div>
 							) : filteredProfiles.length === 0 ? (
-								<div className="empty model-empty">
-									일치하는 프리셋이 없습니다. 다른 이름이나 모델을 검색하세요.
-								</div>
+								<div className="empty model-empty">{t("models.noPresetMatches")}</div>
 							) : (
 								<ul
 									ref={presetResults}
 									className="model-result-list"
-									aria-label="프리셋 검색 결과"
+									aria-label={t("models.presetResults")}
 									onKeyDown={navigateList}
 								>
 									{filteredProfiles.map(profile => {
@@ -339,11 +336,10 @@ export function ModelPicker({
 												<div className="model-option" aria-current={profile.active ? "true" : undefined}>
 													<Button
 														className="model-option-hit"
-														aria-label={`${profile.name} 프로필을 이 대화에 적용`}
-														aria-describedby={busy ? busyReasonId : undefined}
-														disabled={!onApplyProfile || busy || applying}
+														aria-label={t("models.applyPreset", { name: profile.name })}
+														disabled={!onApplyProfile || applying}
 														onClick={() => {
-															if (!onApplyProfile || busy) return;
+															if (!onApplyProfile) return;
 															onApplyProfile(profile.id);
 															closeDialog();
 														}}
@@ -351,9 +347,11 @@ export function ModelPicker({
 														<span className="model-option-main">
 															<strong>{profile.name}</strong>
 															<small>
-																{profile.source === "builtin" ? "내장" : "설정"}
-																{profile.active ? " · 현재 적용" : ""}
-																{profile.default ? " · 기본 프로필" : ""}
+																{profile.source === "builtin"
+																	? t("models.presetBuiltin")
+																	: t("models.presetConfigured")}
+																{profile.active ? ` · ${t("models.active")}` : ""}
+																{profile.default ? ` · ${t("models.defaultProfile")}` : ""}
 															</small>
 															{entries.length > 0 && (
 																<span className="preset-roles">
@@ -378,20 +376,23 @@ export function ModelPicker({
 							{choice ? (
 								<div className="model-role-choice">
 									<button type="button" ref={back} className="button model-role-back" onClick={returnToList}>
-										뒤로
+										{t("models.back")}
 									</button>
-									<p>역할 선택: {models.find(model => model.id === choice)?.name ?? choice}</p>
-									<p className="muted">Default: 공통 설정 · 나머지 역할: 현재 대화</p>
+									<p>
+										{t("models.chooseRole", {
+											name: models.find(model => model.id === choice)?.name ?? choice,
+										})}
+									</p>
+									<p className="muted">{t("models.roleScope")}</p>
 									<div className="model-role-list">
 										{ROLE_ORDER.map(role => {
 											const preference = roleFor(role);
 											const fixtureDefault = role === "default" && !onAssign && !roles;
 											const available = fixtureDefault || (!!onAssign && !!preference?.canApply.available);
-											const reason = preference?.canApply.reason ?? "이 역할은 사용할 수 없습니다.";
+											const reason = preference?.canApply.reason ?? t("models.roleUnavailable");
 											const assigned = matches(role, choice);
 											// Default selects this conversation's model, which the renderer defers; only role
 											// preference writes need a settled session.
-											const preferenceBlocked = busy && role !== "default";
 											const canClear =
 												role !== "default" &&
 												assigned &&
@@ -402,35 +403,33 @@ export function ModelPicker({
 												<div className="model-role-row" key={role}>
 													<Button
 														className="model-role-option"
-														aria-describedby={preferenceBlocked ? busyReasonId : undefined}
-														disabled={!available || preferenceBlocked || applying}
+														disabled={!available || applying}
 														onClick={() => {
 															if (onAssign) onAssign(role, choice);
 															else if (fixtureDefault) onSelect(choice);
 															closeDialog();
 														}}
 													>
-														{ROLE_LABELS[role]}
-														{assigned ? " · 현재 적용" : ""}
+														{ROLE_LABELS[role]()}
+														{assigned ? ` · ${t("models.active")}` : ""}
 													</Button>
 													{!available && <small className="model-role-reason">{reason}</small>}
 													{role !== "default" && assigned && preference?.configured && (
 														<Button
 															className="model-role-clear"
-															aria-describedby={busy ? busyReasonId : undefined}
-															disabled={!canClear || busy || applying}
+															disabled={!canClear || applying}
 															title={
 																preference.canClear.reason ??
-																(!canClear ? "이 역할의 재정의를 해제할 수 없습니다." : undefined)
+																(!canClear ? t("models.overrideNotClearable") : undefined)
 															}
 															onClick={() => {
-																if (canClear && !busy) {
+																if (canClear) {
 																	onAssign?.(role, null);
 																	closeDialog();
 																}
 															}}
 														>
-															재정의 해제
+															{t("models.clearOverride")}
 														</Button>
 													)}
 												</div>
@@ -438,7 +437,7 @@ export function ModelPicker({
 										})}
 									</div>
 									<Button className="model-role-cancel" onClick={closeDialog}>
-										취소
+										{t("models.cancel")}
 									</Button>
 								</div>
 							) : (
@@ -455,30 +454,28 @@ export function ModelPicker({
 									}).map(role => (
 										<div className="model-role-row" key={role}>
 											<span>
-												{ROLE_LABELS[role]} · {roleFor(role)?.model?.name ?? "사용할 수 없는 모델"}
+												{ROLE_LABELS[role]()} · {roleFor(role)?.model?.name ?? t("models.unavailableModel")}
 											</span>
 											<Button
 												className="model-role-unavailable-clear"
-												aria-describedby={busy ? busyReasonId : undefined}
-												disabled={!onAssign || busy || applying}
+												disabled={!onAssign || applying}
 												onClick={() => {
-													if (busy) return;
 													onAssign?.(role, null);
 													setOpen(false);
 												}}
 											>
-												재정의 해제
+												{t("models.clearOverride")}
 											</Button>
 										</div>
 									))}
 									<div className="model-toolbar">
 										<label className="model-search">
-											<span className="sr-only">모델 또는 제공자 검색</span>
+											<span className="sr-only">{t("models.searchModels")}</span>
 											<Search size={16} aria-hidden="true" />
 											<input
 												ref={modelInput}
 												value={modelQuery}
-												placeholder="모델 이름, 제공자 또는 ID 검색"
+												placeholder={t("models.searchModelsPlaceholder")}
 												onChange={event => setModelQuery(event.target.value)}
 												onKeyDown={event => {
 													if (event.key !== "ArrowDown") return;
@@ -489,8 +486,8 @@ export function ModelPicker({
 										</label>
 										<Button
 											className="model-refresh"
-											aria-label="모델 목록 새로고침"
-											title="모델 목록 새로고침"
+											aria-label={t("models.refreshModels")}
+											title={t("models.refreshModels")}
 											disabled={!onRefresh || !!refreshing}
 											onClick={() => onRefresh?.()}
 										>
@@ -498,26 +495,26 @@ export function ModelPicker({
 										</Button>
 									</div>
 									<p className="muted" role="status">
-										{filtered.length}개 모델
+										{t("models.modelCount", { count: filtered.length })}
 									</p>
 									{favorites.error && (
 										<p className="model-favorites-error" role="alert">
-											즐겨찾기를 저장하거나 불러오지 못했습니다. 모델 선택은 계속할 수 있습니다.
+											{t("models.favoritesError")}
 										</p>
 									)}
 									{filtered.length === 0 ? (
 										<div className="empty model-empty">
 											{models.length === 0
 												? refreshing
-													? "모델 목록을 불러오는 중…"
-													: "사용 가능한 모델이 없습니다. 설정에서 제공자를 추가하거나 계정을 연결하세요."
-												: "일치하는 모델이 없습니다. 다른 이름이나 제공자를 검색하세요."}
+													? t("models.loadingModels")
+													: t("models.noModels")
+												: t("models.noModelMatches")}
 										</div>
 									) : (
 										<ul
 											ref={results}
 											className="model-result-list"
-											aria-label="모델 검색 결과"
+											aria-label={t("models.modelResults")}
 											onKeyDown={navigateList}
 										>
 											{filtered.map(model => {
@@ -538,16 +535,18 @@ export function ModelPicker({
 																	<span className="model-role-tags">
 																		{ROLE_ORDER.filter(role => matches(role, model.id)).map(role => (
 																			<span className="model-role-tag" key={role}>
-																				{ROLE_LABELS[role]}
+																				{ROLE_LABELS[role]()}
 																			</span>
 																		))}
 																	</span>
 																</span>
-																{selected && <span className="sr-only">현재 선택됨</span>}
+																{selected && (
+																	<span className="sr-only">{t("models.selectedModel")}</span>
+																)}
 															</Button>
 															<Button
 																className="model-favorite"
-																aria-label={`${model.name} 즐겨찾기`}
+																aria-label={t("models.starModel", { name: model.name })}
 																aria-pressed={favorites.ids.includes(model.id)}
 																onClick={() => toggleFavorite(model.id)}
 															>
@@ -571,7 +570,7 @@ export function ModelPicker({
 													onConfigureProviders();
 												}}
 											>
-												제공자 추가·연결
+												{t("models.configureProviders")}
 											</Button>
 										</div>
 									)}

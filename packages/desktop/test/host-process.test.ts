@@ -199,7 +199,8 @@ for (const isolated of [true, false]) {
 			// Refusal copy must not point at a menu the app does not have.
 			for (const text of ["/move /tmp", "/session delete"]) {
 				const refused = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text });
-				expect(refused.output).not.toContain("대화 메뉴");
+				expect(refused.output).toContain("not supported");
+				expect(refused.output).not.toContain("conversation menu");
 			}
 			// The palette can only offer commands the host will actually run.
 			const catalog = await host.request<{ name: string }[]>("command.list");
@@ -215,7 +216,7 @@ for (const isolated of [true, false]) {
 			expect(unknown.consumed).toBe(false);
 			expect(unknown.refused).toBe(true);
 			expect(unknown.prompt).toBeUndefined();
-			expect(unknown.output).toContain("사용할 수 없습니다");
+			expect(unknown.output).toContain("not available in the desktop app");
 			// Queue cancellation is only valid for an input this session still owns.
 			await expect(
 				host.request("queue.cancel", { sessionId: session.id, queueId: "queued-missing" }),

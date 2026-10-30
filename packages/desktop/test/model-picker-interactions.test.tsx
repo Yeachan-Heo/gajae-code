@@ -169,8 +169,8 @@ describe("mounted model picker tabs", () => {
 			expect(presets[0]).toContain("Default anthropic/claude-sonnet");
 			expect(presets[0]).toContain("Executor anthropic/claude-haiku");
 			expect(presets[0]).not.toContain("Planner");
-			expect(presets[1]).toContain("현재 적용");
-			expect(presets[1]).toContain("기본 프로필");
+			expect(presets[1]).toContain("Active");
+			expect(presets[1]).toContain("Default profile");
 			await page.type(".model-search input", "review");
 			expect(await page.$$eval(".model-option-hit", nodes => nodes.map(node => node.textContent ?? ""))).toHaveLength(1);
 			await page.click(".model-search input", { clickCount: 3 });
@@ -191,7 +191,7 @@ describe("mounted model picker tabs", () => {
 				label: button.getAttribute("aria-label"),
 			}));
 			expect(label.text).toBe("");
-			expect(label.label).toBe("모델 목록 새로고침");
+			expect(label.label).toBe("Refresh the model list");
 			await page.click(".model-refresh");
 			expect(await calls(page)).toEqual([["refresh", null]]);
 			await setRefreshing(page, true);
@@ -220,19 +220,19 @@ describe("mounted model picker tabs", () => {
 			await setRoles(page, [role("default", "m5")]);
 			await open(page);
 			await setApplying(page, true);
-			await page.waitForFunction(() => document.body.textContent?.includes("선택한 설정을 적용하는 중"));
+			await page.waitForFunction(() => document.body.textContent?.includes("Applying the selected settings"));
 			await choose(page, "p/m1");
 			expect(
 				await page.$$eval(".model-role-option", nodes => nodes.map(node => (node as HTMLButtonElement).disabled)),
 			).toEqual([true, true, true, true, true]);
 			expect(await calls(page)).toEqual([]);
 			await setApplying(page, false);
-			await page.waitForFunction(() => !document.body.textContent?.includes("선택한 설정을 적용하는 중"));
+			await page.waitForFunction(() => !document.body.textContent?.includes("Applying the selected settings"));
 		} finally { await closeComponentFixture(context, page); }
 	});
 
 describe("mounted model picker busy state", () => {
-	test("keeps the dialog open across loading and disables only host-refused profile actions", async () => {
+	test("keeps the dialog open across loading and leaves every dispatch available during a run", async () => {
 		const { context, page } = await fixture();
 		try {
 			await setProfiles(page, [profile("focused", "Focused", [{ id: "default", model: "p/m1" }])]);
@@ -243,36 +243,32 @@ describe("mounted model picker busy state", () => {
 			await Bun.sleep(150);
 			expect(await page.$("dialog")).not.toBeNull();
 			await setRefreshing(page, false);
-			// While busy, only the actions the host refuses are disabled: presets and
-			// non-default roles. Default maps to model.set, which is deferred instead.
-			await setBusy(page, true);
+			// A running conversation keeps every dispatch available: the caller defers the
+			// request instead of the picker refusing it, and nothing explains that in prose.
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
 			await page.waitForSelector(".preset-roles");
-			expect(
-				await page.$$eval(".model-option-hit", nodes => nodes.map(node => (node as HTMLButtonElement).disabled)),
-			).toEqual([true]);
-			expect(await page.$eval(".model-busy-reason", node => node.textContent?.trim())).toBe(
-				"작업이 끝난 뒤 프로필을 변경할 수 있습니다.",
+			const presetDisabledIdle = await page.$$eval("#picker-fixture .model-option-hit, dialog .model-option-hit", nodes =>
+				nodes.map(node => (node as HTMLButtonElement).disabled),
 			);
+			await setBusy(page, true);
+			expect(await page.$(".model-busy-reason")).toBeNull();
+			// The run changes nothing about which actions are offered; only availability does.
+			expect(
+				await page.$$eval("#picker-fixture .model-option-hit, dialog .model-option-hit", nodes =>
+					nodes.map(node => (node as HTMLButtonElement).disabled),
+				),
+			).toEqual(presetDisabledIdle);
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][1]!.click());
 			await choose(page, "p/m8");
+			const rolesIdle = await page.$$eval(".model-role-option", nodes =>
+				nodes.map(node => (node as HTMLButtonElement).disabled),
+			);
+			await setBusy(page, false);
 			expect(
-				await page.$$eval(".model-role-option", nodes =>
-					nodes.map(node => ({
-						label: node.textContent?.split(" · ")[0],
-						disabled: (node as HTMLButtonElement).disabled,
-					})),
-				),
-			).toEqual([
-				{ label: "Default", disabled: false },
-				{ label: "Executor", disabled: true },
-				{ label: "Planner", disabled: true },
-				{ label: "Critic", disabled: true },
-				{ label: "Architect", disabled: true },
-			]);
+				await page.$$eval(".model-role-option", nodes => nodes.map(node => (node as HTMLButtonElement).disabled)),
+			).toEqual(rolesIdle);
 			await page.click(".model-role-option");
 			expect(await calls(page)).toEqual([["default", "p/m8"]]);
-			await setBusy(page, false);
 		} finally { await closeComponentFixture(context, page); }
 	});
 });
@@ -283,7 +279,7 @@ describe("mounted model picker", () => {
 		try {
 			await setRoles(page, [role('default', 'm5')]); await open(page);
 			expect((await rows(page)).length).toBe(100);
-			expect(await page.$eval('dialog', element => element.textContent?.includes('모델 더 보기'))).toBe(false);
+			expect(await page.$eval('dialog', element => element.textContent?.includes('Show more models'))).toBe(false);
 			await page.type('.model-search input', 'm99');
 			expect(await rows(page)).toEqual(['p/m99']);
 			await choose(page, 'p/m99'); expect(await calls(page)).toEqual([]);

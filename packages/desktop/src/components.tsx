@@ -21,6 +21,7 @@ import type {
 	DesktopSession,
 	DesktopSetting,
 } from "../../desktop-host/src/protocol";
+import { t } from "./i18n";
 
 import { Markdown } from "./Markdown";
 
@@ -39,7 +40,13 @@ export function ErrorBanner({ children }: { children: ReactNode }) {
 		</div>
 	);
 }
-const statuses = { idle: "대기", done: "완료", running: "작업 중", waiting: "응답 필요", error: "오류" };
+const statuses = {
+	idle: () => t("support.statusIdle"),
+	done: () => t("support.statusDone"),
+	running: () => t("support.statusRunning"),
+	waiting: () => t("support.statusWaiting"),
+	error: () => t("support.statusError"),
+};
 const statusIcons = {
 	idle: Circle,
 	done: CircleCheck,
@@ -65,12 +72,12 @@ export function SessionRow({
 				<span className="session-title">{session.title}</span>
 				<small className={`status ${session.status}`}>
 					<StatusIcon aria-hidden="true" />
-					{statuses[session.status]}
+					{statuses[session.status]()}
 				</small>
 			</button>
 			<Button
 				className="session-star"
-				aria-label={session.starred ? "즐겨찾기 해제" : "즐겨찾기"}
+				aria-label={session.starred ? t("support.unstar") : t("support.star")}
 				aria-pressed={session.starred}
 				onClick={onStar}
 			>
@@ -86,10 +93,10 @@ function MessageImage({ block }: { block: Extract<DesktopMessageBlock, { type: "
 		typeof block.data === "string" && block.data.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/u.test(block.data);
 	const source = `data:${block.mimeType};base64,${block.data}`;
 	if (!safeMime || !safeData || failedSource === source)
-		return <p className="message-image-unavailable">이미지를 표시할 수 없습니다.</p>;
+		return <p className="message-image-unavailable">{t("support.imageUnavailable")}</p>;
 	return (
 		<figure className="message-image">
-			<img src={source} alt="대화에 포함된 이미지" onError={() => setFailedSource(source)} />
+			<img src={source} alt={t("support.imageAlt")} onError={() => setFailedSource(source)} />
 		</figure>
 	);
 }
@@ -120,7 +127,7 @@ function MessageBlocks({
 			case "thinking":
 				return block.text.trim() ? (
 					<details className="thinking-disclosure" key={index}>
-						<summary>생각 과정</summary>
+						<summary>{t("support.reasoningSummary")}</summary>
 						<div className="message-text">
 							<Markdown text={block.text} />
 						</div>
@@ -131,7 +138,7 @@ function MessageBlocks({
 			case "image-unavailable":
 				return (
 					<p className="message-image-unavailable" key={index}>
-						이미지를 표시할 수 없습니다. {block.reason}
+						{t("support.imageUnavailableWithReason", { reason: block.reason })}
 					</p>
 				);
 		}
@@ -141,7 +148,12 @@ function MessageBlocks({
 
 export function Message({ message }: { message: DesktopMessage }) {
 	/** Matches the TUI response header, which prints the literal `gajae` label. */
-	const labels = { user: "나", assistant: "gajae", tool: "도구", system: "시스템" };
+	const labels = {
+		user: () => t("support.roleUser"),
+		assistant: () => t("support.roleAssistant"),
+		tool: () => t("support.roleTool"),
+		system: () => t("support.roleSystem"),
+	};
 	const blocks = message.blocks;
 	const hasContent = blocks
 		? blocks.some(block => block.type === "image" || block.type === "image-unavailable" || !!block.text.trim())
@@ -149,24 +161,20 @@ export function Message({ message }: { message: DesktopMessage }) {
 	if (message.role === "assistant" && !hasContent) return null;
 	return (
 		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
-			<strong className="role-label">{labels[message.role]}</strong>
-			{message.truncated && (
-				<small className="truncation-notice">
-					긴 메시지의 앞부분을 생략했습니다. 전체 내용은 대화 내보내기로 확인하세요.
-				</small>
-			)}
+			<strong className="role-label">{labels[message.role]()}</strong>
+			{message.truncated && <small className="truncation-notice">{t("support.truncated")}</small>}
 			{message.role === "tool" ? (
 				<details className="tool-disclosure">
 					<summary>
 						<ChevronRight className="disclosure-chevron" aria-hidden="true" />
-						<span className="tool-name">{message.toolName || "도구 실행"}</span>
-						{message.excludeFromContext && <small> · 모델 컨텍스트 제외</small>}
+						<span className="tool-name">{message.toolName || t("support.toolFallback")}</span>
+						{message.excludeFromContext && <small> · {t("support.excludedFromContext")}</small>}
 						{message.cancelled ? (
-							<small> · 취소됨</small>
+							<small> · {t("support.cancelled")}</small>
 						) : (
 							message.isError && (
 								<span className="tool-failure">
-									<CircleAlert aria-hidden="true" /> · 실패
+									<CircleAlert aria-hidden="true" /> · {t("support.failed")}
 								</span>
 							)
 						)}
@@ -179,7 +187,7 @@ export function Message({ message }: { message: DesktopMessage }) {
 								<pre className="bounded-output">{message.text}</pre>
 							)
 						) : (
-							<pre className="bounded-output">출력 없음</pre>
+							<pre className="bounded-output">{t("support.noOutput")}</pre>
 						)}
 					</div>
 				</details>
@@ -275,7 +283,7 @@ export function Composer({
 				M
 			</span>
 			<label className="sr-only" htmlFor={id}>
-				메시지
+				{t("support.composerLabel")}
 			</label>
 			<div className="composer-input">
 				{attachment}
@@ -284,7 +292,7 @@ export function Composer({
 					id={id}
 					value={value}
 					onChange={event => onChange(event.target.value)}
-					placeholder="무엇을 함께 만들까요?"
+					placeholder={t("support.composerPlaceholder")}
 					rows={1}
 					disabled={disabled}
 					onPaste={onPaste}
@@ -317,22 +325,22 @@ export function Composer({
 				/>
 			</div>
 			{controls != null && (
-				<div className="composer-controls" role="group" aria-label="메시지 작성 설정">
+				<div className="composer-controls" role="group" aria-label={t("support.composerControls")}>
 					{controls}
 				</div>
 			)}
 			<div className="composer-actions">
 				{busy && allowQueue && onDeliverAs && (
 					<div className="composer-delivery">
-						<label htmlFor={deliverId}>실행 중 입력</label>
+						<label htmlFor={deliverId}>{t("support.deliverLabel")}</label>
 						<select
 							id={deliverId}
 							value={deliverAs ?? "steer"}
 							disabled={disabled}
 							onChange={event => onDeliverAs(event.target.value === "followUp" ? "followUp" : "steer")}
 						>
-							<option value="steer">작업에 개입</option>
-							<option value="followUp">끝난 뒤 후속</option>
+							<option value="steer">{t("support.deliverSteer")}</option>
+							<option value="followUp">{t("support.deliverFollowUp")}</option>
 						</select>
 					</div>
 				)}
@@ -340,12 +348,12 @@ export function Composer({
 					{busy && (
 						<Button onClick={onStop} disabled={disabled}>
 							<Square aria-hidden="true" />
-							작업 중지
+							{t("support.stop")}
 						</Button>
 					)}
 					<Button type="submit" className="primary" disabled={!canSubmit}>
 						{busy && allowQueue ? <ListPlus aria-hidden="true" /> : <ArrowUp aria-hidden="true" />}
-						{busy && allowQueue ? "대기열에 추가" : "보내기"}
+						{busy && allowQueue ? t("support.queue") : t("support.send")}
 					</Button>
 				</div>
 			</div>
@@ -379,7 +387,7 @@ export function QuestionCard({
 			{pending && (
 				<p className="question-pending">
 					<LoaderCircle aria-hidden="true" />
-					연결 또는 응답 처리를 기다리는 중…
+					{t("support.waitingConnection")}
 				</p>
 			)}
 			{question.message && <p>{question.message}</p>}
@@ -387,10 +395,10 @@ export function QuestionCard({
 				<div className="actions">
 					<Button disabled={pending} onClick={() => onAnswer(true)}>
 						<Check aria-hidden="true" />
-						확인
+						{t("support.confirm")}
 					</Button>
 					<Button disabled={pending} onClick={() => onAnswer(false)}>
-						아니요
+						{t("support.cancel")}
 					</Button>
 				</div>
 			) : question.kind === "select" ? (
@@ -408,7 +416,7 @@ export function QuestionCard({
 						onAnswer(value);
 					}}
 				>
-					<label htmlFor={id}>답변</label>
+					<label htmlFor={id}>{t("support.answerLabel")}</label>
 					{question.kind === "editor" ? (
 						<textarea
 							id={id}
@@ -421,12 +429,12 @@ export function QuestionCard({
 						<input id={id} value={value} disabled={pending} onChange={event => setValue(event.target.value)} />
 					)}
 					<Button type="submit" disabled={pending}>
-						답변 보내기
+						{t("support.sendAnswer")}
 					</Button>
 				</form>
 			)}
 			<Button disabled={pending} onClick={() => onAnswer(null)}>
-				취소
+				{t("support.cancel")}
 			</Button>
 		</section>
 	);
@@ -492,7 +500,7 @@ export function Modal({
 		>
 			<header>
 				<h2 id={titleId}>{title}</h2>
-				<Button className="modal-close" aria-label="닫기" onClick={onClose}>
+				<Button className="modal-close" aria-label={t("support.close")} onClick={onClose}>
 					<X aria-hidden="true" />
 				</Button>
 			</header>
@@ -535,7 +543,7 @@ export function SettingField({
 					setError("");
 					onSave(parsed);
 				} catch {
-					setError("올바른 값을 입력하세요.");
+					setError(t("support.invalidValue"));
 				}
 			}}
 		>
@@ -574,7 +582,7 @@ export function SettingField({
 			)}
 			<Button type="submit" disabled={!setting.writable || pending}>
 				{pending && <LoaderCircle aria-hidden="true" />}
-				{pending ? "연결 또는 처리 대기" : setting.writable ? "저장" : "읽기 전용"}
+				{pending ? t("support.settingPending") : setting.writable ? t("support.save") : t("support.readOnly")}
 			</Button>
 			{error && <ErrorBanner>{error}</ErrorBanner>}
 		</form>

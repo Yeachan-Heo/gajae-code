@@ -10,16 +10,18 @@ function draft(id: string, name: string): DesktopAttachmentDraft {
 // meantime has to survive alongside the recovered text.
 describe("composer restore after a refused dispatch", () => {
 	test("puts the rejected text back into an empty composer", () => {
-		expect(restoreDraft("", "보내지 못한 메시지")).toBe("보내지 못한 메시지");
+		expect(restoreDraft("", "Message that was not sent")).toBe("Message that was not sent");
 	});
 
 	test("an attachment-only dispatch restores newest text without blank lines", () => {
-		expect(restoreDraft("새로 쓴 메시지", "")).toBe("새로 쓴 메시지");
+		expect(restoreDraft("Newly typed message", "")).toBe("Newly typed message");
 		expect(restoreDraft("", "")).toBe("");
 	});
 
 	test("keeps text typed during the dispatch below the rejected text", () => {
-		expect(restoreDraft("새로 쓴 메시지", "보내지 못한 메시지")).toBe("보내지 못한 메시지\n\n새로 쓴 메시지");
+		expect(restoreDraft("Newly typed message", "Message that was not sent")).toBe(
+			"Message that was not sent\n\nNewly typed message",
+		);
 	});
 
 	test("re-adds the attachments that were sent and are gone", () => {

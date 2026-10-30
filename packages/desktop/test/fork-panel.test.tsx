@@ -5,10 +5,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopHistory } from "../../desktop-host/src/protocol";
 import { ForkPanel, type ForkPanelProps } from "../src/ForkPanel";
 
-const wholeCopy = "전체 대화 복사 (선택 없이 fork)";
-const selectedFork = "선택한 메시지 직전에서 분기";
-const loadMore = "다음 500개 불러오기";
-const duplicateText = "동일한 사용자 메시지\n  공백도 보존합니다.";
+const wholeCopy = "Copy the whole conversation (fork without a selection)";
+const selectedFork = "Fork before the selected message";
+const loadMore = "Load the next 500";
+const duplicateText = "Duplicate user message\n  Whitespace is preserved too.";
 
 function history(overrides: Partial<DesktopHistory> = {}): DesktopHistory {
 	return {
@@ -18,9 +18,9 @@ function history(overrides: Partial<DesktopHistory> = {}): DesktopHistory {
 		truncated: false,
 		messages: [
 			{ id: "display-first", entryId: "entry:first", role: "user", text: duplicateText },
-			{ id: "display-assistant", entryId: "entry:not-user", role: "assistant", text: "선택할 수 없는 응답" },
-			{ id: "display-unpersisted", role: "user", text: "저장된 entryId 없는 메시지" },
-			{ id: "display-second", entryId: "entry:second/한국어", role: "user", text: duplicateText },
+			{ id: "display-assistant", entryId: "entry:not-user", role: "assistant", text: "Response that cannot be selected" },
+			{ id: "display-unpersisted", role: "user", text: "Message without a persisted entryId" },
+			{ id: "display-second", entryId: "entry:second/日本語", role: "user", text: duplicateText },
 			{ id: "display-empty", entryId: "entry:empty", role: "user", text: "" },
 		],
 		...overrides,
@@ -107,15 +107,15 @@ function click(tree: ReactNode, label: string) {
 
 describe("desktop controlled fork body", () => {
 	test("only persisted user entries become numbered native options and duplicate text keeps distinct canonical identities", () => {
-		const tree = capture({ selectedEntryId: "entry:second/한국어" });
+		const tree = capture({ selectedEntryId: "entry:second/日本語" });
 		const options = nodes(tree, element => element.type === "option");
-		expect(options.map(option => option.props.value)).toEqual(["", "entry:first", "entry:second/한국어", "entry:empty"]);
-		const html = render({ selectedEntryId: "entry:second/한국어" });
-		expect(html).toContain('value="entry:second/한국어" selected=""');
+		expect(options.map(option => option.props.value)).toEqual(["", "entry:first", "entry:second/日本語", "entry:empty"]);
+		const html = render({ selectedEntryId: "entry:second/日本語" });
+		expect(html).toContain('value="entry:second/日本語" selected=""');
 		expect(html).toContain(`1. ${duplicateText}`);
 		expect(html).toContain(`2. ${duplicateText}`);
-		expect(html).toContain("3. 텍스트 없는 사용자 메시지");
-		for (const excluded of ["display-first", "display-second", "display-assistant", "display-unpersisted", "entry:not-user", "선택할 수 없는 응답", "저장된 entryId 없는 메시지"]) {
+		expect(html).toContain("3. User message without text");
+		for (const excluded of ["display-first", "display-second", "display-assistant", "display-unpersisted", "entry:not-user", "Response that cannot be selected", "Message without a persisted entryId"]) {
 			expect(html).not.toContain(excluded);
 		}
 	});
@@ -125,16 +125,16 @@ describe("desktop controlled fork body", () => {
 		const forks: Array<string | undefined> = [];
 		const callbacks = { onSelect: (entryId: string) => selections.push(entryId), onFork: (entryId?: string) => forks.push(entryId) };
 		const tree = capture(callbacks);
-		change(tree, "entry:second/한국어");
-		expect(selections).toEqual(["entry:second/한국어"]);
+		change(tree, "entry:second/日本語");
+		expect(selections).toEqual(["entry:second/日本語"]);
 		expect(forks).toEqual([]);
 		// Selection is owned by the parent: the old render still targets its old ID.
 		click(tree, selectedFork);
-		click(capture({ ...callbacks, selectedEntryId: "entry:second/한국어" }), selectedFork);
-		expect(forks).toEqual(["entry:first", "entry:second/한국어"]);
+		click(capture({ ...callbacks, selectedEntryId: "entry:second/日本語" }), selectedFork);
+		expect(forks).toEqual(["entry:first", "entry:second/日本語"]);
 		change(tree, "");
 		for (const invalid of ["display-second", "entry:not-user", "unknown-entry"]) change(tree, invalid);
-		expect(selections).toEqual(["entry:second/한국어", ""]);
+		expect(selections).toEqual(["entry:second/日本語", ""]);
 	});
 
 	test("whole-copy omits entry identity even with a selected message or history not yet loaded", () => {
@@ -163,7 +163,7 @@ describe("desktop controlled fork body", () => {
 	});
 
 	test("read-only preview preserves inert text and explicitly associates truncation without treating display text as the fork payload", () => {
-		const text = '<script>alert("fixture")</script>\n  한국어와 日本語 / 中文\n';
+		const text = '<script>alert("fixture")</script>\n  日本語 / 中文\n';
 		const value = history({ messages: [{ id: "display-truncated", entryId: "entry:truncated", role: "user", text, truncated: true }] });
 		const forks: Array<string | undefined> = [];
 		const tree = capture({ history: value, selectedEntryId: "entry:truncated", onFork: entryId => forks.push(entryId) });
@@ -175,13 +175,13 @@ describe("desktop controlled fork body", () => {
 		const notice = node(tree, element => element.props.id === preview.props["aria-describedby"]);
 		expect(notice.type).toBe("p");
 		const html = render({ history: value, selectedEntryId: "entry:truncated" });
-		expect(html).toContain("표시된 내용은 전체 원문이 아닙니다");
-		expect(html).toContain("SDK가 반환한 선택 원문");
-		expect(html).toContain("&lt;script&gt;alert(&quot;fixture&quot;)&lt;/script&gt;\n  한국어와 日本語 / 中文\n");
+		expect(html).toContain("the displayed text is not the complete original");
+		expect(html).toContain("original selected text returned by the SDK");
+		expect(html).toContain("&lt;script&gt;alert(&quot;fixture&quot;)&lt;/script&gt;\n  日本語 / 中文\n");
 		expect(html).not.toContain("<script");
 		click(tree, selectedFork);
 		expect(forks).toEqual(["entry:truncated"]);
-		expect(render()).not.toContain("표시된 내용은 전체 원문이 아닙니다");
+		expect(render()).not.toContain("the displayed text is not the complete original");
 	});
 
 	test("pending and disconnected guard every action and selection but leave the selected preview inspectable", () => {
@@ -200,7 +200,7 @@ describe("desktop controlled fork body", () => {
 			expect(html.match(/<textarea\b[^>]*>/u)?.[0]).not.toContain('disabled=""');
 			const tree = capture(options);
 			expect(node(tree, element => element.type === "textarea").props.value).toBe(duplicateText);
-			change(tree, "entry:second/한국어");
+			change(tree, "entry:second/日本語");
 			for (const label of [wholeCopy, selectedFork, loadMore]) click(tree, label);
 			expect(calls).toEqual([]);
 		}
@@ -215,11 +215,11 @@ describe("desktop controlled fork body", () => {
 		expect(render({ history: value })).toContain(loadMore);
 		expect(render()).not.toContain(loadMore);
 		const empty = render({ history: history({ total: 0, messages: [] }), selectedEntryId: "" });
-		expect(empty).toContain("불러온 기록에 분기 가능한 사용자 메시지가 없습니다.");
+		expect(empty).toContain("The loaded history has no user messages to fork from.");
 		expect(button(empty, selectedFork)).toContain('disabled=""');
 		const loading = render({ history: null, selectedEntryId: "" });
-		expect(loading).not.toContain("분기 가능한 사용자 메시지가 없습니다.");
-		expect(loading).not.toContain("불러오는 중");
+		expect(loading).not.toContain("no user messages to fork from");
+		expect(loading).not.toContain("Loading");
 		expect(loading).not.toContain('role="alert"');
 		expect(loading).not.toContain("<dialog");
 	});
@@ -228,8 +228,8 @@ describe("desktop controlled fork body", () => {
 		const html = renderToStaticMarkup(<><ForkPanel {...props()} /><ForkPanel {...props()} /></>);
 		const labels = [...html.matchAll(/<label for="([^"]+)">([^<]+)<\/label>/gu)];
 		expect(labels.map(match => match[2])).toEqual([
-			"분기할 사용자 메시지", "선택한 메시지 미리보기 (읽기 전용)",
-			"분기할 사용자 메시지", "선택한 메시지 미리보기 (읽기 전용)",
+			"User message to fork from", "Selected message preview (read only)",
+			"User message to fork from", "Selected message preview (read only)",
 		]);
 		expect(new Set(labels.map(match => match[1])).size).toBe(4);
 		for (const match of labels) expect(html).toContain(`id="${match[1]}"`);

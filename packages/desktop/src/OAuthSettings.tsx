@@ -2,13 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { DesktopAuthProvider, DesktopAuthState } from "../../desktop-host/src/protocol";
 import { openAuthUrl, request, subscribe } from "./bridge";
 import { Button, ErrorBanner } from "./components";
+import { t } from "./i18n";
 
 const statuses = {
-	authorizing: "인증 진행 중",
-	waiting: "인증 응답 대기 중",
-	complete: "계정 연결 완료",
-	cancelled: "계정 연결 취소됨",
-	error: "계정 연결 실패",
+	authorizing: () => t("settings.oauthStatusAuthorizing"),
+	waiting: () => t("settings.oauthStatusWaiting"),
+	complete: () => t("settings.oauthStatusComplete"),
+	cancelled: () => t("settings.oauthStatusCancelled"),
+	error: () => t("settings.oauthStatusError"),
 };
 
 function authorizationUrl(value: string | undefined): string | undefined {
@@ -71,7 +72,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 							revision.current += 1;
 							setReady(false);
 							setValue("");
-							setError("인증 호스트와의 연결이 끊겼습니다.");
+							setError(t("settings.oauthHostLost"));
 						}
 					});
 					if (!alive()) {
@@ -92,7 +93,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 					);
 					setReady(true);
 				} catch {
-					if (alive()) setError("계정 연결 정보를 불러오지 못했습니다. 다시 시도하세요.");
+					if (alive()) setError(t("settings.oauthLoadFailed"));
 				}
 			})();
 		}
@@ -113,8 +114,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 			const state = await request<DesktopAuthState>(method, params);
 			if (generation.current === scope && revision.current === version) apply(state);
 		} catch {
-			if (generation.current === scope && revision.current === version)
-				setError("인증 요청을 처리하지 못했습니다. 연결 상태를 확인하고 다시 시도하세요.");
+			if (generation.current === scope && revision.current === version) setError(t("settings.oauthRequestFailed"));
 		} finally {
 			if (generation.current === scope) {
 				locked.current = false;
@@ -128,17 +128,17 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 	const prompt = active ? auth?.prompt : undefined;
 	return (
 		<section className="oauth-settings" aria-labelledby="oauth-title">
-			<h3 id="oauth-title">계정 연결</h3>
+			<h3 id="oauth-title">{t("settings.oauthHeading")}</h3>
 			{error && <ErrorBanner>{error}</ErrorBanner>}
 			{!ready && !error && (
-				<p role="status">{connected ? "계정 연결 정보를 불러오는 중…" : "호스트 연결이 필요합니다."}</p>
+				<p role="status">{connected ? t("settings.oauthLoading") : t("settings.oauthNeedsHost")}</p>
 			)}
 			{!ready && error && (
 				<Button disabled={!connected} onClick={() => setReload(previous => previous + 1)}>
-					다시 불러오기
+					{t("settings.oauthReload")}
 				</Button>
 			)}
-			<label htmlFor="oauth-provider">계정 제공자</label>
+			<label htmlFor="oauth-provider">{t("settings.oauthProviderLabel")}</label>
 			<select
 				id="oauth-provider"
 				value={provider}
@@ -156,19 +156,17 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 					disabled={!connected || !ready || busy || active || !provider}
 					onClick={() => void act("auth.login", { provider })}
 				>
-					계정 연결
+					{t("settings.oauthConnect")}
 				</Button>
 			</div>
-			{ready && providers.length === 0 && <p>연결 가능한 계정 제공자가 없습니다.</p>}
+			{ready && providers.length === 0 && <p>{t("settings.oauthNoProviders")}</p>}
 			{auth && (
 				<div className="oauth-flow">
 					<p role="status">
 						<strong>{providers.find(provider => provider.id === auth.provider)?.name ?? auth.provider}</strong> ·{" "}
-						{statuses[auth.status]}
+						{statuses[auth.status]()}
 					</p>
-					{auth.status === "error" && (
-						<ErrorBanner>{auth.error || "계정 연결을 완료하지 못했습니다."}</ErrorBanner>
-					)}
+					{auth.status === "error" && <ErrorBanner>{auth.error || t("settings.oauthIncomplete")}</ErrorBanner>}
 					{auth.instructions && <pre className="bounded-output">{auth.instructions}</pre>}
 					{active && (
 						<>
@@ -186,7 +184,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 												.catch(cause => {
 													if (generation.current === scope && revision.current === version)
 														setError(
-															cause instanceof Error ? cause.message : "인증 페이지를 열지 못했습니다.",
+															cause instanceof Error ? cause.message : t("settings.oauthOpenFailed"),
 														);
 												})
 												.finally(() => {
@@ -194,11 +192,11 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 												});
 										}}
 									>
-										브라우저에서 인증 페이지 열기
+										{t("settings.oauthOpen")}
 									</Button>
 								</>
 							)}
-							{auth.url && !url && <ErrorBanner>안전한 HTTPS 인증 주소가 아니므로 열 수 없습니다.</ErrorBanner>}
+							{auth.url && !url && <ErrorBanner>{t("settings.oauthInsecureUrl")}</ErrorBanner>}
 							{prompt && (
 								<form
 									onSubmit={event => {
@@ -224,7 +222,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 										type="submit"
 										disabled={!connected || !ready || busy || (!prompt.allowEmpty && !value)}
 									>
-										응답 제출
+										{t("settings.oauthSubmit")}
 									</Button>
 								</form>
 							)}
@@ -236,7 +234,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 										void act("auth.cancel", { flowId: auth.id });
 									}}
 								>
-									계정 연결 취소
+									{t("settings.oauthCancel")}
 								</Button>
 							</div>
 						</>

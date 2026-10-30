@@ -9,30 +9,33 @@ import type {
 	DesktopSamplingPreference,
 } from "../../desktop-host/src/preferences-protocol";
 import { Button, ErrorBanner } from "./components";
+import { t } from "./i18n";
 
 export interface PreferencesPanelProps {
 	preferences: DesktopPreferences | null;
 	pending?: boolean;
-	busy?: boolean;
 	error?: string;
 	onRefresh: () => void;
 	onApply: (action: DesktopPreferenceAction) => void;
 }
 
 const originLabels = {
-	default: "기본값",
-	global: "전역",
-	project: "프로젝트",
-	runtime: "실행 중",
-	layered: "여러 계층",
+	default: () => t("settings.originDefault"),
+	global: () => t("settings.originGlobal"),
+	project: () => t("settings.originProject"),
+	runtime: () => t("settings.originRuntime"),
+	layered: () => t("settings.originLayered"),
 };
 
 function Resolution({ resolution }: { resolution: DesktopPreferenceResolution }) {
 	return (
 		<>
-			{originLabels[resolution.origin]} ({resolution.origin})
+			{originLabels[resolution.origin]()}
 			{resolution.layers.length > 0 && (
-				<> · 계층: {resolution.layers.map(layer => `${originLabels[layer]} (${layer})`).join(" → ")}</>
+				<>
+					{" "}
+					· {t("settings.layers")}: {resolution.layers.map(layer => originLabels[layer]()).join(" → ")}
+				</>
 			)}
 		</>
 	);
@@ -41,14 +44,10 @@ function Resolution({ resolution }: { resolution: DesktopPreferenceResolution })
 function ProfileOption({
 	profile,
 	pending,
-	busy,
-	busyReasonId,
 	onApply,
 }: {
 	profile: DesktopModelProfile;
 	pending?: boolean;
-	busy?: boolean;
-	busyReasonId: string;
 	onApply: (action: DesktopPreferenceAction) => void;
 }) {
 	const id = useId();
@@ -61,13 +60,16 @@ function ProfileOption({
 			data-default={profile.default || undefined}
 		>
 			<div className="preference-badges">
-				<span>{profile.source === "configured" ? "사용자 설정" : "기본 제공"}</span>
+				<span>
+					{profile.source === "configured" ? t("settings.sourceConfigured") : t("settings.sourceBuiltin")}
+				</span>
 				{profile.active && (
 					<span>
-						<Check size={14} aria-hidden="true" />이 대화에서 사용 중
+						<Check size={14} aria-hidden="true" />
+						{t("settings.inUseSession")}
 					</span>
 				)}
-				{profile.default && <span>저장된 기본 프로필</span>}
+				{profile.default && <span>{t("settings.savedDefault")}</span>}
 			</div>
 			<h4>{profile.name}</h4>
 			<p className="preference-value">
@@ -76,45 +78,39 @@ function ProfileOption({
 			{profile.description && <p className="muted">{profile.description}</p>}
 			<div className="preference-actions actions">
 				<Button
-					aria-label={`${profile.name} (${profile.id}): 이 대화에 적용`}
+					aria-label={t("settings.applySessionAria", { name: profile.name, id: profile.id })}
 					aria-pressed={profile.active}
-					aria-describedby={`${id}-session${busy ? ` ${busyReasonId}` : ""}`}
-					disabled={pending || busy || !session.available || profile.active}
+					disabled={pending || !session.available || profile.active}
 					onClick={() => {
-						if (!pending && !busy && session.available && !profile.active) {
+						if (!pending && session.available && !profile.active) {
 							onApply({ type: "profile.select", name: profile.id, scope: "session" });
 						}
 					}}
 				>
-					{profile.active ? "현재 대화 프로필" : "이 대화에 적용"}
+					{profile.active ? t("settings.currentSessionProfile") : t("settings.applySession")}
 				</Button>
 				<Button
-					aria-label={`${profile.name} (${profile.id}): 기본 프로필로 저장`}
+					aria-label={t("settings.saveDefaultAria", { name: profile.name, id: profile.id })}
 					aria-pressed={profile.default}
-					aria-describedby={`${id}-default${busy ? ` ${busyReasonId}` : ""}`}
-					disabled={pending || busy || !persisted.available || profile.default}
+					disabled={pending || !persisted.available || profile.default}
 					onClick={() => {
-						if (!pending && !busy && persisted.available && !profile.default) {
+						if (!pending && persisted.available && !profile.default) {
 							onApply({ type: "profile.select", name: profile.id, scope: "default" });
 						}
 					}}
 				>
-					{profile.default ? "저장된 기본 프로필" : "기본 프로필로 저장"}
+					{profile.default ? t("settings.savedDefault") : t("settings.saveDefault")}
 				</Button>
 			</div>
 			<p id={`${id}-session`} className="preference-reason">
-				이 대화:{" "}
+				{t("settings.thisConversation")}{" "}
 				{session.reason ??
-					(session.available
-						? "적용 시 자격 증명과 실제 모델을 확인합니다."
-						: "프로필 선택을 사용할 수 없습니다.")}
+					(session.available ? t("settings.thisConversationReason") : t("settings.sessionUnavailable"))}
 			</p>
 			<p id={`${id}-default`} className="preference-reason">
-				기본값 저장:{" "}
+				{t("settings.savingDefault")}{" "}
 				{persisted.reason ??
-					(persisted.available
-						? "공유 설정의 기본 프로필을 변경합니다."
-						: "안전한 기본 프로필 저장 기능을 사용할 수 없습니다.")}
+					(persisted.available ? t("settings.savingDefaultReason") : t("settings.defaultUnavailable"))}
 			</p>
 		</li>
 	);
@@ -123,16 +119,14 @@ function ProfileOption({
 function RolePreference({ role }: { role: DesktopModelRolePreference }) {
 	return (
 		<li className="preference-row">
-			<h4>
-				{role.name} <small>({role.id})</small>
-			</h4>
+			<h4>{role.name}</h4>
 			<dl>
 				<div>
-					<dt>설정 상태</dt>
-					<dd>{role.configured ? "명시적으로 설정됨" : "상속 또는 기본값"}</dd>
+					<dt>{t("settings.configState")}</dt>
+					<dd>{role.configured ? t("settings.explicitlyConfigured") : t("settings.inherited")}</dd>
 				</div>
 				<div>
-					<dt>현재 해석된 모델</dt>
+					<dt>{t("settings.resolvedModel")}</dt>
 					<dd className="preference-value">
 						{role.model ? (
 							<>
@@ -143,16 +137,16 @@ function RolePreference({ role }: { role: DesktopModelRolePreference }) {
 								</code>
 							</>
 						) : (
-							"해석된 모델 없음"
+							t("settings.noResolvedModel")
 						)}
 					</dd>
 				</div>
 				<div>
-					<dt>추론 수준</dt>
-					<dd>{role.thinkingLevel ?? "설정 없음"}</dd>
+					<dt>{t("settings.reasoningLevel")}</dt>
+					<dd>{role.thinkingLevel ?? t("settings.notSet")}</dd>
 				</div>
 				<div>
-					<dt>역할 맵 출처</dt>
+					<dt>{t("settings.roleMapOrigin")}</dt>
 					<dd>
 						<Resolution resolution={role.configurationResolution} />
 					</dd>
@@ -161,9 +155,9 @@ function RolePreference({ role }: { role: DesktopModelRolePreference }) {
 			<p className="preference-reason">
 				{role.canApply.available
 					? role.scope === "default"
-						? "모델 선택에서 변경 · 공통 설정에 저장"
-						: "모델 선택에서 변경 · 현재 대화에만 적용"
-					: `변경 불가: ${role.canApply.reason ?? "이 역할은 변경할 수 없습니다."}`}
+						? t("settings.roleChangeDefault")
+						: t("settings.roleChangeSession")
+					: t("settings.cannotChange", { reason: role.canApply.reason ?? t("settings.roleLocked") })}
 			</p>
 		</li>
 	);
@@ -176,100 +170,78 @@ function SamplingPreference({ sampling }: { sampling: DesktopSamplingPreference 
 			<h4>{sampling.parameter}</h4>
 			<dl>
 				<div>
-					<dt>병합된 설정 값</dt>
+					<dt>{t("settings.mergedValue")}</dt>
 					<dd>
-						{sampling.configuredValue ?? "값 없음"}
-						{sampling.mode === "provider-default" && " · 제공자 기본값 (-1)"}
-						{sampling.mode === "invalid" && " · 유효하지 않은 설정"}
+						{sampling.configuredValue ?? t("settings.noValue")}
+						{sampling.mode === "provider-default" && ` · ${t("settings.providerDefault")}`}
+						{sampling.mode === "invalid" && ` · ${t("settings.invalidSetting")}`}
 					</dd>
 				</div>
 				<div>
-					<dt>다음 실행 옵션 값</dt>
-					<dd>{sampling.effectiveValue ?? "명시적 옵션 값 없음"}</dd>
+					<dt>{t("settings.nextRunValue")}</dt>
+					<dd>{sampling.effectiveValue ?? t("settings.noExplicitValue")}</dd>
 				</div>
 				<div>
-					<dt>설정 출처</dt>
+					<dt>{t("settings.settingOrigin")}</dt>
 					<dd>
 						<Resolution resolution={sampling.resolution} />
 					</dd>
 				</div>
 				<div>
-					<dt>모델별 지원 여부</dt>
-					<dd>알 수 없음 (unknown)</dd>
+					<dt>{t("settings.modelSupport")}</dt>
+					<dd>{t("settings.modelSupportUnknown")}</dd>
 				</div>
 			</dl>
 			<Button disabled aria-describedby={id}>
-				샘플링 변경 불가
+				{t("settings.samplingLocked")}
 			</Button>
 			<p id={id} className="preference-reason">
-				읽기 전용:{" "}
-				{sampling.canApply.reason ?? "공개 SDK에 모델별 샘플링 지원 정보와 안전한 값 검증·변경 기능이 없습니다."}
+				{t("settings.readOnlyPrefix")} {sampling.canApply.reason ?? t("settings.samplingReason")}
 			</p>
 		</li>
 	);
 }
 
-export function PreferencesPanel({
-	preferences,
-	pending = false,
-	busy = false,
-	error,
-	onRefresh,
-	onApply,
-}: PreferencesPanelProps) {
+export function PreferencesPanel({ preferences, pending = false, error, onRefresh, onApply }: PreferencesPanelProps) {
 	const id = useId();
 	return (
 		<section className="preferences-panel" aria-labelledby={`${id}-title`} aria-busy={pending}>
 			<div className="preferences-toolbar">
 				<div>
-					<h2 id={`${id}-title`}>모델 환경설정</h2>
+					<h2 id={`${id}-title`}>{t("settings.title")}</h2>
 				</div>
 				<Button disabled={pending} onClick={onRefresh}>
 					<RefreshCw aria-hidden="true" />
-					새로고침
+					{t("settings.refresh")}
 				</Button>
 			</div>
 			{error && <ErrorBanner>{error}</ErrorBanner>}
 			{pending && (
 				<p className="preference-reason" role="status">
-					{preferences
-						? "설정 연결 또는 요청 처리를 기다리는 중… 아래는 마지막으로 받은 값입니다."
-						: "환경설정을 불러오는 중…"}
+					{preferences ? t("settings.pendingRetained") : t("settings.loading")}
 				</p>
 			)}
-			{!preferences && !pending && !error && <p className="empty model-empty">환경설정 정보가 없습니다.</p>}
+			{!preferences && !pending && !error && <p className="empty model-empty">{t("settings.empty")}</p>}
 			{preferences && (
 				<>
 					<section className="preferences-group" aria-labelledby={`${id}-profiles`}>
-						<h3 id={`${id}-profiles`}>모델 프로필</h3>
-						{busy && (
-							<p id={`${id}-busy`} className="preference-reason">
-								실행 중에는 프로필을 변경할 수 없습니다.
-							</p>
-						)}
+						<h3 id={`${id}-profiles`}>{t("settings.profilesHeading")}</h3>
 						{preferences.profiles.length === 0 ? (
-							<p className="empty model-empty">사용 가능한 모델 프로필이 없습니다.</p>
+							<p className="empty model-empty">{t("settings.profilesEmpty")}</p>
 						) : (
-							<ul className="preference-grid" aria-label="모델 프로필 목록">
+							<ul className="preference-grid" aria-label={t("settings.profilesList")}>
 								{preferences.profiles.map(profile => (
-									<ProfileOption
-										key={profile.id}
-										profile={profile}
-										pending={pending}
-										busy={busy}
-										busyReasonId={`${id}-busy`}
-										onApply={onApply}
-									/>
+									<ProfileOption key={profile.id} profile={profile} pending={pending} onApply={onApply} />
 								))}
 							</ul>
 						)}
 					</section>
 					<section className="preferences-group" aria-labelledby={`${id}-roles`}>
-						<h3 id={`${id}-roles`}>역할별 모델</h3>
+						<h3 id={`${id}-roles`}>{t("settings.rolesHeading")}</h3>
 						{preferences.roles.length === 0 ? (
-							<p className="empty model-empty">역할별 모델 정보가 없습니다.</p>
+							<p className="empty model-empty">{t("settings.rolesEmpty")}</p>
 						) : (
-							<ul className="preference-grid" aria-label="역할별 모델 목록">
+							<ul className="preference-grid" aria-label={t("settings.rolesList")}>
 								{preferences.roles.map(role => (
 									<RolePreference key={role.id} role={role} />
 								))}
@@ -277,12 +249,12 @@ export function PreferencesPanel({
 						)}
 					</section>
 					<section className="preferences-group" aria-labelledby={`${id}-sampling`}>
-						<h3 id={`${id}-sampling`}>샘플링</h3>
-						<p className="preference-reason">다음 실행에 적용됩니다. 모델별 지원 여부는 알 수 없습니다.</p>
+						<h3 id={`${id}-sampling`}>{t("settings.samplingHeading")}</h3>
+						<p className="preference-reason">{t("settings.samplingHint")}</p>
 						{preferences.sampling.length === 0 ? (
-							<p className="empty model-empty">샘플링 설정 정보가 없습니다.</p>
+							<p className="empty model-empty">{t("settings.samplingEmpty")}</p>
 						) : (
-							<ul className="preference-grid" aria-label="샘플링 설정 목록">
+							<ul className="preference-grid" aria-label={t("settings.samplingList")}>
 								{preferences.sampling.map(sampling => (
 									<SamplingPreference key={sampling.parameter} sampling={sampling} />
 								))}

@@ -9,21 +9,21 @@ function presentation(): DesktopGatePresentation {
 		gate: {
 			ref: { sessionGeneration: "hidden-session-generation", connectionGeneration: "hidden-connection-generation", key: "hidden-gate-reference" },
 			kind: "approval",
-			stage: "설계 검토 단계",
+			stage: "Design review stage",
 			createdAt: "2026-10-28T18:00:00Z",
 			answerable: true,
 			content: {
-				title: "한국어 日本語 中文 실행 전 검토",
-				prompt: "원본 내용을 읽고 응답하세요.\n다음 줄도 유지합니다.",
-				summary: "요약: 선택과 실행은 별개입니다.",
-				plan: "1. 설계 확인\n2. 별도 실행 승인",
+				title: "日本語 中文 pre-run review",
+				prompt: "Read the original content and answer.\nThe next line is preserved too.",
+				summary: "Summary: choosing and executing are separate.",
+				plan: "1. Confirm the design\n2. Approve execution separately",
 				source: "artifact:///private/source.md",
 				language: "ko-KR / 日本語 / 中文",
 			},
-			artifacts: [{ kind: "plan", path: "artifact:///private/계획.html", sha256: "a".repeat(64) }],
+			artifacts: [{ kind: "plan", path: "artifact:///private/plan.html", sha256: "a".repeat(64) }],
 			schemaJson: '{"type":"object","properties":{"decision":{"enum":["approve","revise"]}},"required":["decision"]}',
-			choices: [{ key: "opaque-choice-not-display", label: "완전한 응답 제공", description: "생산자가 검증한 전체 값" }],
-			optionLabels: [{ label: "필드 설명 전용", description: "이 안내는 완전한 응답이 아닙니다." }],
+			choices: [{ key: "opaque-choice-not-display", label: "Complete answer provided", description: "The full value verified by the producer" }],
+			optionLabels: [{ label: "Field description only", description: "This guidance is not a complete answer." }],
 			truncated: false,
 			maxAnswerBytes: 65_536,
 		},
@@ -58,17 +58,17 @@ function button(html: string, label: string): string {
 describe("desktop gate dialog presentation", () => {
 	test("renders complete producer content and inert, read-only evidence with existing semantic controls", () => {
 		const html = render();
-		for (const text of ["한국어 日本語 中文 실행 전 검토", "원본 내용을 읽고 응답하세요.\n다음 줄도 유지합니다.", "요약: 선택과 실행은 별개입니다.", "1. 설계 확인\n2. 별도 실행 승인", "artifact:///private/source.md", "ko-KR / 日本語 / 中文", "artifact:///private/계획.html", "a".repeat(64), "설계 검토 단계"]) {
+		for (const text of ["日本語 中文 pre-run review", "Read the original content and answer.\nThe next line is preserved too.", "Summary: choosing and executing are separate.", "1. Confirm the design\n2. Approve execution separately", "artifact:///private/source.md", "ko-KR / 日本語 / 中文", "artifact:///private/plan.html", "a".repeat(64), "Design review stage"]) {
 			expect(html).toContain(text);
 		}
 		for (const hook of ["gate-dialog", "gate-content", "gate-evidence", "gate-schema", "gate-answer", "gate-actions", "gate-status"]) expect(html).toContain(hook);
 		expect(html).toContain('<dialog aria-labelledby=');
 		expect(html).toContain('class="modal gate-dialog"');
 		expect(html).toContain('<form class="gate-answer"');
-		expect(html).toContain("아티팩트 참조 · 읽기 전용");
-		expect(html).toContain("스키마 JSON · 읽기 전용");
+		expect(html).toContain("Artifact references · Read only");
+		expect(html).toContain("Schema JSON · Read only");
 		expect(html).toContain("&quot;required&quot;:[&quot;decision&quot;]");
-		expect(html).toContain("원본 검증 스키마가 아닙니다.");
+		expect(html).toContain("is not the original validation schema.");
 		expect(html).not.toContain("href=");
 		expect(html).not.toContain("src=");
 		expect(html).not.toContain("<iframe");
@@ -78,53 +78,53 @@ describe("desktop gate dialog presentation", () => {
 
 	test("only advertised complete choices become actions; schema and option labels never synthesize buttons or fields", () => {
 		const html = render();
-		expect(button(html, "완전한 응답 제공")).not.toContain('disabled=""');
-		expect(html).toContain("생산자가 검증한 전체 값");
-		expect(html).toContain("필드 설명 전용");
-		expect(html).toContain("이 안내는 완전한 응답이 아닙니다.");
+		expect(button(html, "Complete answer provided")).not.toContain('disabled=""');
+		expect(html).toContain("The full value verified by the producer");
+		expect(html).toContain("Field description only");
+		expect(html).toContain("This guidance is not a complete answer.");
 		expect(html.match(/<button\b/gu)).toHaveLength(3); // Native close, actual choice, explicit JSON submit.
 		expect(html).not.toContain('name="decision"');
 		expect(html).not.toContain(">approve</button>");
 		expect(html).not.toContain(">revise</button>");
-		expect(button(html, "JSON 응답 보내기")).toContain('disabled=""'); // Empty draft is not JSON.
+		expect(button(html, "Send JSON answer")).toContain('disabled=""'); // Empty draft is not JSON.
 		expect(html.match(/<textarea\b/gu)).toHaveLength(1);
 		expect(html.match(/<textarea\b[^>]*>/u)?.[0]).not.toContain('disabled=""');
 		const value = presentation();
 		value.gate.choices = [];
 		const jsonOnly = render({ presentation: value });
-		expect(jsonOnly).toContain("제공된 완전한 응답 선택지 없음 · JSON 응답을 사용하세요.");
-		expect(jsonOnly).toContain("필드 설명 전용");
+		expect(jsonOnly).toContain("No complete answer choices provided · Use a JSON answer.");
+		expect(jsonOnly).toContain("Field description only");
 		expect(jsonOnly.match(/<button\b/gu)).toHaveLength(2);
 	});
 
 	test("unsupported, truncated, unacknowledged, pending and invalid-limit states disable answers without cancelling on close", () => {
 		const unsupported = presentation();
 		unsupported.gate.answerable = false;
-		unsupported.gate.reason = "생산자가 원격 응답을 지원하지 않습니다.";
+		unsupported.gate.reason = "The producer does not support remote answers.";
 		const truncated = presentation();
 		truncated.gate.truncated = true;
 		const invalidLimit = presentation();
 		invalidLimit.gate.maxAnswerBytes = 0;
 		const states: Array<{ overrides: Partial<GateDialogProps>; notice: string }> = [
-			{ overrides: { presentation: unsupported }, notice: "읽기 전용입니다." },
-			{ overrides: { presentation: truncated }, notice: "완전한 내용을 확인할 수 없어 응답할 수 없습니다." },
-			{ overrides: { presented: false }, notice: "화면 표시의 서버 확인을 기다리는 중입니다." },
-			{ overrides: { pending: true }, notice: "연결 또는 응답 처리를 기다리는 중입니다." },
-			{ overrides: { presentation: invalidLimit }, notice: "유효한 응답 크기 한도가 제공되지 않아 응답할 수 없습니다." },
+			{ overrides: { presentation: unsupported }, notice: "It is read only." },
+			{ overrides: { presentation: truncated }, notice: "It cannot be answered because the complete content is not available." },
+			{ overrides: { presented: false }, notice: "Waiting for the host to confirm that this surface is displayed." },
+			{ overrides: { pending: true }, notice: "Waiting for the connection or for the answer to be processed." },
+			{ overrides: { presentation: invalidLimit }, notice: "The request cannot be answered because no valid answer size limit was provided." },
 		];
 		for (const { overrides, notice } of states) {
 			const html = render(overrides);
 			expect(html).toContain(notice);
-			expect(button(html, "완전한 응답 제공")).toContain('disabled=""');
-			expect(button(html, "JSON 응답 보내기")).toContain('disabled=""');
+			expect(button(html, "Complete answer provided")).toContain('disabled=""');
+			expect(button(html, "Send JSON answer")).toContain('disabled=""');
 			expect(html.match(/<textarea\b[^>]*>/u)?.[0]).toContain('disabled=""');
-			expect(button(html, "닫기")).not.toContain('disabled=""');
-			expect(html).toContain("닫기는 화면 철회 요청이며 워크플로 취소가 아닙니다.");
-			expect(html).toContain("응답 수락은 실행 승인이나 워크플로 진행 완료를 뜻하지 않습니다.");
+			expect(button(html, "Close")).not.toContain('disabled=""');
+			expect(html).toContain("Closing requests that the surface be withdrawn; it does not cancel the workflow.");
+			expect(html).toContain("Accepting an answer does not mean execution approval or workflow progress.");
 		}
 		expect(render({ pending: true })).toContain('aria-busy="true"');
-		expect(render({ error: "서버가 응답을 거절했습니다." })).toContain('role="alert"');
-		expect(render({ error: "서버가 응답을 거절했습니다." })).toContain("서버가 응답을 거절했습니다.");
+		expect(render({ error: "The host rejected the answer." })).toContain('role="alert"');
+		expect(render({ error: "The host rejected the answer." })).toContain("The host rejected the answer.");
 	});
 
 	test("escapes all producer text and treats HTML, schema and artifact URLs as inert literals", () => {
@@ -148,26 +148,26 @@ describe("desktop gate dialog presentation", () => {
 	test("bounds oversized CJK, schema, evidence and choice labels and disables incomplete local displays", () => {
 		for (const field of ["content", "schema", "artifact", "choice", "options"] as const) {
 			const value = presentation();
-			if (field === "content") value.gate.content.plan = "가".repeat(32_769);
+			if (field === "content") value.gate.content.plan = "日".repeat(32_769);
 			if (field === "schema") value.gate.schemaJson = "s".repeat(65_537);
 			if (field === "artifact") value.gate.artifacts[0]!.path = "p".repeat(1025);
 			if (field === "choice") value.gate.choices[0]!.description = "d".repeat(1025);
-			if (field === "options") value.gate.optionLabels = Array.from({ length: 65 }, (_, index) => ({ label: `안내-${index}` }));
+			if (field === "options") value.gate.optionLabels = Array.from({ length: 65 }, (_, index) => ({ label: `Guide-${index}` }));
 			const html = render({ presentation: value });
-			expect(html).toContain("완전한 내용을 확인할 수 없어 응답할 수 없습니다.");
-			expect(button(html, "완전한 응답 제공")).toContain('disabled=""');
-			if (field === "options") expect(html).not.toContain("안내-64");
-			else expect(html).toContain("긴 내용 생략");
-			expect(html).not.toContain("가".repeat(32_769));
+			expect(html).toContain("It cannot be answered because the complete content is not available.");
+			expect(button(html, "Complete answer provided")).toContain('disabled=""');
+			if (field === "options") expect(html).not.toContain("Guide-64");
+			else expect(html).toContain("content truncated");
+			expect(html).not.toContain("日".repeat(32_769));
 			expect(html).not.toContain("s".repeat(65_537));
 			expect(html).not.toContain("p".repeat(1025));
 		}
 		const value = presentation();
-		value.gate.content.plan = `${"x".repeat(32_767)}😀뒤`;
+		value.gate.content.plan = `${"x".repeat(32_767)}😀after`;
 		const html = render({ presentation: value });
 		expect(html).not.toContain("\uD83D");
 		expect(html).not.toContain("😀");
-		expect(html).toContain("긴 내용 생략");
+		expect(html).toContain("content truncated");
 	});
 
 	test("retiring renders no root, Modal or answer controls even while pending; SSR emits no lifecycle callbacks", () => {
@@ -175,13 +175,13 @@ describe("desktop gate dialog presentation", () => {
 			expect(render({ retiring: { nonce: "exact-retirement-nonce" }, pending })).toBe("");
 		}
 		// Callbacks throw in these SSR fixtures: rendering visible and retired trees must not call them.
-		expect(render({ presented: false })).toContain("화면 표시의 서버 확인을 기다리는 중입니다.");
+		expect(render({ presented: false })).toContain("Waiting for the host to confirm that this surface is displayed.");
 	});
 });
 
 describe("desktop gate JSON syntax and UTF-8 validation", () => {
 	test("preserves the exact JSON wire text and accepts whole values without guessing schema fields", () => {
-		for (const json of [' {"decision":"revise","note":"검토 日本語 😀"}\n', "false", "null", "42", '"직접 응답"', '["선택", 1]']) {
+		for (const json of [' {"decision":"revise","note":"review 日本語 😀"}\n', "false", "null", "42", '"direct answer"', '["choice", 1]']) {
 			const bytes = new TextEncoder().encode(json).byteLength;
 			expect(validateGateJsonAnswer(json, bytes)).toEqual({ valid: true, bytes, answer: { kind: "json", json } });
 		}
@@ -189,21 +189,21 @@ describe("desktop gate JSON syntax and UTF-8 validation", () => {
 
 	test("rejects empty, whitespace, malformed, trailing and JavaScript-only input rather than executing or repairing it", () => {
 		for (const json of ["", "  \n", "{", '{"a":1,}', '{"a":undefined}', "true false", "NaN", "(() => 1)()", "// comment\n1"]) {
-			expect(validateGateJsonAnswer(json, 1024)).toEqual({ valid: false, error: "유효한 JSON 값을 입력하세요." });
+			expect(validateGateJsonAnswer(json, 1024)).toEqual({ valid: false, error: "Enter a valid JSON value." });
 		}
 	});
 
 	test("measures multibyte UTF-8 at the exact boundary including whitespace and refuses over-limit answers", () => {
-		const json = '"가😀"'; // Two quotes + three-byte Hangul + four-byte emoji.
+		const json = '"日😀"'; // Two quotes + three-byte CJK + four-byte emoji.
 		expect(validateGateJsonAnswer(json, 9)).toEqual({ valid: true, bytes: 9, answer: { kind: "json", json } });
-		expect(validateGateJsonAnswer(json, 8)).toEqual({ valid: false, error: "응답은 UTF-8 8바이트 이하여야 합니다." });
-		expect(validateGateJsonAnswer(" true ", 5)).toEqual({ valid: false, error: "응답은 UTF-8 5바이트 이하여야 합니다." });
-		expect(validateGateJsonAnswer('"abcd"', 5)).toEqual({ valid: false, error: "응답은 UTF-8 5바이트 이하여야 합니다." });
+		expect(validateGateJsonAnswer(json, 8)).toEqual({ valid: false, error: "The answer must be at most 8 bytes of UTF-8." });
+		expect(validateGateJsonAnswer(" true ", 5)).toEqual({ valid: false, error: "The answer must be at most 5 bytes of UTF-8." });
+		expect(validateGateJsonAnswer('"abcd"', 5)).toEqual({ valid: false, error: "The answer must be at most 5 bytes of UTF-8." });
 	});
 
 	test("refuses missing or unusable wire limits rather than substituting a browser default", () => {
 		for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
-			expect(validateGateJsonAnswer("true", limit)).toEqual({ valid: false, error: "유효한 응답 크기 한도가 제공되지 않았습니다." });
+			expect(validateGateJsonAnswer("true", limit)).toEqual({ valid: false, error: "No valid answer size limit was provided." });
 		}
 	});
 });

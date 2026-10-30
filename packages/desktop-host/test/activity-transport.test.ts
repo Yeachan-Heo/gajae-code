@@ -546,7 +546,7 @@ describe("desktop activity and preferences over the real transport", () => {
 				sessionId: dto.id,
 				action: { type: "profile.select", name: "desktop-b", scope: "session" },
 			}),
-		).rejects.toThrow("실행 중");
+		).rejects.toThrow("Another operation is running");
 		const pending = workflow(sdk, executionGate({ summary: "Exact busy-turn execution boundary" }));
 		const ui = new CommittedOwner(f, dto.id);
 		const presentation = await ui.present(gateRef(await f.activity()));
@@ -1185,7 +1185,7 @@ describe("genuine workflow gate transport terminalization", () => {
 		expect(sdk.sessionLifecycle).toMatchObject({ generation, disposed: false });
 		expect(finished).toBe(false);
 		expect(pending.state.advanced).toBe(false);
-		await expect(ui.present(ref)).rejects.toThrow("세션 변경 전에");
+		await expect(ui.present(ref)).rejects.toThrow("before the session change");
 		await expect(
 			f.call("gate.retired", { sessionId: dto.id, presentationId: second.id, nonce: firstRetirement.nonce }),
 		).rejects.toThrow("No matching");

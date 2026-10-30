@@ -3,6 +3,7 @@ import type { DesktopBtwConversation } from "../../desktop-host/src/btw-protocol
 import { BtwPanel } from "./BtwPanel";
 import { request, subscribe } from "./bridge";
 import { ErrorBanner, Modal } from "./components";
+import { t } from "./i18n";
 
 interface BtwDialogOwner {
 	active: boolean;
@@ -67,7 +68,7 @@ export function BtwDialog(props: BtwDialogProps) {
 			setDraft(value => (value === question ? "" : value));
 			latest.current.onAdmitted();
 		} catch (failure) {
-			if (current(owner)) setError(failure instanceof Error ? failure.message : "별도 대화 요청에 실패했습니다.");
+			if (current(owner)) setError(failure instanceof Error ? failure.message : t("support.btwSendFailed"));
 		} finally {
 			owner.inFlight = false;
 			if (current(owner)) setPending(false);
@@ -133,8 +134,7 @@ export function BtwDialog(props: BtwDialogProps) {
 				const question = latest.current.initialQuestion;
 				if (question?.trim() && !owner.conversation) await send(owner, question);
 			} catch (failure) {
-				if (current(owner))
-					setError(failure instanceof Error ? failure.message : "별도 대화를 불러오지 못했습니다.");
+				if (current(owner)) setError(failure instanceof Error ? failure.message : t("support.btwLoadFailed"));
 			}
 		})();
 		return () => {
@@ -162,8 +162,7 @@ export function BtwDialog(props: BtwDialogProps) {
 				latest.current.onClose();
 			}
 		} catch (failure) {
-			if (current(owner))
-				setError(failure instanceof Error ? failure.message : "별도 대화 닫기 요청에 실패했습니다.");
+			if (current(owner)) setError(failure instanceof Error ? failure.message : t("support.btwCloseFailed"));
 		} finally {
 			if (current(owner)) setPending(false);
 		}
@@ -184,17 +183,16 @@ export function BtwDialog(props: BtwDialogProps) {
 				}),
 			);
 		} catch (failure) {
-			if (current(owner))
-				setError(failure instanceof Error ? failure.message : "별도 대화 중지 요청에 실패했습니다.");
+			if (current(owner)) setError(failure instanceof Error ? failure.message : t("support.btwStopFailed"));
 		} finally {
 			owner.inFlight = false;
 			if (current(owner)) setPending(false);
 		}
 	};
 	return (
-		<Modal title="별도 대화 · /btw" onClose={() => void close()}>
+		<Modal title={t("support.btwTitle")} onClose={() => void close()}>
 			{error && <ErrorBanner>{error}</ErrorBanner>}
-			{!ready && !error && <p role="status">별도 대화 정보를 불러오는 중…</p>}
+			{!ready && !error && <p role="status">{t("support.btwLoading")}</p>}
 			<BtwPanel
 				conversation={conversation}
 				draft={draft}

@@ -101,6 +101,16 @@ const clickText = async (label) => {
   }, label);
   if (!ok) throw new Error("Missing button: " + label + " BODY=" + (await body()).slice(0, 900));
 };
+const openMenu = async () => {
+  const ok = await page.evaluate(() => {
+    const node = document.querySelector('[aria-label="Conversation actions menu"]');
+    if (!node) return false;
+    node.click();
+    return true;
+  });
+  if (!ok) throw new Error("Missing conversation actions menu BODY=" + (await body()).slice(0, 900));
+  await waitFn(() => !!document.querySelector(".modal"));
+};
 const feature = (name, value) => { report.features[name] = value; void flush(); };
 const clickRow = async (title) => {
   const ok = await page.evaluate((wanted) => {
@@ -133,41 +143,42 @@ try {
 
   // 1. Seeded catalog loads without a connection error.
   setStage("seeded-catalog");
-  await waitFn(() => document.body.innerText.includes("긴 대화"));
+  await waitFn(() => document.body.innerText.includes("Long conversation"));
   const seeded = await body();
   feature("catalog", {
     projects: seeded.includes("qa-project"),
-    sessions: ["긴 대화", "짧은 대화", "즐겨찾기 대화"].every((title) => seeded.includes(title)),
-    connectionError: seeded.includes("연결 끊김"),
+    sessions: ["Long conversation", "Short conversation", "Starred conversation"].every((title) => seeded.includes(title)),
+    connectionError: seeded.includes("Disconnected:") || seeded.includes("Host connection failed"),
   });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "01-sidebar.png"))} });
 
   // 2. Selecting a conversation renders its history (the reported failure mode).
   setStage("select-session");
-  await clickRow("긴 대화");
-  await waitFn(() => document.querySelectorAll(".conversation .message, .conversation [class*=message]").length > 0 || document.body.innerText.includes("긴 대화] 메시지 119"));
+  await clickRow("Long conversation");
+  await waitFn(() => document.querySelectorAll(".conversation .message, .conversation [class*=message]").length > 0 || document.body.innerText.includes("Long conversation] Message 119"));
   await page.waitForTimeout(600);
   const selectedBody = await body();
   feature("selectSession", {
-    header: selectedBody.includes("긴 대화"),
-    historyRendered: selectedBody.includes("메시지 119"),
+    header: selectedBody.includes("Long conversation"),
+    historyRendered: selectedBody.includes("Message 119"),
   });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "02-conversation.png"))} });
 
   // 3. Full-history dialog pages a 120-message conversation.
   setStage("history-dialog");
-  await clickText("전체 기록");
-  await waitFn(() => document.body.innerText.includes("전체 120개"));
+  await openMenu();
+  await clickText("Full conversation history");
+  await waitFn(() => document.body.innerText.includes("of 120."));
   const historyBody = await body();
-  feature("historyDialog", { total: historyBody.includes("전체 120개"), rendered: historyBody.includes("메시지 0") });
+  feature("historyDialog", { total: historyBody.includes("of 120."), rendered: historyBody.includes("Message 0") });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "03-history.png"))} });
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
   // 4. Command palette advertises only runnable builtins and runs one.
   setStage("palette");
-  await clickText("명령");
-  await waitFn(() => document.body.innerText.includes("GJC 슬래시 명령"));
+  await clickText("Commands");
+  await waitFn(() => document.body.innerText.includes("GJC slash commands"));
   const palette = await body();
   feature("palette", {
     hasTools: palette.includes("/tools"),
@@ -187,18 +198,19 @@ try {
   setStage("unknown-command");
   await page.fill("#command-input", "/not-a-command");
   await page.click(".command-run button[type=submit]");
-  await waitFn(() => (document.querySelector(".bounded-output")?.innerText || "").includes("실행하지 않았습니다"));
+  await waitFn(() => (document.querySelector(".bounded-output")?.innerText || "").includes("Not run."));
   feature("unknownCommand", { refused: true, output: (await page.evaluate(() => document.querySelector(".bounded-output")?.innerText || "")).slice(0, 200) });
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
   // 6. Rename through the dialog reaches the catalog title.
   setStage("rename");
-  await clickText("이름 변경");
+  await openMenu();
+  await clickText("Rename");
   await waitFn(() => !!document.querySelector("#session-title"));
-  await page.fill("#session-title", "이름 변경 검증");
-  await clickText("저장");
-  await waitFn(() => document.body.innerText.includes("이름 변경 검증"));
+  await page.fill("#session-title", "Rename check");
+  await clickText("Save");
+  await waitFn(() => document.body.innerText.includes("Rename check"));
   feature("rename", { applied: true });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "05-rename.png"))} });
   await page.keyboard.press("Escape");
@@ -206,8 +218,8 @@ try {
 
   // 7. Settings: 321 scalar entries, filter, and a persisted write.
   setStage("settings");
-  await clickText("설정");
-  await waitFn(() => ["321", "320", "319", "318"].some((count) => document.body.innerText.includes(count + "개")));
+  await clickText("Settings");
+  await waitFn(() => ["321", "320", "319", "318"].some((count) => document.body.innerText.includes("Matches: " + count + " of " + count)));
   await page.fill("#setting-search", "retry");
   await waitFn(() => document.body.innerText.toLowerCase().includes("retry."));
   const settingsBody = await body();
@@ -217,7 +229,7 @@ try {
   });
   feature("settings", {
     filtered: settingsBody.toLowerCase().includes("retry."),
-    showsReadOnlyNote: settingsBody.includes("터미널 전용") || settingsBody.includes("일치"),
+    showsReadOnlyNote: settingsBody.includes("Read only") || settingsBody.includes("Matches:"),
     writableInput: writable,
   });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "06-settings.png"))} });
@@ -226,11 +238,14 @@ try {
 
   // 8. Change review shows the isolated project's untracked file.
   setStage("diff");
-  await clickText("변경 검토");
+  await clickText("Review changes");
   await waitFn(() => document.body.innerText.includes("qa-untracked.txt"), 45000);
   feature("diff", { shown: (await body()).includes("qa-untracked.txt"), pane: (await body()).slice(-160) });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "07-diff.png"))} });
-  await clickText("닫기").catch(() => {});
+  await page.evaluate(() => {
+    const node = document.querySelector('button[aria-label="Close review changes"], .modal-close');
+    if (node) node.click();
+  });
   await page.waitForTimeout(300);
 
   // 9. Protocol-level surfaces the TUI exposes, driven through the app bridge.
@@ -238,28 +253,28 @@ try {
   const sessionId = await page.evaluate(() => {
     const snapshot = (window.__qaFrames || []).find((frame) => frame && frame.type === "snapshot");
     const sessions = snapshot?.snapshot?.sessions || [];
-    const renamed = sessions.find((item) => item.title === "이름 변경 검증");
+    const renamed = sessions.find((item) => item.title === "Rename check");
     return renamed?.id || sessions[0]?.id || "";
   });
   feature("sessionIdResolved", { id: sessionId.length > 0 });
 
   // 10. Session search narrows the sidebar.
   setStage("session-search");
-  await page.fill("#session-search", "짧은");
+  await page.fill("#session-search", "Short");
   await waitFn(() => {
     const text = document.body.innerText;
-    return text.includes("짧은 대화") && !text.includes("이름 변경 검증" + String.fromCharCode(10) + "대기");
+    return text.includes("Short conversation") && !text.includes("Rename check" + String.fromCharCode(10) + "Idle");
   });
-  feature("sessionSearch", { filtered: !(await body()).includes("즐겨찾기 대화") });
+  feature("sessionSearch", { filtered: !(await body()).includes("Starred conversation") });
   await page.fill("#session-search", "");
   await page.waitForTimeout(200);
 
   // 11. Active-tools dialog lists tools and saves a selection.
   setStage("tools-dialog");
-  await clickText("명령");
-  await waitFn(() => document.body.innerText.includes("GJC 슬래시 명령"));
-  await clickText("활성 도구 관리");
-  await waitFn(() => document.body.innerText.includes("도구"));
+  await clickText("Commands");
+  await waitFn(() => document.body.innerText.includes("GJC slash commands"));
+  await clickText("Manage active tools");
+  await waitFn(() => document.body.innerText.includes("Active tools"));
   feature("toolsDialog", { opened: true, body: (await body()).slice(-260) });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "08-tools.png"))} });
   await page.keyboard.press("Escape");
@@ -267,16 +282,16 @@ try {
 
   // 12. Goal dialog opens against the live session.
   setStage("goal-dialog");
-  await clickText("명령");
-  await waitFn(() => document.body.innerText.includes("GJC 슬래시 명령"));
+  await clickText("Commands");
+  await waitFn(() => document.body.innerText.includes("GJC slash commands"));
   const goalClicked = await page.evaluate(() => {
-    const node = [...document.querySelectorAll("button")].find((item) => (item.innerText || "").includes("목표 관리"));
+    const node = [...document.querySelectorAll("button")].find((item) => (item.innerText || "").includes("Manage goal"));
     if (!node) return false;
     node.click();
     return true;
   });
   if (goalClicked) {
-    await waitFn(() => document.body.innerText.includes("목표") || document.body.innerText.includes("goal"));
+    await waitFn(() => document.body.innerText.includes("Objective") || document.body.innerText.includes("goal"));
     feature("goalDialog", { opened: true, body: (await body()).slice(-200) });
     await page.keyboard.press("Escape");
     await page.waitForTimeout(300);
@@ -286,8 +301,9 @@ try {
 
   // 13. Delete dialog is reachable and dismissible without touching data.
   setStage("delete-dialog");
-  await clickText("삭제");
-  await waitFn(() => document.body.innerText.includes("되돌릴 수 없습니다"));
+  await openMenu();
+  await clickText("Delete conversation");
+  await waitFn(() => document.body.innerText.includes("This cannot be undone."));
   feature("deleteDialog", { opened: true });
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
@@ -299,10 +315,10 @@ try {
     const area = document.querySelector(".composer textarea, .composer input, textarea");
     if (!area) throw new Error("No composer");
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-    setter?.call(area, "안녕하세요");
+    setter?.call(area, "Hello");
     area.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await clickText("보내기");
+  await clickText("Send");
   await page.waitForTimeout(6000);
   const after = await body();
   feature("promptError", {
@@ -330,7 +346,7 @@ try {
   });
   feature("modelsListed", { count: models.length });
   const extra = [
-    ["goal.operate", { sessionId, op: "create", objective: "데스크톱 QA 목표" }],
+    ["goal.operate", { sessionId, op: "create", objective: "Desktop QA goal" }],
     ["goal.operate", { sessionId, op: "get" }],
     ["session.export", { sessionId }],
     ["session.fork", { sessionId }],
@@ -377,18 +393,18 @@ try {
       setter?.call(area, "Reply with exactly: OK");
       area.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await clickText("보내기");
+    await clickText("Send");
     await waitFn(() => {
       const conversation = document.querySelector(".conversation");
       const text = conversation ? conversation.innerText : "";
-      return text.includes("OK") && !document.body.innerText.includes("작업 중");
+      return text.includes("OK") && !document.body.innerText.includes("Working");
     }, 120000);
     const liveBody = await body();
     feature("liveTurn", {
       ms: Date.now() - started,
       replied: liveBody.includes("OK"),
-      idle: liveBody.includes("대기"),
-      error: /오류|isError/.test(liveBody),
+      idle: liveBody.includes("Idle"),
+      error: /Error|isError/.test(liveBody),
     });
     await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "10-live-turn.png"))} });
   }

@@ -3,6 +3,7 @@ import type { FocusEvent, KeyboardEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import type { DesktopThinking, DesktopThinkingLevel } from "../../desktop-host/src/protocol";
 import { Button } from "./components";
+import { t } from "./i18n";
 
 export function ReasoningSelect({
 	thinking,
@@ -21,12 +22,12 @@ export function ReasoningSelect({
 	const unavailable = !thinking?.available || options.length === 0;
 	const inactive = !!disabled || !!pending || unavailable;
 	const fallbackLabel = pending
-		? "추론 설정 적용 중…"
+		? t("models.reasoningApplying")
 		: unavailable
 			? thinking?.mode === "always-on"
-				? "추론 항상 켜짐"
-				: "추론 설정 없음"
-			: value || "모델 기본값";
+				? t("models.reasoningAlwaysOn")
+				: t("models.reasoningNone")
+			: value || t("models.modelDefault");
 	const [open, setOpen] = useState(false);
 	const [anchor, setAnchor] = useState<{ left: number; width: number; bottom: number }>();
 	const control = useRef<HTMLDivElement>(null);
@@ -125,8 +126,8 @@ export function ReasoningSelect({
 					className="select-trigger"
 					aria-haspopup="listbox"
 					aria-expanded={open}
-					aria-label={`추론 수준: ${current?.label ?? fallbackLabel}`}
-					title={thinking?.reason ?? "다음 요청에 사용할 추론 수준"}
+					aria-label={t("models.reasoningLevelFor", { level: current?.label ?? fallbackLabel })}
+					title={thinking?.reason ?? t("models.reasoningLevelTitle")}
 					disabled={inactive}
 					onClick={() => (open ? setOpen(false) : openMenu())}
 					onKeyDown={event => {
@@ -144,7 +145,7 @@ export function ReasoningSelect({
 						ref={menu}
 						className="select-menu"
 						role="listbox"
-						aria-label="추론 수준"
+						aria-label={t("models.reasoningLevel")}
 						style={
 							anchor
 								? {

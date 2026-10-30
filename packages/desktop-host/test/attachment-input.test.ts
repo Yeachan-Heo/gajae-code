@@ -2,20 +2,17 @@ import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import { MAX_STAGED_PROMPT_IMAGES } from "@gajae-code/coding-agent/utils/image-limits";
 import { SUPPORTED_INPUT_IMAGE_MIME_TYPES } from "@gajae-code/coding-agent/utils/image-loading";
-import {
-	prepareDesktopAttachmentInput,
-	validateDesktopAttachmentPromptRequest,
-} from "../src/attachment-input";
+import { prepareDesktopAttachmentInput, validateDesktopAttachmentPromptRequest } from "../src/attachment-input";
 import {
 	assertDesktopAttachmentRequestSize,
 	DESKTOP_ATTACHMENT_IMAGE_MIMES,
 	DESKTOP_ATTACHMENT_MAX_COUNT,
 	DESKTOP_ATTACHMENT_NAME_BYTES,
 	DESKTOP_ATTACHMENT_REQUEST_BYTES,
-	desktopAttachmentBase64Bytes,
-	desktopAttachmentJsonBytes,
 	type DesktopAttachment,
 	type DesktopAttachmentPromptRequest,
+	desktopAttachmentBase64Bytes,
+	desktopAttachmentJsonBytes,
 	validateDesktopAttachmentName,
 	validateDesktopAttachmentText,
 } from "../src/attachment-protocol";
@@ -31,7 +28,7 @@ function request(attachments: DesktopAttachment[] = [], text = "Review these fil
 function exactFrame(attachments: DesktopAttachment[]): DesktopAttachmentPromptRequest {
 	const value = request(attachments, "");
 	const remaining = DESKTOP_ATTACHMENT_REQUEST_BYTES - desktopAttachmentJsonBytes(value);
-	value.params.text = "한".repeat(Math.floor(remaining / 3)) + "a".repeat(remaining % 3);
+	value.params.text = "漢".repeat(Math.floor(remaining / 3)) + "a".repeat(remaining % 3);
 	return value;
 }
 
@@ -45,7 +42,7 @@ describe("desktop host attachment transport validation", () => {
 	});
 
 	test("admits exactly 8 MiB with text, escaped JSON and base64; rejects one byte more", () => {
-		const value = exactFrame([image, { kind: "text", name: "한글.ts", text: 'const x = "한글";\r\n\t' }]);
+		const value = exactFrame([image, { kind: "text", name: "漢字.ts", text: 'const x = "漢字";\r\n\t' }]);
 		expect(desktopAttachmentJsonBytes(value)).toBe(MAX_FRAME_BYTES);
 		expect(validateDesktopAttachmentPromptRequest(value).params.attachments).toEqual(value.params.attachments);
 		expect(parseRequest(JSON.stringify(value)).id).toBe(value.id);
@@ -56,8 +53,8 @@ describe("desktop host attachment transport validation", () => {
 	});
 
 	test("counts multibyte envelope IDs, filenames, escaped controls and every attachment", () => {
-		const value = request([{ kind: "text", name: "파일.ts", text: '\t"\\한\n' }]);
-		value.id = "요청";
+		const value = request([{ kind: "text", name: "文書.ts", text: '\t"\\漢\n' }]);
+		value.id = "要求";
 		expect(desktopAttachmentJsonBytes(value)).toBe(Buffer.byteLength(JSON.stringify(value), "utf8"));
 		expect(desktopAttachmentJsonBytes(value)).toBeGreaterThan(JSON.stringify(value).length);
 		const small = request([{ kind: "text", name: "one.txt", text: "a".repeat(4 * 1024 * 1024) }]);
@@ -75,16 +72,34 @@ describe("desktop host attachment transport validation", () => {
 		const remaining = MAX_FRAME_BYTES - desktopAttachmentJsonBytes(value);
 		value.params.text = "a".repeat(remaining);
 		expect(desktopAttachmentJsonBytes(value)).toBe(MAX_FRAME_BYTES);
-		expect(desktopAttachmentBase64Bytes(value.params.attachments[0].kind === "image" ? value.params.attachments[0].data : "")).toBe(base64Bytes / 4 * 3);
+		expect(
+			desktopAttachmentBase64Bytes(
+				value.params.attachments[0].kind === "image" ? value.params.attachments[0].data : "",
+			),
+		).toBe((base64Bytes / 4) * 3);
 		expect(validateDesktopAttachmentPromptRequest(value).params.attachments?.length).toBe(1);
 		value.params.attachments = [{ ...image, data: "A".repeat(base64Bytes + 4) }];
 		expect(() => validateDesktopAttachmentPromptRequest(value)).toThrow("8 MiB");
 	});
 
 	test("uses UTF-8 filename bytes and refuses paths/control/bidi names", () => {
-		expect(validateDesktopAttachmentPromptRequest(request([{ kind: "text", name: "한".repeat(85), text: "x" }])).params.attachments?.length).toBe(1);
-		expect(Buffer.byteLength("한".repeat(85))).toBe(DESKTOP_ATTACHMENT_NAME_BYTES);
-		for (const name of ["한".repeat(86), "../secret", "/etc/passwd", "C:\\secret", "a\0b", "a\nb", "a\u202eb", "", ".", ".."]) {
+		expect(
+			validateDesktopAttachmentPromptRequest(request([{ kind: "text", name: "漢".repeat(85), text: "x" }])).params
+				.attachments?.length,
+		).toBe(1);
+		expect(Buffer.byteLength("漢".repeat(85))).toBe(DESKTOP_ATTACHMENT_NAME_BYTES);
+		for (const name of [
+			"漢".repeat(86),
+			"../secret",
+			"/etc/passwd",
+			"C:\\secret",
+			"a\0b",
+			"a\nb",
+			"a\u202eb",
+			"",
+			".",
+			"..",
+		]) {
 			expect(() => validateDesktopAttachmentName(name)).toThrow("safe basename");
 		}
 	});
@@ -97,28 +112,67 @@ describe("desktop host attachment transport validation", () => {
 			{ ...image, text: "wrong kind" },
 			{ kind: "file", name: "secret.txt", data: "AA==" },
 		]) {
-			expect(() => validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, attachments: [attached] } })).toThrow();
+			expect(() =>
+				validateDesktopAttachmentPromptRequest({
+					...request(),
+					params: { ...request().params, attachments: [attached] },
+				}),
+			).toThrow();
 		}
-		for (const key of ["supportsImageInput", "autoResize", "imagesBlocked", "images", "sdkRunCapability", "preflightSignal"])
-			expect(() => validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, [key]: true } })).toThrow("Unknown");
+		for (const key of [
+			"supportsImageInput",
+			"autoResize",
+			"imagesBlocked",
+			"images",
+			"sdkRunCapability",
+			"preflightSignal",
+		])
+			expect(() =>
+				validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, [key]: true } }),
+			).toThrow("Unknown");
 	});
 
 	test("rejects invalid envelopes and prompt parameter types before framing", () => {
-		for (const value of [null, [], {}, { ...request(), method: "command.run" }, { ...request(), id: "" },
-			{ ...request(), id: "a".repeat(129) }, { ...request(), params: [] },
+		for (const value of [
+			null,
+			[],
+			{},
+			{ ...request(), method: "command.run" },
+			{ ...request(), id: "" },
+			{ ...request(), id: "a".repeat(129) },
+			{ ...request(), params: [] },
 			{ ...request(), params: { sessionId: "", text: "x" } },
-			{ ...request(), params: { sessionId: "session-one", text: null } }])
+			{ ...request(), params: { sessionId: "session-one", text: null } },
+		])
 			expect(() => prepareDesktopAttachmentInput(value)).toThrow();
 	});
 
 	test("rejects malformed objects, unsupported types/count and queue modes", () => {
-		for (const attachments of [null, {}, [null], ["path"], [{ ...image, mimeType: "image/svg+xml" }], Array.from({ length: 17 }, () => image)])
-			expect(() => validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, attachments } })).toThrow();
+		for (const attachments of [
+			null,
+			{},
+			[null],
+			["path"],
+			[{ ...image, mimeType: "image/svg+xml" }],
+			Array.from({ length: 17 }, () => image),
+		])
+			expect(() =>
+				validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, attachments } }),
+			).toThrow();
 		for (const deliverAs of ["drop", "follow-up", false, null])
-			expect(() => validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, deliverAs } })).toThrow("delivery");
+			expect(() =>
+				validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, deliverAs } }),
+			).toThrow("delivery");
 	});
 
-	test.each(["", "AA", "AB==", "AAB=", `${PNG}\n`, "data:image/png;base64,AA=="])("rejects noncanonical raw image transport %s", data => {
+	test.each([
+		"",
+		"AA",
+		"AB==",
+		"AAB=",
+		`${PNG}\n`,
+		"data:image/png;base64,AA==",
+	])("rejects noncanonical raw image transport %s", data => {
 		expect(() => prepareDesktopAttachmentInput(request([{ ...image, data }]))).toThrow("canonical base64");
 	});
 });
@@ -136,7 +190,7 @@ describe("desktop host attachment transport validation", () => {
 // These are references to the SDK's assertions, not normalization/admission proof from desktop preparation.
 describe("synchronous desktop attachment framing and raw source extraction", () => {
 	test("preserves text/code content, file identity, line endings and escaped names", () => {
-		const text = 'const greeting = "안녕 𝛂";\r\n\treturn greeting;\n';
+		const text = 'const greeting = "hello 𝛂";\r\n\treturn greeting;\n';
 		const input = { kind: "text" as const, name: 'review "draft".ts', text };
 		const prepared = prepareDesktopAttachmentInput(request([input]));
 		expect(prepared.text).toContain(text);
@@ -150,7 +204,10 @@ describe("synchronous desktop attachment framing and raw source extraction", () 
 		const value = request([image]);
 		value.params.deliverAs = deliverAs;
 		const prepared = prepareDesktopAttachmentInput(value);
-		expect(prepared).toEqual({ text: value.params.text, images: [{ type: "image", mimeType: "image/png", data: PNG }] });
+		expect(prepared).toEqual({
+			text: value.params.text,
+			images: [{ type: "image", mimeType: "image/png", data: PNG }],
+		});
 		expect(value.params.deliverAs).toBe(deliverAs);
 	});
 
@@ -160,7 +217,13 @@ describe("synchronous desktop attachment framing and raw source extraction", () 
 		expect(prepared.images).toEqual([{ type: "image", mimeType: "image/png", data: PNG }]);
 		const emptyFile = prepareDesktopAttachmentInput(request([{ kind: "text", name: "empty.txt", text: "" }], ""));
 		expect(emptyFile.text).toContain("empty.txt");
-		expect(prepareDesktopAttachmentInput({ id: "plain", method: "prompt", params: { sessionId: "session-one", text: "  plain text\n" } })).toEqual({ text: "  plain text\n", images: [] });
+		expect(
+			prepareDesktopAttachmentInput({
+				id: "plain",
+				method: "prompt",
+				params: { sessionId: "session-one", text: "  plain text\n" },
+			}),
+		).toEqual({ text: "  plain text\n", images: [] });
 		expect(() => prepareDesktopAttachmentInput(request([], "  "))).toThrow("empty");
 	});
 
@@ -177,8 +240,10 @@ describe("synchronous desktop attachment framing and raw source extraction", () 
 
 	test("rejects controls, NUL and unpaired Unicode surrogates in text DTOs", () => {
 		for (const text of ["a\0b", "a\u001bb", "a\u0085b", "a\ud800b", "a\udcffb"])
-			expect(() => prepareDesktopAttachmentInput(request([{ kind: "text", name: "bad.txt", text }]))).toThrow("UTF-8");
-		expect(validateDesktopAttachmentText("\ufeff한글\t\r\n𝛂")).toBeUndefined();
+			expect(() => prepareDesktopAttachmentInput(request([{ kind: "text", name: "bad.txt", text }]))).toThrow(
+				"UTF-8",
+			);
+		expect(validateDesktopAttachmentText("\ufeff漢字\t\r\n𝛂")).toBeUndefined();
 	});
 
 	test("never opens a path while framing selected bytes or rejecting renderer paths", () => {
@@ -186,14 +251,23 @@ describe("synchronous desktop attachment framing and raw source extraction", () 
 		const read = vi.spyOn(fs, "readFile");
 		const open = vi.spyOn(fs, "open");
 		try {
-			const prepared = prepareDesktopAttachmentInput(request([image, { kind: "text", name: "passwd", text: "operator-selected content" }]));
+			const prepared = prepareDesktopAttachmentInput(
+				request([image, { kind: "text", name: "passwd", text: "operator-selected content" }]),
+			);
 			expect(prepared.text).toContain("operator-selected content");
-			expect(() => prepareDesktopAttachmentInput({ ...request(), params: { ...request().params, attachments: [{ kind: "text", name: "secret", path: "/etc/passwd" }] } })).toThrow("Unknown");
+			expect(() =>
+				prepareDesktopAttachmentInput({
+					...request(),
+					params: { ...request().params, attachments: [{ kind: "text", name: "secret", path: "/etc/passwd" }] },
+				}),
+			).toThrow("Unknown");
 			expect(file).not.toHaveBeenCalled();
 			expect(read).not.toHaveBeenCalled();
 			expect(open).not.toHaveBeenCalled();
 		} finally {
-			file.mockRestore(); read.mockRestore(); open.mockRestore();
+			file.mockRestore();
+			read.mockRestore();
+			open.mockRestore();
 		}
 	});
 });

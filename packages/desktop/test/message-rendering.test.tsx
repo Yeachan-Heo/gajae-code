@@ -31,9 +31,9 @@ describe("desktop transcript rendering", () => {
 		] });
 		expect(html).toContain("first &lt;script&gt;");
 		expect(html).toContain("<details");
-		expect(html).toContain("생각 과정");
+		expect(html).toContain("Reasoning");
 		expect(html).toContain("actual thought");
-		expect(html.match(/생각 과정/g)).toHaveLength(1);
+		expect(html.match(/Reasoning/g)).toHaveLength(1);
 		expect(html.indexOf("first &lt;script&gt;")).toBeLessThan(html.indexOf("actual thought"));
 		expect(html.indexOf("actual thought")).toBeLessThan(html.indexOf("<figure"));
 		expect(html.indexOf("<figure")).toBeLessThan(html.indexOf("last text"));
@@ -45,7 +45,7 @@ describe("desktop transcript rendering", () => {
 	test("renders safe inline images and explains unavailable and invalid media", () => {
 		const html = render({ id: "user-image", role: "user", text: "", blocks: [image] });
 		expect(html).toContain(`src="data:image/png;base64,${pngData}"`);
-		expect(html).toContain('alt="대화에 포함된 이미지"');
+		expect(html).toContain('alt="Image in the conversation"');
 		for (const bad of [
 			{ type: "image", mimeType: "image/svg+xml", data: "AAAA" },
 			{ type: "image", mimeType: "image/png", data: "https://example.com/image.png" },
@@ -54,7 +54,7 @@ describe("desktop transcript rendering", () => {
 			{ type: "image", mimeType: "image/png", data: "AA=A" },
 		] as unknown as DesktopMessageBlock[]) {
 			const invalid = render({ id: "invalid", role: "user", text: "", blocks: [bad] });
-			expect(invalid).toContain("이미지를 표시할 수 없습니다");
+			expect(invalid).toContain("This image cannot be shown");
 			expect(invalid).not.toContain("<img");
 			expect(invalid).not.toContain("https://example.com");
 		}
@@ -69,13 +69,13 @@ describe("desktop transcript rendering", () => {
 		expect(html).toContain("bounded-output");
 		expect(html).toContain("actual output");
 		expect(html).toContain("<img");
-		expect(html).toContain("실패");
-		expect(html).toContain("모델 컨텍스트 제외");
-		expect(html).toContain("긴 메시지의 앞부분을 생략했습니다");
+		expect(html).toContain("Failed");
+		expect(html).toContain("Excluded from model context");
+		expect(html).toContain("The start of this message was omitted");
 		const cancelled = render({ id: "cancelled", role: "tool", text: "", cancelled: true });
-		expect(cancelled).toContain("취소됨");
-		expect(cancelled).toContain("출력 없음");
-		expect(cancelled).not.toContain("응답을 기다리는 중");
-		expect(render({ id: "blank-tool", role: "tool", text: " \n" })).toContain("출력 없음");
+		expect(cancelled).toContain("Cancelled");
+		expect(cancelled).toContain("No output");
+		expect(cancelled).not.toContain("Waiting for the connection");
+		expect(render({ id: "blank-tool", role: "tool", text: " \n" })).toContain("No output");
 	});
 });

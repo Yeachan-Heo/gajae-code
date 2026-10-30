@@ -53,7 +53,7 @@ try {
 		captures.push(file);
 		await page
 			.locator(".showcase .actions button")
-			.filter(button => button.textContent === "설정 열기")
+			.filter(button => button.textContent === "Open settings")
 			.click();
 		await page.screenshot({ path: path.join(directory, `dialog-${width}.png`) });
 		captures.push(`dialog-${width}.png`);

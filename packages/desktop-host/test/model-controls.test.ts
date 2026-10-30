@@ -23,7 +23,12 @@ const reasoning: Model = {
 	api: "anthropic-messages",
 	baseUrl: "https://example.invalid",
 	reasoning: true,
-	thinking: { mode: "budget", minLevel: Effort.Low, maxLevel: Effort.Max, levels: [Effort.Low, Effort.High, Effort.Max] },
+	thinking: {
+		mode: "budget",
+		minLevel: Effort.Low,
+		maxLevel: Effort.Max,
+		levels: [Effort.Low, Effort.High, Effort.Max],
+	},
 	input: ["text"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 32_768,
@@ -53,12 +58,22 @@ describe("desktop model and session reasoning controls", () => {
 		// Keep genuine configured catalog/auth availability; only force the host's
 		// initial online refresh onto the canonical offline path (no provider probes).
 		const refresh = ModelRegistry.prototype.refresh;
-		vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(function (this: ModelRegistry, _strategy, sessionId) {
+		vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(function (
+			this: ModelRegistry,
+			_strategy,
+			sessionId,
+		) {
 			return refresh.call(this, "offline", sessionId);
 		});
 		const blockedFetch: typeof fetch = Object.assign(
-			async () => { throw new Error("Model control tests must not probe provider or credential endpoints"); },
-			{ preconnect: () => { throw new Error("Model control tests must not preconnect to provider endpoints"); } },
+			async () => {
+				throw new Error("Model control tests must not probe provider or credential endpoints");
+			},
+			{
+				preconnect: () => {
+					throw new Error("Model control tests must not preconnect to provider endpoints");
+				},
+			},
 		);
 		vi.spyOn(globalThis, "fetch").mockImplementation(blockedFetch);
 	});
@@ -80,7 +95,10 @@ describe("desktop model and session reasoning controls", () => {
 		await fs.mkdir(projectDir);
 		await fs.mkdir(path.join(dataDir, "agent"));
 		await setModelPresetRegistryDisabled({ agentDir: path.join(dataDir, "agent"), disabled: true });
-		const providers: Record<string, { baseUrl: string; api: Model["api"]; apiKeyEnv: string; models: Omit<Model, "provider">[] }> = {};
+		const providers: Record<
+			string,
+			{ baseUrl: string; api: Model["api"]; apiKeyEnv: string; models: Omit<Model, "provider">[] }
+		> = {};
 		for (const { provider, ...model } of [reasoning, plain, toggle, alwaysOn, missingKey]) {
 			const apiKeyEnv = `GJC_DESKTOP_MODEL_FIXTURE_${provider.replaceAll("-", "_").toUpperCase()}_KEY`;
 			delete process.env[apiKeyEnv];
@@ -96,14 +114,19 @@ describe("desktop model and session reasoning controls", () => {
 			emit: frame => frames.push(frame),
 			createSession: async options => {
 				const { authStorage, modelRegistry, sessionManager, settings } = options;
-				if (!authStorage || !modelRegistry || !sessionManager || !settings) throw new Error("Missing host-owned dependencies");
+				if (!authStorage || !modelRegistry || !sessionManager || !settings)
+					throw new Error("Missing host-owned dependencies");
 				expect(modelRegistry.getError()).toBeUndefined();
 				authStorage.setRuntimeApiKey(reasoning.provider, "fixture-key-never-send");
 				authStorage.setRuntimeApiKey(toggle.provider, "fixture-native-key-never-send");
 				const agent = new Agent({
-					getApiKey: () => { throw new Error("No provider turns in model controls tests"); },
+					getApiKey: () => {
+						throw new Error("No provider turns in model controls tests");
+					},
 					initialState: { model: nextModel, tools: [], messages: [], systemPrompt: ["private fixture prompt"] },
-					streamFn: () => { throw new Error("No provider turns in model controls tests"); },
+					streamFn: () => {
+						throw new Error("No provider turns in model controls tests");
+					},
 				});
 				const session = new AgentSession({
 					agent,
@@ -125,8 +148,11 @@ describe("desktop model and session reasoning controls", () => {
 			},
 		});
 		cleanups.push(async () => {
-			try { await host.close(); }
-			finally { await fs.rm(dataDir, { recursive: true, force: true }); }
+			try {
+				await host.close();
+			} finally {
+				await fs.rm(dataDir, { recursive: true, force: true });
+			}
 		});
 		async function call<T>(method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<T> {
 			const id = crypto.randomUUID();
@@ -140,7 +166,18 @@ describe("desktop model and session reasoning controls", () => {
 		const create = () => call<DesktopSession>("session.create", { projectId: project.id });
 		const dto = (id: string) => host.snapshot().sessions.find(session => session.id === id)!;
 		const session = await create();
-		return { host, frames, sessions, session, create, call, dto, setNextModel: (model: Model | undefined) => { nextModel = model; } };
+		return {
+			host,
+			frames,
+			sessions,
+			session,
+			create,
+			call,
+			dto,
+			setNextModel: (model: Model | undefined) => {
+				nextModel = model;
+			},
+		};
 	}
 
 	test("projects canonical discrete efforts and model metadata without prompts or credentials", async () => {
@@ -149,11 +186,17 @@ describe("desktop model and session reasoning controls", () => {
 		expect(snapshot.models.find(model => model.id === selector(reasoning))).toMatchObject({
 			contextWindow: 32_768,
 			reasoning: true,
-			thinking: { mode: "budget", options: [{ value: "off" }, { value: "low" }, { value: "high" }, { value: "max" }] },
+			thinking: {
+				mode: "budget",
+				options: [{ value: "off" }, { value: "low" }, { value: "high" }, { value: "max" }],
+			},
 		});
 		expect(session.thinking).toMatchObject({ level: "low", scope: "global config", mode: "budget", available: true });
 		expect(session.thinking?.options.map(option => option.value)).toEqual(["inherit", "off", "low", "high", "max"]);
-		expect(snapshot.models.find(model => model.id === selector(plain))).toMatchObject({ reasoning: false, thinking: { options: [] } });
+		expect(snapshot.models.find(model => model.id === selector(plain))).toMatchObject({
+			reasoning: false,
+			thinking: { options: [] },
+		});
 		const serialized = JSON.stringify(frames);
 		expect(serialized).not.toContain("fixture-key-never-send");
 		expect(serialized).not.toContain("private fixture prompt");
@@ -171,7 +214,12 @@ describe("desktop model and session reasoning controls", () => {
 		expect(dto(session.id).thinking).toMatchObject({ level: "max", scope: "session" });
 		expect(dto(other.id).thinking?.level).toBe("low");
 		expect(sdk.settings.getGlobal("defaultThinkingLevel")).toBe(originalDefault);
-		expect(frames.some(frame => frame.type === "session" && frame.session.id === session.id && frame.session.thinking?.level === "max")).toBe(true);
+		expect(
+			frames.some(
+				frame =>
+					frame.type === "session" && frame.session.id === session.id && frame.session.thinking?.level === "max",
+			),
+		).toBe(true);
 		await call("thinking.set", { sessionId: session.id, level: "inherit" });
 		expect(dto(session.id).thinking).toMatchObject({ level: sdk.thinkingLevel ?? null, scope: "global config" });
 	});
@@ -182,10 +230,14 @@ describe("desktop model and session reasoning controls", () => {
 		const model = vi.spyOn(sessions[0]!, "setDefaultModelSelection");
 		for (const level of [null, true, {}, [], "", " high", "HIGH", "ultra", "medium", "xhigh"]) {
 			await expect(call("thinking.set", { sessionId: session.id, level })).rejects.toThrow(/thinking level/i);
-			await expect(call("model.set", { sessionId: session.id, modelId: selector(reasoning), thinkingLevel: level })).rejects.toThrow(/thinking level/i);
+			await expect(
+				call("model.set", { sessionId: session.id, modelId: selector(reasoning), thinkingLevel: level }),
+			).rejects.toThrow(/thinking level/i);
 		}
 		await expect(call("thinking.set", { sessionId: session.id })).rejects.toThrow("Invalid thinking level");
-		await expect(call("model.set", { sessionId: session.id, modelId: selector(reasoning), thinkingLevel: "inherit" })).rejects.toThrow("Unsupported thinking level");
+		await expect(
+			call("model.set", { sessionId: session.id, modelId: selector(reasoning), thinkingLevel: "inherit" }),
+		).rejects.toThrow("Unsupported thinking level");
 		expect(thinking).not.toHaveBeenCalled();
 		expect(model).not.toHaveBeenCalled();
 		expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "low" } });
@@ -197,10 +249,22 @@ describe("desktop model and session reasoning controls", () => {
 		await expect(call("thinking.set", { sessionId: session.id, level: "high" })).rejects.toThrow("does not support");
 		setNextModel(undefined);
 		const empty = await create();
-		expect(dto(empty.id).thinking).toMatchObject({ available: false, level: null, scope: null, options: [], reason: "No model is selected." });
+		expect(dto(empty.id).thinking).toMatchObject({
+			available: false,
+			level: null,
+			scope: null,
+			options: [],
+			reason: "No model is selected.",
+		});
 		await expect(call("thinking.set", { sessionId: empty.id, level: "off" })).rejects.toThrow("No model is selected");
 		expect(sessions[1]?.model).toBeUndefined();
-		expect(projectDesktopThinking()).toMatchObject({ available: false, level: null, scope: null, options: [], reason: "Open the session to read reasoning controls." });
+		expect(projectDesktopThinking()).toMatchObject({
+			available: false,
+			level: null,
+			scope: null,
+			options: [],
+			reason: "Open the session to read reasoning controls.",
+		});
 	});
 
 	test("native toggle controls use on/off labels and always-on models cannot be disabled", async () => {
@@ -210,14 +274,20 @@ describe("desktop model and session reasoning controls", () => {
 			thinking: { mode: "always-on", options: [] },
 		});
 		expect(session.thinking).toMatchObject({ mode: "toggle", available: true });
-		expect(session.thinking?.options.map(option => [option.value, option.label])).toEqual([["inherit", "inherit"], ["off", "off"], ["high", "on"]]);
+		expect(session.thinking?.options.map(option => [option.value, option.label])).toEqual([
+			["inherit", "inherit"],
+			["off", "off"],
+			["high", "on"],
+		]);
 		await call("thinking.set", { sessionId: session.id, level: "off" });
 		expect(dto(session.id).thinking?.level).toBe("off");
 		setNextModel(alwaysOn);
 		const fixed = await create();
 		expect(fixed.thinking).toMatchObject({ available: false, mode: "always-on", options: [] });
 		await expect(call("thinking.set", { sessionId: fixed.id, level: "off" })).rejects.toThrow("always on");
-		await expect(call("model.set", { sessionId: session.id, modelId: selector(alwaysOn), thinkingLevel: "off" })).rejects.toThrow("Unsupported thinking level");
+		await expect(
+			call("model.set", { sessionId: session.id, modelId: selector(alwaysOn), thinkingLevel: "off" }),
+		).rejects.toThrow("Unsupported thinking level");
 	});
 
 	test("model changes use SDK durable selection and publish the selected effort", async () => {
@@ -243,8 +313,12 @@ describe("desktop model and session reasoning controls", () => {
 		const compact = call("session.compact", { sessionId: session.id });
 		await entered.promise;
 		try {
-			await expect(call("thinking.set", { sessionId: session.id, level: "high" })).rejects.toThrow("다른 작업");
-			await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow("다른 작업");
+			await expect(call("thinking.set", { sessionId: session.id, level: "high" })).rejects.toThrow(
+				"Another operation is running",
+			);
+			await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow(
+				"Another operation is running",
+			);
 			expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "low" } });
 		} finally {
 			release.resolve();
@@ -257,8 +331,12 @@ describe("desktop model and session reasoning controls", () => {
 		try {
 			expect(sdk.isStreaming).toBe(true);
 			expect(dto(session.id).status).toBe("running");
-			await expect(call("thinking.set", { sessionId: session.id, level: "high" })).rejects.toThrow("다른 작업");
-			await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow("다른 작업");
+			await expect(call("thinking.set", { sessionId: session.id, level: "high" })).rejects.toThrow(
+				"Another operation is running",
+			);
+			await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow(
+				"Another operation is running",
+			);
 			expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "low" } });
 		} finally {
 			sdk.agent.state.isStreaming = previousStreaming;
@@ -269,19 +347,42 @@ describe("desktop model and session reasoning controls", () => {
 		const { call, session, sessions, dto } = await launch();
 		const sdk = sessions[0]!;
 		await call("thinking.set", { sessionId: session.id, level: "max" });
-		await expect(call("model.set", { sessionId: session.id, modelId: selector(missingKey), thinkingLevel: "high" })).rejects.toThrow("등록된 제공자에서 사용할 수 없는 모델");
-		expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "max", scope: "session" } });
+		await expect(
+			call("model.set", { sessionId: session.id, modelId: selector(missingKey), thinkingLevel: "high" }),
+		).rejects.toThrow("This model is not available from a registered provider");
+		expect(dto(session.id)).toMatchObject({
+			model: selector(reasoning),
+			thinking: { level: "max", scope: "session" },
+		});
 		// Availability is genuine; credentials can still fail at the async SDK
 		// preflight after admission. That failure must preserve the live selection.
-		const credentialFailure = vi.spyOn(sdk.modelRegistry, "getApiKey").mockRejectedValueOnce(new Error("No API key at selection preflight"));
-		await expect(call("model.set", { sessionId: session.id, modelId: selector(reasoning), thinkingLevel: "high" })).rejects.toThrow("No API key at selection preflight");
+		const credentialFailure = vi
+			.spyOn(sdk.modelRegistry, "getApiKey")
+			.mockRejectedValueOnce(new Error("No API key at selection preflight"));
+		await expect(
+			call("model.set", { sessionId: session.id, modelId: selector(reasoning), thinkingLevel: "high" }),
+		).rejects.toThrow("No API key at selection preflight");
 		credentialFailure.mockRestore();
-		expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "max", scope: "session" } });
-		vi.spyOn(sdk.settings, "commitAtomicBatchWithCurrent").mockRejectedValue(new Error("fixture durable write refused"));
-		await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow("fixture durable write refused");
-		expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "max", scope: "session" } });
-		const control = vi.spyOn(sdk, "setThinkingLevelForControl").mockRejectedValue(new Error("fixture reasoning write refused"));
-		await expect(call("thinking.set", { sessionId: session.id, level: "low" })).rejects.toThrow("fixture reasoning write refused");
+		expect(dto(session.id)).toMatchObject({
+			model: selector(reasoning),
+			thinking: { level: "max", scope: "session" },
+		});
+		vi.spyOn(sdk.settings, "commitAtomicBatchWithCurrent").mockRejectedValue(
+			new Error("fixture durable write refused"),
+		);
+		await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow(
+			"fixture durable write refused",
+		);
+		expect(dto(session.id)).toMatchObject({
+			model: selector(reasoning),
+			thinking: { level: "max", scope: "session" },
+		});
+		const control = vi
+			.spyOn(sdk, "setThinkingLevelForControl")
+			.mockRejectedValue(new Error("fixture reasoning write refused"));
+		await expect(call("thinking.set", { sessionId: session.id, level: "low" })).rejects.toThrow(
+			"fixture reasoning write refused",
+		);
 		expect(control).toHaveBeenCalledWith(ThinkingLevel.Low, false);
 		expect(dto(session.id).thinking?.level).toBe("max");
 	});
@@ -295,15 +396,22 @@ describe("desktop model and session reasoning controls", () => {
 			kind: "not_promoted",
 			error: new Error("fixture promotion refused"),
 		});
-		await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow("Default model selection could not be completed after durable selection.");
-		expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "max", scope: "session" } });
+		await expect(call("model.set", { sessionId: session.id, modelId: selector(plain) })).rejects.toThrow(
+			"Default model selection could not be completed after durable selection.",
+		);
+		expect(dto(session.id)).toMatchObject({
+			model: selector(reasoning),
+			thinking: { level: "max", scope: "session" },
+		});
 		expect(sdk.settings.getGlobal("modelRoles")).toEqual(previousRoles);
 	});
 
 	test("session ownership rejects unknown IDs without selecting a model", async () => {
 		const { call, session, dto } = await launch();
 		for (const method of ["thinking.set", "model.set"] as const)
-			await expect(call(method, { sessionId: crypto.randomUUID(), level: "high", modelId: selector(plain) })).rejects.toThrow("Session not found");
+			await expect(
+				call(method, { sessionId: crypto.randomUUID(), level: "high", modelId: selector(plain) }),
+			).rejects.toThrow("Session not found");
 		expect(dto(session.id)).toMatchObject({ model: selector(reasoning), thinking: { level: "low" } });
 	});
 });

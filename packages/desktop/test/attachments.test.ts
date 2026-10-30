@@ -83,10 +83,12 @@ describe("browser selection and per-session draft ownership", () => {
 		const file = new File([Buffer.from(PNG, "base64")], "capture.png", { type: "image/png" });
 		const read = vi.spyOn(file, "arrayBuffer");
 		try {
-			await expect(readDesktopAttachmentFile(file, { supportsImageInput: false })).rejects.toThrow("지원하지");
+			await expect(readDesktopAttachmentFile(file, { supportsImageInput: false })).rejects.toThrow(
+				"does not support image input",
+			);
 			await expect(
 				readDesktopAttachmentFile(file, { supportsImageInput: true, imagesBlocked: true }),
-			).rejects.toThrow("차단");
+			).rejects.toThrow("blocked in the SDK settings");
 			expect(read).not.toHaveBeenCalled();
 		} finally {
 			read.mockRestore();
@@ -126,8 +128,8 @@ describe("browser selection and per-session draft ownership", () => {
 			status: "error",
 			error: "Invalid UTF-8",
 		};
-		expect(() => readyDesktopAttachments([reading])).toThrow("읽기");
-		expect(() => readyDesktopAttachments([failed])).toThrow("오류");
+		expect(() => readyDesktopAttachments([reading])).toThrow("finish reading");
+		expect(() => readyDesktopAttachments([failed])).toThrow("with an error");
 		expect(readyDesktopAttachments(settleDesktopAttachmentDraft([reading], ready))).toEqual([image]);
 		expect(settleDesktopAttachmentDraft([], ready)).toEqual([]);
 		const differentSession: DesktopAttachmentDraft = { ...reading, id: "different-session" };
@@ -156,14 +158,17 @@ describe("browser selection and per-session draft ownership", () => {
 		const next = settleDesktopAttachmentDraft([first, reading], result);
 		expect(next[1].status).toBe("error");
 		expect(next[1].attachment).toBeUndefined();
-		expect(() => readyDesktopAttachments(next)).toThrow("오류");
+		const rejected = next[1] as Extract<DesktopAttachmentDraft, { status: "error" }>;
+		expect(rejected.error).toContain("together exceed the 8 MiB request limit");
+		expect(rejected.error).not.toContain("AAAA");
+		expect(() => readyDesktopAttachments(next)).toThrow("Remove the attachment with an error and select it again.");
 	});
 
 	test("renders real filename/size/pending/error/removal controls and explicit image-disabled state", () => {
 		const drafts: DesktopAttachmentDraft[] = [
 			{ id: "ready", name: "capture.png", size: 69, status: "ready", attachment: image },
-			{ id: "pending", name: "읽는 중.ts", size: 2048, status: "reading" },
-			{ id: "error", name: "잘못된.bin", size: 2, status: "error", error: "Invalid UTF-8" },
+			{ id: "pending", name: "reading.ts", size: 2048, status: "reading" },
+			{ id: "error", name: "invalid.bin", size: 2, status: "error", error: "Invalid UTF-8" },
 		];
 		const html = renderToStaticMarkup(
 			createElement(AttachmentPicker, {
@@ -175,14 +180,14 @@ describe("browser selection and per-session draft ownership", () => {
 		);
 		expect(html).toContain('type="file"');
 		expect(html).toContain('aria-busy="true"');
-		expect(html).toContain("capture.png 첨부 제거");
+		expect(html).toContain("Remove capture.png");
 		expect(html).toContain("2.0 KiB");
 		expect(html).toContain("Invalid UTF-8");
-		expect(html).toContain("이미지 입력 미지원");
-		expect(html).toContain('aria-label="파일 첨부"');
-		expect(html).not.toContain('aria-label="이미지 붙여넣기 영역"');
+		expect(html).toContain("Selected model has no image input");
+		expect(html).toContain('aria-label="Attach file"');
+		expect(html).not.toContain('aria-label="Image paste area"');
 		expect(html).not.toContain('class="attachment-paste"');
-		expect(html).not.toContain("최대 16개 · 전체 요청 8 MiB");
+		expect(html).not.toContain("Up to 16 files · 8 MiB total request");
 		expect(html).not.toContain(PNG);
 	});
 });

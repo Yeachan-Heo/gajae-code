@@ -9,8 +9,8 @@ export const HISTORY_PAGE_BYTES = 2_000_000;
 export const IMAGE_PREVIEW_BYTES = 256_000;
 const MAX_BLOCKS = 128;
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-const unavailable = "이미지를 미리 볼 수 없습니다.";
-const tooLarge = "이미지가 너무 커서 미리 볼 수 없습니다.";
+const unavailable = "Image preview is unavailable.";
+const tooLarge = "Image is too large to preview.";
 const record = (value: unknown): Record<string, unknown> | undefined =>
 	value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8") + 1;
@@ -66,7 +66,7 @@ function project(
 		return {
 			id: messageId(index, message.timestamp),
 			role: "tool",
-			toolName: message.role === "bashExecution" ? "셸 직접 실행" : "Python 직접 실행",
+			toolName: message.role === "bashExecution" ? "Direct shell" : "Direct Python",
 			text,
 			excludeFromContext: message.excludeFromContext === true,
 			...(source.length + output.length + 1 > limit || message.truncated === true ? { truncated: true } : {}),
@@ -125,7 +125,7 @@ function project(
 			)
 				blocks.push({ type: "image-unavailable", reason: unavailable });
 			else if (redact(data) !== data) {
-				blocks.push({ type: "image-unavailable", reason: "보안상의 이유로 이미지를 미리 볼 수 없습니다." });
+				blocks.push({ type: "image-unavailable", reason: "Image preview is unavailable for security reasons." });
 			} else {
 				images.remaining -= data.length;
 				blocks.push({

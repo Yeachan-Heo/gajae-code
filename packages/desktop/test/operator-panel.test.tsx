@@ -7,13 +7,13 @@ import { OperatorPanel, type OperatorPanelProps } from "../src/OperatorPanel";
 
 function operation(overrides: Partial<DesktopOperatorOperation> = {}): DesktopOperatorOperation {
 	return {
-		operationId: "opaque:!/$ <&> ?=29\n끝",
+		operationId: "opaque:!/$ <&> ?=29\nend",
 		connectionGeneration: "connection-fixture",
 		sessionGeneration: 17,
 		kind: "bash",
 		excludeFromContext: false,
 		status: "running",
-		output: "실제 호스트 출력\n두 번째 줄",
+		output: "Actual host output\nsecond line",
 		outputTruncated: false,
 		liveOutput: "redacted",
 		...overrides,
@@ -22,7 +22,7 @@ function operation(overrides: Partial<DesktopOperatorOperation> = {}): DesktopOp
 
 function props(overrides: Partial<OperatorPanelProps> = {}): OperatorPanelProps {
 	return {
-		value: "!! printf '한국어'\n  printf 'next'\n",
+		value: "!! printf 'hello'\n  printf 'next'\n",
 		operation: null,
 		onChange: () => { throw new Error("Rendering must not change a draft"); },
 		onExecute: () => { throw new Error("Rendering must not execute"); },
@@ -101,24 +101,24 @@ function change(tree: ReactNode, value: string) {
 describe("desktop operator panel presentation", () => {
 	test("labels a multiline draft, explains all prefixes and never executes during SSR", () => {
 		const html = render();
-		expect(html).toMatch(/<label for="[^"]+">셸 명령 \/ Python 코드<\/label>/u);
+		expect(html).toMatch(/<label for="[^"]+">Shell command \/ Python code<\/label>/u);
 		expect(html).toMatch(/<textarea[^>]*aria-describedby="[^"]+"[^>]*rows="3"/u);
-		expect(html).toContain("!! printf &#x27;한국어&#x27;\n  printf &#x27;next&#x27;\n");
-		expect(html).toContain("<code>!</code> 셸");
-		expect(html).toContain("<code>!!</code> 셸 (모델 문맥에서 제외)");
+		expect(html).toContain("!! printf &#x27;hello&#x27;\n  printf &#x27;next&#x27;\n");
+		expect(html).toContain("<code>!</code> shell");
+		expect(html).toContain("<code>!!</code> shell (excluded from model context)");
 		expect(html).toContain("<code>$</code> Python");
-		expect(html).toContain("<code>$$</code> Python (모델 문맥에서 제외)");
-		expect(html).toContain("Enter는 줄바꿈이며, 실행 버튼으로만 제출합니다.");
-		expect(html).toContain("모델에게 보내는 메시지가 아닙니다.");
-		expect(html).toContain("아직 받은 실행 정보가 없습니다.");
-		expect(html).not.toContain("성공");
+		expect(html).toContain("<code>$$</code> Python (excluded from model context)");
+		expect(html).toContain("Enter inserts a line break; submit only with the run button.");
+		expect(html).toContain("This is not a message to the model.");
+		expect(html).toContain("No run information has been received yet.");
+		expect(html).not.toContain("succeeded");
 		expect(html).not.toContain("onkeydown");
-		expect(button(html, "실행")).toContain('type="submit"');
-		expect(button(html, "실행")).not.toContain('disabled=""');
+		expect(button(html, "Run")).toContain('type="submit"');
+		expect(button(html, "Run")).not.toContain('disabled=""');
 	});
 
 	test("preserves every exact operator string and only submits through the explicit form handler", () => {
-		for (const text of ["! echo a\n echo b\n", "!!  printf '!$'  ", "$ print('한국어')\n", "$$ x = 1\nprint(x)\n"]) {
+		for (const text of ["! echo a\n echo b\n", "!!  printf '!$'  ", "$ print('hello')\n", "$$ x = 1\nprint(x)\n"]) {
 			const changes: string[] = [];
 			const executions: string[] = [];
 			const tree = capture({ value: text, onChange: value => changes.push(value), onExecute: value => executions.push(value) });
@@ -137,18 +137,18 @@ describe("desktop operator panel presentation", () => {
 		const reads: string[] = [];
 		let folds = 0;
 		const tree = capture({ operation: value, onAbort: id => aborts.push(id), onRefresh: id => reads.push(id), onFold: () => { folds++; } });
-		click(tree, "취소 요청");
-		click(tree, "실행 상세 새로고침");
-		click(tree, "현재 포그라운드 도구 접기");
+		click(tree, "Request cancellation");
+		click(tree, "Refresh run details");
+		click(tree, "Fold the current foreground tool");
 		expect(aborts).toEqual([value.operationId]);
 		expect(reads).toEqual([value.operationId]);
 		expect(folds).toBe(1);
 		const html = render({ operation: value });
-		expect(html).toContain("opaque:!/$ &lt;&amp;&gt; ?=29\n끝");
+		expect(html).toContain("opaque:!/$ &lt;&amp;&gt; ?=29\nend");
 		expect(html).toContain("current foreground tool");
-		expect(html).toContain("직접 실행한 ! / !! 셸 명령을 접는 기능이 아닙니다.");
-		expect(button(html, "실행")).toContain('disabled=""');
-		for (const label of ["취소 요청", "실행 상세 새로고침", "현재 포그라운드 도구 접기"]) {
+		expect(html).toContain("It does not fold shell commands you ran directly with ! or !!.");
+		expect(button(html, "Run")).toContain('disabled=""');
+		for (const label of ["Request cancellation", "Refresh run details", "Fold the current foreground tool"]) {
 			expect(button(html, label)).not.toContain('disabled=""');
 			expect(button(html, label)).toContain('type="button"');
 		}
@@ -158,24 +158,24 @@ describe("desktop operator panel presentation", () => {
 		for (const state of [{ pending: true }, { disabled: true }]) {
 			const overrides = { operation: operation(), ...state };
 			const html = render(overrides);
-			for (const label of ["실행", "취소 요청", "실행 상세 새로고침", "현재 포그라운드 도구 접기"]) {
+			for (const label of ["Run", "Request cancellation", "Refresh run details", "Fold the current foreground tool"]) {
 				expect(button(html, label)).toContain('disabled=""');
 			}
 			expect(html).toMatch(/<textarea[^>]*disabled=""/u);
-			expect(html).toContain("실제 호스트 출력");
+			expect(html).toContain("Actual host output");
 			expect(html).toContain("!! printf");
 			const tree = capture(overrides);
 			expect(submit(tree)).toBe(true);
 			change(tree, "! must not change");
-			click(tree, "취소 요청");
-			click(tree, "실행 상세 새로고침");
-			click(tree, "현재 포그라운드 도구 접기");
+			click(tree, "Request cancellation");
+			click(tree, "Refresh run details");
+			click(tree, "Fold the current foreground tool");
 		}
 		expect(render({ pending: true })).toContain('aria-busy="true"');
-		expect(render({ pending: true })).toContain("실행 완료를 뜻하지 않습니다.");
-		expect(render({ disabled: true })).toContain("현재 연결 또는 세션에서는 제어할 수 없습니다.");
+		expect(render({ pending: true })).toContain("This does not mean the run finished.");
+		expect(render({ disabled: true })).toContain("Controls are unavailable on the current connection or session.");
 		for (const value of ["", " \n\t"]) {
-			expect(button(render({ value }), "실행")).toContain('disabled=""');
+			expect(button(render({ value }), "Run")).toContain('disabled=""');
 			expect(submit(capture({ value }))).toBe(true);
 		}
 	});
@@ -184,17 +184,17 @@ describe("desktop operator panel presentation", () => {
 		for (const value of [null, operation(), operation({ status: "completed", exitCode: 0 })]) {
 			const overrides = { busy: true, operation: value };
 			const html = render(overrides);
-			expect(button(html, "실행")).toContain('disabled=""');
-			expect(button(html, "현재 포그라운드 도구 접기")).not.toContain('disabled=""');
+			expect(button(html, "Run")).toContain('disabled=""');
+			expect(button(html, "Fold the current foreground tool")).not.toContain('disabled=""');
 			expect(html).not.toMatch(/<textarea[^>]*disabled=""/u);
 			expect(html).toContain('aria-busy="false"');
 			if (value?.status === "running") {
-				expect(button(html, "취소 요청")).not.toContain('disabled=""');
-				expect(html).not.toContain("다른 세션 작업이 실행 중이거나 응답을 기다리고 있어");
+				expect(button(html, "Request cancellation")).not.toContain('disabled=""');
+				expect(html).not.toContain("Another session is working or waiting for input");
 			} else {
-				expect(html).toContain("다른 세션 작업이 실행 중이거나 응답을 기다리고 있어 새 직접 실행을 시작할 수 없습니다.");
+				expect(html).toContain("Another session is working or waiting for input, so a new direct run cannot start. Tool folding and run detail reads are separate controls.");
 			}
-			if (value) expect(button(html, "실행 상세 새로고침")).not.toContain('disabled=""');
+			if (value) expect(button(html, "Refresh run details")).not.toContain('disabled=""');
 			const changes: string[] = [];
 			const aborts: string[] = [];
 			const reads: string[] = [];
@@ -202,10 +202,10 @@ describe("desktop operator panel presentation", () => {
 			const tree = capture({ ...overrides, onChange: text => changes.push(text), onAbort: id => aborts.push(id), onRefresh: id => reads.push(id), onFold: () => { folds++; } });
 			expect(submit(tree)).toBe(true);
 			change(tree, "$$ print('preserved')\n");
-			click(tree, "현재 포그라운드 도구 접기");
+			click(tree, "Fold the current foreground tool");
 			if (value) {
-				click(tree, "실행 상세 새로고침");
-				click(tree, "취소 요청");
+				click(tree, "Refresh run details");
+				click(tree, "Request cancellation");
 			}
 			expect(changes).toEqual(["$$ print('preserved')\n"]);
 			expect(folds).toBe(1);
@@ -214,7 +214,7 @@ describe("desktop operator panel presentation", () => {
 		}
 		for (const state of [{ pending: true }, { disabled: true }]) {
 			const html = render({ busy: true, operation: operation(), ...state });
-			for (const label of ["실행", "취소 요청", "실행 상세 새로고침", "현재 포그라운드 도구 접기"]) {
+			for (const label of ["Run", "Request cancellation", "Refresh run details", "Fold the current foreground tool"]) {
 				expect(button(html, label)).toContain('disabled=""');
 			}
 		}
@@ -226,99 +226,99 @@ describe("desktop operator panel presentation", () => {
 			const html = render({ operation: operation({ status }) });
 			expect(html).toContain(`data-status="${status}"`);
 			expect(html).toContain(`(${status})`);
-			expect(button(html, "취소 요청")).toContain('disabled=""');
-			expect(button(html, "실행 상세 새로고침")).not.toContain('disabled=""');
-			expect(button(html, "현재 포그라운드 도구 접기")).not.toContain('disabled=""');
-			click(capture({ operation: operation({ status }) }), "취소 요청");
+			expect(button(html, "Request cancellation")).toContain('disabled=""');
+			expect(button(html, "Refresh run details")).not.toContain('disabled=""');
+			expect(button(html, "Fold the current foreground tool")).not.toContain('disabled=""');
+			click(capture({ operation: operation({ status }) }), "Request cancellation");
 			if (status === "cancel_requested") {
-				expect(button(html, "실행")).toContain('disabled=""');
-				expect(html).toContain("취소 요청됨 · 실행 종료 미확인");
-				expect(html).not.toContain("취소됨");
+				expect(button(html, "Run")).toContain('disabled=""');
+				expect(html).toContain("Cancellation requested · Exit not confirmed");
+				expect(html).not.toContain("Cancelled");
 				expect(submit(capture({ operation: operation({ status }) }))).toBe(true);
 			} else {
-				expect(button(html, "실행")).not.toContain('disabled=""');
+				expect(button(html, "Run")).not.toContain('disabled=""');
 				const executions: string[] = [];
 				const reads: string[] = [];
 				const value = operation({ status });
 				const tree = capture({ operation: value, onExecute: text => executions.push(text), onRefresh: id => reads.push(id) });
 				expect(submit(tree)).toBe(true);
-				click(tree, "실행 상세 새로고침");
+				click(tree, "Refresh run details");
 				expect(executions).toEqual([props().value]);
 				expect(reads).toEqual([value.operationId]);
 			}
-			expect(html).not.toContain("자원 정리 완료");
+			expect(html).not.toContain("Resource cleanup complete");
 		}
 	});
 
 	test("preserves explicit cancellation despite its nonzero exit or termination signal", () => {
 		for (const result of [{ exitCode: 130 }, { signal: "SIGTERM" }, { exitCode: 137, signal: "SIGKILL" }]) {
 			const html = render({ operation: operation({ status: "cancelled", ...result }) });
-			expect(html).toContain("취소됨 (cancelled)");
+			expect(html).toContain("Cancelled (cancelled)");
 			expect(html).not.toContain('data-failed="true"');
-			expect(html).not.toContain(" · 실패");
-			expect(html).not.toContain("성공");
-			if (result.exitCode !== undefined) expect(html).toContain(`<dt>종료 코드</dt><dd>${result.exitCode}</dd>`);
-			if (result.signal !== undefined) expect(html).toContain(`<dt>종료 신호</dt><dd>${result.signal}</dd>`);
+			expect(html).not.toContain(" · Failed");
+			expect(html).not.toContain("succeeded");
+			if (result.exitCode !== undefined) expect(html).toContain(`<dt>Exit code</dt><dd>${result.exitCode}</dd>`);
+			if (result.signal !== undefined) expect(html).toContain(`<dt>Exit signal</dt><dd>${result.signal}</dd>`);
 		}
-		const error = render({ operation: operation({ status: "cancelled", exitCode: 130, error: { code: "redaction_failed", message: "출력 가림 처리 실패" } }) });
-		expect(error).toContain("취소됨 (cancelled)");
-		expect(error).toContain("redaction_failed: 출력 가림 처리 실패");
+		const error = render({ operation: operation({ status: "cancelled", exitCode: 130, error: { code: "redaction_failed", message: "Output redaction failed" } }) });
+		expect(error).toContain("Cancelled (cancelled)");
+		expect(error).toContain("redaction_failed: Output redaction failed");
 		expect(error).toContain('role="alert"');
 	});
 
 	test("never presents a completed nonzero exit, signal or operation error as success", () => {
 		const nonzero = render({ operation: operation({ status: "completed", exitCode: 7 }) });
-		expect(nonzero).toContain("실행 종료 (completed) · 실패");
-		expect(nonzero).toContain("<dt>종료 코드</dt><dd>7</dd>");
+		expect(nonzero).toContain("Run ended (completed) · Failed");
+		expect(nonzero).toContain("<dt>Exit code</dt><dd>7</dd>");
 		expect(nonzero).toContain('data-failed="true"');
 		const signal = render({ operation: operation({ status: "completed", signal: "SIGTERM" }) });
-		expect(signal).toContain("<dt>종료 신호</dt><dd>SIGTERM</dd>");
+		expect(signal).toContain("<dt>Exit signal</dt><dd>SIGTERM</dd>");
 		expect(signal).toContain('data-failed="true"');
-		const error = render({ operation: operation({ status: "failed", error: { code: "backend_failure", message: "실제 SDK 오류" } }), error: "상세 조회 실패" });
-		expect(error).toContain("backend_failure: 실제 SDK 오류");
-		expect(error).toContain("상세 조회 실패");
+		const error = render({ operation: operation({ status: "failed", error: { code: "backend_failure", message: "Actual SDK error" } }), error: "Detail read failed" });
+		expect(error).toContain("backend_failure: Actual SDK error");
+		expect(error).toContain("Detail read failed");
 		expect(error.match(/role="alert"/gu)).toHaveLength(2);
 		for (const html of [nonzero, signal, error, render({ operation: operation({ status: "completed", output: "", exitCode: 0 }) }), render({ operation: operation({ status: "completed", output: "" }) })]) {
-			expect(html).not.toContain("성공");
-			expect(html).not.toContain("실행 성공");
+			expect(html).not.toContain("succeeded");
+			expect(html).not.toContain("Run succeeded");
 		}
-		expect(render({ operation: operation({ status: "completed" }) })).toContain("<dt>종료 코드</dt><dd>제공되지 않음</dd>");
+		expect(render({ operation: operation({ status: "completed" }) })).toContain("<dt>Exit code</dt><dd>Not provided</dd>");
 	});
 
 	test("distinguishes withheld status-only updates from redacted output and allows actual final output", () => {
 		for (const status of ["running", "cancel_requested"] as const) {
 			const html = render({ operation: operation({ status, liveOutput: "withheld", output: "must remain withheld" }) });
-			expect(html).toContain("실시간 출력 보류 · 상태만 수신 중입니다.");
-			expect(html).toContain("현재 출력 내용은 표시하지 않습니다.");
+			expect(html).toContain("Live output withheld · Receiving status only.");
+			expect(html).toContain("No output content is shown right now.");
 			expect(html).not.toContain("must remain withheld");
 			expect(html).not.toContain("<pre");
 		}
-		const final = render({ operation: operation({ status: "completed", liveOutput: "withheld", output: "실제 종료 결과", exitCode: 0 }) });
-		expect(final).toContain("실시간 출력은 보류되었습니다. 제공된 종료 출력만 표시합니다.");
-		expect(final).toContain("실제 종료 결과</pre>");
+		const final = render({ operation: operation({ status: "completed", liveOutput: "withheld", output: "Actual final result", exitCode: 0 }) });
+		expect(final).toContain("Live output was withheld.");
+		expect(final).toContain("Actual final result</pre>");
 		const redacted = render({ operation: operation({ output: "token=[REDACTED]" }) });
-		expect(redacted).toContain("민감 정보 가림 처리된 출력");
+		expect(redacted).toContain("This output is redacted");
 		expect(redacted).toContain("token=[REDACTED]</pre>");
 		const empty = render({ operation: operation({ output: "" }) });
-		expect(empty).toContain("제공된 출력이 없습니다. 상태 정보는 출력이 아닙니다.");
+		expect(empty).toContain("No output was provided. Status information is not output.");
 		expect(empty).not.toContain("<pre");
 	});
 
 	test("renders bounded inert output, host truncation and actual context exclusion without HTML interpretation", () => {
 		const hostile = '<script>alert(1)</script><img src=x onerror="alert(2)">';
 		const html = render({ operation: operation({ kind: "python", excludeFromContext: true, output: hostile, outputTruncated: true }) });
-		expect(html).toContain("Python · 실행 중");
-		expect(html).toContain("모델 문맥에서 제외</p>");
+		expect(html).toContain("Python · Running");
+		expect(html).toContain("Excluded from model context</p>");
 		expect(html).toContain('class="bounded-output operator-output"');
 		expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;&lt;img");
 		expect(html).not.toContain("<script");
 		expect(html).not.toContain("<img");
-		expect(html).toContain("표시된 출력은 전체가 아닙니다.");
-		expect(render({ operation: operation() })).toContain("모델 문맥에 포함</p>");
+		expect(html).toContain("The shown output is not complete.");
+		expect(render({ operation: operation() })).toContain("Included in model context</p>");
 		const bounded = render({ operation: operation({ output: `omitted prefix${"x".repeat(20_000)}tail` }) });
 		expect(bounded).not.toContain("omitted prefix");
 		expect(bounded).not.toContain("x".repeat(16_385));
 		expect(bounded).toContain("tail</pre>");
-		expect(bounded).toContain("출력 한도로 일부 내용이 생략되었습니다.");
+		expect(bounded).toContain("Some content is omitted because of the output limit.");
 	});
 });
