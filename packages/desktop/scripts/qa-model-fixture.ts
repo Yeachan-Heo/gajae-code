@@ -33,7 +33,11 @@ export function fixtureLayout(root: string): FixtureLayout {
 }
 
 /** Construct from scratch: never inherit HOME, credentials, proxies, or SDK overrides. */
-export function fixtureEnvironment(layout: FixtureLayout, baseUrl: string, providerToken: string): Record<string, string> {
+export function fixtureEnvironment(
+	layout: FixtureLayout,
+	baseUrl: string,
+	providerToken: string,
+): Record<string, string> {
 	assertFixtureEndpoint(baseUrl);
 	return {
 		PATH: "/usr/bin:/bin",
@@ -65,10 +69,17 @@ export function fixtureEnvironment(layout: FixtureLayout, baseUrl: string, provi
 export function assertFixtureEndpoint(baseUrl: string): void {
 	const url = new URL(baseUrl);
 	if (
-		url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port ||
-		url.username || url.password || url.pathname !== "/v1" || url.search || url.hash ||
+		url.protocol !== "http:" ||
+		url.hostname !== "127.0.0.1" ||
+		!url.port ||
+		url.username ||
+		url.password ||
+		url.pathname !== "/v1" ||
+		url.search ||
+		url.hash ||
 		url.href !== baseUrl
-	) throw new Error("Only the owned loopback fixture endpoint is permitted");
+	)
+		throw new Error("Only the owned loopback fixture endpoint is permitted");
 }
 
 export function assertFixtureMode(environment: NodeJS.ProcessEnv): void {
@@ -78,56 +89,172 @@ export function assertFixtureMode(environment: NodeJS.ProcessEnv): void {
 
 export async function seedFixture(layout: FixtureLayout, baseUrl: string, providerToken: string): Promise<void> {
 	assertFixtureEndpoint(baseUrl);
-	for (const directory of [layout.agentDir, layout.project, ...["home", "config", "data", "state", "cache"].map(name => path.join(layout.dataDir, name))])
+	for (const directory of [
+		layout.agentDir,
+		layout.project,
+		...["home", "config", "data", "state", "cache"].map(name => path.join(layout.dataDir, name)),
+	])
 		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	const models = QA_MODEL_IDS.map(id => ({
 		id,
 		name: `TEST ONLY ${id}`,
 		reasoning: id !== "qa-plain",
-		...(id === "qa-plain" ? {} : { thinking: {
-			mode: "effort", minLevel: "low", maxLevel: id === "qa-discrete" ? "max" : "high",
-			defaultLevel: "low", ...(id === "qa-discrete" ? { levels: ["low", "high", "max"] } : {}),
-		} }),
+		...(id === "qa-plain"
+			? {}
+			: {
+					thinking: {
+						mode: "effort",
+						minLevel: "low",
+						maxLevel: id === "qa-discrete" ? "max" : "high",
+						defaultLevel: "low",
+						...(id === "qa-discrete" ? { levels: ["low", "high", "max"] } : {}),
+					},
+				}),
 		input: id === "qa-discrete" ? ["text", "image"] : ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 131072,
 		maxTokens: 1024,
 	}));
+	// This trusted user extension is owned by the fixture, not the project.
+	const extensionDir = path.join(layout.agentDir, "extensions");
+	await fs.mkdir(extensionDir, { recursive: true, mode: 0o700 });
+	await Bun.write(
+		path.join(extensionDir, "desktop-qa.ts"),
+		`
+import * as fs from "node:fs/promises";
+export default function(pi) {
+  let startupUi;
+  pi.on("session_start", async (_event, ctx) => {
+    startupUi = ctx.ui;
+    await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-starts.txt"))}, "start\\n");
+    if (await Bun.file(${JSON.stringify(path.join(layout.root, "extension-send"))}).exists()) {
+      await pi.sendUserMessage("TEST ONLY extension startup message");
+      await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-sent.txt"))}, "sent\\n");
+    }
+    if (await Bun.file(${JSON.stringify(path.join(layout.root, "extension-question"))}).exists()) {
+      const answer = await ctx.ui.input("TEST ONLY extension startup question");
+      await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-answers.txt"))}, String(answer) + "\\n");
+      ctx.ui.notify("TEST ONLY extension answered: " + String(answer), "info");
+    } else ctx.ui.notify("TEST ONLY extension started", "info");
+  });
+  pi.on("session_switch", async () => {
+    await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-switches.txt"))}, "switch\\n");
+  });
+  pi.on("input", async (event, ctx) => {
+    if (event.text !== "TEST ONLY generation probe") return;
+    startupUi.notify("TEST ONLY stale extension UI", "info");
+    const answer = await ctx.ui.input("TEST ONLY refreshed extension UI");
+    await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-generation-answers.txt"))}, String(answer) + "\\n");
+    throw new Error("TEST ONLY generation handler failure");
+  });
+}
+`,
+	);
+	// A project-local extension must never be imported by SDK discovery.
+	const projectExtensions = path.join(layout.project, ".gjc", "extensions");
+	await fs.mkdir(projectExtensions, { recursive: true, mode: 0o700 });
+	await Bun.write(
+		path.join(projectExtensions, "must-not-load.ts"),
+		`
+import * as fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(path.join(layout.root, "project-extension-loaded"))}, "unsafe");
+export default function() {}
+`,
+	);
 	// JSON is valid YAML. All paths and credentials here belong to this temporary fixture.
-	await Bun.write(path.join(layout.agentDir, "models.yml"), JSON.stringify({
-		providers: { [QA_PROVIDER]: {
-			api: "openai-completions", baseUrl, apiKey: QA_KEY,
-			headers: { "X-Desktop-QA-Fixture": providerToken },
-			compat: { supportsReasoningEffort: true, thinkingFormat: "openai", supportsStore: false },
-			models,
-		} },
-		profiles: Object.fromEntries(QA_MODEL_IDS.map(id => [id, {
-			display_name: `TEST ONLY ${id}`, required_providers: [QA_PROVIDER],
-			model_mapping: { default: `${QA_PROVIDER}/${id}${id === "qa-plain" ? "" : ":low"}` },
-		}])),
-	}));
-	await Bun.write(path.join(layout.agentDir, "config.yml"), JSON.stringify({
-		modelRoles: { default: `${QA_PROVIDER}/qa-reasoning:low` },
-		compaction: { enabled: false }, retry: { enabled: false },
-	}));
-	await Bun.write(path.join(layout.root, markerName), JSON.stringify({ version: 1, root: layout.root, baseUrl, providerToken }));
+	await Bun.write(
+		path.join(layout.agentDir, "models.yml"),
+		JSON.stringify({
+			providers: {
+				[QA_PROVIDER]: {
+					api: "openai-completions",
+					baseUrl,
+					apiKey: QA_KEY,
+					headers: { "X-Desktop-QA-Fixture": providerToken },
+					compat: { supportsReasoningEffort: true, thinkingFormat: "openai", supportsStore: false },
+					models,
+				},
+			},
+			profiles: Object.fromEntries(
+				QA_MODEL_IDS.map(id => [
+					id,
+					{
+						display_name: `TEST ONLY ${id}`,
+						required_providers: [QA_PROVIDER],
+						model_mapping: { default: `${QA_PROVIDER}/${id}${id === "qa-plain" ? "" : ":low"}` },
+					},
+				]),
+			),
+		}),
+	);
+	await Bun.write(
+		path.join(layout.agentDir, "config.yml"),
+		JSON.stringify({
+			modelRoles: { default: `${QA_PROVIDER}/qa-reasoning:low` },
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			lsp: { enabled: true },
+		}),
+	);
+	// Reuse the SDK's real protocol fixture, copied into this run's owned root.
+	const lspServer = path.join(layout.root, "owned-lsp-server.ts");
+	const lspSource = await fs.readFile(
+		path.resolve(import.meta.dir, "../../coding-agent/test/fixtures/session-move-service-server.ts"),
+		"utf8",
+	);
+	await Bun.write(
+		lspServer,
+		`import * as fixtureFs from "node:fs";\nfixtureFs.appendFileSync(${JSON.stringify(path.join(layout.root, "lsp-lifecycle.jsonl"))}, JSON.stringify({ event: "start", pid: process.pid }) + "\\n");\nprocess.on("exit", () => fixtureFs.appendFileSync(${JSON.stringify(path.join(layout.root, "lsp-lifecycle.jsonl"))}, JSON.stringify({ event: "exit", pid: process.pid }) + "\\n"));\n${lspSource}`,
+	);
+	const lspConfigDir = path.join(layout.dataDir, "home", ".gjc-desktop", "agent");
+	await fs.mkdir(lspConfigDir, { recursive: true, mode: 0o700 });
+	await Bun.write(
+		path.join(lspConfigDir, "lsp.json"),
+		JSON.stringify({
+			servers: {
+				desktop_fixture: {
+					command: process.execPath,
+					args: [lspServer, "lsp"],
+					fileTypes: [".move"],
+					rootMarkers: [".move-root"],
+					warmupTimeoutMs: 5000,
+				},
+			},
+		}),
+	);
+	await Bun.write(path.join(layout.project, ".move-root"), "owned fixture\n");
+	await Bun.write(path.join(layout.project, "probe.move"), "probe_symbol\n");
+	await Bun.write(path.join(layout.project, "definition.move"), "OWNED_DEFINITION_MARKER\n");
+	await Bun.write(
+		path.join(layout.root, markerName),
+		JSON.stringify({ version: 1, root: layout.root, baseUrl, providerToken }),
+	);
 }
 
 /** Refuse direct invocation with arbitrary roots/endpoints or inherited install state. */
-export async function validateFixtureEnvironment(environment: NodeJS.ProcessEnv): Promise<{ layout: FixtureLayout; baseUrl: string; providerToken: string }> {
+export async function validateFixtureEnvironment(
+	environment: NodeJS.ProcessEnv,
+): Promise<{ layout: FixtureLayout; baseUrl: string; providerToken: string }> {
 	assertFixtureMode(environment);
 	const root = environment.GJC_DESKTOP_QA_FIXTURE_ROOT;
 	const baseUrl = environment.GJC_DESKTOP_QA_FIXTURE_URL;
 	const providerToken = environment.GJC_DESKTOP_QA_FIXTURE_TOKEN;
-	if (!root || !baseUrl || !providerToken || !/^[a-f0-9-]{36}$/.test(providerToken)) throw new Error("Missing owned fixture configuration");
+	if (!root || !baseUrl || !providerToken || !/^[a-f0-9-]{36}$/.test(providerToken))
+		throw new Error("Missing owned fixture configuration");
 	assertFixtureEndpoint(baseUrl);
 	const canonical = await fs.realpath(root);
 	if (canonical !== root || !path.basename(root).startsWith("gjc-host-ui-qa-") || environment.TMPDIR !== root)
 		throw new Error("Fixture root must be a canonical QA-owned temporary directory");
 	const info = await fs.stat(root);
-	if ((info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())) throw new Error("Fixture root ownership is unsafe");
+	if ((info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid()))
+		throw new Error("Fixture root ownership is unsafe");
 	const marker = await Bun.file(path.join(root, markerName)).json();
-	if (marker.version !== 1 || marker.root !== root || marker.baseUrl !== baseUrl || marker.providerToken !== providerToken)
+	if (
+		marker.version !== 1 ||
+		marker.root !== root ||
+		marker.baseUrl !== baseUrl ||
+		marker.providerToken !== providerToken
+	)
 		throw new Error("Fixture ownership marker does not match");
 	const layout = fixtureLayout(root);
 	const expected = fixtureEnvironment(layout, baseUrl, providerToken);
@@ -137,23 +264,64 @@ export async function validateFixtureEnvironment(environment: NodeJS.ProcessEnv)
 	for (const key of Object.keys(environment)) {
 		if (!(key in expected)) throw new Error(`Unexpected fixture environment: ${key}`);
 	}
-	for (const directory of [layout.dataDir, layout.agentDir, layout.project, ...["home", "config", "data", "state", "cache"].map(name => path.join(layout.dataDir, name))]) {
-		if (await fs.realpath(directory) !== directory) throw new Error("Fixture roots cannot be symlinked");
+	for (const directory of [
+		layout.dataDir,
+		layout.agentDir,
+		layout.project,
+		...["home", "config", "data", "state", "cache"].map(name => path.join(layout.dataDir, name)),
+	]) {
+		if ((await fs.realpath(directory)) !== directory) throw new Error("Fixture roots cannot be symlinked");
 	}
 	return { layout, baseUrl, providerToken };
 }
 
 /** All SDK fetch traffic is fenced to one owned route; redirects cannot escape. */
-export function fixtureFetch(baseUrl: string, providerToken: string, transport: typeof fetch): typeof fetch {
+export function fixtureFetch(
+	baseUrl: string,
+	providerToken: string,
+	transport: typeof fetch,
+	mcpUrl?: string,
+): typeof fetch {
 	assertFixtureEndpoint(baseUrl);
+	if (mcpUrl) {
+		const url = new URL(mcpUrl);
+		if (
+			url.protocol !== "http:" ||
+			url.hostname !== "127.0.0.1" ||
+			!url.port ||
+			url.pathname !== "/mcp" ||
+			url.search ||
+			url.hash ||
+			url.username ||
+			url.password ||
+			url.href !== mcpUrl
+		)
+			throw new Error("Only the owned loopback MCP endpoint is permitted");
+	}
 	const guarded = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 		const request = input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
-		if (request.url !== `${baseUrl}/chat/completions` || request.method !== "POST" ||
-			request.headers.get("X-Desktop-QA-Fixture") !== providerToken || request.headers.get("Authorization") !== `Bearer ${QA_KEY}`)
+		if (
+			mcpUrl &&
+			request.url === mcpUrl &&
+			["GET", "POST", "DELETE"].includes(request.method) &&
+			!request.headers.has("Origin") &&
+			request.headers.get("Authorization") === `Bearer ${providerToken}`
+		)
+			return transport(request, { redirect: "error" });
+		if (
+			request.url !== `${baseUrl}/chat/completions` ||
+			request.method !== "POST" ||
+			request.headers.get("X-Desktop-QA-Fixture") !== providerToken ||
+			request.headers.get("Authorization") !== `Bearer ${QA_KEY}`
+		)
 			throw new Error("TEST ONLY fixture refused non-owned network request");
 		return transport(request, { redirect: "error" });
 	};
-	return Object.assign(guarded, { preconnect: () => { throw new Error("Fixture preconnect is forbidden"); } }) as typeof fetch;
+	return Object.assign(guarded, {
+		preconnect: () => {
+			throw new Error("Fixture preconnect is forbidden");
+		},
+	}) as typeof fetch;
 }
 
 export type FixtureGateKind = "approval" | "question" | "execution";
@@ -221,21 +389,41 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 	let writeError: unknown;
 	const encoder = new TextEncoder();
 	const snapshot = (): FixtureSnapshot => ({
-		version: 1, testOnly: true, provider: QA_PROVIDER, baseUrl,
-		models: QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`), holdNext,
+		version: 1,
+		testOnly: true,
+		provider: QA_PROVIDER,
+		baseUrl,
+		models: QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`),
+		holdNext,
 		requests: structuredClone(records),
 	});
 	const persist = () => {
 		const text = JSON.stringify(snapshot(), null, 2);
-		writes = writes.then(async () => { await Bun.write(artifactPath, text); }).catch(error => { writeError = error; });
+		writes = writes
+			.then(async () => {
+				await Bun.write(artifactPath, text);
+			})
+			.catch(error => {
+				writeError = error;
+			});
 	};
 	const server = Bun.serve<undefined>({
-		hostname: "127.0.0.1", port: 0, idleTimeout: 0, maxRequestBodySize: 4 * 1024 * 1024,
+		hostname: "127.0.0.1",
+		port: 0,
+		idleTimeout: 0,
+		maxRequestBodySize: 4 * 1024 * 1024,
 		async fetch(request) {
 			const url = new URL(request.url);
-			if (url.origin !== `http://127.0.0.1:${server.port}` || request.headers.get("host") !== `127.0.0.1:${server.port}` ||
-				url.pathname !== "/v1/chat/completions" || url.search || request.method !== "POST" || request.headers.has("Origin") ||
-				request.headers.get("Authorization") !== `Bearer ${QA_KEY}` || request.headers.get("X-Desktop-QA-Fixture") !== providerToken)
+			if (
+				url.origin !== `http://127.0.0.1:${server.port}` ||
+				request.headers.get("host") !== `127.0.0.1:${server.port}` ||
+				url.pathname !== "/v1/chat/completions" ||
+				url.search ||
+				request.method !== "POST" ||
+				request.headers.has("Origin") ||
+				request.headers.get("Authorization") !== `Bearer ${QA_KEY}` ||
+				request.headers.get("X-Desktop-QA-Fixture") !== providerToken
+			)
 				return new Response("Forbidden fixture request", { status: 403 });
 			if (records.length >= 64) return new Response("Fixture request limit", { status: 429 });
 			let body: Record<string, unknown>;
@@ -243,18 +431,30 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 				const value: unknown = await request.json();
 				if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid body");
 				body = value as Record<string, unknown>;
-				if (!QA_MODEL_IDS.some(id => id === body.model) || body.stream !== true || !Array.isArray(body.messages)) throw new Error("Invalid model or stream");
-			} catch { return new Response("Invalid fixture completion", { status: 400 }); }
+				if (!QA_MODEL_IDS.some(id => id === body.model) || body.stream !== true || !Array.isArray(body.messages))
+					throw new Error("Invalid model or stream");
+			} catch {
+				return new Response("Invalid fixture completion", { status: 400 });
+			}
 			if (records.length >= 64) return new Response("Fixture request limit", { status: 429 });
 			const record: FixtureRequestRecord = {
-				id: records.length + 1, method: "POST", path: "/v1/chat/completions", body,
-				state: "held", held: holdNext, released: false, chunks: [],
+				id: records.length + 1,
+				method: "POST",
+				path: "/v1/chat/completions",
+				body,
+				state: "held",
+				held: holdNext,
+				released: false,
+				chunks: [],
 			};
 			holdNext = false;
 			records.push(record);
 			let heartbeat: Timer | undefined;
 			let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
-			const onAbort = () => { abort(); streamController?.close(); };
+			const onAbort = () => {
+				abort();
+				streamController?.close();
+			};
 			const abort = () => {
 				if (record.state !== "held") return;
 				record.state = "aborted";
@@ -270,17 +470,29 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 						record.chunks.push(data);
 						controller.enqueue(encoder.encode(`data: ${data}\n\n`));
 					};
-					const chunk = (delta: Record<string, unknown>, finish: string | null = null) => JSON.stringify({
-						id: `qa-completion-${record.id}`, object: "chat.completion.chunk", created: 1700000000,
-						model: body.model, choices: [{ index: 0, delta, finish_reason: finish }],
-					});
+					const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
+						JSON.stringify({
+							id: `qa-completion-${record.id}`,
+							object: "chat.completion.chunk",
+							created: 1700000000,
+							model: body.model,
+							choices: [{ index: 0, delta, finish_reason: finish }],
+						});
 					const finish = () => {
 						if (record.state !== "held") return;
 						if (heartbeat) clearInterval(heartbeat);
 						send(chunk({ content: `Fixture turn ${record.id} complete.` }));
 						send(chunk({}, "stop"));
-						send(JSON.stringify({ id: `qa-completion-${record.id}`, object: "chat.completion.chunk", created: 1700000000,
-							model: body.model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } }));
+						send(
+							JSON.stringify({
+								id: `qa-completion-${record.id}`,
+								object: "chat.completion.chunk",
+								created: 1700000000,
+								model: body.model,
+								choices: [],
+								usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
+							}),
+						);
 						send("[DONE]");
 						record.state = "completed";
 						held.delete(record.id);
@@ -299,16 +511,25 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 						persist();
 					} else finish();
 				},
-				cancel() { abort(); },
+				cancel() {
+					abort();
+				},
 			});
-			return new Response(response, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store" } });
+			return new Response(response, {
+				headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store" },
+			});
 		},
 	});
 	const baseUrl = `http://127.0.0.1:${server.port}/v1`;
 	persist();
 	return {
-		baseUrl, providerToken, snapshot,
-		holdNext() { holdNext = true; persist(); },
+		baseUrl,
+		providerToken,
+		snapshot,
+		holdNext() {
+			holdNext = true;
+			persist();
+		},
 		release(id) {
 			const finish = held.get(id);
 			if (!finish) return false;
@@ -316,7 +537,10 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 			finish();
 			return true;
 		},
-		async flush() { await writes; if (writeError) throw writeError; },
+		async flush() {
+			await writes;
+			if (writeError) throw writeError;
+		},
 		async close() {
 			for (const finish of held.values()) finish();
 			await server.stop(true);

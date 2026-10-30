@@ -13,6 +13,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import * as stream from "node:stream";
 import { type DesktopMethod, MAX_FRAME_BYTES, parseRequest } from "../../desktop-host/src/protocol";
+import { childDiagnostics } from "./child-diagnostics";
 import {
 	assertFixtureMode,
 	fixtureEnvironment,
@@ -46,6 +47,7 @@ const allowed = new Set<DesktopMethod>([
 	"history.get",
 	"session.delete",
 	"queue.cancel",
+	"delivery.ack",
 	"abort",
 	"models.list",
 	"activity.get",
@@ -59,6 +61,7 @@ const allowed = new Set<DesktopMethod>([
 	"gate.answer",
 	"gate.withdraw",
 	"gate.retired",
+	"question.answer",
 	"operator.execute",
 	"operator.get",
 	"operator.abort",
@@ -93,6 +96,7 @@ const clients = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
 const encoder = new TextEncoder();
 let temporary: string | undefined;
 let host: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+let hostDiagnostics: { wait(timeoutMs: number): Promise<string> } | undefined;
 let fixture: ModelFixture | undefined;
 let gateControl: string | undefined;
 let server: Bun.Server<undefined> | undefined;
@@ -100,24 +104,38 @@ let timer: Timer | undefined;
 let heartbeat: Timer | undefined;
 let stopping = false;
 
-async function cleanup() {
+async function stopHost(child: Bun.Subprocess<"pipe", "pipe", "pipe">) {
+	if (child.exitCode !== null) return;
+	const force = setTimeout(() => child.kill("SIGKILL"), 3000);
+	try {
+		child.kill("SIGTERM");
+		await child.exited;
+	} finally {
+		clearTimeout(force);
+	}
+}
+
+async function cleanup(graceful = false) {
 	if (stopping) return;
 	stopping = true;
 	if (timer) clearTimeout(timer);
 	if (heartbeat) clearInterval(heartbeat);
 	for (const client of clients.values()) client.close();
 	clients.clear();
-	await server?.stop(true);
-	if (host && host.exitCode === null) {
-		const child = host;
-		const force = setTimeout(() => child.kill("SIGKILL"), 3000);
+	if (server && graceful) {
+		const timeout = Promise.withResolvers<boolean>();
+		const deadline = setTimeout(() => timeout.resolve(false), 1000);
 		try {
-			child.kill("SIGTERM");
-			await child.exited;
+			const stopped = await Promise.race([server.stop(false).then(() => true), timeout.promise]);
+			if (!stopped) await server.stop(true);
 		} finally {
-			clearTimeout(force);
+			clearTimeout(deadline);
 		}
+	} else {
+		await server?.stop(true);
 	}
+	if (host) await stopHost(host);
+	await hostDiagnostics?.wait(1000);
 	try {
 		await fixture?.close();
 	} finally {
@@ -361,25 +379,25 @@ try {
 	// Drain diagnostics before waiting for the backend control endpoint to start,
 	// keeping a tail so a child that dies before the control endpoint exists says
 	// why instead of leaving the wait to time out silently.
-	let childStderr = "";
-	void (async () => {
-		for await (const chunk of child.stderr) {
-			childStderr = (childStderr + new TextDecoder().decode(chunk)).slice(-4000);
-		}
-	})();
+	const diagnostics = childDiagnostics(child.stderr, fixture ? [token, fixture.providerToken] : []);
+	hostDiagnostics = diagnostics;
 	if (fixture) {
 		const layout = fixtureLayout(temporary);
 		const deadline = Date.now() + 30000;
 		while (!(await Bun.file(layout.gateControlPath).exists())) {
 			if (child.exitCode !== null || Date.now() >= deadline) {
+				const timedOut = child.exitCode === null;
+				if (timedOut) await stopHost(child);
+				const childStderr = await diagnostics.wait(1000);
 				throw new Error(
-					`Fixture gate control did not start${child.exitCode === null ? " within 30s" : ` (backend exited ${child.exitCode})`}${childStderr ? `: ${childStderr.trim()}` : ""}`,
+					`Fixture gate control did not start${timedOut ? " within 30s" : ` (backend exited ${child.exitCode})`}${childStderr ? `: ${childStderr.trim()}` : ""}`,
 				);
 			}
 			await Bun.sleep(25);
 		}
 		gateControl = await readFixtureGateControl(layout);
 	}
+	let requestedShutdown = false;
 	server = Bun.serve<undefined>({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -509,6 +527,7 @@ try {
 				if (envelope.method === "project.open" && envelope.params.path !== project)
 					return reply("Only the isolated QA project may be opened", 403);
 				child.stdin.write(`${JSON.stringify(envelope)}\n`);
+				if (envelope.method === "shutdown") requestedShutdown = true;
 				await child.stdin.flush();
 				return reply("null");
 			} catch {
@@ -516,26 +535,64 @@ try {
 			}
 		},
 	});
-	const lines = readline.createInterface({ input: stream.Readable.from(child.stdout), crlfDelay: Infinity });
-	void (async () => {
+	let handlingHostFailure = false;
+	async function handleHostFailure() {
+		if (stopping || handlingHostFailure) return;
+		handlingHostFailure = true;
 		try {
-			for await (const line of lines) {
-				if (Buffer.byteLength(line) > MAX_FRAME_BYTES) throw new Error("Host frame exceeds limit");
-				JSON.parse(line);
-				const bytes = encoder.encode(`data: ${line}\n\n`);
-				for (const [id, controller] of clients) {
-					if ((controller.desiredSize ?? 0) < -32) {
-						controller.close();
-						clients.delete(id);
-					} else controller.enqueue(bytes);
-				}
-			}
+			await stopHost(child);
+			const childStderr = fixture ? await diagnostics.wait(1000) : "";
+			console.error(`Host terminated unexpectedly${childStderr ? `: ${childStderr.trim()}` : ""}`);
+			process.exitCode = 1;
 		} finally {
 			await cleanup();
 		}
-	})().catch(() => {
-		process.exitCode = 1;
-	});
+	}
+	const lines = readline.createInterface({ input: stream.Readable.from(child.stdout), crlfDelay: Infinity });
+	const stdout = (async () => {
+		for await (const line of lines) {
+			if (Buffer.byteLength(line) > MAX_FRAME_BYTES) throw new Error("Host frame exceeds limit");
+			JSON.parse(line);
+			const bytes = encoder.encode(`data: ${line}\n\n`);
+			for (const [id, controller] of clients) {
+				if ((controller.desiredSize ?? 0) < -32) {
+					controller.close();
+					clients.delete(id);
+				} else controller.enqueue(bytes);
+			}
+		}
+	})();
+	void stdout.then(
+		() => {
+			if (!requestedShutdown) void handleHostFailure();
+		},
+		() => {
+			void handleHostFailure();
+		},
+	);
+	void child.exited
+		.then(async code => {
+			if (stopping) return;
+			if (!requestedShutdown || code !== 0) {
+				await handleHostFailure();
+				return;
+			}
+			const timeout = Promise.withResolvers<void>();
+			const deadline = setTimeout(() => timeout.resolve(), 1000);
+			try {
+				await Promise.race([stdout, timeout.promise]);
+			} catch {
+				await handleHostFailure();
+				return;
+			} finally {
+				clearTimeout(deadline);
+				lines.close();
+			}
+			await cleanup(true);
+		})
+		.catch(() => {
+			process.exitCode = 1;
+		});
 	heartbeat = setInterval(() => {
 		for (const controller of clients.values()) controller.enqueue(encoder.encode(": heartbeat\n\n"));
 	}, 15000);

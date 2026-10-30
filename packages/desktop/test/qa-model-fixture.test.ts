@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import * as stream from "node:stream";
 import type { DesktopBtwConversation } from "../../desktop-host/src/btw-protocol";
+import type { DesktopMcpOperationResult, DesktopMcpSnapshot } from "../../desktop-host/src/mcp-protocol";
 import type {
 	DesktopActivityUpdate,
 	DesktopFrame,
@@ -139,8 +140,402 @@ async function sdkHost() {
 	await call("bootstrap");
 	const project = await call<DesktopProject>("project.open", { path: owned.layout.project });
 	const session = await call<DesktopSession>("session.create", { projectId: project.id });
-	return { ...owned, child, send, call, frames, session };
+	return { ...owned, child, send, call, frames, session, diagnostics: () => stderr };
 }
+
+test("real discovered extension startup question does not block publication or prompt admission", async () => {
+	const { layout, fixture, call, send, frames, session } = await sdkHost();
+	await Bun.write(path.join(layout.root, "extension-question"), "enabled");
+	const created = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === created.id &&
+					frame.session.question?.title === "TEST ONLY extension startup question",
+			),
+		"extension startup question",
+	);
+	const question = frames
+		.flatMap(frame =>
+			frame.type === "session" && frame.session.id === created.id && frame.session.question
+				? [frame.session.question]
+				: [],
+		)
+		.at(-1);
+	if (!question) throw new Error("Startup question missing");
+	const before = fixture.snapshot().requests.length;
+	const prompt = send("prompt", { sessionId: created.id, text: "extension barrier turn" });
+	await Bun.sleep(100);
+	expect(fixture.snapshot().requests.length).toBe(before);
+	await call("question.answer", { sessionId: created.id, questionId: question.id, value: "owned answer" });
+	await waitFor(
+		() => fixture.snapshot().requests.length === before + 1 && fixture.snapshot().requests[before]?.held === true,
+		"held post-startup prompt",
+	);
+	expect(fixture.release(fixture.snapshot().requests[before]!.id)).toBe(true);
+	expect((await prompt).ok).toBe(true);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === created.id &&
+					frame.session.messages.some(message => message.text === "TEST ONLY extension answered: owned answer"),
+			),
+		"extension answer notice",
+	);
+	expect(await Bun.file(path.join(layout.root, "extension-answers.txt")).text()).toBe("owned answer\n");
+	expect((await Bun.file(path.join(layout.root, "extension-starts.txt")).text()).trim().split("\n")).toHaveLength(2);
+	expect(await Bun.file(path.join(layout.root, "project-extension-loaded")).exists()).toBe(false);
+}, 90000);
+
+test("session_start can await an extension-originated user message without self-deadlock", async () => {
+	const { layout, fixture, call, send, frames, session } = await sdkHost();
+	await Bun.write(path.join(layout.root, "extension-send"), "enabled");
+	await Bun.write(path.join(layout.root, "extension-question"), "enabled");
+	const created = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	await waitFor(
+		() => fixture.snapshot().requests.length === 1 && fixture.snapshot().requests[0]?.held === true,
+		"extension-originated held turn",
+	);
+	expect(JSON.stringify(fixture.snapshot().requests[0]!.body.messages)).toContain(
+		"TEST ONLY extension startup message",
+	);
+	const external = send("prompt", { sessionId: created.id, text: "external startup turn" });
+	await Bun.sleep(100);
+	expect(fixture.snapshot().requests).toHaveLength(1);
+	expect(fixture.release(fixture.snapshot().requests[0]!.id)).toBe(true);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === created.id &&
+					frame.session.question?.title === "TEST ONLY extension startup question",
+			),
+		"question after extension send",
+	);
+	const question = frames
+		.flatMap(frame =>
+			frame.type === "session" && frame.session.id === created.id && frame.session.question
+				? [frame.session.question]
+				: [],
+		)
+		.at(-1);
+	if (!question) throw new Error("Startup question missing");
+	expect(await Bun.file(path.join(layout.root, "extension-sent.txt")).text()).toBe("sent\n");
+	expect(fixture.snapshot().requests).toHaveLength(1);
+	await call("question.answer", { sessionId: created.id, questionId: question.id, value: "after send" });
+	expect((await external).ok).toBe(true);
+	await waitFor(() => fixture.snapshot().requests.length === 2, "external turn after startup");
+	expect(JSON.stringify(fixture.snapshot().requests[1]!.body.messages)).toContain("external startup turn");
+}, 90000);
+
+test("clear retains one extension runner, refreshes UI ownership and reports one hook error", async () => {
+	const { layout, fixture, call, send, frames, session } = await sdkHost();
+	const sessionId = session.id;
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === sessionId &&
+					frame.session.messages.some(message => message.text === "TEST ONLY extension started"),
+			),
+		"initial extension startup",
+	);
+	await call("command.run", { sessionId, text: "/clear" });
+	const successor = await call<DesktopSession>("session.select", { sessionId });
+	expect(successor.controlGeneration).not.toBe(session.controlGeneration);
+	const control = await readFixtureGateControl(layout);
+	const runner = await fetch(`${control}/runner`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", "X-Desktop-QA-Fixture": fixture.providerToken },
+		body: JSON.stringify({ sessionId }),
+	});
+	expect(await runner.json()).toEqual({ sameRunner: true });
+	expect(await Bun.file(path.join(layout.root, "extension-starts.txt")).text()).toBe("start\n");
+	// clearContext changes generation without switching the session identity.
+	expect(await Bun.file(path.join(layout.root, "extension-switches.txt")).exists()).toBe(false);
+	const prompt = send("prompt", { sessionId, text: "TEST ONLY generation probe" });
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === sessionId &&
+					frame.session.question?.title === "TEST ONLY refreshed extension UI",
+			),
+		"refreshed extension question",
+	);
+	const question = frames
+		.flatMap(frame =>
+			frame.type === "session" &&
+			frame.session.id === sessionId &&
+			frame.session.question?.title === "TEST ONLY refreshed extension UI"
+				? [frame.session.question]
+				: [],
+		)
+		.at(-1)!;
+	await call("question.answer", { sessionId, questionId: question.id, value: "new owner" });
+	await waitFor(() => fixture.snapshot().requests[0]?.held === true, "held generation probe turn");
+	expect(fixture.release(fixture.snapshot().requests[0]!.id)).toBe(true);
+	await prompt;
+	const current = await call<DesktopSession>("session.select", { sessionId });
+	expect(await Bun.file(path.join(layout.root, "extension-generation-answers.txt")).text()).toBe("new owner\n");
+	expect(
+		current.messages.filter(message => message.text.includes("TEST ONLY generation handler failure")),
+	).toHaveLength(1);
+	expect(current.messages.some(message => message.text === "TEST ONLY stale extension UI")).toBe(false);
+	expect(await Bun.file(path.join(layout.root, "extension-starts.txt")).text()).toBe("start\n");
+}, 90000);
+
+test("extension initialization failure refuses a first provider turn", async () => {
+	const { layout, fixture, call, send, frames, session } = await sdkHost();
+	await Bun.write(path.join(layout.root, "extension-init-failure"), "enabled");
+	const created = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === created.id &&
+					frame.session.messages.some(message =>
+						message.text.includes("TEST ONLY extension initialization failure"),
+					),
+			),
+		"extension initialization error",
+	);
+	const before = fixture.snapshot().requests.length;
+	const result = await send("prompt", { sessionId: created.id, text: "must not run" });
+	expect(result.ok).toBe(false);
+	expect(fixture.snapshot().requests.length).toBe(before);
+}, 90000);
+
+test("deleting a session cancels its pending extension question without stale notices", async () => {
+	const { layout, call, send, frames, session } = await sdkHost();
+	await Bun.write(path.join(layout.root, "extension-question"), "enabled");
+	const created = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	await waitFor(
+		() => frames.some(frame => frame.type === "session" && frame.session.id === created.id && frame.session.question),
+		"question before deletion",
+	);
+	const question = frames
+		.flatMap(frame =>
+			frame.type === "session" && frame.session.id === created.id && frame.session.question
+				? [frame.session.question]
+				: [],
+		)
+		.at(-1)!;
+	await call("session.delete", { sessionId: created.id });
+	expect((await send("question.answer", { sessionId: created.id, questionId: question.id, value: "late" })).ok).toBe(
+		false,
+	);
+	const answers = Bun.file(path.join(layout.root, "extension-answers.txt"));
+	const deadline = Date.now() + 10000;
+	while (!(await answers.exists())) {
+		if (Date.now() > deadline) throw new Error("Cancelled extension continuation did not settle");
+		await Bun.sleep(10);
+	}
+	expect(await answers.text()).toBe("undefined\n");
+	expect(
+		frames.some(
+			frame =>
+				frame.type === "session" &&
+				frame.session.id === created.id &&
+				frame.session.messages.some(message => message.text.includes("extension answered")),
+		),
+	).toBe(false);
+}, 90000);
+
+test("signal shutdown reports a close failure and still terminates the fixture host", async () => {
+	const { layout, child, diagnostics } = await sdkHost();
+	await Bun.write(path.join(layout.root, "signal-close-failure"), "enabled");
+	child.kill("SIGTERM");
+	expect(await child.exited).not.toBe(0);
+	await waitFor(
+		() => diagnostics().includes("QA fixture host signal shutdown failed"),
+		"signal close failure diagnostic",
+	);
+}, 90000);
+
+test("owned real MCP control lifecycle and LSP diagnostics cross the SDK", async () => {
+	const { layout, fixture, child, call, send, session } = await sdkHost();
+	await Bun.write(path.join(layout.root, "enable-services"), "enabled");
+	const created = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	const endpoint = await readFixtureGateControl(layout);
+	const services = (sessionId = created.id) =>
+		fetch(`${endpoint}/services`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "X-Desktop-QA-Fixture": fixture.providerToken },
+			body: JSON.stringify({ sessionId }),
+		});
+	const lifecycle = async (name: string): Promise<Array<{ event: string; pid?: number; sessionId?: string }>> => {
+		const file = Bun.file(path.join(layout.root, `${name}-lifecycle.jsonl`));
+		if (!(await file.exists())) return [];
+		return (await file.text())
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+	};
+	const waitLifecycle = async (
+		name: string,
+		predicate: (events: Array<{ event: string; pid?: number; sessionId?: string }>) => boolean,
+	) => {
+		const deadline = Date.now() + 15000;
+		for (;;) {
+			const events = await lifecycle(name);
+			if (predicate(events)) return events;
+			if (Date.now() >= deadline)
+				throw new Error(`Timed out waiting for ${name} lifecycle: ${JSON.stringify(events)}`);
+			await Bun.sleep(20);
+		}
+	};
+	expect(
+		(
+			await fetch(`${endpoint}/services`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ sessionId: created.id }),
+			})
+		).status,
+	).toBe(403);
+	const effect = await services();
+	expect(effect.status).toBe(200);
+	const result = (await effect.json()) as {
+		mcpResult: unknown;
+		lspResult: unknown;
+		mcpCalls: string[];
+		mcpUrl: string;
+	};
+	const mcpBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+	const invalidHeaders: Record<string, string>[] = [
+		{ "Content-Type": "application/json" },
+		{ "Content-Type": "application/json", Authorization: "Bearer wrong" },
+		{
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${fixture.providerToken}`,
+			Origin: "http://example.invalid",
+		},
+	];
+	for (const headers of invalidHeaders)
+		expect((await fetch(result.mcpUrl, { method: "POST", headers, body: mcpBody })).status).toBe(403);
+	expect(
+		(
+			await fetch(`${result.mcpUrl}?other=1`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${fixture.providerToken}` },
+				body: mcpBody,
+			})
+		).status,
+	).toBe(403);
+	expect(JSON.stringify(result.mcpResult)).toContain("owned MCP effect");
+	expect(JSON.stringify(result.lspResult)).toContain(`fixture workspace ${layout.project}`);
+	expect(result.mcpCalls).toContain("tools/call");
+	const initialMcpEvents = await waitLifecycle("mcp", events => events.some(event => event.event === "call"));
+	const initialMcpId = initialMcpEvents.findLast(event => event.event === "call")!.sessionId;
+	if (!initialMcpId) throw new Error("Initial MCP session ID missing");
+	const auth = { Authorization: `Bearer ${fixture.providerToken}`, "Mcp-Session-Id": crypto.randomUUID() };
+	expect((await fetch(result.mcpUrl, { method: "DELETE", headers: auth })).status).toBe(404);
+	const snapshot = await call<DesktopMcpSnapshot>("mcp.get", { sessionId: created.id });
+	expect(snapshot.available).toBe(true);
+	const server = snapshot.servers.find(entry => entry.state === "connected");
+	if (!server) throw new Error("Owned MCP server not connected");
+	const suspended = await call<DesktopMcpOperationResult>("mcp.operate", {
+		sessionId: created.id,
+		ref: server.ref,
+		action: "suspend",
+	});
+	expect(suspended.status).toBe("suspended");
+	const suspendedServer = suspended.snapshot.servers.find(entry => entry.state === "suspended");
+	if (!suspendedServer) throw new Error("Owned MCP server not suspended");
+	const resumed = await call<DesktopMcpOperationResult>("mcp.operate", {
+		sessionId: created.id,
+		ref: suspendedServer.ref,
+		action: "resume",
+	});
+	expect(resumed.status).toBe("resumed");
+	const afterResume = await services();
+	expect(afterResume.status).toBe(200);
+	expect(JSON.stringify(await afterResume.json())).toContain("owned MCP effect");
+	const waitProcessGone = async (pid: number | undefined) => {
+		if (!pid) throw new Error("Owned LSP PID missing");
+		const deadline = Date.now() + 15000;
+		for (;;) {
+			try {
+				process.kill(pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+				throw error;
+			}
+			if (Date.now() >= deadline) throw new Error(`Owned LSP process ${pid} did not exit`);
+			await Bun.sleep(20);
+		}
+	};
+	const lspBeforeDelete = await waitLifecycle("lsp", events => events.some(event => event.event === "start"));
+	const deletePid = lspBeforeDelete.findLast(event => event.event === "start")!.pid;
+	const mcpBeforeDelete = await waitLifecycle(
+		"mcp",
+		events =>
+			events.filter(event => event.event === "open").length >= 2 &&
+			events.some(event => event.event === "close" && event.sessionId === initialMcpId) &&
+			events.some(event => event.event === "terminate" && event.sessionId === initialMcpId),
+	);
+	const resumedMcpId = mcpBeforeDelete.findLast(event => event.event === "call")?.sessionId;
+	if (!resumedMcpId || resumedMcpId === initialMcpId)
+		throw new Error("Resumed MCP session identity missing or reused");
+	expect(mcpBeforeDelete.some(event => event.event === "open" && event.sessionId === resumedMcpId)).toBe(true);
+	// A predecessor's delayed close/termination cannot count for the resumed owner.
+	expect(mcpBeforeDelete.some(event => event.event === "close" && event.sessionId === initialMcpId)).toBe(true);
+	expect(mcpBeforeDelete.some(event => event.event === "terminate" && event.sessionId === initialMcpId)).toBe(true);
+	expect(
+		mcpBeforeDelete.some(
+			event => (event.event === "close" || event.event === "terminate") && event.sessionId === resumedMcpId,
+		),
+	).toBe(false);
+	await call("session.delete", { sessionId: created.id });
+	expect((await send("mcp.operate", { sessionId: created.id, ref: server.ref, action: "suspend" })).ok).toBe(false);
+	await waitLifecycle(
+		"mcp",
+		events =>
+			events.some(event => event.event === "close" && event.sessionId === resumedMcpId) &&
+			events.some(event => event.event === "terminate" && event.sessionId === resumedMcpId),
+	);
+	await waitProcessGone(deletePid);
+	const next = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	expect((await services(next.id)).status).toBe(200);
+	const lspBeforeShutdown = await waitLifecycle(
+		"lsp",
+		events => events.filter(event => event.event === "start").length >= 2,
+	);
+	const shutdownPid = lspBeforeShutdown.findLast(event => event.event === "start")!.pid;
+	expect(shutdownPid).not.toBe(deletePid);
+	const mcpBeforeShutdown = await waitLifecycle(
+		"mcp",
+		events => events.filter(event => event.event === "open").length >= 3,
+	);
+	const shutdownMcpId = mcpBeforeShutdown.findLast(event => event.event === "call")?.sessionId;
+	if (!shutdownMcpId || shutdownMcpId === resumedMcpId || shutdownMcpId === initialMcpId)
+		throw new Error("Shutdown MCP session identity missing or reused");
+	expect(mcpBeforeShutdown.some(event => event.event === "open" && event.sessionId === shutdownMcpId)).toBe(true);
+	expect(
+		mcpBeforeShutdown.some(
+			event => (event.event === "close" || event.event === "terminate") && event.sessionId === shutdownMcpId,
+		),
+	).toBe(false);
+	child.kill("SIGTERM");
+	expect(await child.exited).toBe(143);
+	await waitLifecycle(
+		"mcp",
+		events =>
+			events.some(event => event.event === "close" && event.sessionId === shutdownMcpId) &&
+			events.some(event => event.event === "terminate" && event.sessionId === shutdownMcpId),
+	);
+	await waitProcessGone(shutdownPid);
+}, 90000);
 
 describe("test-only desktop model fixture safety", () => {
 	test("requires explicit fixture opt-in and refuses LIVE before creating state", () => {
@@ -216,6 +611,20 @@ describe("test-only desktop model fixture safety", () => {
 		);
 		expect(calls).toBe(1);
 		expect(redirect).toBe("error");
+		const mcpUrl = "http://127.0.0.1:12345/mcp";
+		const mcpGuard = fixtureFetch(fixture.baseUrl, fixture.providerToken, transport, mcpUrl);
+		await expect(mcpGuard(mcpUrl, { method: "POST" })).rejects.toThrow("non-owned");
+		await expect(
+			mcpGuard(mcpUrl, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${fixture.providerToken}`, Origin: "http://example.invalid" },
+			}),
+		).rejects.toThrow("non-owned");
+		expect(
+			(await mcpGuard(mcpUrl, { method: "POST", headers: { Authorization: `Bearer ${fixture.providerToken}` } }))
+				.status,
+		).toBe(200);
+		expect(calls).toBe(2);
 	});
 });
 
