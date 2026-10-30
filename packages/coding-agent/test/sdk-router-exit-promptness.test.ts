@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { cancellableSleep } from "../src/sdk/broker/startup-budget";
+import { SessionRouter } from "../src/sdk/router";
 
 const ROUTER_SOURCE = readFileSync(join(import.meta.dir, "../src/sdk/router/session-router.ts"), "utf8");
 
@@ -74,15 +76,36 @@ describe("SessionRouter exit promptness", () => {
 		expect(cancellable.length).toBeGreaterThanOrEqual(4);
 	});
 
-	test("the reconcile interval is unref'd where it is armed", () => {
-		// A Router started without a matching stop() must not keep a host alive. The
-		// assertion is scoped to the reconcile interval because other timers in this
-		// file are unref'd too, so a bare source-wide search would still pass with
-		// this one missing.
-		const armed = ROUTER_SOURCE.indexOf("this.#deps.setInterval ?? setInterval");
-		expect(armed).toBeGreaterThan(-1);
-		const assignedStopTimer = ROUTER_SOURCE.indexOf("this.#stopTimer =", armed);
-		expect(assignedStopTimer).toBeGreaterThan(armed);
-		expect(ROUTER_SOURCE.slice(armed, assignedStopTimer)).toInclude("timer.unref?.()");
+	test("start unrefs its reconcile interval and stop clears the same handle", async () => {
+		const events: string[] = [];
+		const timer = { unref: () => events.push("unref") };
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => true,
+			indexSeq: 1,
+			listSessions: () => ({ indexSeq: 1, sessions: [], warnings: [] }),
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir: import.meta.dir,
+			deps: {
+				createIndex: () => index,
+				setInterval: (() => {
+					events.push("arm");
+					return timer;
+				}) as unknown as typeof setInterval,
+				clearInterval: (handle: unknown) => {
+					expect(handle).toBe(timer);
+					events.push("clear");
+				},
+			},
+		});
+		try {
+			await router.start();
+			expect(events).toEqual(["arm", "unref"]);
+		} finally {
+			await router.stop();
+		}
+		expect(events).toEqual(["arm", "unref", "clear"]);
 	});
 });

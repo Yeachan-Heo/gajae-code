@@ -92,7 +92,7 @@
           "type": "string"
         }
       },
-      "description": "Client settings for an explicit MCP OAuth authorization consumer. These fields do not define a public standalone or ACP slash-command flow: those sessions do not expose /mcp reauth, /mcp test, or /mcp reconnect, and no public MCP OAuth authorization or reauthorization entry path is provided. Refreshing an already-stored credential does not read these: it uses the separate `auth` binding's clientId/clientSecret."
+      "description": "Client settings for an explicit MCP OAuth authorization consumer. These fields do not define a public standalone or ACP slash-command authorization flow: those sessions do not expose /mcp reauth or /mcp test, and no public MCP OAuth authorization or reauthorization entry path is provided. The /mcp reconnect command of an interactive root session with session MCP controls reconnects a declared server and does not perform OAuth authorization. Refreshing an already-stored credential does not read these: it uses the separate `auth` binding's clientId/clientSecret."
     },
     "serverBase": {
       "type": "object",

@@ -64,8 +64,10 @@ const store = new ManagedSessionDescendantStore(
 );
 
 function publishReady(phase: WriterInput["phase"], markerPath: string, dev: bigint, ino: bigint): void {
-	const fd = fs.openSync(input.ready, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+	const tempReady = `${input.ready}.tmp`;
+	let fd: number | undefined;
 	try {
+		fd = fs.openSync(tempReady, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
 		fs.writeSync(
 			fd,
 			Buffer.from(
@@ -80,8 +82,22 @@ function publishReady(phase: WriterInput["phase"], markerPath: string, dev: bigi
 			),
 		);
 		fs.fsyncSync(fd);
-	} finally {
 		fs.closeSync(fd);
+		fd = undefined;
+		fs.renameSync(tempReady, input.ready);
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				/* ignore */
+			}
+		}
+		try {
+			fs.unlinkSync(tempReady);
+		} catch {
+			/* ignore */
+		}
 	}
 }
 
