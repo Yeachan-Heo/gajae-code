@@ -44,17 +44,6 @@ export function hasMacOSMallocEnv(env: Record<string, string | undefined>): bool
 }
 
 /**
- * `env(1)` unset operands for a pane command that must exec its process directly.
- *
- * A managed tmux pane process must stay the exact supervisor PID that managed close
- * pins. The in-process guard re-execs through a child, which would put the real
- * supervisor below the pane PID, so the launcher scrubs these variables instead.
- */
-export function macOSMallocEnvUnsetArgs(): string[] {
-	return MACOS_MALLOC_ENV_VARS.flatMap(name => ["-u", name]);
-}
-
-/**
  * True iff we must re-exec to escape a contaminated macOS startup snapshot:
  * darwin, not already inside the scrubbed re-exec, and at least one malloc var
  * present. Off darwin or on the re-exec'd child this is always false, so the

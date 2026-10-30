@@ -125,22 +125,16 @@ export async function writeNotificationDiagnostic(
 	});
 }
 
-export function sanitizeProviderDiagnostic(text: string, cfg: NotificationConfig, extraToken?: string): string {
-	const tokens = [cfg.botToken, cfg.discord.botToken, cfg.slack.botToken, cfg.slack.appToken, extraToken]
-		.filter((token): token is string => typeof token === "string" && token.trim().length > 0)
-		.map(token => token.trim());
-	const secrets = [...tokens, ...tokens.map(tokenFingerprint)].sort((a, b) => b.length - a.length);
+function sanitizeProviderDiagnostic(text: string, cfg: NotificationConfig, provider: NotificationProvider): string {
+	const secrets =
+		provider === "telegram"
+			? [cfg.botToken]
+			: provider === "discord"
+				? [cfg.discord.botToken]
+				: [cfg.slack.botToken, cfg.slack.appToken];
 	let detail = text;
-	for (const secret of secrets) detail = detail.split(secret).join("<redacted>");
-	return sanitizeDiagnostic(detail);
-}
-
-function diagnosticNotificationConfig(settings: Settings): NotificationConfig {
-	try {
-		return getNotificationConfig(settings);
-	} catch {
-		throw new Error("Notification configuration is unavailable.");
-	}
+	for (const secret of secrets) detail = sanitizeDiagnostic(detail, secret);
+	return detail;
 }
 
 /** Identity evidence required to remove precisely the endpoint that was inspected. */
@@ -772,11 +766,11 @@ async function probeTelegramReachability(
 		}
 		return {
 			ok: false,
-			detail: payload?.description ?? `Telegram getMe failed (HTTP ${response.status})`,
+			detail: sanitizeDiagnostic(payload?.description ?? `Telegram getMe failed (HTTP ${response.status})`, token),
 		};
 	} catch (error) {
 		if (signal?.aborted) return { ok: false, detail: "Telegram probe cancelled." };
-		return { ok: false, detail: error instanceof Error ? error.message : "network error" };
+		return { ok: false, detail: sanitizeDiagnostic(error instanceof Error ? error.message : "network error", token) };
 	}
 }
 
@@ -836,13 +830,14 @@ async function probeSelectedProvider(
 		} else {
 			result = { ok: false, detail: `${provider} configuration is unavailable.` };
 		}
-		return { ...result, detail: sanitizeProviderDiagnostic(result.detail, cfg) };
+		return { ...result, detail: sanitizeProviderDiagnostic(result.detail, cfg, provider) };
 	} catch (error) {
 		return {
 			ok: false,
 			detail: sanitizeProviderDiagnostic(
 				error instanceof Error ? error.message : `${provider} diagnostic failed.`,
 				cfg,
+				provider,
 			),
 		};
 	}
@@ -861,7 +856,7 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	const pidAlive = deps.pidAlive ?? defaultPidAlive;
 	const stateRoot = opts.stateRoot ?? defaultStateRoot();
 
-	const cfg: NotificationConfig = diagnosticNotificationConfig(opts.settings);
+	const cfg: NotificationConfig = getNotificationConfig(opts.settings);
 	const provider = selectNotificationProvider(cfg, opts.provider);
 	const resolution = provider ? resolveNotificationProvider(cfg, provider) : undefined;
 	const configured = resolution?.configured ?? hasAnyCompleteProvider(cfg);
@@ -1166,7 +1161,7 @@ async function selectedProviderRuntimeReady(
 /** Send a one-off test through exactly one durable, effective provider. */
 export async function sendNotificationTest(opts: TestOptions): Promise<NotificationTestResult> {
 	const deps = opts.deps ?? {};
-	const cfg = diagnosticNotificationConfig(opts.settings);
+	const cfg = getNotificationConfig(opts.settings);
 	const provider = selectNotificationProvider(cfg, opts.provider);
 	if (!provider) {
 		return {
@@ -1198,6 +1193,7 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 			detail: sanitizeProviderDiagnostic(
 				error instanceof Error ? error.message : `${provider} runtime readiness check failed.`,
 				cfg,
+				provider,
 			),
 		};
 	}
@@ -1232,11 +1228,11 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 				adapter: "telegram",
 				destination: cfg.chatId,
 				...(uncertain ? { uncertain: true } : {}),
-				detail: sanitizeProviderDiagnostic(
+				detail: sanitizeDiagnostic(
 					uncertain
 						? "Telegram may have accepted the message but returned no usable message receipt."
 						: (payload?.description ?? `Telegram sendMessage failed (HTTP ${response.status})`),
-					cfg,
+					cfg.botToken,
 				),
 			};
 		} catch (error) {
@@ -1247,7 +1243,7 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 				uncertain: true,
 				detail: opts.signal?.aborted
 					? "Telegram notification delivery is uncertain because cancellation raced with dispatch."
-					: sanitizeProviderDiagnostic(error instanceof Error ? error.message : "network error", cfg),
+					: sanitizeDiagnostic(error instanceof Error ? error.message : "network error", cfg.botToken),
 			};
 		}
 	}
@@ -1272,7 +1268,7 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 				ok: result.ok,
 				adapter: "discord",
 				destination: cfg.discord.parentChannelId,
-				detail: sanitizeProviderDiagnostic(result.detail, cfg),
+				detail: sanitizeProviderDiagnostic(result.detail, cfg, "discord"),
 				...(result.uncertain ? { uncertain: true } : {}),
 			};
 		} catch (error) {
@@ -1284,6 +1280,7 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 				detail: sanitizeProviderDiagnostic(
 					error instanceof Error ? error.message : "Discord notification delivery failed.",
 					cfg,
+					"discord",
 				),
 			};
 		}
@@ -1307,7 +1304,7 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 				ok: result.ok,
 				adapter: "slack",
 				destination: cfg.slack.channelId,
-				detail: sanitizeProviderDiagnostic(result.detail, cfg),
+				detail: sanitizeProviderDiagnostic(result.detail, cfg, "slack"),
 				...(result.uncertain ? { uncertain: true } : {}),
 			};
 		} catch (error) {
@@ -1319,6 +1316,7 @@ export async function sendNotificationTest(opts: TestOptions): Promise<Notificat
 				detail: sanitizeProviderDiagnostic(
 					error instanceof Error ? error.message : "Slack notification delivery failed.",
 					cfg,
+					"slack",
 				),
 			};
 		}

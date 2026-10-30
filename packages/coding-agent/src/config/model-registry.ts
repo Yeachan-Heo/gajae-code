@@ -98,7 +98,6 @@ import {
 } from "./model-preset-registry";
 import {
 	ModelProfileReplacementRequiredError,
-	readDurableModelProfileOwnership,
 	readDurableModelProfileOwnershipFromRaw,
 	UnresolvedModelProfileOwnershipError,
 } from "./model-profile-ownership";
@@ -4375,17 +4374,7 @@ export class ModelRegistry {
 					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
 				);
 			}
-			await this.#writeCheckedModelsConfig(checkedConfig.data, () => {
-				// A settings write can claim this profile while the batch is suspended on
-				// the filesystem. The claim wins: refuse before the deletion reaches disk,
-				// otherwise the durable owner would point at a profile that no longer exists.
-				const live = this.#settings;
-				if (!live) return;
-				const currentOwnership = readDurableModelProfileOwnership(live);
-				if (currentOwnership.marker.kind === "profile" && currentOwnership.marker.profile === normalizedName) {
-					throw new ModelProfileReplacementRequiredError(normalizedName);
-				}
-			});
+			await this.#writeCheckedModelsConfig(checkedConfig.data);
 			deletedProfile = profile;
 			return [];
 		});
@@ -4415,7 +4404,7 @@ export class ModelRegistry {
 		return { current, profile };
 	}
 
-	async #writeCheckedModelsConfig(config: ModelsConfig, beforeCommit?: () => void): Promise<void> {
+	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
 		const configPath = this.#modelsConfigFile.path();
 		const parentPath = path.dirname(configPath);
 		await fs.mkdir(parentPath, { recursive: true, mode: 0o700 });
@@ -4424,10 +4413,6 @@ export class ModelRegistry {
 		// still reach the same file. The final name stays lexical, so a symlink
 		// at models.yml is still opened with O_NOFOLLOW.
 		const parent = await fs.realpath(parentPath);
-		// Runs after every await in this write path so a caller can re-assert a
-		// precondition that another actor may have changed while the write was
-		// suspended, before any bytes reach the file.
-		beforeCommit?.();
 		writeExplicitOwnerOnlyTextSync(path.join(parent, path.basename(configPath)), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();

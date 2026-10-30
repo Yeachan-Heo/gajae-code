@@ -2,16 +2,14 @@ import { describe, expect, it } from "bun:test";
 import { reconcileSettingsSchema, SETTINGS_SCHEMA } from "../src/config/settings-schema";
 
 describe("retry budget settings schema", () => {
-	it("preserves independently configured request and stream retry budgets", () => {
-		for (const retry of [
-			{ requestMaxRetries: 0, streamMaxRetries: 7 },
-			{ requestMaxRetries: 3, streamMaxRetries: 0 },
-		]) {
-			const reconciled = reconcileSettingsSchema({ retry: { ...retry } });
+	it("registers provider request and stream retry knobs with bounded defaults", async () => {
+		const schema = await Bun.file(new URL("../src/config/settings-schema.ts", import.meta.url)).text();
 
-			expect(reconciled.settings).toEqual({ retry });
-			expect(reconciled.report).toEqual({ issues: [], valid: true });
-		}
+		expect(schema).toContain('"retry.requestMaxRetries"');
+		expect(schema).toContain('"retry.streamMaxRetries"');
+		expect(schema).toContain("requestMaxRetries: number;");
+		expect(schema).toContain("streamMaxRetries: number;");
+		expect(schema).toContain("default: 5");
 	});
 
 	it("defines a finite nonnegative first-event timeout with a bounded default", () => {

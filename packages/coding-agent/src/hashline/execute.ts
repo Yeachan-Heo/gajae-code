@@ -8,7 +8,7 @@ import type { EditToolDetails } from "../edit/renderer";
 import { wrapUntrustedContent } from "../session/messages";
 import { truncateLine } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
-import { assertEditableFileContent, assertEditableFileName } from "../tools/auto-generated-guard";
+import { assertEditableFileContent } from "../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
@@ -332,7 +332,6 @@ export async function executeHashlineSingle(
 	const sections = mergeSamePathSections(
 		splitHashlineInputs(options.input, { cwd: options.session.cwd, path: options.path }),
 	);
-	assertHashlineSectionNamesEditable(options, sections);
 
 	// Fast path: a single section needs no preflight pass.
 	if (sections.length === 1) {
@@ -370,17 +369,6 @@ export async function executeHashlineSingle(
 			}),
 		},
 	};
-}
-
-/** Apply the filename patterns to every section before the first write. Lexical basename only. */
-function assertHashlineSectionNamesEditable(
-	options: ExecuteHashlineSingleOptions,
-	sections: HashlineInputSection[],
-): void {
-	for (const section of sections) {
-		const absolutePath = resolvePlanPath(options.session, section.path);
-		assertEditableFileName(absolutePath, section.path, options.session.settings);
-	}
 }
 
 /**

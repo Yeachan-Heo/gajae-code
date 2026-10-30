@@ -33,9 +33,8 @@ There is no current `packages/natives/src` TypeScript wrapper layer. Consumers i
 Current capability groups in the generated API include:
 
 - **Search/text/code primitives**: `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `astGrep`, `astEdit`, text width/slicing/wrapping/sanitization, syntax highlighting.
-- **Execution/process/terminal primitives**: `executeShell`, `Shell`, `PtySession`, `TtyWriter`, `reassertRawTty`, process-tree helpers, key parsing.
+- **Execution/process/terminal primitives**: `executeShell`, `Shell`, `PtySession`, `TtyWriter`, process-tree helpers, key parsing.
 The TUI lazily loads `TtyWriter` on the first Unix terminal write and routes terminal escape output through its FIFO queue; Windows continues to write through stdout.
-On Unix, the TUI calls `reassertRawTty` before each OSC 11 background-color query whenever the runtime already reports stdin as raw. It re-applies raw termios with `TCSANOW` only when a foreground child left the tty cooked, so the tty never enters an echoing mode. The startup Kitty keyboard query (`CSI ? u`) and the Mode 2031 subscription are written without this guard.
 - **System/media/conversion primitives**: clipboard, image resize/encode/SIXEL, HTML-to-Markdown, macOS appearance/power helpers, work profiling, Windows ProjFS overlay helpers.
 
 ## Loader layer

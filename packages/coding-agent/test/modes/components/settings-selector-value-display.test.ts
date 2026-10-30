@@ -37,7 +37,6 @@ function expectNoPayload(text: string): void {
 function selector(cwd: string, changed: Array<{ path: string; value: unknown }>): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
-			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw", "blue-crab"],

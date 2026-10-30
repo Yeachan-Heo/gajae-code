@@ -1024,7 +1024,7 @@ mod platform {
 	/// `KERN_PROC_PID` reports the same identity fields for every process
 	/// visible to the caller.
 	#[derive(Clone, Copy)]
-	pub(super) struct ProcInfo {
+	struct ProcInfo {
 		pid:          i32,
 		ppid:         i32,
 		pgid:         i32,

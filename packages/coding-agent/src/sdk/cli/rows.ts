@@ -8,8 +8,6 @@
  * rendering.
  */
 
-import { sessionOwnershipV1 } from "../broker/session-scope";
-
 export const SESSION_ROWS_VERSION = 2;
 
 export type SdkSessionActivityState = "active" | "idle";
@@ -41,10 +39,6 @@ export interface SdkSessionRowV1 {
 	identityProvenance?: "composite" | "legacy";
 	/** True when the same sessionId maps to more than one stateRoot (cross-repo duplicate). */
 	ambiguous?: boolean;
-	/** Present when the session's index row records a master role. */
-	role?: "master";
-	/** Broker-recorded spawning master; `self` is set when the viewing master is known. */
-	spawnedBy?: { masterSessionId: string; self?: boolean };
 }
 
 export interface SdkRingPositionV1 {
@@ -229,9 +223,6 @@ export function toSessionRowV1(value: unknown): SdkSessionRowV1 {
 	if (value.identityProvenance === "composite" || value.identityProvenance === "legacy")
 		row.identityProvenance = value.identityProvenance;
 	if (value.ambiguous === true) row.ambiguous = true;
-	const ownership = sessionOwnershipV1(value);
-	if (ownership.role !== undefined) row.role = ownership.role;
-	if (ownership.spawnedBy !== undefined) row.spawnedBy = ownership.spawnedBy;
 	return row;
 }
 

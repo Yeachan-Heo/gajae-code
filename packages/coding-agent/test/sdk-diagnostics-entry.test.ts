@@ -3,7 +3,6 @@ import { constants as fsConstants, statSync as fsStatSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { prepareManagedDirectoryRoot } from "../src/session/internal/managed-session-storage";
 
 /**
  * Public-entry inertness contract for `gjc sdk diagnostics` (DESIGN §B1).
@@ -799,15 +798,6 @@ describe("sdk diagnostics public entry (B1)", () => {
 		// owner state root -- a write that a read-only observation must never attempt.
 		const ownerStateDir = path.join(workspace, `owner-state-${Math.random().toString(36).slice(2)}`);
 		await fs.mkdir(ownerStateDir, { recursive: true, mode: 0o700 });
-		// Create and prepare the lifecycle root with proper owner-only security.
-		const lifecycleRoot = path.join(ownerStateDir, "g1-session", "owner-lifecycle");
-		await fs.mkdir(lifecycleRoot, { recursive: true, mode: 0o700 });
-		try {
-			prepareManagedDirectoryRoot(lifecycleRoot);
-		} catch (e) {
-			// prepareManagedDirectoryRoot may fail in test environment; ensure directory exists with proper mode
-			await fs.chmod(lifecycleRoot, 0o700);
-		}
 		const ownerEnv = {
 			GJC_TMUX_OWNER_STATE_DIR: ownerStateDir,
 			GJC_COORDINATOR_SESSION_ID: "g1-session",
@@ -822,21 +812,10 @@ describe("sdk diagnostics public entry (B1)", () => {
 		// result proves nothing -- the earlier stale-addon receipt recorded
 		// fsMutations=[] only because the addon import failed first, which is NOT
 		// evidence that the admission write was avoided.
-		// After PR #7399, durableHandoff uses the native addon (not Node.js fs functions),
-		// so we check for native activation and verify the handoff file was actually created.
 		const baseline = await runEntry(["sdk", "diagnostics", "--help"], { mode: "ordinary", env: ownerEnv });
-		// The ordinary path should activate the native addon when attempting the durable handoff write.
-		expect(baseline.trap.nativeActivations).toBeGreaterThan(0);
-		// Verify the handoff file was actually created in the lifecycle root (use a fresh check).
-		const handoffFiles = (await fs.readdir(lifecycleRoot)).filter(f => f.startsWith("admission-handoff-"));
-		expect(handoffFiles.length).toBeGreaterThan(0);
-		// Clean up the handoff file and empty directories so the later assertion passes.
-		for (const file of handoffFiles) {
-			await fs.unlink(path.join(lifecycleRoot, file));
-		}
-		// Remove the empty lifecycle root and session directories
-		await fs.rm(lifecycleRoot, { recursive: true, force: true });
-		await fs.rm(path.join(ownerStateDir, "g1-session"), { recursive: true, force: true });
+		const attemptedOwnerWrites = baseline.trap.fsMutations.filter(entry => entry.includes(ownerStateDir));
+		expect(attemptedOwnerWrites.length).toBeGreaterThan(0);
+		expect(baseline.trap.fsMutations.join("\n")).toContain("mkdir");
 
 		// Fixed path: the actual bin entry and the exported runCli render help with no
 		// mutation anywhere, and the owner state root stays empty.

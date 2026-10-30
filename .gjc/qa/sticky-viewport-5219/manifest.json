@@ -1,0 +1,709 @@
+{
+  "schema_version": 2,
+  "fixture_revision": "sticky-viewport-showcase-v2",
+  "command": "bun packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts --out .gjc/qa/sticky-viewport-<run>",
+  "capture_timestamp": "1970-01-01T00:00:00.000Z",
+  "expected_entry_count": 20,
+  "entry_count": 20,
+  "ordered_keys": [
+    "live-overflow/80x24/unicode-color",
+    "live-overflow/120x36/unicode-color",
+    "manual-history/80x24/unicode-color",
+    "manual-history/120x36/unicode-color",
+    "manual-new-output/80x24/unicode-color",
+    "manual-new-output/120x36/unicode-color",
+    "multiline-editor-hooks-pet/80x24/unicode-color",
+    "multiline-editor-hooks-pet/120x36/unicode-color",
+    "capacity-many/80x24/unicode-color",
+    "capacity-many/120x36/unicode-color",
+    "capacity-one/80x24/unicode-color",
+    "capacity-one/120x36/unicode-color",
+    "capacity-zero/80x24/unicode-color",
+    "capacity-zero/120x36/unicode-color",
+    "selection-boundary/80x24/unicode-color",
+    "selection-boundary/120x36/unicode-color",
+    "manual-new-output/80x24/ascii-no-color",
+    "capacity-zero/48x10/ascii-no-color",
+    "multiline-editor-hooks-pet/48x10/unicode-color",
+    "narrow-cjk/48x10/unicode-color"
+  ],
+  "provenance": {
+    "capture_mode": "production-tui-virtual-terminal",
+    "live_pty": false,
+    "network": false,
+    "fixed_clock": true,
+    "author_identity": "capture-sticky-viewport-showcase",
+    "executor_identity": "capture-sticky-viewport-showcase",
+    "git_head": "37ce0360d9755f79567b968e22a420bfd6c90d9b",
+    "oracle_commit": "37ce0360d9755f79567b968e22a420bfd6c90d9b",
+    "git_diff_scope": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "bun.lock",
+      "crates",
+      "packages/agent/src",
+      "packages/ai/src",
+      "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+      "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+      "packages/coding-agent/src",
+      "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+      "packages/natives/native",
+      "packages/stats/src",
+      "packages/tui/src",
+      "packages/tui/test/virtual-terminal.ts",
+      "packages/utils/src"
+    ],
+    "git_diff_binary_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_sha256": {
+      "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts": "f93ad57595e69c72f82ce04a69825db373b4c44b8018f7da0a5c960d904ad2ed",
+      "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts": "6f1c4ebb53b8e15cafd4da8bc69d6fdad79466e18b45c08a734f1f3f6138d25a",
+      "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts": "5b75a1a87ed78b2dbb8a4cb05b6b41067b753624ee78b62bb7baa3cd3deb62a3",
+      "packages/coding-agent/src/modes/interactive-mode.ts": "dc9cae46ccac36f49eef61e2bd4e2fd142a40059df877d98565905123aa82eae",
+      "packages/coding-agent/src/modes/components/irc-sidebar.ts": "538b06bece50815e85194bdb024bff9014181004a971a2ddf0fa4040779e699d",
+      "packages/tui/src/tui.ts": "398cd35524bbf86ed47c5af5ee711e6870f3091879c91738b4d1bcae8f5acb53"
+    }
+  },
+  "review_input_file": "review-input.json",
+  "entries": [
+    {
+      "key": "live-overflow/80x24/unicode-color",
+      "state_id": "live-overflow",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "live-overflow/80x24/unicode-color/terminal.txt",
+          "sha256": "3842ca184f099f4693fc9906422d6826ab8d581ba59132e572cd7dcdcc7ff3ae",
+          "byte_length": 2383
+        },
+        {
+          "path": "live-overflow/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "0a15a7ea5c763145a3cf1872e495d0509eb86c75d879b0293b1299f7363ef617",
+          "byte_length": 3397
+        },
+        {
+          "path": "live-overflow/80x24/unicode-color/terminal.html",
+          "sha256": "dfda6d9736138eaf14004ab64f8d9f8ff4e26b04d8ded38a094d7ea913558d01",
+          "byte_length": 5475
+        },
+        {
+          "path": "live-overflow/80x24/unicode-color/metadata.json",
+          "sha256": "99e20a867ba7730641be143e3f603234e50be78eb4fd74e7b31f12a6390509ca",
+          "byte_length": 84233
+        }
+      ]
+    },
+    {
+      "key": "live-overflow/120x36/unicode-color",
+      "state_id": "live-overflow",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "live-overflow/120x36/unicode-color/terminal.txt",
+          "sha256": "4a0155a0fe58f156ceff006906103204da94ffcd4dfab03341e78eb646dbc069",
+          "byte_length": 5059
+        },
+        {
+          "path": "live-overflow/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "e088ddb8794195a5cb5531440d8b17f71f85037eb47cb3124f27e3d388b05b5c",
+          "byte_length": 6499
+        },
+        {
+          "path": "live-overflow/120x36/unicode-color/terminal.html",
+          "sha256": "ef19073c20da6a4200bc7242193dc384e9ccd7a062050821ca7470786648898e",
+          "byte_length": 9285
+        },
+        {
+          "path": "live-overflow/120x36/unicode-color/metadata.json",
+          "sha256": "894b5990e5d6985b5b7ab94cc20a20dae3f42fc2dc16f9a6eeb345752a7f33d8",
+          "byte_length": 84236
+        }
+      ]
+    },
+    {
+      "key": "manual-history/80x24/unicode-color",
+      "state_id": "manual-history",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "manual-history/80x24/unicode-color/terminal.txt",
+          "sha256": "ffc3d960e0e2884778aebbf1f337a5166b13824266bdb772bcc5a06fa495a801",
+          "byte_length": 2387
+        },
+        {
+          "path": "manual-history/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "45b9eecfab9541fcd4afb40c61d095d8871c7e89e916dbd800474a74d0b19735",
+          "byte_length": 3493
+        },
+        {
+          "path": "manual-history/80x24/unicode-color/terminal.html",
+          "sha256": "b2f59adf97d76d4209d61164dfe7e27ba2907ba889fece8287676535ba6b6eca",
+          "byte_length": 5740
+        },
+        {
+          "path": "manual-history/80x24/unicode-color/metadata.json",
+          "sha256": "baeb27ddb881a786a4b88ebd1f024434b0fe11a297bd0fd63ee6aa5af26bf8a5",
+          "byte_length": 84245
+        }
+      ]
+    },
+    {
+      "key": "manual-history/120x36/unicode-color",
+      "state_id": "manual-history",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "manual-history/120x36/unicode-color/terminal.txt",
+          "sha256": "c56dd520ba17e097b74be75ecf035ae840a7e17bc32369b7dc7e68557cd0e320",
+          "byte_length": 5063
+        },
+        {
+          "path": "manual-history/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "c6b9ca1b7992ba13c2223171fb70b8bf1e8b3ac4075b8ee99b148e1993108255",
+          "byte_length": 6595
+        },
+        {
+          "path": "manual-history/120x36/unicode-color/terminal.html",
+          "sha256": "d8ded5512776f67c06f4ec4b738ec967dac2cfa00599c9de0f08b07056ec0316",
+          "byte_length": 9550
+        },
+        {
+          "path": "manual-history/120x36/unicode-color/metadata.json",
+          "sha256": "e6ae7d161e779247687cf0803b9ab94eb7dd63d9236b004dfd3dd9a96725e66f",
+          "byte_length": 84236
+        }
+      ]
+    },
+    {
+      "key": "manual-new-output/80x24/unicode-color",
+      "state_id": "manual-new-output",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "manual-new-output/80x24/unicode-color/terminal.txt",
+          "sha256": "7f4ba77d435fa9a565af7e2b4139ca3f3f96281bb270f487cf1c7130b6759bc2",
+          "byte_length": 2387
+        },
+        {
+          "path": "manual-new-output/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "a68d961875abdfdfd8832c880808dcd7b9a247a3e42855f2233b30873f49aff1",
+          "byte_length": 3420
+        },
+        {
+          "path": "manual-new-output/80x24/unicode-color/terminal.html",
+          "sha256": "d322a74852e46e38a42bfd2c6798978c249ab96c268a59f8921692f72d51ef62",
+          "byte_length": 5520
+        },
+        {
+          "path": "manual-new-output/80x24/unicode-color/metadata.json",
+          "sha256": "61b8456662eebb0220340871f6cebb34c948f202b1eeb5665ebf2cb84f79b829",
+          "byte_length": 84247
+        }
+      ]
+    },
+    {
+      "key": "manual-new-output/120x36/unicode-color",
+      "state_id": "manual-new-output",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "manual-new-output/120x36/unicode-color/terminal.txt",
+          "sha256": "7a991015ee9cf5b3ca3e61098dad74ebb73937ad3fed03cd3c9899dc872abfd4",
+          "byte_length": 5063
+        },
+        {
+          "path": "manual-new-output/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "359d5f5a1856fd07599182eab402f074b382a86434a0bd90f8cc27c612b6faf0",
+          "byte_length": 6522
+        },
+        {
+          "path": "manual-new-output/120x36/unicode-color/terminal.html",
+          "sha256": "ca6833b35d1d39b810526d7864c3a984718b33ba00d9fdfa73fe96f92f3ef989",
+          "byte_length": 9330
+        },
+        {
+          "path": "manual-new-output/120x36/unicode-color/metadata.json",
+          "sha256": "fbf16b3f80ab26f489f459d13a4fa9181cca40293a98cfd4b5bde66a065e7991",
+          "byte_length": 84238
+        }
+      ]
+    },
+    {
+      "key": "multiline-editor-hooks-pet/80x24/unicode-color",
+      "state_id": "multiline-editor-hooks-pet",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "multiline-editor-hooks-pet/80x24/unicode-color/terminal.txt",
+          "sha256": "31dca1a342ac71668275578c6fd9130a3cf877329ec5831383534b303dd62a67",
+          "byte_length": 2389
+        },
+        {
+          "path": "multiline-editor-hooks-pet/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "97e1aa1f4bb181e4fbc88a3f6f773f1f5533d563cbb1de3eba701c2e2ee48c78",
+          "byte_length": 3460
+        },
+        {
+          "path": "multiline-editor-hooks-pet/80x24/unicode-color/terminal.html",
+          "sha256": "8796a44fe2a54d8f5ca879cefb95b686f21dbe88350778353544f835b9e8eec2",
+          "byte_length": 5604
+        },
+        {
+          "path": "multiline-editor-hooks-pet/80x24/unicode-color/metadata.json",
+          "sha256": "b992f6f0b2e8ce452d46fce9888c5482000951ffb66bf1b0854cdc88ed91cdf0",
+          "byte_length": 84327
+        }
+      ]
+    },
+    {
+      "key": "multiline-editor-hooks-pet/120x36/unicode-color",
+      "state_id": "multiline-editor-hooks-pet",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "multiline-editor-hooks-pet/120x36/unicode-color/terminal.txt",
+          "sha256": "808d4c6570baa89f7794cbf4a851cf3a4ab8ba66b6e801bcfb40bef3240eb85d",
+          "byte_length": 5065
+        },
+        {
+          "path": "multiline-editor-hooks-pet/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "1c40070e3836535954a9a4ba4d482b8f43c0b2aa483e0edb992bf4c2db5ada00",
+          "byte_length": 6562
+        },
+        {
+          "path": "multiline-editor-hooks-pet/120x36/unicode-color/terminal.html",
+          "sha256": "8464d3bf6cceb01abd2ac2882450c03ad56758bdf9b67f1f4c6178f1d51e4eaf",
+          "byte_length": 9414
+        },
+        {
+          "path": "multiline-editor-hooks-pet/120x36/unicode-color/metadata.json",
+          "sha256": "751cf3662e70ddfb818feee2d0c4156579e83d6b035d3143f3a1b0a5250f0c8a",
+          "byte_length": 84330
+        }
+      ]
+    },
+    {
+      "key": "capacity-many/80x24/unicode-color",
+      "state_id": "capacity-many",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "capacity-many/80x24/unicode-color/terminal.txt",
+          "sha256": "aca409aca28d0ca73f709f7bcd27c45b4a806cf675e2d5004c5d9d20afebc0b4",
+          "byte_length": 2387
+        },
+        {
+          "path": "capacity-many/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "deb18b9ff2cdd325be919948556d299dada043e501905c6fd9524c5aaba8e3ae",
+          "byte_length": 3493
+        },
+        {
+          "path": "capacity-many/80x24/unicode-color/terminal.html",
+          "sha256": "04600aca624a1fce27122d0a43d8fc02fc714db85753718074ebf481c6bec1c0",
+          "byte_length": 5740
+        },
+        {
+          "path": "capacity-many/80x24/unicode-color/metadata.json",
+          "sha256": "c6847c78ee33159257fb64f500cf94ce022e238737f34b9b3511da97e59fd188",
+          "byte_length": 84244
+        }
+      ]
+    },
+    {
+      "key": "capacity-many/120x36/unicode-color",
+      "state_id": "capacity-many",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "capacity-many/120x36/unicode-color/terminal.txt",
+          "sha256": "2fdda6be14cd09998152adcb3ccf78649f8f3ec70ddf5459891e86be85facfd2",
+          "byte_length": 5063
+        },
+        {
+          "path": "capacity-many/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "cce56f95b45191d3a2bb8c64f7153fa599eca8ef29c731b84c19c80e8b65f66e",
+          "byte_length": 6595
+        },
+        {
+          "path": "capacity-many/120x36/unicode-color/terminal.html",
+          "sha256": "809bc4958d514ad39b1ee4230bc3c463c85b163e87ac5940193dd4b2b064a5f9",
+          "byte_length": 9550
+        },
+        {
+          "path": "capacity-many/120x36/unicode-color/metadata.json",
+          "sha256": "f9262bcdfca18576299a21a2dea55513f4702687a80693fa22c1b0c2d0044917",
+          "byte_length": 84235
+        }
+      ]
+    },
+    {
+      "key": "capacity-one/80x24/unicode-color",
+      "state_id": "capacity-one",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "capacity-one/80x24/unicode-color/terminal.txt",
+          "sha256": "e1a60324216cd566ae501a072c0aa78bf5b9d025bf445b2449b97ccaae7bb287",
+          "byte_length": 2351
+        },
+        {
+          "path": "capacity-one/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "ceece4de50877d982e4d1c45bd403678483874073d7a67659e5bd00c3762f38f",
+          "byte_length": 2668
+        },
+        {
+          "path": "capacity-one/80x24/unicode-color/terminal.html",
+          "sha256": "957f1e6b70182d654928535660aa66a3535286bbe63af7c3237715efc1049cd3",
+          "byte_length": 3510
+        },
+        {
+          "path": "capacity-one/80x24/unicode-color/metadata.json",
+          "sha256": "d24e3002fd442c05807e7f0bc33bbe25c160c215f03d0fbccdba234276e4882f",
+          "byte_length": 73470
+        }
+      ]
+    },
+    {
+      "key": "capacity-one/120x36/unicode-color",
+      "state_id": "capacity-one",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "capacity-one/120x36/unicode-color/terminal.txt",
+          "sha256": "54be306624731c9ab0fcf6bcb026dc0db3eb2c2920a63fbcdfaa905d5418e1fb",
+          "byte_length": 5003
+        },
+        {
+          "path": "capacity-one/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "ceef31dfa5437f8e10130676566e3435fd24e5dfa72ef8717e7ea4686fcb5b78",
+          "byte_length": 5335
+        },
+        {
+          "path": "capacity-one/120x36/unicode-color/terminal.html",
+          "sha256": "7e10cd108881a6a32807859b1daf9ac5b9627bb385c579be7b841184fe763dba",
+          "byte_length": 6214
+        },
+        {
+          "path": "capacity-one/120x36/unicode-color/metadata.json",
+          "sha256": "862e6eb0807352f3a7de8afbd2841f15691cba5fd11bd4fe65eaf3770ca899ee",
+          "byte_length": 69203
+        }
+      ]
+    },
+    {
+      "key": "capacity-zero/80x24/unicode-color",
+      "state_id": "capacity-zero",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "capacity-zero/80x24/unicode-color/terminal.txt",
+          "sha256": "42d69208bfa8bfd6d772f77cf86137a2b8bc857f6ed112dd3c5a9a4392789c37",
+          "byte_length": 2349
+        },
+        {
+          "path": "capacity-zero/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "af19dd2e99d675f1aef2c62ba81306d9e9a289de9f20bf595858955c15f53d67",
+          "byte_length": 2608
+        },
+        {
+          "path": "capacity-zero/80x24/unicode-color/terminal.html",
+          "sha256": "20faf8db62f33496fbc1aa7dae676bcd97b74de32b14a647962de02d580ff433",
+          "byte_length": 3340
+        },
+        {
+          "path": "capacity-zero/80x24/unicode-color/metadata.json",
+          "sha256": "c795286a29d0c16500bfe8b7cf28c1d9ed9686266153f2c28f2745305514c238",
+          "byte_length": 72643
+        }
+      ]
+    },
+    {
+      "key": "capacity-zero/120x36/unicode-color",
+      "state_id": "capacity-zero",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "capacity-zero/120x36/unicode-color/terminal.txt",
+          "sha256": "9ea1cbee164c07147400d16a772ef7afb76de71abeea81a662e8043f1a7e73ce",
+          "byte_length": 5001
+        },
+        {
+          "path": "capacity-zero/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "5c11b00729d88256ef4bf9d4ab4cb07d59b744a275b0b9a1c15478ec189ff667",
+          "byte_length": 5260
+        },
+        {
+          "path": "capacity-zero/120x36/unicode-color/terminal.html",
+          "sha256": "b4bc4c899cfc7c157c94a7543924f84fe013cf215a3c55646e9c0b90e530ce96",
+          "byte_length": 5992
+        },
+        {
+          "path": "capacity-zero/120x36/unicode-color/metadata.json",
+          "sha256": "59090386c47764bdbf30f6adedc39b02eac3cb7073fd41bcad66bae781b48163",
+          "byte_length": 68523
+        }
+      ]
+    },
+    {
+      "key": "selection-boundary/80x24/unicode-color",
+      "state_id": "selection-boundary",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "selection-boundary/80x24/unicode-color/terminal.txt",
+          "sha256": "4502f6153f69903ee1e92a518c89d493f2672fafb9155eca337032283ed84740",
+          "byte_length": 2387
+        },
+        {
+          "path": "selection-boundary/80x24/unicode-color/terminal-ansi.txt",
+          "sha256": "a9b3303c75125206e32e0c4f54a3329ee69c72c3094860fbdd6549f57c6480b6",
+          "byte_length": 3518
+        },
+        {
+          "path": "selection-boundary/80x24/unicode-color/terminal.html",
+          "sha256": "6820409750721cddf1de1f42729dbf031a0343b2f7d977b19c4535cefebba935",
+          "byte_length": 5845
+        },
+        {
+          "path": "selection-boundary/80x24/unicode-color/metadata.json",
+          "sha256": "bfa2eec2139732fabffec79455f4fc6f05710d29fe60058f9fcf036c5baa0baf",
+          "byte_length": 84374
+        }
+      ]
+    },
+    {
+      "key": "selection-boundary/120x36/unicode-color",
+      "state_id": "selection-boundary",
+      "viewport": {
+        "id": "120x36",
+        "columns": 120,
+        "rows": 36
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "selection-boundary/120x36/unicode-color/terminal.txt",
+          "sha256": "cf6ef1f23ac726d9259488109800449b2f426a1a759288aa27ab0503a2458d43",
+          "byte_length": 5063
+        },
+        {
+          "path": "selection-boundary/120x36/unicode-color/terminal-ansi.txt",
+          "sha256": "620f9c96637b4b836eff58ac217f77bb40f9855c89d91b1bcb5a0c0bde69e187",
+          "byte_length": 6651
+        },
+        {
+          "path": "selection-boundary/120x36/unicode-color/terminal.html",
+          "sha256": "d4af8598efea005f90a9730d4669abfba51bda9a29ffce8a02222ea42d688ac8",
+          "byte_length": 9736
+        },
+        {
+          "path": "selection-boundary/120x36/unicode-color/metadata.json",
+          "sha256": "9f8533c15775711c87ea495a164544438dcb7d5a0b6719ae5caaeb988d1ef835",
+          "byte_length": 84365
+        }
+      ]
+    },
+    {
+      "key": "manual-new-output/80x24/ascii-no-color",
+      "state_id": "manual-new-output",
+      "viewport": {
+        "id": "80x24",
+        "columns": 80,
+        "rows": 24
+      },
+      "render_mode": "ascii-no-color",
+      "files": [
+        {
+          "path": "manual-new-output/80x24/ascii-no-color/terminal.txt",
+          "sha256": "7f4ba77d435fa9a565af7e2b4139ca3f3f96281bb270f487cf1c7130b6759bc2",
+          "byte_length": 2387
+        },
+        {
+          "path": "manual-new-output/80x24/ascii-no-color/terminal-ansi.txt",
+          "sha256": "7f4ba77d435fa9a565af7e2b4139ca3f3f96281bb270f487cf1c7130b6759bc2",
+          "byte_length": 2387
+        },
+        {
+          "path": "manual-new-output/80x24/ascii-no-color/terminal.html",
+          "sha256": "e5fc715e4a33fb56b87df69d31c30f1f457687f64164d9efca01afe6fce1e3b7",
+          "byte_length": 2658
+        },
+        {
+          "path": "manual-new-output/80x24/ascii-no-color/metadata.json",
+          "sha256": "91291ed41431508879b589d4680d061545da5e9af5c38248c4e5393f57a95e44",
+          "byte_length": 69915
+        }
+      ]
+    },
+    {
+      "key": "capacity-zero/48x10/ascii-no-color",
+      "state_id": "capacity-zero",
+      "viewport": {
+        "id": "48x10",
+        "columns": 48,
+        "rows": 10
+      },
+      "render_mode": "ascii-no-color",
+      "files": [
+        {
+          "path": "capacity-zero/48x10/ascii-no-color/terminal.txt",
+          "sha256": "6529580c2eabbce471c5645812a62db6f8475a7d677c1fd92ec4ee4588e21dae",
+          "byte_length": 703
+        },
+        {
+          "path": "capacity-zero/48x10/ascii-no-color/terminal-ansi.txt",
+          "sha256": "6529580c2eabbce471c5645812a62db6f8475a7d677c1fd92ec4ee4588e21dae",
+          "byte_length": 703
+        },
+        {
+          "path": "capacity-zero/48x10/ascii-no-color/terminal.html",
+          "sha256": "d458b4d1f5f2a7c89bd193589cac5b4c37048307f1cd9075dda095671a8ebcba",
+          "byte_length": 974
+        },
+        {
+          "path": "capacity-zero/48x10/ascii-no-color/metadata.json",
+          "sha256": "de61693923f016fbb6db35438052a929b9ce9ee50029feda01df46f010d826b8",
+          "byte_length": 69088
+        }
+      ]
+    },
+    {
+      "key": "multiline-editor-hooks-pet/48x10/unicode-color",
+      "state_id": "multiline-editor-hooks-pet",
+      "viewport": {
+        "id": "48x10",
+        "columns": 48,
+        "rows": 10
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "multiline-editor-hooks-pet/48x10/unicode-color/terminal.txt",
+          "sha256": "952b1517f0054102b9f30e0ca9a58fddd98fc435916c1f5076c42a39d91773eb",
+          "byte_length": 707
+        },
+        {
+          "path": "multiline-editor-hooks-pet/48x10/unicode-color/terminal-ansi.txt",
+          "sha256": "774517c0b89887596cba13d7e9821c5e7b6191b2803e0ef1c9c360ca95e6f8d7",
+          "byte_length": 1102
+        },
+        {
+          "path": "multiline-editor-hooks-pet/48x10/unicode-color/terminal.html",
+          "sha256": "6862dfcd7ed8052cd19eb4ce611661e9a65be8c88664e809b32b6ca0e301a9ce",
+          "byte_length": 2069
+        },
+        {
+          "path": "multiline-editor-hooks-pet/48x10/unicode-color/metadata.json",
+          "sha256": "d2cdd64b11760cc6385578c9f8624528a8c02cbce30b043c160786ad784aa311",
+          "byte_length": 84336
+        }
+      ]
+    },
+    {
+      "key": "narrow-cjk/48x10/unicode-color",
+      "state_id": "narrow-cjk",
+      "viewport": {
+        "id": "48x10",
+        "columns": 48,
+        "rows": 10
+      },
+      "render_mode": "unicode-color",
+      "files": [
+        {
+          "path": "narrow-cjk/48x10/unicode-color/terminal.txt",
+          "sha256": "18a2b8131a3304b889d4718082a9ef23ee7db7c81af11064b1410cbf9a7d29cb",
+          "byte_length": 712
+        },
+        {
+          "path": "narrow-cjk/48x10/unicode-color/terminal-ansi.txt",
+          "sha256": "722f6c45b0d388d969764172f2e8a7b615ea2bcbeaf414811e334c8a9dc55044",
+          "byte_length": 1088
+        },
+        {
+          "path": "narrow-cjk/48x10/unicode-color/terminal.html",
+          "sha256": "278b098b96199a1bf6abfb14ecc5e6a49388c3883bd88ea11c8c2e1878cef20f",
+          "byte_length": 2044
+        },
+        {
+          "path": "narrow-cjk/48x10/unicode-color/metadata.json",
+          "sha256": "1ce0d21f622e501ca1e894e820f1a1dcf9cc6e5e1240f4c4cf70e74d251e405f",
+          "byte_length": 84074
+        }
+      ]
+    }
+  ]
+}

@@ -941,29 +941,25 @@ describe("Settings", () => {
 			settings.getStorage()?.close();
 		}
 	});
-	for (const ownsPresentation of [false, true]) {
-		it(`publishes repaired durable changes with ${ownsPresentation ? "owned" : "isolated"} presentation hooks`, async () => {
-			await Bun.write(getConfigPath(), "display: [");
-			const settings = ownsPresentation
-				? await Settings.init({ cwd: projectDir, agentDir })
-				: await Settings.loadForScope({ cwd: projectDir, agentDir });
-			const changedPaths: string[] = [];
-			const unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
-			try {
-				setDefaultTabWidth(3);
-				await Bun.write(getConfigPath(), "display:\n  tabWidth: 7\n");
-				await settings.flush();
+	it("publishes repaired durable setting changes through hooks and listeners", async () => {
+		await Bun.write(getConfigPath(), "display: [");
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		const changedPaths: string[] = [];
+		const unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
+		try {
+			setDefaultTabWidth(3);
+			await Bun.write(getConfigPath(), "display:\n  tabWidth: 7\n");
+			await settings.flush();
 
-				expect(settings.get("display.tabWidth")).toBe(7);
-				expect(getDefaultTabWidth()).toBe(ownsPresentation ? 7 : 3);
-				expect(changedPaths).toEqual(["display.tabWidth"]);
-			} finally {
-				unsubscribe();
-				setDefaultTabWidth(4);
-				settings.getStorage()?.close();
-			}
-		});
-	}
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(getDefaultTabWidth()).toBe(7);
+			expect(changedPaths).toEqual(["display.tabWidth"]);
+		} finally {
+			unsubscribe();
+			setDefaultTabWidth(4);
+			settings.getStorage()?.close();
+		}
+	});
 
 	it("persists a retained dirty patch on the first flush after YAML repair", async () => {
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -1163,7 +1159,7 @@ describe("Settings", () => {
 		}
 	});
 
-	it("preserves pending patches and overrides without changing disk or another owner's presentation", async () => {
+	it("preserves pending patches and project/runtime overrides without writing config.yml", async () => {
 		await writeSettings({
 			configSchemaVersion: 2,
 			display: { tabWidth: 3 },
@@ -1205,7 +1201,7 @@ describe("Settings", () => {
 			expect(settings.get("edit.mode")).toBe("hashline");
 			expect(settings.get("theme.dark")).toBe("blue-crab");
 			expect(settings.getGlobal("theme.light")).toBe("blue-crab");
-			expect(getDefaultTabWidth()).toBe(3);
+			expect(getDefaultTabWidth()).toBe(7);
 			expect(changedPaths).toEqual(["display.tabWidth"]);
 			expect(await Bun.file(getConfigPath()).text()).toBe(externalConfig);
 		} finally {

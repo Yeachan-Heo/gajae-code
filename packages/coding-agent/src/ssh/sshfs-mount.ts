@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $which, getRemoteDir, postmortem } from "@gajae-code/utils";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { $ } from "bun";
 import {
 	getControlDir,
@@ -66,13 +65,13 @@ function buildSshfsArgs(host: SSHConnectionTarget): string[] {
 async function unmountPath(path: string): Promise<boolean> {
 	const fusermount = $which("fusermount") ?? $which("fusermount3");
 	if (fusermount) {
-		const result = await $`${fusermount} -u ${path}`.env(projectSafeSpawnEnv()).quiet().nothrow();
+		const result = await $`${fusermount} -u ${path}`.quiet().nothrow();
 		if (result.exitCode === 0) return true;
 	}
 
 	const umount = $which("umount");
 	if (!umount) return false;
-	const result = await $`${umount} ${path}`.env(projectSafeSpawnEnv()).quiet().nothrow();
+	const result = await $`${umount} ${path}`.quiet().nothrow();
 	return result.exitCode === 0;
 }
 
@@ -83,7 +82,7 @@ export function hasSshfs(): boolean {
 export async function isMounted(path: string): Promise<boolean> {
 	const mountpoint = $which("mountpoint");
 	if (!mountpoint) return false;
-	const result = await $`${mountpoint} -q ${path}`.env(projectSafeSpawnEnv()).quiet().nothrow();
+	const result = await $`${mountpoint} -q ${path}`.quiet().nothrow();
 	return result.exitCode === 0;
 }
 
@@ -106,7 +105,7 @@ export async function mountRemote(host: SSHConnectionTarget, remotePath = "/"): 
 
 	const target = `${buildSshTarget(host.username, host.host)}:${remotePath}`;
 	const args = buildSshfsArgs(host);
-	const result = await $`sshfs ${args} ${target} ${mountPath}`.env(projectSafeSpawnEnv()).nothrow();
+	const result = await $`sshfs ${args} ${target} ${mountPath}`.nothrow();
 
 	if (result.exitCode !== 0) {
 		const detail = result.stderr.toString().trim();

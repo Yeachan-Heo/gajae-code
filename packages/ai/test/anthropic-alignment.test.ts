@@ -377,12 +377,9 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(isClaudeCloakingUserId(payload.metadata?.user_id ?? "")).toBe(true);
 	});
 
-	it.each([
-		["auto", undefined],
-		["named", { type: "tool", name: "proxy_resolve" }],
-	] as const)("resolves Mythos forced tool_choice from %s compatibility", async (toolChoiceSupport, expected) => {
+	it("omits forced tool_choice for Anthropic Mythos models via compat resolution", async () => {
 		const payload = (await captureAnthropicPayload(
-			{ ...ANTHROPIC_MODEL, id: "claude-mythos-4", name: "Claude Mythos 4", compat: { toolChoiceSupport } },
+			{ ...ANTHROPIC_MODEL, id: "claude-mythos-4", name: "Claude Mythos 4", compat: { toolChoiceSupport: "auto" } },
 			{
 				systemPrompt: ["Stay concise."],
 				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
@@ -401,8 +398,13 @@ describe("Anthropic request fingerprint alignment", () => {
 			{ toolChoice: { type: "tool", name: "resolve" } },
 		)) as { tool_choice?: unknown; tools?: unknown[] };
 
-		expect(payload.tool_choice).toEqual(expected);
+		expect(payload.tool_choice).toBeUndefined();
 		expect(payload.tools).toHaveLength(1);
+	});
+
+	it("does not hard-code Mythos forced tool_choice gating in Anthropic request code", () => {
+		const source = fs.readFileSync(path.join(import.meta.dir, "../src/providers/anthropic.ts"), "utf8");
+		expect(source).not.toContain("claude-mythos");
 	});
 
 	it("keeps forced tool_choice for compatible Anthropic models", async () => {

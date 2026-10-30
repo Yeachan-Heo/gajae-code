@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import * as nodeCrypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -71,8 +70,6 @@ export interface CasReceipt {
 export interface AtomicYamlUpdate<T> {
 	apply(current: Record<string, unknown>): T | Promise<T>;
 	shouldWrite?(result: T): boolean;
-	/** Explicit mutation intent, including same-value writes; omitted means whole-document ownership. */
-	mutationPaths?(): readonly string[];
 	committed?(current: Record<string, unknown>, result: T): void | Promise<void>;
 }
 
@@ -94,8 +91,6 @@ export interface AtomicYamlPatchOptions {
 	platform?: NodeJS.Platform;
 	/** Called under the config lock before patches are applied. */
 	validateRoot?: (root: unknown, patches: readonly AtomicYamlPatch[]) => void | Promise<void>;
-	/** Additional owner revisions checked under the config lock before CAS restoration. */
-	restoreConflicts?: () => readonly string[];
 	/** Called under the config lock after a successful CAS restore. */
 	onRestored?: (patches: readonly AtomicYamlPatch[]) => void | Promise<void>;
 }
@@ -146,42 +141,8 @@ type ReceiptChange = {
 	publicRevision: AtomicYamlPatchRevision;
 };
 
-// Descendant tasks retain this context after completion, so the lease must be
-// deactivated rather than treating every inherited path as permanently held.
-// While active, ancestry is a conservative lease, not proof of an actual await:
-// even a detached timer inherits it and must not acquire the same or a busy file.
-// Only the narrowly scoped Settings admission below deliberately drops the lease.
-type QueueContext = { path: string; active: boolean; parent: QueueContext | undefined };
-
 const queues = new Map<string, Promise<void>>();
-const activeQueueHolders = new Set<string>();
-const queueContext = new AsyncLocalStorage<QueueContext>();
 let nextReceiptRevision = 0;
-// Process-local authority shared by every queued writer, keyed by the canonical
-// file, not its lexical aliases. Unknown/cross-process writers remain hash-only:
-// the lock serializes writes but cannot prove their same-value or ABA intent.
-const durableRevisions = new Map<string, Map<string, number>>();
-
-function recordDurableMutation(configPath: string, paths: readonly string[]): void {
-	let revisions = durableRevisions.get(configPath);
-	if (!revisions) {
-		revisions = new Map();
-		durableRevisions.set(configPath, revisions);
-	}
-	const revision = ++nextReceiptRevision;
-	for (const settingPath of paths) revisions.set(settingPath, revision);
-}
-
-function hasNewerDurableMutation(configPath: string, settingPath: string, revision: number): boolean {
-	return [...(durableRevisions.get(configPath) ?? [])].some(
-		([other, newer]) =>
-			newer > revision &&
-			(other === "" ||
-				other === settingPath ||
-				other.startsWith(`${settingPath}.`) ||
-				settingPath.startsWith(`${other}.`)),
-	);
-}
 /** Bounded Windows sharing-violation retries: 10, 25, 50, 100, then 200 ms. */
 const WINDOWS_RENAME_BACKOFF_MS = [10, 25, 50, 100, 200] as const;
 const WINDOWS_SHARING_VIOLATION_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
@@ -292,99 +253,33 @@ function resolveAbsentThroughAncestors(target: string): string | null {
 	}
 }
 
-const UNSAFE_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
-
-/** Whether every segment is a non-empty, safe property name. */
-export function isSafeAtomicYamlPath(segments: readonly string[]): boolean {
-	return (
-		segments.length > 0 &&
-		segments.every(segment => typeof segment === "string" && segment.length > 0 && !UNSAFE_PATH_SEGMENTS.has(segment))
-	);
-}
-
-function assertSafePath(segments: readonly string[]): void {
-	if (!isSafeAtomicYamlPath(segments))
-		throw new Error("Atomic YAML paths require non-empty, safe dotted path segments.");
-}
-
-function assertNotObjectPrototype(value: Record<string, unknown>): void {
-	if (value === Object.prototype) throw new Error("Atomic YAML paths cannot mutate Object.prototype.");
-}
-
 function assertPatch(patch: AtomicYamlPatch): void {
 	if (
 		!patch ||
 		typeof patch.path !== "string" ||
 		patch.path.length === 0 ||
-		!isSafeAtomicYamlPath(patch.path.split("."))
+		patch.path.split(".").some(part => !part)
 	) {
-		throw new Error("Atomic YAML patches require a non-empty, safe dotted path.");
+		throw new Error("Atomic YAML patches require a non-empty dotted path.");
 	}
 	if (
-		patch.expected !== undefined &&
-		(patch.expected === null ||
-			typeof patch.expected !== "object" ||
-			typeof patch.expected.path !== "string" ||
+		patch.expected &&
+		(typeof patch.expected.path !== "string" ||
 			patch.expected.path.length === 0 ||
-			!isSafeAtomicYamlPath(patch.expected.path.split(".")) ||
+			patch.expected.path.split(".").some(part => !part) ||
 			typeof patch.expected.hash !== "string" ||
 			patch.expected.hash.length === 0)
 	) {
-		throw new Error("Atomic YAML patch preconditions require a non-empty, safe dotted path and hash.");
+		throw new Error("Atomic YAML patch preconditions require a non-empty dotted path and hash.");
 	}
 	if (patch.op === "set") {
 		if (patch.value === undefined) {
-			throw new TypeError("Atomic YAML set patch cannot carry undefined; use unset instead.");
+			throw new TypeError(`Atomic YAML set patch for ${patch.path} cannot carry undefined; use unset instead.`);
 		}
 		return;
 	}
 	if (patch.op !== "unset") {
-		throw new Error("Unknown atomic YAML patch operation.");
-	}
-}
-
-// Read caller-owned properties only once, before validation or any writer mutation.
-function snapshotPatches(patches: readonly AtomicYamlPatch[]): readonly AtomicYamlPatch[] {
-	const snapshots: AtomicYamlPatch[] = [];
-	try {
-		if (!Array.isArray(patches)) throw new TypeError();
-		const length = patches.length;
-		if (!Number.isInteger(length) || length < 0 || length > 0xffffffff) throw new TypeError();
-		for (let index = 0; index < length; index++) {
-			if (patches.length !== length || !Object.hasOwn(patches, index)) throw new TypeError();
-			const patch = patches[index];
-			if (patch === null || typeof patch !== "object" || Array.isArray(patch)) throw new TypeError();
-			const path = patch.path;
-			const op = patch.op;
-			const expectedInput = patch.expected;
-			const expected =
-				expectedInput !== undefined && expectedInput !== null && typeof expectedInput === "object"
-					? Object.freeze({ path: expectedInput.path, hash: expectedInput.hash })
-					: expectedInput;
-			const value = op === "set" ? structuredClone(patch.value) : undefined;
-			snapshots.push(Object.freeze({ path, op, value, expected }) as AtomicYamlPatch);
-		}
-		if (patches.length !== length) throw new TypeError();
-	} catch {
-		throw new Error("Atomic YAML patch input could not be read or cloned.");
-	}
-	for (const patch of snapshots) assertPatch(patch);
-	return Object.freeze(snapshots);
-}
-
-/** Ancestor/descendant paths cannot share one independently restorable receipt. */
-export function assertNonOverlappingAtomicYamlPatches(patches: readonly { path: string }[]): void {
-	const paths = new Set(patches.map(patch => patch.path));
-	for (const patchPath of paths) {
-		const segments = patchPath.split(".");
-		segments.pop();
-		while (segments.length > 0) {
-			const ancestor = segments.join(".");
-			if (paths.has(ancestor)) {
-				throw new TypeError(`Atomic YAML batches cannot contain overlapping paths: ${ancestor} and ${patchPath}.`);
-			}
-			segments.pop();
-		}
+		throw new Error(`Unknown atomic YAML patch operation: ${(patch as { op?: unknown }).op}`);
 	}
 }
 
@@ -393,11 +288,9 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 
 function stateAtPath(value: Record<string, unknown>, segments: readonly string[]): PathState {
-	assertSafePath(segments);
 	let current: Record<string, unknown> = value;
 	for (let index = 0; index < segments.length - 1; index++) {
-		const segment = segments[index]!;
-		const next = Object.hasOwn(current, segment) ? record(current[segment]) : undefined;
+		const next = record(current[segments[index]!]);
 		if (!next) return { exists: false, value: undefined };
 		current = next;
 	}
@@ -405,54 +298,26 @@ function stateAtPath(value: Record<string, unknown>, segments: readonly string[]
 	return Object.hasOwn(current, key) ? { exists: true, value: current[key] } : { exists: false, value: undefined };
 }
 
-/** Reject set paths that would replace a non-record ancestor outside the receipt's scope.
- * Missing ancestors may be created; unset paths do not replace ancestors.
- */
-export function assertAtomicYamlSetAncestors(value: Record<string, unknown>, segments: readonly string[]): void {
-	assertSafePath(segments);
-	let current = value;
-	for (let index = 0; index < segments.length - 1; index++) {
-		const segment = segments[index]!;
-		if (!Object.hasOwn(current, segment)) return;
-		const next = record(current[segment]);
-		if (!next) throw new Error("Atomic YAML set path cannot replace a non-record ancestor.");
-		current = next;
-	}
-}
-
 /** Set a dotted YAML path, creating object intermediates as needed. */
 export function setByPath(value: Record<string, unknown>, segments: readonly string[], nextValue: unknown): void {
-	assertSafePath(segments);
 	let current = value;
 	for (let index = 0; index < segments.length - 1; index++) {
-		assertNotObjectPrototype(current);
 		const segment = segments[index]!;
-		const next = Object.hasOwn(current, segment) ? record(current[segment]) : undefined;
-		if (!next) {
-			Object.defineProperty(current, segment, { value: {}, writable: true, enumerable: true, configurable: true });
-		}
+		const next = record(current[segment]);
+		if (!next) current[segment] = {};
 		current = current[segment] as Record<string, unknown>;
 	}
-	assertNotObjectPrototype(current);
-	Object.defineProperty(current, segments[segments.length - 1]!, {
-		value: nextValue,
-		writable: true,
-		enumerable: true,
-		configurable: true,
-	});
+	current[segments[segments.length - 1]!] = nextValue;
 }
 
 /** Delete a dotted YAML path without disturbing sibling keys or parent objects. */
 export function deleteByPath(value: Record<string, unknown>, segments: readonly string[]): void {
-	assertSafePath(segments);
 	let current = value;
 	for (let index = 0; index < segments.length - 1; index++) {
-		const segment = segments[index]!;
-		const next = Object.hasOwn(current, segment) ? record(current[segment]) : undefined;
+		const next = record(current[segments[index]!]);
 		if (!next) return;
 		current = next;
 	}
-	assertNotObjectPrototype(current);
 	delete current[segments[segments.length - 1]!];
 }
 
@@ -795,7 +660,6 @@ async function writeAtomicYaml(
 	expectedState?: YamlFileState,
 	/** Lexical (unresolved) config path; re-verified against the canonical target before the rename. */
 	lexicalConfigPath?: string,
-	mutationPaths: readonly string[] = [""],
 ): Promise<YamlFileState> {
 	const directory = path.dirname(configPath);
 	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
@@ -953,7 +817,6 @@ async function writeAtomicYaml(
 	} finally {
 		if (!preserveTempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
-	recordDurableMutation(configPath, mutationPaths);
 	return { exists: true, raw: nextRaw };
 }
 
@@ -964,7 +827,6 @@ function createReceipt(
 ): CasReceipt {
 	let discarded = false;
 	const revisions = changes.map(change => change.publicRevision);
-	const ownershipRevision = nextReceiptRevision;
 
 	return {
 		revisions,
@@ -976,21 +838,13 @@ function createReceipt(
 			return await enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
 				if (discarded) return { status: "discarded" };
 				return await withFileLock(canonicalPath, async () => {
-					const state = await readYaml(canonicalPath);
-					const { current, root } = state;
-					const conflicts = [
-						...new Set([
-							...changes
-								.filter(
-									change =>
-										hasNewerDurableMutation(canonicalPath, change.path, ownershipRevision) ||
-										stateHash(stateAtPath(current, change.path.split("."))) !==
-											change.publicRevision.afterHash,
-								)
-								.map(change => change.path),
-							...(options.restoreConflicts?.() ?? []),
-						]),
-					];
+					const { current, root } = await readYaml(canonicalPath);
+					const conflicts = changes
+						.filter(
+							change =>
+								stateHash(stateAtPath(current, change.path.split("."))) !== change.publicRevision.afterHash,
+						)
+						.map(change => change.path);
 					if (conflicts.length > 0) return { status: "conflict", paths: conflicts };
 
 					const restorePatches: AtomicYamlPatch[] = changes.map(change =>
@@ -998,14 +852,14 @@ function createReceipt(
 							? { path: change.path, op: "set", value: structuredClone(change.before.value) }
 							: { path: change.path, op: "unset" },
 					);
-					await options.validateRoot?.(structuredClone(root), structuredClone(restorePatches));
+					await options.validateRoot?.(root, restorePatches);
 					const receipt = await applyPatchesUnderLock(
 						canonicalPath,
 						current,
 						restorePatches,
 						options,
 						false,
-						state,
+						undefined,
 						lexicalPath,
 					);
 					await options.onRestored?.(restorePatches);
@@ -1026,7 +880,6 @@ async function applyPatchesUnderLock(
 	lexicalConfigPath?: string,
 ): Promise<CasReceipt> {
 	if (patches.length === 0) return createReceipt(configPath, [], options);
-	assertNonOverlappingAtomicYamlPatches(patches);
 
 	for (const patch of patches) {
 		if (!patch.expected) continue;
@@ -1034,11 +887,6 @@ async function applyPatchesUnderLock(
 		if (actualHash !== patch.expected.hash) {
 			throw new AtomicYamlConflictError(patch.expected.path, patch.expected.hash, actualHash);
 		}
-	}
-
-	// Preflight the whole batch before changing the transaction's in-memory state.
-	for (const patch of patches) {
-		if (patch.op === "set") assertAtomicYamlSetAncestors(current, patch.path.split("."));
 	}
 
 	const changesByPath = new Map<string, ReceiptChange>();
@@ -1069,15 +917,7 @@ async function applyPatchesUnderLock(
 	}
 	const changes = [...changesByPath.values()];
 
-	if (!skipWrite)
-		await writeAtomicYaml(
-			configPath,
-			current,
-			options,
-			expectedState,
-			lexicalConfigPath,
-			patches.map(patch => patch.path),
-		);
+	if (!skipWrite) await writeAtomicYaml(configPath, current, options, expectedState, lexicalConfigPath);
 	return createReceipt(configPath, changes, options);
 }
 
@@ -1092,11 +932,11 @@ export function applyAtomicYamlPatchesWithCurrent(
 	return enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const state = await readYaml(canonicalPath);
-			const { current, root } = state;
-			const patches = snapshotPatches(await buildPatches(structuredClone(current)));
-			await options.validateRoot?.(structuredClone(root), structuredClone(patches));
-			return await applyPatchesUnderLock(canonicalPath, current, patches, options, false, state, lexicalPath);
+			const { current, root } = await readYaml(canonicalPath);
+			const patches = await buildPatches(current);
+			for (const patch of patches) assertPatch(patch);
+			await options.validateRoot?.(root, patches);
+			return await applyPatchesUnderLock(canonicalPath, current, patches, options, false, undefined, lexicalPath);
 		});
 	});
 }
@@ -1148,9 +988,7 @@ export function withAtomicYamlConfigTransaction<T>(
 	return enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const state = await readYaml(canonicalPath);
-			let { current } = state;
-			const { root, raw, exists } = state;
+			const { current, root, raw, exists } = await readYaml(canonicalPath);
 			// External editors do not participate in the file lock, so a save
 			// between the initial read and a write would be silently overwritten.
 			// Guard every write with a compare-and-swap against the last file state
@@ -1169,255 +1007,125 @@ export function withAtomicYamlConfigTransaction<T>(
 				}
 			};
 			let written = false;
-			let active = true;
-			let busy = false;
-			let closed = false;
-			let pending: Promise<CasReceipt> | undefined;
-			const mutate = (action: () => Promise<CasReceipt>): Promise<CasReceipt> => {
-				if (closed) return Promise.reject(new Error("Atomic YAML transaction is closed."));
-				if (busy)
-					return Promise.reject(
-						new Error(
-							"Atomic YAML transaction is busy: cannot mutate while patch input is being read or another mutation is in progress.",
-						),
-					);
-				busy = true;
-				const result = (async () => {
-					try {
-						return await action();
-					} finally {
-						busy = false;
-					}
-				})();
-				pending = result;
-				return result;
-			};
 			const markWritten = (): void => {
 				written = true;
 			};
-			const transaction: AtomicYamlConfigTransaction = {
+			return await operation({
 				configPath: canonicalPath,
-				get root() {
-					return structuredClone(root);
-				},
-				get current() {
-					return structuredClone(current);
-				},
+				root,
+				current,
 				get written(): boolean {
 					return written;
 				},
-				applyPatches: (input, options = {}) =>
-					mutate(async () => {
-						const patches = snapshotPatches(input);
-						await options.validateRoot?.(structuredClone(root), structuredClone(patches));
-						await casGuard();
-						const candidate = structuredClone(current);
-						const receipt = await applyPatchesUnderLock(
-							canonicalPath,
-							candidate,
-							patches,
-							options,
-							false,
-							lastKnownState ?? initialState,
-							lexicalPath,
-						);
-						if (patches.length > 0) {
-							current = candidate;
-							lastKnownState = { exists: true, raw: YAML.stringify(candidate, null, 2) };
-							markWritten();
-						}
-						return {
-							revisions: receipt.revisions,
-							discard: () => receipt.discard(),
-							restore: () => {
-								if (active)
-									return Promise.reject(
-										new Error("Cannot restore a receipt while its atomic YAML transaction is active."),
-									);
-								return receipt.restore();
-							},
-						};
-					}),
-				removeTopLevelKeys: (input, options = {}) =>
-					mutate(async () => {
-						const keys = Array.from(input);
-						const candidate = structuredClone(current);
-						for (const key of keys) delete candidate[key];
-						await casGuard();
-						lastKnownState = await writeAtomicYaml(
-							canonicalPath,
-							candidate,
-							options,
-							lastKnownState ?? initialState,
-							lexicalPath,
-							keys,
-						);
-						current = candidate;
+				applyPatches: async (patches, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					await options.validateRoot?.(root, patches);
+					await casGuard();
+					const receipt = await applyPatchesUnderLock(
+						canonicalPath,
+						current,
+						patches,
+						options,
+						false,
+						lastKnownState ?? initialState,
+						lexicalPath,
+					);
+					if (patches.length > 0) {
+						lastKnownState = { exists: true, raw: YAML.stringify(current, null, 2) };
 						markWritten();
-						// The deleted top-level key values are not journaled, so a
-						// restore() would vacuously claim success; report honestly that
-						// the receipt is not restorable.
-						let discarded = false;
-						return {
-							revisions: [],
-							discard(): void {
-								discarded = true;
-							},
-							async restore(): Promise<CasRestoreResult> {
-								return discarded ? { status: "discarded" } : { status: "not-restorable" };
-							},
-						};
-					}),
-				applyPatchesAndRemoveTopLevelKeys: (input, keys, options = {}) =>
-					mutate(async () => {
-						const patches = snapshotPatches(input);
-						const topLevelKeys = Array.from(keys);
-						await options.validateRoot?.(structuredClone(root), structuredClone(patches));
-						await casGuard();
-						const candidate = structuredClone(current);
-						await applyPatchesUnderLock(canonicalPath, candidate, patches, options, true, undefined, lexicalPath);
-						for (const key of topLevelKeys) delete candidate[key];
-						lastKnownState = await writeAtomicYaml(
-							canonicalPath,
-							candidate,
-							options,
-							lastKnownState ?? initialState,
-							lexicalPath,
-							[...patches.map(patch => patch.path), ...topLevelKeys],
-						);
-						current = candidate;
-						markWritten();
-						let discarded = false;
-						return {
-							revisions: [],
-							discard(): void {
-								discarded = true;
-							},
-							async restore(): Promise<CasRestoreResult> {
-								return discarded ? { status: "discarded" } : { status: "not-restorable" };
-							},
-						};
-					}),
-				replaceCurrent: (next, options = {}) =>
-					mutate(async () => {
-						const candidate = structuredClone(next);
-						await casGuard();
-						lastKnownState = await writeAtomicYaml(
-							canonicalPath,
-							candidate,
-							options,
-							lastKnownState ?? initialState,
-							lexicalPath,
-						);
-						current = candidate;
-						markWritten();
-						let discarded = false;
-						return {
-							revisions: [],
-							discard(): void {
-								discarded = true;
-							},
-							async restore(): Promise<CasRestoreResult> {
-								return discarded ? { status: "discarded" } : { status: "not-restorable" };
-							},
-						};
-					}),
-			};
-			try {
-				const result = await operation(transaction);
-				closed = true;
-				if (busy) await pending;
-				return result;
-			} catch (error) {
-				closed = true;
-				if (busy) {
-					try {
-						await pending;
-					} catch (pendingError) {
-						if (pendingError !== error)
-							throw new AggregateError(
-								[error, pendingError],
-								"Atomic YAML transaction callback and pending mutation failed.",
-							);
 					}
-				}
-				throw error;
-			} finally {
-				active = false;
-			}
+					return receipt;
+				},
+				removeTopLevelKeys: async (keys, options = {}) => {
+					for (const key of keys) delete current[key];
+					await casGuard();
+					lastKnownState = await writeAtomicYaml(
+						canonicalPath,
+						current,
+						options,
+						lastKnownState ?? initialState,
+						lexicalPath,
+					);
+					markWritten();
+					// The deleted top-level key values are not journaled, so a
+					// restore() would vacuously claim success; report honestly that
+					// the receipt is not restorable.
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+				applyPatchesAndRemoveTopLevelKeys: async (patches, topLevelKeys, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					await options.validateRoot?.(root, patches);
+					await casGuard();
+					await applyPatchesUnderLock(canonicalPath, current, patches, options, true, undefined, lexicalPath);
+					for (const key of topLevelKeys) delete current[key];
+					lastKnownState = await writeAtomicYaml(
+						canonicalPath,
+						current,
+						options,
+						lastKnownState ?? initialState,
+						lexicalPath,
+					);
+					markWritten();
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+				replaceCurrent: async (next, options = {}) => {
+					for (const key of Object.keys(current)) delete current[key];
+					Object.assign(current, next);
+					await casGuard();
+					lastKnownState = await writeAtomicYaml(
+						canonicalPath,
+						current,
+						options,
+						lastKnownState ?? initialState,
+						lexicalPath,
+					);
+					markWritten();
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+			});
 		});
 	});
-}
-
-function assertNoActiveCanonicalYamlOperation(canonicalPath: string): void {
-	for (let context = queueContext.getStore(); context; context = context.parent) {
-		if (context.active && context.path === canonicalPath) {
-			throw new Error(`Cannot enqueue a reentrant atomic YAML operation for ${canonicalPath}.`);
-		}
-	}
-}
-
-/**
- * Settings may reserve a deferred save without inheriting the caller's lease.
- * Reject a nested flush against an actively held file, even across independent
- * roots: waiting for that save can otherwise form a cycle. A reservation alone
- * is not a holder, so a nested flush of an idle different file remains valid.
- * This process-local policy cannot rule out cross-process waits.
- */
-export function assertSafeAtomicYamlSettingsFlush(configPath: string): void {
-	const canonicalPath = canonicalConfigPath(configPath);
-	assertNoActiveCanonicalYamlOperation(canonicalPath);
-	if (activeQueueHolders.has(canonicalPath)) {
-		for (let context = queueContext.getStore(); context; context = context.parent) {
-			if (context.active) throw new Error(`Cannot flush Settings for busy atomic YAML file ${canonicalPath}.`);
-		}
-	}
 }
 
 /**
  * Reserve a FIFO operation for a config file immediately. The patch supplier runs
  * only when this operation reaches the front of the in-process queue, which lets
- * Settings debounce/coalesce inside its already-reserved causal slot. Nested
- * callers holding an active lease may acquire an idle different file, but cannot
- * queue behind a busy file. This conservative rule also applies to detached
- * callbacks that inherited the lease, even when nobody awaits their work.
+ * Settings debounce/coalesce inside its already-reserved causal slot.
  */
 export function enqueueAtomicYamlOperation<T>(
 	configPath: string,
 	operation: (canonicalConfigPath: string, lexicalConfigPath: string) => Promise<T>,
 ): Promise<T> {
 	const canonicalPath = canonicalConfigPath(configPath);
-	try {
-		assertNoActiveCanonicalYamlOperation(canonicalPath);
-	} catch (error) {
-		return Promise.reject(error);
-	}
-	const parent = queueContext.getStore();
-	const queued = queues.get(canonicalPath);
-	// A nested operation may acquire an idle file, but must not wait behind
-	// another queue while holding a lease. Independent roots may be waiting on
-	// each other through different async contexts, which ancestry cannot detect.
-	if (queued) {
-		for (let context = parent; context; context = context.parent) {
-			if (context.active)
-				return Promise.reject(
-					new Error(`Cannot enqueue a nested atomic YAML operation for busy ${canonicalPath}.`),
-				);
-		}
-	}
-	const prior = queued ?? Promise.resolve();
-	const result = prior
-		.catch(() => undefined)
-		.then(async () => {
-			const context: QueueContext = { path: canonicalPath, active: true, parent };
-			activeQueueHolders.add(canonicalPath);
-			try {
-				return await queueContext.run(context, () => operation(canonicalPath, configPath));
-			} finally {
-				context.active = false;
-				activeQueueHolders.delete(canonicalPath);
-			}
-		});
+	const prior = queues.get(canonicalPath) ?? Promise.resolve();
+	const result = prior.catch(() => undefined).then(() => operation(canonicalPath, configPath));
 	const completion = result.then(
 		() => undefined,
 		() => undefined,
@@ -1439,12 +1147,13 @@ export function reserveAtomicYamlPatchSlot(
 	options: AtomicYamlPatchOptions = {},
 ): Promise<CasReceipt> {
 	return enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
-		const nextPatches = snapshotPatches(await patches());
+		const nextPatches = await patches();
+		for (const patch of nextPatches) assertPatch(patch);
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
 			const state = await readYaml(canonicalPath);
 			const { current, root } = state;
-			await options.validateRoot?.(structuredClone(root), structuredClone(nextPatches));
+			await options.validateRoot?.(root, nextPatches);
 			return await applyPatchesUnderLock(
 				canonicalPath,
 				current,
@@ -1488,29 +1197,11 @@ export function reserveAtomicYamlUpdateSlot<T>(
 					// an external edit during the queue wait is a conflict.
 					state,
 					lexicalPath,
-					atomicUpdate.mutationPaths?.(),
 				);
 			}
 			await atomicUpdate.committed?.(current, result);
 			return result;
 		});
-	});
-}
-
-/**
- * Reserve the Settings debounce slot without inheriting the caller's queue lease.
- * This is fire-and-forget admission: completion is delivered to Settings rather
- * than returned to the caller that may currently hold the same file's queue.
- * The update itself still runs under a fresh queue lease and lock.
- * @internal
- */
-export function reserveDeferredSettingsSave<T>(
-	configPath: string,
-	update: () => Promise<AtomicYamlUpdate<T>> | AtomicYamlUpdate<T>,
-	completion: Pick<PromiseWithResolvers<T>, "resolve" | "reject">,
-): void {
-	queueContext.exit(() => {
-		void reserveAtomicYamlUpdateSlot(configPath, update).then(completion.resolve, completion.reject);
 	});
 }
 
@@ -1523,6 +1214,17 @@ export function applyAtomicYamlPatches(
 	patches: readonly AtomicYamlPatch[],
 	options: AtomicYamlPatchOptions = {},
 ): Promise<CasReceipt> {
-	const immutablePatches = snapshotPatches(patches);
+	for (const patch of patches) assertPatch(patch);
+	const immutablePatches = patches.map(patch => {
+		const expected = patch.expected ? { ...patch.expected } : undefined;
+		return patch.op === "set"
+			? ({
+					path: patch.path,
+					op: "set",
+					value: structuredClone(patch.value),
+					...(expected ? { expected } : {}),
+				} as const)
+			: ({ path: patch.path, op: "unset", ...(expected ? { expected } : {}) } as const);
+	});
 	return reserveAtomicYamlPatchSlot(configPath, () => immutablePatches, options);
 }

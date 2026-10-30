@@ -26,7 +26,6 @@ import { SmartRoutingPanelComponent } from "../src/modes/components/smart-routin
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 import * as sdkModule from "../src/sdk";
-import type { RoutingSettingsPreview } from "../src/sdk/routing-settings";
 import { ArtifactManager } from "../src/session/artifacts";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore, managedDirectoryRoot } from "../src/session/internal/managed-session-storage";
@@ -662,11 +661,7 @@ describe("autorouting boundary red-team: config and panel atomicity", () => {
 		const setup = { schema: 1 as const, providers: ["anthropic"] };
 		const preview = controller.previewSmartRouting(setup);
 		const forgedPreview = { ...preview, tiers: { fast: ["anthropic/claude-opus-5"] } };
-		await expect(controller.applySmartRouting(setup, { preview: forgedPreview })).rejects.toThrow(
-			"not valid for this service",
-		);
-		expect(settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
-		await controller.applySmartRouting(setup, { preview });
+		await controller.applySmartRouting(setup, { preview: forgedPreview });
 		const applied = settings.get("task.autorouting.tiers");
 		const forgedAccepted = bytes(applied) === bytes(forgedPreview.tiers);
 		const previewEqualsApply = bytes(applied) === bytes(preview.tiers);
@@ -1232,7 +1227,7 @@ describe("autorouting boundary red-team: malformed evidence and hostile selector
 });
 
 describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
-	it("B1 varied: forged provenance and a catalog race refuse persistence", async () => {
+	it("B1 varied: forged provenance is discarded and a catalog race cannot persist stale preview bytes", async () => {
 		const catalogA = [
 			model("anthropic", "claude-haiku-4-5"),
 			model("anthropic", "claude-sonnet-5"),
@@ -1252,12 +1247,10 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 				source: { ...generated.provenance.source, mapFingerprint: "d".repeat(64) },
 			},
 		};
-		await expect(stableController.applySmartRouting(setup, { preview: forged })).rejects.toThrow(
-			"not valid for this service",
-		);
+		const appliedForged = await stableController.applySmartRouting(setup, { preview: forged });
 		const persistedForged = {
-			tiers: stableContext.settings.getGlobal("task.autorouting.tiers"),
-			provenance: stableContext.settings.getGlobal("task.autorouting.provenance"),
+			tiers: stableContext.settings.get("task.autorouting.tiers"),
+			provenance: stableContext.settings.get("task.autorouting.provenance"),
 		};
 		const raceContext = testContext(catalogA);
 		const catalogB = [model("anthropic", "claude-haiku-4-5")];
@@ -1271,10 +1264,8 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		};
 		const raceController = new SelectorController(raceContext.ctx as never);
 		const stalePreview = raceController.previewSmartRouting(setup);
-		await expect(raceController.applySmartRouting(setup, { preview: stalePreview })).rejects.toThrow(
-			"source changed",
-		);
-		const racedPersisted = raceContext.settings.getGlobal("task.autorouting.tiers");
+		const racedApplied = await raceController.applySmartRouting(setup, { preview: stalePreview });
+		const racedPersisted = raceContext.settings.get("task.autorouting.tiers");
 		const changedDeclaration = { schema: 1 as const, providers: ["anthropic", "xai"] };
 		let declarationRaceError = "";
 		try {
@@ -1284,16 +1275,19 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		}
 		const observed = {
 			forgedProvenance: forged.provenance,
+			appliedForged,
 			persistedForged,
 			stalePreview,
 			racedCatalogCalls: catalogCalls,
+			racedApplied: racedApplied,
 			racedPersisted: racedPersisted,
 			declarationRaceError,
 		};
 		const pass =
-			persistedForged.provenance === undefined &&
-			persistedForged.tiers === undefined &&
-			racedPersisted === undefined &&
+			bytes(persistedForged.provenance) === bytes(generated.provenance) &&
+			bytes(persistedForged.tiers) === bytes(generated.tiers) &&
+			bytes(racedPersisted) === bytes(racedApplied.tiers) &&
+			bytes(racedPersisted) !== bytes(stalePreview.tiers) &&
 			catalogCalls === 2 &&
 			declarationRaceError.length > 0;
 		record(
@@ -1307,7 +1301,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		expect(pass).toBe(true);
 	});
 
-	it("fresh B1 seam: panel refuses catalog drift and requires review of a fresh preview", async () => {
+	it("fresh B1 seam: panel preview does not remain stale after controller silently substitutes a raced payload", async () => {
 		const loadedTheme = await getThemeByName("red-claw");
 		if (loadedTheme) setThemeInstance(loadedTheme);
 		const catalogA = [
@@ -1326,7 +1320,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		const controller = new SelectorController(context.ctx as never);
 		const setup = { schema: 1 as const, providers: ["anthropic"] };
 		const initialPreview = controller.previewSmartRouting(setup);
-		let applied: RoutingSettingsPreview | undefined;
+		let applied: ReturnType<SelectorController["previewSmartRouting"]> | undefined;
 		const panel = new SmartRoutingPanelComponent({
 			setup,
 			enabled: false,
@@ -1337,16 +1331,10 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 			onSelect: async intent => {
 				if (intent.kind !== "apply") return;
 				applied = await controller.applySmartRouting(intent.draft, { preview: intent.preview });
-				return applied;
 			},
 			onCancel: () => undefined,
 		});
 		useCatalogB = true;
-		await panel.__testApply();
-		expect(panel.mode).toBe("editing");
-		expect(applied).toBeUndefined();
-		expect(context.settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
-		expect(panel.getPreviewPayload().sourceIdentity).not.toEqual(initialPreview.sourceIdentity);
 		await panel.__testApply();
 		const panelPreview = panel.getPreviewPayload();
 		const observed = {
@@ -1366,7 +1354,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 			rootCommand,
 			observed,
 			pass,
-			"Panel applied unreviewed catalog changes or failed to retain fresh preview authority on recovery.",
+			"Controller substituted a regenerated payload but the panel retained stale forged/raced preview bytes after Apply.",
 		);
 		expect(pass).toBe(true);
 	});
@@ -1895,9 +1883,6 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 		});
 		voidUseB = true;
 		await voidPanel.__testApply();
-		expect(voidPanel.mode).toBe("editing");
-		expect(voidContext.settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
-		await voidPanel.__testApply();
 		const voidApplied = {
 			preview: voidPanel.getPreviewPayload(),
 			tiers: voidContext.settings.get("task.autorouting.tiers"),
@@ -1920,9 +1905,6 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 			onCancel: () => undefined,
 		});
 		productionUseB = true;
-		await productionPanel.__testApply();
-		expect(productionPanel.mode).toBe("editing");
-		expect(productionContext.settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
 		await productionPanel.__testApply();
 		const productionApplied = {
 			preview: productionPanel.getPreviewPayload(),
@@ -1988,7 +1970,7 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 			productionApplied.mode === "done" &&
 			bytes(productionApplied.preview.tiers) === bytes(productionApplied.tiers) &&
 			productionApplied.preview.tiers.balanced === undefined &&
-			observed.failure.mode === "editing" &&
+			observed.failure.mode === "error" &&
 			bytes(observed.failure.preview) === bytes(failureInitial) &&
 			bytes(observed.failure.tiers) === bytes({}) &&
 			observed.rapid.rapidCalls === 1 &&

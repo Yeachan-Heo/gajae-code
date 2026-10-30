@@ -153,51 +153,6 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
 }
 
-/**
- * An intent whose later SIGTERM is an operator shutdown. Elsewhere the closer
- * delivers that signal itself; a Darwin closer never does, so there the intent
- * also needs its supervisor's confirmed relay record, and the child's record that
- * the relay was the first termination cause it handled.
- */
-async function createRelayedOwnerIntent(
-	stateDir: string,
-	input: Parameters<typeof createOwnerIntent>[1],
-): Promise<Awaited<ReturnType<typeof createOwnerIntent>>> {
-	const intent = await createOwnerIntent(stateDir, input);
-	if (process.platform !== "darwin") return intent;
-	const paths = lifecyclePaths(stateDir, intent.session_id, intent.generation);
-	const supervisor = { child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" };
-	const ownerOnly = (file: string, value: unknown) =>
-		fs.writeFile(file, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: "wx" });
-	await ownerOnly(paths.supervisorIndexFile, {
-		schema_version: 1,
-		generation: intent.generation,
-		session_id: intent.session_id,
-		...supervisor,
-	});
-	await ownerOnly(paths.relayFile, {
-		schema_version: 1,
-		intent_id: intent.intent_id,
-		dispatch_id: intent.dispatch_id,
-		generation: intent.generation,
-		session_id: intent.session_id,
-		server_key: intent.server_key,
-		...supervisor,
-		relayed_at: intent.created_at,
-	});
-	await ownerOnly(paths.shutdownCauseFile, {
-		schema_version: 1,
-		generation: intent.generation,
-		session_id: intent.session_id,
-		child_token: supervisor.child_token,
-		child_pid: process.pid,
-		cause: "cooperative",
-		signal: "SIGUSR2",
-		recorded_at: intent.created_at,
-	});
-	return intent;
-}
-
 describe("coordinator runtime state sidecar", () => {
 	it("persists post-publication integration failures with correlation", async () => {
 		const root = await tempRoot();
@@ -2213,7 +2168,7 @@ describe("coordinator runtime state sidecar", () => {
 		const stateFile = path.join(root, "state.json");
 		const sessionId = "preserved-owner-session";
 		const generation = await replaceOwnerGeneration(root, sessionId, "preserved-owner-generation");
-		await createRelayedOwnerIntent(root, {
+		await createOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "opaque-owner",
@@ -2252,123 +2207,6 @@ describe("coordinator runtime state sidecar", () => {
 			classification: "expected_operator_shutdown",
 			observer: "sidecar",
 		});
-	});
-
-	it.skipIf(process.platform !== "darwin").each([
-		["waits for an in-flight relay", "pending"],
-		["waits for the final flush after a confirmed relay", "confirmed"],
-		["fails on plain contention", "none"],
-		["never adopts a relay published after the signal was captured", "after_capture"],
-	] as const)("finalizes a signaled child whose supervisor still holds the relay lock: %s", async (_case, phase) => {
-		const inFlight = phase === "pending" || phase === "confirmed";
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		const sessionId = "relay-lock-session";
-		const generation = await replaceOwnerGeneration(root, sessionId, "relay-lock-generation");
-		const paths = lifecyclePaths(root, sessionId, generation);
-		const intent = await createOwnerIntent(root, {
-			generation,
-			session_id: sessionId,
-			server_key: "opaque-owner",
-			expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
-			dispatch_id: "operator-dispatch",
-			created_at: new Date(Date.now() - 1_000).toISOString(),
-			expires_at: new Date(Date.now() + 60_000).toISOString(),
-		});
-		const supervisor = { child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" };
-		await fs.writeFile(
-			paths.supervisorIndexFile,
-			`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, ...supervisor })}\n`,
-			{ mode: 0o600 },
-		);
-		const record = {
-			schema_version: 1,
-			intent_id: intent.intent_id,
-			dispatch_id: intent.dispatch_id,
-			generation,
-			session_id: sessionId,
-			server_key: "opaque-owner",
-			...supervisor,
-			// After capture the relay is stamped earlier than the observation, as after a
-			// backward wall-clock step; only capture-time evidence can exclude it.
-			relayed_at: new Date(Date.now() - (phase === "after_capture" ? 500 : 0)).toISOString(),
-		};
-		if (phase === "pending")
-			await fs.writeFile(paths.relayPendingFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-		// The child handled the relay as its first cause; only capture order is under test.
-		await fs.writeFile(
-			paths.shutdownCauseFile,
-			`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, child_token: "token", child_pid: process.pid, cause: "cooperative", signal: "SIGUSR2", recorded_at: new Date().toISOString() })}\n`,
-			{ mode: 0o600 },
-		);
-		// The confirmed record is published; the supervisor still holds the lock for its final flush.
-		if (phase === "confirmed") await fs.writeFile(paths.relayFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
-		await Bun.write(
-			stateFile,
-			JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state: "running",
-				cwd: root,
-				workdir: root,
-				session_file: null,
-			}),
-		);
-		// The supervisor holds the generation lock across signal delivery and the
-		// confirmed record's slow durable publication, well past the 250 ms base budget.
-		const holder = Bun.spawn({
-			cmd: [
-				process.execPath,
-				"-e",
-				`import { Database } from "bun:sqlite"; import * as fs from "node:fs";
-const env = process.env; const db = new Database(env.LOCK_DB); db.exec("BEGIN IMMEDIATE");
-process.stdout.write("locked\\n");
-setTimeout(() => {
-	if (env.RELAY_FILE) { fs.writeFileSync(env.RELAY_FILE, env.RELAY_BYTES, { mode: 0o600, flag: "wx" }); fs.rmSync(env.PENDING_FILE, { force: true }); }
-	db.exec("COMMIT"); db.close(); process.exit(0);
-}, Number(env.HOLD_MS));`,
-			],
-			env: {
-				...process.env,
-				LOCK_DB: paths.lockDatabaseFile,
-				PENDING_FILE: paths.relayPendingFile,
-				HOLD_MS: phase === "after_capture" ? "100" : "700",
-				...(phase === "pending" || phase === "after_capture"
-					? { RELAY_FILE: paths.relayFile, RELAY_BYTES: `${JSON.stringify(record)}\n` }
-					: {}),
-			},
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		try {
-			const reader = holder.stdout.getReader();
-			try {
-				expect(new TextDecoder().decode((await reader.read()).value)).toBe("locked\n");
-			} finally {
-				reader.releaseLock();
-			}
-			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
-				sessionId,
-				cwd: root,
-				sessionFile: null,
-				ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
-			});
-		} finally {
-			expect(await holder.exited).toBe(0);
-		}
-		const payload = await readPayload(stateFile);
-		if (inFlight) {
-			expect(payload).toMatchObject({ state: "completed" });
-			expect(await readJson(paths.verdictFile)).toMatchObject({ classification: "expected_operator_shutdown" });
-		} else if (phase === "after_capture") {
-			expect(payload).toMatchObject({ state: "errored" });
-			expect(await readJson(paths.verdictFile)).toMatchObject({ classification: "unexpected_owner_loss" });
-		} else {
-			expect(payload).toMatchObject({ state: "errored", error: { code: "owner_verdict_unavailable" } });
-			expect(fsSync.existsSync(paths.verdictFile)).toBeFalse();
-		}
 	});
 
 	it("does not overwrite richer terminal launch_error evidence during postmortem", async () => {
@@ -2461,7 +2299,7 @@ setTimeout(() => {
 		const stateFile = path.join(root, "state.json");
 		const sessionId = "owner-sidecar-session";
 		const generation = await replaceOwnerGeneration(root, sessionId, "generation-one");
-		await createRelayedOwnerIntent(root, {
+		await createOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "opaque-server-key",
@@ -2738,7 +2576,7 @@ setTimeout(() => {
 		const root = await tempRoot();
 		const sessionId = "barrier-race";
 		const generation = await replaceOwnerGeneration(root, sessionId, "barrier-generation");
-		await createRelayedOwnerIntent(root, {
+		await createOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "private-owner",

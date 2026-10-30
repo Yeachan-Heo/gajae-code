@@ -1,0 +1,10 @@
+ selectable                                     
+                                                
+                                                
+ user                                           
+ ⬢ sonnet-4.5 · 0.0% ───────── vsticky-viewport 
+hook: ready                                     
+╭─────────────────────────────────────────────╮ 
+│ > first composer line                       │ 
+│   second composer line                      │ 
+╰─────────────────────────────────────────────╯ 

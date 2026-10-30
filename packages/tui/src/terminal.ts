@@ -1,26 +1,9 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-import type { reassertRawTty as reassertRawTtyFn } from "@gajae-code/natives";
 import { $env, $flag, $pickenv } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import { flushTerminalOutput, terminalWriterIsDead, writeTerminalOutput } from "./terminal-writer";
-
-type NativeReassertRawTty = typeof reassertRawTtyFn;
-let nativeReassertRawTty: NativeReassertRawTty | undefined;
-
-function reassertRawTty(fd: number): boolean {
-	nativeReassertRawTty ??= (require("@gajae-code/natives") as { reassertRawTty: NativeReassertRawTty }).reassertRawTty;
-	return nativeReassertRawTty(fd);
-}
-
-/**
- * Replace the native termios re-assert so tests can model the kernel tty mode
- * without touching the real controlling terminal. Pass `undefined` to restore.
- */
-export function __setReassertRawTtyForTests(impl: NativeReassertRawTty | undefined): void {
-	nativeReassertRawTty = impl;
-}
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -732,29 +715,16 @@ export class ProcessTerminal implements Terminal {
 		if (!process.stdin.isTTY) return true;
 		if (typeof process.stdin.setRawMode !== "function") return false;
 		try {
-			if (process.platform === "win32") {
-				// `isRaw` and setRawMode() both trust the runtime's last requested mode,
-				// so a repeated setRawMode(true) is a no-op. Console mode changes apply
-				// immediately, so cycling forces a real apply without a drain wait.
-				process.stdin.setRawMode(false);
-				process.stdin.setRawMode(true);
-				// setRawMode() resets console input flags. Restore VT input so
-				// modified keys keep arriving as escape sequences after self-healing.
-				this.#enableWindowsVTInput();
-			} else if (process.stdin.isRaw) {
-				// The runtime believes the tty is raw, so setRawMode(true) would be a
-				// no-op even after a child changed termios directly. Do not cycle
-				// through setRawMode(false): on Unix each call is tcsetattr(TCSADRAIN),
-				// which waits for queued output in cooked+ECHO mode. A terminal that
-				// stopped reading (screen lock, display sleep) and then resumes answers
-				// queued probes inside that wait, and the kernel echoes the replies over
-				// the composer (#7373). Re-apply raw mode from the live termios with
-				// TCSANOW instead; this is a no-op when the tty is already raw.
-				reassertRawTty(process.stdin.fd);
-			} else {
-				// The runtime does not consider the tty raw, so this is a real apply.
-				process.stdin.setRawMode(true);
-			}
+			// `isRaw` and setRawMode() both trust the runtime's last requested mode.
+			// A child can change the shared tty's termios directly without updating
+			// that cache, so a repeated setRawMode(true) is a no-op in Node and Bun.
+			// Cycle through cooked mode synchronously to force a real raw-mode apply;
+			// no JavaScript or input callback can run between these two operations.
+			process.stdin.setRawMode(false);
+			process.stdin.setRawMode(true);
+			// On Windows setRawMode() resets console input flags. Restore VT input so
+			// modified keys keep arriving as escape sequences after self-healing.
+			this.#enableWindowsVTInput();
 			return true;
 		} catch {
 			// Do not write a probe into a tty whose input mode is unknown. A later

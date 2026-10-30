@@ -108,7 +108,6 @@ function buildComponent(dense = false, cjk = false): SettingsSelectorComponent {
 		`left=${(preview.leftSegments ?? []).join(",")} right=${(preview.rightSegments ?? []).join(",")} separator=${preview.separator}`;
 	const component = new SettingsSelectorComponent(
 		{
-			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw", "blue-crab"],

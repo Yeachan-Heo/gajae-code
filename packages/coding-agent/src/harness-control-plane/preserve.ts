@@ -15,7 +15,6 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { GitDelta } from "./types";
 
 export interface UntrackedEntry {
@@ -34,12 +33,7 @@ export interface PreserveResult {
 }
 
 function git(workspace: string, args: string[]): string {
-	return execFileSync("git", args, {
-		env: projectSafeSpawnEnv(),
-		cwd: workspace,
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "ignore"],
-	});
+	return execFileSync("git", args, { cwd: workspace, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 }
 
 function sha256(input: string | Buffer): string {

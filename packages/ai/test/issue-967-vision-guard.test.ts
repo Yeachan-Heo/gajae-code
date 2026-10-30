@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { resolveOpenAICompat } from "../src/openai-completions-compat";
 import { convertAnthropicMessages } from "../src/providers/anthropic";
 import { convertMessages as convertGoogleMessages } from "../src/providers/google-shared";
 import { convertCodexResponsesMessages } from "../src/providers/openai-codex-responses";
@@ -9,7 +8,7 @@ import {
 	convertResponsesInputContent,
 } from "../src/providers/openai-responses-shared";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "../src/providers/vision-guard";
-import type { Api, AssistantMessage, Context, Model, ToolResultMessage, Usage } from "../src/types";
+import type { Api, AssistantMessage, Context, Model, OpenAICompat, ToolResultMessage, Usage } from "../src/types";
 
 const emptyUsage: Usage = {
 	input: 0,
@@ -18,6 +17,40 @@ const emptyUsage: Usage = {
 	cacheWrite: 0,
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+const compat: Required<OpenAICompat> = {
+	supportsStore: true,
+	supportsDeveloperRole: true,
+	sendSessionHeaders: false,
+	supportsResponsesSessionAffinity: false,
+	supportsServiceTier: false,
+	reservedToolNames: [],
+	supportsMultipleSystemMessages: true,
+	supportsReasoningEffort: true,
+	reasoningEffortMap: {},
+	supportsUsageInStreaming: true,
+	supportsToolChoice: true,
+	supportsForcedToolChoice: true,
+	supportsUltrafastTier: false,
+	toolChoiceSupport: "named",
+	disableReasoningOnForcedToolChoice: false,
+	disableReasoningOnToolChoice: false,
+	maxTokensField: "max_completion_tokens",
+	requiresToolResultName: false,
+	requiresAssistantAfterToolResult: false,
+	requiresThinkingAsText: false,
+	requiresMistralToolIds: false,
+	thinkingFormat: "openai",
+	reasoningContentField: "reasoning_content",
+	requiresReasoningContentForToolCalls: false,
+	allowsSyntheticReasoningContentForToolCalls: true,
+	requiresAssistantContentForToolCalls: false,
+	openRouterRouting: {},
+	vercelGatewayRouting: {},
+	extraBody: {},
+	supportsStrictMode: true,
+	toolStrictMode: "none",
 };
 
 function makeModel<TApi extends Api>(api: TApi, provider: Model["provider"]): Model<TApi> {
@@ -104,7 +137,7 @@ describe("issue #967 vision guard", () => {
 			],
 		};
 
-		const messages = convertOpenAICompletionsMessages(model, context, resolveOpenAICompat(model));
+		const messages = convertOpenAICompletionsMessages(model, context, compat);
 		expect(countTaggedValues(messages, "image_url")).toBe(0);
 		expect(messages.filter(message => message.role === "user")).toHaveLength(1);
 		expect(messages[0]).toMatchObject({

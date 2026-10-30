@@ -17,7 +17,6 @@ import {
 	telegramActivationIdentity,
 	tokenFingerprint,
 } from "./config";
-import type { NotificationSessionReconcileResult } from "./session-control";
 import {
 	DAEMON_VERSION,
 	type EnsureTelegramDaemonDetailedResult,
@@ -67,9 +66,7 @@ function defaultPidAlive(pid: number): boolean {
 		process.kill(pid, 0);
 		return true;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return false;
-		if ((error as NodeJS.ErrnoException)?.code === "EPERM") return true;
-		throw error;
+		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 
@@ -93,26 +90,11 @@ export async function proposedTelegramIdentity(
 
 	try {
 		const state = await readDaemonState(input.settings, input.deps?.fs);
-		if (state === undefined) return { status: "absent" };
-		if (state === null || typeof state !== "object" || Array.isArray(state)) return { status: "unknown" };
+		if (!state) return { status: "absent" };
 
-		const config = getNotificationConfig(input.settings);
-		const secrets = [
-			input.botToken,
-			config.botToken,
-			config.discord.botToken,
-			config.slack.botToken,
-			config.slack.appToken,
-		].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
-		const sensitive = [...secrets, ...secrets.map(tokenFingerprint), state.tokenFingerprint].filter(
-			(value): value is string => typeof value === "string" && value.length > 0,
-		);
-		const isSecretSafe = (value: string): boolean => !sensitive.some(secret => value.includes(secret));
 		const metadata =
 			typeof state.ownerId === "string" &&
 			state.ownerId.trim().length > 0 &&
-			isSecretSafe(state.ownerId) &&
-			!(typeof state.chatId === "string" && state.chatId.length > 0 && state.ownerId.includes(state.chatId)) &&
 			validPositiveInteger(state.pid) &&
 			validGeneration(state.generation)
 				? {
@@ -135,18 +117,18 @@ export async function proposedTelegramIdentity(
 		const pidIncarnation = input.deps?.pidIncarnation ?? processIncarnation;
 		const persistedIncarnation = state.incarnation;
 		const currentIncarnation = pidIncarnation(metadata.pid);
-		if (!isProcessIncarnation(persistedIncarnation) || !isProcessIncarnation(currentIncarnation)) {
-			return { status: "unknown", owner: metadata };
+		if (
+			!isProcessIncarnation(persistedIncarnation) ||
+			!isProcessIncarnation(currentIncarnation) ||
+			persistedIncarnation !== currentIncarnation
+		) {
+			return { status: "absent" };
 		}
-		if (persistedIncarnation !== currentIncarnation) return { status: "absent" };
 
 		if (state.tokenFingerprint === tokenFingerprint(input.botToken) && state.chatId === input.chatId) {
 			return {
 				status: "same",
-				owner:
-					input.chatDisplay === undefined || !isSecretSafe(input.chatDisplay)
-						? metadata
-						: { ...metadata, chatDisplay: input.chatDisplay },
+				owner: input.chatDisplay === undefined ? metadata : { ...metadata, chatDisplay: input.chatDisplay },
 			};
 		}
 		return { status: "foreign", owner: metadata };
@@ -315,11 +297,10 @@ export type TelegramDaemonReconnectOutcome = EnsureTelegramDaemonDetailedResult;
  * blocked save only after no further frames can reach the foreign owner.
  */
 export interface NotificationRuntimeController {
-	/** True after fencing, false on failure, or undefined when there is no local session. */
-	enterBlockedRuntime(): Promise<boolean | undefined>;
+	/** Resolves only after the current endpoint is stopped and removed. */
+	enterBlockedRuntime(): Promise<unknown>;
 	clearBlockedRuntime(): Promise<unknown>;
-	/** Headless callers with no session return undefined; session adapters return the full result. */
-	reconcileCurrentSession(): Promise<NotificationSessionReconcileResult | undefined>;
+	reconcileCurrentSession(): Promise<unknown>;
 }
 
 export interface TelegramPostCommitActivation {
@@ -353,21 +334,10 @@ export type PostCommitTelegramActivationResult =
 	  };
 
 export type BlockedTelegramRestoreResult =
-	| { status: "restored"; reconnect: TelegramDaemonReconnectOutcome; observerFailed?: boolean; runtimeFailed?: false }
-	| {
-			status: "restored";
-			reconnect?: TelegramDaemonReconnectOutcome;
-			observerFailed?: boolean;
-			runtimeFailed: true;
-			runtimeFenced: boolean;
-			markerRestoreFailed?: boolean;
-			markerRetainFailed?: boolean;
-	  }
+	| { status: "restored"; reconnect: TelegramDaemonReconnectOutcome }
 	| { status: "conflict"; paths: readonly string[] }
 	| { status: "discarded" }
-	| { status: "not-restorable" }
-	| { status: "marker_blocked"; observerFailed?: boolean }
-	| { status: "still_blocked"; observerFailed?: boolean };
+	| { status: "still_blocked" };
 
 async function restoreBlockedConfiguration(input: {
 	receipt: SettingsAtomicReceipt;
@@ -382,15 +352,11 @@ async function restoreBlockedConfiguration(input: {
 	let restored: CasRestoreResult;
 	try {
 		restored = await input.receipt.restore();
-	} catch {
-		try {
-			await retainBlockedMarker();
-		} catch {
-			// No durable rollback was confirmed, regardless of marker retention.
-		}
-		throw new Error("Telegram configuration restore failed.");
+	} catch (error) {
+		await retainBlockedMarker();
+		throw error;
 	}
-	if (restored.status !== "restored") {
+	if (restored.status === "conflict" || restored.status === "discarded") {
 		await retainBlockedMarker();
 		return restored;
 	}
@@ -398,61 +364,27 @@ async function restoreBlockedConfiguration(input: {
 	// Keep the fail-closed marker durable until the configuration rollback has
 	// completed. Removing it first exposes the blocked identity between two CAS
 	// operations to other processes.
-	let inactiveRestored: CasRestoreResult | undefined;
-	let markerRestoreFailed = false;
+	let inactiveRestored: CasRestoreResult;
 	try {
 		inactiveRestored = await input.inactiveReceipt.restore();
-	} catch {
-		markerRestoreFailed = true;
+	} catch (error) {
+		await retainBlockedMarker();
+		throw error;
 	}
-	if (inactiveRestored?.status !== "restored") {
-		if (inactiveRestored?.status === "not-restorable") markerRestoreFailed = true;
-		let markerRetainFailed = false;
-		let runtimeFenced = false;
-		try {
-			await retainBlockedMarker();
-		} catch {
-			markerRetainFailed = true;
-		}
-		try {
-			runtimeFenced = (await input.activation.controller.enterBlockedRuntime()) !== false;
-		} catch {
-			// The configuration was already restored; report the fencing failure.
-		}
-		if (!markerRestoreFailed && !markerRetainFailed && runtimeFenced) return { status: "marker_blocked" };
-		return { status: "restored", runtimeFailed: true, runtimeFenced, markerRestoreFailed, markerRetainFailed };
+	if (inactiveRestored.status === "conflict" || inactiveRestored.status === "discarded") {
+		await retainBlockedMarker();
+		await input.activation.controller.enterBlockedRuntime();
+		return { status: "still_blocked" };
 	}
 
-	let reconnect: TelegramDaemonReconnectOutcome | undefined;
-	const runtimeFailure = async (): Promise<BlockedTelegramRestoreResult> => {
-		let runtimeFenced = false;
-		try {
-			runtimeFenced = (await input.activation.controller.enterBlockedRuntime()) !== false;
-		} catch {
-			// The durable rollback still succeeded even when runtime fencing fails.
-		}
-		return {
-			status: "restored",
-			...(reconnect === undefined ? {} : { reconnect }),
-			runtimeFailed: true,
-			runtimeFenced,
-		};
-	};
-	try {
-		reconnect = await input.activation.reconnect();
-		if (reconnect === "blocked_identity") {
-			if ((await input.activation.controller.enterBlockedRuntime()) === false) {
-				return { status: "restored", reconnect, runtimeFailed: true, runtimeFenced: false };
-			}
-			return { status: "still_blocked" };
-		}
-		await input.activation.controller.clearBlockedRuntime();
-		const reconciliation = await input.activation.controller.reconcileCurrentSession();
-		if (reconciliation?.outcome === "failed") return await runtimeFailure();
-		return { status: "restored", reconnect };
-	} catch {
-		return await runtimeFailure();
+	const reconnect = await input.activation.reconnect();
+	if (reconnect === "blocked_identity") {
+		await input.activation.controller.enterBlockedRuntime();
+		return { status: "still_blocked" };
 	}
+	await input.activation.controller.clearBlockedRuntime();
+	await input.activation.controller.reconcileCurrentSession();
+	return { status: "restored", reconnect };
 }
 
 /**
@@ -468,20 +400,13 @@ async function reconcileCommittedTelegramConfigurationUnsafe(input: {
 }): Promise<PostCommitTelegramActivationResult> {
 	const reconnect = await input.activation.reconnect();
 	if (reconnect === "blocked_identity") {
-		if ((await input.activation.controller.enterBlockedRuntime()) === false) {
-			return {
-				status: "activation_failed",
-				receipt: input.receipt,
-				reconnect,
-				message: "Configuration was saved, but activation was blocked and the current runtime could not be fenced.",
-			};
-		}
+		await input.activation.controller.enterBlockedRuntime();
 		const inactiveReceipt = await input.activation.persistInactive(input.activation.marker);
 		return {
 			receipt: input.receipt,
 			status: "blocked_identity",
 			message:
-				"Configuration saved inactive; activation blocked; foreign daemon untouched. The local runtime was fenced or no local session was present.",
+				"Configuration saved inactive; activation blocked; foreign daemon untouched. Current session stopped because Telegram activation was blocked by a foreign daemon.",
 			restore: () => restoreBlockedConfiguration({ ...input, inactiveReceipt }),
 			retainCommitted: () => {
 				inactiveReceipt.discard();
@@ -490,46 +415,26 @@ async function reconcileCommittedTelegramConfigurationUnsafe(input: {
 		};
 	}
 	if (reconnect === "disabled") {
-		const fenced = (await input.activation.controller.enterBlockedRuntime()) !== false;
+		await input.activation.controller.enterBlockedRuntime();
 		return {
 			receipt: input.receipt,
 			status: "activation_failed",
 			reconnect,
-			message: fenced
-				? "Configuration and desired intent were saved, but Telegram runtime activation did not become ready; the local runtime was fenced or no local session was present."
-				: "Configuration and desired intent were saved, but Telegram runtime activation did not become ready and the current runtime could not be fenced.",
+			message: "Configuration and desired intent were saved, but Telegram runtime activation did not become ready.",
 		};
 	}
 
 	if (input.inactiveMarkerToClear) {
-		await input.activation.clearInactive(input.inactiveMarkerToClear);
+		try {
+			await input.activation.clearInactive(input.inactiveMarkerToClear);
+		} catch (error) {
+			await input.activation.controller.enterBlockedRuntime();
+			throw error;
+		}
 	}
 	await input.activation.controller.clearBlockedRuntime();
-	const reconciliation = await input.activation.controller.reconcileCurrentSession();
-	if (reconciliation?.outcome === "failed") {
-		return await failedPostCommitActivation(input, reconnect);
-	}
+	await input.activation.controller.reconcileCurrentSession();
 	return { status: "activated", receipt: input.receipt, reconnect };
-}
-
-async function failedPostCommitActivation(
-	input: { receipt: SettingsAtomicReceipt; activation: TelegramPostCommitActivation },
-	reconnect?: TelegramDaemonReconnectOutcome,
-): Promise<PostCommitTelegramActivationResult> {
-	let fenced = false;
-	try {
-		fenced = (await input.activation.controller.enterBlockedRuntime()) !== false;
-	} catch {
-		// The durable commit remains valid even if fencing fails.
-	}
-	return {
-		status: "activation_failed",
-		receipt: input.receipt,
-		...(reconnect === undefined ? {} : { reconnect }),
-		message: fenced
-			? "Configuration and desired intent were saved, but post-commit activation or reconciliation failed; the current runtime was fenced or no local session was present."
-			: "Configuration and desired intent were saved, but post-commit activation or reconciliation failed and the current runtime could not be fenced.",
-	};
 }
 
 export async function reconcileCommittedTelegramConfiguration(input: {
@@ -540,7 +445,20 @@ export async function reconcileCommittedTelegramConfiguration(input: {
 	try {
 		return await reconcileCommittedTelegramConfigurationUnsafe(input);
 	} catch {
-		return await failedPostCommitActivation(input);
+		let fenced = false;
+		try {
+			await input.activation.controller.enterBlockedRuntime();
+			fenced = true;
+		} catch {
+			fenced = false;
+		}
+		return {
+			status: "activation_failed",
+			receipt: input.receipt,
+			message: fenced
+				? "Configuration and desired intent were saved, but post-commit activation or reconciliation failed; the current runtime was fenced."
+				: "Configuration and desired intent were saved, but post-commit activation or reconciliation failed and the current runtime could not be fenced.",
+		};
 	}
 }
 

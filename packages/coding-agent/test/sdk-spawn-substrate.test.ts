@@ -1,13 +1,11 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { __setBinaryResolverForTests, __setExecutableIdentityResolverForTests } from "../src/gjc-runtime/psmux-detect";
 import type { ManagedTmuxLaunchProof } from "../src/gjc-runtime/tmux-sessions";
 import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
 import {
 	createSpawnSubstrateProvider,
-	type SpawnLifecycleProcess,
 	type SpawnSubstrateProviderDependencies,
 } from "../src/sdk/broker/spawn-substrate";
 
@@ -69,252 +67,6 @@ afterEach(async () => {
 	);
 });
 
-describe("lifecycle owner resolution", () => {
-	function fixture() {
-		let clock = 0;
-		let childrenReads = 0;
-		let verifies = 0;
-		const incarnations = new Map([
-			[701, "darwin:701"],
-			[702, "darwin:702"],
-		]);
-		const child: SpawnLifecycleProcess = {
-			pid: 702,
-			incarnation: "darwin:702",
-			ppid: 701,
-			status: () => "running",
-			children: () => [],
-		};
-		const parent: SpawnLifecycleProcess = {
-			pid: 701,
-			incarnation: "darwin:701",
-			ppid: 700,
-			status: () => "running",
-			children: () => [child],
-		};
-		const state = {
-			child,
-			parent,
-			incarnations,
-			open: (pid: number): SpawnLifecycleProcess | null => (pid === 701 ? parent : pid === 702 ? child : null),
-			children: (_read: number): SpawnLifecycleProcess[] => [child],
-			onVerify: (_read: number) => {},
-			verdict: "verified" as "verified" | "mismatch" | "gone",
-			advance: (ms: number) => {
-				clock += ms;
-			},
-			sleeps: [] as number[],
-		};
-		parent.children = () => state.children(++childrenReads);
-		const provider = createSpawnSubstrateProvider(
-			managedDependencies({
-				now: () => clock,
-				sleep: async ms => {
-					state.sleeps.push(ms);
-					clock += ms;
-				},
-				processIncarnation: pid => incarnations.get(pid),
-				openLifecycleProcess: pid => state.open(pid),
-				verifyManaged: () => {
-					state.onVerify(++verifies);
-					return state.verdict;
-				},
-			}),
-		);
-		return { state, provider };
-	}
-
-	it("waits for positive direct-child evidence and keeps supervisor cleanup proof", async () => {
-		const { state, provider } = fixture();
-		state.children = read => (read < 3 ? [] : [state.child]);
-		const proof = substrateProof();
-		expect(await provider.resolveLifecycleOwner(proof, 125)).toEqual({
-			ok: true,
-			owner: { pid: 702, incarnation: "darwin:702" },
-		});
-		expect(state.sleeps).toEqual([50, 50]);
-		expect(proof.pid).toBe(701);
-		expect(proof.processIncarnation).toBe("darwin:701");
-	});
-
-	it("treats empty enumeration as inconclusive until the original deadline", async () => {
-		const { state, provider } = fixture();
-		state.children = () => [];
-		expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
-			ok: false,
-			code: "owner_deadline",
-		});
-		expect(state.sleeps).toEqual([50, 50, 25]);
-	});
-
-	it("rejects ambiguity without filtering an unverifiable second child", async () => {
-		const { state, provider } = fixture();
-		state.children = () => [state.child, { ...state.child, pid: 703, incarnation: "", status: () => "exited" }];
-		expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
-			ok: false,
-			code: "owner_ambiguous",
-		});
-	});
-
-	for (const failure of [
-		"parent-exit",
-		"child-exit",
-		"parent-reuse",
-		"child-reuse",
-		"missing-identity",
-		"reparent",
-		"provider-drift",
-		"disappearance",
-		"replacement",
-		"late-ambiguity",
-		"throw",
-	] as const) {
-		it(`rejects ${failure} after pinning instead of adopting another child`, async () => {
-			const { state, provider } = fixture();
-			state.onVerify = read => {
-				if (read !== 2) return;
-				switch (failure) {
-					case "parent-exit":
-						state.parent.status = () => "exited";
-						break;
-					case "child-exit":
-						state.child.status = () => "exited";
-						break;
-					case "parent-reuse":
-						state.incarnations.set(701, "replacement");
-						break;
-					case "child-reuse":
-						state.incarnations.set(702, "replacement");
-						break;
-					case "missing-identity":
-						state.incarnations.delete(702);
-						break;
-					case "reparent":
-						Object.defineProperty(state.child, "ppid", { value: 999 });
-						break;
-					case "provider-drift":
-						state.verdict = "mismatch";
-						break;
-					case "disappearance":
-						state.children = () => [];
-						break;
-					case "replacement":
-						state.children = () => [{ ...state.child, pid: 703 }];
-						break;
-					case "late-ambiguity":
-						state.children = () => [state.child, { ...state.child, pid: 703 }];
-						break;
-					case "throw":
-						throw new Error("unavailable process evidence");
-				}
-			};
-			expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
-				ok: false,
-				code: failure === "late-ambiguity" ? "owner_ambiguous" : "owner_proof_failed",
-			});
-			expect(state.sleeps).toEqual([]);
-		});
-	}
-
-	for (const check of [1, 2]) {
-		it(`checks the original deadline after awaited provider verification ${check}`, async () => {
-			const { state, provider } = fixture();
-			state.onVerify = read => {
-				if (read === check) state.advance(125);
-			};
-			expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
-				ok: false,
-				code: "owner_deadline",
-			});
-		});
-	}
-
-	it("checks expiry after synchronous process observations too", async () => {
-		const { state, provider } = fixture();
-		state.children = read => {
-			if (read === 2) state.advance(125);
-			return [state.child];
-		};
-		expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
-			ok: false,
-			code: "owner_deadline",
-		});
-	});
-
-	it("rejects unsupported managed topology", async () => {
-		const { provider } = fixture();
-		expect(await provider.resolveLifecycleOwner({ ...substrateProof(), substrateKind: "psmux" }, 125)).toEqual({
-			ok: false,
-			code: "owner_unsupported",
-		});
-	});
-
-	for (const evidence of ["missing", "reused", "exited", "reparented"] as const) {
-		it(`rejects ${evidence} fresh child evidence even when retained getters still match`, async () => {
-			const { state, provider } = fixture();
-			state.open = pid => {
-				if (pid === 701) return state.parent;
-				if (evidence === "missing") return null;
-				return {
-					...state.child,
-					incarnation: evidence === "reused" ? "replacement" : state.child.incarnation,
-					ppid: evidence === "reparented" ? 999 : 701,
-					status: () => (evidence === "exited" ? "exited" : "running"),
-				};
-			};
-			expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
-				ok: false,
-				code: "owner_proof_failed",
-			});
-		});
-	}
-
-	it("does not begin observation with an expired or invalid deadline", async () => {
-		const { state, provider } = fixture();
-		state.onVerify = () => {
-			throw new Error("must not verify");
-		};
-		for (const deadline of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-			expect(await provider.resolveLifecycleOwner(substrateProof(), deadline)).toEqual({
-				ok: false,
-				code: "owner_deadline",
-			});
-		}
-	});
-
-	it("reproves headless state and live identity instead of returning a stored tuple", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "spawn-owner-"));
-		temporaryDirectories.push(directory);
-		let status = "running";
-		const reference: SpawnLifecycleProcess = {
-			pid: 701,
-			incarnation: "darwin:701",
-			ppid: 1,
-			status: () => status,
-			children: () => [],
-		};
-		const provider = createSpawnSubstrateProvider(
-			managedDependencies({
-				selectMultiplexer: () => "none",
-				startHeadless: () => ({ pid: 701, terminate() {} }),
-				now: () => 0,
-				openLifecycleProcess: () => reference,
-			}),
-		);
-		const launched = await provider.launch(launchSpec(directory));
-		if (!launched.ok) throw new Error("fixture launch failed");
-		expect(await provider.resolveLifecycleOwner(launched.proof, 125)).toEqual({
-			ok: true,
-			owner: { pid: 701, incarnation: "darwin:701" },
-		});
-		status = "exited";
-		expect(await provider.resolveLifecycleOwner(launched.proof, 125)).toEqual({
-			ok: false,
-			code: "owner_proof_failed",
-		});
-	});
-});
-
 describe("Broker spawn substrate provider", () => {
 	it("captures the managed provider, native session, server, pid, and owner proof inputs", async () => {
 		const provider = createSpawnSubstrateProvider(managedDependencies());
@@ -370,148 +122,32 @@ describe("Broker spawn substrate provider", () => {
 		expect(drops).toEqual([["FOO-BAR", "TOO_LARGE"]]);
 	});
 
-	it("selects headless on Windows before any multiplexer probe or managed launch so the host stays resolvable", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-"));
-		temporaryDirectories.push(cwd);
-		let selections = 0;
-		let managedLaunches = 0;
-		let headlessLaunches = 0;
-		let terminated = false;
-		const reference: SpawnLifecycleProcess = {
-			pid: 701,
-			incarnation: "windows:701",
-			ppid: 1,
-			status: () => "running",
-			children: () => [],
-		};
+	it("uses the psmux substrate kind only for the Windows multiplexer selection", async () => {
+		const psmux = managedProof({
+			providerIdentity: '["windows-psmux","C:\\\\psmux.exe","namespace","volume:42"]',
+			psmuxIncarnation: "psmux-incarnation",
+		});
 		const provider = createSpawnSubstrateProvider({
 			platform: "win32",
-			selectMultiplexer: () => {
-				selections += 1;
-				return "tmux";
-			},
-			launchManaged: () => {
-				managedLaunches += 1;
-				throw new Error("managed launch must not be attempted on Windows");
-			},
-			startHeadless: () => {
-				headlessLaunches += 1;
-				return { pid: 701, terminate: () => (terminated = true) };
-			},
+			selectMultiplexer: () => "psmux",
+			launchManaged: () => psmux,
+			verifyManaged: () => "verified",
+			closeManaged: async () => {},
 			processIncarnation: () => "windows:701",
-			isProcessGone: () => false,
-			openLifecycleProcess: () => reference,
-			now: () => 0,
 		});
-		const result = await provider.launch({ ...launchSpec(cwd), argv: ["custom-trusted-host", "--serve"] });
-		if (!result.ok) throw new Error(`headless launch failed: ${result.message}`);
-		expect(result.proof).toMatchObject({ substrateKind: "headless", pid: 701, processIncarnation: "windows:701" });
-		expect({ selections, managedLaunches, headlessLaunches, terminated }).toEqual({
-			selections: 0,
-			managedLaunches: 0,
-			headlessLaunches: 1,
-			terminated: false,
-		});
-		expect(await provider.verify(result.proof)).toBe("verified");
-		expect(await provider.resolveLifecycleOwner(result.proof, 125)).toEqual({
+		const result = await provider.launch(launchSpec("C:\\repo"));
+		expect(result).toEqual({
 			ok: true,
-			owner: { pid: 701, incarnation: "windows:701" },
-		});
-	});
-
-	it("never probes a configured psmux through the default Windows selector", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-default-"));
-		temporaryDirectories.push(cwd);
-		let managedLaunches = 0;
-		// An installed, identifiable psmux that the pre-admission selector would pick.
-		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
-		__setExecutableIdentityResolverForTests(() => "volume:42");
-		const which = spyOn(Bun, "which").mockImplementation(command => command);
-		const provider = createSpawnSubstrateProvider({
-			platform: "win32",
-			env: { GJC_TMUX_COMMAND: "psmux" },
-			launchManaged: () => {
-				managedLaunches += 1;
-				throw new Error("managed launch must not be attempted on Windows");
+			proof: {
+				...substrateProof(psmux),
+				substrateKind: "psmux",
+				processIncarnation: "windows:701",
+				stateFileProof: {
+					...substrateProof(psmux).stateFileProof,
+					psmuxIncarnation: "psmux-incarnation",
+				},
 			},
-			startHeadless: () => ({ pid: 702, terminate() {} }),
-			processIncarnation: () => "windows:702",
 		});
-		let result: Awaited<ReturnType<typeof provider.launch>>;
-		try {
-			result = await provider.launch(launchSpec(cwd));
-		} finally {
-			which.mockRestore();
-			__setBinaryResolverForTests(null);
-			__setExecutableIdentityResolverForTests(null);
-		}
-		expect(result).toMatchObject({ ok: true, proof: { substrateKind: "headless", pid: 702 } });
-		expect(managedLaunches).toBe(0);
-	});
-
-	it.each([
-		["win32", true],
-		["darwin", false],
-	] as const)("%s headless publication tolerates an unflushable directory handle: %p", async (platform, published) => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `gjc-spawn-${platform}-dirsync-`));
-		temporaryDirectories.push(cwd);
-		const realOpen = fs.open;
-		const directoryOpens: string[] = [];
-		const open = spyOn(fs, "open").mockImplementation((async (file, flags, mode) => {
-			if (flags === "r") {
-				directoryOpens.push(String(file));
-				throw Object.assign(new Error("EPERM: directory flush unsupported"), { code: "EPERM" });
-			}
-			return realOpen(file, flags, mode);
-		}) as typeof fs.open);
-		let terminated = false;
-		let result: Awaited<ReturnType<ReturnType<typeof createSpawnSubstrateProvider>["launch"]>>;
-		try {
-			const provider = createSpawnSubstrateProvider({
-				platform,
-				selectMultiplexer: () => "none",
-				startHeadless: () => ({ pid: 704, terminate: () => (terminated = true) }),
-				processIncarnation: () => `${platform}:704`,
-			});
-			result = await provider.launch(launchSpec(cwd));
-		} finally {
-			open.mockRestore();
-		}
-		if (published) {
-			if (!result.ok) throw new Error(`headless publication failed: ${result.message}`);
-			const stateFile = result.proof.stateFileProof?.stateFile as string;
-			expect(JSON.parse(await Bun.file(stateFile).text())).toMatchObject({
-				pid: 704,
-				processIncarnation: "win32:704",
-			});
-			expect({ directoryOpens, terminated }).toEqual({ directoryOpens: [], terminated: false });
-		} else {
-			expect(result).toEqual({
-				ok: false,
-				code: "substrate_proof_failed",
-				message: "The selected spawn substrate could not be proven exactly.",
-			});
-			expect(directoryOpens).toHaveLength(1);
-			expect(terminated).toBeTrue();
-		}
-	});
-
-	it("terminates the Windows headless child when its proof cannot be published", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-unpublished-"));
-		temporaryDirectories.push(cwd);
-		await Bun.write(path.join(cwd, ".gjc"), "not a directory");
-		let terminated = false;
-		const provider = createSpawnSubstrateProvider({
-			platform: "win32",
-			startHeadless: () => ({ pid: 703, terminate: () => (terminated = true) }),
-			processIncarnation: () => "windows:703",
-		});
-		await expect(provider.launch(launchSpec(cwd))).resolves.toEqual({
-			ok: false,
-			code: "substrate_proof_failed",
-			message: "The selected spawn substrate could not be proven exactly.",
-		});
-		expect(terminated).toBeTrue();
 	});
 
 	it("does not fall back after a managed proof failure without cleanup evidence", async () => {

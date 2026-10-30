@@ -9,7 +9,7 @@
  */
 
 import { TERMINAL } from "@gajae-code/tui";
-import type { Settings } from "../../config/settings";
+import { Settings } from "../../config/settings";
 import {
 	type AnyUiMetadata,
 	getDefault,
@@ -39,7 +39,7 @@ interface BaseSettingDef {
 	 * setting is hidden from the UI. Applies to every variant — booleans,
 	 * enums, submenus, and text inputs.
 	 */
-	condition?: (settings: Settings) => boolean;
+	condition?: () => boolean;
 }
 
 export interface BooleanSettingDef extends BaseSettingDef {
@@ -80,9 +80,15 @@ export type SettingDef =
 // Condition Functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-const CONDITIONS: Record<string, (settings: Settings) => boolean> = {
+const CONDITIONS: Record<string, () => boolean> = {
 	hasImageProtocol: () => !!TERMINAL.imageProtocol,
-	hindsightActive: settings => settings.get("memory.backend") === "hindsight",
+	hindsightActive: () => {
+		try {
+			return Settings.instance.get("memory.backend") === "hindsight";
+		} catch {
+			return false;
+		}
+	},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

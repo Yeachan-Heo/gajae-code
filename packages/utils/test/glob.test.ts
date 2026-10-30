@@ -131,36 +131,4 @@ describe("globPaths", () => {
 
 		expect(results.sort()).toEqual(["other/sub/skip.ts"]);
 	});
-
-	it("excludes the contents of a directory ignored without a trailing slash", async () => {
-		const cwd = await makeTempDir();
-		await mkdir(join(cwd, "dist", "nested"), { recursive: true });
-		await mkdir(join(cwd, "pkg", "dist"), { recursive: true });
-		await mkdir(join(cwd, "src"), { recursive: true });
-		await writeFile(join(cwd, ".gitignore"), "dist\n");
-		await writeFile(join(cwd, "dist", "bundle.ts"), "export {};\n");
-		await writeFile(join(cwd, "dist", "nested", "chunk.ts"), "export {};\n");
-		await writeFile(join(cwd, "pkg", "dist", "index.ts"), "export {};\n");
-		await writeFile(join(cwd, "src", "keep.ts"), "export {};\n");
-
-		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
-
-		expect(results.sort()).toEqual(["src/keep.ts"]);
-	});
-
-	it("excludes the contents of rooted and anchored directories ignored without a trailing slash", async () => {
-		const cwd = await makeTempDir();
-		await mkdir(join(cwd, "build"), { recursive: true });
-		await mkdir(join(cwd, "sub", "build"), { recursive: true });
-		await mkdir(join(cwd, "app", "generated"), { recursive: true });
-		await writeFile(join(cwd, ".gitignore"), "/build\napp/generated\n");
-		await writeFile(join(cwd, "build", "skip.ts"), "export {};\n");
-		await writeFile(join(cwd, "sub", "build", "keep.ts"), "export {};\n");
-		await writeFile(join(cwd, "app", "generated", "skip.ts"), "export {};\n");
-		await writeFile(join(cwd, "app", "main.ts"), "export {};\n");
-
-		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
-
-		expect(results.sort()).toEqual(["app/main.ts", "sub/build/keep.ts"]);
-	});
 });

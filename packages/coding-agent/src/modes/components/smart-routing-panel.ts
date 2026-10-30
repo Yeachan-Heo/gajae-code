@@ -7,29 +7,28 @@ import type {
 	AutoroutingTier,
 	TierMap,
 } from "../../config/autorouting-contract";
-import {
-	RoutingSettingsActivationError,
-	RoutingSettingsConfirmationRequiredError,
-	type RoutingSettingsPreview,
-} from "../../sdk/routing-settings";
+import type { AutoroutingSourceIdentity } from "../../config/autorouting-generator";
 import { theme } from "../theme/theme";
 
 /** Longest rendered panel line before truncation. */
 export const MAX_PANEL_LINE_WIDTH = 200;
 
-// Even double-width code points fit alongside the draft label within the line cap.
-const DRAFT_PAGE_CODE_POINTS = 64;
+export type SmartRoutingPreview = {
+	readonly setup: AutoroutingSetup;
+	readonly tiers: TierMap;
+	readonly provenance: AutoroutingProvenance;
+	readonly sourceIdentity: AutoroutingSourceIdentity;
+};
 
 export type SmartRoutingIntent =
 	| {
 			kind: "apply";
 			draft: AutoroutingSetup;
-			preview: RoutingSettingsPreview;
+			preview: SmartRoutingPreview;
 			confirmHandEdit?: boolean;
 	  }
 	| {
 			kind: "refresh";
-			preview?: RoutingSettingsPreview;
 			confirmHandEdit?: boolean;
 	  }
 	| {
@@ -50,15 +49,11 @@ export interface SmartRoutingPanelOptions {
 	/** Advisory drift between the recorded declaration and current provider priority. */
 	providerOrderHint?: AutoroutingProviderOrderHint;
 	enabled: boolean;
-	effectiveGeneratedSetup?: boolean;
 	readOnly: boolean;
-	isStateUnknown?: () => boolean;
 	stale: boolean;
-	preview: RoutingSettingsPreview;
-	generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
-	discardPreview?: (preview: RoutingSettingsPreview) => void;
-	effectiveDiffersFromSaved?: boolean;
-	onSelect: (intent: SmartRoutingIntent) => undefined | Promise<RoutingSettingsPreview | undefined>;
+	preview: SmartRoutingPreview;
+	generatePreview: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	onSelect: (intent: SmartRoutingIntent) => undefined | Promise<SmartRoutingPreview | undefined>;
 	onCancel: () => void;
 }
 
@@ -66,7 +61,7 @@ function cloneSetup(setup: AutoroutingSetup): AutoroutingSetup {
 	return structuredClone(setup);
 }
 
-function clonePreview(preview: RoutingSettingsPreview): RoutingSettingsPreview {
+function clonePreview(preview: SmartRoutingPreview): SmartRoutingPreview {
 	return structuredClone(preview);
 }
 
@@ -89,24 +84,6 @@ function displaySafe(text: string): string {
 	return truncateToWidth(replaceTabs(sanitizeDisplayLine(text)), MAX_PANEL_LINE_WIDTH);
 }
 
-function draftPageEnd(text: string, start: number): number {
-	let end = start;
-	for (let count = 0; count < DRAFT_PAGE_CODE_POINTS && end < text.length; count++) {
-		end += (text.codePointAt(end) ?? 0) > 0xffff ? 2 : 1;
-	}
-	return end;
-}
-
-function draftPageStart(text: string, end: number): number {
-	let start = end;
-	for (let count = 0; count < DRAFT_PAGE_CODE_POINTS && start > 0; count++) {
-		start--;
-		const code = text.charCodeAt(start);
-		if (code >= 0xdc00 && code <= 0xdfff && start > 0) start--;
-	}
-	return start;
-}
-
 function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {
 	const selectors = tiers?.[tier];
 	return displaySafe(
@@ -121,24 +98,15 @@ function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {
 export class SmartRoutingPanelComponent extends Container {
 	readonly #onSelect: SmartRoutingPanelOptions["onSelect"];
 	readonly #onCancel: () => void;
-	readonly #discardPreview?: (preview: RoutingSettingsPreview) => void;
-	readonly #generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	readonly #generatePreview: (draft: AutoroutingSetup) => SmartRoutingPreview;
 	readonly #readOnly: boolean;
-	readonly #isStateUnknown?: () => boolean;
-	#sharedStateInvalidated = false;
 	#draft: AutoroutingSetup;
 
 	#tiers?: TierMap;
 	#provenance?: AutoroutingProvenance;
-	#enabled: boolean | undefined;
-	#effectiveGeneratedSetup: boolean | undefined;
-	#stateRevision = 0;
+	#enabled: boolean;
 	#stale: boolean;
-	/** Service-owned preview identity; never clone it when forwarding a mutation intent. */
-	#preview: RoutingSettingsPreview;
-	#previewValid = true;
-	#committedPreviewUnknown = false;
-	#effectiveDiffersFromSaved: boolean | undefined = false;
+	#preview: SmartRoutingPreview;
 	#mode: SmartRoutingPanelMode = "editing";
 	#confirmation: SmartRoutingConfirmation;
 	/** Intent that triggered the current hand-edit confirmation, replayed verbatim on confirm. */
@@ -146,10 +114,6 @@ export class SmartRoutingPanelComponent extends Container {
 	#providerCursor = 0;
 	#allowlistEditing = false;
 	#allowlistBuffer = "";
-	#uncommittedAllowlist: string | undefined;
-	// Maintain the sanitized view on input, never allocate a full draft during rendering.
-	#sanitizedAllowlistBuffer = "";
-	#uncommittedPageStart = 0;
 	#providerOrderHint: AutoroutingProviderOrderHint | undefined;
 	#status = "";
 	#error = "";
@@ -158,20 +122,16 @@ export class SmartRoutingPanelComponent extends Container {
 		super();
 		this.#onSelect = options.onSelect;
 		this.#onCancel = options.onCancel;
-		this.#discardPreview = options.discardPreview;
-		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
 		this.#generatePreview = options.generatePreview;
 		this.#readOnly = options.readOnly;
-		this.#isStateUnknown = options.isStateUnknown;
 		this.#draft = cloneSetup(options.setup);
 
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
-		this.#effectiveGeneratedSetup = options.effectiveGeneratedSetup;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#stale = options.stale;
-		this.#preview = options.preview;
+		this.#preview = clonePreview(options.preview);
 		this.#render();
 	}
 
@@ -187,20 +147,8 @@ export class SmartRoutingPanelComponent extends Container {
 		return cloneSetup(this.#draft);
 	}
 
-	/** Detached display data only; apply intents retain the service-issued identity internally. */
-	getPreviewPayload(): RoutingSettingsPreview {
-		return clonePreview(this.#visiblePreview());
-	}
-
-	#visiblePreview(): RoutingSettingsPreview {
-		if (
-			this.#confirmation === "hand-edit" &&
-			this.#pendingIntent?.kind === "refresh" &&
-			this.#pendingIntent.preview
-		) {
-			return this.#pendingIntent.preview;
-		}
-		return this.#preview;
+	getPreviewPayload(): SmartRoutingPreview {
+		return clonePreview(this.#preview);
 	}
 
 	getProviderOrder(): readonly string[] {
@@ -221,72 +169,29 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#render();
 	}
 
-	/** Forget effective indicators when a committed result cannot be presented reliably. */
-	markEffectiveStateUnknown(): void {
-		this.#enabled = undefined;
-		this.#effectiveGeneratedSetup = undefined;
-		this.#provenance = undefined;
-		this.#stale = false;
-		this.#providerOrderHint = undefined;
-		this.#effectiveDiffersFromSaved = undefined;
-		this.#status = "";
-	}
-
-	#observeSharedInvalidation(): boolean {
-		if (!this.#sharedStateInvalidated && this.#isStateUnknown?.()) {
-			this.#sharedStateInvalidated = true;
-			if (this.#pendingIntent && "preview" in this.#pendingIntent) {
-				const pendingPreview = this.#pendingIntent.preview;
-				if (pendingPreview && pendingPreview !== this.#preview) this.#discardPreview?.(pendingPreview);
-			}
-			this.#pendingIntent = undefined;
-			this.#confirmation = undefined;
-			if (this.#mode === "confirming") this.#mode = "editing";
-			if (this.#allowlistEditing) this.#uncommittedAllowlist = this.#allowlistBuffer;
-			this.#allowlistEditing = false;
-			this.#allowlistBuffer = "";
-			this.markEffectiveStateUnknown();
-			this.#render();
-		}
-		return this.#sharedStateInvalidated;
-	}
-
-	render(width: number): string[] {
-		this.#observeSharedInvalidation();
-		return super.render(width);
-	}
-
 	/** Replace the panel's persisted snapshot after a controller mutation. */
 	refreshState(options: {
 		setup: AutoroutingSetup;
 		tiers?: TierMap;
 		provenance?: AutoroutingProvenance;
 		enabled: boolean;
-		effectiveGeneratedSetup: boolean;
 		providerOrderHint?: AutoroutingProviderOrderHint;
 		stale: boolean;
-		preview?: RoutingSettingsPreview;
-		effectiveDiffersFromSaved?: boolean;
+		preview: SmartRoutingPreview;
 	}): void {
-		if (this.#preview !== options.preview) this.#discardPreview?.(this.#preview);
 		this.#draft = cloneSetup(options.setup);
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
-		this.#effectiveGeneratedSetup = options.effectiveGeneratedSetup;
 		this.#stale = options.stale;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
-		if (options.preview) this.#preview = options.preview;
-		this.#previewValid = options.preview !== undefined;
-		this.#committedPreviewUnknown = false;
-		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
+		this.#preview = clonePreview(options.preview);
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
 		this.#mode = "editing";
 		this.#confirmation = undefined;
 		this.#status = "";
 		this.#error = "";
 		this.#render();
-		this.#stateRevision++;
 	}
 
 	#render(): void {
@@ -302,18 +207,6 @@ export class SmartRoutingPanelComponent extends Container {
 					0,
 					0,
 				),
-			);
-		}
-		if (this.#sharedStateInvalidated) {
-			this.addChild(
-				new Text(theme.fg("warning", "Routing settings are unknown; reload Settings before continuing."), 0, 0),
-			);
-		}
-		if (this.#effectiveDiffersFromSaved === undefined) {
-			this.addChild(new Text(theme.fg("muted", "Effective settings comparison to global: unknown."), 0, 0));
-		} else if (this.#effectiveDiffersFromSaved) {
-			this.addChild(
-				new Text(theme.fg("muted", "Committed preview is global; effective settings currently differ."), 0, 0),
 			);
 		}
 		if (this.#stale) {
@@ -353,32 +246,8 @@ export class SmartRoutingPanelComponent extends Container {
 		if (this.#provenance)
 			this.addChild(new Text(theme.fg("dim", "Provenance recorded for this generated setup."), 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(
-			new Text(
-				theme.fg(
-					"muted",
-					`Effective enabled: ${this.#enabled === undefined ? "unknown" : this.#enabled ? "yes" : "no"}`,
-				),
-				0,
-				0,
-			),
-		);
-		this.addChild(
-			new Text(
-				theme.fg(
-					"muted",
-					`Effective generated setup: ${this.#effectiveGeneratedSetup === undefined ? "unknown" : this.#effectiveGeneratedSetup ? "present" : "absent"}`,
-				),
-				0,
-				0,
-			),
-		);
-		const providersLabel = this.#sharedStateInvalidated
-			? "Providers:"
-			: this.#committedPreviewUnknown
-				? "Draft providers:"
-				: "Providers (↑/↓ reorder; x removes; m edits allowlist):";
-		this.addChild(new Text(theme.fg("muted", providersLabel), 0, 0));
+		this.addChild(new Text(theme.fg("muted", `Enabled: ${this.#enabled ? "yes" : "no"}`), 0, 0));
+		this.addChild(new Text(theme.fg("muted", "Providers (↑/↓ reorder; x removes; m edits allowlist):"), 0, 0));
 		for (let index = 0; index < this.#draft.providers.length; index++) {
 			const provider = this.#draft.providers[index] ?? "";
 			const prefix = index === this.#providerCursor ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
@@ -407,81 +276,17 @@ export class SmartRoutingPanelComponent extends Container {
 				),
 			);
 		}
-		if (this.#uncommittedAllowlist !== undefined) {
-			this.addChild(
-				new Text(
-					theme.fg(
-						"warning",
-						displaySafe(
-							`Uncommitted allowlist draft (read-only): ${this.#sanitizedAllowlistBuffer.slice(
-								this.#uncommittedPageStart,
-								draftPageEnd(this.#sanitizedAllowlistBuffer, this.#uncommittedPageStart),
-							)}`,
-						),
-					),
-					0,
-					0,
-				),
-			);
-		}
 		this.addChild(new Spacer(1));
-		const visiblePreview = this.#visiblePreview();
-		const visiblePreviewValid =
-			this.#previewValid ||
-			(this.#confirmation === "hand-edit" &&
-				this.#pendingIntent?.kind === "refresh" &&
-				this.#pendingIntent.preview !== undefined);
-		if (this.#confirmation === "hand-edit" && this.#pendingIntent?.kind === "refresh") {
-			this.addChild(
-				new Text(
-					theme.fg(
-						"warning",
-						displaySafe(
-							`Pending refresh uses recorded global providers: ${visiblePreview.setup.providers.join(", ")}`,
-						),
-					),
-					0,
-					0,
-				),
-			);
-			this.addChild(
-				new Text(
-					theme.fg(
-						"warning",
-						displaySafe(
-							`Pending refresh uses recorded global allowlist: ${visiblePreview.setup.models?.length ? visiblePreview.setup.models.join(", ") : "(all labeled models)"}`,
-						),
-					),
-					0,
-					0,
-				),
-			);
-		}
-		this.addChild(
-			new Text(
-				theme.fg(
-					"muted",
-					visiblePreviewValid
-						? "Preview:"
-						: this.#committedPreviewUnknown
-							? "Committed preview: unknown."
-							: "Preview invalid; regenerate before applying:",
-				),
-				0,
-				0,
-			),
-		);
-		if (visiblePreviewValid) {
-			for (const tier of ["fast", "balanced", "strong"] as const) {
-				this.addChild(new Text(`  ${formatTier(tier, visiblePreview.tiers)}`, 0, 0));
-			}
+		this.addChild(new Text(theme.fg("muted", "Preview:"), 0, 0));
+		for (const tier of ["fast", "balanced", "strong"] as const) {
+			this.addChild(new Text(`  ${formatTier(tier, this.#preview.tiers)}`, 0, 0));
 		}
 		if (this.#status) this.addChild(new Text(theme.fg("success", displaySafe(this.#status)), 0, 0));
 		if (this.#error) this.addChild(new Text(theme.fg("error", displaySafe(this.#error)), 0, 0));
 		if (this.#confirmation === "clear") {
 			this.addChild(
 				new Text(
-					theme.fg("warning", "Clear global generated tiers, setup, and provenance? Enter confirms; Esc cancels."),
+					theme.fg("warning", "Clear generated tiers, setup, and provenance? Enter confirms; Esc cancels."),
 					0,
 					0,
 				),
@@ -499,22 +304,13 @@ export class SmartRoutingPanelComponent extends Container {
 			);
 		}
 		this.addChild(new Spacer(1));
-		const actions =
-			this.#sharedStateInvalidated && this.#uncommittedAllowlist !== undefined
-				? "PageUp/PageDown: inspect draft · Esc: cancel"
-				: this.#readOnly || this.#sharedStateInvalidated
-					? "Esc: cancel"
-					: "a: apply · r: refresh · t: toggle · c: clear · Esc: cancel";
+		const actions = this.#readOnly ? "Esc: cancel" : "a: apply · r: refresh · t: toggle · c: clear · Esc: cancel";
 		this.addChild(new Text(theme.fg("muted", actions), 0, 0));
 	}
 
 	#recomputePreview(): void {
-		this.#committedPreviewUnknown = false;
-		this.#discardPreview?.(this.#preview);
-		this.#previewValid = false;
 		try {
-			this.#preview = this.#generatePreview(this.#draft);
-			this.#previewValid = true;
+			this.#preview = clonePreview(this.#generatePreview(this.#draft));
 			this.#error = "";
 		} catch (error) {
 			this.#error = error instanceof Error ? error.message : String(error);
@@ -522,115 +318,38 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	async #emit(intent: SmartRoutingIntent): Promise<void> {
-		if (this.#observeSharedInvalidation() || this.#readOnly || this.#mode === "committing") return;
-		if (intent.kind === "apply" && !this.#previewValid) {
-			this.#error = "Preview unavailable; edit the setup to generate and review a fresh preview.";
-			this.#render();
-			return;
-		}
+		if (this.#readOnly || this.#mode === "committing") return;
 		this.#mode = "committing";
 		this.#status = "Committing smart-routing settings…";
 		this.#error = "";
 		this.#confirmation = undefined;
 		this.#render();
-		const stateRevision = this.#stateRevision;
 		try {
 			const result = await this.#onSelect(intent);
-			const invalidated = this.#observeSharedInvalidation();
-			if (invalidated) {
-				if (result) this.#discardPreview?.(result);
-				if ((intent.kind === "apply" || intent.kind === "refresh") && intent.preview && intent.preview !== result) {
-					this.#discardPreview?.(intent.preview);
-				}
-				if (intent.kind === "apply" || intent.kind === "refresh") {
-					this.#previewValid = false;
-					this.#committedPreviewUnknown = true;
-				}
-			} else if ((intent.kind === "apply" || intent.kind === "refresh") && result) {
-				if (this.#preview !== result) this.#discardPreview?.(this.#preview);
-				this.#draft = cloneSetup(result.setup);
-				this.#preview = result;
-				this.#previewValid = true;
-				this.#committedPreviewUnknown = false;
-			} else if ((intent.kind === "apply" || intent.kind === "refresh") && !result) {
-				this.#previewValid = false;
-				this.#committedPreviewUnknown = true;
-			}
-			if (invalidated || this.#stateRevision === stateRevision) {
-				// A callback-only host cannot establish effective state after any write.
-				this.markEffectiveStateUnknown();
+			if (intent.kind === "apply") {
+				const appliedPreview = result ?? this.#generatePreview(intent.draft);
+				this.#draft = cloneSetup(appliedPreview.setup);
+				this.#preview = clonePreview(appliedPreview);
+			} else if (intent.kind === "toggle") {
+				this.#enabled = intent.enabled;
 			}
 			this.#mode = "done";
-			this.#status =
-				intent.kind === "clear"
-					? "Global generated setup cleared."
-					: intent.kind === "toggle"
-						? `Global enabled updated: ${intent.enabled ? "yes" : "no"}.`
-						: "Global smart-routing settings updated.";
+			this.#status = intent.kind === "clear" ? "Generated setup cleared." : "Smart-routing settings saved.";
 		} catch (error) {
-			if (this.#observeSharedInvalidation()) {
-				if (error instanceof RoutingSettingsConfirmationRequiredError) this.#discardPreview?.(error.preview);
-				if ((intent.kind === "apply" || intent.kind === "refresh") && intent.preview) {
-					if (!(error instanceof RoutingSettingsConfirmationRequiredError) || intent.preview !== error.preview) {
-						this.#discardPreview?.(intent.preview);
-					}
-				}
-				this.#previewValid = false;
-				this.markEffectiveStateUnknown();
-				this.#mode = "error";
-				this.#status = "";
-				this.#error =
-					error instanceof RoutingSettingsConfirmationRequiredError
-						? ""
-						: error instanceof Error
-							? error.message
-							: String(error);
-				this.#render();
-				return;
-			}
-			if (
-				error instanceof RoutingSettingsActivationError &&
-				(error.rollback === "conflict" || error.rollback === "failed" || error.rollback === "not-restorable") &&
-				this.#stateRevision === stateRevision
-			) {
-				this.#enabled = undefined;
-				this.#effectiveGeneratedSetup = undefined;
-				this.#provenance = undefined;
-				this.#stale = false;
-				this.#effectiveDiffersFromSaved = undefined;
-			}
-			if (
-				error instanceof RoutingSettingsConfirmationRequiredError &&
-				(intent.kind === "apply" || intent.kind === "refresh")
-			) {
+			const typed = error as { code?: unknown } | undefined;
+			if (typed?.code === "autorouting-hand-edited") {
 				this.#mode = "confirming";
 				this.#confirmation = "hand-edit";
 				// Retain the intent that triggered the guard so confirming replays THAT intent. An Apply
 				// carrying an edited draft must not be silently downgraded to a Refresh, which would
 				// discard the frozen preview and commit the previously recorded setup instead (AC6).
-				this.#pendingIntent =
-					intent.kind === "apply"
-						? { ...intent, preview: error.preview }
-						: { kind: "refresh", preview: error.preview };
+				this.#pendingIntent = intent;
 				this.#status = "";
 				this.#error = "";
 			} else {
 				this.#mode = "error";
 				this.#error = error instanceof Error ? error.message : String(error);
 				this.#status = "";
-				if (intent.kind === "apply" || intent.kind === "refresh") {
-					if (intent.preview) this.#discardPreview?.(intent.preview);
-					this.#discardPreview?.(this.#preview);
-					this.#previewValid = false;
-					this.#mode = "editing";
-					try {
-						this.#preview = this.#generatePreview(this.#draft);
-						this.#previewValid = true;
-						this.#error += " A fresh preview is shown; review it before applying again.";
-					} catch {
-						this.#error += " Preview generation failed; edit the setup to prepare again.";
-					}
-				}
 			}
 		}
 		this.#render();
@@ -654,45 +373,18 @@ export class SmartRoutingPanelComponent extends Container {
 				: { schema: 1, providers: [...this.#draft.providers] };
 		this.#allowlistEditing = false;
 		this.#allowlistBuffer = "";
-		this.#sanitizedAllowlistBuffer = "";
 		this.#recomputePreview();
 		this.#render();
 	}
 
 	handleInput(data: string): void {
-		if (this.#observeSharedInvalidation()) {
-			if (this.#uncommittedAllowlist !== undefined && matchesKey(data, "pageDown")) {
-				const end = draftPageEnd(this.#sanitizedAllowlistBuffer, this.#uncommittedPageStart);
-				if (end < this.#sanitizedAllowlistBuffer.length) this.#uncommittedPageStart = end;
-				this.#render();
-			} else if (this.#uncommittedAllowlist !== undefined && matchesKey(data, "pageUp")) {
-				this.#uncommittedPageStart = draftPageStart(this.#sanitizedAllowlistBuffer, this.#uncommittedPageStart);
-				this.#render();
-			} else if (getKeybindings().matches(data, "tui.select.cancel")) {
-				this.#discardPreview?.(this.#preview);
-				this.#onCancel();
-			}
-			return;
-		}
 		if (this.#mode === "committing") return;
 		if (this.#mode === "done" || this.#mode === "error") {
-			if (getKeybindings().matches(data, "tui.select.cancel")) {
-				this.#discardPreview?.(this.#preview);
-				this.#onCancel();
-			}
+			if (getKeybindings().matches(data, "tui.select.cancel")) this.#onCancel();
 			return;
 		}
 		if (this.#confirmation) {
 			if (getKeybindings().matches(data, "tui.select.cancel")) {
-				if (
-					this.#confirmation === "hand-edit" &&
-					this.#pendingIntent &&
-					"preview" in this.#pendingIntent &&
-					this.#pendingIntent.preview
-				) {
-					this.#discardPreview?.(this.#pendingIntent.preview);
-					if (this.#pendingIntent.preview === this.#preview) this.#recomputePreview();
-				}
 				this.#confirmation = undefined;
 				this.#pendingIntent = undefined;
 				this.#mode = "editing";
@@ -712,25 +404,21 @@ export class SmartRoutingPanelComponent extends Container {
 			if (getKeybindings().matches(data, "tui.select.cancel")) {
 				this.#allowlistEditing = false;
 				this.#allowlistBuffer = "";
-				this.#sanitizedAllowlistBuffer = "";
 				this.#render();
 				return;
 			}
 			if (isBackspace(data)) {
 				this.#allowlistBuffer = this.#allowlistBuffer.slice(0, -1);
-				this.#sanitizedAllowlistBuffer = replaceTabs(sanitizeDisplayLine(this.#allowlistBuffer));
 				this.#render();
 				return;
 			}
 			if (isPrintable(data)) {
 				this.#allowlistBuffer += data;
-				this.#sanitizedAllowlistBuffer = replaceTabs(sanitizeDisplayLine(this.#allowlistBuffer));
 				this.#render();
 			}
 			return;
 		}
 		if (getKeybindings().matches(data, "tui.select.cancel")) {
-			this.#discardPreview?.(this.#preview);
 			this.#onCancel();
 			return;
 		}
@@ -738,7 +426,6 @@ export class SmartRoutingPanelComponent extends Container {
 		if (data === "m" || data === "M") {
 			this.#allowlistEditing = true;
 			this.#allowlistBuffer = this.#draft.models?.join(", ") ?? "";
-			this.#sanitizedAllowlistBuffer = replaceTabs(sanitizeDisplayLine(this.#allowlistBuffer));
 			this.#render();
 			return;
 		}
@@ -784,7 +471,7 @@ export class SmartRoutingPanelComponent extends Container {
 			return;
 		}
 		if (data === "a" || data === "A") {
-			void this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: this.#preview });
+			void this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: clonePreview(this.#preview) });
 			return;
 		}
 		if (data === "r" || data === "R") {
@@ -792,7 +479,7 @@ export class SmartRoutingPanelComponent extends Container {
 			return;
 		}
 		if (data === "t" || data === "T") {
-			void this.#emit({ kind: "toggle", enabled: this.#enabled !== true });
+			void this.#emit({ kind: "toggle", enabled: !this.#enabled });
 			return;
 		}
 		if (data === "c" || data === "C") {
@@ -801,21 +488,21 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	__testApply(): Promise<void> {
-		return this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: this.#preview });
+		return this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: clonePreview(this.#preview) });
 	}
 
 	/** Test hook mirroring an in-panel provider reorder/edit: mutates the draft and re-previews. */
 	__testSetProviders(providers: string[]): void {
 		this.#draft = { ...this.#draft, providers: [...providers] };
-		this.#recomputePreview();
+		this.#preview = this.#generatePreview(this.#draft);
 		this.#providerCursor = 0;
 	}
 
-	__testRefresh(): Promise<void> {
-		return this.#emit({ kind: "refresh" });
+	__testRefresh(confirmHandEdit = false): Promise<void> {
+		return this.#emit({ kind: "refresh", ...(confirmHandEdit ? { confirmHandEdit: true } : {}) });
 	}
 
-	__testToggle(enabled = this.#enabled !== true): Promise<void> {
+	__testToggle(enabled = !this.#enabled): Promise<void> {
 		return this.#emit({ kind: "toggle", enabled });
 	}
 
@@ -839,8 +526,6 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#pendingIntent = undefined;
 		if (pending?.kind === "apply")
 			return this.#emit({ kind: "apply", draft: pending.draft, preview: pending.preview, confirmHandEdit: true });
-		if (pending?.kind === "refresh" && pending.preview)
-			return this.#emit({ kind: "refresh", preview: pending.preview, confirmHandEdit: true });
-		return Promise.resolve();
+		return this.#emit({ kind: "refresh", confirmHandEdit: true });
 	}
 }

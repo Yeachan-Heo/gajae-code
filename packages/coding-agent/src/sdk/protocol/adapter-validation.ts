@@ -18,11 +18,6 @@ type Input = Record<string, unknown>;
 type SecretInputError = { code: "secret_field_forbidden"; message: string };
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 
-/** Shared conservative key classification for configuration display and patch boundaries. */
-export function isSecretConfigKey(key: string): boolean {
-	return SECRET_FIELD.test(key);
-}
-
 type UltrafastRestrictionError = { code: "ultrafast_tier_forbidden"; message: string };
 
 function containsUltrafastServiceTier(value: unknown): boolean {
@@ -38,7 +33,7 @@ function containsUltrafastServiceTier(value: unknown): boolean {
 function containsSecretField(value: unknown): boolean {
 	if (Array.isArray(value)) return value.some(containsSecretField);
 	if (!value || typeof value !== "object") return false;
-	return Object.entries(value).some(([key, nested]) => isSecretConfigKey(key) || containsSecretField(nested));
+	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
 }
 
 /** Rejects secret-bearing and ultrafast-tier config patches from model-facing adapter inputs. */

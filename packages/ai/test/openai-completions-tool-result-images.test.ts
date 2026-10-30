@@ -1,8 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
-import { resolveOpenAICompat } from "@gajae-code/ai/openai-completions-compat";
 import { convertMessages } from "@gajae-code/ai/providers/openai-completions";
-import type { AssistantMessage, Context, Model, ToolResultMessage, Usage } from "@gajae-code/ai/types";
+import type { AssistantMessage, Context, Model, OpenAICompat, ToolResultMessage, Usage } from "@gajae-code/ai/types";
 
 const emptyUsage: Usage = {
 	input: 0,
@@ -11,6 +10,40 @@ const emptyUsage: Usage = {
 	cacheWrite: 0,
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+const compat: Required<OpenAICompat> = {
+	supportsStore: true,
+	supportsDeveloperRole: true,
+	sendSessionHeaders: false,
+	supportsResponsesSessionAffinity: false,
+	supportsServiceTier: false,
+	reservedToolNames: [],
+	supportsMultipleSystemMessages: true,
+	supportsReasoningEffort: true,
+	reasoningEffortMap: {},
+	supportsUsageInStreaming: true,
+	supportsToolChoice: true,
+	supportsForcedToolChoice: true,
+	supportsUltrafastTier: false,
+	toolChoiceSupport: "named",
+	disableReasoningOnForcedToolChoice: false,
+	disableReasoningOnToolChoice: false,
+	maxTokensField: "max_completion_tokens",
+	requiresToolResultName: false,
+	requiresAssistantAfterToolResult: false,
+	requiresThinkingAsText: false,
+	requiresMistralToolIds: false,
+	thinkingFormat: "openai",
+	reasoningContentField: "reasoning_content",
+	requiresReasoningContentForToolCalls: false,
+	allowsSyntheticReasoningContentForToolCalls: true,
+	requiresAssistantContentForToolCalls: false,
+	openRouterRouting: {},
+	vercelGatewayRouting: {},
+	extraBody: {},
+	supportsStrictMode: true,
+	toolStrictMode: "none",
 };
 
 function buildToolResult(toolCallId: string, timestamp: number): ToolResultMessage {
@@ -60,7 +93,7 @@ describe("openai-completions convertMessages", () => {
 			],
 		};
 
-		const messages = convertMessages(model, context, resolveOpenAICompat(model));
+		const messages = convertMessages(model, context, compat);
 		const roles = messages.map(message => message.role);
 		expect(roles).toEqual(["user", "assistant", "tool", "tool", "user"]);
 
@@ -106,7 +139,7 @@ describe("openai-completions convertMessages", () => {
 			],
 		};
 
-		const messages = convertMessages(model, context, resolveOpenAICompat(model));
+		const messages = convertMessages(model, context, compat);
 		const assistantParam = messages.find(message => message.role === "assistant") as
 			| { role: "assistant"; tool_calls?: Array<{ id: string }> }
 			| undefined;
@@ -151,7 +184,7 @@ describe("openai-completions convertMessages", () => {
 			messages: [{ role: "user", content: "Read README", timestamp: now - 1 }, assistantMessage],
 		};
 
-		const messages = convertMessages(model, context, resolveOpenAICompat(model));
+		const messages = convertMessages(model, context, compat);
 		const assistantParam = messages.find(message => message.role === "assistant") as
 			| { role: "assistant"; tool_calls?: Array<{ function: { arguments: string } }> }
 			| undefined;

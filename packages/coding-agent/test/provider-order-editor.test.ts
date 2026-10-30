@@ -374,7 +374,6 @@ describe("SettingsSelectorComponent provider order integration", () => {
 	function createSelector(registry: ModelRegistry, errors: string[]): SettingsSelectorComponent {
 		return new SettingsSelectorComponent(
 			{
-				settings: Settings.instance,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: ["red-claw", "blue-crab"],

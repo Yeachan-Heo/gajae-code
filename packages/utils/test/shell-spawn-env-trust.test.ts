@@ -40,7 +40,6 @@ const HOOK_KEYS = [
 	"LD_LIBRARY_PATH",
 	"DYLD_LIBRARY_PATH",
 	"GIT_ASKPASS",
-	"SSH_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",
 	"GIT_SEQUENCE_EDITOR",
@@ -105,7 +104,6 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
 	"GIT_ASKPASS=./hook.sh",
-	"SSH_ASKPASS=./hook.sh",
 	"GIT_EXEC_PATH=./git-exec",
 	"GIT_PROXY_COMMAND=./proxy.sh",
 	"GIT_SEQUENCE_EDITOR=./hook.sh",
@@ -137,7 +135,6 @@ describe.each([
 		expect(probe).toMatchObject({
 			BASH_ENV: null,
 			GIT_ASKPASS: null,
-			SSH_ASKPASS: null,
 			GIT_EXEC_PATH: null,
 			GIT_PROXY_COMMAND: null,
 			GIT_SEQUENCE_EDITOR: null,

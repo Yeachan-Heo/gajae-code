@@ -1662,7 +1662,6 @@ export type SpawnChildHostLaunch = {
 	inheritedEnv: Readonly<Record<string, string>>;
 	env: Readonly<Record<string, string>>;
 	effectMarker: string;
-	semanticReadyDeadlineAt: number;
 };
 
 export function prepareSpawnChildHostLaunch(
@@ -1706,7 +1705,6 @@ export function prepareSpawnChildHostLaunch(
 			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
 		},
 		effectMarker,
-		semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
 	};
 }
 

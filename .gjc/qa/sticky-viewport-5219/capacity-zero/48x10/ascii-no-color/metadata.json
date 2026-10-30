@@ -1,0 +1,299 @@
+{
+  "schema_version": 2,
+  "entry_key": "capacity-zero/48x10/ascii-no-color",
+  "fixture_revision": "sticky-viewport-showcase-v2",
+  "capture_timestamp": "1970-01-01T00:00:00.000Z",
+  "command_or_replay_source": "bun packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts --out .gjc/qa/sticky-viewport-<run>",
+  "fixture_source": "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+  "terminal": {
+    "id": "48x10",
+    "columns": 48,
+    "rows": 10,
+    "font_rendering_assumptions": "Embedded red-claw theme at deterministic truecolor; HTML uses a monospace terminal fallback stack.",
+    "wrapping_truncation_policy": "ANSI-aware terminal-cell wrapping preserves semantic CJK phrase boundaries; constrained height drops the notice, decorative pet, then low-priority hooks without truncating pinned status or the focused composer."
+  },
+  "render_mode": "ascii-no-color",
+  "ansi_mode": false,
+  "source_revision": "production-tui-virtual-terminal-v3",
+  "output_revision": "0",
+  "state": {
+    "manual": false,
+    "notice": false,
+    "observed_output_revision": "0",
+    "transcript_capacity": 0,
+    "composer_visible": true,
+    "resize_probes": [
+      {
+        "columns": 64,
+        "rows": 10,
+        "effective_lane": "transcript",
+        "left_width": 64,
+        "right_width": 0,
+        "separator_width": 0,
+        "irc_records": 0,
+        "todo_rows": 0,
+        "todo_expanded": false,
+        "frame": {
+          "ansi": " ⬢ sonnet-4.5 · 0.0% ───────────────────────── vsticky-viewport \nhook: ready                                                     \n╭─────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                    │ \n╰─────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                           \nreserved suffix row 2                                           \nreserved suffix row 3                                           \nreserved suffix row 4                                           \nreserved suffix row 5                                           \n",
+          "text": " ⬢ sonnet-4.5 · 0.0% ───────────────────────── vsticky-viewport \nhook: ready                                                     \n╭─────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                    │ \n╰─────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                           \nreserved suffix row 2                                           \nreserved suffix row 3                                           \nreserved suffix row 4                                           \nreserved suffix row 5                                           \n",
+          "sha256": "9ccd08e93ccddcddd08a18cec7d4e81e11623b20aa233ce62a81ac46c682fb1a"
+        }
+      },
+      {
+        "columns": 65,
+        "rows": 10,
+        "effective_lane": "split",
+        "left_width": 32,
+        "right_width": 30,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": false,
+        "frame": {
+          "ansi": " ⬢ sonnet-4.5 · 0.0% ────────────────────────── vsticky-viewport \nhook: ready                                                      \n╭──────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                     │ \n╰──────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                            \nreserved suffix row 2                                            \nreserved suffix row 3                                            \nreserved suffix row 4                                            \nreserved suffix row 5                                            \n",
+          "text": " ⬢ sonnet-4.5 · 0.0% ────────────────────────── vsticky-viewport \nhook: ready                                                      \n╭──────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                     │ \n╰──────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                            \nreserved suffix row 2                                            \nreserved suffix row 3                                            \nreserved suffix row 4                                            \nreserved suffix row 5                                            \n",
+          "sha256": "89bf57495c4b0ce8387b73a152b66805930fc15b2749b045e6f8dcf8fc5ca4b0"
+        }
+      },
+      {
+        "columns": 80,
+        "rows": 24,
+        "effective_lane": "split",
+        "left_width": 47,
+        "right_width": 30,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": true,
+        "frame": {
+          "ansi": " user                                           │   observation 混合日本語 mixed\n                                                │   Latin long IRC observation  \n assistant 47: transcript output remains        │   混合日本語 mixed Latin long \n selectable                                     │   IRC observation 混合日本語  \n                                                │   mixed Latin                 \npending: queued composer input                                                  \n                                                                                \n   Todos                                                                        \n   └ I. triage                                                                  \n   └ ☑ verify production todo                                                   \n     ☐ expanded production todo                                                 \n   └ II. implementation                                                         \n   └ ☐ long todo 混合日本語 mixed Latin                                         \nBTW: production viewport evidence                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport \nhook: ready                                                                     \n╭─────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                           \nreserved suffix row 2                                                           \nreserved suffix row 3                                                           \nreserved suffix row 4                                                           \nreserved suffix row 5                                                           \n",
+          "text": " user                                           │   observation 混合日本語 mixed\n                                                │   Latin long IRC observation  \n assistant 47: transcript output remains        │   混合日本語 mixed Latin long \n selectable                                     │   IRC observation 混合日本語  \n                                                │   mixed Latin                 \npending: queued composer input                                                  \n                                                                                \n   Todos                                                                        \n   └ I. triage                                                                  \n   └ ☑ verify production todo                                                   \n     ☐ expanded production todo                                                 \n   └ II. implementation                                                         \n   └ ☐ long todo 混合日本語 mixed Latin                                         \nBTW: production viewport evidence                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport \nhook: ready                                                                     \n╭─────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                           \nreserved suffix row 2                                                           \nreserved suffix row 3                                                           \nreserved suffix row 4                                                           \nreserved suffix row 5                                                           \n",
+          "sha256": "08400ea3209fdb664eff0f5cf432edb905dafd6d5896a560a366b20bb18f96a4"
+        }
+      },
+      {
+        "columns": 120,
+        "rows": 36,
+        "effective_lane": "split",
+        "left_width": 81,
+        "right_width": 36,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": true,
+        "frame": {
+          "ansi": " assistant 44: transcript output remains selectable                               │                                     \n                                                                                  │                                     \n                                                                                  │                                     \n user                                                                             │                                     \n                                                                                  │                                     \n assistant 45: transcript output remains selectable                               │ worker → you · 00:00                \n                                                                                  │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n user                                                                             │   混合日本語 mixed Latin long IRC   \n                                                                                  │   observation 混合日本語 mixed Latin\n assistant 46: transcript output remains selectable                               │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin long IRC   \n user                                                                             │   observation 混合日本語 mixed Latin\n                                                                                  │   long IRC observation 混合日本語   \n assistant 47: transcript output remains selectable                               │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin            \npending: queued composer input                                                                                          \n                                                                                                                        \n   Todos                                                                                                                \n   └ I. triage                                                                                                          \n   └ ☑ verify production todo                                                                                           \n     ☐ expanded production todo                                                                                         \n   └ II. implementation                                                                                                 \n   └ ☐ long todo 混合日本語 mixed Latin                                                                                 \nBTW: production viewport evidence                                                                                       \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────── vsticky-viewport \nhook: ready                                                                                                             \n╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                                                            │ \n╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                                                                   \nreserved suffix row 2                                                                                                   \nreserved suffix row 3                                                                                                   \nreserved suffix row 4                                                                                                   \nreserved suffix row 5                                                                                                   \n",
+          "text": " assistant 44: transcript output remains selectable                               │                                     \n                                                                                  │                                     \n                                                                                  │                                     \n user                                                                             │                                     \n                                                                                  │                                     \n assistant 45: transcript output remains selectable                               │ worker → you · 00:00                \n                                                                                  │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n user                                                                             │   混合日本語 mixed Latin long IRC   \n                                                                                  │   observation 混合日本語 mixed Latin\n assistant 46: transcript output remains selectable                               │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin long IRC   \n user                                                                             │   observation 混合日本語 mixed Latin\n                                                                                  │   long IRC observation 混合日本語   \n assistant 47: transcript output remains selectable                               │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin            \npending: queued composer input                                                                                          \n                                                                                                                        \n   Todos                                                                                                                \n   └ I. triage                                                                                                          \n   └ ☑ verify production todo                                                                                           \n     ☐ expanded production todo                                                                                         \n   └ II. implementation                                                                                                 \n   └ ☐ long todo 混合日本語 mixed Latin                                                                                 \nBTW: production viewport evidence                                                                                       \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────── vsticky-viewport \nhook: ready                                                                                                             \n╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                                                            │ \n╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                                                                   \nreserved suffix row 2                                                                                                   \nreserved suffix row 3                                                                                                   \nreserved suffix row 4                                                                                                   \nreserved suffix row 5                                                                                                   \n",
+          "sha256": "3144df59679dc76c2d0d4e022bcafa1e5beb4a8ac373c507751739dbc740f7a7"
+        }
+      },
+      {
+        "columns": 160,
+        "rows": 48,
+        "effective_lane": "split",
+        "left_width": 109,
+        "right_width": 48,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": true,
+        "frame": {
+          "ansi": " user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 42: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 43: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 44: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 45: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │ worker → you · 00:00                            \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n assistant 46: transcript output remains selectable                                                           │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n user                                                                                                         │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n assistant 47: transcript output remains selectable                                                           │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \npending: queued composer input                                                                                                                                  \n                                                                                                                                                                \n   Todos                                                                                                                                                        \n   └ I. triage                                                                                                                                                  \n   └ ☑ verify production todo                                                                                                                                   \n     ☐ expanded production todo                                                                                                                                 \n   └ II. implementation                                                                                                                                         \n   └ ☐ long todo 混合日本語 mixed Latin                                                                                                                         \nBTW: production viewport evidence                                                                                                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── vsticky-viewport \nhook: ready                                                                                                                                                     \n╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                                                                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                                                                                                           \nreserved suffix row 2                                                                                                                                           \nreserved suffix row 3                                                                                                                                           \nreserved suffix row 4                                                                                                                                           \nreserved suffix row 5                                                                                                                                           \n",
+          "text": " user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 42: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 43: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 44: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │                                                 \n                                                                                                              │                                                 \n assistant 45: transcript output remains selectable                                                           │                                                 \n                                                                                                              │                                                 \n                                                                                                              │                                                 \n user                                                                                                         │ worker → you · 00:00                            \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n assistant 46: transcript output remains selectable                                                           │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n user                                                                                                         │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \n assistant 47: transcript output remains selectable                                                           │   long IRC observation 混合日本語 mixed Latin   \n                                                                                                              │   long IRC observation 混合日本語 mixed Latin   \npending: queued composer input                                                                                                                                  \n                                                                                                                                                                \n   Todos                                                                                                                                                        \n   └ I. triage                                                                                                                                                  \n   └ ☑ verify production todo                                                                                                                                   \n     ☐ expanded production todo                                                                                                                                 \n   └ II. implementation                                                                                                                                         \n   └ ☐ long todo 混合日本語 mixed Latin                                                                                                                         \nBTW: production viewport evidence                                                                                                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── vsticky-viewport \nhook: ready                                                                                                                                                     \n╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                                                                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                                                                                                           \nreserved suffix row 2                                                                                                                                           \nreserved suffix row 3                                                                                                                                           \nreserved suffix row 4                                                                                                                                           \nreserved suffix row 5                                                                                                                                           \n",
+          "sha256": "66d8184b57d4b6cbe5c429ba9e7e24fb4b47e956af32e22554d922041cb688be"
+        }
+      },
+      {
+        "columns": 120,
+        "rows": 36,
+        "effective_lane": "split",
+        "left_width": 81,
+        "right_width": 36,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": true,
+        "frame": {
+          "ansi": " assistant 44: transcript output remains selectable                               │                                     \n                                                                                  │                                     \n                                                                                  │                                     \n user                                                                             │                                     \n                                                                                  │                                     \n assistant 45: transcript output remains selectable                               │ worker → you · 00:00                \n                                                                                  │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n user                                                                             │   混合日本語 mixed Latin long IRC   \n                                                                                  │   observation 混合日本語 mixed Latin\n assistant 46: transcript output remains selectable                               │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin long IRC   \n user                                                                             │   observation 混合日本語 mixed Latin\n                                                                                  │   long IRC observation 混合日本語   \n assistant 47: transcript output remains selectable                               │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin            \npending: queued composer input                                                                                          \n                                                                                                                        \n   Todos                                                                                                                \n   └ I. triage                                                                                                          \n   └ ☑ verify production todo                                                                                           \n     ☐ expanded production todo                                                                                         \n   └ II. implementation                                                                                                 \n   └ ☐ long todo 混合日本語 mixed Latin                                                                                 \nBTW: production viewport evidence                                                                                       \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────── vsticky-viewport \nhook: ready                                                                                                             \n╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                                                            │ \n╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                                                                   \nreserved suffix row 2                                                                                                   \nreserved suffix row 3                                                                                                   \nreserved suffix row 4                                                                                                   \nreserved suffix row 5                                                                                                   \n",
+          "text": " assistant 44: transcript output remains selectable                               │                                     \n                                                                                  │                                     \n                                                                                  │                                     \n user                                                                             │                                     \n                                                                                  │                                     \n assistant 45: transcript output remains selectable                               │ worker → you · 00:00                \n                                                                                  │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n user                                                                             │   混合日本語 mixed Latin long IRC   \n                                                                                  │   observation 混合日本語 mixed Latin\n assistant 46: transcript output remains selectable                               │   long IRC observation 混合日本語   \n                                                                                  │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin long IRC   \n user                                                                             │   observation 混合日本語 mixed Latin\n                                                                                  │   long IRC observation 混合日本語   \n assistant 47: transcript output remains selectable                               │   mixed Latin long IRC observation  \n                                                                                  │   混合日本語 mixed Latin            \npending: queued composer input                                                                                          \n                                                                                                                        \n   Todos                                                                                                                \n   └ I. triage                                                                                                          \n   └ ☑ verify production todo                                                                                           \n     ☐ expanded production todo                                                                                         \n   └ II. implementation                                                                                                 \n   └ ☐ long todo 混合日本語 mixed Latin                                                                                 \nBTW: production viewport evidence                                                                                       \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────── vsticky-viewport \nhook: ready                                                                                                             \n╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                                                            │ \n╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                                                                   \nreserved suffix row 2                                                                                                   \nreserved suffix row 3                                                                                                   \nreserved suffix row 4                                                                                                   \nreserved suffix row 5                                                                                                   \n",
+          "sha256": "3144df59679dc76c2d0d4e022bcafa1e5beb4a8ac373c507751739dbc740f7a7"
+        }
+      },
+      {
+        "columns": 80,
+        "rows": 24,
+        "effective_lane": "split",
+        "left_width": 47,
+        "right_width": 30,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": true,
+        "frame": {
+          "ansi": " user                                           │   observation 混合日本語 mixed\n                                                │   Latin long IRC observation  \n assistant 47: transcript output remains        │   混合日本語 mixed Latin long \n selectable                                     │   IRC observation 混合日本語  \n                                                │   mixed Latin                 \npending: queued composer input                                                  \n                                                                                \n   Todos                                                                        \n   └ I. triage                                                                  \n   └ ☑ verify production todo                                                   \n     ☐ expanded production todo                                                 \n   └ II. implementation                                                         \n   └ ☐ long todo 混合日本語 mixed Latin                                         \nBTW: production viewport evidence                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport \nhook: ready                                                                     \n╭─────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                           \nreserved suffix row 2                                                           \nreserved suffix row 3                                                           \nreserved suffix row 4                                                           \nreserved suffix row 5                                                           \n",
+          "text": " user                                           │   observation 混合日本語 mixed\n                                                │   Latin long IRC observation  \n assistant 47: transcript output remains        │   混合日本語 mixed Latin long \n selectable                                     │   IRC observation 混合日本語  \n                                                │   mixed Latin                 \npending: queued composer input                                                  \n                                                                                \n   Todos                                                                        \n   └ I. triage                                                                  \n   └ ☑ verify production todo                                                   \n     ☐ expanded production todo                                                 \n   └ II. implementation                                                         \n   └ ☐ long todo 混合日本語 mixed Latin                                         \nBTW: production viewport evidence                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport \nhook: ready                                                                     \n╭─────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                           \nreserved suffix row 2                                                           \nreserved suffix row 3                                                           \nreserved suffix row 4                                                           \nreserved suffix row 5                                                           \n",
+          "sha256": "08400ea3209fdb664eff0f5cf432edb905dafd6d5896a560a366b20bb18f96a4"
+        }
+      },
+      {
+        "columns": 65,
+        "rows": 10,
+        "effective_lane": "split",
+        "left_width": 32,
+        "right_width": 30,
+        "separator_width": 3,
+        "irc_records": 1,
+        "todo_rows": 1,
+        "todo_expanded": false,
+        "frame": {
+          "ansi": " ⬢ sonnet-4.5 · 0.0% ────────────────────────── vsticky-viewport \nhook: ready                                                      \n╭──────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                     │ \n╰──────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                            \nreserved suffix row 2                                            \nreserved suffix row 3                                            \nreserved suffix row 4                                            \nreserved suffix row 5                                            \n",
+          "text": " ⬢ sonnet-4.5 · 0.0% ────────────────────────── vsticky-viewport \nhook: ready                                                      \n╭──────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                     │ \n╰──────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                            \nreserved suffix row 2                                            \nreserved suffix row 3                                            \nreserved suffix row 4                                            \nreserved suffix row 5                                            \n",
+          "sha256": "89bf57495c4b0ce8387b73a152b66805930fc15b2749b045e6f8dcf8fc5ca4b0"
+        }
+      },
+      {
+        "columns": 64,
+        "rows": 10,
+        "effective_lane": "transcript",
+        "left_width": 64,
+        "right_width": 0,
+        "separator_width": 0,
+        "irc_records": 0,
+        "todo_rows": 0,
+        "todo_expanded": false,
+        "frame": {
+          "ansi": " ⬢ sonnet-4.5 · 0.0% ───────────────────────── vsticky-viewport \nhook: ready                                                     \n╭─────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                    │ \n╰─────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                           \nreserved suffix row 2                                           \nreserved suffix row 3                                           \nreserved suffix row 4                                           \nreserved suffix row 5                                           \n",
+          "text": " ⬢ sonnet-4.5 · 0.0% ───────────────────────── vsticky-viewport \nhook: ready                                                     \n╭─────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                    │ \n╰─────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                           \nreserved suffix row 2                                           \nreserved suffix row 3                                           \nreserved suffix row 4                                           \nreserved suffix row 5                                           \n",
+          "sha256": "9ccd08e93ccddcddd08a18cec7d4e81e11623b20aa233ce62a81ac46c682fb1a"
+        }
+      }
+    ],
+    "visible_empty_irc_frame": {
+      "ansi": "                                                │                               \n user                                           │                               \n                                                │                               \n assistant 46: transcript output remains        │                               \n selectable                                     │                               \n                                                │                               \n                                                │                               \n user                                           │                               \n                                                │                               \n assistant 47: transcript output remains        │                               \n selectable                                     │                               \n                                                │                               \npending: queued composer input                                                  \nBTW: production viewport evidence                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport \nhook: ready                                                                     \n╭─────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                           \nreserved suffix row 2                                                           \nreserved suffix row 3                                                           \nreserved suffix row 4                                                           \nreserved suffix row 5                                                           \n",
+      "text": "                                                │                               \n user                                           │                               \n                                                │                               \n assistant 46: transcript output remains        │                               \n selectable                                     │                               \n                                                │                               \n                                                │                               \n user                                           │                               \n                                                │                               \n assistant 47: transcript output remains        │                               \n selectable                                     │                               \n                                                │                               \npending: queued composer input                                                  \nBTW: production viewport evidence                                               \n ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport \nhook: ready                                                                     \n╭─────────────────────────────────────────────────────────────────────────────╮ \n│ > capacity-zero composer                                                    │ \n╰─────────────────────────────────────────────────────────────────────────────╯ \nreserved suffix row 1                                                           \nreserved suffix row 2                                                           \nreserved suffix row 3                                                           \nreserved suffix row 4                                                           \nreserved suffix row 5                                                           \n",
+      "sha256": "8340cbd777d0a5efab466e1785d8fae03ee753c71091861eec202837533530d4"
+    },
+    "root_order": [
+      "irc-split",
+      "pending-messages",
+      "status-container",
+      "todos",
+      "btw",
+      "status-line",
+      "hooks-above",
+      "editor-container",
+      "pet-floor",
+      "hooks-below"
+    ],
+    "pin_boundary": {
+      "component": "status-line",
+      "index": 5,
+      "row": 0,
+      "pinned": true
+    },
+    "focused_component": "editor",
+    "cursor": {
+      "row": 3,
+      "col": 26,
+      "visible": true,
+      "frame_sha256": "6529580c2eabbce471c5645812a62db6f8475a7d677c1fd92ec4ee4588e21dae",
+      "blink": true
+    },
+    "selection": null,
+    "semantic_anchor": null,
+    "cjk_contiguous_semantics": [
+      "의미 있는 문장 경계",
+      "意味のある文の境界",
+      "保留语义短语边界"
+    ],
+    "coverage": {
+      "irc": [
+        "empty",
+        "streaming",
+        "long"
+      ],
+      "todo": [
+        "empty",
+        "populated",
+        "long",
+        "multi-phase",
+        "collapsed",
+        "expanded"
+      ],
+      "widths": [
+        64,
+        65,
+        80,
+        120,
+        160,
+        120,
+        80,
+        65,
+        64
+      ],
+      "heights": [
+        "short",
+        "standard"
+      ],
+      "viewport": [
+        "manual",
+        "follow",
+        "resize-grow",
+        "resize-shrink"
+      ],
+      "chrome": [
+        "pending",
+        "statusContainer",
+        "btw",
+        "statusLine",
+        "hooks",
+        "editor",
+        "pet"
+      ],
+      "evidence": [
+        "overlap",
+        "width-overflow",
+        "hidden-cursor-focus",
+        "anchor-loss",
+        "cjk-semantic-break"
+      ]
+    }
+  },
+  "provenance": {
+    "capture_mode": "production-tui-virtual-terminal",
+    "live_pty": false,
+    "network": false,
+    "fixed_clock": true,
+    "author_identity": "capture-sticky-viewport-showcase",
+    "executor_identity": "capture-sticky-viewport-showcase",
+    "git_head": "37ce0360d9755f79567b968e22a420bfd6c90d9b",
+    "oracle_commit": "37ce0360d9755f79567b968e22a420bfd6c90d9b",
+    "git_diff_scope": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "bun.lock",
+      "crates",
+      "packages/agent/src",
+      "packages/ai/src",
+      "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+      "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+      "packages/coding-agent/src",
+      "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+      "packages/natives/native",
+      "packages/stats/src",
+      "packages/tui/src",
+      "packages/tui/test/virtual-terminal.ts",
+      "packages/utils/src"
+    ],
+    "git_diff_binary_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_sha256": {
+      "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts": "f93ad57595e69c72f82ce04a69825db373b4c44b8018f7da0a5c960d904ad2ed",
+      "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts": "6f1c4ebb53b8e15cafd4da8bc69d6fdad79466e18b45c08a734f1f3f6138d25a",
+      "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts": "5b75a1a87ed78b2dbb8a4cb05b6b41067b753624ee78b62bb7baa3cd3deb62a3",
+      "packages/coding-agent/src/modes/interactive-mode.ts": "dc9cae46ccac36f49eef61e2bd4e2fd142a40059df877d98565905123aa82eae",
+      "packages/coding-agent/src/modes/components/irc-sidebar.ts": "538b06bece50815e85194bdb024bff9014181004a971a2ddf0fa4040779e699d",
+      "packages/tui/src/tui.ts": "398cd35524bbf86ed47c5af5ee711e6870f3091879c91738b4d1bcae8f5acb53"
+    }
+  },
+  "cjk_phrase_boundaries": []
+}

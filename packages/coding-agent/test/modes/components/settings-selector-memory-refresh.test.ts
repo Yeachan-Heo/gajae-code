@@ -22,7 +22,6 @@ afterEach(() => {
 function createSelector(): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
-			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],
@@ -80,7 +79,6 @@ describe("SettingsSelectorComponent memory tab", () => {
 			await Settings.init({ cwd: testDir, agentDir });
 			const component = new SettingsSelectorComponent(
 				{
-					settings: Settings.instance,
 					availableThinkingLevels: [],
 					thinkingLevel: undefined,
 					availableThemes: ["blue-crab"],

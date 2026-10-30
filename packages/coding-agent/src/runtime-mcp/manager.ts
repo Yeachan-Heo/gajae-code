@@ -457,8 +457,6 @@ export class MCPManager {
 	readonly #retiredLeaseReleases = new Set<RetiredLeaseRelease>();
 	#nextScopedOperationId = 1;
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
-	/** Tools a connected server could not publish because another server holds the name. */
-	#shadowedServerTools = new Map<string, CustomTool<TSchema, MCPToolDetails>[]>();
 	#toolCatalogGeneration = 0;
 	#toolCatalogPublished = false;
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
@@ -1727,60 +1725,11 @@ export class MCPManager {
 		const publishedTools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
-		this.#shadowedServerTools.delete(name);
-		if (!this.#suppressedServers.has(name)) {
-			// Tool names are normalized per server (`foo-bar` and `foo.bar` both map to
-			// `mcp__foo_bar_*`). A server joining or refreshing a live catalog must never
-			// replace another server's tool under the same name: keep the existing tool and
-			// hold the incoming one until the name is free.
-			const publishedNames = new Set(publishedTools.map(tool => tool.name));
-			const shadowed: CustomTool<TSchema, MCPToolDetails>[] = [];
-			for (const tool of tools) {
-				if (publishedNames.has(tool.name)) {
-					logger.warn("Skipping MCP tool whose name is already published by another server", {
-						path: `mcp:${name}`,
-						tool: tool.name,
-					});
-					shadowed.push(tool);
-					continue;
-				}
-				publishedNames.add(tool.name);
-				publishedTools.push(tool);
-			}
-			if (shadowed.length > 0) this.#shadowedServerTools.set(name, shadowed);
-		}
-		// This server may have dropped a name another connected server is waiting for.
-		this.#promoteShadowedTools(publishedTools);
+		if (!this.#suppressedServers.has(name)) publishedTools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(publishedTools);
 		this.#publishToolCatalog(publishedTools);
-	}
-
-	/**
-	 * Publish held tools whose name has become free, for servers that are still
-	 * connected. Servers are visited in name order so the surviving owner is deterministic.
-	 * Returns true when a tool was added.
-	 */
-	#promoteShadowedTools(publishedTools: CustomTool<TSchema, MCPToolDetails>[]): boolean {
-		const publishedNames = new Set(publishedTools.map(tool => tool.name));
-		let promoted = false;
-		for (const server of [...this.#shadowedServerTools.keys()].sort()) {
-			if (!this.#connections.has(server) || this.#suppressedServers.has(server)) continue;
-			const stillShadowed: CustomTool<TSchema, MCPToolDetails>[] = [];
-			for (const tool of this.#shadowedServerTools.get(server) ?? []) {
-				if (publishedNames.has(tool.name)) {
-					stillShadowed.push(tool);
-					continue;
-				}
-				publishedNames.add(tool.name);
-				publishedTools.push(tool);
-				promoted = true;
-			}
-			if (stillShadowed.length > 0) this.#shadowedServerTools.set(server, stillShadowed);
-			else this.#shadowedServerTools.delete(server);
-		}
-		return promoted;
 	}
 
 	#exactToolOptions(
@@ -2632,9 +2581,6 @@ export class MCPManager {
 			const remainingTools = this.#tools.filter(
 				tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 			);
-			this.#shadowedServerTools.delete(name);
-			// A still-connected server may have been waiting for one of the freed names.
-			if (hadTools && this.#promoteShadowedTools(remainingTools)) sortMCPToolsByName(remainingTools);
 			if (hadTools) {
 				this.#publishToolCatalog(remainingTools);
 				this.#notifyToolsChanged();
@@ -2749,7 +2695,6 @@ export class MCPManager {
 			this.#pendingExactControlServers.clear();
 			this.#connections.clear();
 			const hadTools = this.#tools.length > 0;
-			this.#shadowedServerTools.clear();
 			this.#publishToolCatalog([]);
 			if (hadTools) this.#notifyToolsChanged();
 			this.#subscribedResources.clear();
@@ -2800,61 +2745,6 @@ export class MCPManager {
 		return attempt.finally(() => {
 			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
 		});
-	}
-
-	/** Connect one ordinary session server without the startup cache fallback. */
-	async connectSessionServer(
-		name: string,
-		config: MCPServerConfig,
-		source: SourceMeta,
-		options?: { restart?: boolean },
-	): Promise<MCPServerConnection> {
-		this.#assertRawMCPAccessAllowed();
-		this.#assertConnectionSetMutable();
-		if (options?.restart && this.#connections.has(name)) {
-			await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true, preserveTools: true });
-		}
-		const existing = this.#connections.get(name);
-		if (existing) return existing;
-		if (
-			this.#pendingConnections.has(name) ||
-			this.#pendingToolLoads.has(name) ||
-			this.#pendingReconnections.has(name)
-		) {
-			throw new Error("connection already pending");
-		}
-		const validationErrors = validateServerConfig(name, config);
-		if (validationErrors.length > 0) throw new Error(validationErrors.join("; "));
-		this.#pruneSettledPendingAcquireCleanups(name);
-		await this.#closePendingConnectionCleanup(name);
-		const hadState = this.#serverConfigs.has(name) || this.#tools.some(tool => tool.mcpServerName === name);
-		this.#serverConfigs.set(name, config);
-		this.#sources.set(name, source);
-		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
-		const flight = this.#connectAndWireServer(name, config, source, this.#epoch, disconnectEpoch);
-		this.#pendingConnections.set(name, flight);
-		let timer: Timer | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() => reject(new Error(`MCP connection timed out: ${name}`)),
-				resolveExactConfigStartupTimeoutMs([config]),
-			);
-		});
-		try {
-			return await Promise.race([flight, timeout]);
-		} catch (error) {
-			void flight.catch(() => {});
-			if ((this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch) {
-				await this.#disconnectServer(
-					name,
-					hadState ? { preserveConfig: true, preserveSource: true, preserveTools: true } : undefined,
-				).catch(cleanupError => this.#logLeaseReleaseFailure(name, this.#connections.get(name), cleanupError));
-			}
-			throw error;
-		} finally {
-			if (timer) clearTimeout(timer);
-			if (this.#pendingConnections.get(name) === flight) this.#pendingConnections.delete(name);
-		}
 	}
 
 	#startReconnect(name: string): Promise<MCPServerConnection | null> {

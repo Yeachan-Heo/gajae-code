@@ -30,7 +30,6 @@ beforeEach(async () => {
 function createSelector(): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
-			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw", "blue-crab"],

@@ -3,7 +3,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@gajae-code/ai/core";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { resolveGjcCommand } from "../task/gjc-command";
 import { shortenPath } from "../tools/render-utils";
 
@@ -314,13 +313,7 @@ async function gitOutput(
 	maxChars = MAX_GIT_OUTPUT_CHARS,
 ): Promise<string> {
 	try {
-		const proc = Bun.spawn(["git", ...args], {
-			env: projectSafeSpawnEnv(),
-			cwd,
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "ignore",
-		});
+		const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
 		const stop = (): void => {
 			try {
 				proc.kill();

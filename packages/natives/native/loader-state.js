@@ -845,9 +845,6 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.currentExecutablePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required executable identity capability \`currentExecutablePath\`.`);
 	}
-	if (typeof bindings.readOwnerOnlyFile !== "function") {
-		throw new Error(`Loaded ${candidate} but it lacks required owner-only reader capability \`readOwnerOnlyFile\`.`);
-	}
 }
 
 function buildHelpMessage(ctx) {

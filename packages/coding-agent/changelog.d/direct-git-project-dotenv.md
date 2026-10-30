@@ -1,3 +1,0 @@
-### Fixed
-
-- The subsystems that run `git` directly instead of through GJC's git wrapper -- `gjc --worktree` launch, ultragoal checkpoints, autoresearch and harness status, plugin installs, contribution prep, ralplan, the coordinator's branch-name check, and the bash tool's worktree check -- now start git from the same filtered environment as the bash tool. Previously, on source and npm installs (Bun dotenv autoload), a repository `.env` declaring `GIT_CONFIG_*` could set `core.hooksPath` or `core.fsmonitor` and make that git run repository code; for example `gjc --worktree` ran a planted `post-checkout` hook and ultragoal checkpoints ran a planted fsmonitor.

@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $flag, $which, logger } from "@gajae-code/utils";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { TOML } from "bun";
 import { spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { isProjectControlledPath } from "./path-trust";
@@ -108,9 +107,6 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
 	try {
 		const owner = spawnOwnedProcess([binaryPath, "status"], {
 			stdin: "ignore",
-			// The process already merged the repository dotenv. Filter it so this child
-			// does not receive project hook variables.
-			env: projectSafeSpawnEnv(),
 			name: "lspmux:status",
 		});
 		const proc = owner.child;

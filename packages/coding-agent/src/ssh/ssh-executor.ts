@@ -1,5 +1,4 @@
 import { logger, ptree } from "@gajae-code/utils";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { Settings } from "../config/settings";
 import { OutputSink, type TerminalArtifactPublisher } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -88,8 +87,6 @@ export async function executeSSH(
 	}
 
 	using child = ptree.spawn(["ssh", ...(await buildRemoteCommand(host, resolvedCommand))], {
-		// Without `env`, Bun hands ssh the autoloaded environment, project `.env` included.
-		env: projectSafeSpawnEnv(),
 		signal: options?.signal,
 		timeout: options?.timeout,
 		stdin: "pipe",

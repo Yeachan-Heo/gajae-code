@@ -115,9 +115,6 @@ describe("status line preview/cancel restore (statusLine.maxRows)", () => {
 		let stopped = false;
 		const controller = new SelectorController({
 			settings,
-			// Production wires ctx.settings and ctx.session.settings to the same owner
-			// (interactive-mode.ts); the controller reads the live session owner.
-			session: { settings },
 			statusLine: component,
 			isStopped: () => stopped,
 			updateEditorTopBorder: () => borderUpdates++,
@@ -158,7 +155,6 @@ describe("status line preview/cancel restore (statusLine.maxRows)", () => {
 			editor,
 			ui,
 			session: {
-				settings,
 				getAvailableThinkingLevels: () => [],
 				thinkingLevel: undefined,
 				getActiveModelProfile: () => undefined,

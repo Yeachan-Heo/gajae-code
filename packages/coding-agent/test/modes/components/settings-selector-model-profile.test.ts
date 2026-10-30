@@ -25,7 +25,6 @@ function createSelector(availableModelProfiles: string[]): {
 	const changedSettings: ChangedSetting[] = [];
 	const component = new SettingsSelectorComponent(
 		{
-			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],

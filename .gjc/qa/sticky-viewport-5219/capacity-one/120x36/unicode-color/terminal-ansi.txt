@@ -1,0 +1,36 @@
+[0m[48;5;234m [0m[38;5;224;48;5;234massistant 0: transcript output remains selectable[0m[48;5;234m                               [0m[38;5;240m │ [0m                                    
+[0m[38;5;224;48;5;234m [0m[38;5;203;48;5;234m⬢ sonnet-4.5 · [0m[38;5;116;48;5;234m0.0%[0m[48;5;234m [0m[38;5;88m─────────────────────────────────────────────────────────────────────────────────[0m[38;5;224;48;5;234m [0m[38;5;240;48;5;234mvsticky-viewport[0m[48;5;234m [0m
+hook: ready                                                                                                             
+[0m[38;5;240m╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮[0m 
+[0m[38;5;240m│ [0m[38;5;203m>[0m capacity-one composer                                                                                            [0m[38;5;240m │[0m 
+[0m[38;5;240m╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[0m 
+reserved suffix row 1                                                                                                   
+reserved suffix row 2                                                                                                   
+reserved suffix row 3                                                                                                   
+reserved suffix row 4                                                                                                   
+reserved suffix row 5                                                                                                   
+reserved suffix row 6                                                                                                   
+reserved suffix row 7                                                                                                   
+reserved suffix row 8                                                                                                   
+reserved suffix row 9                                                                                                   
+reserved suffix row 10                                                                                                  
+reserved suffix row 11                                                                                                  
+reserved suffix row 12                                                                                                  
+reserved suffix row 13                                                                                                  
+reserved suffix row 14                                                                                                  
+reserved suffix row 15                                                                                                  
+reserved suffix row 16                                                                                                  
+reserved suffix row 17                                                                                                  
+reserved suffix row 18                                                                                                  
+reserved suffix row 19                                                                                                  
+reserved suffix row 20                                                                                                  
+reserved suffix row 21                                                                                                  
+reserved suffix row 22                                                                                                  
+reserved suffix row 23                                                                                                  
+reserved suffix row 24                                                                                                  
+reserved suffix row 25                                                                                                  
+reserved suffix row 26                                                                                                  
+reserved suffix row 27                                                                                                  
+reserved suffix row 28                                                                                                  
+reserved suffix row 29                                                                                                  
+reserved suffix row 30                                                                                                  

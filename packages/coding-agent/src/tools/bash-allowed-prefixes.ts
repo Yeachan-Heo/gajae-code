@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import {
 	classifyStateArgv,
 	STATE_ACTION_NAMES,
@@ -412,7 +411,6 @@ function inlineStateSessionIds(words: readonly string[]): string[] {
 
 function gitCommonDir(directory: string): string | undefined {
 	const result = Bun.spawnSync(["git", "-C", directory, "rev-parse", "--git-common-dir"], {
-		env: projectSafeSpawnEnv(),
 		stdout: "pipe",
 		stderr: "ignore",
 	});

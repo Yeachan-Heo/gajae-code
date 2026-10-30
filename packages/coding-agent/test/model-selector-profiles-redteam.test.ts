@@ -105,7 +105,6 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		return originalOverride(path, value);
 	}) as typeof settings.override;
 	const session = {
-		settings,
 		model: alternateModel as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",

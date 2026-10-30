@@ -15,7 +15,6 @@ import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/c
 import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	getImageGenToolsWithRegistry,
-	type ImageGenParams,
 	imageGenTool,
 	UnsupportedImageProviderError,
 } from "@gajae-code/coding-agent/tools/image-gen";
@@ -194,8 +193,6 @@ describe("imageGenTool", () => {
 		const releaseSpy = vi.spyOn(os, "release").mockReturnValue("4.4.302-Minimal™-EAS-QTI_Haptic-R26");
 		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as NodeJS.Architecture);
 		let userAgent: string | undefined;
-		let requestUrl: string | undefined;
-		let requestBody: unknown;
 
 		const codexModel = {
 			api: "openai-codex-responses",
@@ -210,9 +207,7 @@ describe("imageGenTool", () => {
 		).toString("base64url");
 		const codexApiKey = `header.${jwtPayload}.signature`;
 
-		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-			requestUrl = input.toString();
-			requestBody = JSON.parse(String(init?.body));
+		const fetchMock: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
 			userAgent = new Headers(init?.headers).get("User-Agent") ?? undefined;
 			return new Response(
 				JSON.stringify({
@@ -224,6 +219,7 @@ describe("imageGenTool", () => {
 							status: "completed",
 						},
 					],
+					usage: { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
 			);
@@ -257,169 +253,10 @@ describe("imageGenTool", () => {
 			`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
 		);
 		expect(userAgent).toMatch(originatorRegex);
-		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
-		expect(requestBody).toMatchObject({
-			model: "gpt-5.5",
-			stream: true,
-		});
-		expect(requestBody).toHaveProperty("tools");
-		expect(requestBody).toHaveProperty("input");
-		expect(requestBody).not.toHaveProperty("output_format");
 		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
 		platformSpy.mockRestore();
 		releaseSpy.mockRestore();
 		archSpy.mockRestore();
-	});
-	function setupCodexImageGen(id: string, output: Model["output"], baseUrl: string, respond: () => Response) {
-		delete Bun.env.OPENAI_BASE_URL;
-		const captured: { fetchCalls: number; requestUrl?: string; requestBody?: unknown } = { fetchCalls: 0 };
-		const model = {
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			id,
-			name: id,
-			baseUrl,
-			output,
-		} as Model;
-		const jwtPayload = Buffer.from(
-			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
-		).toString("base64url");
-		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-			captured.fetchCalls++;
-			captured.requestUrl = input.toString();
-			captured.requestBody = JSON.parse(String(init?.body));
-			return respond();
-		}) as unknown as typeof fetch;
-		fetchMock.preconnect = originalFetch.preconnect;
-		global.fetch = fetchMock;
-		const ctx: CustomToolContext = {
-			sessionManager: {
-				getCwd: () => "/tmp",
-				getSessionId: () => "test-session",
-			} as unknown as ReadonlySessionManager,
-			modelRegistry: makeMockRegistry(
-				{ getApiKey: async () => `header.${jwtPayload}.signature`, getApiKeyForProvider: async () => undefined },
-				[model],
-			),
-			model,
-			settings: makeMockSettings(`openai-codex/${id}`),
-			isIdle: () => true,
-			hasQueuedMessages: () => false,
-			abort: () => {},
-		};
-		return {
-			captured,
-			run: (params: ImageGenParams) => imageGenTool.execute("call-codex", params, undefined, ctx),
-		};
-	}
-	it("posts bundled Codex gpt-image-* models to the generations route", async () => {
-		const { captured, run } = setupCodexImageGen(
-			"gpt-image-2",
-			["image"],
-			"",
-			() =>
-				new Response(
-					JSON.stringify({
-						data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
-					}),
-					{ status: 200, headers: { "content-type": "application/json" } },
-				),
-		);
-		const result = await run({ subject: "a circle" });
-		const imagePaths = result.details?.imagePaths ?? [];
-		generatedImagePaths.push(...imagePaths);
-		expect(imagePaths).toHaveLength(1);
-		expect((await fs.readFile(imagePaths[0])).toString()).toBe("fake-webp");
-		const { requestUrl, requestBody } = captured;
-		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
-		expect(requestBody).toMatchObject({ model: "gpt-image-2", n: 1, quality: "auto", output_format: "webp" });
-		expect(requestBody).not.toHaveProperty("tools");
-		expect(requestBody).not.toHaveProperty("input");
-	});
-	async function codexRequestFor(
-		id: string,
-		output: Model["output"],
-		baseUrl: string,
-		input?: { data: string; mime_type: string }[],
-	): Promise<{ fetchCalls: number; requestUrl?: string; requestBody?: unknown }> {
-		const { captured, run } = setupCodexImageGen(
-			id,
-			output,
-			baseUrl,
-			() => new Response("bad gateway", { status: 502 }),
-		);
-		await expect(run({ subject: "a circle", ...(input ? { input } : {}) })).rejects.toThrow(
-			"OpenAI image request failed (502)",
-		);
-		return captured;
-	}
-	describe.each([
-		["/codex", "https://chatgpt.com/backend-api/codex"],
-		["/codex/responses", "https://chatgpt.com/backend-api/codex/responses/"],
-	])("Codex base URL ending in %s", (_suffix, baseUrl) => {
-		it("posts bundled gpt-image-* models to a single /codex/images/generations route", async () => {
-			expect((await codexRequestFor("gpt-image-2", ["image"], baseUrl)).requestUrl).toBe(
-				"https://chatgpt.com/backend-api/codex/images/generations",
-			);
-		});
-
-		it("keeps chat models on /codex/responses", async () => {
-			expect((await codexRequestFor("gpt-5.5", ["text", "image"], baseUrl)).requestUrl).toBe(
-				"https://chatgpt.com/backend-api/codex/responses",
-			);
-		});
-	});
-	describe.each([
-		[
-			"a query string",
-			"https://proxy.example/backend-api/?trace=1",
-			"https://proxy.example/backend-api/codex/responses?trace=1",
-		],
-		[
-			"a fragment",
-			"https://proxy.example/backend-api/codex#section/codex",
-			"https://proxy.example/backend-api/codex/responses",
-		],
-		["a hostname ending in codex", "http://codex/", "http://codex/codex/responses"],
-	])("Codex base URL with %s", (_label, baseUrl, responsesUrl) => {
-		it("normalizes the responses route on the pathname", async () => {
-			expect((await codexRequestFor("gpt-5.5", ["text", "image"], baseUrl)).requestUrl).toBe(responsesUrl);
-		});
-	});
-	it("keeps custom image-only Codex models that are not gpt-image-* on /codex/responses, including edits", async () => {
-		const { requestUrl, requestBody } = await codexRequestFor("custom-image-model", ["image"], "", [
-			{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" },
-		]);
-		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
-		expect(requestBody).toMatchObject({ model: "custom-image-model" });
-		expect(requestBody).toHaveProperty("tools");
-		expect(requestBody).toHaveProperty("input");
-	});
-	describe.each(["gpt-image-custom", "gpt-image-2"])("custom Codex model %s with a custom base URL", id => {
-		it.each([
-			["generations", undefined],
-			["edits", [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }]],
-		])("keeps %s on /codex/responses with the hosted image_generation tool", async (_label, input) => {
-			const captured = await codexRequestFor(id, ["image"], "https://proxy.example/backend-api", input);
-			expect(captured.fetchCalls).toBe(1);
-			expect(captured.requestUrl).toBe("https://proxy.example/backend-api/codex/responses");
-			expect(captured.requestBody).toMatchObject({
-				model: id,
-				tools: [{ type: "image_generation" }],
-				tool_choice: { type: "image_generation" },
-			});
-			expect(captured.requestBody).toHaveProperty("input");
-		});
-	});
-	it("rejects image edits for bundled Codex gpt-image-* models before fetch", async () => {
-		const { captured, run } = setupCodexImageGen("gpt-image-2", ["image"], "", () => new Response());
-		await expect(
-			run({
-				subject: "edit this image",
-				input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
-			}),
-		).rejects.toThrow("Codex image edits are not supported on this route.");
-		expect(captured.fetchCalls).toBe(0);
 	});
 
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {

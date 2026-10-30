@@ -1,3 +1,0 @@
-### Fixed
-
-- A project `.env` can no longer choose `SSH_ASKPASS` for processes GJC starts with the filtered spawn environment (its own git and gh calls, tool servers, and the helpers started from it). With no `GIT_ASKPASS` or `core.askPass`, git runs `SSH_ASKPASS` for HTTP credential prompts even with `GIT_TERMINAL_PROMPT=0`, and ssh runs it for passphrase and host-key prompts, so a repository could make e.g. the github tool's push or fetch run its own program. `GIT_ASKPASS` was already filtered; an `SSH_ASKPASS` exported by the launching shell is still honored. The bash tool was not affected, because it pins `SSH_ASKPASS` to `/usr/bin/false`.

@@ -36,8 +36,6 @@ export interface LoadMCPConfigsOptions {
 	filterBrowser?: boolean;
 	/** Only include startup-eligible servers; exact-config sessions always enforce autoload !== false. */
 	autoloadOnly?: boolean;
-	/** Include disabled native declarations for session-local status and controls. */
-	includeDisabled?: boolean;
 	/**
 	 * Restrict discovery to GJC's own native config (`.gjc/` project and
 	 * `~/.gjc/agent/` user scopes). Conventional standalone sessions use this
@@ -69,8 +67,6 @@ export interface LoadMCPConfigsResult {
 	configurationWarning: boolean;
 	/** Provider warnings surfaced during discovery (parse/skip diagnostics). */
 	warnings: string[];
-	/** Native declarations skipped because they cannot be connected. */
-	disabled?: Record<string, { source: SourceMeta; reason: "enabled-false" | "disabled-servers"; autoload: boolean }>;
 }
 
 /**
@@ -190,17 +186,9 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	// Convert to legacy format and preserve source metadata
 	let configs: Record<string, MCPServerConfig> = {};
 	let sources: Record<string, SourceMeta> = {};
-	const disabled: NonNullable<LoadMCPConfigsResult["disabled"]> = {};
 	for (const server of servers) {
 		const config = convertToLegacyConfig(server);
 		if (config.enabled === false || disabledServers.has(server.name)) {
-			if (options?.includeDisabled && !exactConfig) {
-				disabled[server.name] = {
-					source: server._source,
-					reason: config.enabled === false ? "enabled-false" : "disabled-servers",
-					autoload: config.autoload !== false,
-				};
-			}
 			if (!exactConfig) {
 				logSkippedServer(
 					server.name,
@@ -235,14 +223,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		sources = browserResult.sources;
 	}
 
-	return {
-		configs,
-		exaApiKeys,
-		sources,
-		configurationWarning,
-		warnings,
-		...(Object.keys(disabled).length > 0 ? { disabled } : {}),
-	};
+	return { configs, exaApiKeys, sources, configurationWarning, warnings };
 }
 
 /** Pattern to match Exa MCP servers */

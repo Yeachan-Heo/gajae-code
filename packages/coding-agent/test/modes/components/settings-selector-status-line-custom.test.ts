@@ -57,7 +57,6 @@ function createSelector(options: SelectorOptions = {}) {
 	const previewWidths: Array<number | undefined> = [];
 	const component = new SettingsSelectorComponent(
 		{
-			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw", "blue-crab"],

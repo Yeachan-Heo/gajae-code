@@ -13,7 +13,6 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { type LinuxProcPidProbeResult, probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
 import { checkTmuxSelfInjection } from "../tools/tmux-self-injection-guard";
 import {
@@ -398,7 +397,6 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 function git(workspace: string, args: string[]): string | null {
 	try {
 		return execFileSync("git", args, {
-			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],

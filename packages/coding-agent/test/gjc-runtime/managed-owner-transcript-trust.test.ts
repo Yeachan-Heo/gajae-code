@@ -191,15 +191,14 @@ async function writeTerminal(cwd: string): Promise<void> {
 
 async function writePredecessor(stateDir: string): Promise<void> {
 	const root = lifecyclePaths(stateDir, sessionId, "generation-2681").root;
-	await fsp.mkdir(root, { recursive: true, mode: 0o700 });
+	await fsp.mkdir(root, { recursive: true });
 	const command = ["gjc", "--resume"];
 	const commandSha256 = createHash("sha256").update(JSON.stringify(command)).digest("hex");
 	const token = "predecessor";
 	await fsp.writeFile(
 		path.join(root, `child-${token}.binding.json`),
 		`${JSON.stringify({
-			schema_version: 3,
-			binding_kind: "recoverable",
+			schema_version: 2,
 			generation: "generation-2681",
 			session_id: sessionId,
 			run_id: "run-2681",
@@ -211,7 +210,6 @@ async function writePredecessor(stateDir: string): Promise<void> {
 			supervisor_start_time: "1",
 			created_at: "2026-07-19T00:00:00.000Z",
 		})}\n`,
-		{ mode: 0o600 },
 	);
 	await fsp.writeFile(
 		path.join(root, `sigabrt-${token}.receipt.json`),
@@ -232,7 +230,6 @@ async function writePredecessor(stateDir: string): Promise<void> {
 			exit_code: null,
 			received_at: "2026-07-19T00:00:00.000Z",
 		})}\n`,
-		{ mode: 0o600 },
 	);
 }
 
@@ -320,7 +317,7 @@ function launchReplacement(root: string, sessionEnv: Record<string, string>): st
 	const incarnation = "replacement-incarnation";
 	const predecessorToken = "exact-predecessor";
 	const ownerRoot = lifecyclePaths(root, sessionName, generation).root;
-	fs.mkdirSync(ownerRoot, { recursive: true, mode: 0o700 });
+	fs.mkdirSync(ownerRoot, { recursive: true });
 	fs.writeFileSync(
 		lifecyclePaths(root, sessionName, generation).generationFile,
 		`${JSON.stringify({ schema_version: 1, generation, session_id: sessionName, published_at: "2026-07-19T00:00:00.000Z" })}\n`,
@@ -329,13 +326,11 @@ function launchReplacement(root: string, sessionEnv: Record<string, string>): st
 	const commandSha256 = createHash("sha256").update(JSON.stringify(command)).digest("hex");
 	fs.writeFileSync(
 		path.join(ownerRoot, `child-${predecessorToken}.binding.json`),
-		`${JSON.stringify({ schema_version: 3, binding_kind: "recoverable", generation, session_id: sessionName, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, created_at: "2026-07-19T00:00:00.000Z" })}\n`,
-		{ mode: 0o600 },
+		`${JSON.stringify({ schema_version: 2, generation, session_id: sessionName, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, created_at: "2026-07-19T00:00:00.000Z" })}\n`,
 	);
 	fs.writeFileSync(
 		path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`),
 		`${JSON.stringify({ schema_version: 2, generation, session_id: sessionName, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, child_pid: 2, child_start_time: "2", signal: "SIGABRT", signal_number: 6, exit_code: null, received_at: "2026-07-19T00:00:00.000Z" })}\n`,
-		{ mode: 0o600 },
 	);
 	const calls: string[][] = [];
 	const handled = launchDefaultTmuxIfNeeded({

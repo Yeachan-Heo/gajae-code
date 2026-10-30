@@ -36,11 +36,7 @@ beforeAll(async () => {
 	setThemeInstance(theme);
 });
 
-function baseContext(
-	cwd: string,
-	settings: Settings,
-): {
-	settings: Settings;
+function baseContext(cwd: string): {
 	availableThinkingLevels: [];
 	thinkingLevel: undefined;
 	availableThemes: string[];
@@ -48,7 +44,6 @@ function baseContext(
 	cwd: string;
 } {
 	return {
-		settings,
 		availableThinkingLevels: [],
 		thinkingLevel: undefined,
 		availableThemes: ["red-claw"],
@@ -77,11 +72,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 		);
 
 		const selector = new SettingsSelectorComponent(
-			{
-				...baseContext("/tmp/does-not-need-to-exist", Settings.instance),
-				gjcRuntimeSnapshot: store,
-				gjcActivationGeneration: 7,
-			},
+			{ ...baseContext("/tmp/does-not-need-to-exist"), gjcRuntimeSnapshot: store, gjcActivationGeneration: 7 },
 			{ onCancel: () => {}, onChange: () => {} },
 		);
 
@@ -203,7 +194,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 
 				selector = new SettingsSelectorComponent(
 					{
-						...baseContext(cwd, created.session.settings),
+						...baseContext(cwd),
 						gjcRuntimeSnapshot: runtimeSnapshot,
 						gjcActivationGeneration: created.session.gjcActivationGeneration,
 					},
@@ -400,7 +391,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 	);
 
 	test("a missing provider degrades honestly instead of crashing", () => {
-		const selector = new SettingsSelectorComponent(baseContext("/tmp/does-not-need-to-exist", Settings.instance), {
+		const selector = new SettingsSelectorComponent(baseContext("/tmp/does-not-need-to-exist"), {
 			onCancel: () => {},
 			onChange: () => {},
 		});

@@ -35,7 +35,6 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = {
 	type: string;
-	id?: string;
 	kind?: string;
 	payload?: Frame;
 	seq?: number;
@@ -48,7 +47,6 @@ type Frame = {
 	cwd?: string;
 	state?: string;
 	updateId?: number;
-	reason?: string;
 };
 
 type TestContextUsage = {
@@ -1660,152 +1658,56 @@ test("stream-enabled final always carries a messageRef and a late message_update
 }, 30000);
 
 // #4528 lifecycle regression: a daemon-originated user message must be acked
-// `accepted` at session preflight acceptance (before turn_start). Pre-acceptance
-// rejection must not accept; a failure after acceptance must still reject.
+// `accepted` at session preflight acceptance (before turn_start), and a late
+// admission rejection must ack `rejected` — never a false `accepted`.
 test("inbound user_message acks accepted at preflight acceptance and rejected on late failure", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
-	type AcceptanceOptions = {
-		onPreflightAcceptCommit?: () => void;
-		onPreflightAccepted?: () => void;
-	};
-	type Submission = {
-		content: unknown;
-		options: AcceptanceOptions;
-		promise: Promise<void>;
-		resolve: () => void;
-		reject: (reason?: unknown) => void;
-	};
-	const sendCalls: Submission[] = [];
 	try {
+		let admission: "accept" | "reject" = "accept";
+		const sendCalls: Array<Record<string, unknown>> = [];
 		const { handlers, ctx, frames, ws, token, sid } = await setup({
 			sendUserMessageOverride: (content, options) => {
-				const held = Promise.withResolvers<void>();
-				sendCalls.push({ content, options: options as AcceptanceOptions, ...held });
-				// Return the held promise itself: the bus registers its await continuation
-				// synchronously before the test can release this submission.
-				return held.promise;
+				sendCalls.push({ content, options });
+				// Simulate AgentSession preflight acceptance: fires before the prompt
+				// (and its turn_start) resolves, like the production session does.
+				const opts = options as { onPreflightAcceptCommit?: () => void } | undefined;
+				if (admission === "accept" && opts?.onPreflightAcceptCommit) opts.onPreflightAcceptCommit();
+				if (admission === "reject") return Promise.reject(new Error("admission rejected"));
+				return new Promise<void>(resolve => setTimeout(resolve, 50));
 			},
 		});
-		const acks = (updateId: number) =>
-			frames
-				.filter(f => f.type === "inbound_ack" && f.updateId === updateId)
-				.map(f => ({
-					state: f.state,
-					updateId: f.updateId,
-					...(f.reason === undefined ? {} : { reason: f.reason }),
-				}));
-		const submit = async (updateId: number, text: string): Promise<Submission> => {
-			const index = sendCalls.length;
-			ws.send(JSON.stringify({ type: "user_message", sessionId: sid, token, text, updateId }));
-			await waitFor(() => sendCalls.length === index + 1, 3000, `submission ${updateId}`);
-			const call = sendCalls[index]!;
-			expect(call.content).toBe(text);
-			expect(call.options).toHaveProperty("onPreflightAcceptCommit");
-			expect(call.options).toHaveProperty("onPreflightAccepted");
-			return call;
-		};
-		const repeatCallbacks = (call: Submission): void => {
-			call.options.onPreflightAcceptCommit!();
-			call.options.onPreflightAccepted!();
-			call.options.onPreflightAcceptCommit!();
-			call.options.onPreflightAccepted!();
-		};
-		const flushAcks = async (updateId: number): Promise<void> => {
-			// This authenticated socket's correlated replay response follows directed
-			// acks already queued by callbacks, turn_start, and the settled bus await.
-			const id = `inbound-acceptance-${updateId}`;
-			ws.send(JSON.stringify({ type: "event_replay", id, sinceGeneration: 0, sinceSeq: 0 }));
-			await waitFor(
-				() => frames.some(f => f.type === "event_replay_result" && f.id === id),
-				3000,
-				`ack barrier ${updateId}`,
-			);
-		};
-		const rejectSubmission = async (call: Submission): Promise<void> => {
-			call.reject(new Error("admission rejected"));
-			await call.promise.catch(() => {});
-		};
+		const acks = () =>
+			frames.filter(f => f.type === "inbound_ack").map(f => ({ state: f.state, updateId: f.updateId }));
 
 		// --- Accepted path: the ack must land at preflight acceptance, before the
-		// test releases the prompt promise, and before turn_start fires.
-		const committed = await submit(9001, "hello from telegram");
-		committed.options.onPreflightAcceptCommit!();
-		await waitFor(() => acks(9001).some(a => a.state === "accepted"), 3000, "accepted inbound_ack");
-		repeatCallbacks(committed);
+		// prompt promise settles, and before turn_start fires.
+		ws.send(
+			JSON.stringify({ type: "user_message", sessionId: sid, token, text: "hello from telegram", updateId: 9001 }),
+		);
+		await waitFor(() => acks().length === 1, 3000, "accepted inbound_ack");
+		expect(acks()[0]).toEqual({ state: "accepted", updateId: 9001 });
 
-		// turn_start now fires while the prompt is still held pending: the
+		// turn_start now fires while the (still pending) prompt resolves: the
 		// update was already registered, so consumption acks rather than races.
 		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
-		await waitFor(() => acks(9001).some(a => a.state === "consumed"), 3000, "consumed inbound_ack");
+		await waitFor(
+			() => acks().some(a => a.state === "consumed" && a.updateId === 9001),
+			3000,
+			"consumed inbound_ack",
+		);
 		expect(sendCalls.length).toBe(1);
-		repeatCallbacks(committed);
-		committed.resolve();
-		// Await the SAME returned promise, after the bus's earlier continuation:
-		// its synchronous post-await acceptance fallback has now run.
-		await committed.promise;
-		repeatCallbacks(committed);
-		await flushAcks(9001);
-		expect(acks(9001)).toEqual([
-			{ state: "accepted", updateId: 9001 },
-			{ state: "consumed", updateId: 9001 },
-		]);
+		expect(sendCalls[0]!.options).toHaveProperty("onPreflightAcceptCommit");
 
 		// --- Rejected path: a late admission rejection acks rejected, never accepted.
-		const rejected = await submit(9002, "second try");
-		await rejectSubmission(rejected);
-		await flushAcks(9002);
-		expect(acks(9002)).toEqual([{ state: "rejected", updateId: 9002, reason: "injection_failed" }]);
-
-		// The legacy callback independently accepts; commit is not required first.
-		const legacy = await submit(9003, "legacy acceptance");
-		legacy.options.onPreflightAccepted!();
-		await waitFor(() => acks(9003).some(a => a.state === "accepted"), 3000, "legacy accepted inbound_ack");
-		repeatCallbacks(legacy);
-		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
-		await waitFor(() => acks(9003).some(a => a.state === "consumed"), 3000, "legacy consumed inbound_ack");
-		repeatCallbacks(legacy);
-		legacy.resolve();
-		await legacy.promise;
-		repeatCallbacks(legacy);
-		await flushAcks(9003);
-		expect(acks(9003)).toEqual([
-			{ state: "accepted", updateId: 9003 },
-			{ state: "consumed", updateId: 9003 },
-		]);
-
-		// With no callback, successful settlement must supply acceptance itself.
-		const fallback = await submit(9004, "settlement fallback");
-		fallback.resolve();
-		await fallback.promise;
-		await waitFor(() => acks(9004).some(a => a.state === "accepted"), 3000, "fallback accepted inbound_ack");
-		repeatCallbacks(fallback);
-		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
-		await waitFor(() => acks(9004).some(a => a.state === "consumed"), 3000, "fallback consumed inbound_ack");
-		repeatCallbacks(fallback);
-		await flushAcks(9004);
-		expect(acks(9004)).toEqual([
-			{ state: "accepted", updateId: 9004 },
-			{ state: "consumed", updateId: 9004 },
-		]);
-
-		// Acceptance does not suppress a later rejection: preserve both wire acks.
-		const lateFailure = await submit(9005, "failure after acceptance");
-		lateFailure.options.onPreflightAcceptCommit!();
-		await waitFor(() => acks(9005).some(a => a.state === "accepted"), 3000, "late-failure accepted inbound_ack");
-		repeatCallbacks(lateFailure);
-		await rejectSubmission(lateFailure);
-		repeatCallbacks(lateFailure);
-		await flushAcks(9005);
-		expect(acks(9005)).toEqual([
-			{ state: "accepted", updateId: 9005 },
-			{ state: "rejected", updateId: 9005, reason: "injection_failed" },
-		]);
-		expect(sendCalls.length).toBe(5);
+		admission = "reject";
+		ws.send(JSON.stringify({ type: "user_message", sessionId: sid, token, text: "second try", updateId: 9002 }));
+		await waitFor(() => acks().some(a => a.updateId === 9002), 3000, "rejected inbound_ack");
+		const second = acks().find(a => a.updateId === 9002)!;
+		expect(second.state).toBe("rejected");
+		// Exactly one ack per update id — no accepted-then-rejected contradiction.
+		expect(acks().filter(a => a.updateId === 9002).length).toBe(1);
 	} finally {
-		// Do not leave the extension awaiting a held prompt if any assertion fails.
-		for (const call of sendCalls) call.resolve();
-		await Promise.allSettled(sendCalls.map(call => call.promise));
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
