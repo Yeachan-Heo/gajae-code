@@ -367,7 +367,10 @@ export interface FixtureSnapshot {
 	baseUrl: string;
 	models: string[];
 	holdNext: boolean;
+	/** Main and side-chat model turns; automatic title transactions do not consume these IDs or holds. */
 	requests: FixtureRequestRecord[];
+	/** Independently numbered title transactions, including their input digest and SSE chunks. */
+	titleRequests: FixtureRequestRecord[];
 }
 
 export interface ModelFixture {
@@ -380,9 +383,61 @@ export interface ModelFixture {
 	close(): Promise<void>;
 }
 
+function isTitleRequest(body: Record<string, unknown>): boolean {
+	const choice = body.tool_choice;
+	if (!choice || typeof choice !== "object" || Array.isArray(choice)) return false;
+	const forced = choice as Record<string, unknown>;
+	if (
+		forced.type !== "function" ||
+		!forced.function ||
+		typeof forced.function !== "object" ||
+		Array.isArray(forced.function)
+	)
+		return false;
+	if ((forced.function as Record<string, unknown>).name !== "set_title") return false;
+	if (!Array.isArray(body.tools) || body.tools.length !== 1) return false;
+	const tool = body.tools[0];
+	if (
+		!tool ||
+		typeof tool !== "object" ||
+		tool.type !== "function" ||
+		!tool.function ||
+		typeof tool.function !== "object"
+	)
+		return false;
+	const fn = tool.function;
+	const parameters = fn.parameters;
+	if (
+		fn.name !== "set_title" ||
+		!parameters ||
+		typeof parameters !== "object" ||
+		parameters.type !== "object" ||
+		parameters.additionalProperties !== false
+	)
+		return false;
+	if (!Array.isArray(parameters.required) || parameters.required.length !== 1 || parameters.required[0] !== "title")
+		return false;
+	if (
+		!parameters.properties ||
+		typeof parameters.properties !== "object" ||
+		parameters.properties.title?.type !== "string"
+	)
+		return false;
+	if (!Array.isArray(body.messages) || body.messages.length !== 2) return false;
+	const [system, user] = body.messages;
+	return (
+		(system?.role === "system" || system?.role === "developer") &&
+		typeof system.content === "string" &&
+		system.content.startsWith("Generate a 3-6 word title for a coding session") &&
+		user?.role === "user" &&
+		typeof user.content === "string"
+	);
+}
+
 export function startModelFixture(artifactPath: string): ModelFixture {
 	const providerToken = crypto.randomUUID();
 	const records: FixtureRequestRecord[] = [];
+	const titleRecords: FixtureRequestRecord[] = [];
 	const held = new Map<number, () => void>();
 	let holdNext = true;
 	let writes = Promise.resolve();
@@ -396,6 +451,7 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 		models: QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`),
 		holdNext,
 		requests: structuredClone(records),
+		titleRequests: structuredClone(titleRecords),
 	});
 	const persist = () => {
 		const text = JSON.stringify(snapshot(), null, 2);
@@ -425,7 +481,8 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 				request.headers.get("X-Desktop-QA-Fixture") !== providerToken
 			)
 				return new Response("Forbidden fixture request", { status: 403 });
-			if (records.length >= 64) return new Response("Fixture request limit", { status: 429 });
+			if (records.length >= 64 && titleRecords.length >= 64)
+				return new Response("Fixture request limit", { status: 429 });
 			let body: Record<string, unknown>;
 			try {
 				const value: unknown = await request.json();
@@ -436,19 +493,21 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 			} catch {
 				return new Response("Invalid fixture completion", { status: 400 });
 			}
-			if (records.length >= 64) return new Response("Fixture request limit", { status: 429 });
+			const title = isTitleRequest(body);
+			const collection = title ? titleRecords : records;
+			if (collection.length >= 64) return new Response("Fixture request limit", { status: 429 });
 			const record: FixtureRequestRecord = {
-				id: records.length + 1,
+				id: collection.length + 1,
 				method: "POST",
 				path: "/v1/chat/completions",
 				body,
 				state: "held",
-				held: holdNext,
+				held: !title && holdNext,
 				released: false,
 				chunks: [],
 			};
-			holdNext = false;
-			records.push(record);
+			if (!title) holdNext = false;
+			collection.push(record);
 			let heartbeat: Timer | undefined;
 			let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
 			const onAbort = () => {
@@ -458,7 +517,7 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 			const abort = () => {
 				if (record.state !== "held") return;
 				record.state = "aborted";
-				held.delete(record.id);
+				if (!title) held.delete(record.id);
 				if (heartbeat) clearInterval(heartbeat);
 				request.signal.removeEventListener("abort", onAbort);
 				persist();
@@ -481,8 +540,27 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 					const finish = () => {
 						if (record.state !== "held") return;
 						if (heartbeat) clearInterval(heartbeat);
-						send(chunk({ content: `Fixture turn ${record.id} complete.` }));
-						send(chunk({}, "stop"));
+						if (title) {
+							send(
+								chunk({
+									tool_calls: [
+										{
+											index: 0,
+											id: `qa-title-call-${record.id}`,
+											type: "function",
+											function: {
+												name: "set_title",
+												arguments: JSON.stringify({ title: "Fixture Generated Session Title" }),
+											},
+										},
+									],
+								}),
+							);
+							send(chunk({}, "tool_calls"));
+						} else {
+							send(chunk({ content: `Fixture turn ${record.id} complete.` }));
+							send(chunk({}, "stop"));
+						}
 						send(
 							JSON.stringify({
 								id: `qa-completion-${record.id}`,
@@ -495,14 +573,16 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 						);
 						send("[DONE]");
 						record.state = "completed";
-						held.delete(record.id);
+						if (!title) held.delete(record.id);
 						request.signal.removeEventListener("abort", onAbort);
 						controller.close();
 						persist();
 					};
 					send(chunk({ role: "assistant", content: "" }));
-					if (body.model !== "qa-plain") send(chunk({ reasoning_content: `Fixture reasoning ${record.id}. ` }));
-					send(chunk({ content: `Fixture turn ${record.id} started. ` }));
+					if (!title) {
+						if (body.model !== "qa-plain") send(chunk({ reasoning_content: `Fixture reasoning ${record.id}. ` }));
+						send(chunk({ content: `Fixture turn ${record.id} started. ` }));
+					}
 					request.signal.addEventListener("abort", onAbort, { once: true });
 					if (request.signal.aborted) onAbort();
 					else if (record.held) {

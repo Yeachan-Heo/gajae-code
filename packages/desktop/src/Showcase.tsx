@@ -2,6 +2,7 @@ import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } fro
 import { useState } from "react";
 import type { DesktopBtwConversation, DesktopBtwTurn } from "../../desktop-host/src/btw-protocol";
 import type { DesktopMcpServer, DesktopMcpSnapshot } from "../../desktop-host/src/mcp-protocol";
+import type { DesktopModelRolePreference } from "../../desktop-host/src/preferences-protocol";
 import type {
 	DesktopHistory,
 	DesktopModel,
@@ -10,11 +11,12 @@ import type {
 	DesktopThinkingLevel,
 } from "../../desktop-host/src/protocol";
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "../../desktop-host/src/session-info-protocol";
+import { AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
 import { ForkPanel, type ForkPanelProps } from "./ForkPanel";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
-import { ModelPicker } from "./ModelPicker";
+import { ModelPicker, type PickerModelRole } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionInfoPanel, type SessionInfoPanelProps } from "./SessionInfoPanel";
 import "./styles.css";
@@ -26,7 +28,7 @@ const transcriptPreviewImage =
 const fixtureModels: DesktopModel[] = Array.from(
 	{ length: 84 },
 	(_, index): DesktopModel => ({
-		id: `design-fixture/model-${index + 1}`,
+		id: `design-fixture-${index % 2 === 0 ? "a" : "b"}/model-${index + 1}`,
 		name:
 			index === 0
 				? "한국어와 TypeScript를 함께 검토하는 긴 이름의 디자인 예시 모델"
@@ -58,7 +60,29 @@ function FixtureControls({
 	pending?: boolean;
 	empty?: boolean;
 }) {
-	const [selectedId, setSelectedId] = useState("design-fixture/model-1");
+	const [selectedId, setSelectedId] = useState(fixtureModels[0].id);
+	const [assignments, setAssignments] = useState<Partial<Record<PickerModelRole, string>>>({
+		executor: fixtureModels[2].id,
+		planner: fixtureModels[1].id,
+	});
+	const roles: DesktopModelRolePreference[] = (["default", "executor", "planner", "critic", "architect"] as const).map(
+		id => {
+			const model = fixtureModels.find(model => model.id === (id === "default" ? selectedId : assignments[id]));
+			return {
+				id,
+				name: id,
+				configured: !!model,
+				model: model
+					? { provider: model.provider, id: model.id.slice(model.provider.length + 1), name: model.name }
+					: null,
+				thinkingLevel: null,
+				configurationResolution: { origin: "runtime", layers: ["runtime"] },
+				canApply: { available: true, reason: null },
+				scope: id === "default" ? "default" : "session",
+				canClear: { available: id !== "default" && !!model, reason: null },
+			};
+		},
+	);
 	const [level, setLevel] = useState<DesktopThinkingLevel>("medium");
 	const models = empty ? [] : fixtureModels;
 	const selectedModel = models.find(model => model.id === selectedId);
@@ -78,6 +102,17 @@ function FixtureControls({
 				disabled={disabled}
 				pending={pending}
 				onSelect={setSelectedId}
+				roles={roles}
+				onAssign={(role, modelId) => {
+					if (role === "default" && modelId) setSelectedId(modelId);
+					else
+						setAssignments(previous => {
+							const next = { ...previous };
+							if (modelId) next[role] = modelId;
+							else delete next[role];
+							return next;
+						});
+				}}
 			/>
 			<ReasoningSelect thinking={thinking} disabled={disabled} pending={pending} onChange={setLevel} />
 			<small className="model-control-status fixture-note">
@@ -887,6 +922,7 @@ function FixtureForkPanel() {
 
 export default function Showcase() {
 	const [draft, setDraft] = useState("");
+	const [attachments, setAttachments] = useState<DesktopAttachmentDraft[]>([]);
 	const [populatedDraft, setPopulatedDraft] = useState(
 		"기존 구조를 유지하면서 한국어와 TypeScript 변경 사항을 검토해 주세요.",
 	);
@@ -984,7 +1020,7 @@ export default function Showcase() {
 					message={{
 						id: "2",
 						role: "assistant",
-						text: "먼저 기존 구현을 살펴보겠습니다.\n대화별 작업은 독립적으로 진행됩니다.\n\n日本語の文章と 한국어 문장을 함께 검토합니다. 中文内容也需要保持清晰。",
+						text: '## 변경 사항\n\n기존 구현을 유지하면서 **안전하게** 정리했습니다.\n\n- 한국어와 TypeScript를 함께 검토\n- 日本語の文章と 中文内容도 명확하게 표시\n\n```ts\nconst message = "안녕하세요";\nconsole.info(message);\n```\n\n| 확인 | 결과 |\n| --- | --- |\n| 코드 복사 | 원본 코드만 복사 |\n| 실행 소유권 | 변경 없음 |',
 					}}
 				/>
 				<Message
@@ -1019,7 +1055,12 @@ export default function Showcase() {
 							id: "thinking",
 							role: "assistant",
 							text: "",
-							blocks: [{ type: "thinking", text: "제공된 내용을 차례로 검토합니다." }],
+							blocks: [
+								{
+									type: "thinking",
+									text: "### 검토 기준\n\n1. **기존 동작**을 먼저 확인합니다.\n2. `sessionId`와 결과의 소유권을 비교합니다.\n\n```ts\nif (owner !== current) return;\n```",
+								},
+							],
 						}}
 					/>
 				</div>
@@ -1182,6 +1223,15 @@ export default function Showcase() {
 				<Composer
 					value={draft}
 					onChange={setDraft}
+					attachment={
+						<AttachmentPicker
+							sessionId="showcase"
+							attachments={attachments}
+							supportsImageInput
+							onChange={(_session, update) => setAttachments(update)}
+						/>
+					}
+					hasAttachments={attachments.length > 0}
 					onSend={() => setAnswer("빈 초안 디자인 예시에서 전송했습니다.")}
 					onStop={() => {}}
 					onSlash={() => setAnswer("슬래시 명령 디자인 예시입니다.")}

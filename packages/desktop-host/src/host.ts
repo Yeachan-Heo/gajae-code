@@ -331,6 +331,7 @@ interface SessionCandidate {
 }
 interface LiveSession extends SessionCandidate {
 	serviceGeneration: number;
+	titleAbort?: AbortController;
 	unsubscribeActivity: () => void;
 	unsubscribeIdentity: () => void;
 	busy: boolean;
@@ -763,11 +764,16 @@ export class DesktopHost {
 	}
 	async #load(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
 		const candidate = await this.#constructCandidate(metadata, manager);
+		const previousTitle = metadata.title;
 		try {
 			const live = this.#publishCandidate(candidate);
+			const title = live.sdk.sessionManager.getSessionName();
+			if (title) metadata.title = title.slice(0, 200);
 			await this.#save();
+			if (metadata.title !== previousTitle) this.#publishSnapshot();
 			return live;
 		} catch (error) {
+			metadata.title = previousTitle;
 			const live = this.#live.get(metadata.id);
 			if (live) this.#retiredLive.add(live);
 			this.#live.delete(metadata.id);
@@ -862,7 +868,6 @@ export class DesktopHost {
 			}
 			// The SDK reserves a path before it writes a transcript. Use its public
 			// persistence API so even an empty desktop session can be resumed.
-			if (!existingFile) await result.session.setSessionName(metadata.title, "user");
 			await sessionManager.ensureOnDisk();
 			await this.#flushSession(candidate);
 			return candidate;
@@ -1240,6 +1245,8 @@ export class DesktopHost {
 			redact: text => this.#redact(text),
 		});
 		this.#cancelQuestions(live.metadata.id);
+		live.titleAbort?.abort();
+		live.titleAbort = undefined;
 		live.serviceGeneration = lifecycle.generation;
 		this.#initializeLiveExtensions(live);
 		live.activityUpdate = undefined;
@@ -1251,6 +1258,7 @@ export class DesktopHost {
 		this.#scheduleActivity(live);
 	}
 	async #disposeLive(live: LiveSession): Promise<void> {
+		live.titleAbort?.abort();
 		this.#retiredLive.add(live);
 		this.#cancelQuestions(live.metadata.id);
 		const failures: unknown[] = [];
@@ -1531,6 +1539,7 @@ export class DesktopHost {
 					throw error;
 				}
 				accepted = true;
+				this.#startAutoTitle(live, text);
 			},
 		};
 		try {
@@ -1888,6 +1897,7 @@ export class DesktopHost {
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
 			live.gateMutation = true;
+			live.titleAbort?.abort();
 			try {
 				this.#cancelQuestions(metadata.id);
 				await live.sdk.abort();
@@ -2061,6 +2071,7 @@ export class DesktopHost {
 							throw error;
 						}
 						accepted = true;
+						this.#startAutoTitle(live, text);
 					},
 				};
 				const terminalEvents = new Map<string, { reason: string | undefined; assistant: string | undefined }>();
@@ -2222,6 +2233,8 @@ export class DesktopHost {
 			this.#publish(live);
 			return { removed };
 		}
+		if (method === "session.delete" && !live.busy && !live.sdk.isStreaming && !live.operator?.isBusy())
+			live.titleAbort?.abort();
 		return this.#exclusive(
 			live,
 			async () => {
@@ -2328,15 +2341,63 @@ export class DesktopHost {
 		this.#publishSnapshot();
 		return null;
 	}
+	#startAutoTitle(live: LiveSession, text: string): void {
+		if (!text.trim() || live.sdk.isLocallyHandledSlashCommand(text.trimStart()) || live.titleAbort) return;
+		const controller = new AbortController();
+		live.titleAbort = controller;
+		const manager = live.sdk.sessionManager;
+		const sessionId = live.sdk.sessionId;
+		const managerId = manager.getSessionId();
+		const sessionFile = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = live.sdk.sessionLifecycle.generation;
+		const current = () => {
+			const lifecycle = live.sdk.sessionLifecycle;
+			return (
+				!controller.signal.aborted &&
+				!this.#closed &&
+				!this.#retiredLive.has(live) &&
+				this.#live.get(live.metadata.id) === live &&
+				this.#catalog.sessions.includes(live.metadata) &&
+				!lifecycle.disposed &&
+				!lifecycle.transitioning &&
+				lifecycle.generation === generation &&
+				live.sdk.sessionManager === manager &&
+				live.sdk.sessionId === sessionId &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionFile() === sessionFile &&
+				manager.getSessionIdentityGeneration() === identityGeneration
+			);
+		};
+		void (async () => {
+			try {
+				const result = await live.sdk.generateAutoSessionTitle(text, { signal: controller.signal });
+				if (result.kind === "failed") {
+					console.error("Desktop automatic session title generation failed");
+					return;
+				}
+				if (result.kind !== "applied" || !current()) return;
+				const title = manager.getSessionName()?.slice(0, 200);
+				if (!title || title === live.metadata.title) return;
+				// The SDK header already durably owns this title. Update the display
+				// cache without enqueuing optional I/O ahead of delivery writes. Normal
+				// catalog mutations persist it; reopening reconciles it from the SDK.
+				live.metadata.title = title;
+				this.#publish(live);
+				this.#publishSnapshot();
+			} catch {
+				console.error("Desktop automatic session title generation failed");
+			}
+		})();
+	}
 	/** Mirror the session's own title into the desktop catalog after a command changed it. */
-	async #syncTitle(live: LiveSession): Promise<void> {
+	#syncTitle(live: LiveSession): void {
 		const title = live.sdk.sessionManager.getSessionName?.();
 		if (!title || title === live.metadata.title) {
 			this.#publishSnapshot();
 			return;
 		}
 		live.metadata.title = title.slice(0, 200);
-		await this.#save().catch(() => {});
 		this.#publishSnapshot();
 		this.#publish(live);
 	}
@@ -2422,7 +2483,7 @@ export class DesktopHost {
 			} else {
 				consumed = true;
 			}
-			await this.#syncTitle(live);
+			this.#syncTitle(live);
 			if (forwarded !== undefined) {
 				// A builtin that returns a prompt starts a real turn, so its failure is the
 				// conversation's failure even though command.run itself is administrative.
@@ -2530,6 +2591,7 @@ export class DesktopHost {
 	}
 	async #close(): Promise<void> {
 		this.#closed = true;
+		for (const live of this.#live.values()) live.titleAbort?.abort();
 		if (this.#init) await this.#init.catch(() => {});
 		const authorizationClose = this.#oauth?.close();
 		// Attach a handler immediately while unrelated session cleanup drains.

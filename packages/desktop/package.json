@@ -19,7 +19,9 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "entities": "catalog:",
     "lucide-react": "catalog:",
+    "marked": "catalog:",
     "react": "catalog:",
     "react-dom": "catalog:"
   },

@@ -38,6 +38,10 @@ export interface DesktopModelRolePreference {
 	/** Resolution of the containing role map, not proof of this individual entry's ownership. */
 	configurationResolution: DesktopPreferenceResolution;
 	canApply: DesktopPreferenceCapability;
+	/** Default is durable; task-role choices apply only to this live session. */
+	scope: "default" | "session" | null;
+	/** Removes only a session-owned choice; inherited configuration may remain. */
+	canClear: DesktopPreferenceCapability;
 }
 
 export type DesktopSamplingParameter =
@@ -70,13 +74,21 @@ export interface DesktopPreferences {
 /** Explicit operations only: never an arbitrary setting path, patch, owner or authority flag. */
 export type DesktopPreferenceAction =
 	| { type: "profile.select"; name: string; scope: "session" | "default" }
-	| { type: "role.set"; role: DesktopModelRoleId; modelId: string }
+	| { type: "role.set"; role: DesktopModelRoleId; modelId: string | null }
 	| { type: "sampling.set"; parameter: DesktopSamplingParameter; value: number; scope: "session" | "default" };
 
-export interface DesktopPreferenceResult {
-	applied: "profile.select";
-	profileId: string;
-	scope: "session" | "default";
-	durability: "session" | "persisted";
-	preferences: DesktopPreferences;
-}
+export type DesktopPreferenceResult =
+	| {
+			applied: "profile.select";
+			profileId: string;
+			scope: "session" | "default";
+			durability: "session" | "persisted";
+			preferences: DesktopPreferences;
+	  }
+	| {
+			applied: "role.set";
+			role: DesktopModelRoleId;
+			scope: "session" | "default";
+			durability: "session" | "persisted";
+			preferences: DesktopPreferences;
+	  };

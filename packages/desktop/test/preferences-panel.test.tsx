@@ -52,7 +52,9 @@ function preferences(): DesktopPreferences {
 				model: { id: "shared-model", provider: "provider-a", name: "공통 모델" },
 				thinkingLevel: "high",
 				configurationResolution: { origin: "layered", layers: ["global", "project", "runtime"] },
-				canApply: { available: false, reason: "No transactional public role-assignment control." },
+				canApply: { available: true, reason: null },
+				scope: "session",
+				canClear: { available: true, reason: null },
 			},
 			{
 				id: "critic",
@@ -61,7 +63,9 @@ function preferences(): DesktopPreferences {
 				model: { id: "shared-model", provider: "provider-b", name: "공통 모델" },
 				thinkingLevel: null,
 				configurationResolution: { origin: "default", layers: [] },
-				canApply: { available: false, reason: "No transactional public role-assignment control." },
+				canApply: { available: false, reason: "Role unavailable." },
+				scope: null,
+				canClear: { available: false, reason: "No session-owned role choice is present." },
 			},
 		],
 		sampling: [
@@ -162,13 +166,25 @@ describe("desktop preferences presentation", () => {
 		expect(executor).toContain("<dt>추론 수준</dt><dd>high</dd>");
 		expect(executor).toContain("여러 계층 (layered)");
 		expect(executor).toContain("전역 (global) → 프로젝트 (project) → 실행 중 (runtime)");
-		expect(executor).toContain("No transactional public role-assignment control.");
-		expect(executor).toMatch(/<button[^>]*disabled=""[^>]*>역할 모델 변경 불가<\/button>/u);
+		expect(executor).toContain("모델 선택에서 변경 · 현재 대화에만 적용");
+		expect(executor).not.toContain("<button");
 		expect(critic).toContain("상속 또는 기본값");
 		expect(critic).toContain("provider-b / shared-model");
 		expect(critic).toContain("<dt>추론 수준</dt><dd>설정 없음</dd>");
 		expect(critic).toContain("기본값 (default)");
+		expect(critic).toContain("변경 불가: Role unavailable.");
+		expect(critic).not.toContain("<button");
 		expect(render()).toContain("역할 맵의 출처는 개별 역할 설정의 소유권을 뜻하지 않습니다.");
+	});
+
+	test("labels durable default model capability without adding another role editor", () => {
+		const data = preferences();
+		data.roles[0]!.id = "default";
+		data.roles[0]!.scope = "default";
+		data.roles[0]!.canClear = { available: false, reason: "The default model cannot be cleared." };
+		const row = preferenceRows(render({ preferences: data }))[0];
+		expect(row).toContain("모델 선택에서 변경 · 공통 설정에 저장");
+		expect(row).not.toContain("<button");
 	});
 
 	test("preserves zero, provider-default -1, invalid values and next-run semantics without inferring provider support", () => {

@@ -3,8 +3,8 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
 	DESKTOP_ATTACHMENT_REQUEST_BYTES,
-	desktopAttachmentBase64Bytes,
 	type DesktopAttachment,
+	desktopAttachmentBase64Bytes,
 } from "../../desktop-host/src/attachment-protocol";
 import {
 	AttachmentPicker,
@@ -20,17 +20,30 @@ const image: DesktopAttachment = { kind: "image", name: "capture.png", mimeType:
 const options = { supportsImageInput: true };
 
 describe("browser-safe attachment base64 protocol", () => {
-	test.each([["AA==", 1], ["AAA=", 2], ["AAAA", 3], ["AQIDBA==", 4]] as const)(
-		"counts canonical base64 %s as %d bytes", (data, bytes) => {
-			expect(desktopAttachmentBase64Bytes(data)).toBe(bytes);
-		},
-	);
+	test.each([
+		["AA==", 1],
+		["AAA=", 2],
+		["AAAA", 3],
+		["AQIDBA==", 4],
+	] as const)("counts canonical base64 %s as %d bytes", (data, bytes) => {
+		expect(desktopAttachmentBase64Bytes(data)).toBe(bytes);
+	});
 
-	test.each(["", "A", "AAA", "====", "AA===", "AA==\n", "AA-_", "data:image/png;base64,AA==", "AB==", "AAB=", "AA=A"])(
-		"rejects malformed, noncanonical or mismatched base64 %s", data => {
-			expect(() => desktopAttachmentBase64Bytes(data)).toThrow("canonical base64");
-		},
-	);
+	test.each([
+		"",
+		"A",
+		"AAA",
+		"====",
+		"AA===",
+		"AA==\n",
+		"AA-_",
+		"data:image/png;base64,AA==",
+		"AB==",
+		"AAB=",
+		"AA=A",
+	])("rejects malformed, noncanonical or mismatched base64 %s", data => {
+		expect(() => desktopAttachmentBase64Bytes(data)).toThrow("canonical base64");
+	});
 });
 
 describe("browser selection and per-session draft ownership", () => {
@@ -43,21 +56,27 @@ describe("browser selection and per-session draft ownership", () => {
 	test("reads actual clipboard-style image File bytes, including absent MIME with a supported extension", async () => {
 		for (const type of ["image/png", ""]) {
 			const file = new File([Buffer.from(PNG, "base64")], "clipboard.png", { type });
-			expect(await readDesktopAttachmentFile(file, options)).toEqual(image.kind === "image" ? { ...image, name: "clipboard.png" } : image);
+			expect(await readDesktopAttachmentFile(file, options)).toEqual(
+				image.kind === "image" ? { ...image, name: "clipboard.png" } : image,
+			);
 		}
 	});
 
 	test("extracts only actual clipboard image Files and leaves ordinary text paste alone", async () => {
 		const file = new File([Buffer.from(PNG, "base64")], "pasted.png", { type: "image/png" });
-		const files = desktopClipboardImageFiles({ items: [
-			{ kind: "string", type: "text/plain", getAsFile: () => null },
-			{ kind: "file", type: "image/png", getAsFile: () => file },
-			{ kind: "file", type: "image/png", getAsFile: () => null },
-			{ kind: "file", type: "application/pdf", getAsFile: () => new File(["pdf"], "excluded.pdf") },
-		] });
+		const files = desktopClipboardImageFiles({
+			items: [
+				{ kind: "string", type: "text/plain", getAsFile: () => null },
+				{ kind: "file", type: "image/png", getAsFile: () => file },
+				{ kind: "file", type: "image/png", getAsFile: () => null },
+				{ kind: "file", type: "application/pdf", getAsFile: () => new File(["pdf"], "excluded.pdf") },
+			],
+		});
 		expect(files).toEqual([file]);
 		expect(await readDesktopAttachmentFile(files[0], options)).toEqual({ ...image, name: file.name });
-		expect(desktopClipboardImageFiles({ items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] })).toEqual([]);
+		expect(
+			desktopClipboardImageFiles({ items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] }),
+		).toEqual([]);
 	});
 
 	test("refuses image-disabled selections before reading and rejects unsupported binary/invalid UTF-8", async () => {
@@ -65,16 +84,21 @@ describe("browser selection and per-session draft ownership", () => {
 		const read = vi.spyOn(file, "arrayBuffer");
 		try {
 			await expect(readDesktopAttachmentFile(file, { supportsImageInput: false })).rejects.toThrow("지원하지");
-			await expect(readDesktopAttachmentFile(file, { supportsImageInput: true, imagesBlocked: true })).rejects.toThrow("차단");
+			await expect(
+				readDesktopAttachmentFile(file, { supportsImageInput: true, imagesBlocked: true }),
+			).rejects.toThrow("차단");
 			expect(read).not.toHaveBeenCalled();
-		} finally { read.mockRestore(); }
+		} finally {
+			read.mockRestore();
+		}
 		for (const binary of [
 			new File(["%PDF-1.7"], "doc.pdf", { type: "application/pdf" }),
 			new File([Uint8Array.of(0xff, 0xfe)], "binary.txt"),
 			new File([Uint8Array.of(0x61, 0, 0x62)], "binary.bin"),
 			new File(["svg"], "image.svg", { type: "image/svg+xml" }),
 			new File([], "empty.png", { type: "image/png" }),
-		]) await expect(readDesktopAttachmentFile(binary, options)).rejects.toThrow();
+		])
+			await expect(readDesktopAttachmentFile(binary, options)).rejects.toThrow();
 	});
 
 	test("refuses raw and base64-expanded oversize Files without reading bytes", async () => {
@@ -86,26 +110,47 @@ describe("browser selection and per-session draft ownership", () => {
 			try {
 				await expect(readDesktopAttachmentFile(file, options)).rejects.toThrow("8 MiB");
 				expect(read).not.toHaveBeenCalled();
-			} finally { read.mockRestore(); }
+			} finally {
+				read.mockRestore();
+			}
 		}
 	});
 
 	test("blocks sends while reading or errored, and never restores a removed/reset draft", () => {
 		const reading: DesktopAttachmentDraft = { id: "original", name: "capture.png", size: 69, status: "reading" };
 		const ready: DesktopAttachmentDraft = { ...reading, status: "ready", attachment: image };
-		const failed: DesktopAttachmentDraft = { id: "failed", name: "bad.txt", size: 2, status: "error", error: "Invalid UTF-8" };
+		const failed: DesktopAttachmentDraft = {
+			id: "failed",
+			name: "bad.txt",
+			size: 2,
+			status: "error",
+			error: "Invalid UTF-8",
+		};
 		expect(() => readyDesktopAttachments([reading])).toThrow("읽기");
 		expect(() => readyDesktopAttachments([failed])).toThrow("오류");
 		expect(readyDesktopAttachments(settleDesktopAttachmentDraft([reading], ready))).toEqual([image]);
 		expect(settleDesktopAttachmentDraft([], ready)).toEqual([]);
 		const differentSession: DesktopAttachmentDraft = { ...reading, id: "different-session" };
 		expect(settleDesktopAttachmentDraft([differentSession], ready)).toEqual([differentSession]);
-		expect(settleDesktopAttachmentDraft([failed], { ...failed, status: "ready", attachment: image, error: undefined })).toEqual([failed]);
+		expect(
+			settleDesktopAttachmentDraft([failed], { ...failed, status: "ready", attachment: image, error: undefined }),
+		).toEqual([failed]);
 	});
 
 	test("converts aggregate JSON/base64 overflow to a blocking removable error, without storing bytes in that error", () => {
-		const large: DesktopAttachment = { kind: "image", name: "a.png", mimeType: "image/png", data: "A".repeat(6 * 1024 * 1024) };
-		const first: DesktopAttachmentDraft = { id: "first", name: large.name, size: 4_718_592, status: "ready", attachment: large };
+		const large: DesktopAttachment = {
+			kind: "image",
+			name: "a.png",
+			mimeType: "image/png",
+			data: "A".repeat(6 * 1024 * 1024),
+		};
+		const first: DesktopAttachmentDraft = {
+			id: "first",
+			name: large.name,
+			size: 4_718_592,
+			status: "ready",
+			attachment: large,
+		};
 		const reading: DesktopAttachmentDraft = { id: "second", name: large.name, size: 4_718_592, status: "reading" };
 		const result: DesktopAttachmentDraft = { ...reading, status: "ready", attachment: large };
 		const next = settleDesktopAttachmentDraft([first, reading], result);
@@ -120,17 +165,24 @@ describe("browser selection and per-session draft ownership", () => {
 			{ id: "pending", name: "읽는 중.ts", size: 2048, status: "reading" },
 			{ id: "error", name: "잘못된.bin", size: 2, status: "error", error: "Invalid UTF-8" },
 		];
-		const html = renderToStaticMarkup(createElement(AttachmentPicker, {
-			sessionId: "session-one", attachments: drafts, supportsImageInput: false, onChange: () => {},
-		}));
+		const html = renderToStaticMarkup(
+			createElement(AttachmentPicker, {
+				sessionId: "session-one",
+				attachments: drafts,
+				supportsImageInput: false,
+				onChange: () => {},
+			}),
+		);
 		expect(html).toContain('type="file"');
 		expect(html).toContain('aria-busy="true"');
 		expect(html).toContain("capture.png 첨부 제거");
 		expect(html).toContain("2.0 KiB");
 		expect(html).toContain("Invalid UTF-8");
 		expect(html).toContain("이미지 입력 미지원");
-		expect(html).toContain('aria-label="이미지 붙여넣기 영역"');
-		expect(html).toContain('tabindex="0"');
+		expect(html).toContain('aria-label="파일 첨부"');
+		expect(html).not.toContain('aria-label="이미지 붙여넣기 영역"');
+		expect(html).not.toContain('class="attachment-paste"');
+		expect(html).not.toContain("최대 16개 · 전체 요청 8 MiB");
 		expect(html).not.toContain(PNG);
 	});
 });

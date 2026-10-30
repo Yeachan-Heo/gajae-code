@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
-import type { DesktopDeliveryReceipt, DesktopFrame, DesktopRequest, DesktopSession } from "../../desktop-host/src/protocol";
+import type { DesktopPreferences } from "../../desktop-host/src/preferences-protocol";
+import type { DesktopDeliveryReceipt, DesktopFrame, DesktopModel, DesktopRequest, DesktopSession } from "../../desktop-host/src/protocol";
 
 type PromptRequest = DesktopRequest & { method: "prompt"; params: { sessionId: string; attachments?: unknown[] } };
 interface FixtureState {
@@ -16,6 +17,8 @@ interface FixtureControl {
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
 	failNextAck(mode: "lost" | "error"): void;
 	failPostHandoffDraftSave(count?: number): void;
+	holdPreferences(method: "preferences.get" | "preferences.apply", hold: boolean): void;
+	setModels(models: DesktopModel[]): void;
 	receipt(id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]): void;
 	response(id: string, ok: boolean, error?: string, deliveryDisposition?: "refused" | "failed" | "unknown"): void;
 }
@@ -103,6 +106,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let serial = 0;
 		let failDraftAfterHandoff = 0;
 		let sawHandoff = false;
+		const heldPreferences = new Set<string>();
+		let models: DesktopModel[] = [];
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
@@ -144,6 +149,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			bootstrapReceipt: (receipt: DesktopDeliveryReceipt) => { const state = stored(); state.bootReceipt = receipt; state.receipts = []; save(state); },
 			failNextAck: (mode: "lost" | "error") => { const state = stored(); state.ackMode = mode; save(state); },
 			failPostHandoffDraftSave: (count = 1) => { failDraftAfterHandoff = count; sawHandoff = false; },
+			holdPreferences: (method, hold) => { if (hold) heldPreferences.add(method); else heldPreferences.delete(method); },
+			setModels: value => { models = value; },
 			receipt: (id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]) => emit({ type: "delivery", receipt: { id, sessionId, disposition } }),
 			response: (id: string, ok: boolean, error = "refused", deliveryDisposition?: "refused" | "failed" | "unknown") => emit(ok ? { type: "response", id, ok, result: {} } : { type: "response", id, ok, error, deliveryDisposition }),
 		};
@@ -157,7 +164,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				if (command !== "engine_request" || !args.request) throw new Error(command);
 				const request = args.request;
 				const state = stored(); state.requests.push(request); save(state);
-				if (request.method === "prompt") return;
+				if (request.method === "prompt" || heldPreferences.has(request.method)) return;
 				if (request.method === "bootstrap" && sessionStorage.getItem("bufferedReceipts")) {
 					const receipts = JSON.parse(sessionStorage.getItem("bufferedReceipts")!) as DesktopDeliveryReceipt[];
 					sessionStorage.removeItem("bufferedReceipts");
@@ -181,8 +188,10 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					const receipt = state.bootReceipt; delete state.bootReceipt; save(state);
 					emit({ type: "delivery", receipt });
 				}
-				if (request.method === "models.list" || request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
+				if (request.method === "models.list") result = models;
+				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
+				if (request.method === "preferences.get") result = { profiles: [], roles: [], sampling: [] };
 				if (request.method === "queue.cancel") {
 					const prompt = state.requests.find(item => item.id === request.params.queueId);
 					if (prompt && typeof prompt.params.sessionId === "string") emit({ type: "delivery", receipt: { id: prompt.id, sessionId: prompt.params.sessionId, disposition: "cancelled" } });
@@ -266,7 +275,127 @@ async function waitStoredDisposition(page: Page, id: string, disposition: Deskto
 	}, {}, id, disposition);
 }
 
+const available = { available: true, reason: null };
+const profilePreferences: DesktopPreferences = {
+	profiles: [{ id: "focused", name: "Focused profile", description: null, source: "configured", active: false, default: false, capabilities: { selectSession: available, persistDefault: available } }],
+	roles: [],
+	sampling: [],
+};
+const refreshedPreferences: DesktopPreferences = {
+	...profilePreferences,
+	roles: [{ id: "executor", name: "Executor", configured: true, model: { id: "model-one", provider: "fixture", name: "Model One" }, thinkingLevel: null, configurationResolution: { origin: "runtime", layers: ["runtime"] }, canApply: available, scope: "session", canClear: available }],
+};
+
+async function openPreferences(page: Page) {
+	await page.click('button[title="대화 작업 메뉴"]');
+	await page.waitForSelector('[aria-label="현재 대화 작업"]');
+	await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="현재 대화 작업"] button')].find(button => button.textContent?.includes("모델 프로필과 실행 설정"))?.click());
+	await page.waitForSelector(".preferences-panel");
+}
+
+describe("mounted preference ownership", () => {
+	test("late preferences from a retired generation cannot expose capabilities", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.get"));
+			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
+			const before = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").length;
+			await openPreferences(page);
+			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length === count + 1, {}, before);
+			const old = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 2, messages: [] } }));
+			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length >= count + 3, {}, before);
+			const current = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").slice(before + 1);
+			expect(current.every(request => request.params.sessionId === "a" && request.id !== old.id)).toBe(true);
+			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: old.id, result: profilePreferences });
+			await page.evaluate(() => {
+				const committed = Promise.withResolvers<void>();
+				requestAnimationFrame(() => requestAnimationFrame(() => committed.resolve()));
+				return committed.promise;
+			});
+			expect(await page.$(".profile-option")).toBeNull();
+			await page.evaluate(() => document.querySelector<HTMLButtonElement>('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]')?.click());
+			expect((await page.evaluate(() => window.fixture.requests())).some(request => request.method === "preferences.apply")).toBe(false);
+			for (const request of current) await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: request.id, result: profilePreferences });
+			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]:not([disabled])');
+			expect(await page.$eval(".profile-option h4", element => element.textContent)).toBe("Focused profile");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("profile apply refreshes model roles without selecting a default model", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => window.fixture.setModels([{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } }]));
+			await select(page);
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "models.list") && window.fixture.requests().some(request => request.method === "preferences.get"));
+			await page.waitForSelector(".model-trigger:not([disabled])");
+			await page.evaluate(() => { window.fixture.holdPreferences("preferences.get", true); window.fixture.holdPreferences("preferences.apply", true); });
+			const before = await page.evaluate(() => window.fixture.requests());
+			await openPreferences(page);
+			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length > count, {}, before.filter(request => request.method === "preferences.get").length);
+			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: profilePreferences });
+			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]:not([disabled])');
+			await page.click('.profile-option button[aria-label="Focused profile (focused): 이 대화에 적용"]');
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
+			const apply = (await page.evaluate(() => window.fixture.requests())).find(request => request.method === "preferences.apply")!;
+			expect(apply.params).toEqual({ sessionId: "a", action: { type: "profile.select", name: "focused", scope: "session" } });
+			const beforeRefresh = await page.evaluate(() => window.fixture.requests());
+			await page.evaluate(({ id, preferences }) => window.fixture.emit({ type: "response", id, ok: true, result: { applied: "profile.select", profileId: "focused", scope: "session", durability: "session", preferences } }), { id: apply.id, preferences: refreshedPreferences });
+			await page.waitForFunction(({ models, preferences }) => window.fixture.requests().filter(request => request.method === "models.list").length > models && window.fixture.requests().filter(request => request.method === "preferences.get").length > preferences, {}, { models: beforeRefresh.filter(request => request.method === "models.list").length, preferences: beforeRefresh.filter(request => request.method === "preferences.get").length });
+			const refreshRequests = (await page.evaluate(() => window.fixture.requests())).slice(beforeRefresh.length);
+			const refreshModel = refreshRequests.find(request => request.method === "models.list")!;
+			const refreshRead = refreshRequests.find(request => request.method === "preferences.get")!;
+			expect(refreshModel.params.sessionId).toBe("a");
+			expect(refreshRead.params.sessionId).toBe("a");
+			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: refreshRead.id, result: refreshedPreferences });
+			await page.click('.modal-close[aria-label="닫기"]');
+			await page.waitForSelector(".model-trigger:not([disabled])");
+			await page.click(".model-trigger");
+			await page.waitForFunction(() => document.querySelector('.model-option[data-model-id="fixture/model-one"] .model-role-tags')?.textContent?.includes("Executor"));
+			await page.click('.model-option[data-model-id="fixture/model-one"]');
+			await page.waitForSelector(".model-role-choice");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
+			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.apply")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
 describe("mounted composer delivery recovery", () => {
+	test("short workspace keeps queued inputs and recovery controls reachable", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.setViewport({ width: 1000, height: 480 });
+			await select(page);
+			const prompt = await send(page, "recover this payload");
+			await receipt(page, prompt, "failed");
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"] button')].some(button => button.textContent?.includes("초안 복원")));
+			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [], queued: Array.from({ length: 30 }, (_, index) => ({ id: `queue-${index}`, text: `queued ${index} ${"long".repeat(100)}`, deliverAs: "followUp" as const, cancelable: true })) } }));
+			await page.waitForSelector(".queued-input:nth-child(31)");
+			const layout = await page.evaluate(() => {
+				const queue = document.querySelector<HTMLElement>(".queued-inputs")!;
+				const pane = document.querySelector<HTMLElement>(".main-pane")!;
+				const recovery = [...document.querySelectorAll<HTMLButtonElement>('[role="status"] button')].find(button => button.textContent?.includes("초안 복원"))!;
+				const composer = document.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+				const reachable = (element: HTMLElement) => {
+					element.scrollIntoView({ block: "nearest", inline: "nearest" });
+					const rect = element.getBoundingClientRect();
+					const bounds = pane.getBoundingClientRect();
+					return rect.top >= Math.max(0, bounds.top) && rect.bottom <= Math.min(innerHeight, bounds.bottom) && rect.left >= 0 && rect.right <= innerWidth;
+				};
+				return { queueHeight: queue.getBoundingClientRect().height, queueScrolls: queue.scrollHeight > queue.clientHeight, recovery: reachable(recovery), composer: reachable(composer), documentWidth: document.documentElement.scrollWidth, documentHeight: document.documentElement.scrollHeight, width: innerWidth, height: innerHeight, documentTop: document.scrollingElement?.scrollTop };
+			});
+			expect(layout.queueHeight).toBeLessThanOrEqual(layout.height * 0.2 + 1);
+			expect(layout.queueScrolls).toBe(true);
+			expect(layout.recovery).toBe(true);
+			expect(layout.composer).toBe(true);
+			expect(layout.documentWidth).toBeLessThanOrEqual(layout.width);
+			expect(layout.documentHeight).toBeLessThanOrEqual(layout.height);
+			expect(layout.documentTop).toBe(0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("bootstrap reconciliation of an accepted delivery never shows a recovery warning", async () => {
 		const { context, page } = await fixture(true);
 		try {

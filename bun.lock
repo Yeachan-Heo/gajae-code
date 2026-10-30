@@ -101,7 +101,9 @@
       "version": "0.19.0",
       "dependencies": {
         "@tauri-apps/api": "^2.0.0",
+        "entities": "catalog:",
         "lucide-react": "catalog:",
+        "marked": "catalog:",
         "react": "catalog:",
         "react-dom": "catalog:",
       },
@@ -307,6 +309,7 @@
     "chart.js": "^4.5.1",
     "date-fns": "^4.1.0",
     "diff": "^9.0.0",
+    "entities": "2.2.0",
     "fast-check": "4.10.2",
     "fflate": "0.8.2",
     "handlebars": "^4.7.9",

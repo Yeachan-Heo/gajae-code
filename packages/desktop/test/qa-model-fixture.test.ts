@@ -629,6 +629,87 @@ describe("test-only desktop model fixture safety", () => {
 });
 
 describe("deterministic loopback SSE", () => {
+	test("only the forced title tool contract bypasses the main hold", async () => {
+		const { fixture } = await ownedFixture();
+		const headers = {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${QA_KEY}`,
+			"X-Desktop-QA-Fixture": fixture.providerToken,
+		};
+		const body = {
+			model: "qa-reasoning",
+			stream: true,
+			messages: [
+				{
+					role: "developer",
+					content: "Generate a 3-6 word title for a coding session from the supplied user message",
+				},
+				{ role: "user", content: "digest evidence" },
+			],
+			tool_choice: { type: "function", function: { name: "set_title" } },
+			tools: [
+				{
+					type: "function",
+					function: {
+						name: "set_title",
+						parameters: {
+							type: "object",
+							properties: { title: { type: "string" } },
+							required: ["title"],
+							additionalProperties: false,
+						},
+					},
+				},
+			],
+		};
+		const title = await fetch(`${fixture.baseUrl}/chat/completions`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+		});
+		const text = await title.text();
+		expect(text).toContain('"name":"set_title"');
+		expect(text).toContain("Fixture Generated Session Title");
+		expect(text).toContain('"finish_reason":"tool_calls"');
+		expect(text).toContain("data: [DONE]\n\n");
+		expect(fixture.snapshot()).toMatchObject({
+			holdNext: true,
+			requests: [],
+			titleRequests: [{ id: 1, held: false, state: "completed", body }],
+		});
+		const impostor = await fetch(`${fixture.baseUrl}/chat/completions`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ ...body, tools: [] }),
+		});
+		expect(fixture.snapshot().requests[0]).toMatchObject({ id: 1, state: "held", held: true });
+		expect(fixture.snapshot().titleRequests).toHaveLength(1);
+		expect(fixture.release(1)).toBe(true);
+		await impostor.text();
+		await Promise.all(
+			Array.from({ length: 63 }, async () => {
+				const response = await fetch(`${fixture.baseUrl}/chat/completions`, {
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+				});
+				expect(response.status).toBe(200);
+				await response.text();
+			}),
+		);
+		const excessTitle = await fetch(`${fixture.baseUrl}/chat/completions`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+		});
+		expect(excessTitle.status).toBe(429);
+		expect(fixture.snapshot().titleRequests).toHaveLength(64);
+		const nextMain = await completion(fixture.baseUrl, fixture.providerToken);
+		expect(nextMain.status).toBe(200);
+		await nextMain.text();
+		expect(fixture.snapshot().requests.map(record => record.id)).toEqual([1, 2]);
+	});
+
 	test("streams before holding, records exact body, releases once and persists terminal chunks", async () => {
 		const { layout, fixture } = await ownedFixture();
 		const response = await completion(fixture.baseUrl, fixture.providerToken);
@@ -969,6 +1050,52 @@ test("real Host→transport→SDK frames files, serializes PNG images and settle
 	expect(JSON.stringify(fixture.snapshot().requests.map(entry => entry.body.messages))).not.toContain(
 		"aborted queued image follow-up",
 	);
+}, 90000);
+
+test("real Host→SDK title request completes independently of the held main turn", async () => {
+	const { fixture, layout, send, frames, session } = await sdkHost();
+	const first = send("prompt", { sessionId: session.id, text: "investigate title request ownership" });
+	await waitFor(
+		() => fixture.snapshot().requests.length === 1 && fixture.snapshot().titleRequests.length === 1,
+		"main and title HTTP requests",
+	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === session.id &&
+					frame.session.title === "Fixture Generated Session Title",
+			),
+		"SDK-generated title applied",
+	);
+	const snapshot = fixture.snapshot();
+	expect(snapshot.requests).toHaveLength(1);
+	expect(snapshot.requests[0]).toMatchObject({ id: 1, state: "held", held: true, released: false });
+	expect(snapshot.titleRequests).toHaveLength(1);
+	const title = snapshot.titleRequests[0]!;
+	expect(title).toMatchObject({
+		id: 1,
+		method: "POST",
+		path: "/v1/chat/completions",
+		state: "completed",
+		held: false,
+		released: false,
+		body: { stream: true, tool_choice: { type: "function", function: { name: "set_title" } } },
+	});
+	expect(JSON.stringify(title.body.messages)).toContain("investigate title request ownership");
+	expect(JSON.stringify(title.body.tools)).toContain("set_title");
+	expect(title.chunks.join("\n")).toContain("Fixture Generated Session Title");
+	expect(title.chunks.at(-1)).toBe("[DONE]");
+	await fixture.flush();
+	const artifact = (await Bun.file(layout.artifactPath).json()) as FixtureSnapshot;
+	expect(artifact.titleRequests).toEqual(snapshot.titleRequests);
+	expect(artifact.requests).toEqual(snapshot.requests);
+	expect(fixture.release(1)).toBe(true);
+	expect((await first).ok).toBe(true);
+	await waitFor(() => fixture.snapshot().requests[0]?.state === "completed", "main completion cleanup");
+	expect(fixture.snapshot().requests).toHaveLength(1);
+	expect(fixture.release(1)).toBe(false);
 }, 90000);
 
 test("real DesktopHost→transport→SDK serializes reasoning/model transitions and admits queue/steer/abort during held SSE", async () => {

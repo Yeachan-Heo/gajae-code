@@ -12,6 +12,7 @@ import {
 	Settings2,
 	SlidersHorizontal,
 	Trash2,
+	X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
@@ -30,6 +31,7 @@ import type {
 } from "../../desktop-host/src/mcp-protocol";
 import type { DesktopOperatorFoldResult, DesktopOperatorOperation } from "../../desktop-host/src/operator-protocol";
 import type {
+	DesktopModelRolePreference,
 	DesktopPreferenceAction,
 	DesktopPreferenceResult,
 	DesktopPreferences,
@@ -122,7 +124,11 @@ export default function App() {
 	selectedRef.current = selected;
 	const [activity, setActivity] = useState<DesktopActivityUpdate | null>(null);
 	const [activityDetail, setActivityDetail] = useState<DesktopActivityDetail | null>(null);
-	const [preferences, setPreferences] = useState<{ sessionId: string; value: DesktopPreferences } | null>(null);
+	const [preferences, setPreferences] = useState<{
+		sessionId: string;
+		owner: string;
+		value: DesktopPreferences;
+	} | null>(null);
 	const [mcp, setMcp] = useState<{ sessionId: string; value: DesktopMcpSnapshot } | null>(null);
 	const [sessionInfo, setSessionInfo] = useState<{ sessionId: string; value: DesktopSessionInfo } | null>(null);
 	const [gateViews, setGateViews] = useState<Record<string, GateView>>({});
@@ -164,6 +170,7 @@ export default function App() {
 		sessionId: string;
 		generation: number | null;
 		models: DesktopModel[];
+		roles?: DesktopModelRolePreference[];
 		loading: boolean;
 		error?: string;
 	}>({ sessionId: "", generation: null, models: [], loading: false });
@@ -735,10 +742,19 @@ export default function App() {
 		setModelCatalog({ sessionId: selected, generation: modelGeneration, models: [], loading: true });
 		const refresh = refreshModelCatalog.current;
 		refreshModelCatalog.current = false;
-		void request<DesktopModel[]>("models.list", { sessionId: selected, ...(refresh ? { refresh: true } : {}) })
-			.then(models => {
+		void Promise.all([
+			request<DesktopModel[]>("models.list", { sessionId: selected, ...(refresh ? { refresh: true } : {}) }),
+			request<DesktopPreferences>("preferences.get", { sessionId: selected }),
+		])
+			.then(([models, preferences]) => {
 				if (alive && modelOwnerRef.current === owner)
-					setModelCatalog({ sessionId: selected, generation: modelGeneration, models, loading: false });
+					setModelCatalog({
+						sessionId: selected,
+						generation: modelGeneration,
+						models,
+						roles: preferences.roles,
+						loading: false,
+					});
 			})
 			.catch(error => {
 				if (alive && modelOwnerRef.current === owner)
@@ -1181,7 +1197,7 @@ export default function App() {
 	};
 	const activityScope = `activity:${dialogOwner || selected}`;
 	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
-	const preferencesScope = `preferences:${dialogOwner}:${dialogGeneration.current}`;
+	const preferencesScope = `preferences:${dialogOwner}:${dialogGeneration.current}:${modelOwner}`;
 	const mcpReadScope = `mcp-read:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpMutationScope = `mcp-mutation:${dialogOwner}:${dialogGeneration.current}`;
 	const sessionInfoScope = `session-info:${dialogOwner}:${dialogGeneration.current}`;
@@ -1212,25 +1228,34 @@ export default function App() {
 		});
 	};
 	const loadPreferences = (sessionId: string, generation: number) => {
+		const owner = modelOwnerRef.current;
 		setPreferences(null);
-		void run(`preferences:${sessionId}:${generation}`, async () => {
+		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
 			const value = await request<DesktopPreferences>("preferences.get", { sessionId });
-			if (dialogGeneration.current === generation) setPreferences({ sessionId, value });
+			if (dialogGeneration.current === generation && modelOwnerRef.current === owner)
+				setPreferences({ sessionId, owner, value });
 		});
 	};
 	const openPreferences = () => {
-		if (!selected) return;
-		const generation = setDialog("preferences");
-		loadPreferences(selected, generation);
+		if (selected) setDialog("preferences");
 	};
 	const applyPreferences = (action: DesktopPreferenceAction) => {
 		const sessionId = dialogOwner;
 		const generation = dialogGeneration.current;
-		void run(`preferences:${sessionId}:${generation}`, async () => {
+		const owner = modelOwnerRef.current;
+		if (preferences?.sessionId !== sessionId || preferences.owner !== owner) return;
+		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
 			const outcome = await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action });
-			if (dialogGeneration.current === generation) setPreferences({ sessionId, value: outcome.preferences });
+			if (modelOwnerRef.current === owner) {
+				setModelCatalogRevision(value => value + 1);
+				if (dialogGeneration.current === generation)
+					setPreferences({ sessionId, owner, value: outcome.preferences });
+			}
 		});
 	};
+	useEffect(() => {
+		if (dialog === "preferences" && selected && connected) loadPreferences(selected, dialogGeneration.current);
+	}, [dialog, selected, connected, modelOwner]);
 	const loadMcp = (sessionId: string, generation: number) => {
 		void run(`mcp-read:${sessionId}:${generation}`, async () => {
 			const value = await request<DesktopMcpSnapshot>("mcp.get", { sessionId });
@@ -1381,6 +1406,7 @@ export default function App() {
 				<ModelPicker
 					key={ownerKey}
 					models={catalog?.models ?? []}
+					roles={catalog?.roles ?? []}
 					onConfigureProviders={openSettings}
 					selectedId={owner.model}
 					disabled={!connected || busy || changing || loadingModels || !!catalog?.error}
@@ -1388,6 +1414,20 @@ export default function App() {
 					onSelect={modelId => {
 						if (modelOwnerRef.current === ownerKey)
 							void call("model.set", { sessionId: owner.id, modelId }, modelScope);
+					}}
+					onAssign={(role, modelId) => {
+						if (modelOwnerRef.current !== ownerKey) return;
+						void run(modelScope, async () => {
+							if (role === "default" && modelId !== null) {
+								await request("model.set", { sessionId: owner.id, modelId });
+							} else {
+								await request<DesktopPreferenceResult>("preferences.apply", {
+									sessionId: owner.id,
+									action: { type: "role.set", role, modelId },
+								});
+							}
+							if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+						});
 					}}
 				/>
 				<ReasoningSelect
@@ -1410,9 +1450,7 @@ export default function App() {
 									? "제공자를 등록·연결한 뒤 사용 가능한 모델을 선택하세요."
 									: !owner.thinking?.available
 										? (owner.thinking?.reason ?? "세션을 열면 추론 지원 여부를 확인할 수 있습니다.")
-										: owner.thinking.scope === "session"
-											? "대화 전용 추론 설정 · 다음 요청에 적용"
-											: "공통 추론 설정을 상속 중 · 다음 요청에 적용"}
+										: null}
 				</small>
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
 					<Button disabled={!connected} onClick={openSettings}>
@@ -1576,9 +1614,6 @@ export default function App() {
 				<Button onClick={openSettings} disabled={!connected}>
 					<Settings2 size={16} aria-hidden="true" /> 설정
 				</Button>
-				<Button onClick={openCommands} disabled={!connected}>
-					<Command size={15} aria-hidden="true" /> 명령 ⌘K
-				</Button>
 			</footer>
 		</>
 	);
@@ -1587,7 +1622,9 @@ export default function App() {
 			{wide && (
 				<header>
 					<h2>변경 검토</h2>
-					<Button onClick={() => setReview(false)}>닫기</Button>
+					<Button aria-label="변경 검토 닫기" onClick={() => setReview(false)}>
+						<X aria-hidden="true" />
+					</Button>
 				</header>
 			)}
 			{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
@@ -1760,13 +1797,12 @@ export default function App() {
 					<>
 						<div className="session-status" role="status">
 							{session.status === "running"
-								? "작업 중 · 다른 대화로 이동해도 계속됩니다."
+								? "작업 중"
 								: session.status === "waiting"
 									? "응답이 필요합니다."
 									: session.status === "error"
 										? "작업 오류"
 										: "대기"}
-							{pending[selected] && " · 요청 처리 중"}
 						</div>
 						<div
 							className="conversation"
@@ -1874,18 +1910,16 @@ export default function App() {
 						{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
 						<div className="composer-area">
 							<Composer
-								controls={
-									<>
-										{modelControls(session)}
-										<AttachmentPicker
-											sessionId={session.id}
-											attachments={attachmentDrafts[session.id] ?? []}
-											supportsImageInput={session.imageInput?.supported === true}
-											imagesBlocked={session.imageInput?.blocked}
-											disabled={!connected || busyDrafts[session.id]}
-											onChange={changeAttachments}
-										/>
-									</>
+								controls={modelControls(session)}
+								attachment={
+									<AttachmentPicker
+										sessionId={session.id}
+										attachments={attachmentDrafts[session.id] ?? []}
+										supportsImageInput={session.imageInput?.supported === true}
+										imagesBlocked={session.imageInput?.blocked}
+										disabled={!connected || busyDrafts[session.id]}
+										onChange={changeAttachments}
+									/>
 								}
 								hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
 								allowQueue={!session.operatorRunning}
@@ -2102,7 +2136,11 @@ export default function App() {
 					)}
 					{dialog === "preferences" && (
 						<PreferencesPanel
-							preferences={preferences?.sessionId === dialogOwner ? preferences.value : null}
+							preferences={
+								preferences?.sessionId === dialogOwner && preferences.owner === modelOwner
+									? preferences.value
+									: null
+							}
 							pending={pending[preferencesScope]}
 							busy={snapshot?.sessions.some(
 								item => item.id === dialogOwner && (item.status === "running" || item.status === "waiting"),

@@ -12,7 +12,7 @@ import {
 	X,
 } from "lucide-react";
 import type { ButtonHTMLAttributes, ClipboardEventHandler, ReactNode } from "react";
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type {
 	DesktopMessage,
 	DesktopMessageBlock,
@@ -20,6 +20,8 @@ import type {
 	DesktopSession,
 	DesktopSetting,
 } from "../../desktop-host/src/protocol";
+
+import { Markdown } from "./Markdown";
 
 export function Button({ children, className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
 	return (
@@ -85,7 +87,15 @@ function MessageImage({ block }: { block: Extract<DesktopMessageBlock, { type: "
 	);
 }
 
-function MessageBlocks({ blocks, tool }: { blocks: DesktopMessageBlock[]; tool: boolean }) {
+function MessageBlocks({
+	blocks,
+	tool,
+	markdown = false,
+}: {
+	blocks: DesktopMessageBlock[];
+	tool: boolean;
+	markdown?: boolean;
+}) {
 	return blocks.map((block, index) => {
 		switch (block.type) {
 			case "text":
@@ -96,7 +106,7 @@ function MessageBlocks({ blocks, tool }: { blocks: DesktopMessageBlock[]; tool: 
 						</pre>
 					) : (
 						<div className="message-text" key={index}>
-							{block.text}
+							{markdown ? <Markdown text={block.text} /> : block.text}
 						</div>
 					)
 				) : null;
@@ -104,7 +114,9 @@ function MessageBlocks({ blocks, tool }: { blocks: DesktopMessageBlock[]; tool: 
 				return block.text.trim() ? (
 					<details className="thinking-disclosure" key={index}>
 						<summary>생각 과정</summary>
-						<div className="message-text">{block.text}</div>
+						<div className="message-text">
+							<Markdown text={block.text} />
+						</div>
 					</details>
 				) : null;
 			case "image":
@@ -164,9 +176,11 @@ export function Message({ message }: { message: DesktopMessage }) {
 					</div>
 				</details>
 			) : blocks ? (
-				<MessageBlocks blocks={blocks} tool={false} />
+				<MessageBlocks blocks={blocks} tool={false} markdown={message.role === "assistant"} />
 			) : hasContent ? (
-				<div className="message-text">{message.text}</div>
+				<div className="message-text">
+					{message.role === "assistant" ? <Markdown text={message.text} /> : message.text}
+				</div>
 			) : null}
 		</article>
 	);
@@ -182,6 +196,7 @@ export function Composer({
 	onDeliverAs,
 	onSlash,
 	controls,
+	attachment,
 	hasAttachments,
 	allowQueue = true,
 	sendDisabled,
@@ -197,6 +212,7 @@ export function Composer({
 	onDeliverAs?: (value: "steer" | "followUp") => void;
 	onSlash?: () => void;
 	controls?: ReactNode;
+	attachment?: ReactNode;
 	hasAttachments?: boolean;
 	allowQueue?: boolean;
 	sendDisabled?: boolean;
@@ -204,7 +220,38 @@ export function Composer({
 }) {
 	const id = useId();
 	const deliverId = useId();
-	const hintId = useId();
+	const textarea = useRef<HTMLTextAreaElement>(null);
+	const metrics = useRef<HTMLSpanElement>(null);
+	const composing = useRef(false);
+	const resize = () => {
+		const element = textarea.current;
+		if (!element) return;
+		element.style.height = "auto";
+		element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
+		element.style.overflowY = element.scrollHeight > 200 ? "auto" : "hidden";
+	};
+	useLayoutEffect(resize, [value]);
+	useEffect(() => {
+		const element = textarea.current;
+		if (!element) return;
+		let width = element.clientWidth;
+		let font = getComputedStyle(element).font;
+		const observer = new ResizeObserver(entries => {
+			const nextFont = getComputedStyle(element).font;
+			if (
+				element.clientWidth !== width ||
+				nextFont !== font ||
+				entries.some(entry => entry.target === metrics.current)
+			) {
+				width = element.clientWidth;
+				font = nextFont;
+				resize();
+			}
+		});
+		observer.observe(element);
+		if (metrics.current) observer.observe(metrics.current);
+		return () => observer.disconnect();
+	}, []);
 	const canSubmit = !disabled && !sendDisabled && (!busy || allowQueue) && !!(value.trim() || hasAttachments);
 	return (
 		<form
@@ -216,44 +263,57 @@ export function Composer({
 				if (canSubmit) onSend();
 			}}
 		>
+			<span ref={metrics} className="composer-metrics" aria-hidden="true">
+				M
+			</span>
 			<label className="sr-only" htmlFor={id}>
 				메시지
 			</label>
-			<textarea
-				id={id}
-				aria-describedby={hintId}
-				value={value}
-				onChange={event => onChange(event.target.value)}
-				placeholder="무엇을 함께 만들까요?"
-				rows={3}
-				disabled={disabled}
-				onPaste={onPaste}
-				onKeyDown={event => {
-					if (event.key === "/" && !value && onSlash && !event.nativeEvent.isComposing) {
-						event.preventDefault();
-						onSlash();
-						return;
-					}
-					if (
-						event.key === "Enter" &&
-						(event.metaKey || event.ctrlKey) &&
-						!event.nativeEvent.isComposing &&
-						canSubmit
-					) {
-						event.preventDefault();
-						onSend();
-					}
-				}}
-			/>
+			<div className="composer-input">
+				{attachment}
+				<textarea
+					ref={textarea}
+					id={id}
+					value={value}
+					onChange={event => onChange(event.target.value)}
+					placeholder="무엇을 함께 만들까요?"
+					rows={1}
+					disabled={disabled}
+					onPaste={onPaste}
+					onCompositionStart={() => {
+						composing.current = true;
+					}}
+					onCompositionEnd={() => {
+						composing.current = false;
+					}}
+					onKeyDown={event => {
+						if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+						if (
+							event.key === "/" &&
+							!value &&
+							onSlash &&
+							!event.altKey &&
+							!event.ctrlKey &&
+							!event.metaKey &&
+							!event.shiftKey
+						) {
+							event.preventDefault();
+							onSlash();
+							return;
+						}
+						if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+							event.preventDefault();
+							if (canSubmit) onSend();
+						}
+					}}
+				/>
+			</div>
 			{controls != null && (
 				<div className="composer-controls" role="group" aria-label="메시지 작성 설정">
 					{controls}
 				</div>
 			)}
 			<div className="composer-actions">
-				<small id={hintId} className="composer-hint">
-					⌘ / Ctrl + Enter로 보내기
-				</small>
 				{busy && allowQueue && onDeliverAs && (
 					<div className="composer-delivery">
 						<label htmlFor={deliverId}>실행 중 입력</label>
@@ -390,6 +450,33 @@ export function Modal({
 			ref={ref}
 			aria-labelledby={titleId}
 			className={`modal ${className}`}
+			onKeyDown={event => {
+				if (event.key !== "Tab") return;
+				const dialog = event.currentTarget;
+				const targets = [
+					...dialog.querySelectorAll<HTMLElement>(
+						"button:enabled, input:enabled, select:enabled, textarea:enabled, a[href], summary, [tabindex]",
+					),
+				].filter(element => element.tabIndex >= 0 && element.getClientRects().length > 0);
+				const first = targets[0];
+				const last = targets.at(-1);
+				if (!first || !last) {
+					event.preventDefault();
+					dialog.focus();
+				} else if (
+					event.shiftKey &&
+					(document.activeElement === first || !dialog.contains(document.activeElement))
+				) {
+					event.preventDefault();
+					last.focus();
+				} else if (
+					!event.shiftKey &&
+					(document.activeElement === last || !dialog.contains(document.activeElement))
+				) {
+					event.preventDefault();
+					first.focus();
+				}
+			}}
 			onCancel={event => {
 				event.preventDefault();
 				onClose();
@@ -397,12 +484,11 @@ export function Modal({
 		>
 			<header>
 				<h2 id={titleId}>{title}</h2>
-				<Button aria-label="닫기" onClick={onClose}>
+				<Button className="modal-close" aria-label="닫기" onClick={onClose}>
 					<X aria-hidden="true" />
-					닫기
 				</Button>
 			</header>
-			{children}
+			<div className="modal-content">{children}</div>
 		</dialog>
 	);
 }

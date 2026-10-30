@@ -129,10 +129,6 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 	return (
 		<section className="oauth-settings" aria-labelledby="oauth-title">
 			<h3 id="oauth-title">계정 연결</h3>
-			<p className="muted">
-				설정을 닫아도 진행 중인 외부 로그인은 취소되지 않습니다. 다시 열면 이어서 진행할 수 있습니다. 입력한 응답은
-				닫을 때 지워집니다.
-			</p>
 			{error && <ErrorBanner>{error}</ErrorBanner>}
 			{!ready && !error && (
 				<p role="status">{connected ? "계정 연결 정보를 불러오는 중…" : "호스트 연결이 필요합니다."}</p>
