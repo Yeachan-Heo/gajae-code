@@ -301,6 +301,14 @@ const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
 
 `createAgentSession()` uses `ModelRegistry` + `AuthStorage` for model selection and API key resolution.
 
+### Live session task-role selections
+
+`session.setSessionAgentModelSelection(role, model)` selects a concrete available model for `executor`, `planner`, `critic` or `architect` without changing the main model, thinking level or shared `Settings`. These choices last only for the live session: passing `null` removes the session choice and reveals the current inherited profile/configuration. `getAgentModelOverrides()` returns a cloned effective selector map; `hasSessionAgentModelOverride(role)` distinguishes the session-owned source. Real task dispatch, detached task snapshots and eager-delegation prompts consume the same map. Successful explicit profile or session-identity replacement retires choices; failed activation/transition and ordinary configuration refresh preserve them. Default model selection remains the separate durable `setDefaultModelSelection` operation. These are in-process APIs, not new transport mutation authority.
+
+### Automatic session titles
+
+Call `session.generateAutoSessionTitle(text, { signal })` independently at first accepted input, before its first user message is recorded. It reuses SDK model/credential/obfuscation logic and returns `applied`, `skipped` (with a reason), or `failed`; it never changes prompt delivery. Do not seed a display placeholder using a user-sourced name. Existing/manual names win, duplicate generation is coalesced, and session identity/lifecycle changes fence late completion. Hosts must abort their signal synchronously before retiring/replacing the live owner and must recheck ownership before publishing derived metadata. A successful result has committed the SDK title; a redundant application catalog cache can be reconciled from it on reopening. No generation transport operation is implicitly admitted.
+
 ### Explicit wiring
 
 ```ts

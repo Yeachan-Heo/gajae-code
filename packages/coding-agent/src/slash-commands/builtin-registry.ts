@@ -454,7 +454,7 @@ function formatModelSelectorForStatus(value: ModelSelectorValue | undefined): st
 }
 
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
-	const agentModelOverrides = runtime.settings.get("task.agentModelOverrides");
+	const agentModelOverrides = runtime.session.getAgentModelOverrides();
 	const lines = ["Model assignments:"];
 	for (const targetId of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];

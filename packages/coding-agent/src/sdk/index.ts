@@ -20,6 +20,7 @@ export {
 } from "../progress/progress-contract";
 export type {
 	AgentSessionLifecycleState,
+	AutoSessionTitleResult,
 	QueuedInputAdmission,
 	QueuedInputDelivery,
 	QueuedInputExecution,
@@ -28,6 +29,7 @@ export type {
 	QueuedInputSubmission,
 	QueuedInputTerminal,
 	SendUserMessageOptions,
+	SessionAgentModelRole,
 	TrackedSendUserMessageOptions,
 } from "../session/agent-session";
 export { getSessionMessageEntryId } from "../session/session-manager";

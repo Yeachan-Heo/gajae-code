@@ -28,8 +28,9 @@ import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
-import { resolveProfileBindings } from "../config/model-profiles";
+import { type ResolvedProfileBinding, resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import type { Theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -145,7 +146,10 @@ function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 }
 
 /** Retain the caller-visible execution inputs for detached and resumed runs. */
-function captureTaskExecutionScope(session: ToolSession): ToolSession {
+function captureTaskExecutionScope(session: ToolSession): {
+	session: ToolSession;
+	profileBindings?: ResolvedProfileBinding;
+} {
 	const snapshot = new Map<PropertyKey, unknown>([
 		["cwd", session.cwd],
 		["hasUI", session.hasUI],
@@ -195,8 +199,26 @@ function captureTaskExecutionScope(session: ToolSession): ToolSession {
 		}
 	}
 
+	if (session.getAgentModelOverrides) {
+		const overrides = session.getAgentModelOverrides();
+		const copy = Object.fromEntries(
+			Object.entries(overrides).map(([role, value]) => [role, Array.isArray(value) ? [...value] : value]),
+		);
+		snapshot.set("getAgentModelOverrides", () => copy);
+	}
+	if (session.hasSessionAgentModelOverride) {
+		const ownedRoles = new Set(
+			["executor", "planner", "critic", "architect"].filter(role => session.hasSessionAgentModelOverride?.(role)),
+		);
+		snapshot.set("hasSessionAgentModelOverride", (role: string) => ownedRoles.has(role));
+	}
+
+	const profileAccessor = snapshot.get("getActiveModelProfile");
+	const profileName = typeof profileAccessor === "function" ? profileAccessor() : undefined;
+	const profile = typeof profileName === "string" ? session.modelRegistry?.getModelProfile?.(profileName) : undefined;
+	const profileBindings = profile ? structuredClone(resolveProfileBindings(profile)) : undefined;
 	const boundMethods = new Map<PropertyKey, { source: unknown; bound: unknown }>();
-	return new Proxy(session, {
+	const capturedSession = new Proxy(session, {
 		get(target, property) {
 			if (snapshot.has(property)) return snapshot.get(property);
 			const value: unknown = Reflect.get(target, property, target);
@@ -208,6 +230,7 @@ function captureTaskExecutionScope(session: ToolSession): ToolSession {
 			return bound;
 		},
 	}) as ToolSession;
+	return { session: capturedSession, profileBindings };
 }
 
 /** Approval policy copied into a task child. A missing mode stays `allow`, the child default. */
@@ -702,6 +725,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly #sessionRepositoryBinding: RepositoryBinding;
 	readonly #ownerSession: ToolSession;
 	readonly #parentModelProfileOwnershipMarker: unknown;
+	readonly #parentProfileBindings: ResolvedProfileBinding | undefined;
 	#testRunSubprocess: typeof runSubprocess | undefined;
 
 	private constructor(
@@ -710,12 +734,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		sessionRepositoryBinding: RepositoryBinding,
 		ownerSession?: ToolSession,
 		parentModelProfileOwnershipMarker?: unknown,
+		parentProfileBindings?: ResolvedProfileBinding,
 	) {
 		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
 		this.#discoveredAgents = discoveredAgents;
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
 		this.#ownerSession = ownerSession ?? session;
 		this.#parentModelProfileOwnershipMarker = parentModelProfileOwnershipMarker;
+		this.#parentProfileBindings = parentProfileBindings;
 	}
 
 	#runSubprocess(options: Parameters<typeof runSubprocess>[0]): Promise<SingleResult> {
@@ -726,12 +752,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentModelProfileOwnershipMarker = (
 			this.#ownerSession as { sessionManager?: { getModelProfileOwnershipMarker?: () => unknown } }
 		).sessionManager?.getModelProfileOwnershipMarker?.();
+		const captured = captureTaskExecutionScope(this.#ownerSession);
 		const invocation = new TaskTool(
-			captureTaskExecutionScope(this.#ownerSession),
+			captured.session,
 			this.#discoveredAgents,
 			this.#sessionRepositoryBinding,
 			this.#ownerSession,
 			parentModelProfileOwnershipMarker,
+			captured.profileBindings,
 		);
 		invocation.#testRunSubprocess = this.#testRunSubprocess;
 		return invocation;
@@ -1912,7 +1940,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			: agent;
 
 		// Apply per-agent model override from settings (highest priority)
-		const agentModelOverrides = session.settings.get("task.agentModelOverrides");
+		const agentModelOverrides =
+			session.getAgentModelOverrides?.() ?? session.settings.get("task.agentModelOverrides");
 		const settingsModelOverride = agentModelOverrides[agentName];
 		const parentActiveModelPattern = session.getActiveModelString?.();
 		// A live active model profile claims persisted agent overrides: bare
@@ -1923,28 +1952,27 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		).getActiveModelProfile?.();
 		// Propagate the parent session's ownership marker when a session-local profile is active.
 		const parentModelProfileOwnershipMarker = this.#parentModelProfileOwnershipMarker;
-		const parentProfileDefinition = parentActiveModelProfile
-			? session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
-			: undefined;
-		const parentProfileBindings = parentProfileDefinition
-			? resolveProfileBindings(parentProfileDefinition)
-			: undefined;
+		const parentProfileBindings = this.#parentProfileBindings;
 		const parentProfileBinding =
 			parentProfileBindings?.agentModelOverrides[
 				agentName as keyof typeof parentProfileBindings.agentModelOverrides
 			];
+		const effectiveRoleBinding = session.getAgentModelOverrides
+			? settingsModelOverride
+			: (settingsModelOverride ?? parentProfileBinding);
+		const effectiveChain = normalizeModelSelectorValue(effectiveRoleBinding);
+		const profileChain = normalizeModelSelectorValue(parentProfileBinding);
 		const parentOwnedModelProfile =
-			parentProfileDefinition &&
-			parentProfileBindings &&
-			Object.hasOwn(parentProfileBindings.agentModelOverrides, agentName)
+			!session.hasSessionAgentModelOverride?.(agentName) &&
+			effectiveChain.length > 0 &&
+			effectiveChain.length === profileChain.length &&
+			effectiveChain.every((selector, index) => selector === profileChain[index])
 				? parentActiveModelProfile
 				: undefined;
 		const modelOverride = resolveAgentModelPatterns({
-			// Profile bindings are runtime-owned and may not be present in the
-			// persisted settings view exposed to detached task construction.
-			// Keep explicit task settings authoritative, then inherit the active
-			// profile's role binding before falling back to the parent model.
-			settingsOverride: settingsModelOverride ?? parentProfileBinding,
+			// Standalone sessions may expose profile bindings only through their
+			// registry. A session reader, including an empty map, is authoritative.
+			settingsOverride: effectiveRoleBinding,
 			agentModel: effectiveAgent.model,
 			settings: session.settings,
 			activeModelPattern: parentActiveModelPattern,
