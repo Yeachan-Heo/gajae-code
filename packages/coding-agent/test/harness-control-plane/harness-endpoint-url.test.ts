@@ -51,6 +51,25 @@ describe("harness discovery url", () => {
 		expect(isHarnessLoopbackEndpointUrl(`${" ".repeat(2100)}ws://127.0.0.1:9`)).toBe(false);
 	});
 
+	it("rejects port zero and IPv4-mapped IPv6 and keeps port one and IPv6 loopback", () => {
+		for (const raw of [
+			"ws://127.0.0.1:0",
+			"ws://localhost:0",
+			"ws://[::1]:0",
+			" ws://127.0.0.1:0 ",
+			"wss://127.0.0.1:0",
+			"ws://[::ffff:127.0.0.1]:9",
+			"ws://[::FFFF:127.0.0.1]:9",
+			"ws://[::ffff:7f00:1]:9",
+			"ws://[::ffff:127.0.0.1]:1",
+		]) {
+			expect(isHarnessLoopbackEndpointUrl(raw)).toBe(false);
+		}
+		for (const raw of ["ws://127.0.0.1:1", "ws://[::1]:1", "ws://[::1]:9", " wss://127.0.0.1:1 "]) {
+			expect(isHarnessLoopbackEndpointUrl(raw)).toBe(true);
+		}
+	});
+
 	it("property: harness loopback endpoint url, seed 619452, 64 inputs", () => {
 		const host = fc.constantFrom("127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "LOCALHOST", "[::1]");
 		const port = fc.integer({ min: 1, max: 65535 });
@@ -106,6 +125,21 @@ describe("harness discovery url", () => {
 				expect(url.href.includes("?")).toBe(false);
 				expect(url.href.includes("#")).toBe(false);
 				expect(url.pathname === "/" || url.pathname === "").toBe(true);
+			}),
+			{ seed: SEED, numRuns: RUNS },
+		);
+		const loopbackHost = fc.constantFrom("127.0.0.1", "127.0.0.2", "localhost", "[::1]");
+		fc.assert(
+			fc.property(loopbackHost, scheme, (chosenHost, chosenScheme) => {
+				expect(isHarnessLoopbackEndpointUrl(`${chosenScheme}://${chosenHost}:0`)).toBe(false);
+				expect(isHarnessLoopbackEndpointUrl(`${chosenScheme}://${chosenHost}:1`)).toBe(true);
+			}),
+			{ seed: SEED, numRuns: RUNS },
+		);
+		fc.assert(
+			fc.property(scheme, port, (chosenScheme, chosenPort) => {
+				expect(isHarnessLoopbackEndpointUrl(`${chosenScheme}://[::ffff:127.0.0.1]:${chosenPort}`)).toBe(false);
+				expect(isHarnessLoopbackEndpointUrl(`${chosenScheme}://[::ffff:7f00:1]:${chosenPort}`)).toBe(false);
 			}),
 			{ seed: SEED, numRuns: RUNS },
 		);

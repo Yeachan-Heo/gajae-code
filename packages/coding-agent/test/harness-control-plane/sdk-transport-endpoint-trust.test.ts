@@ -183,6 +183,54 @@ describe("harness owner discovery trust", () => {
 		}
 	});
 
+	it("rejects port-zero and IPv4-mapped IPv6 discovery and still attaches to port one and IPv6 loopback", async () => {
+		for (const url of [
+			"ws://127.0.0.1:0",
+			"ws://[::1]:0",
+			"ws://[::ffff:127.0.0.1]:9",
+			"ws://[::ffff:7f00:1]:9",
+			"ws://[::FFFF:127.0.0.1]:1",
+		]) {
+			const rejected = await dial(
+				{ version: 1, sessionId: "session-a", url, token: "rejected-token", pid: process.pid },
+				true,
+			);
+			expect(rejected.spawnCalls).toBe(1);
+			expect(rejected.url).toBe("ws://127.0.0.1:9");
+			expect(rejected.url).not.toBe(url);
+			expect(rejected.token).toBe("spawned-token");
+			expect(rejected.token).not.toBe("rejected-token");
+		}
+		for (const url of ["ws://127.0.0.1:1", "ws://[::1]:9", "ws://[::1]:1"]) {
+			const attached = await dial(
+				{ version: 1, sessionId: "session-a", url, token: "kept-token", pid: process.pid },
+				false,
+			);
+			expect(attached.spawnCalls).toBe(0);
+			expect(attached.url).toBe(url);
+			expect(attached.token).toBe("kept-token");
+		}
+	});
+
+	it("keeps two concurrent discovery attaches on their own records", async () => {
+		const [left, right] = await Promise.all([
+			dial(
+				{ version: 1, sessionId: "session-a", url: "ws://127.0.0.1:1", token: "left-token", pid: process.pid },
+				false,
+			),
+			dial(
+				{ version: 1, sessionId: "session-a", url: "ws://[::1]:9", token: "right-token", pid: process.pid },
+				false,
+			),
+		]);
+		expect(left.spawnCalls).toBe(0);
+		expect(left.url).toBe("ws://127.0.0.1:1");
+		expect(left.token).toBe("left-token");
+		expect(right.spawnCalls).toBe(0);
+		expect(right.url).toBe("ws://[::1]:9");
+		expect(right.token).toBe("right-token");
+	});
+
 	it("still attaches to a live loopback endpoint without spawning", async () => {
 		for (const url of [
 			"ws://127.0.0.1:9",
