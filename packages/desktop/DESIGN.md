@@ -57,8 +57,18 @@ The app uses public AuthStorage login callbacks with a single app-owned authoriz
 
 Before the SDK captures environment state, the sidecar strips inherited provider keys/tokens, routing/proxy overrides and CLI broker state. Shared mode restores the installation's HOME and resolved agent directory (including explicit agent-directory overrides); credentials remain in the SDK's shared storage, not a new Keychain implementation. `GJC_DESKTOP_ISOLATED=1` instead places HOME, agent, configuration and XDG roots under the app data directory for tests/QA. Neither mode is an execution sandbox for SDK tools.
 
+## Delivery recovery and process ownership
+
+Before clearing the composer, atomically retain its original text and ready attachment payloads in local IndexedDB. The host retains metadata-only delivery receipts and acknowledgment tombstones. Durable handoff and SDK preflight acceptance are not proof that a model run executed. Definitive refusal is distinct from provider failure, cancellation, and an unknown outcome; a disconnect or restart must never automatically replay potentially executed input.
+
+Recovery requires an explicit user action. Restore preserves newer draft text and attachments; acknowledging the recovery record does not erase the restored draft. Network acknowledgment is bounded and does not hold the local draft-write queue. Repair and disposal controls belong to an exact delivery ID, not every delivery in the same session; unresolved known-unsent repair cannot be discarded.
+
+The process entrypoint registers host teardown and final frame draining with the shared signal-exit owner. It does not race an independent LSP exit handler or remove unrelated signal listeners. Protocol-requested shutdown is a normal zero exit; SIGTERM retains the shared conventional status. Signal cleanup remains bounded by the existing postmortem deadline (5 seconds by default, configurable with `GJC_CLEANUP_DEADLINE_MS`); expiry can interrupt teardown or final frame flushing, so it is not a guaranteed-delivery contract. Unproven deliveries remain recoverable as unknown. QA fixtures use the same process lifecycle and observe real MCP transport termination and LSP process exit rather than inferring teardown from a stale-session error.
+
 ## Verification
 
 `bun packages/desktop/scripts/app-flow-qa.ts` walks the shipped user journeys (turn, abort, queue, model/reasoning, command search, settings, export, attachments, side chat, operator, session info, fork, delete) against the real Host and SDK and the zero-provider fixture. It is manual only — it needs a local Chrome (`GJC_QA_CHROME` overrides the macOS default), a free port 1420 and no other Vite server on it — and it is not wired into a package script or CI gate. It is App/Host/SDK transport proof, not a live provider or native-WebView check.
+
+Run `bun test packages/desktop/test packages/desktop-host/test` for durable recovery, exact wire-envelope limits, mounted composer failures, causal error ownership, trusted extension input/startup, real owned MCP/LSP effects and teardown, and actual wrapper HTTP/SSE shutdown. Run `cargo test --manifest-path packages/desktop/src-tauri/Cargo.toml` separately for native frame validation and sidecar lifecycle. These fixtures use isolated credentials and owned loopback services, not live provider accounts. Intentional QA shutdown drains diagnostics and final event frames boundedly; failure diagnostics redact fixture tokens.
 
 Fresh current-branch screenshots for implemented surfaces/states/breakpoints and scroll boundaries, CJK wrapping inspection, independent review. Compilation is not evidence of signed standalone distribution, real-provider login or full TUI parity.

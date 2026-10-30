@@ -39,6 +39,7 @@ import type {
 	DesktopCommand,
 	DesktopCommandResult,
 	DesktopCredentialSaveResult,
+	DesktopDeliveryReceipt,
 	DesktopDiff,
 	DesktopForkResult,
 	DesktopFrame,
@@ -59,10 +60,19 @@ import {
 	readyDesktopAttachments,
 } from "./AttachmentPicker";
 import { BtwDialog } from "./BtwDialog";
-import { request, selectProject, subscribe } from "./bridge";
+import { DesktopRequestError, request, selectProject, subscribe, validateDesktopRequest } from "./bridge";
 import { matchesSlashFilter } from "./command-search";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
 import { restoreAttachments, restoreDraft } from "./composer-draft";
+import {
+	commitDraftAndDelivery,
+	type DeliveryRecovery,
+	deleteDelivery,
+	loadDeliveries,
+	loadDrafts,
+	saveDelivery,
+	saveDrafts,
+} from "./delivery-recovery";
 import { ForkPanel } from "./ForkPanel";
 import { GateDialog } from "./GateDialog";
 import { McpPanel } from "./McpPanel";
@@ -101,6 +111,8 @@ interface GateView {
 }
 const textOf = (value: unknown) =>
 	typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "결과 없음");
+const isFinalDelivery = (disposition: DesktopDeliveryReceipt["disposition"]) =>
+	["completed", "cancelled", "refused", "removed", "failed"].includes(disposition);
 
 export default function App() {
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
@@ -159,6 +171,22 @@ export default function App() {
 	const [connection, setConnection] = useState("호스트에 연결하는 중…");
 	const [fatal, setFatal] = useState(false);
 	const [errors, setErrors] = useState<Record<string, string>>({});
+	const [errorOwners, setErrorOwners] = useState<Record<string, { requestId: string; sessionId: string }>>({});
+	const [recoveries, setRecoveries] = useState<DeliveryRecovery[]>([]);
+	const recoveriesRef = useRef<DeliveryRecovery[]>([]);
+	const recoveryWork = useRef<Promise<void>>(Promise.resolve());
+	const ackFlights = useRef(new Set<string>());
+	const [unsentBlocked, setUnsentBlocked] = useState<Record<string, boolean>>({});
+	const unsentBlockedRef = useRef(new Set<string>());
+	const unsentRestoredInMemory = useRef(new Set<string>());
+	const unsentRepairs = useRef(new Map<string, string>());
+	const finishUnsentRepair = (id: string, sessionId: string) => {
+		unsentRepairs.current.delete(id);
+		unsentRestoredInMemory.current.delete(id);
+		if ([...unsentRepairs.current.values()].includes(sessionId)) return;
+		unsentBlockedRef.current.delete(sessionId);
+		setUnsentBlocked(previous => ({ ...previous, [sessionId]: false }));
+	};
 	const [pending, setPending] = useState<Record<string, boolean>>({});
 	const locks = useRef(new Set<string>());
 	const [drafts, setDrafts] = useState<Record<string, string>>(() => {
@@ -174,16 +202,243 @@ export default function App() {
 		}
 	});
 	const [attachmentDrafts, setAttachmentDrafts] = useState<Record<string, DesktopAttachmentDraft[]>>({});
+	// These refs are the authoritative draft state during asynchronous durable
+	// transactions. A render may still contain an older React snapshot and must
+	// never overwrite a handoff that has not yet been published to React.
+	const draftsRef = useRef(drafts);
+	const attachmentsRef = useRef(attachmentDrafts);
+	const [recoveryReady, setRecoveryReady] = useState(false);
+	const draftLocks = useRef(new Set<string>());
+	const deferredAttachments = useRef(
+		new Map<string, Array<(current: DesktopAttachmentDraft[]) => DesktopAttachmentDraft[]>>(),
+	);
+	const deferredText = useRef(new Map<string, Array<(current: string) => string>>());
+	const [busyDrafts, setBusyDrafts] = useState<Record<string, boolean>>({});
+	const lockDraft = (sessionId: string) => {
+		draftLocks.current.add(sessionId);
+		setBusyDrafts(previous => ({ ...previous, [sessionId]: true }));
+	};
+	const drainDraft = (sessionId: string) => {
+		const textUpdates = deferredText.current.get(sessionId) ?? [];
+		deferredText.current.delete(sessionId);
+		for (const update of textUpdates)
+			draftsRef.current = { ...draftsRef.current, [sessionId]: update(draftsRef.current[sessionId] ?? "") };
+		if (textUpdates.length) setDrafts(draftsRef.current);
+		const updates = deferredAttachments.current.get(sessionId) ?? [];
+		deferredAttachments.current.delete(sessionId);
+		for (const update of updates) {
+			const next = update(attachmentsRef.current[sessionId] ?? []);
+			attachmentsRef.current = { ...attachmentsRef.current, [sessionId]: next };
+		}
+		if (updates.length) setAttachmentDrafts(attachmentsRef.current);
+	};
+	const unlockDraft = (sessionId: string) => {
+		drainDraft(sessionId);
+		draftLocks.current.delete(sessionId);
+		setBusyDrafts(previous => ({ ...previous, [sessionId]: false }));
+	};
+	const flushDraft = async (sessionId: string) => {
+		do {
+			drainDraft(sessionId);
+			await saveDrafts([
+				{
+					sessionId,
+					text: draftsRef.current[sessionId] ?? "",
+					attachments: (attachmentsRef.current[sessionId] ?? []).filter(item => item.status === "ready"),
+				},
+			]);
+		} while (deferredText.current.has(sessionId) || deferredAttachments.current.has(sessionId));
+	};
+	const changeText = (sessionId: string, update: (text: string) => string) => {
+		if (draftLocks.current.has(sessionId)) {
+			const updates = deferredText.current.get(sessionId) ?? [];
+			updates.push(update);
+			deferredText.current.set(sessionId, updates);
+			return;
+		}
+		draftsRef.current = { ...draftsRef.current, [sessionId]: update(draftsRef.current[sessionId] ?? "") };
+		setDrafts(draftsRef.current);
+	};
 	const changeAttachments = useCallback(
 		(sessionId: string, update: (current: DesktopAttachmentDraft[]) => DesktopAttachmentDraft[]) => {
-			setAttachmentDrafts(previous => {
-				const current = previous[sessionId] ?? [];
-				const next = update(current);
-				return next === current ? previous : { ...previous, [sessionId]: next };
-			});
+			if (draftLocks.current.has(sessionId)) {
+				const updates = deferredAttachments.current.get(sessionId) ?? [];
+				updates.push(update);
+				deferredAttachments.current.set(sessionId, updates);
+				return;
+			}
+			const current = attachmentsRef.current[sessionId] ?? [];
+			const next = update(current);
+			if (next !== current) {
+				attachmentsRef.current = { ...attachmentsRef.current, [sessionId]: next };
+				setAttachmentDrafts(attachmentsRef.current);
+			}
 		},
 		[],
 	);
+	const updateRecoveries = useCallback((entries: DeliveryRecovery[]) => {
+		recoveriesRef.current = entries;
+		setRecoveries(entries);
+	}, []);
+	const enqueueRecovery = useCallback((work: () => Promise<void>) => {
+		recoveryWork.current = recoveryWork.current.then(work).catch(error => {
+			setErrors(previous => ({
+				...previous,
+				global: `복구 저장소 오류: ${error instanceof Error ? error.message : String(error)}`,
+			}));
+		});
+	}, []);
+	const restoreRecovery = useCallback(
+		async (entry: DeliveryRecovery) => {
+			lockDraft(entry.sessionId);
+			try {
+				if (entry.restored) {
+					await flushDraft(entry.sessionId);
+					return;
+				}
+				const currentText = draftsRef.current[entry.sessionId] ?? "";
+				const currentAttachments = attachmentsRef.current[entry.sessionId] ?? [];
+				const text = restoreDraft(currentText, entry.text);
+				const attachments = restoreAttachments(currentAttachments, entry.attachments);
+				const next = { ...entry, restored: true };
+				await commitDraftAndDelivery(next, {
+					sessionId: entry.sessionId,
+					text,
+					attachments: attachments.filter(item => item.status === "ready"),
+				});
+				updateRecoveries(recoveriesRef.current.map(item => (item.id === entry.id ? next : item)));
+				const latestText = draftsRef.current[entry.sessionId] ?? "";
+				const latestAttachments = attachmentsRef.current[entry.sessionId] ?? [];
+				const mergedText = latestText === currentText ? text : restoreDraft(latestText, entry.text);
+				const mergedAttachments =
+					latestAttachments === currentAttachments
+						? attachments
+						: restoreAttachments(latestAttachments, entry.attachments);
+				draftsRef.current = { ...draftsRef.current, [entry.sessionId]: mergedText };
+				attachmentsRef.current = { ...attachmentsRef.current, [entry.sessionId]: mergedAttachments };
+				setDrafts(draftsRef.current);
+				setAttachmentDrafts(attachmentsRef.current);
+				await flushDraft(entry.sessionId);
+			} finally {
+				unlockDraft(entry.sessionId);
+			}
+		},
+		[updateRecoveries],
+	);
+	const finalizeRecovery = useCallback(
+		async (entry: DeliveryRecovery) => {
+			const finalized = { ...entry, finalizing: true };
+			await saveDelivery(finalized);
+			updateRecoveries(recoveriesRef.current.map(item => (item.id === entry.id ? finalized : item)));
+			if (ackFlights.current.has(entry.id)) return;
+			ackFlights.current.add(entry.id);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = Promise.withResolvers<never>();
+			timer = setTimeout(() => timeout.reject(new Error("전송 확인 응답 시간이 초과되었습니다.")), 5000);
+			void Promise.race([request("delivery.ack", { deliveryId: entry.id }), timeout.promise])
+				.then(() => {
+					enqueueRecovery(async () => {
+						const current = recoveriesRef.current.find(item => item.id === entry.id);
+						if (!current?.finalizing) return;
+						await deleteDelivery(entry.id);
+						updateRecoveries(recoveriesRef.current.filter(item => item.id !== entry.id));
+					});
+				})
+				.catch(error => {
+					setErrors(previous => ({
+						...previous,
+						global: `전송 확인 오류: ${error instanceof Error ? error.message : String(error)}`,
+					}));
+				})
+				.finally(() => {
+					if (timer) clearTimeout(timer);
+					ackFlights.current.delete(entry.id);
+				});
+		},
+		[updateRecoveries, enqueueRecovery],
+	);
+	const reconcileReceipt = useCallback(
+		async (receipt: DesktopDeliveryReceipt) => {
+			const entry = recoveriesRef.current.find(
+				item => item.id === receipt.id && item.sessionId === receipt.sessionId,
+			);
+			if (!entry) return;
+			if (entry.prepared) {
+				if (unsentRestoredInMemory.current.has(entry.id)) {
+					const restored = { ...entry, disposition: "refused" as const, prepared: false, restored: true };
+					await commitDraftAndDelivery(restored, {
+						sessionId: entry.sessionId,
+						text: draftsRef.current[entry.sessionId] ?? "",
+						attachments: (attachmentsRef.current[entry.sessionId] ?? []).filter(item => item.status === "ready"),
+					});
+					updateRecoveries(recoveriesRef.current.map(item => (item.id === entry.id ? restored : item)));
+				} else await restoreRecovery({ ...entry, disposition: "refused", prepared: false });
+				const current = recoveriesRef.current.find(item => item.id === entry.id);
+				if (current) await finalizeRecovery(current);
+				finishUnsentRepair(entry.id, entry.sessionId);
+				return;
+			}
+			if (unsentRepairs.current.has(entry.id) && entry.restored) await flushDraft(entry.sessionId);
+			if (entry.finalizing) {
+				await finalizeRecovery(entry);
+				if (unsentRepairs.current.has(entry.id)) finishUnsentRepair(entry.id, entry.sessionId);
+				return;
+			}
+			const next = isFinalDelivery(entry.disposition)
+				? entry
+				: { ...entry, disposition: receipt.disposition, error: receipt.error };
+			await saveDelivery(next);
+			updateRecoveries(recoveriesRef.current.map(item => (item.id === next.id ? next : item)));
+			if (next.disposition === "refused" || next.disposition === "removed") await restoreRecovery(next);
+			if (
+				next.disposition === "completed" ||
+				next.disposition === "cancelled" ||
+				next.disposition === "refused" ||
+				next.disposition === "removed"
+			) {
+				const current = recoveriesRef.current.find(item => item.id === entry.id);
+				if (current) await finalizeRecovery(current);
+				if (unsentRepairs.current.has(entry.id)) finishUnsentRepair(entry.id, entry.sessionId);
+			}
+		},
+		[restoreRecovery, updateRecoveries, finalizeRecovery],
+	);
+	useEffect(() => {
+		enqueueRecovery(async () => {
+			const [entries, storedDrafts] = await Promise.all([loadDeliveries(), loadDrafts()]);
+			for (const entry of entries)
+				if (entry.prepared) {
+					unsentBlockedRef.current.add(entry.sessionId);
+					unsentRepairs.current.set(entry.id, entry.sessionId);
+				}
+			setUnsentBlocked(Object.fromEntries([...unsentBlockedRef.current].map(sessionId => [sessionId, true])));
+			updateRecoveries(entries);
+			const nextDrafts = { ...draftsRef.current };
+			const nextAttachments = { ...attachmentsRef.current };
+			for (const draft of storedDrafts) {
+				nextDrafts[draft.sessionId] = draft.text;
+				nextAttachments[draft.sessionId] = draft.attachments;
+			}
+			draftsRef.current = nextDrafts;
+			attachmentsRef.current = nextAttachments;
+			setDrafts(nextDrafts);
+			setAttachmentDrafts(nextAttachments);
+			setRecoveryReady(true);
+		});
+	}, [enqueueRecovery, updateRecoveries]);
+	useEffect(() => {
+		if (!recoveryReady) return;
+		enqueueRecovery(async () => {
+			const ids = new Set([...Object.keys(draftsRef.current), ...Object.keys(attachmentsRef.current)]);
+			await saveDrafts(
+				[...ids].map(sessionId => ({
+					sessionId,
+					text: draftsRef.current[sessionId] ?? "",
+					attachments: (attachmentsRef.current[sessionId] ?? []).filter(item => item.status === "ready"),
+				})),
+			);
+		});
+	}, [drafts, attachmentDrafts, recoveryReady, enqueueRecovery]);
 	const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
 	const [dialog, setDialogState] = useState<Dialog>(null);
 	const dialogGeneration = useRef(0);
@@ -223,14 +478,14 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
-	// A failed turn is published on the session itself; the request that carried it
-	// reports the same string. Render it once instead of twice.
 	const scopeError = (scope: string) => {
-		const message = errors[scope];
-		return message && message !== session?.error ? message : "";
+		const owner = errorOwners[scope];
+		return owner && owner.sessionId === session?.id && owner.requestId === session?.errorOwner
+			? ""
+			: (errors[scope] ?? "");
 	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
-	const connected = snapshot !== null && !fatal;
+	const connected = snapshot !== null && !fatal && recoveryReady;
 	const modelGeneration = session?.controlGeneration ?? null;
 	const modelOwner = session ? `${session.id}:${modelGeneration}` : "";
 	const modelOwnerRef = useRef(modelOwner);
@@ -292,7 +547,13 @@ export default function App() {
 				setReview(false);
 				setKey("");
 			}
-			if (event.type === "snapshot") setSnapshot(event.snapshot);
+			if (event.type === "snapshot") {
+				setSnapshot(event.snapshot);
+				enqueueRecovery(async () => {
+					for (const receipt of event.snapshot.deliveries) await reconcileReceipt(receipt);
+				});
+			}
+			if (event.type === "delivery") enqueueRecovery(() => reconcileReceipt(event.receipt));
 			if (event.type === "activity") applyActivityUpdate(event.update);
 			if (event.type === "operator") rememberOperator(event.sessionId, event.event.operation);
 			if (event.type === "gate") {
@@ -333,6 +594,16 @@ export default function App() {
 				const initial = await request<DesktopSnapshot>("bootstrap");
 				if (alive && !failed) {
 					setSnapshot(initial);
+					enqueueRecovery(async () => {
+						for (const entry of recoveriesRef.current) {
+							const receipt = initial.deliveries.find(
+								item => item.id === entry.id && item.sessionId === entry.sessionId,
+							);
+							await reconcileReceipt(
+								receipt ?? { id: entry.id, sessionId: entry.sessionId, disposition: "unknown" },
+							);
+						}
+					});
 					bootstrapped = true;
 					for (const event of buffered) frame(event);
 					setConnection("");
@@ -349,7 +620,7 @@ export default function App() {
 			alive = false;
 			unsubscribe?.();
 		};
-	}, [applyActivityUpdate, rememberOperator]);
+	}, [applyActivityUpdate, rememberOperator, enqueueRecovery, reconcileReceipt]);
 	useEffect(() => {
 		setActivity(null);
 		if (!selected || !connected) return;
@@ -436,9 +707,20 @@ export default function App() {
 		locks.current.add(scope);
 		setPending(previous => ({ ...previous, [scope]: true }));
 		setErrors(previous => ({ ...previous, [scope]: "" }));
+		setErrorOwners(previous => {
+			const next = { ...previous };
+			delete next[scope];
+			return next;
+		});
+		const errorSessionId = selectedRef.current;
 		try {
 			await action();
 		} catch (error) {
+			if (error instanceof DesktopRequestError)
+				setErrorOwners(previous => ({
+					...previous,
+					[scope]: { requestId: error.requestId, sessionId: errorSessionId },
+				}));
 			setErrors(previous => ({
 				...previous,
 				[scope]: scope.startsWith("auth:")
@@ -510,7 +792,7 @@ export default function App() {
 		setDialog("btw");
 	};
 	const send = () => {
-		if (!session || !connected) return;
+		if (!session || !connected || unsentBlockedRef.current.has(session.id)) return;
 		const sessionId = session.id;
 		const text = drafts[sessionId] || "";
 		const ownedAttachments = attachmentDrafts[sessionId] ?? [];
@@ -528,28 +810,102 @@ export default function App() {
 			return;
 		}
 		const queued = session.status === "running" || session.status === "waiting";
-		// A prompt request resolves only when the turn ends, so the composer clears on
-		// admission rather than on reply: keeping the sent text invites a duplicate
-		// submission. Clearing inside the action means a send that `run` refuses to
-		// admit (locked scope) leaves the draft untouched. Queue admission takes its
-		// own scope, or steer/follow-up submissions would collide with the running turn.
 		void run(queued ? `enqueue:${sessionId}` : sessionId, async () => {
 			const attachments = readyDesktopAttachments(ownedAttachments);
+			const id = crypto.randomUUID();
+			const params = {
+				sessionId,
+				text,
+				...(attachments.length ? { attachments } : {}),
+				...(queued ? { deliverAs } : {}),
+			};
+			validateDesktopRequest("prompt", params, id);
+			const entry: DeliveryRecovery = {
+				id,
+				sessionId,
+				text,
+				attachments: ownedAttachments,
+				disposition: "pending",
+				prepared: true,
+			};
 			const sentIds = new Set(ownedAttachments.map(draft => draft.id));
-			setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
-			changeAttachments(sessionId, current => current.filter(draft => !sentIds.has(draft.id)));
+			const commit = recoveryWork.current.then(async () => {
+				lockDraft(sessionId);
+				try {
+					const currentText = draftsRef.current[sessionId] ?? "";
+					const currentAttachments = attachmentsRef.current[sessionId] ?? [];
+					await commitDraftAndDelivery(entry, {
+						sessionId,
+						text: currentText === text ? "" : currentText,
+						attachments: currentAttachments.filter(draft => !sentIds.has(draft.id) && draft.status === "ready"),
+					});
+					updateRecoveries([...recoveriesRef.current, entry]);
+					const latestText = draftsRef.current[sessionId] ?? "";
+					draftsRef.current = { ...draftsRef.current, [sessionId]: latestText === text ? "" : latestText };
+					attachmentsRef.current = {
+						...attachmentsRef.current,
+						[sessionId]: (attachmentsRef.current[sessionId] ?? []).filter(draft => !sentIds.has(draft.id)),
+					};
+					try {
+						await flushDraft(sessionId);
+						const dispatching = { ...entry, prepared: false };
+						await saveDelivery(dispatching);
+						updateRecoveries(recoveriesRef.current.map(item => (item.id === id ? dispatching : item)));
+					} catch (error) {
+						draftsRef.current = {
+							...draftsRef.current,
+							[sessionId]: restoreDraft(draftsRef.current[sessionId] ?? "", text),
+						};
+						attachmentsRef.current = {
+							...attachmentsRef.current,
+							[sessionId]: restoreAttachments(attachmentsRef.current[sessionId] ?? [], ownedAttachments),
+						};
+						setDrafts(draftsRef.current);
+						setAttachmentDrafts(attachmentsRef.current);
+						unsentRestoredInMemory.current.add(id);
+						unsentRepairs.current.set(id, sessionId);
+						unsentBlockedRef.current.add(sessionId);
+						setUnsentBlocked(previous => ({ ...previous, [sessionId]: true }));
+						try {
+							const restored = { ...entry, disposition: "refused" as const, prepared: false, restored: true };
+							await commitDraftAndDelivery(restored, {
+								sessionId,
+								text: draftsRef.current[sessionId] ?? "",
+								attachments: (attachmentsRef.current[sessionId] ?? []).filter(item => item.status === "ready"),
+							});
+							updateRecoveries(recoveriesRef.current.map(item => (item.id === id ? restored : item)));
+							await flushDraft(sessionId);
+							await finalizeRecovery(restored);
+							finishUnsentRepair(id, sessionId);
+						} catch {
+							// Keep the durable prepared record and block retry until reconciliation succeeds.
+						}
+						throw error;
+					}
+					setDrafts(draftsRef.current);
+					setAttachmentDrafts(attachmentsRef.current);
+				} finally {
+					unlockDraft(sessionId);
+				}
+			});
+			recoveryWork.current = commit.catch(() => {});
+			await commit;
 			try {
-				const result = await request<{ queued?: boolean }>("prompt", {
-					sessionId,
-					text,
-					...(attachments.length ? { attachments } : {}),
-					...(queued ? { deliverAs } : {}),
-				});
+				const result = await request<{ queued?: boolean }>("prompt", params, id);
 				if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
 			} catch (error) {
-				// The host refused the dispatch, so the payload is still undelivered.
-				setDrafts(previous => ({ ...previous, [sessionId]: restoreDraft(previous[sessionId] ?? "", text) }));
-				changeAttachments(sessionId, current => restoreAttachments(current, ownedAttachments));
+				enqueueRecovery(async () => {
+					const current = recoveriesRef.current.find(item => item.id === id);
+					if (!current) return;
+					const disposition =
+						error instanceof DesktopRequestError ? (error.deliveryDisposition ?? "unknown") : "unknown";
+					await reconcileReceipt({
+						id,
+						sessionId,
+						disposition,
+						error: error instanceof Error ? error.message : undefined,
+					});
+				});
 				throw error;
 			}
 		});
@@ -578,15 +934,37 @@ export default function App() {
 		// through the same queue-aware prompt path as the composer so it is never
 		// dropped when a run is active.
 		if (!text.trimStart().startsWith("/")) {
-			closeDialog();
 			const queued = session?.status === "running" || session?.status === "waiting";
 			void run(`command:${sessionId}`, async () => {
-				const result = await request<{ queued?: boolean }>("prompt", {
-					sessionId,
-					text,
-					...(queued ? { deliverAs } : {}),
+				const id = crypto.randomUUID();
+				const params = { sessionId, text, ...(queued ? { deliverAs } : {}) };
+				validateDesktopRequest("prompt", params, id);
+				const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
+				const commit = recoveryWork.current.then(async () => {
+					await saveDelivery(entry);
+					updateRecoveries([...recoveriesRef.current, entry]);
 				});
-				if (result.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+				recoveryWork.current = commit.catch(() => {});
+				await commit;
+				closeDialog();
+				try {
+					const result = await request<{ queued?: boolean }>("prompt", params, id);
+					if (result.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+				} catch (error) {
+					enqueueRecovery(async () => {
+						const current = recoveriesRef.current.find(item => item.id === id);
+						if (!current) return;
+						const disposition =
+							error instanceof DesktopRequestError ? (error.deliveryDisposition ?? "unknown") : "unknown";
+						await reconcileReceipt({
+							id,
+							sessionId,
+							disposition,
+							error: error instanceof Error ? error.message : undefined,
+						});
+					});
+					throw error;
+				}
 			});
 			return;
 		}
@@ -638,7 +1016,7 @@ export default function App() {
 			}
 			await request<DesktopSession>("session.select", { sessionId: value.session.id });
 			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
-			setDrafts(previous => ({ ...previous, [value.session.id]: value.selectedText }));
+			changeText(value.session.id, () => value.selectedText);
 			closeDialog();
 			setSelected(value.session.id);
 		});
@@ -1144,6 +1522,60 @@ export default function App() {
 			)}
 		</>
 	);
+	const recoveryPanel = (item: DeliveryRecovery) => (
+		<div className="notice" key={item.id} role="status">
+			<p>
+				전송 복구 ({item.sessionId}): {item.disposition}. 알 수 없는 전송은 이미 실행되었을 수 있습니다. 복원해도
+				자동 전송하지 않습니다.
+			</p>
+			{item.error && <p>{item.error}</p>}
+			{unsentRepairs.current.get(item.id) === item.sessionId && (
+				<Button
+					onClick={() =>
+						enqueueRecovery(async () => {
+							const current = recoveriesRef.current.find(entry => entry.id === item.id);
+							if (current && unsentRepairs.current.get(current.id) === current.sessionId)
+								await reconcileReceipt({
+									id: current.id,
+									sessionId: current.sessionId,
+									disposition: "refused",
+								});
+						})
+					}
+				>
+					저장 복구 다시 시도
+				</Button>
+			)}
+			<Button
+				disabled={item.restored || unsentBlocked[item.sessionId]}
+				onClick={() =>
+					enqueueRecovery(async () => {
+						const current = recoveriesRef.current.find(entry => entry.id === item.id);
+						if (current) await restoreRecovery(current);
+					})
+				}
+			>
+				초안 복원
+			</Button>
+			<Button
+				disabled={
+					(!isFinalDelivery(item.disposition) && !(item.disposition === "unknown" && item.restored)) ||
+					item.finalizing ||
+					unsentRepairs.current.has(item.id)
+				}
+				onClick={() =>
+					enqueueRecovery(async () => {
+						const current = recoveriesRef.current.find(entry => entry.id === item.id);
+						if (!current || current.finalizing || unsentRepairs.current.has(current.id)) return;
+						if (isFinalDelivery(current.disposition) || (current.disposition === "unknown" && current.restored))
+							await finalizeRecovery(current);
+					})
+				}
+			>
+				{item.disposition === "unknown" ? "복원한 기록 지우기" : "복구 항목 버리기"}
+			</Button>
+		</div>
+	);
 	return (
 		<div className="app-shell">
 			<aside className="sidebar desktop-sidebar">{sidebarContent}</aside>
@@ -1207,6 +1639,7 @@ export default function App() {
 						<p role="status">{connection}</p>
 					))}
 				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
+				{!session && recoveries.map(recoveryPanel)}
 				{Object.entries(errors)
 					.filter(([scope, error]) => scope.startsWith("gate") && error)
 					.map(([scope, error]) => (
@@ -1327,6 +1760,7 @@ export default function App() {
 								))}
 							</div>
 						)}
+						{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
 						<div className="composer-area">
 							<Composer
 								controls={
@@ -1337,7 +1771,7 @@ export default function App() {
 											attachments={attachmentDrafts[session.id] ?? []}
 											supportsImageInput={session.imageInput?.supported === true}
 											imagesBlocked={session.imageInput?.blocked}
-											disabled={!connected}
+											disabled={!connected || busyDrafts[session.id]}
 											onChange={changeAttachments}
 										/>
 									</>
@@ -1346,6 +1780,7 @@ export default function App() {
 								allowQueue={!session.operatorRunning}
 								sendDisabled={
 									session.operatorRunning ||
+									unsentBlocked[session.id] ||
 									attachmentDrafts[session.id]?.some(
 										draft =>
 											draft.status !== "ready" ||
@@ -1355,7 +1790,7 @@ export default function App() {
 								}
 								onPaste={event => {
 									const files = desktopClipboardImageFiles(event.clipboardData);
-									if (!files.length || !connected) return;
+									if (!files.length || !connected || draftLocks.current.has(session.id)) return;
 									event.preventDefault();
 									addDesktopAttachmentFiles(
 										{
@@ -1363,21 +1798,21 @@ export default function App() {
 											attachments: attachmentDrafts[session.id] ?? [],
 											supportsImageInput: session.imageInput?.supported === true,
 											imagesBlocked: session.imageInput?.blocked,
-											disabled: !connected,
+											disabled: !connected || busyDrafts[session.id],
 											onChange: changeAttachments,
 										},
 										files,
 									);
 								}}
 								value={drafts[selected] || ""}
-								onChange={value => setDrafts(previous => ({ ...previous, [selected]: value }))}
+								onChange={value => changeText(selected, () => value)}
 								onSend={send}
 								onStop={() => void call("abort", { sessionId: selected }, `abort:${selected}`)}
 								busy={session.status === "running" || session.status === "waiting"}
 								deliverAs={deliverAs}
 								onDeliverAs={setDeliverAs}
 								onSlash={openCommands}
-								disabled={!connected}
+								disabled={!connected || busyDrafts[session.id]}
 							/>
 						</div>
 					</>
@@ -1412,9 +1847,7 @@ export default function App() {
 					onAdmitted={() => {
 						const { sessionId, composerText } = btwOwner;
 						if (composerText !== undefined)
-							setDrafts(previous =>
-								previous[sessionId] === composerText ? { ...previous, [sessionId]: "" } : previous,
-							);
+							changeText(sessionId, current => (current === composerText ? "" : current));
 					}}
 				/>
 			)}
@@ -1442,7 +1875,6 @@ export default function App() {
 					}
 					onClose={closeDialog}
 				>
-					{session?.error && <ErrorBanner>{session.error}</ErrorBanner>}
 					{[settingsScope, authScope, toolsScope, "goal", selected].map(scope =>
 						scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 					)}

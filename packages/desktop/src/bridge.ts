@@ -3,6 +3,34 @@ import { listen } from "@tauri-apps/api/event";
 import { assertDesktopAttachmentRequestSize } from "../../desktop-host/src/attachment-protocol";
 import type { DesktopFrame, DesktopMethod, DesktopRequest } from "../../desktop-host/src/protocol";
 
+export class DesktopRequestError extends Error {
+	constructor(
+		readonly requestId: string,
+		message: string,
+		readonly deliveryDisposition?: "refused" | "failed" | "unknown",
+	) {
+		super(message);
+		this.name = "DesktopRequestError";
+	}
+}
+
+export class DesktopLocalRequestError extends DesktopRequestError {
+	constructor(requestId: string, message: string) {
+		super(requestId, message, "refused");
+		this.name = "DesktopLocalRequestError";
+	}
+}
+
+/** Validate the exact envelope sent over the wire before any durable draft handoff. */
+export function validateDesktopRequest(method: DesktopMethod, params: Record<string, unknown>, id: string): void {
+	if (method !== "prompt") return;
+	try {
+		assertDesktopAttachmentRequestSize({ id, method, params } satisfies DesktopRequest);
+	} catch (error) {
+		throw new DesktopLocalRequestError(id, error instanceof Error ? error.message : String(error));
+	}
+}
+
 interface PendingRequest {
 	resolve: (value: unknown) => void;
 	reject: (reason: Error) => void;
@@ -17,7 +45,7 @@ function receive(frame: DesktopFrame): void {
 		if (waiter) {
 			pending.delete(frame.id);
 			if (frame.ok) waiter.resolve(frame.result);
-			else waiter.reject(new Error(frame.error));
+			else waiter.reject(new DesktopRequestError(frame.id, frame.error, frame.deliveryDisposition));
 		}
 	} else if (frame.type === "fatal") {
 		for (const waiter of pending.values()) waiter.reject(new Error(frame.error));
@@ -53,19 +81,22 @@ export async function subscribe(listener: (frame: DesktopFrame) => void): Promis
 	};
 }
 
-export async function request<T>(method: DesktopMethod, params: Record<string, unknown> = {}): Promise<T> {
+export async function request<T>(
+	method: DesktopMethod,
+	params: Record<string, unknown> = {},
+	id: string = crypto.randomUUID(),
+): Promise<T> {
+	validateDesktopRequest(method, params, id);
 	await connect();
-	const id = crypto.randomUUID();
 	const envelope: DesktopRequest = { id, method, params };
-	if (method === "prompt") assertDesktopAttachmentRequestSize(envelope);
 	const result = Promise.withResolvers<unknown>();
+	// Frames can settle before the invoke write acknowledgement returns.
+	void result.promise.catch(() => {});
 	pending.set(id, { resolve: result.resolve, reject: result.reject });
-	try {
-		await invoke("engine_request", { request: envelope });
-	} catch (error) {
+	void invoke("engine_request", { request: envelope }).catch(error => {
 		pending.delete(id);
 		result.reject(error instanceof Error ? error : new Error(String(error)));
-	}
+	});
 	return (await result.promise) as T;
 }
 
