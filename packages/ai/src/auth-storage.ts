@@ -3526,6 +3526,18 @@ export class AuthStorage {
 		}
 	}
 
+	#explicitKeyOverridesUnavailablePin(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner" | "credentialSelector">,
+	): boolean {
+		return (
+			!options?.credentialSelector &&
+			this.hasSessionCredentialUnavailable(provider, sessionId) &&
+			(this.hasRuntimeApiKey(provider) || this.hasLiteralConfigApiKey(provider, options?.owner))
+		);
+	}
+
 	#resolveSelectedStoredCredential(
 		provider: string,
 		options?: AuthApiKeyOptions,
@@ -3994,6 +4006,7 @@ export class AuthStorage {
 
 	hasAuth(provider: string, sessionId?: string, options?: Pick<AuthApiKeyOptions, "owner">): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#explicitKeyOverridesUnavailablePin(storageProvider, sessionId, options)) return true;
 		try {
 			this.#resolveSelectedStoredCredential(
 				storageProvider,
@@ -4017,6 +4030,7 @@ export class AuthStorage {
 		options?: Pick<AuthApiKeyOptions, "owner" | "credentialSelector">,
 	): AuthCredential["type"] | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#explicitKeyOverridesUnavailablePin(storageProvider, sessionId, options)) return "api_key";
 		let selected: ({ index: number } & StoredCredential) | undefined;
 		try {
 			selected = this.#resolveSelectedStoredCredential(storageProvider, options, sessionId);
@@ -4047,6 +4061,7 @@ export class AuthStorage {
 		options?: Pick<AuthApiKeyOptions, "owner" | "credentialSelector"> & { sessionId?: string },
 	): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#explicitKeyOverridesUnavailablePin(storageProvider, options?.sessionId, options)) return true;
 		try {
 			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider, options, options?.sessionId);
 			if (this.hasRuntimeApiKey(storageProvider)) return true;
@@ -7324,6 +7339,11 @@ export class AuthStorage {
 		onCredentialRowResolved?: (rowId: number) => void,
 	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
+		if (this.#explicitKeyOverridesUnavailablePin(provider, sessionId, options)) {
+			return (
+				this.#runtimeOverrides.get(provider) || this.#configOverrideRegistration(provider, options?.owner)?.apiKey
+			);
+		}
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
 		// Runtime override takes highest priority after selector validation.

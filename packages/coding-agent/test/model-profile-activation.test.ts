@@ -1049,9 +1049,7 @@ describe("model profile activation", () => {
 						if (interveningIntent === "thinking") {
 							// DEFAULT is non-reasoning, so this is deliberately same-value intent;
 							// role-only keeps the reasoning model and changes the effective level.
-							fixture.session.setThinkingLevel(
-								firstProfile === "profile-a" ? undefined : ThinkingLevel.Medium,
-							);
+							fixture.session.setThinkingLevel(firstProfile === "profile-a" ? undefined : ThinkingLevel.Medium);
 						}
 						if (interveningIntent === "global roles") {
 							await fixture.settings.commitAtomicBatch([

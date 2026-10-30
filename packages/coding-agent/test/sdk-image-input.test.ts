@@ -8,7 +8,9 @@ import { createMockModel, type MockHandler } from "@gajae-code/ai/providers/mock
 import { logger, TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { ExtensionRunner, loadExtensions } from "../src/extensibility/extensions";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createSessionImageInput } from "../src/sdk/image-input";
 import { AgentSession, type QueuedInputSubmission } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -73,6 +75,7 @@ function buildSession(
 	responses: MockHandler[] = [() => ({ content: ["done"] })],
 	autoResize = false,
 	sessionManager = SessionManager.inMemory(temp.path()),
+	extensionRunner?: ExtensionRunner,
 ): AgentSession {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected bundled test model");
@@ -89,7 +92,7 @@ function buildSession(
 		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 		streamFn: mock.stream,
 	});
-	const session = new AgentSession({ agent, sessionManager, settings, modelRegistry: registry });
+	const session = new AgentSession({ agent, sessionManager, settings, modelRegistry: registry, extensionRunner });
 	sessions.push(session);
 	return session;
 }
@@ -136,6 +139,275 @@ afterEach(async () => {
 	auth.close();
 	await temp.remove();
 	vi.restoreAllMocks();
+});
+
+test.each(["prompt", "submit"] as const)("%s waits for the caller's durable preflight fence", async operation => {
+	const session = buildSession();
+	const evaluation = operation === "submit" ? holdEvaluation(session) : undefined;
+	const controller = createSessionImageInput(session);
+	const entered = deferred();
+	const commit = deferred();
+	let calls = 0;
+	const options = {
+		onPreflightAcceptCommit: async () => {
+			calls++;
+			entered.resolve();
+			await commit.promise;
+		},
+	};
+	const pending =
+		operation === "prompt"
+			? controller.prompt("durable", [image()], options)
+			: controller.submitUserMessage("durable", [image()], { ...options, deliverAs: "followUp" });
+	await entered.promise;
+	expect(providerCalls).toBe(0);
+	expect(session.getQueuedMessages().followUp).toEqual([]);
+	commit.resolve();
+	const result = await pending;
+	expect(calls).toBe(1);
+	if (result) {
+		expect(await result.admitted).toMatchObject({ submissionId: result.submissionId });
+		await cancel(result);
+	} else {
+		expect(providerCalls).toBe(1);
+	}
+	evaluation?.release();
+	await evaluation?.done;
+});
+
+test.each([
+	"prompt",
+	"submit",
+] as const)("%s releases its reservation when durable persistence fails", async operation => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	const evaluation = operation === "submit" ? holdEvaluation(session) : undefined;
+	const controller = createSessionImageInput(session);
+	const failure = new Error("durable write refused");
+	const options = {
+		onPreflightAcceptCommit: async () => {
+			throw failure;
+		},
+	};
+	const pending =
+		operation === "prompt"
+			? controller.prompt("not admitted", [image()], options)
+			: controller.submitUserMessage("not admitted", [image()], { ...options, deliverAs: "followUp" });
+	await expect(pending).rejects.toBe(failure);
+	expect(providerCalls).toBe(0);
+	expect(session.getQueuedMessages().followUp).toEqual([]);
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	evaluation?.release();
+	await evaluation?.done;
+});
+
+test.each([
+	"prompt",
+	"submit",
+] as const)("%s rechecks cancellation after an awaited persistence fence", async operation => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	const evaluation = operation === "submit" ? holdEvaluation(session) : undefined;
+	const controller = createSessionImageInput(session);
+	const entered = deferred();
+	const commit = deferred();
+	const signal = new AbortController();
+	const options = {
+		preflightSignal: signal.signal,
+		onPreflightAcceptCommit: async () => {
+			entered.resolve();
+			await commit.promise;
+		},
+	};
+	const pending =
+		operation === "prompt"
+			? controller.prompt("cancel during commit", [image()], options)
+			: controller.submitUserMessage("cancel during commit", [image()], { ...options, deliverAs: "followUp" });
+	const rejected = pending.then(
+		() => undefined,
+		error => error,
+	);
+	await entered.promise;
+	signal.abort();
+	commit.resolve();
+	expect(await rejected).toBeDefined();
+	expect(providerCalls).toBe(0);
+	expect(session.getQueuedMessages().followUp).toEqual([]);
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	evaluation?.release();
+	await evaluation?.done;
+});
+
+test("preflight persistence without core acceptance releases image capacity", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	const failure = new Error("core refused before run acceptance");
+	vi.spyOn(session.agent, "prompt").mockRejectedValueOnce(failure);
+	let commits = 0;
+	await expect(
+		createSessionImageInput(session).prompt("no run", [image()], {
+			onPreflightAcceptCommit: () => {
+				commits++;
+			},
+		}),
+	).rejects.toBe(failure);
+	expect(commits).toBe(1);
+	expect(providerCalls).toBe(0);
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("a command registered during image preparation cannot bypass the fence or discard images", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	let effects = 0;
+	let commits = 0;
+	const pending = createSessionImageInput(session).prompt("/mutate", [image()], {
+		onPreflightAcceptCommit: () => {
+			commits++;
+		},
+	});
+	session.setMCPPromptCommands([
+		{
+			path: "owned-image-command",
+			resolvedPath: "owned-image-command",
+			source: "project",
+			command: {
+				name: "mutate",
+				description: "Test side effect",
+				async execute() {
+					effects++;
+				},
+			},
+		},
+	]);
+	await expect(pending).rejects.toMatchObject({ code: "invalid_input" });
+	expect(effects).toBe(0);
+	expect(commits).toBe(0);
+	expect(providerCalls).toBe(0);
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("a throwing public acceptance observer cannot strand an accepted run", async () => {
+	const session = buildSession();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	let accepts = 0;
+	await session.prompt("observer failure", {
+		onRunAccepted: () => {
+			accepts++;
+			throw new Error("observer failed");
+		},
+	});
+	expect(accepts).toBe(1);
+	expect(providerCalls).toBe(1);
+	expect(session.isStreaming).toBe(false);
+	expect(warning).toHaveBeenCalledWith("Prompt run acceptance observer failed");
+});
+
+test("a competing run cannot become the image invocation's resource owner", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const resource = deferred();
+	let imageHandle: string | undefined;
+	let competingHandle: string | undefined;
+	let session: AgentSession;
+	session = buildSession([
+		async () => {
+			competingHandle = session.agent.activeResourceRunId;
+			return { content: ["competitor finished"] };
+		},
+		async () => {
+			imageHandle = session.agent.activeResourceRunId;
+			if (!imageHandle) throw new Error("Image run did not acquire a resource identity");
+			session.agent.resourceLedger.track(imageHandle, "post_prompt", "owned image consumer", resource.promise);
+			return { content: ["image finished"] };
+		},
+	]);
+	const prompt = session.agent.prompt.bind(session.agent);
+	vi.spyOn(session.agent, "prompt").mockImplementationOnce(async (messages, options) => {
+		// Deterministic real competing start after SDK preflight, before THIS
+		// invocation's core acceptance. It must never capture this image lease.
+		await prompt("competing prompt");
+		if (typeof messages === "string" || Array.isArray(options))
+			throw new Error("Expected session-owned canonical message invocation");
+		return prompt(messages, options);
+	});
+	await createSessionImageInput(session).prompt("owned image", [image()]);
+	expect(competingHandle).toBeDefined();
+	expect(imageHandle).toBeDefined();
+	expect(imageHandle).not.toBe(competingHandle);
+	expect(
+		session.agent.resourceLedger.pending(imageHandle!).some(entry => entry.label === "owned image consumer"),
+	).toBe(true);
+	expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+	resource.resolve();
+	await tick();
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("registered extension commands reject image input before handler side effects", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const marker = path.join(temp.path(), "extension-side-effect");
+	const extension = path.join(temp.path(), "image-command.ts");
+	await Bun.write(
+		extension,
+		`export default function(api) { api.registerCommand("image-effect", { description: "owned fixture", handler: async () => { await Bun.write(${JSON.stringify(marker)}, "executed"); } }); }`,
+	);
+	const loaded = await loadExtensions([extension], temp.path());
+	expect(loaded.errors).toEqual([]);
+	const manager = SessionManager.inMemory(temp.path());
+	const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, temp.path(), manager, registry);
+	const session = buildSession(undefined, false, manager, runner);
+	let commits = 0;
+	await expect(
+		createSessionImageInput(session).prompt("/image-effect", [image()], {
+			onPreflightAcceptCommit: () => {
+				commits++;
+			},
+		}),
+	).rejects.toMatchObject({ code: "invalid_input" });
+	expect(await Bun.file(marker).exists()).toBe(false);
+	expect(commits).toBe(0);
+	expect(providerCalls).toBe(0);
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("image acceptance observers run after quota ownership and cannot strand the run", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	let calls = 0;
+	let observedScope: unknown;
+	let observedResource: string | undefined;
+	await createSessionImageInput(session).prompt("owned observer", [image()], {
+		onRunAccepted: run => {
+			calls++;
+			observedScope = run.scope;
+			observedResource = session.agent.activeResourceRunId;
+			throw new Error("image observer failure");
+		},
+	});
+	expect(observedScope).toBeDefined();
+	expect(observedResource).toBeDefined();
+	expect(calls).toBe(1);
+	expect(providerCalls).toBe(1);
+	expect(session.isStreaming).toBe(false);
+	expect(warning).toHaveBeenCalledWith("Prompt run acceptance observer failed");
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("asynchronous image run observers cannot create unhandled rejections or gate execution", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const observer = deferred();
+	await createSessionImageInput(session).prompt("async observer", [image()], {
+		onRunAccepted: () => observer.promise,
+	});
+	expect(providerCalls).toBe(1);
+	expect(session.isStreaming).toBe(false);
+	observer.reject(new Error("late observer failure"));
+	await tick();
+	expect(warning).toHaveBeenCalledWith("Prompt run acceptance observer failed");
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
 });
 
 test("factory cannot reset a live quota or revive a manually disposed controller", async () => {
@@ -608,6 +880,47 @@ test("abort is not resource-settlement proof for an accepted initial prompt", as
 	expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
 	resource.resolve();
 	await tick();
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("a real queued no-model refusal settles the image receipt and releases quota", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const entered = deferred();
+	const finish = deferred();
+	const session = buildSession([
+		async () => {
+			entered.resolve();
+			await finish.promise;
+			return { content: ["predecessor"] };
+		},
+	]);
+	const predecessor = session.prompt("predecessor");
+	await entered.promise;
+	const submit = session.submitUserMessage.bind(session);
+	const submitSpy = vi
+		.spyOn(session, "submitUserMessage")
+		.mockImplementation((content, options) =>
+			submit(content, { ...options, sdkRunCapability: createSdkRunCapability("refused-image-owner") }),
+		);
+	let submission: QueuedInputSubmission;
+	try {
+		submission = await createSessionImageInput(session).submitUserMessage("queued image", [image()], {
+			deliverAs: "followUp",
+		});
+	} finally {
+		submitSpy.mockRestore();
+	}
+	expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+	session.agent.setModel(undefined);
+	finish.resolve();
+	expect(await submission.execution).toMatchObject({ disposition: "removed", reason: "refused" });
+	expect(await submission.terminal).toMatchObject({ disposition: "removed", reason: "refused" });
+	await predecessor;
+	await session.waitForIdle();
+	await tick();
+	expect(submission.cancel()).toBe(false);
+	expect(providerCalls).toBe(1);
+	expect(session.agent.state.messages.filter(message => message.role === "user")).toHaveLength(1);
 	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
 });
 

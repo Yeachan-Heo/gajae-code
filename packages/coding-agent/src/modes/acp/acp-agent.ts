@@ -706,6 +706,17 @@ type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed"
 };
 
 /**
+ * The broker indexed a session as live, but this process's Router holds no attachment for it
+ * after the bounded reconcile window. A distinct type lets reattachment fall back to
+ * `session.resume`, which re-proves the host and returns its exact endpoint authority.
+ */
+class RouterAttachmentMissingError extends AcpSdkAdapterError {
+	constructor(sessionId: string) {
+		super("unavailable", `ACP session ${sessionId} has no current Router attachment.`);
+	}
+}
+
+/**
  * A prompt rejection that still carries the terminal's structured failure classification.
  * The ACP client sees only the code and message, but the first-turn retry gate must decide on
  * what the terminal actually proved — the failure's execution phase and its bounded origin
@@ -3456,8 +3467,19 @@ export class AcpAgent implements Agent {
 		if (indexed?.live) {
 			// A reconnect may repeat the client's MCP declaration. Attaching to the
 			// existing endpoint preserves the live host's immutable configuration.
-			await this.#attach(id, cwd, epoch);
-			return;
+			try {
+				await this.#attach(id, cwd, epoch);
+				return;
+			} catch (error) {
+				// A long-lived ACP process can outlast the Router's attachment while the broker
+				// index still reports the host live. Resume re-proves the host and either returns
+				// its exact endpoint (`reused`) or relaunches it, so only this error falls through.
+				if (!(error instanceof RouterAttachmentMissingError)) throw error;
+				this.#assertSessionEpoch(id, epoch);
+				logger.warn(
+					`ACP session ${id} is broker-live without a Router attachment; retrying through session.resume.`,
+				);
+			}
 		}
 
 		const saved = await this.#resolveSavedSession(id, cwd);
@@ -3543,8 +3565,7 @@ export class AcpAgent implements Agent {
 				await this.#router.reconcile();
 				currentAttachment = this.#router.attachment(id);
 			}
-			if (!currentAttachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
+			if (!currentAttachment) throw new RouterAttachmentMissingError(id);
 			adapter = new AcpSdkAdapter({
 				router: this.#router,
 				attachment: currentAttachment,

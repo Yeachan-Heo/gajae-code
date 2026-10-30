@@ -72,6 +72,7 @@ import type { MCPManager } from "./runtime-mcp";
 // Leaf path, not the barrel: the capability registry must stay out of the
 // runtime-mcp import graph that every root command would otherwise load.
 import { attachExactMcpControls } from "./runtime-mcp/redaction";
+import { issueSessionMcpControlGrant } from "./runtime-mcp/session-controls-grant";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -2471,7 +2472,12 @@ export async function runRootCommand(
 	// defer; their connect evidence is published during session creation).
 	// ACP/print/SDK sessions connect eagerly and are not carved out here.
 	if (isInteractive) {
+		// Root TUI sessions may control conventional autoload declarations after first paint.
+		// The grant is minted here only; SDK callers of createAgentSession cannot mint one.
+		// Exact --mcp-config sessions retain their existing capability path.
 		sessionOptions.deferMcpConfigStartup = true;
+		if (sessionOptions.mcpConfigPath === undefined && sessionOptions.enableMcpAutoload !== false)
+			sessionOptions.sessionMcpControlGrant = issueSessionMcpControlGrant();
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup

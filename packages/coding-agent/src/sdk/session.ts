@@ -165,6 +165,7 @@ import {
 import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import { type MCPLoadResult, omitUnapprovedProjectStdio } from "../runtime-mcp/manager";
 import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
+import { isIssuedSessionMcpControlGrant, type SessionMcpControlGrant } from "../runtime-mcp/session-controls-grant";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -597,8 +598,11 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
 	 */
 	deferMcpConfigStartup?: boolean;
-	/** @internal Enables session-local MCP controls for root interactive CLI sessions only. */
-	sessionMcpControls?: boolean;
+	/**
+	 * @internal Session-local MCP controls for the root interactive CLI session.
+	 * Only a token minted by the CLI entry point is honored; any other value is ignored.
+	 */
+	sessionMcpControlGrant?: SessionMcpControlGrant;
 	/** Process-local master authority. Never persist or pass to lifecycle children. */
 	masterModeContext?: MasterModeContext;
 	/**
@@ -2058,10 +2062,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const configuredPins = startupAuthConfig?.credentialPins ?? {};
 		const persistedPinStoreMatches =
 			startupAuthConfig?.credentialPinStoreIdentity === startupAuthConfig?.credentialStoreIdentity;
-		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
-		// discarded durable pin identity local to this credential scope so startup
-		// config cannot immediately replace it with a different account; later
-		// request-time resolution for this provider remains ordinary AUTO ranking.
+		// Keep stale durable pins from being replaced by startup configuration;
+		// AuthStorage retains their unavailable markers for request-time resolution.
 		const staleDurableCredentialPins = new Set<string>();
 		if (options.credentialSelector) {
 			const provider = options.credentialSelector.provider ?? options.model?.provider;
@@ -2177,8 +2179,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const pin = record.pin as { auto?: unknown; kind?: unknown; value?: unknown } | undefined;
 			// Durable replay must never abort session startup: a pinned account may
 			// have been removed, disabled, or deduplicated since the pin was written.
-			// Pin identity is preserved by leaving the provider unpinned on failure —
-			// never silently retarget to another account; the user re-pins or picks AUTO.
+			// Preserve an unavailable marker on failure rather than silently retargeting
+			// to another account; the user re-pins or picks AUTO.
 			try {
 				if (pin?.auto === true) {
 					authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
@@ -2344,7 +2346,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let startupActiveModelProfile =
 			acceptedInheritedProfileName ??
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+		// Auth-filtered catalogs hide models whose durable pin is unavailable.
+		// Distinguish those registered selectors from genuinely missing models before
+		// deciding whether recovery or a generic missing-model warning applies.
+		const markUnavailableSavedSelectors = (skips: Array<{ selector: string; reason: string }>): void => {
+			for (const skip of skips) {
+				if (skip.reason !== "unknown_model") continue;
+				const parsed = parseModelString(skip.selector);
+				if (
+					parsed &&
+					isCredentialPinBlocking(parsed.provider) &&
+					modelRegistry.find(parsed.provider, parsed.id, credentialSessionId)
+				) {
+					skip.reason = "credential_unavailable";
+				}
+			}
+		};
+		// A saved chain's head is an identity boundary when its credential pin is
+		// unavailable, even if the head is not registered until extensions load.
+		const savedHeadPinBlocked = (): boolean => {
+			const head = defaultModelEntries[0] ? parseModelString(defaultModelEntries[0]) : undefined;
+			return head !== undefined && isCredentialPinBlocking(head.provider);
+		};
 		let savedDefaultWasUnresolved = false;
+		let savedDefaultCredentialUnavailable = false;
 		let deferredMissingSessionRecovery = false;
 		let retainedRecoveryBindingsAfterLateRestore = false;
 		let recoveredSessionDefault:
@@ -2362,7 +2387,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
 			await logger.time("restoreSessionModel", async () => {
 				const restoredDefaultResolution = await resolveModelChainWithAuth(
-					defaultModelEntries,
+					savedHeadPinBlocked() ? defaultModelEntries.slice(0, 1) : defaultModelEntries,
 					modelRegistry,
 					settings,
 					credentialSessionId,
@@ -2373,8 +2398,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 					},
 				);
+				markUnavailableSavedSelectors(restoredDefaultResolution.skips);
+				if (savedHeadPinBlocked()) {
+					restoredDefaultResolution.model = undefined;
+					restoredDefaultResolution.skips = [
+						{ selector: defaultModelEntries[0], reason: "credential_unavailable" },
+					];
+				}
 				model = restoredDefaultResolution.model;
-				if (restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+				savedDefaultCredentialUnavailable =
+					!model && restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable");
+				if (savedDefaultCredentialUnavailable) {
 					modelFallbackMessage =
 						"Saved session credential is unavailable. Re-pin a credential or select AUTO explicitly.";
 				}
@@ -2423,6 +2457,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (
 			!hasExplicitModel &&
 			!model &&
+			!savedDefaultCredentialUnavailable &&
 			defaultRoleSpec.model &&
 			!isCredentialPinBlocking(defaultRoleSpec.model.provider) &&
 			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
@@ -2738,6 +2773,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let sessionMcpRestoreFlight: { manager: MCPManager; completion: Promise<boolean> } | undefined;
 		let sessionMcpRestoreDisposal: Promise<void> | undefined;
 		let sessionMcpRestoreCancelled = false;
+		/** Settles once queued owned-manager tool publications have been applied to the session. */
+		let settleOwnedMcpToolSync: () => Promise<void> = () => Promise.resolve();
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const installMcpInputHandler = (manager: MCPManager): void => {
 			manager.setInputRequestHandler(
@@ -2838,8 +2875,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						Object.keys(loaded.configs).filter(name => !pluginNames.has(name)),
 					);
 					for (const name of conventionalCacheServerNames) ownedConventionalMcpServerNames.add(name);
-					publishOwnedMcpTools = Object.keys(mergedConfigs).length > 0;
-					if (Object.keys(mergedConfigs).length > 0 || (sessionMcpGrant && pluginNames.size === 0)) {
+					// A granted session keeps an owned manager with no autoload servers so
+					// servers connected later still publish their tool-list changes.
+					publishOwnedMcpTools =
+						Object.keys(mergedConfigs).length > 0 || (sessionMcpGrant && pluginNames.size === 0);
+					if (publishOwnedMcpTools) {
 						nextManager = new MCPManager(
 							to,
 							conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
@@ -3911,7 +3951,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				const pluginNames = new Set(Object.keys(configs));
 				const grant =
-					options.sessionMcpControls === true &&
+					isIssuedSessionMcpControlGrant(options.sessionMcpControlGrant) &&
 					options.deferMcpConfigStartup === true &&
 					options.enableMcpAutoload !== false &&
 					options.mcpManager === undefined &&
@@ -3979,8 +4019,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						mcpManager = owned;
 						ownsMcpManager = true;
 					} else if (Object.keys(mergedConfigs).length === 0) {
+						// Granted session with only autoload:false servers: keep an empty owned
+						// manager and publish servers connected later through the tool sync.
 						mcpManager = owned;
 						ownsMcpManager = true;
+						pluginMcpManagerServers.set(owned, new Set());
+						conventionalMcpManagerServers.set(owned, new Set());
+						publishOwnedMcpTools = true;
 					} else {
 						await connectOwnedConventionalMcp(
 							owned,
@@ -4440,7 +4485,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// catalog before retaining a durable runtime fallback.
 		if (savedDefaultWasUnresolved && defaultModelEntries.length > 0) {
 			const restoredAfterExtensions = await resolveModelChainWithAuth(
-				defaultModelEntries,
+				savedHeadPinBlocked() ? defaultModelEntries.slice(0, 1) : defaultModelEntries,
 				modelRegistry,
 				settings,
 				credentialSessionId,
@@ -4451,6 +4496,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 				},
 			);
+			markUnavailableSavedSelectors(restoredAfterExtensions.skips);
+			if (savedHeadPinBlocked()) {
+				restoredAfterExtensions.model = undefined;
+				restoredAfterExtensions.skips = [{ selector: defaultModelEntries[0], reason: "credential_unavailable" }];
+			}
+			savedDefaultCredentialUnavailable =
+				!restoredAfterExtensions.model &&
+				restoredAfterExtensions.skips.some(skip => skip.reason === "credential_unavailable");
+			if (savedDefaultCredentialUnavailable) model = undefined;
 			if (
 				restoredAfterExtensions.model &&
 				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
@@ -4529,6 +4583,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					recoveredSessionDefault = undefined;
 					startupActiveModelProfile = undefined;
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+				}
+				if (!lateRecoveryAccepted && savedDefaultCredentialUnavailable) {
+					modelFallbackMessage =
+						"Saved session credential is unavailable. Re-pin a credential or select AUTO explicitly.";
 				}
 			}
 		}
@@ -4609,6 +4667,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (
 			!model &&
 			!options.modelPattern &&
+			!savedDefaultCredentialUnavailable &&
 			!startupCredentialModelRejected &&
 			(configuredDefaultPatterns.length === 0 || preferredCredentialProvider !== undefined)
 		) {
@@ -5616,6 +5675,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				.catch(() => {});
 			return flight.then(restored => {
 				if (!restored) throw new Error("Session MCP restoration ownership changed before completion");
+				// Physical restoration runs while the predecessor identity is owned.
+				// Tool publication waits for the transition to finish: arm the next
+				// turn fence before returning, but never await it from inside reset.
+				// A failed physical restore has no successor and arms no new fence.
+				session.extendStartupTurnBarrier(settleOwnedMcpToolSync());
 			});
 		};
 		const disposeSessionMcpRestoration = (): Promise<void> => {
@@ -5990,146 +6054,143 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Each link swallows (and logs) its own failure so one bad
 			// publication cannot kill the chain for every later one.
 			let ownedMcpToolsSync: Promise<void> = Promise.resolve();
+			let ownedMcpToolPublication: Promise<void> = ownedMcpToolsSync;
 			let acceptingOwnedMcpTools = true;
 			const syncOwnedMcpTools = (tools: readonly CustomTool[]): Promise<void> => {
 				if (!acceptingOwnedMcpTools) return ownedMcpToolsSync;
-				ownedMcpToolsSync = ownedMcpToolsSync
-					.then(async () => {
-						if (session.isDisposed || mcpManager !== manager) return;
-						const pluginServerNames = new Set(pluginMcpManagerServers.get(manager));
-						const conventionalServerNames = new Set(conventionalMcpManagerServers.get(manager));
-						// Plugin authority is fixed from validated bundle provenance when
-						// this manager is created. SourceMeta can be caller-supplied later.
-						for (const serverName of manager.getAllServerNames()) {
-							if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+				ownedMcpToolPublication = ownedMcpToolsSync.then(async () => {
+					if (session.isDisposed || mcpManager !== manager) return;
+					const pluginServerNames = new Set(pluginMcpManagerServers.get(manager));
+					const conventionalServerNames = new Set(conventionalMcpManagerServers.get(manager));
+					// Plugin authority is fixed from validated bundle provenance when
+					// this manager is created. SourceMeta can be caller-supplied later.
+					for (const serverName of manager.getAllServerNames()) {
+						if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+					}
+					for (const tool of tools) {
+						const serverName = tool.mcpServerName;
+						if (!serverName) continue;
+						if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+					}
+					conventionalMcpManagerServers.set(manager, conventionalServerNames);
+					const failedPluginServers = failedPluginMcpManagerServers.get(manager);
+					const nextCachedConventionalMcpServerNames = new Set(cachedConventionalMcpServerNames);
+					for (const serverName of nextCachedConventionalMcpServerNames) {
+						if (!tools.some(tool => tool.mcpServerName === serverName)) {
+							nextCachedConventionalMcpServerNames.delete(serverName);
 						}
-						for (const tool of tools) {
-							const serverName = tool.mcpServerName;
-							if (!serverName) continue;
-							if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+					}
+					for (const tool of tools) {
+						if (
+							tool instanceof DeferredMCPTool &&
+							tool.mcpServerName &&
+							conventionalServerNames.has(tool.mcpServerName)
+						) {
+							nextCachedConventionalMcpServerNames.add(tool.mcpServerName);
 						}
-						conventionalMcpManagerServers.set(manager, conventionalServerNames);
-						const failedPluginServers = failedPluginMcpManagerServers.get(manager);
-						const nextCachedConventionalMcpServerNames = new Set(cachedConventionalMcpServerNames);
-						for (const serverName of nextCachedConventionalMcpServerNames) {
-							if (!tools.some(tool => tool.mcpServerName === serverName)) {
-								nextCachedConventionalMcpServerNames.delete(serverName);
-							}
+					}
+					const nextTools = tools.filter(tool => {
+						const serverName = tool.mcpServerName;
+						if (!serverName) return false;
+						if (failedPluginServers?.has(serverName) && manager.getConnectionStatus(serverName) !== "connected") {
+							return false;
 						}
-						for (const tool of tools) {
-							if (
-								tool instanceof DeferredMCPTool &&
-								tool.mcpServerName &&
-								conventionalServerNames.has(tool.mcpServerName)
-							) {
-								nextCachedConventionalMcpServerNames.add(tool.mcpServerName);
-							}
-						}
-						const nextTools = tools.filter(tool => {
-							const serverName = tool.mcpServerName;
-							if (!serverName) return false;
-							if (
-								failedPluginServers?.has(serverName) &&
-								manager.getConnectionStatus(serverName) !== "connected"
-							) {
-								return false;
-							}
-							return pluginServerNames.has(serverName) || conventionalServerNames.has(serverName);
+						return pluginServerNames.has(serverName) || conventionalServerNames.has(serverName);
+					});
+					const previousNames = ownedMcpManagerToolNames;
+					const nextToolNames = nextTools.map(tool => tool.name);
+					const previousSet = new Set(previousNames);
+					const nextPluginToolNames = retainPluginMcpMandatoryNames(
+						nextTools,
+						nextTools
+							.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
+							.map(tool => tool.name),
+					);
+					const nextConventionalToolNames = nextTools
+						.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
+						.map(tool => tool.name);
+					const nextMandatoryMcpToolNames = [
+						...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
+							name => !previousSet.has(name),
+						),
+						...nextPluginToolNames,
+					];
+					const nextConventionalMcpToolNames = [
+						...conventionalMcpToolNames.filter(name => !previousSet.has(name)),
+						...nextConventionalToolNames,
+					];
+					const nextCwdCapturingToolNames = [
+						...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
+						...nextToolNames,
+					];
+					const nextOwnedPluginServersConnected = [...pluginServerNames].some(
+						name => manager.getConnectionStatus(name) === "connected",
+					);
+					const nextOwnedConventionalMcpServerNames = new Set(conventionalServerNames);
+					const hasPublishedCachedTool = nextTools.some(
+						tool =>
+							tool.mcpServerName !== undefined && nextCachedConventionalMcpServerNames.has(tool.mcpServerName),
+					);
+					try {
+						await session.replaceNamedCustomTools(previousNames, nextTools, {
+							mandatoryMCPToolNames: nextMandatoryMcpToolNames,
+							defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload
+								? []
+								: nextConventionalToolNames,
+							activateNewTools: false,
+							persistMCPSelection: false,
 						});
-						const previousNames = ownedMcpManagerToolNames;
-						const nextToolNames = nextTools.map(tool => tool.name);
-						const previousSet = new Set(previousNames);
-						const nextPluginToolNames = retainPluginMcpMandatoryNames(
-							nextTools,
-							nextTools
-								.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
-								.map(tool => tool.name),
-						);
-						const nextConventionalToolNames = nextTools
-							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
-							.map(tool => tool.name);
-						const nextMandatoryMcpToolNames = [
-							...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
-								name => !previousSet.has(name),
-							),
-							...nextPluginToolNames,
-						];
-						const nextConventionalMcpToolNames = [
-							...conventionalMcpToolNames.filter(name => !previousSet.has(name)),
-							...nextConventionalToolNames,
-						];
-						const nextCwdCapturingToolNames = [
-							...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
-							...nextToolNames,
-						];
-						const nextOwnedPluginServersConnected = [...pluginServerNames].some(
-							name => manager.getConnectionStatus(name) === "connected",
-						);
-						const nextOwnedConventionalMcpServerNames = new Set(conventionalServerNames);
-						const hasPublishedCachedTool = nextTools.some(
-							tool =>
-								tool.mcpServerName !== undefined &&
-								nextCachedConventionalMcpServerNames.has(tool.mcpServerName),
-						);
-						try {
-							await session.replaceNamedCustomTools(previousNames, nextTools, {
-								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
-								defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload
-									? []
-									: nextConventionalToolNames,
-								activateNewTools: false,
+						const defaultMcpToolNamesToActivate =
+							deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
+								? nextTools
+										.filter(
+											tool =>
+												tool.mcpServerName !== undefined &&
+												discoveryDefaultServerNames.has(tool.mcpServerName),
+										)
+										.map(tool => tool.name)
+								: [];
+						if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
+							await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 								persistMCPSelection: false,
 							});
-							const defaultMcpToolNamesToActivate =
-								deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
-									? nextTools
-											.filter(
-												tool =>
-													tool.mcpServerName !== undefined &&
-													discoveryDefaultServerNames.has(tool.mcpServerName),
-											)
-											.map(tool => tool.name)
-									: [];
-							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
-								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
-									persistMCPSelection: false,
-								});
-							}
-						} catch (error) {
-							ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
-							throw error;
 						}
-						ownedMcpManagerToolNames = nextToolNames;
-						ownedMcpManagerTools = nextTools;
-						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...nextMandatoryMcpToolNames);
-						conventionalMcpToolNames.splice(0, conventionalMcpToolNames.length, ...nextConventionalMcpToolNames);
-						cwdCapturingToolNames.splice(0, cwdCapturingToolNames.length, ...nextCwdCapturingToolNames);
-						ownedConventionalMcpServerNames.clear();
-						for (const name of nextOwnedConventionalMcpServerNames) ownedConventionalMcpServerNames.add(name);
-						cachedConventionalMcpServerNames.clear();
-						for (const name of nextCachedConventionalMcpServerNames) cachedConventionalMcpServerNames.add(name);
-						// Mixed plugin + conventional sessions defer the seal while a
-						// conventional server is connecting. Cached fallback servers retain
-						// their reconnect path while any of their tools remain published,
-						// including after reconnect replaces DeferredMCPTool with MCPTool.
-						// Derive that hold from this snapshot so removing/replacing the tools
-						// restores the fixed-connection plugin contract.
-						if (
-							nextOwnedPluginServersConnected &&
-							!manager.isConnectionSetSealed() &&
-							![...nextOwnedConventionalMcpServerNames].some(
-								name => manager.getConnectionStatus(name) === "connecting",
-							) &&
-							!hasPublishedCachedTool
-						) {
-							manager.sealConnectionSet();
-						}
-					})
-					.catch(error => {
-						logger.warn("Failed to publish owned MCP tools", { error: safeErrorForLog(error) });
-					});
+					} catch (error) {
+						ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
+						throw error;
+					}
+					ownedMcpManagerToolNames = nextToolNames;
+					ownedMcpManagerTools = nextTools;
+					pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...nextMandatoryMcpToolNames);
+					conventionalMcpToolNames.splice(0, conventionalMcpToolNames.length, ...nextConventionalMcpToolNames);
+					cwdCapturingToolNames.splice(0, cwdCapturingToolNames.length, ...nextCwdCapturingToolNames);
+					ownedConventionalMcpServerNames.clear();
+					for (const name of nextOwnedConventionalMcpServerNames) ownedConventionalMcpServerNames.add(name);
+					cachedConventionalMcpServerNames.clear();
+					for (const name of nextCachedConventionalMcpServerNames) cachedConventionalMcpServerNames.add(name);
+					// Mixed plugin + conventional sessions defer the seal while a
+					// conventional server is connecting. Cached fallback servers retain
+					// their reconnect path while any of their tools remain published,
+					// including after reconnect replaces DeferredMCPTool with MCPTool.
+					// Derive that hold from this snapshot so removing/replacing the tools
+					// restores the fixed-connection plugin contract.
+					if (
+						nextOwnedPluginServersConnected &&
+						!manager.isConnectionSetSealed() &&
+						![...nextOwnedConventionalMcpServerNames].some(
+							name => manager.getConnectionStatus(name) === "connecting",
+						) &&
+						!hasPublishedCachedTool
+					) {
+						manager.sealConnectionSet();
+					}
+				});
+				ownedMcpToolsSync = ownedMcpToolPublication.catch(error => {
+					logger.warn("Failed to publish owned MCP tools", { error: safeErrorForLog(error) });
+				});
 				return ownedMcpToolsSync;
 			};
+			settleOwnedMcpToolSync = () => ownedMcpToolPublication;
 			session.registerToolSessionCleanup(async () => {
 				acceptingOwnedMcpTools = false;
 				await ownedMcpToolsSync;

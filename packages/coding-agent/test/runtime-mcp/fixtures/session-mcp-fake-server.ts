@@ -1,6 +1,8 @@
 // Minimal stdio MCP server used by the session MCP connect tests.
 // It logs `spawn <name> <pid>` / `exit <name> <pid>` so tests can count real processes.
 // Flags: --name <n> --log <file> [--delay-init ms] [--delay-if-exists <file> ms] [--fail] [--fail-if-exists <file>]
+//        [--tools a,b]: tool names to list (default: echo)
+//        [--grow-on <file>]: once <file> exists, also list `grown` and send tools/list_changed.
 import { appendFileSync, existsSync } from "node:fs";
 
 const argv = process.argv.slice(2);
@@ -31,6 +33,21 @@ const delayIfExists =
 const send = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const baseTools = (flag("--tools") ?? "echo").split(",");
+const growOn = flag("--grow-on");
+if (growOn) {
+	const timer = setInterval(() => {
+		if (!existsSync(growOn)) return;
+		clearInterval(timer);
+		send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+	}, 50);
+}
+const tool = (toolName: string) => ({
+	name: toolName,
+	description: `${toolName} tool of ${name}`,
+	inputSchema: { type: "object", properties: { text: { type: "string" } } },
+});
+
 async function handle(message: { id?: number | string; method?: string; params?: { name?: string } }): Promise<void> {
 	if (message.id === undefined) return;
 	switch (message.method) {
@@ -43,7 +60,7 @@ async function handle(message: { id?: number | string; method?: string; params?:
 				id: message.id,
 				result: {
 					protocolVersion: "2024-11-05",
-					capabilities: { tools: {} },
+					capabilities: { tools: { listChanged: growOn !== undefined } },
 					serverInfo: { name, version: "1.0.0" },
 				},
 			});
@@ -53,15 +70,7 @@ async function handle(message: { id?: number | string; method?: string; params?:
 			send({
 				jsonrpc: "2.0",
 				id: message.id,
-				result: {
-					tools: [
-						{
-							name: "echo",
-							description: `Echo tool of ${name}`,
-							inputSchema: { type: "object", properties: { text: { type: "string" } } },
-						},
-					],
-				},
+				result: { tools: [...baseTools, ...(growOn && existsSync(growOn) ? ["grown"] : [])].map(tool) },
 			});
 			return;
 		case "tools/call":

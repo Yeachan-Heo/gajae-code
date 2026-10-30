@@ -693,7 +693,16 @@ describe("AgentSession /btw isolation", () => {
 			},
 			onTextDelta,
 		});
-		const rejected = expect(turn).rejects.toThrow("retired");
+		const rejected = turn.then(
+			() => {
+				throw new Error("Retired side turn unexpectedly completed");
+			},
+			error => {
+				expect(error).toBeInstanceOf(Error);
+				expect(error.message).toContain("retired");
+			},
+		);
+		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
 		await drainSyntheticStart();
 		const transition = harness.session.clearContext();
@@ -998,7 +1007,15 @@ describe("AgentSession /btw isolation", () => {
 			},
 			onTextDelta,
 		});
-		const rejected = expect(turn).rejects.toThrow();
+		const rejected = turn.then(
+			() => {
+				throw new Error("Disposed side turn unexpectedly completed");
+			},
+			error => {
+				expect(error).toBeInstanceOf(Error);
+			},
+		);
+		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
 		harness.session.setDisposeTimeoutForTests(10);
 		vi.useFakeTimers();
@@ -1118,7 +1135,15 @@ describe("AgentSession /btw isolation", () => {
 			signal: controller.signal,
 			onTextDelta,
 		});
-		const rejected = expect(turn).rejects.toMatchObject({ code: "unknown_effect" });
+		const rejected = turn.then(
+			() => {
+				throw new Error("Uncertain side turn unexpectedly completed");
+			},
+			error => {
+				expect(error).toMatchObject({ code: "unknown_effect" });
+			},
+		);
+		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
 		await drainSyntheticStart();
 		vi.useFakeTimers();
@@ -1161,20 +1186,29 @@ describe("AgentSession /btw isolation", () => {
 		await expect(harness.session.dispose()).rejects.toThrow("/btw turns");
 	});
 
-	it("checks cancellation after message conversion", async () => {
-		const conversion = Promise.withResolvers<Message[]>();
-		const harness = createHarness({ convert: async () => conversion.promise });
-		const controller = new AbortController();
-		const turn = harness.session.runEphemeralTurn({
-			purpose: "btw",
-			turn: { question: "cancelled", scope: harness.session.createBtwConversationScope("btw test instruction") },
-			signal: controller.signal,
+	it("keeps private canonical side input out of the main session conversion pipeline", async () => {
+		const convert = vi.fn(async (): Promise<Message[]> => {
+			throw new Error("Main conversion must not inspect private side input");
 		});
-		await Promise.resolve();
-		controller.abort(new Error("replaced during conversion"));
-		conversion.resolve([]);
-
-		await expect(turn).rejects.toThrow("replaced during conversion");
-		expect(harness.model.calls).toHaveLength(0);
+		let providerMessages = "";
+		const model = createMockModel({
+			responses: [
+				context => {
+					providerMessages = JSON.stringify(context.messages);
+					return { content: ["done"] };
+				},
+			],
+		});
+		const harness = createHarness({ convert, model });
+		await harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: {
+				question: "private question",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
+		});
+		expect(convert).not.toHaveBeenCalled();
+		expect(harness.model.calls).toHaveLength(1);
+		expect(providerMessages).toContain("private question");
 	});
 });

@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import { getAgentTerminalOwnerContext } from "@gajae-code/agent-core";
+import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
 import type { AttemptScopeRef, ImageContent } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import {
@@ -14,12 +15,18 @@ import { PromptImageUploadStore, retirePromptImageReservation } from "./host/pro
 export interface SessionImagePromptOptions {
 	expandPromptTemplates?: boolean;
 	preflightSignal?: AbortSignal;
+	/** Awaited preflight persistence fence, not proof of execution or transcript durability. */
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Exact invocation-owned core acceptance observer; errors are contained by AgentSession. */
+	onRunAccepted?: (handle: AttemptRunHandle) => void | Promise<void>;
 }
 
 export interface SessionImageSubmissionOptions {
 	deliverAs: QueuedInputDelivery;
 	queuePolicy?: QueuedInputQueuePolicy;
 	preflightSignal?: AbortSignal;
+	/** Awaited before queue admission; execution still requires the tracked receipt. */
+	onPreflightAcceptCommit?: () => void | Promise<void>;
 }
 
 /** Bounded admission for user-selected canonical bytes, not file/path loading. */
@@ -229,12 +236,10 @@ class BoundSessionImageInput implements SessionImageInput {
 				reservation.release,
 			);
 		};
-		// Capture identity from a synchronous, scoped core event, never by sampling
-		// an arbitrary current run after an await or after the prompt returns.
+		// Only this invocation's core acceptance callback may bind its lease.
+		// A durable preflight callback or another agent_start is not run evidence.
 		const unsubscribe = this.#agent.subscribe(event => {
 			if (!accepted) return;
-			if (!settled && !handle && event.type === "agent_start" && event.scope)
-				handle = this.#agent.activeResourceRunId;
 			if (event.type === "agent_end" && handle && getAgentTerminalOwnerContext(event)?.resourceRunId === handle) {
 				terminal = true;
 				retire();
@@ -251,9 +256,15 @@ class BoundSessionImageInput implements SessionImageInput {
 				// AgentSession invokes the durable commit callback INSTEAD OF the
 				// legacy accepted callback when both are supplied. Admission must be
 				// recorded at that real fence, before any core execution can start.
-				onPreflightAcceptCommit: () => {
+				onPreflightAcceptCommit: async () => {
 					reservation.guard();
+					await options.onPreflightAcceptCommit?.();
+					reservation.guard();
+				},
+				onRunAccepted: run => {
 					accepted = true;
+					handle = this.#agent.activeResourceRunId;
+					return options.onRunAccepted?.(run);
 				},
 			};
 			await this.#session.prompt(text, promptOptions);
@@ -305,7 +316,11 @@ class BoundSessionImageInput implements SessionImageInput {
 				queuePolicy: options.queuePolicy,
 				trackSubmission: true,
 				preflightSignal: options.preflightSignal,
-				onPreflightAcceptCommit: reservation.guard,
+				onPreflightAcceptCommit: async () => {
+					reservation.guard();
+					await options.onPreflightAcceptCommit?.();
+					reservation.guard();
+				},
 				onQueuedPromoted: promotion => {
 					if (!promotion.removed) executionStarted = true;
 				},
