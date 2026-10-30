@@ -13,7 +13,13 @@ import {
 } from "lucide-react";
 import type { ButtonHTMLAttributes, ClipboardEventHandler, ReactNode } from "react";
 import { useEffect, useId, useRef, useState } from "react";
-import type { DesktopMessage, DesktopQuestion, DesktopSession, DesktopSetting } from "../../desktop-host/src/protocol";
+import type {
+	DesktopMessage,
+	DesktopMessageBlock,
+	DesktopQuestion,
+	DesktopSession,
+	DesktopSetting,
+} from "../../desktop-host/src/protocol";
 
 export function Button({ children, className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
 	return (
@@ -64,8 +70,63 @@ export function SessionRow({
 		</div>
 	);
 }
+function MessageImage({ block }: { block: Extract<DesktopMessageBlock, { type: "image" }> }) {
+	const [failedSource, setFailedSource] = useState<string>();
+	const safeMime = ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(block.mimeType);
+	const safeData =
+		typeof block.data === "string" && block.data.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/u.test(block.data);
+	const source = `data:${block.mimeType};base64,${block.data}`;
+	if (!safeMime || !safeData || failedSource === source)
+		return <p className="message-image-unavailable">이미지를 표시할 수 없습니다.</p>;
+	return (
+		<figure className="message-image">
+			<img src={source} alt="대화에 포함된 이미지" onError={() => setFailedSource(source)} />
+		</figure>
+	);
+}
+
+function MessageBlocks({ blocks, tool }: { blocks: DesktopMessageBlock[]; tool: boolean }) {
+	return blocks.map((block, index) => {
+		switch (block.type) {
+			case "text":
+				return block.text.trim() ? (
+					tool ? (
+						<pre className="bounded-output" key={index}>
+							{block.text}
+						</pre>
+					) : (
+						<div className="message-text" key={index}>
+							{block.text}
+						</div>
+					)
+				) : null;
+			case "thinking":
+				return block.text.trim() ? (
+					<details className="thinking-disclosure" key={index}>
+						<summary>생각 과정</summary>
+						<div className="message-text">{block.text}</div>
+					</details>
+				) : null;
+			case "image":
+				return <MessageImage key={index} block={block} />;
+			case "image-unavailable":
+				return (
+					<p className="message-image-unavailable" key={index}>
+						이미지를 표시할 수 없습니다. {block.reason}
+					</p>
+				);
+		}
+		return null;
+	});
+}
+
 export function Message({ message }: { message: DesktopMessage }) {
 	const labels = { user: "나", assistant: "GJC", tool: "도구", system: "시스템" };
+	const blocks = message.blocks;
+	const hasContent = blocks
+		? blocks.some(block => block.type === "image" || block.type === "image-unavailable" || !!block.text.trim())
+		: !!message.text.trim();
+	if (message.role === "assistant" && !hasContent) return null;
 	return (
 		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
 			<strong className="role-label">{labels[message.role]}</strong>
@@ -90,14 +151,23 @@ export function Message({ message }: { message: DesktopMessage }) {
 							)
 						)}
 					</summary>
-					<pre className="bounded-output">{message.text}</pre>
+					<div className="tool-output">
+						{hasContent ? (
+							blocks ? (
+								<MessageBlocks blocks={blocks} tool />
+							) : (
+								<pre className="bounded-output">{message.text}</pre>
+							)
+						) : (
+							<pre className="bounded-output">출력 없음</pre>
+						)}
+					</div>
 				</details>
-			) : (
-				<div className={`message-text ${!message.text ? "message-loading" : ""}`}>
-					{!message.text && <LoaderCircle aria-hidden="true" />}
-					{message.text || "응답을 기다리는 중…"}
-				</div>
-			)}
+			) : blocks ? (
+				<MessageBlocks blocks={blocks} tool={false} />
+			) : hasContent ? (
+				<div className="message-text">{message.text}</div>
+			) : null}
 		</article>
 	);
 }

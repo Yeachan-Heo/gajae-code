@@ -19,6 +19,10 @@ import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionInfoPanel, type SessionInfoPanelProps } from "./SessionInfoPanel";
 import "./styles.css";
 
+// Deterministic 768×192 PNG: real intrinsic size exercises responsive preview bounds.
+const transcriptPreviewImage =
+	"iVBORw0KGgoAAAANSUhEUgAAAwAAAADACAIAAAA845PwAAAEpUlEQVR42u3WwQnAIBREQXuxIOtIbTl6sKRcQmpIDYIhXx2YAkRwfSkfBQBgK8kVAAACCABAAAEACCAAAAEEACCAAAAEEACAAAIAEEAAAAIIAEAAAQAIIAAAAQQAIIAAAAQQAIAAAgAEEACAAAIAEEAAAAIIAEAAAQAIIAAAAQQAsEQA3c8FbGLUbtR2AnQRQIAAAgSQAAIEECCABBAggAABJIAAAQQIIAEECCBAAAkgQAABAkgAAQIIEEACCBBAgAASQCCABBAggAABJIAAAQQIIAEECCBAAAkgQAABAghAAAECCEAAAQIIQAABAggQQAIIEECAABJAgAACBJAAAgQQIIAEECCAAAEkgAABBAggAQQIIEAACSBAAAEC6IsAGnUeIP47NeWAABJAIIAABBAggAAEECCAAAEkgAABBAggAQQIIEAACSBAAAECSACBABJAgAASQCCABBAggAQQCCABBAggAQQCSAABAkgAgQASQIAAEkAggAQQIIAEEAggAQQIIAEEAkgAAQJIAIEAEkCAABJAIIAABBAggAAEECCAAAQQIIAAASSAAAEECCABBAggQAAJIBBAAggQQAIIBJAAAgSQAAIBJIAAASSAQAAJIEAACSAQQAIIEEACCASQAAIEkAACASSAAAEkgEAACSBAAAkgEEACCBBAAggEEIAAAgQQgAACBBCAAAIEECCABBAggAABJIAAAQQIIAEECCBAAAkgEEACCBBAAggEkAACBJAAAgEkgAABJIBAAAkgQAAJIBBAAggQQAIIBJAAAgSQAAIBJIAAASSAQAAJIEAACSAQQAACyC8FAghAAAECCEAAAQIIEEACCBBAgAASQIAAAgSQAAIEECCABBAIIAEECCABBAJIAAECSACBABJAgAASQCCABBAggAQQCCABBAggAQQCSAABAkgAgQASQIAAEkAggAQQIIAEEAggAAEkgEAAAQggQAABCCBAAAECSAABAggQQAIIEECAABJAgAACBJAAAgEkgAABJIBAAAkgQAAJIBBAAggQQAIIBJAAAgSQAAIBJIAAASSAQAAJIEAACSAQQAIIEEACCASQAAIEkAACAWTNAQEkgEAAAQggQAABCCBAAAECSAABAggQQAIIEECAABJAgAACBJAAAgEkgAABJIBAAAkgQAAJIBBAAggQQAIIBJAAAgSQAAIBJIAAASSAQAAJIEAACSAQQAIIEEACCASQAAIEkAACASSAAAEkgEAAAQggQAABCCBAAAECSAABAggQQGsEEBCfAAIEkAACASSAAAEECCABBAggQAAJIEAAAQJIAAECCBBAAAIIEEAAAggQQAACCBBAgAASQIAAAgSQAAIEECCABBAggAABJIAAAQQIIAEECCBAAAkgQAABAkgAAQIIEEACCASQAAIEECCABBAggAABJIAAAQQIIAEECCBAAAEIIEAAAQggQAABCCBAAAECKEIAAQDMQgABAAIIAEAAAQAIIAAAAQQAIIAAAAQQAIAAAgAQQAAAAggAQAABAAggAAABBAAggAAABBAAgAACAAQQAIAAAgAQQAAAAggAQAABAAggAAABBADwqxfwgRtym8TYiQAAAABJRU5ErkJggg==";
+
 const fixtureModels: DesktopModel[] = Array.from(
 	{ length: 84 },
 	(_, index): DesktopModel => ({
@@ -1004,7 +1008,77 @@ export default function Showcase() {
 						text: "권한이 없어 명령을 실행하지 못했습니다.\n비밀 값: [REDACTED]\n다시 시도하기 전에 프로젝트 권한을 확인하세요.",
 					}}
 				/>
-				<Message message={{ id: "5", role: "assistant", text: "" }} />
+				<div id="showcase-message-empty-assistant">
+					<p className="muted">디자인 예시 · 도구 호출만 있는 빈 응답은 표시하지 않습니다.</p>
+					<Message message={{ id: "5", role: "assistant", text: "" }} />
+				</div>
+				<div id="showcase-message-thinking">
+					<p className="muted">디자인 예시 · 생각 과정만 있는 응답</p>
+					<Message
+						message={{
+							id: "thinking",
+							role: "assistant",
+							text: "",
+							blocks: [{ type: "thinking", text: "제공된 내용을 차례로 검토합니다." }],
+						}}
+					/>
+				</div>
+				<div id="showcase-message-image-only">
+					<p className="muted">디자인 예시 · 이미지만 있는 사용자 메시지</p>
+					<Message
+						message={{
+							id: "image",
+							role: "user",
+							text: "",
+							blocks: [{ type: "image", mimeType: "image/png", data: transcriptPreviewImage }],
+						}}
+					/>
+				</div>
+				<div id="showcase-message-mixed">
+					<p className="muted">디자인 예시 · 텍스트, 생각 과정, 이미지 순서</p>
+					<Message
+						message={{
+							id: "mixed",
+							role: "assistant",
+							text: "",
+							blocks: [
+								{ type: "text", text: "이미지 앞의 설명입니다." },
+								{ type: "thinking", text: "제공된 이미지와 설명을 살펴봅니다." },
+								{ type: "image", mimeType: "image/png", data: transcriptPreviewImage },
+								{ type: "text", text: "이미지 뒤의 설명입니다." },
+							],
+						}}
+					/>
+				</div>
+				<div id="showcase-message-tool-image">
+					<p className="muted">디자인 예시 · 이미지가 포함된 도구 출력</p>
+					<Message
+						message={{
+							id: "tool-image",
+							role: "tool",
+							toolName: "read",
+							text: "",
+							blocks: [
+								{ type: "text", text: "이미지 출력" },
+								{ type: "image", mimeType: "image/png", data: transcriptPreviewImage },
+							],
+						}}
+					/>
+				</div>
+				<div id="showcase-message-image-unavailable">
+					<p className="muted">디자인 예시 · 사용할 수 없거나 읽기 실패한 이미지</p>
+					<Message
+						message={{
+							id: "unavailable",
+							role: "assistant",
+							text: "",
+							blocks: [
+								{ type: "image-unavailable", reason: "지원하지 않는 이미지 형식입니다." },
+								{ type: "image", mimeType: "image/png", data: "AAAA" },
+							],
+						}}
+					/>
+				</div>
 				<Message
 					message={{
 						id: "6",

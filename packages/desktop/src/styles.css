@@ -85,7 +85,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 	line-height: 1.45;
 }
 .button svg, .status svg, .error-banner > svg, .question-heading > svg,
-.question-pending svg, .tool-disclosure svg, .message-loading svg, .notice > svg {
+.question-pending svg, .tool-disclosure svg, .notice > svg {
 	width: 16px;
 	height: 16px;
 	flex-shrink: 0;
@@ -146,11 +146,15 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .message-text { white-space: pre-wrap; max-height: 60vh; overflow: auto; line-height: 1.7; }
 .message-error { color: var(--error); }
 .message-error .role-label { color: var(--error); }
-.message-loading { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.8125rem; }
+.thinking-disclosure { color: var(--muted); font-size: 0.8125rem; }
+.thinking-disclosure .message-text { padding: 0 12px 12px; }
+.message-image { margin: 8px 0; max-width: 100%; }
+.message-image img { display: block; max-width: 100%; max-height: 320px; width: auto; height: auto; object-fit: contain; }
+.message-image-unavailable { margin: 8px 0; color: var(--muted); font-size: 0.8125rem; }
 .truncation-notice { display: block; margin: 0 0 8px; padding: 8px 12px; border-left: 2px solid var(--border); background: var(--surface); }
 summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-disclosure { border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
-.tool-disclosure summary { display: flex; align-items: center; gap: 8px; padding: 10px 12px; list-style: none; border-radius: 7px; font-size: 0.8125rem; }
+.tool-disclosure summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; list-style: none; border-radius: 7px; font-size: 0.8125rem; }
 .tool-disclosure summary::-webkit-details-marker { display: none; }
 .tool-name { min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); }
 .tool-failure { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; font-family: inherit; }
@@ -158,6 +162,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-disclosure[open] > summary .disclosure-chevron { transform: rotate(90deg); }
 .tool-disclosure[open] > summary { border-bottom: 1px solid var(--border); border-radius: 7px 7px 0 0; }
 .bounded-output { max-height: 320px; overflow: auto; background: var(--surface); padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.tool-output { max-height: 320px; overflow: auto; min-width: 0; }
+.tool-output .message-image, .tool-output .message-image-unavailable, .tool-output .thinking-disclosure { margin: 8px 12px; }
 .tool-disclosure .bounded-output { margin: 0; border: 0; border-radius: 0 0 7px 7px; color: var(--text); }
 .message-error .tool-disclosure { border-color: var(--error); }
 .composer-area { padding: 12px 24px 20px; flex-shrink: 0; max-height: 60dvh; overflow: auto; }

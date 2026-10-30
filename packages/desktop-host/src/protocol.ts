@@ -76,10 +76,17 @@ export interface DesktopRequest {
 	params: Record<string, unknown>;
 }
 
+export type DesktopMessageBlock =
+	| { type: "text"; text: string }
+	| { type: "thinking"; text: string }
+	| { type: "image"; mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp"; data: string }
+	| { type: "image-unavailable"; reason: string };
+
 export interface DesktopMessage {
 	id: string;
 	/** Canonical persisted user-entry identity; display IDs never authorize branching. */
 	entryId?: string;
+	blocks?: DesktopMessageBlock[];
 	role: "user" | "assistant" | "tool" | "system";
 	text: string;
 	toolName?: string;

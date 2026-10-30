@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent } from "@gajae-code/ai/core";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -26,7 +25,6 @@ import {
 	createAgentSession,
 	createSessionImageInput,
 	executeAcpBuiltinSlashCommand,
-	getSessionMessageEntryId,
 	type SlashCommandRuntime,
 } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
@@ -51,6 +49,14 @@ import {
 	type DesktopGatePresenter,
 } from "./gate-presentation";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
+import {
+	countVisibleMessages,
+	fitMessages,
+	HISTORY_LIMIT,
+	projectHistoryPage,
+	projectMessages,
+	TEXT_LIMIT,
+} from "./message-projection";
 import {
 	projectDesktopModel,
 	projectDesktopThinking,
@@ -83,12 +89,8 @@ import { PROTOCOL_VERSION } from "./protocol";
 import { readDesktopSessionInfo } from "./session-info";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 
-const HISTORY_LIMIT = 160;
-const VISIBLE_MESSAGE_ROLES = new Set(["user", "assistant", "toolResult", "bashExecution", "pythonExecution"]);
-const TEXT_LIMIT = 8_000;
 const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
 	JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
-const FULL_TEXT_LIMIT = 32_000;
 /** Owned controllers redact complete display fields before producing these DTOs. */
 const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"activity.get",
@@ -110,7 +112,6 @@ const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"session.info",
 ]);
 const HISTORY_PAGE_LIMIT = 500;
-const HISTORY_PAGE_BYTES = 2_000_000;
 const COMMAND_OUTPUT_LIMIT = 200_000;
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 /**
@@ -303,130 +304,6 @@ export function validateDesktopSetting(path: unknown, value: unknown): SettingPa
 	return settingPath;
 }
 
-/**
- * Only visible text is projected: model thinking, tool-call arguments, images
- * and headers are never serialized. Explicit user execution code/output remains
- * visible even when excluded from model context. The host redacts known secrets.
- * `limit` bounds per-message text; the caller decides how many messages to keep.
- */
-function projectVisibleMessage(value: unknown, index: number, limit: number): DesktopMessage | undefined {
-	const message = record(value);
-	if (!message || !VISIBLE_MESSAGE_ROLES.has(String(message.role))) return undefined;
-	if (message.role === "bashExecution" || message.role === "pythonExecution") {
-		const source = message.role === "bashExecution" ? message.command : message.code;
-		if (typeof source !== "string" || typeof message.output !== "string") return undefined;
-		const text = `${source}\n${message.output}`;
-		return {
-			id: `${index}:${String(message.timestamp ?? "")}`,
-			role: "tool",
-			toolName: message.role === "bashExecution" ? "셸 직접 실행" : "Python 직접 실행",
-			text: text.slice(-limit),
-			excludeFromContext: message.excludeFromContext === true,
-			...(text.length > limit || message.truncated === true ? { truncated: true } : {}),
-			...(message.cancelled === true
-				? { cancelled: true }
-				: typeof message.exitCode === "number" && message.exitCode !== 0
-					? { isError: true }
-					: {}),
-		};
-	}
-	const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
-	const content =
-		typeof message.content === "string"
-			? message.content
-			: Array.isArray(message.content)
-				? message.content
-						.flatMap(part => {
-							const block = record(part);
-							return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
-						})
-						.join("\n")
-				: "";
-	// A provider failure arrives as an assistant turn with an empty body and the
-	// reason in errorMessage; dropping it renders a blank bubble the user cannot act on.
-	const failed = message.stopReason === "error";
-	const errorText = failed && typeof message.errorMessage === "string" ? message.errorMessage : "";
-	const text = content || errorText;
-	const entryId = role === "user" ? getSessionMessageEntryId(value as AgentMessage) : undefined;
-	return {
-		id: `${index}:${String(message.timestamp ?? "")}`,
-		...(entryId ? { entryId } : {}),
-		role,
-		text: text.slice(-limit),
-		...(text.length > limit ? { truncated: true } : {}),
-		...(typeof message.toolName === "string" ? { toolName: message.toolName.slice(0, 100) } : {}),
-		...(message.isError === true || failed ? { isError: true } : {}),
-	};
-}
-
-function projectVisibleMessages(messages: readonly unknown[], limit: number): DesktopMessage[] {
-	const projected: DesktopMessage[] = [];
-	for (let index = 0; index < messages.length; index += 1) {
-		const message = projectVisibleMessage(messages[index], index, limit);
-		if (message) projected.push(message);
-	}
-	return projected;
-}
-
-/** How many messages the transcript view would show, without projecting text. */
-function countVisibleMessages(messages: readonly unknown[]): number {
-	let count = 0;
-	for (const message of messages) {
-		const role =
-			message && typeof message === "object" && typeof (message as { role?: unknown }).role === "string"
-				? (message as { role: string }).role
-				: "";
-		if (VISIBLE_MESSAGE_ROLES.has(role)) {
-			const execution = record(message);
-			if (
-				(role === "bashExecution" || role === "pythonExecution") &&
-				(typeof (role === "bashExecution" ? execution?.command : execution?.code) !== "string" ||
-					typeof execution?.output !== "string")
-			)
-				continue;
-			count += 1;
-		}
-	}
-	return count;
-}
-
-/** Bounded snapshot projection used for every session in the snapshot frame. */
-export function projectMessages(messages: readonly unknown[]): DesktopMessage[] {
-	return projectVisibleMessages(messages.slice(-HISTORY_LIMIT), TEXT_LIMIT);
-}
-
-/**
- * On-demand projection for the explicit history view: no message-count cap.
- * `offset` is applied to the full projection so every page is addressable.
- */
-export function projectHistoryPage(
-	messages: readonly unknown[],
-	offset: number,
-	limit: number,
-): { total: number; page: DesktopMessage[]; truncated: boolean } {
-	const total = countVisibleMessages(messages);
-	const page: DesktopMessage[] = [];
-	// Bound the response by characters as well as message count so one huge page
-	// cannot exceed the frame budget.
-	let budget = HISTORY_PAGE_BYTES;
-	let visible = 0;
-	for (let index = 0; index < messages.length && page.length < limit; index += 1) {
-		const message = projectVisibleMessage(messages[index], index, FULL_TEXT_LIMIT);
-		if (!message) continue;
-		if (visible < offset) {
-			visible += 1;
-			continue;
-		}
-		visible += 1;
-		// Project only the requested page: the whole transcript would be allocated
-		// (32k chars per message) just to discard all but one page.
-		if (page.length > 0 && message.text.length > budget) break;
-		budget -= message.text.length;
-		page.push(message);
-	}
-	return { total, page, truncated: offset + page.length < total };
-}
-
 interface SavedSession {
 	id: string;
 	projectId: string;
@@ -549,27 +426,28 @@ export class DesktopHost {
 			// Still clone at the boundary so a consumer cannot mutate a private ledger.
 			const completeProjection =
 				projected || frame.type === "activity" || frame.type === "gate" || frame.type === "operator";
+			const redact = (text: string) => this.#redact(text);
 			const serialized = completeProjection
 				? JSON.stringify(frame)
-				: JSON.stringify(frame, (key, value: unknown) =>
-						typeof value === "string" &&
-						![
-							"id",
-							"entryId",
-							"sessionId",
-							"projectId",
-							"deliveryId",
-							"sdkSubmissionId",
-							"errorOwner",
-							"type",
-							"status",
-							"kind",
-							"role",
-							"provider",
-						].includes(key)
-							? this.#redact(value)
-							: value,
-					);
+				: JSON.stringify(frame, (key, value: unknown) => {
+						return typeof value === "string" &&
+							![
+								"id",
+								"entryId",
+								"sessionId",
+								"projectId",
+								"deliveryId",
+								"sdkSubmissionId",
+								"errorOwner",
+								"type",
+								"status",
+								"kind",
+								"role",
+								"provider",
+							].includes(key)
+							? redact(value)
+							: value;
+					});
 			options.emit(JSON.parse(serialized) as DesktopFrame);
 		};
 		this.#createSession = options.createSession ?? createAgentSession;
@@ -735,11 +613,39 @@ export class DesktopHost {
 		this.#saving = save;
 		return save;
 	}
-	#dto(metadata: SavedSession): DesktopSession {
+	#dto(metadata: SavedSession, messageBudget = 2_000_000): DesktopSession {
 		const live = this.#live.get(metadata.id);
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
 		const awaitingGate = gates?.available && gates.pending.length > 0;
+		const projected = live
+			? projectMessages(
+					live.streamingMessage ? [...live.sdk.messages, live.streamingMessage] : live.sdk.messages,
+					text => this.#redact(text),
+					messageBudget,
+				)
+			: [];
+		const notices = (live?.notices ?? []).map(message => ({
+			...message,
+			text: this.#redact(message.text),
+			...(message.toolName === undefined ? {} : { toolName: this.#redact(message.toolName) }),
+			...(message.blocks === undefined
+				? {}
+				: {
+						blocks: message.blocks.map(block => {
+							if (block.type === "text" || block.type === "thinking")
+								return { ...block, text: this.#redact(block.text) };
+							if (block.type === "image-unavailable") return { ...block, reason: this.#redact(block.reason) };
+							return this.#redact(block.data) === block.data
+								? block
+								: {
+										type: "image-unavailable" as const,
+										reason: "보안상의 이유로 이미지를 미리 볼 수 없습니다.",
+									};
+						}),
+					}),
+		}));
+		const fitted = fitMessages([...projected, ...notices].slice(-HISTORY_LIMIT), messageBudget);
 		return {
 			id: metadata.id,
 			projectId: metadata.projectId,
@@ -763,17 +669,15 @@ export class DesktopHost {
 						blocked: live.sdk.settings.get("images.blockImages"),
 					}
 				: null,
-			messages: live
-				? [
-						...projectMessages(
-							live.streamingMessage ? [...live.sdk.messages, live.streamingMessage] : live.sdk.messages,
-						),
-						...live.notices,
-					]
-						.slice(-HISTORY_LIMIT)
-						.map(message => ({ ...message, text: this.#redact(message.text) }))
-				: [],
-			...(live && live.sdk.messages.length + live.notices.length > HISTORY_LIMIT ? { historyTruncated: true } : {}),
+			messages: fitted.messages,
+			...(live &&
+			(fitted.truncated ||
+				countVisibleMessages(live.sdk.messages) +
+					(live.streamingMessage ? countVisibleMessages([live.streamingMessage]) : 0) +
+					live.notices.length >
+					HISTORY_LIMIT)
+				? { historyTruncated: true }
+				: {}),
 			...(question ? { question } : {}),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
@@ -785,24 +689,7 @@ export class DesktopHost {
 			projects: this.#catalog.projects.map(project => ({ ...project })),
 			sessions: this.#catalog.sessions
 				.filter(session => !this.#pendingForks.has(session.id))
-				.map(session => {
-					const dto = this.#dto(session);
-					let remaining = Math.floor(500_000 / Math.max(1, this.#catalog.sessions.length));
-					dto.messages = dto.messages
-						.slice()
-						.reverse()
-						.flatMap(message => {
-							if (remaining <= 0) {
-								dto.historyTruncated = true;
-								return [];
-							}
-							const text = message.text.slice(-remaining);
-							remaining -= text.length;
-							return [{ ...message, text, truncated: message.truncated || text.length < message.text.length }];
-						})
-						.reverse();
-					return dto;
-				}),
+				.map(session => this.#dto(session, Math.floor(500_000 / Math.max(1, this.#catalog.sessions.length)))),
 			models: this.#registry?.getAvailable().map(projectDesktopModel) ?? [],
 			capabilities: CAPABILITIES.map(capability => ({ ...capability })),
 			deliveries: this.#deliveries.list(),
@@ -1943,12 +1830,14 @@ export class DesktopHost {
 				throw new Error("Invalid history offset");
 			if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > HISTORY_PAGE_LIMIT)
 				throw new Error("Invalid history limit");
-			const { total, page, truncated } = projectHistoryPage(live.sdk.messages, offset, limit);
+			const { total, page, truncated } = projectHistoryPage(live.sdk.messages, offset, limit, text =>
+				this.#redact(text),
+			);
 			return {
 				sessionId: live.metadata.id,
 				total,
 				offset,
-				messages: page.map(message => ({ ...message, text: this.#redact(message.text) })),
+				messages: page,
 				truncated,
 			} satisfies DesktopHistory;
 		}

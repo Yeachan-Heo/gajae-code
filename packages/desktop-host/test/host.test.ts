@@ -13,12 +13,11 @@ import { isolateEnvironment } from "../src/environment-policy";
 import {
 	DesktopHost,
 	desktopSettings,
-	projectHistoryPage,
-	projectMessages,
 	requiredString,
 	validateDesktopSetting,
 	validateQuestionAnswer,
 } from "../src/host";
+import { projectHistoryPage, projectMessages } from "../src/message-projection";
 import type {
 	DesktopForkResult,
 	DesktopFrame,
@@ -100,13 +99,13 @@ describe("desktop protocol validation", () => {
 			expect(() => requiredString({ text: value }, "text", 4)).toThrow("Invalid text");
 		expect(requiredString({ text: "test" }, "text", 4)).toBe("test");
 	});
-	test("only serializes visible message text, excluding credentials and reasoning blocks", () => {
+	test("projects thinking and visible text without credentials or tool arguments", () => {
 		const messages = projectMessages([
 			{ role: "system", content: "private instructions" },
 			{
 				role: "assistant",
 				content: [
-					{ type: "thinking", thinking: "private reasoning" },
+					{ type: "thinking", thinking: "visible reasoning", thinkingSignature: "secret" },
 					{ type: "toolCall", arguments: { key: "secret" } },
 					{ type: "text", text: "Visible" },
 				],
@@ -120,7 +119,10 @@ describe("desktop protocol validation", () => {
 		]);
 		expect(messages[1]?.isError).toBe(true);
 		expect(JSON.stringify(messages)).not.toContain("secret");
-		expect(JSON.stringify(messages)).not.toContain("private");
+		expect(messages[0]?.blocks).toEqual([
+			{ type: "thinking", text: "visible reasoning" },
+			{ type: "text", text: "Visible" },
+		]);
 	});
 	test("bounds history and message text", () => {
 		const projected = projectMessages(
@@ -265,6 +267,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 	async function launch(
 		options: {
 			beforeBranch?: () => Promise<{ cancel?: boolean }>;
+			profileFailureSecret?: string;
 			observeFrame?: (frame: DesktopFrame) => void;
 			configureCandidate?: (
 				result: CreateAgentSessionResult,
@@ -332,6 +335,12 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 								: [],
 					});
 					sessions.push(result);
+					if (!candidate && options.profileFailureSecret) {
+						result.session.settings.set("modelProfile.default", options.profileFailureSecret);
+						result.session.activateModelProfileForControl = async () => {
+							throw new Error(`profile failure ${options.profileFailureSecret}`);
+						};
+					}
 					const ownedDependencies = { settings: result.session.settings, registry: factoryOptions.modelRegistry! };
 					dependencies.push(ownedDependencies);
 					if (candidate) options.configureCandidate?.(result, ownedDependencies);
@@ -424,6 +433,10 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			return call<DesktopSnapshot>("bootstrap");
 		};
 		const project = await call<DesktopProject>("project.open", { path: projectDir });
+		if (options.profileFailureSecret)
+			await expect(
+				call("auth.setKey", { provider: "unknown-provider", key: options.profileFailureSecret }),
+			).rejects.toThrow();
 		const source = await call<DesktopSession>("session.create", { projectId: project.id });
 		const sdk = sessions[0]!.session;
 		const sourceFile = sdk.sessionFile!;
@@ -451,6 +464,61 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			dataDir,
 		};
 	}
+
+	test("redacts thinking and withholds secret-bearing previews across DTOs and emitted frames", async () => {
+		const h = await launch();
+		await expect(h.call("auth.setKey", { provider: "unknown-provider", key: "QUFB" })).rejects.toThrow();
+		const existing = h.sdk.messages.find(message => message.role === "assistant") as AssistantMessage;
+		h.sdk.agent.state.messages.push({
+			...existing,
+			content: [
+				{ type: "thinking", thinking: "secret QUFB", thinkingSignature: "signature-secret" },
+				{ type: "image", mimeType: "image/png", data: "QUFB" },
+				{ type: "image", mimeType: "image/png", data: "QkJC" },
+			],
+		} as unknown as AssistantMessage);
+		const snapshot = h.host.snapshot();
+		const history = await h.call<DesktopHistory>("history.get", { sessionId: h.source.id });
+		for (const message of [
+			snapshot.sessions.find(session => session.id === h.source.id)!.messages.at(-1)!,
+			history.messages.at(-1)!,
+		]) {
+			expect(message.blocks).toEqual([
+				{ type: "thinking", text: "secret [redacted]" },
+				{ type: "image-unavailable", reason: "보안상의 이유로 이미지를 미리 볼 수 없습니다." },
+				{ type: "image", mimeType: "image/png", data: "QkJC" },
+			]);
+			expect(JSON.stringify(message)).not.toContain("signature-secret");
+		}
+		const frame = h.frames.findLast(
+			frame =>
+				frame.type === "response" &&
+				frame.ok &&
+				!!frame.result &&
+				typeof frame.result === "object" &&
+				"messages" in frame.result,
+		);
+		expect(frame).toBeDefined();
+		expect(JSON.stringify(frame)).not.toContain("QUFB");
+		expect(JSON.stringify(frame)).toContain("QkJC");
+		await h.call("bootstrap");
+		const snapshotFrame = h.frames.findLast(frame => frame.type === "snapshot");
+		expect(snapshotFrame).toBeDefined();
+		expect(JSON.stringify(snapshotFrame)).not.toContain("QUFB");
+		expect(JSON.stringify(snapshotFrame)).toContain("QkJC");
+	});
+
+	test("redacts default profile candidate failure notices in direct snapshots", async () => {
+		const secret = "profile-credential-unique";
+		const h = await launch({ profileFailureSecret: secret });
+		const snapshot = h.host.snapshot();
+		const notice = snapshot.sessions
+			.find(session => session.id === h.source.id)!
+			.messages.find(message => message.id.startsWith("profile:"));
+		expect(notice?.text).toContain("[redacted]");
+		expect(notice?.text).not.toContain(secret);
+		expect(JSON.stringify(h.frames)).not.toContain(secret);
+	});
 
 	test.each([0, 1, 2])("branches before persisted user entry %s without rotating the source", async index => {
 		const h = await launch();
