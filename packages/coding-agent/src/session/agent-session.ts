@@ -893,7 +893,7 @@ export type AgentSessionEvent =
 
 export type QueuedInputDelivery = "steer" | "followUp";
 export type QueuedInputQueuePolicy = "respect-mode" | "sequential";
-export type QueuedInputRemovalReason = "cancelled" | "removed";
+export type QueuedInputRemovalReason = "cancelled" | "removed" | "refused";
 
 export interface QueuedInputAdmission {
 	submissionId: string;
@@ -3477,6 +3477,7 @@ export class AgentSession {
 		state: TrackedQueuedInput,
 		promotion: { startsOwnRun?: boolean; removed?: boolean },
 	): void {
+		if (state.executionSettled || state.terminalSettled) return;
 		if (promotion.removed) {
 			this.#settleTrackedQueuedInputRemoved(state, state.cancelRequested ? "cancelled" : "removed");
 			return;
@@ -3755,6 +3756,19 @@ export class AgentSession {
 		}
 	}
 	#handleQueuedRunStartDecision(decision: AgentQueuedRunStartDecision): void {
+		if (decision.disposition === "not-started") {
+			const consumed = new Set(decision.consumedQueuedMessages);
+			for (const state of this.#trackedQueuedInputs.values()) {
+				if (
+					!state.executionSettled &&
+					!state.terminalSettled &&
+					state.message !== undefined &&
+					consumed.has(state.message)
+				) {
+					this.#settleTrackedQueuedInputRemoved(state, "refused");
+				}
+			}
+		}
 		let callbackError: unknown;
 		for (const message of decision.consumedQueuedMessages) {
 			const hook = this.#queuedRunStartFailureHooks.get(message);

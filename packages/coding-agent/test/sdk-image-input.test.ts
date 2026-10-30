@@ -10,6 +10,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner, loadExtensions } from "../src/extensibility/extensions";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createSessionImageInput } from "../src/sdk/image-input";
 import { AgentSession, type QueuedInputSubmission } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -879,6 +880,47 @@ test("abort is not resource-settlement proof for an accepted initial prompt", as
 	expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
 	resource.resolve();
 	await tick();
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("a real queued no-model refusal settles the image receipt and releases quota", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const entered = deferred();
+	const finish = deferred();
+	const session = buildSession([
+		async () => {
+			entered.resolve();
+			await finish.promise;
+			return { content: ["predecessor"] };
+		},
+	]);
+	const predecessor = session.prompt("predecessor");
+	await entered.promise;
+	const submit = session.submitUserMessage.bind(session);
+	const submitSpy = vi
+		.spyOn(session, "submitUserMessage")
+		.mockImplementation((content, options) =>
+			submit(content, { ...options, sdkRunCapability: createSdkRunCapability("refused-image-owner") }),
+		);
+	let submission: QueuedInputSubmission;
+	try {
+		submission = await createSessionImageInput(session).submitUserMessage("queued image", [image()], {
+			deliverAs: "followUp",
+		});
+	} finally {
+		submitSpy.mockRestore();
+	}
+	expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+	session.agent.setModel(undefined);
+	finish.resolve();
+	expect(await submission.execution).toMatchObject({ disposition: "removed", reason: "refused" });
+	expect(await submission.terminal).toMatchObject({ disposition: "removed", reason: "refused" });
+	await predecessor;
+	await session.waitForIdle();
+	await tick();
+	expect(submission.cancel()).toBe(false);
+	expect(providerCalls).toBe(1);
+	expect(session.agent.state.messages.filter(message => message.role === "user")).toHaveLength(1);
 	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
 });
 
