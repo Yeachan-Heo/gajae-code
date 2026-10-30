@@ -74,7 +74,7 @@ async function step<T>(page: Page, label: string, action: () => Promise<T>): Pro
 	}
 }
 
-async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
+async function fixture(observeRecoveryNotices = false): Promise<{ context: BrowserContext; page: Page }> {
 	const context = await browser.createBrowserContext();
 	const page = await context.newPage();
 	page.setDefaultTimeout(5000);
@@ -90,16 +90,35 @@ async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
 	});
 	try {
 	await page.setViewport({ width: 1400, height: 900 });
-	await page.evaluateOnNewDocument(() => {
+	await page.evaluateOnNewDocument((observeRecoveryNotices: boolean) => {
 		const w = window as unknown as FixtureWindow;
+		if (observeRecoveryNotices) {
+			new MutationObserver(() => {
+				if ([...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 복구")))
+					sessionStorage.setItem("sawRecoveryNotice", "yes");
+			}).observe(document, { subtree: true, childList: true, characterData: true });
+		}
 		const callbacks = new Map<number, (event: unknown) => void>();
 		const listeners = new Map<number, number>();
 		let serial = 0;
 		let failDraftAfterHandoff = 0;
 		let sawHandoff = false;
+		const put = IDBObjectStore.prototype.put;
+		IDBObjectStore.prototype.put = function (value, key) {
+			const fault = sessionStorage.getItem("failDeliveryPut");
+			if (this.name === "deliveries" && fault === `${value.id}:${value.disposition}`) {
+				sessionStorage.removeItem("failDeliveryPut");
+				throw new DOMException("Injected delivery save failure", "QuotaExceededError");
+			}
+			return key === undefined ? Reflect.apply(put, this, [value]) : Reflect.apply(put, this, [value, key]);
+		};
 		const transaction = IDBDatabase.prototype.transaction;
 		IDBDatabase.prototype.transaction = function (storeNames, mode, options) {
 			const names = Array.isArray(storeNames) ? storeNames : [storeNames];
+			if (sessionStorage.getItem("failBootstrapRestore") && names.includes("deliveries") && names.includes("drafts") && mode === "readwrite") {
+				sessionStorage.removeItem("failBootstrapRestore");
+				throw new DOMException("Injected bootstrap restore failure", "QuotaExceededError");
+			}
 			if (failDraftAfterHandoff && sawHandoff && names.length === 1 && names[0] === "drafts" && mode === "readwrite") {
 				failDraftAfterHandoff--;
 				throw new DOMException("Injected post-handoff storage failure", "QuotaExceededError");
@@ -139,6 +158,18 @@ async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
 				const request = args.request;
 				const state = stored(); state.requests.push(request); save(state);
 				if (request.method === "prompt") return;
+				if (request.method === "bootstrap" && sessionStorage.getItem("bufferedReceipts")) {
+					const receipts = JSON.parse(sessionStorage.getItem("bufferedReceipts")!) as DesktopDeliveryReceipt[];
+					sessionStorage.removeItem("bufferedReceipts");
+					for (const receipt of receipts) emit({ type: "delivery", receipt });
+				}
+				if (request.method === "bootstrap" && sessionStorage.getItem("failBootstrap")) {
+					const mode = sessionStorage.getItem("failBootstrap");
+					sessionStorage.removeItem("failBootstrap");
+					if (mode === "fatal") emit({ type: "fatal", error: "Injected bootstrap fatal" });
+					queueMicrotask(() => emit({ type: "response", id: request.id, ok: false, error: "Injected bootstrap failure" }));
+					return;
+				}
 				let result: unknown;
 				if (request.method === "session.select") {
 					const sessionId = request.params.sessionId;
@@ -172,7 +203,7 @@ async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
 			},
 		};
 		w.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
-	});
+	}, observeRecoveryNotices);
 	await step(page, "open app", () => page.goto(origin));
 	await step(page, "bootstrap session list", () => page.waitForSelector(".session-select"));
 	await step(page, "bootstrap connection", () => page.waitForFunction(() => !document.body.textContent?.includes("호스트에 연결하는 중")));
@@ -218,8 +249,164 @@ async function send(page: Page, text: string) {
 async function receipt(page: Page, request: PromptRequest, disposition: DesktopDeliveryReceipt["disposition"]) {
 	await step(page, `emit ${disposition} receipt`, () => page.evaluate(({ request, disposition }) => window.fixture.receipt(request.id, request.params.sessionId, disposition), { request, disposition }));
 }
+async function waitStoredDisposition(page: Page, id: string, disposition: DesktopDeliveryReceipt["disposition"]) {
+	await page.waitForFunction(async (id, disposition) => {
+		const db = await new Promise<IDBDatabase>((resolve, reject) => {
+			const request = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error);
+		});
+		const entry = await new Promise<{ disposition: string } | undefined>((resolve, reject) => {
+			const request = db.transaction("deliveries").objectStore("deliveries").get(id);
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error);
+		});
+		db.close();
+		return entry?.disposition === disposition;
+	}, {}, id, disposition);
+}
 
 describe("mounted composer delivery recovery", () => {
+	test("bootstrap reconciliation of an accepted delivery never shows a recovery warning", async () => {
+		const { context, page } = await fixture(true);
+		try {
+			await select(page); const request = await send(page, "bootstrap accepted");
+			await page.evaluate((request: PromptRequest) => window.fixture.bootstrapReceipt({ id: request.id, sessionId: request.params.sessionId, disposition: "accepted" }), request);
+			await page.reload(); await select(page);
+			await waitStoredDisposition(page, request.id, "accepted");
+			expect(await page.evaluate(() => sessionStorage.getItem("sawRecoveryNotice"))).toBeNull();
+			expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), request.id)).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("bootstrap without a matching receipt exposes the retained unknown payload", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); await send(page, "missing receipt payload");
+			await page.reload(); await select(page);
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			expect(await page.evaluate(() => document.body.textContent?.includes("초안 복원"))).toBe(true);
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	for (const mode of ["error", "fatal"] as const) test(`failed bootstrap (${mode}) persists unknown and never replays`, async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); const request = await send(page, "unconfirmed bootstrap payload");
+			await page.evaluate((mode: string) => sessionStorage.setItem("failBootstrap", mode), mode);
+			await page.reload();
+			await waitStoredDisposition(page, request.id, "unknown");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
+			await page.reload(); await select(page);
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "unconfirmed bootstrap payload");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	for (const mode of ["normal", "error", "fatal"] as const) test(`bootstrap (${mode}) continues later receipts for the same delivery after a save failure`, async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); const request = await send(page, "multiple receipt payload");
+			await page.evaluate(({ request, mode }) => {
+				sessionStorage.setItem("failDeliveryPut", `${request.id}:accepted`);
+				sessionStorage.setItem("bufferedReceipts", JSON.stringify([
+					{ id: request.id, sessionId: request.params.sessionId, disposition: "accepted" },
+					{ id: request.id, sessionId: request.params.sessionId, disposition: "failed" },
+				]));
+				if (mode !== "normal") sessionStorage.setItem("failBootstrap", mode);
+			}, { request, mode });
+			await page.reload();
+			await waitStoredDisposition(page, request.id, "failed");
+			if (mode !== "normal") await page.reload();
+			await select(page);
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("failed unknown classification remains actionable in memory while later records reconcile", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					open.onsuccess = () => resolve(open.result);
+					open.onerror = () => reject(open.error);
+				});
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction("deliveries", "readwrite");
+					const store = tx.objectStore("deliveries");
+					store.put({ id: "a-unknown", sessionId: "a", text: "exact uncertain payload", attachments: [], disposition: "pending" });
+					store.put({ id: "b-accepted", sessionId: "a", text: "active payload", attachments: [], disposition: "pending" });
+					tx.oncomplete = () => resolve(); tx.onabort = () => reject(tx.error);
+				});
+				db.close();
+				const state = JSON.parse(sessionStorage.getItem("fixture") || '{"receipts":[],"requests":[]}') as FixtureState;
+				state.receipts = [{ id: "b-accepted", sessionId: "a", disposition: "accepted" }];
+				sessionStorage.setItem("fixture", JSON.stringify(state));
+				sessionStorage.setItem("failDeliveryPut", "a-unknown:unknown");
+			});
+			await page.reload(); await select(page);
+			await waitStoredDisposition(page, "a-unknown", "pending");
+			await waitStoredDisposition(page, "b-accepted", "accepted");
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			expect(await page.evaluate(() => document.body.textContent?.includes("저장 복구 다시 시도"))).toBe(false);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "exact uncertain payload");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(0);
+			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "delivery.ack"))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("bootstrap continues other deliveries after an isolated restoration failure", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					open.onsuccess = () => resolve(open.result);
+					open.onerror = () => reject(open.error);
+				});
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction("deliveries", "readwrite");
+					const store = tx.objectStore("deliveries");
+					store.put({ id: "a-refused", sessionId: "b", text: "refused payload", attachments: [], disposition: "pending" });
+					store.put({ id: "b-missing", sessionId: "a", text: "exact missing payload", attachments: [], disposition: "pending" });
+					store.put({ id: "c-accepted", sessionId: "a", text: "active payload", attachments: [], disposition: "pending" });
+					tx.oncomplete = () => resolve();
+					tx.onabort = () => reject(tx.error);
+				});
+				db.close();
+				const state = JSON.parse(sessionStorage.getItem("fixture") || '{"receipts":[],"requests":[]}') as FixtureState;
+				state.receipts = [
+					{ id: "a-refused", sessionId: "b", disposition: "refused" },
+					{ id: "c-accepted", sessionId: "a", disposition: "accepted" },
+				];
+				sessionStorage.setItem("fixture", JSON.stringify(state));
+				sessionStorage.setItem("failBootstrapRestore", "yes");
+			});
+			await page.reload(); await select(page);
+			await waitStoredDisposition(page, "b-missing", "unknown");
+			await waitStoredDisposition(page, "c-accepted", "accepted");
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].filter(el => el.textContent?.includes("전송 복구")).length)).toBe(1);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "exact missing payload");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(0);
+			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === "c-accepted"))).toBe(false);
+			await select(page, 1);
+			await page.waitForFunction(() => document.body.textContent?.includes("저장 복구 다시 시도"));
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복구 항목 버리기"))?.disabled)).toBe(true);
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("저장 복구 다시 시도"))?.click());
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "refused payload");
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === "a-refused"));
+			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "delivery.ack" && (r.params.deliveryId === "b-missing" || r.params.deliveryId === "c-accepted")))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("delayed refusal restores attachment and merges newer text once in its original session", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -253,7 +440,8 @@ describe("mounted composer delivery recovery", () => {
 			await select(page); await attach(page);
 			await page.evaluate(() => {
 				const textarea = document.querySelector(".composer textarea") as HTMLTextAreaElement;
-				Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "x".repeat(8 * 1024 * 1024));
+				// Keep all 8 MiB while bounding individual lines, so this tests framing rather than pathological word layout.
+				Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, `${"x".repeat(1023)}\n`.repeat(8192));
 				textarea.dispatchEvent(new Event("input", { bubbles: true }));
 			});
 			await page.click('.composer button[type="submit"]');
@@ -288,7 +476,7 @@ describe("mounted composer delivery recovery", () => {
 		try {
 			await select(page); const first = await send(page, "active first");
 			await receipt(page, first, "accepted");
-			await page.waitForFunction(() => document.body.textContent?.includes(": accepted."));
+			await waitStoredDisposition(page, first.id, "accepted");
 			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [], queued: [] } }));
 			await page.type(".composer textarea", "unsent second");
 			await page.evaluate(() => window.fixture.failPostHandoffDraftSave(2));
@@ -297,14 +485,15 @@ describe("mounted composer delivery recovery", () => {
 			const panels = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')]
 				.filter(el => el.textContent?.includes("전송 복구"))
 				.map(el => ({ text: el.textContent ?? "", repairs: [...el.querySelectorAll("button")].filter(button => button.textContent?.includes("저장 복구 다시 시도")).length })));
-			expect(panels).toHaveLength(2);
-			expect(panels.find(panel => panel.text.includes(": accepted."))?.repairs).toBe(0);
-			expect(panels.find(panel => panel.text.includes(": refused."))?.repairs).toBe(1);
+			expect(panels).toHaveLength(1);
+			expect(panels[0]?.repairs).toBe(1);
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복구 항목 버리기"))?.disabled)).toBe(true);
 			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("저장 복구 다시 시도"))?.click());
 			await page.waitForFunction(() => !document.body.textContent?.includes("저장 복구 다시 시도"));
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("unsent second");
 			expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), first.id)).toBe(false);
-			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes(": accepted.")))).toBe(true);
+			expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 복구")))).toBe(false);
+			await waitStoredDisposition(page, first.id, "accepted");
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
@@ -344,24 +533,70 @@ describe("mounted composer delivery recovery", () => {
 			try {
 				await select(page); const request = await send(page, "do not replay");
 				await page.evaluate(({ id, disposition }) => window.fixture.response(id, false, "same error", disposition), { id: request.id, disposition });
-				await page.waitForFunction(status => document.body.textContent?.includes(`: ${status}.`), {}, disposition ?? "unknown");
+				await page.waitForFunction(copy => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes(copy)), {}, disposition === "failed" ? "전송 처리에 실패했습니다" : "전송 결과를 확인할 수 없습니다");
 				expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("");
+				const panel = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].find(el => el.textContent?.includes("전송 복구"))?.textContent ?? "");
+				expect(panel).toContain("이미 실행되었을 수 있습니다");
+				expect(panel).toContain("초안 복원");
+				expect(panel).toContain(disposition === "failed" ? "복구 항목 버리기" : "자동으로 다시 보내지 않습니다");
 			} finally { await closeFixture(context, page); }
 		}
 	}, 30000);
 
 	test("active deliveries cannot be discarded before their final outcome", async () => {
-		const { context, page } = await fixture();
+		const { context, page } = await fixture(true);
 		try {
 			await select(page); const request = await send(page, "retain active");
 			for (const disposition of ["pending", "accepted", "queued"] as const) {
 				await receipt(page, request, disposition);
-				await page.waitForFunction(status => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes(`: ${status}.`)), {}, disposition);
-				const disabled = await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복구 항목 버리기"))?.disabled);
-				expect(disabled).toBe(true);
+				await waitStoredDisposition(page, request.id, disposition);
+				expect(await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 복구")))).toBe(false);
+				expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), request.id)).toBe(false);
 			}
-			await receipt(page, request, "removed");
-			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "retain active");
+			await receipt(page, request, "completed");
+			await page.waitForFunction((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), {}, request.id);
+			expect(await page.evaluate(() => sessionStorage.getItem("sawRecoveryNotice"))).toBeNull();
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("fatal after a successful queued response exposes durable uncertainty without replay", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] } }));
+			await page.waitForSelector(".composer-delivery select");
+			await page.select(".composer-delivery select", "followUp");
+			const request = await send(page, "queued disconnect payload");
+			expect(request.params.deliverAs).toBe("followUp");
+			await receipt(page, request, "queued");
+			await waitStoredDisposition(page, request.id, "queued");
+			await page.evaluate((id: string) => window.fixture.response(id, true), request.id);
+			await page.type(".composer textarea", "newer draft");
+			await page.waitForFunction(() => !(document.querySelector('.composer button[type="submit"]') as HTMLButtonElement).disabled);
+			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
+			await waitStoredDisposition(page, request.id, "unknown");
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
+			expect(await page.evaluate((id: string) => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === id), request.id)).toBe(false);
+			await page.evaluate(() => window.fixture.failNextAck("error"));
+			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "queued disconnect payload\n\nnewer draft");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("failed acknowledgement does not block a new draft or become an unsent repair", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); const first = await send(page, "ack failure payload");
+			await page.evaluate(() => window.fixture.failNextAck("error"));
+			await receipt(page, first, "removed");
+			await page.waitForFunction(() => document.body.textContent?.includes("전송 확인 오류"));
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "ack failure payload");
+			expect(await page.evaluate(() => document.body.textContent?.includes("저장 복구 다시 시도"))).toBe(false);
+			await page.evaluate((id: string) => window.fixture.response(id, true), first.id);
+			await page.waitForFunction(() => !(document.querySelector('.composer button[type="submit"]') as HTMLButtonElement).disabled);
+			await page.click('.composer button[type="submit"]');
+			await page.waitForFunction((id: string) => window.fixture.lastPrompt()?.id !== id, {}, first.id);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
@@ -383,14 +618,14 @@ describe("mounted composer delivery recovery", () => {
 				expect(next?.params.attachments).toHaveLength(1);
 				if (!next) throw new Error("Second prompt was not recorded");
 				await receipt(page, next, "failed");
-				await page.waitForFunction(() => document.body.textContent?.includes("failed"));
+				await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
 			}
 			await receipt(page, request, "accepted");
 			await page.reload(); await select(page);
 			await page.waitForFunction(() => window.fixture.requests().filter(r => r.method === "delivery.ack").length >= 2);
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe(mode === "lost" ? "" : "restore once");
 			if (mode === "lost") {
-				await page.waitForFunction(() => document.body.textContent?.includes("failed"));
+				await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
 				await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
 				await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "restore once newer");
 				expect(await page.$$(".attachment-ready")).toHaveLength(1);
@@ -423,11 +658,11 @@ describe("mounted composer delivery recovery", () => {
 		try {
 			await select(page); const request = await send(page, "uncertain"); await receipt(page, request, "accepted");
 			await receipt(page, request, "failed");
-			await page.waitForFunction(() => document.body.textContent?.includes("failed"));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("");
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => document.body.textContent?.includes("failed"));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 처리에 실패했습니다")));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -452,7 +687,7 @@ describe("mounted composer delivery recovery", () => {
 			await select(page); await send(page, "unknown disposable");
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => document.body.textContent?.includes("unknown"));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
 			expect(await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("복원한 기록 지우기"))?.disabled)).toBe(true);
 			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("초안 복원"))?.click());
 			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "unknown disposable");
@@ -469,7 +704,7 @@ describe("mounted composer delivery recovery", () => {
 			await select(page); await send(page, "unknown payload");
 			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
 			await page.reload(); await select(page);
-			await page.waitForFunction(() => document.body.textContent?.includes("unknown"));
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("전송 결과를 확인할 수 없습니다")));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(r => r.method === "prompt")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);

@@ -6,6 +6,38 @@ import {
 } from "../../desktop-host/src/attachment-protocol";
 import { DesktopLocalRequestError, validateDesktopRequest } from "../src/bridge";
 import type * as Recovery from "../src/delivery-recovery";
+import { type DeliveryRecovery, recoveryNotice } from "../src/delivery-recovery";
+
+test("recovery notices distinguish actionable outcomes from routine bookkeeping", () => {
+	const entry: DeliveryRecovery = {
+		id: "id",
+		sessionId: "session",
+		text: "payload",
+		attachments: [],
+		disposition: "pending",
+	};
+	for (const disposition of [
+		"pending",
+		"accepted",
+		"queued",
+		"completed",
+		"cancelled",
+		"refused",
+		"removed",
+	] as const) {
+		expect(recoveryNotice({ ...entry, disposition }, false)).toBeNull();
+	}
+	const unknown = recoveryNotice({ ...entry, disposition: "unknown" }, false);
+	expect(unknown).toContain("이미 실행되었을 수 있습니다");
+	expect(unknown).toContain("자동으로 다시 보내지 않습니다");
+	const failed = recoveryNotice({ ...entry, disposition: "failed" }, false);
+	expect(failed).toContain("실패했습니다");
+	expect(failed).toContain("이미 실행되었을 수 있습니다");
+	expect(recoveryNotice({ ...entry, disposition: "failed", finalizing: true }, false)).toBeNull();
+	for (const changes of [{ prepared: true }, { restored: true }, { finalizing: true }]) {
+		expect(recoveryNotice({ ...entry, ...changes }, true)).toContain("저장 복구를 다시 시도");
+	}
+});
 
 test("prompt envelope validation includes exact UTF-8 bytes at the frame boundary", () => {
 	const id = "request-id";

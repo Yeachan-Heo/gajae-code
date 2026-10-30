@@ -1,4 +1,6 @@
 ### Fixed
+- Keep normal accepted/queued delivery bookkeeping out of recovery warnings, including bootstrap reconciliation; distinguish unknown outcomes, failed turns and actual local storage repair without blocking sends on acknowledgment failure.
+- Omit empty tool-call-only assistant rows instead of inventing repeated waiting messages. Render actual ordered text, display thinking and safe bounded image previews, with explicit unavailable-image feedback and retained tool/error/truncation states.
 - Persist submitted text and ready attachments atomically before clearing the composer, and restore the exact payload on definitive refusal without overwriting a newer draft. Durable handoff is not proof of model execution.
 - Retain uncertain deliveries across reloads for explicit recovery without automatic replay; keep acknowledgment failures from blocking later draft edits and sends.
 - Scope known-unsent repair and disposal to the exact delivery, so one failed local write cannot re-arm an already accepted message or permanently block the session.

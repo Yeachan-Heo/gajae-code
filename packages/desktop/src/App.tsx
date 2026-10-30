@@ -70,6 +70,7 @@ import {
 	deleteDelivery,
 	loadDeliveries,
 	loadDrafts,
+	recoveryNotice,
 	saveDelivery,
 	saveDrafts,
 } from "./delivery-recovery";
@@ -173,6 +174,7 @@ export default function App() {
 	const [errors, setErrors] = useState<Record<string, string>>({});
 	const [errorOwners, setErrorOwners] = useState<Record<string, { requestId: string; sessionId: string }>>({});
 	const [recoveries, setRecoveries] = useState<DeliveryRecovery[]>([]);
+	const [recoveryBootstrapSettled, setRecoveryBootstrapSettled] = useState(false);
 	const recoveriesRef = useRef<DeliveryRecovery[]>([]);
 	const recoveryWork = useRef<Promise<void>>(Promise.resolve());
 	const ackFlights = useRef(new Set<string>());
@@ -180,6 +182,8 @@ export default function App() {
 	const unsentBlockedRef = useRef(new Set<string>());
 	const unsentRestoredInMemory = useRef(new Set<string>());
 	const unsentRepairs = useRef(new Map<string, string>());
+	const restorationFailures = useRef(new Map<string, { sessionId: string; disposition: "refused" | "removed" }>());
+	const [, setRestorationRevision] = useState(0);
 	const finishUnsentRepair = (id: string, sessionId: string) => {
 		unsentRepairs.current.delete(id);
 		unsentRestoredInMemory.current.delete(id);
@@ -387,9 +391,21 @@ export default function App() {
 			const next = isFinalDelivery(entry.disposition)
 				? entry
 				: { ...entry, disposition: receipt.disposition, error: receipt.error };
-			await saveDelivery(next);
-			updateRecoveries(recoveriesRef.current.map(item => (item.id === next.id ? next : item)));
-			if (next.disposition === "refused" || next.disposition === "removed") await restoreRecovery(next);
+			try {
+				await saveDelivery(next);
+				updateRecoveries(recoveriesRef.current.map(item => (item.id === next.id ? next : item)));
+				if (next.disposition === "refused" || next.disposition === "removed") await restoreRecovery(next);
+			} catch (error) {
+				if (next.disposition === "unknown" && !isFinalDelivery(entry.disposition)) {
+					updateRecoveries(recoveriesRef.current.map(item => (item.id === entry.id ? next : item)));
+				}
+				if (next.disposition === "refused" || next.disposition === "removed") {
+					restorationFailures.current.set(entry.id, { sessionId: entry.sessionId, disposition: next.disposition });
+					setRestorationRevision(revision => revision + 1);
+				}
+				throw error;
+			}
+			if (restorationFailures.current.delete(entry.id)) setRestorationRevision(revision => revision + 1);
 			if (
 				next.disposition === "completed" ||
 				next.disposition === "cancelled" ||
@@ -531,6 +547,44 @@ export default function App() {
 		let failed = false;
 		let bootstrapped = false;
 		const buffered: DesktopFrame[] = [];
+		const reconcileIndividually = async (receipt: DesktopDeliveryReceipt) => {
+			try {
+				await reconcileReceipt(receipt);
+			} catch (error) {
+				setErrors(previous => ({
+					...previous,
+					global: `복구 저장소 오류: ${error instanceof Error ? error.message : String(error)}`,
+				}));
+			}
+		};
+		const settleFailedBootstrap = () => {
+			const receipts: DesktopDeliveryReceipt[] = [];
+			for (const event of buffered) {
+				if (event.type === "snapshot") receipts.push(...event.snapshot.deliveries);
+				if (event.type === "delivery") receipts.push(event.receipt);
+			}
+			enqueueRecovery(async () => {
+				try {
+					for (const entry of recoveriesRef.current) {
+						const matched = receipts.filter(
+							receipt => receipt.id === entry.id && receipt.sessionId === entry.sessionId,
+						);
+						if (matched.length) {
+							for (const receipt of matched) await reconcileIndividually(receipt);
+						} else if (
+							!entry.prepared &&
+							!entry.finalizing &&
+							!unsentRepairs.current.has(entry.id) &&
+							["pending", "accepted", "queued"].includes(entry.disposition)
+						) {
+							await reconcileIndividually({ id: entry.id, sessionId: entry.sessionId, disposition: "unknown" });
+						}
+					}
+				} finally {
+					if (alive) setRecoveryBootstrapSettled(true);
+				}
+			});
+		};
 		const frame = (event: DesktopFrame) => {
 			if (!alive || failed) return;
 			if (!bootstrapped && event.type !== "fatal") {
@@ -538,6 +592,24 @@ export default function App() {
 				return;
 			}
 			if (event.type === "fatal") {
+				if (!bootstrapped) settleFailedBootstrap();
+				else
+					enqueueRecovery(async () => {
+						for (const entry of recoveriesRef.current) {
+							if (
+								!entry.prepared &&
+								!entry.finalizing &&
+								!unsentRepairs.current.has(entry.id) &&
+								["pending", "accepted", "queued"].includes(entry.disposition)
+							) {
+								await reconcileIndividually({
+									id: entry.id,
+									sessionId: entry.sessionId,
+									disposition: "unknown",
+								});
+							}
+						}
+					});
 				failed = true;
 				setFatal(true);
 				setConnection(event.error);
@@ -550,7 +622,7 @@ export default function App() {
 			if (event.type === "snapshot") {
 				setSnapshot(event.snapshot);
 				enqueueRecovery(async () => {
-					for (const receipt of event.snapshot.deliveries) await reconcileReceipt(receipt);
+					for (const receipt of event.snapshot.deliveries) await reconcileIndividually(receipt);
 				});
 			}
 			if (event.type === "delivery") enqueueRecovery(() => reconcileReceipt(event.receipt));
@@ -594,14 +666,29 @@ export default function App() {
 				const initial = await request<DesktopSnapshot>("bootstrap");
 				if (alive && !failed) {
 					setSnapshot(initial);
+					const bootstrapDeliveries = [...initial.deliveries];
+					for (const event of buffered) {
+						if (event.type === "snapshot") bootstrapDeliveries.push(...event.snapshot.deliveries);
+						if (event.type === "delivery") bootstrapDeliveries.push(event.receipt);
+					}
 					enqueueRecovery(async () => {
-						for (const entry of recoveriesRef.current) {
-							const receipt = initial.deliveries.find(
-								item => item.id === entry.id && item.sessionId === entry.sessionId,
-							);
-							await reconcileReceipt(
-								receipt ?? { id: entry.id, sessionId: entry.sessionId, disposition: "unknown" },
-							);
+						try {
+							for (const entry of recoveriesRef.current) {
+								const receipts = bootstrapDeliveries.filter(
+									item => item.id === entry.id && item.sessionId === entry.sessionId,
+								);
+								if (receipts.length) {
+									for (const receipt of receipts) await reconcileIndividually(receipt);
+								} else {
+									await reconcileIndividually({
+										id: entry.id,
+										sessionId: entry.sessionId,
+										disposition: "unknown",
+									});
+								}
+							}
+						} finally {
+							if (alive) setRecoveryBootstrapSettled(true);
 						}
 					});
 					bootstrapped = true;
@@ -610,6 +697,7 @@ export default function App() {
 				}
 			} catch (error) {
 				if (alive) {
+					if (!failed && !bootstrapped) settleFailedBootstrap();
 					failed = true;
 					setFatal(true);
 					setConnection(error instanceof Error ? error.message : "호스트 연결 실패");
@@ -1522,60 +1610,83 @@ export default function App() {
 			)}
 		</>
 	);
-	const recoveryPanel = (item: DeliveryRecovery) => (
-		<div className="notice" key={item.id} role="status">
-			<p>
-				전송 복구 ({item.sessionId}): {item.disposition}. 알 수 없는 전송은 이미 실행되었을 수 있습니다. 복원해도
-				자동 전송하지 않습니다.
-			</p>
-			{item.error && <p>{item.error}</p>}
-			{unsentRepairs.current.get(item.id) === item.sessionId && (
+	const recoveryPanel = (item: DeliveryRecovery) => {
+		if (!recoveryBootstrapSettled) return null;
+		const restorationFailure = restorationFailures.current.get(item.id);
+		const copy =
+			restorationFailure?.sessionId === item.sessionId
+				? "전송 복구: 초안을 복원하거나 저장하지 못했습니다. 저장 복구를 다시 시도하세요."
+				: recoveryNotice(item, unsentRepairs.current.get(item.id) === item.sessionId);
+		return copy ? (
+			<div className="notice" key={item.id} role="status">
+				<p>{copy}</p>
+				{item.error && <p>{item.error}</p>}
+				{(unsentRepairs.current.get(item.id) === item.sessionId ||
+					restorationFailure?.sessionId === item.sessionId) && (
+					<Button
+						onClick={() =>
+							enqueueRecovery(async () => {
+								const current = recoveriesRef.current.find(entry => entry.id === item.id);
+								const failure = restorationFailures.current.get(item.id);
+								if (
+									current &&
+									(unsentRepairs.current.get(current.id) === current.sessionId ||
+										failure?.sessionId === current.sessionId)
+								)
+									await reconcileReceipt({
+										id: current.id,
+										sessionId: current.sessionId,
+										disposition: failure?.sessionId === current.sessionId ? failure.disposition : "refused",
+									});
+							})
+						}
+					>
+						저장 복구 다시 시도
+					</Button>
+				)}
 				<Button
+					disabled={
+						item.restored || unsentBlocked[item.sessionId] || restorationFailure?.sessionId === item.sessionId
+					}
 					onClick={() =>
 						enqueueRecovery(async () => {
 							const current = recoveriesRef.current.find(entry => entry.id === item.id);
-							if (current && unsentRepairs.current.get(current.id) === current.sessionId)
-								await reconcileReceipt({
-									id: current.id,
-									sessionId: current.sessionId,
-									disposition: "refused",
-								});
+							if (current) await restoreRecovery(current);
 						})
 					}
 				>
-					저장 복구 다시 시도
+					초안 복원
 				</Button>
-			)}
-			<Button
-				disabled={item.restored || unsentBlocked[item.sessionId]}
-				onClick={() =>
-					enqueueRecovery(async () => {
-						const current = recoveriesRef.current.find(entry => entry.id === item.id);
-						if (current) await restoreRecovery(current);
-					})
-				}
-			>
-				초안 복원
-			</Button>
-			<Button
-				disabled={
-					(!isFinalDelivery(item.disposition) && !(item.disposition === "unknown" && item.restored)) ||
-					item.finalizing ||
-					unsentRepairs.current.has(item.id)
-				}
-				onClick={() =>
-					enqueueRecovery(async () => {
-						const current = recoveriesRef.current.find(entry => entry.id === item.id);
-						if (!current || current.finalizing || unsentRepairs.current.has(current.id)) return;
-						if (isFinalDelivery(current.disposition) || (current.disposition === "unknown" && current.restored))
-							await finalizeRecovery(current);
-					})
-				}
-			>
-				{item.disposition === "unknown" ? "복원한 기록 지우기" : "복구 항목 버리기"}
-			</Button>
-		</div>
-	);
+				<Button
+					disabled={
+						(!isFinalDelivery(item.disposition) && !(item.disposition === "unknown" && item.restored)) ||
+						item.finalizing ||
+						unsentRepairs.current.has(item.id) ||
+						restorationFailure?.sessionId === item.sessionId
+					}
+					onClick={() =>
+						enqueueRecovery(async () => {
+							const current = recoveriesRef.current.find(entry => entry.id === item.id);
+							if (
+								!current ||
+								current.finalizing ||
+								unsentRepairs.current.has(current.id) ||
+								restorationFailures.current.get(current.id)?.sessionId === current.sessionId
+							)
+								return;
+							if (
+								isFinalDelivery(current.disposition) ||
+								(current.disposition === "unknown" && current.restored)
+							)
+								await finalizeRecovery(current);
+						})
+					}
+				>
+					{item.disposition === "unknown" ? "복원한 기록 지우기" : "복구 항목 버리기"}
+				</Button>
+			</div>
+		) : null;
+	};
 	return (
 		<div className="app-shell">
 			<aside className="sidebar desktop-sidebar">{sidebarContent}</aside>

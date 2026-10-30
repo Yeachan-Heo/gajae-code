@@ -13,6 +13,16 @@ export interface DeliveryRecovery {
 	prepared?: boolean;
 }
 
+export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean): string | null {
+	if (unsentRepair) return "전송 복구: 보내지 못한 입력의 저장 복구가 필요합니다. 저장 복구를 다시 시도하세요.";
+	if (entry.finalizing) return null;
+	if (entry.disposition === "unknown")
+		return "전송 복구: 전송 결과를 확인할 수 없습니다. 이미 실행되었을 수 있습니다. 초안을 복원해도 자동으로 다시 보내지 않습니다.";
+	if (entry.disposition === "failed")
+		return "전송 복구: 전송 처리에 실패했습니다. 일부 작업이 이미 실행되었을 수 있습니다. 내용을 확인한 뒤 초안을 복원하거나 기록을 버릴 수 있습니다.";
+	return null;
+}
+
 export interface DurableDraft {
 	sessionId: string;
 	text: string;
