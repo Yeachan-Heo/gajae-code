@@ -568,7 +568,7 @@ describe("desktop activity and preferences over the real transport", () => {
 		expect(promptSettled).toBe(false);
 		control.finish();
 		await prompt;
-		expect((await f.call<DesktopSnapshot>("bootstrap")).sessions[0]?.status).toBe("idle");
+		expect((await f.call<DesktopSnapshot>("bootstrap")).sessions[0]?.status).toBe("done");
 	});
 
 	test("captured owners reject foreign session/connection/guessed references and ACK scopes", async () => {

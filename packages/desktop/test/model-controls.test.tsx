@@ -49,10 +49,12 @@ describe("desktop model and reasoning controls", () => {
 
 	test("renders only SDK-declared discrete reasoning choices and actual selected value", () => {
 		const html = renderToStaticMarkup(<ReasoningSelect thinking={thinking} onChange={() => {}} />);
-		expect(html).toContain('value="high" selected=""');
-		expect(html).toContain('value="inherit"');
-		expect(html).toContain('value="low"');
-		expect(html).not.toContain('value="medium"');
+		// The control is a button-triggered listbox, never a native system select.
+		expect(html).not.toContain("<select");
+		expect(html).toContain('aria-haspopup="listbox"');
+		expect(html).toContain('aria-expanded="false"');
+		expect(html).toContain("추론 수준: 높음");
+		expect(html).not.toContain("추론 수준: 상속");
 		expect(html).not.toContain('disabled=""');
 	});
 

@@ -4,6 +4,7 @@ import {
 	ChevronRight,
 	Circle,
 	CircleAlert,
+	CircleCheck,
 	CircleHelp,
 	ListPlus,
 	LoaderCircle,
@@ -38,8 +39,14 @@ export function ErrorBanner({ children }: { children: ReactNode }) {
 		</div>
 	);
 }
-const statuses = { idle: "대기", running: "작업 중", waiting: "응답 필요", error: "오류" };
-const statusIcons = { idle: Circle, running: LoaderCircle, waiting: CircleHelp, error: CircleAlert };
+const statuses = { idle: "대기", done: "완료", running: "작업 중", waiting: "응답 필요", error: "오류" };
+const statusIcons = {
+	idle: Circle,
+	done: CircleCheck,
+	running: LoaderCircle,
+	waiting: CircleHelp,
+	error: CircleAlert,
+};
 export function SessionRow({
 	session,
 	selected,
@@ -133,7 +140,8 @@ function MessageBlocks({
 }
 
 export function Message({ message }: { message: DesktopMessage }) {
-	const labels = { user: "나", assistant: "GJC", tool: "도구", system: "시스템" };
+	/** Matches the TUI response header, which prints the literal `gajae` label. */
+	const labels = { user: "나", assistant: "gajae", tool: "도구", system: "시스템" };
 	const blocks = message.blocks;
 	const hasContent = blocks
 		? blocks.some(block => block.type === "image" || block.type === "image-unavailable" || !!block.text.trim())

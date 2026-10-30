@@ -22,7 +22,11 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createDesktopPreferencesController, DesktopPreferenceError } from "../src/preferences-controls";
-import type { DesktopPreferenceAction, DesktopSamplingParameter } from "../src/preferences-protocol";
+import type {
+	DesktopModelRoleId,
+	DesktopPreferenceAction,
+	DesktopSamplingParameter,
+} from "../src/preferences-protocol";
 
 const provider = "desktop-preferences-fixture";
 const key = "private-fixture-key-never-send";
@@ -173,6 +177,20 @@ describe("desktop public preferences projection", () => {
 			capabilities: { selectSession: { available: true }, persistDefault: { available: false } },
 		});
 		expect(dto.profiles.find(item => item.id === "desk-b")).toMatchObject({ active: true, default: false });
+		const order: DesktopModelRoleId[] = ["default", "executor", "architect", "planner", "critic", "image"];
+		const deskA = dto.profiles.find(item => item.id === "desk-a")!;
+		expect(deskA.roles.map(role => role.id)).toEqual(order);
+		expect(deskA.roles).toEqual([
+			{ id: "default", model: selector("base") },
+			{ id: "executor", model: selector("worker") },
+			{ id: "architect", model: null },
+			{ id: "planner", model: null },
+			{ id: "critic", model: null },
+			{ id: "image", model: null },
+		]);
+		expect(dto.profiles.find(item => item.id === "role-only")?.roles.filter(role => role.model !== null)).toEqual([
+			{ id: "executor", model: selector("worker") },
+		]);
 		const serialized = JSON.stringify(dto);
 		for (const withheld of [
 			key,

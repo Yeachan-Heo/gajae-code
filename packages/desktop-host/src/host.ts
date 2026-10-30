@@ -659,7 +659,9 @@ export class DesktopHost {
 						? "running"
 						: live?.error
 							? "error"
-							: "idle",
+							: fitted.messages.length > 0
+								? "done"
+								: "idle",
 			...(live?.sdk.model ? { model: `${live.sdk.model.provider}/${live.sdk.model.id}` } : {}),
 			thinking: projectDesktopThinking(live?.sdk),
 			operatorRunning: live?.operator?.isBusy() ?? false,

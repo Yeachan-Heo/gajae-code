@@ -223,7 +223,6 @@ export function PreferencesPanel({
 			<div className="preferences-toolbar">
 				<div>
 					<h2 id={`${id}-title`}>모델 환경설정</h2>
-					<p className="muted">현재 대화의 프로필, 역할 모델과 샘플링 설정을 확인하세요.</p>
 				</div>
 				<Button disabled={pending} onClick={onRefresh}>
 					<RefreshCw aria-hidden="true" />
@@ -238,28 +237,16 @@ export function PreferencesPanel({
 						: "환경설정을 불러오는 중…"}
 				</p>
 			)}
-			{!preferences && !pending && !error && (
-				<p className="empty model-empty">환경설정 정보가 아직 없습니다. 새로고침으로 불러오세요.</p>
-			)}
+			{!preferences && !pending && !error && <p className="empty model-empty">환경설정 정보가 없습니다.</p>}
 			{preferences && (
 				<>
-					{error && (
-						<p className="preference-reason">
-							아래는 마지막으로 받은 값입니다. 오류 메시지는 설정 적용 완료를 뜻하지 않습니다.
-						</p>
-					)}
 					<section className="preferences-group" aria-labelledby={`${id}-profiles`}>
 						<h3 id={`${id}-profiles`}>모델 프로필</h3>
 						{busy && (
 							<p id={`${id}-busy`} className="preference-reason">
-								변경은 현재 작업이 끝난 뒤 다시 요청하세요. 실행 중이거나 응답을 기다리는 동안에는 프로필을
-								변경할 수 없습니다. 요청이 자동으로 예약되지는 않습니다.
+								실행 중에는 프로필을 변경할 수 없습니다.
 							</p>
 						)}
-						<p className="preference-reason">
-							대화에 적용해도 저장된 기본 프로필은 바뀌지 않습니다. 단, SDK의 최근 사용 모델(MRU) 기록은 공유
-							저장소에 쓰일 수 있습니다.
-						</p>
 						{preferences.profiles.length === 0 ? (
 							<p className="empty model-empty">사용 가능한 모델 프로필이 없습니다.</p>
 						) : (
@@ -279,9 +266,6 @@ export function PreferencesPanel({
 					</section>
 					<section className="preferences-group" aria-labelledby={`${id}-roles`}>
 						<h3 id={`${id}-roles`}>역할별 모델</h3>
-						<p className="preference-reason">
-							현재 해석된 값만 표시합니다. 역할 맵의 출처는 개별 역할 설정의 소유권을 뜻하지 않습니다.
-						</p>
 						{preferences.roles.length === 0 ? (
 							<p className="empty model-empty">역할별 모델 정보가 없습니다.</p>
 						) : (
@@ -294,10 +278,7 @@ export function PreferencesPanel({
 					</section>
 					<section className="preferences-group" aria-labelledby={`${id}-sampling`}>
 						<h3 id={`${id}-sampling`}>샘플링</h3>
-						<p className="preference-reason">
-							다음 실행의 에이전트 옵션 값입니다. 실제 제공자 요청에 포함되거나 제공자가 수락한다는 뜻은
-							아닙니다. 모델별 지원 여부는 알 수 없습니다.
-						</p>
+						<p className="preference-reason">다음 실행에 적용됩니다. 모델별 지원 여부는 알 수 없습니다.</p>
 						{preferences.sampling.length === 0 ? (
 							<p className="empty model-empty">샘플링 설정 정보가 없습니다.</p>
 						) : (

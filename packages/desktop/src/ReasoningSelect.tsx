@@ -1,6 +1,8 @@
-import { Brain } from "lucide-react";
-import { useId } from "react";
+import { Brain, ChevronDown } from "lucide-react";
+import type { FocusEvent, KeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DesktopThinking, DesktopThinkingLevel } from "../../desktop-host/src/protocol";
+import { Button } from "./components";
 
 export function ReasoningSelect({
 	thinking,
@@ -13,36 +15,185 @@ export function ReasoningSelect({
 	pending?: boolean;
 	onChange: (level: DesktopThinkingLevel) => void;
 }) {
-	const id = useId();
 	const options = thinking?.options ?? [];
 	const value = thinking?.level ?? "";
-	const currentListed = options.some(option => option.value === value);
+	const current = options.find(option => option.value === value);
 	const unavailable = !thinking?.available || options.length === 0;
+	const inactive = !!disabled || !!pending || unavailable;
+	const fallbackLabel = pending
+		? "추론 설정 적용 중…"
+		: unavailable
+			? thinking?.mode === "always-on"
+				? "추론 항상 켜짐"
+				: "추론 설정 없음"
+			: value || "모델 기본값";
+	const [open, setOpen] = useState(false);
+	const [anchor, setAnchor] = useState<{ left: number; width: number; bottom: number }>();
+	const control = useRef<HTMLDivElement>(null);
+	const menu = useRef<HTMLUListElement>(null);
+
+	// The composer pane scrolls and clips absolute children, so the menu is anchored
+	// to the trigger in viewport coordinates and re-measured on every open.
+	const openMenu = () => {
+		const rect = control.current?.getBoundingClientRect();
+		if (rect) setAnchor({ left: rect.left, width: rect.width, bottom: window.innerHeight - rect.top + 4 });
+		setOpen(true);
+	};
+	useEffect(() => {
+		if (inactive) setOpen(false);
+	}, [inactive]);
+	useEffect(() => {
+		if (!open) return;
+		const listener = (event: PointerEvent) => {
+			if (event.target instanceof Node && control.current?.contains(event.target)) return;
+			setOpen(false);
+		};
+		// Follow the trigger instead of closing: opening the menu can itself scroll
+		// the composer, and a stale fixed position is worse than a moved anchor.
+		const reposition = () => {
+			const next = control.current?.getBoundingClientRect();
+			if (!next || next.bottom < 0 || next.top > window.innerHeight) {
+				setOpen(false);
+				return;
+			}
+			setAnchor({ left: next.left, width: next.width, bottom: window.innerHeight - next.top + 4 });
+		};
+		document.addEventListener("pointerdown", listener);
+		window.addEventListener("resize", reposition);
+		window.addEventListener("scroll", reposition, true);
+		return () => {
+			document.removeEventListener("pointerdown", listener);
+			window.removeEventListener("resize", reposition);
+			window.removeEventListener("scroll", reposition, true);
+		};
+	}, [open]);
+	useEffect(() => {
+		if (!open) return;
+		const listbox = menu.current;
+		const selected = listbox?.querySelector<HTMLButtonElement>('[role="option"][aria-selected="true"]');
+		(selected ?? listbox?.querySelector<HTMLButtonElement>('[role="option"]:not(:disabled)'))?.focus();
+	}, [open]);
+
+	function focusTrigger() {
+		control.current?.querySelector<HTMLButtonElement>(".select-trigger")?.focus();
+	}
+	// React reports focusout here, so focus moving between the trigger and an option stays
+	// inside the control and must not close the menu; only a real departure does.
+	function handleBlur(event: FocusEvent<HTMLDivElement>) {
+		const next = event.relatedTarget;
+		if (next instanceof Node && control.current?.contains(next)) return;
+		setOpen(false);
+	}
+	function handleMenuKeyDown(event: KeyboardEvent<HTMLUListElement>) {
+		const buttons = [...(menu.current?.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)') ?? [])];
+		const active = document.activeElement;
+		const index = active instanceof HTMLButtonElement ? buttons.indexOf(active) : -1;
+		if (event.key === "Escape") {
+			event.preventDefault();
+			setOpen(false);
+			focusTrigger();
+			return;
+		}
+		if (event.key === "Enter" || event.key === " ") {
+			if (index < 0) return;
+			event.preventDefault();
+			buttons[index].click();
+			return;
+		}
+		if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || buttons.length === 0) return;
+		event.preventDefault();
+		const next =
+			event.key === "Home"
+				? 0
+				: event.key === "End"
+					? buttons.length - 1
+					: Math.max(
+							0,
+							Math.min(
+								buttons.length - 1,
+								(index < 0 && event.key === "ArrowDown" ? -1 : Math.max(index, 0)) +
+									(event.key === "ArrowDown" ? 1 : -1),
+							),
+						);
+		buttons[next]?.focus();
+	}
+
 	return (
-		<label className="reasoning-control" htmlFor={id} title={thinking?.reason ?? "다음 요청에 사용할 추론 수준"}>
-			<Brain size={15} aria-hidden="true" />
-			<span className="sr-only">추론 수준</span>
-			<select
-				id={id}
-				value={value}
-				disabled={disabled || pending || unavailable}
-				aria-label="추론 수준"
-				onChange={event => {
-					const option = options.find(item => item.value === event.target.value);
-					if (option) onChange(option.value);
-				}}
-			>
-				{!currentListed && (
-					<option value={value} disabled>
-						{pending ? "추론 설정 적용 중…" : unavailable ? (thinking?.mode === "always-on" ? "추론 항상 켜짐" : "추론 설정 없음") : value || "모델 기본값"}
-					</option>
+		<div className="reasoning-control" ref={control} onBlur={handleBlur}>
+			<div className="select-control">
+				<Button
+					className="select-trigger"
+					aria-haspopup="listbox"
+					aria-expanded={open}
+					aria-label={`추론 수준: ${current?.label ?? fallbackLabel}`}
+					title={thinking?.reason ?? "다음 요청에 사용할 추론 수준"}
+					disabled={inactive}
+					onClick={() => (open ? setOpen(false) : openMenu())}
+					onKeyDown={event => {
+						if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+						event.preventDefault();
+						if (!open) openMenu();
+					}}
+				>
+					<Brain size={15} aria-hidden="true" />
+					<span>{current?.label ?? fallbackLabel}</span>
+					<ChevronDown size={13} aria-hidden="true" />
+				</Button>
+				{open && (
+					<ul
+						ref={menu}
+						className="select-menu"
+						role="listbox"
+						aria-label="추론 수준"
+						style={
+							anchor
+								? {
+										position: "fixed",
+										left: anchor.left,
+										width: anchor.width,
+										bottom: anchor.bottom,
+										top: "auto",
+										right: "auto",
+									}
+								: undefined
+						}
+						onKeyDown={handleMenuKeyDown}
+					>
+						{!current && (
+							<li role="presentation">
+								<button
+									type="button"
+									className="button select-option"
+									role="option"
+									aria-selected={false}
+									disabled
+								>
+									{fallbackLabel}
+								</button>
+							</li>
+						)}
+						{options.map(option => (
+							<li role="presentation" key={option.value}>
+								<button
+									type="button"
+									className="button select-option"
+									role="option"
+									aria-selected={option.value === value}
+									title={option.description}
+									onClick={() => {
+										setOpen(false);
+										onChange(option.value);
+										focusTrigger();
+									}}
+								>
+									{option.label}
+									{option.description && <small>{option.description}</small>}
+								</button>
+							</li>
+						))}
+					</ul>
 				)}
-				{options.map(option => (
-					<option key={option.value} value={option.value} title={option.description}>
-						{option.label}
-					</option>
-				))}
-			</select>
-		</label>
+			</div>
+		</div>
 	);
 }

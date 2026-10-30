@@ -7,6 +7,7 @@ import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 } from "@gajae-code/coding-agent/config/model-registry";
+import { normalizeModelSelectorValue } from "@gajae-code/coding-agent/config/model-selector-value";
 import { validateSettingPatch } from "@gajae-code/coding-agent/config/settings-schema";
 import { getSettingsCatalog, type SettingCatalogItem } from "@gajae-code/coding-agent/sdk/settings-catalog";
 import type { AgentSession, SessionAgentModelRole } from "@gajae-code/coding-agent/session/agent-session";
@@ -191,20 +192,28 @@ export function createDesktopPreferencesController(session: AgentSession): Deskt
 		const configuredDefault = settings.getGlobal("modelProfile.default");
 		const defaultName =
 			configuredDefault === undefined ? undefined : resolveModelProfileName(configuredDefault, profiles);
-		return catalog.map(item => ({
-			id: item.id,
-			name: item.displayName,
-			description: null,
-			source: item.source,
-			active: item.id === active,
-			default: item.id === defaultName,
-			capabilities: {
-				selectSession: { available: true, reason: null },
-				persistDefault: canPersistDefault()
-					? { available: true, reason: null }
-					: unavailable(DEFAULT_PROFILE_UNAVAILABLE),
-			},
-		}));
+		return catalog.map(item => {
+			const mapping = profiles.get(item.id)?.modelMapping;
+			return {
+				id: item.id,
+				name: item.displayName,
+				description: null,
+				source: item.source,
+				active: item.id === active,
+				default: item.id === defaultName,
+				capabilities: {
+					selectSession: { available: true, reason: null },
+					persistDefault: canPersistDefault()
+						? { available: true, reason: null }
+						: unavailable(DEFAULT_PROFILE_UNAVAILABLE),
+				},
+				// Definition data only: the selector says what the profile would bind, not that it can.
+				roles: GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(role => ({
+					id: role,
+					model: normalizeModelSelectorValue(mapping?.[role])[0] ?? null,
+				})),
+			};
+		});
 	};
 
 	const read = (): DesktopPreferences => {

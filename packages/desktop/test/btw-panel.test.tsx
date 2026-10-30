@@ -203,8 +203,8 @@ describe("desktop BTW side-chat presentation", () => {
 			expect(changes).toEqual(["보존할 다음 초안\n  후속 질문"]);
 			expect(html.match(/<textarea[^>]*>/u)?.[0]).not.toContain('disabled=""');
 		}
-		expect(render({ pending: true })).toContain("접수나 응답 완료를 뜻하지 않습니다");
-		expect(render({ disabled: true })).toContain("연결 또는 세션을 사용할 수 없어");
+		expect(render({ pending: true })).toContain("응답을 기다리는 중");
+		expect(render({ disabled: true })).toContain("연결 또는 세션을 사용할 수 없습니다");
 		expect(render({ disabled: true })).toContain(props().draft);
 	});
 

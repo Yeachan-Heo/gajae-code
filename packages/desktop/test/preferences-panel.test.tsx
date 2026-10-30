@@ -14,6 +14,7 @@ function preferences(): DesktopPreferences {
 				source: "configured",
 				active: true,
 				default: false,
+				roles: [{ id: "default", model: "fixture/model-one" }],
 				capabilities: {
 					selectSession: { available: true, reason: null },
 					persistDefault: { available: false, reason: "Default-profile ownership CAS is unavailable." },
@@ -26,6 +27,7 @@ function preferences(): DesktopPreferences {
 				source: "builtin",
 				active: false,
 				default: true,
+				roles: [{ id: "default", model: "fixture/model-one" }],
 				capabilities: {
 					selectSession: { available: true, reason: null },
 					persistDefault: { available: false, reason: "Default-profile ownership CAS is unavailable." },
@@ -38,6 +40,7 @@ function preferences(): DesktopPreferences {
 				source: "configured",
 				active: false,
 				default: false,
+				roles: [{ id: "default", model: "fixture/model-one" }],
 				capabilities: {
 					selectSession: { available: false, reason: "Session selection requires an available host." },
 					persistDefault: { available: false, reason: "Default-profile ownership CAS is unavailable." },
@@ -154,8 +157,8 @@ describe("desktop preferences presentation", () => {
 		expect(unavailable).toMatch(/<button[^>]*aria-label="[^"]*: 기본 프로필로 저장"[^>]*disabled=""/u);
 		expect(unavailable).toContain("이 대화: Session selection requires an available host.");
 		expect(unavailable).toContain("기본값 저장: Default-profile ownership CAS is unavailable.");
-		expect(html).toContain("최근 사용 모델(MRU) 기록은 공유 저장소에 쓰일 수 있습니다.");
-		expect(html).toContain("대화에 적용해도 저장된 기본 프로필은 바뀌지 않습니다.");
+		expect(html).not.toContain("최근 사용 모델(MRU) 기록");
+		expect(html).toContain("이 대화에 적용");
 	});
 
 	test("renders resolved role identities, configuration state, thinking and map provenance as read-only", () => {
@@ -174,7 +177,7 @@ describe("desktop preferences presentation", () => {
 		expect(critic).toContain("기본값 (default)");
 		expect(critic).toContain("변경 불가: Role unavailable.");
 		expect(critic).not.toContain("<button");
-		expect(render()).toContain("역할 맵의 출처는 개별 역할 설정의 소유권을 뜻하지 않습니다.");
+		expect(render()).not.toContain("역할 맵의 출처");
 	});
 
 	test("labels durable default model capability without adding another role editor", () => {
@@ -203,26 +206,26 @@ describe("desktop preferences presentation", () => {
 			expect(row).toContain("Sampling validation and model capabilities are unavailable.");
 			expect(row).toMatch(/<button[^>]*disabled=""[^>]*>샘플링 변경 불가<\/button>/u);
 		}
-		expect(html).toContain("다음 실행의 에이전트 옵션 값입니다.");
-		expect(html).toContain("실제 제공자 요청에 포함되거나 제공자가 수락한다는 뜻은 아닙니다.");
+		expect(html).toContain("다음 실행에 적용됩니다.");
+		expect(html).toContain("모델별 지원 여부는 알 수 없습니다.");
 		expect(html).not.toContain("<input");
 		expect(html).not.toContain("<select");
 	});
 
 	test("distinguishes unloaded, loading, failed, empty and idle states without optimistic application notices", () => {
 		const unloaded = render({ preferences: null });
-		expect(unloaded).toContain("환경설정 정보가 아직 없습니다.");
+		expect(unloaded).toContain("환경설정 정보가 없습니다.");
 		expect(unloaded).not.toContain('role="status"');
 		const loading = render({ preferences: null, pending: true });
 		expect(loading).toContain('aria-busy="true"');
 		expect(loading).toContain('role="status"');
 		expect(loading).toContain("환경설정을 불러오는 중…");
-		expect(loading).not.toContain("환경설정 정보가 아직 없습니다.");
+		expect(loading).not.toContain("환경설정 정보가 없습니다.");
 		const failed = render({ preferences: null, error: "호스트 응답을 받지 못했습니다." });
 		expect(failed).toContain('role="alert"');
 		expect(failed).toContain("호스트 응답을 받지 못했습니다.");
 		expect(failed).not.toContain("불러오는 중");
-		expect(failed).not.toContain("환경설정 정보가 아직 없습니다.");
+		expect(failed).not.toContain("환경설정 정보가 없습니다.");
 		const empty = render({ preferences: { profiles: [], roles: [], sampling: [] } });
 		expect(empty).toContain("사용 가능한 모델 프로필이 없습니다.");
 		expect(empty).toContain("역할별 모델 정보가 없습니다.");
@@ -254,8 +257,8 @@ describe("desktop preferences presentation", () => {
 		expect(refreshButton).not.toContain('disabled=""');
 		expect(html).toContain('aria-busy="false"');
 		expect(html).not.toContain("설정 연결 또는 요청 처리를 기다리는 중");
-		expect(html).toContain("변경은 현재 작업이 끝난 뒤 다시 요청하세요.");
-		expect(html).toContain("요청이 자동으로 예약되지는 않습니다.");
+		expect(html).toContain("실행 중에는 프로필을 변경할 수 없습니다.");
+		expect(html).toContain("실행 중에는 프로필을 변경할 수 없습니다.");
 		for (const profile of profileOptions(html)) {
 			const buttons = profile.match(/<button\b[^>]*>/gu) ?? [];
 			expect(buttons).toHaveLength(2);

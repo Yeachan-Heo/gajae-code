@@ -25,6 +25,12 @@ export interface DesktopModelProfile {
 		selectSession: DesktopPreferenceCapability;
 		persistDefault: DesktopPreferenceCapability;
 	};
+	/**
+	 * Definition data in assignment-target order. `model` is the profile's configured selector
+	 * string (e.g. `anthropic/claude-sonnet-4`) and `null` means the profile leaves that role
+	 * unset; neither value proves the provider is authenticated.
+	 */
+	roles: { id: DesktopModelRoleId; model: string | null }[];
 }
 
 export type DesktopModelRoleId = "default" | "executor" | "architect" | "planner" | "critic" | "image";

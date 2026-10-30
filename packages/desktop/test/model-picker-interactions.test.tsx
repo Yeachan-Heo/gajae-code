@@ -24,7 +24,21 @@ interface Control {
 	setDisabled(value: boolean): void;
 	setSelected(value: string): void;
 	setRoles(value: Role[]): void;
+	setProfiles(value: Profile[]): void;
+	setRefreshing(value: boolean): void;
+	setBusy(value: boolean): void;
+	setApplying(value: boolean): void;
 	calls(): [string, string | null][];
+}
+interface Profile {
+	id: string;
+	name: string;
+	description: string | null;
+	source: "builtin" | "configured";
+	active: boolean;
+	default: boolean;
+	roles: { id: string; model: string | null }[];
+	capabilities: { selectSession: { available: boolean; reason: string | null }; persistDefault: { available: boolean; reason: string | null } };
 }
 interface Role {
 	id: string;
@@ -69,10 +83,20 @@ async function fixture(storage?: string, failStorage = false): Promise<{ context
 		function Fixture() {
 			const [selectedId, setSelected] = useState('p/m5');
 			const [roles, setRoles] = useState([]);
+			const [profiles, setProfiles] = useState([]);
 			const [pending, setPending] = useState(false);
 			const [disabled, setDisabled] = useState(false);
-			window.pickerTest = { setSelected, setRoles, setPending, setDisabled, calls: () => calls };
-			return h(ModelPicker, { models, selectedId, roles, pending, disabled, onSelect: id => calls.push(['legacy', id]), onAssign: (role, id) => calls.push([role, id]) });
+			const [refreshing, setRefreshing] = useState(false);
+			const [busy, setBusy] = useState(false);
+			const [applying, setApplying] = useState(false);
+			window.pickerTest = { setSelected, setRoles, setProfiles, setRefreshing, setBusy, setApplying, setPending, setDisabled, calls: () => calls };
+			return h(ModelPicker, {
+				models, selectedId, roles, profiles, pending, disabled, refreshing, busy, applying,
+				onSelect: id => calls.push(['legacy', id]),
+				onAssign: (role, id) => calls.push([role, id]),
+				onApplyProfile: profileId => calls.push(['profile', profileId]),
+				onRefresh: () => calls.push(['refresh', null]),
+			});
 		}
 		const root = document.createElement('div'); root.id = 'picker-fixture'; document.body.replaceChildren(root); createRoot(root).render(h(Fixture));
 	`, 'picker-fixture', true);
@@ -85,6 +109,18 @@ async function fixture(storage?: string, failStorage = false): Promise<{ context
 async function invoke(page: Page, method: "setPending" | "setDisabled", value: boolean): Promise<void> {
 	await page.evaluate(({ method, value }) => (window as unknown as { pickerTest: Control }).pickerTest[method](value), { method, value });
 }
+async function setProfiles(page: Page, profiles: Profile[]): Promise<void> {
+	await page.evaluate(value => (window as unknown as { pickerTest: Control }).pickerTest.setProfiles(value), profiles);
+}
+async function setApplying(page: Page, value: boolean): Promise<void> {
+	await page.evaluate(next => (window as unknown as { pickerTest: Control }).pickerTest.setApplying(next), value);
+}
+async function setBusy(page: Page, value: boolean): Promise<void> {
+	await page.evaluate(next => (window as unknown as { pickerTest: Control }).pickerTest.setBusy(next), value);
+}
+async function setRefreshing(page: Page, value: boolean): Promise<void> {
+	await page.evaluate(next => (window as unknown as { pickerTest: Control }).pickerTest.setRefreshing(next), value);
+}
 async function setRoles(page: Page, roles: Role[]): Promise<void> {
 	await page.evaluate(value => (window as unknown as { pickerTest: Control }).pickerTest.setRoles(value), roles);
 }
@@ -92,8 +128,154 @@ async function calls(page: Page): Promise<[string, string | null][]> {
 	return page.evaluate(() => (window as unknown as { pickerTest: Control }).pickerTest.calls());
 }
 async function open(page: Page): Promise<void> { await page.click('.model-trigger'); await page.waitForSelector('.model-result-list'); }
-async function choose(page: Page, id: string): Promise<void> { await page.click(`.model-option[data-model-id="${id}"]`); await page.waitForSelector('.model-role-choice'); }
-async function rows(page: Page): Promise<string[]> { return page.$$eval('.model-option', buttons => buttons.map(button => button.getAttribute('data-model-id') ?? '')); }
+async function choose(page: Page, id: string): Promise<void> { await page.click(`.model-option-hit[data-model-id="${id}"]`); await page.waitForSelector('.model-role-choice'); }
+async function rows(page: Page): Promise<string[]> { return page.$$eval('.model-option-hit', buttons => buttons.map(button => button.getAttribute('data-model-id') ?? '')); }
+
+const profile = (id: string, name: string, roles: { id: string; model: string | null }[], overrides: Partial<Profile> = {}): Profile => ({
+	id,
+	name,
+	description: null,
+	source: "configured",
+	active: false,
+	default: false,
+	roles,
+	capabilities: { selectSession: { available: true, reason: null }, persistDefault: { available: true, reason: null } },
+	...overrides,
+});
+
+describe("mounted model picker tabs", () => {
+	test("switches between preset and model tabs while keeping one query per tab", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [
+				profile("focused", "Focused", [
+					{ id: "default", model: "anthropic/claude-sonnet" },
+					{ id: "executor", model: "anthropic/claude-haiku" },
+					{ id: "planner", model: null },
+				]),
+				profile("review", "Review only", [{ id: "critic", model: "openai/gpt-review" }], { active: true, default: true }),
+			]);
+			await open(page);
+			// selectedId is set, so the model tab owns the initial view.
+			expect(await page.$$eval(".model-tab", tabs => tabs.map(tab => tab.getAttribute("aria-selected")))).toEqual(["false", "true"]);
+			await page.type(".model-search input", "m99");
+			expect(await rows(page)).toEqual(["p/m99"]);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-roles");
+			expect(await page.$eval(".model-search input", input => (input as HTMLInputElement).value)).toBe("");
+			const presets = await page.$$eval(".model-option-hit", nodes => nodes.map(node => node.textContent ?? ""));
+			expect(presets).toHaveLength(2);
+			expect(presets[0]).toContain("Focused");
+			expect(presets[0]).toContain("Default anthropic/claude-sonnet");
+			expect(presets[0]).toContain("Executor anthropic/claude-haiku");
+			expect(presets[0]).not.toContain("Planner");
+			expect(presets[1]).toContain("현재 적용");
+			expect(presets[1]).toContain("기본 프로필");
+			await page.type(".model-search input", "review");
+			expect(await page.$$eval(".model-option-hit", nodes => nodes.map(node => node.textContent ?? ""))).toHaveLength(1);
+			await page.click(".model-search input", { clickCount: 3 });
+			await page.type(".model-search input", "sonnet");
+			expect(await page.$$eval(".model-option-hit", nodes => nodes.map(node => node.textContent ?? ""))).toHaveLength(1);
+			await page.click(".model-option-hit");
+			expect(await calls(page)).toEqual([["profile", "focused"]]);
+			expect(await page.$("dialog")).toBeNull();
+		} finally { await closeComponentFixture(context, page); }
+	});
+
+	test("refreshes through an icon-only control inside the model toolbar", async () => {
+		const { context, page } = await fixture();
+		try {
+			await open(page);
+			const label = await page.$eval(".model-refresh", button => ({
+				text: (button.textContent ?? "").trim(),
+				label: button.getAttribute("aria-label"),
+			}));
+			expect(label.text).toBe("");
+			expect(label.label).toBe("모델 목록 새로고침");
+			await page.click(".model-refresh");
+			expect(await calls(page)).toEqual([["refresh", null]]);
+			await setRefreshing(page, true);
+			await page.waitForFunction(() => (document.querySelector(".model-refresh") as HTMLButtonElement).disabled);
+		} finally { await closeComponentFixture(context, page); }
+	});
+
+	test("keeps the favorite control inside the model row without selecting it", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setRoles(page, [role("default", "m5")]);
+			await open(page);
+			expect(await page.$(".model-option > .model-favorite")).not.toBeNull();
+			expect(await page.$$eval(".model-option-hit svg.lucide-check", nodes => nodes.length)).toBe(0);
+			await page.click('.model-result-row:has([data-model-id="p/m1"]) .model-favorite');
+			expect(await calls(page)).toEqual([]);
+			expect(await page.$(".model-role-choice")).toBeNull();
+		} finally { await closeComponentFixture(context, page); }
+	});
+});
+
+
+	test("blocks dispatch with a visible state while a selection is already applying", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setRoles(page, [role("default", "m5")]);
+			await open(page);
+			await setApplying(page, true);
+			await page.waitForFunction(() => document.body.textContent?.includes("선택한 설정을 적용하는 중"));
+			await choose(page, "p/m1");
+			expect(
+				await page.$$eval(".model-role-option", nodes => nodes.map(node => (node as HTMLButtonElement).disabled)),
+			).toEqual([true, true, true, true, true]);
+			expect(await calls(page)).toEqual([]);
+			await setApplying(page, false);
+			await page.waitForFunction(() => !document.body.textContent?.includes("선택한 설정을 적용하는 중"));
+		} finally { await closeComponentFixture(context, page); }
+	});
+
+describe("mounted model picker busy state", () => {
+	test("keeps the dialog open across loading and disables only host-refused profile actions", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [profile("focused", "Focused", [{ id: "default", model: "p/m1" }])]);
+			await setRoles(page, [role("default", "m5"), role("executor", "m8")]);
+			await open(page);
+			// Refreshing the catalog must not unmount the dialog.
+			await setRefreshing(page, true);
+			await Bun.sleep(150);
+			expect(await page.$("dialog")).not.toBeNull();
+			await setRefreshing(page, false);
+			// While busy, only the actions the host refuses are disabled: presets and
+			// non-default roles. Default maps to model.set, which is deferred instead.
+			await setBusy(page, true);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-roles");
+			expect(
+				await page.$$eval(".model-option-hit", nodes => nodes.map(node => (node as HTMLButtonElement).disabled)),
+			).toEqual([true]);
+			expect(await page.$eval(".model-busy-reason", node => node.textContent?.trim())).toBe(
+				"작업이 끝난 뒤 프로필을 변경할 수 있습니다.",
+			);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][1]!.click());
+			await choose(page, "p/m8");
+			expect(
+				await page.$$eval(".model-role-option", nodes =>
+					nodes.map(node => ({
+						label: node.textContent?.split(" · ")[0],
+						disabled: (node as HTMLButtonElement).disabled,
+					})),
+				),
+			).toEqual([
+				{ label: "Default", disabled: false },
+				{ label: "Executor", disabled: true },
+				{ label: "Planner", disabled: true },
+				{ label: "Critic", disabled: true },
+				{ label: "Architect", disabled: true },
+			]);
+			await page.click(".model-role-option");
+			expect(await calls(page)).toEqual([["default", "p/m8"]]);
+			await setBusy(page, false);
+		} finally { await closeComponentFixture(context, page); }
+	});
+});
 
 describe("mounted model picker", () => {
 	test("renders and searches the full catalog; selection requires an explicit role", async () => {
@@ -117,7 +299,7 @@ describe("mounted model picker", () => {
 			await setRoles(page, [role('architect', 'm8'), role('critic', 'm8', false), role('planner', 'm8'), role('executor', 'm8'), role('default', 'm5')]);
 			await open(page);
 			expect((await rows(page)).slice(0, 4)).toEqual(['p/m5', 'p/m8', 'p/m2', 'p/m0']);
-			expect(await page.$$eval('[data-model-id="p/m8"] .model-role-tag', tags => tags.map(tag => tag.textContent))).toEqual(['Executor', 'Planner', 'Critic · 상속', 'Architect']);
+			expect(await page.$$eval('[data-model-id="p/m8"] .model-role-tag', tags => tags.map(tag => tag.textContent))).toEqual(['Executor', 'Planner', 'Critic', 'Architect']);
 			await choose(page, 'p/m8');
 			await page.click('.model-role-clear');
 			expect(await calls(page)).toEqual([['executor', null]]);
@@ -156,7 +338,7 @@ describe("mounted model picker", () => {
 		try {
 			await setRoles(page, [role('default', 'm5'), role('executor', 'missing')]);
 			await open(page);
-			expect(await page.$('.model-option[data-model-id="p/missing"]')).toBeNull();
+			expect(await page.$('.model-option-hit[data-model-id="p/missing"]')).toBeNull();
 			await page.click('.model-role-unavailable-clear');
 			expect(await calls(page)).toEqual([['executor', null]]);
 		} finally { await closeComponentFixture(context, page); }
@@ -169,7 +351,7 @@ describe("mounted model picker", () => {
 			inherited.canClear = { available: false, reason: 'Inherited configuration' };
 			await setRoles(page, [role('default', 'm5'), inherited]);
 			await open(page);
-			expect(await page.$eval('[data-model-id="p/m8"] .model-role-tag', element => element.textContent)).toBe('Planner · 상속');
+			expect(await page.$eval('[data-model-id="p/m8"] .model-role-tag', element => element.textContent)).toBe('Planner');
 		} finally { await closeComponentFixture(context, page); }
 	});
 
@@ -203,10 +385,17 @@ describe("mounted model picker", () => {
 			await page.click('.model-role-back');
 			expect(await page.evaluate(() => document.activeElement?.getAttribute('data-model-id'))).toBe('p/m1');
 			await choose(page, 'p/m1');
-			await invoke(page, 'setPending', true); await page.waitForSelector('dialog', { hidden: true });
-			await invoke(page, 'setPending', false); await open(page); await choose(page, 'p/m1');
-			await invoke(page, 'setDisabled', true); await page.waitForSelector('dialog', { hidden: true });
-			await invoke(page, 'setDisabled', false); await open(page); await choose(page, 'p/m1');
+			// Neither a background mutation (pending) nor a disabled trigger may tear down
+			// a dialog the user is using: only dismissal, an applied selection, or an
+			// owner change closes it.
+			await invoke(page, 'setPending', true);
+			await Bun.sleep(150);
+			expect(await page.$('.model-role-choice')).not.toBeNull();
+			await invoke(page, 'setPending', false);
+			await invoke(page, 'setDisabled', true);
+			await Bun.sleep(150);
+			expect(await page.$('.model-role-choice')).not.toBeNull();
+			await invoke(page, 'setDisabled', false);
 			await page.evaluate(() => (window as unknown as { pickerTest: Control }).pickerTest.setSelected('p/m2'));
 			await page.waitForSelector('dialog', { hidden: true });
 			expect(await calls(page)).toEqual([]);

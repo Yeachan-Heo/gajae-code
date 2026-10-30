@@ -336,7 +336,13 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await page.waitForSelector(".model-trigger", { timeout: 10000 });
 			await page.evaluate(() => (document.querySelector(".model-trigger") as HTMLElement).click());
 			await page.waitForSelector(".model-dialog", { timeout: 8000 });
-			const options = await page.$$eval(".model-option", nodes =>
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")]
+					.find(tab => tab.textContent?.includes("모델"))
+					?.click(),
+			);
+			await page.waitForSelector(".model-result-list .model-option-hit", { timeout: 8000 });
+			const options = await page.$$eval(".model-option-hit", nodes =>
 				nodes.map(node => (node.textContent ?? "").trim()),
 			);
 			expect(options.length === 3, `expected only the three fixture models, saw ${options.length}`);
@@ -344,11 +350,11 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			expect(search, "model search input missing");
 			await (search as NonNullable<typeof search>).type("plain");
 			await Bun.sleep(300);
-			const filtered = await page.$$eval(".model-option", nodes =>
+			const filtered = await page.$$eval(".model-option-hit", nodes =>
 				nodes.map(node => (node.textContent ?? "").trim()),
 			);
 			expect(filtered.length === 1 && filtered[0]!.includes("qa-plain"), `search filter wrong: ${filtered}`);
-			await page.click(".model-option");
+			await page.click(".model-option-hit");
 			await waitFor(
 				async () =>
 					!(await page.evaluate(() => Boolean(document.querySelector(".model-dialog")))) &&
@@ -366,13 +372,34 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await page.waitForSelector(".model-trigger", { timeout: 10000 });
 			await page.evaluate(() => (document.querySelector(".model-trigger") as HTMLElement).click());
 			await page.waitForSelector(".model-dialog", { timeout: 8000 });
-			await page.click(".model-result-list li:first-child .model-option");
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")]
+					.find(tab => tab.textContent?.includes("모델"))
+					?.click(),
+			);
+			await page.waitForSelector(".model-result-list .model-option-hit", { timeout: 8000 });
+			await page.click(".model-result-list li:first-child .model-option-hit");
 			await waitFor(
 				async () => (await text()).includes("qa-reasoning") && !(await page.$(".model-dialog")),
 				"reasoning model selected",
 			);
-			const selectedLevels = await page.select(".reasoning-control select", "high");
-			expect(selectedLevels.includes("high"), `reasoning select did not hold the chosen level: ${selectedLevels}`);
+			// The reasoning control is a custom listbox, so the level is chosen by label.
+			await page.waitForSelector(".reasoning-control .select-trigger:not([disabled])", { timeout: 8000 });
+			await page.click(".reasoning-control .select-trigger");
+			await page.waitForSelector(".select-menu .select-option:not([disabled])", { timeout: 8000 });
+			await page.evaluate(() => {
+				const option = [...document.querySelectorAll<HTMLButtonElement>(".select-menu .select-option")].find(item =>
+					/high|높음/iu.test(item.textContent ?? ""),
+				);
+				option?.click();
+			});
+			await waitFor(
+				async () =>
+					/high|높음/iu.test(
+						await page.$eval(".reasoning-control .select-trigger", element => element.textContent ?? ""),
+					),
+				"reasoning level applied",
+			);
 			const request = await sendAndSettle("flow-qa reasoning");
 			expect(
 				request.body.reasoning_effort === "high",

@@ -1,4 +1,6 @@
 ### Fixed
+- Port every bundled TUI theme to the desktop and default to red-claw; keep 작업 중/완료/응답 필요/오류 distinguishable on every palette instead of deriving them from the accent.
+- Replace the reasoning level's native system dropdown with a button-triggered listbox that matches the model trigger's height and radius.
 - Render assistant responses and reasoning as safe Markdown with fenced-code copy actions, without executing HTML or fetching Markdown images.
 - Generate new-session names through the SDK instead of persisting the placeholder as a manual title; preserve manual names and reject stale generation.
 - Compact the composer with an inline attachment icon, one-line auto-growing input and IME-safe Enter/Shift+Enter behavior; remove redundant helper copy and duplicate command navigation.
@@ -16,6 +18,8 @@
 - Keep a refused operation from marking the conversation as failed: only a failed prompt turn sets the session error, so `/compact`, `/retry` or a profile switch that the host declines leaves the row idle and shows one banner.
 
 ### Added
+- Keep model and reasoning selection usable while work runs: the choices merge into one intent and are applied once the session is truly settled (no queued input, no operator), instead of being blocked with an explanatory sentence. A level the target model does not declare is offered to the host as its own request so its real reason is shown.
+- Split the model dialog into 프리셋 and 모델 tabs; presets apply a registered profile by id, list its per-role model selectors and stay searchable, while model rows keep the favorite star inside the row, drop the redundant selection checkmark and role-inheritance suffix, and expose list refresh as an icon-only dialog control.
 - Show every available model, browser-local favorites and ordered role tags; choose Default, Executor, Planner, Critic or Architect before applying. Default remains shared/durable; task-role choices apply only to the current live session and clearing reveals inherited configuration.
 - Integrate trusted extension startup questions and handled/transformed input for direct, queued and forwarded prompts without replaying startup on UI refresh.
 - Exercise real owned MCP effects and transport termination, real LSP diagnostics and subprocess exit, and the QA wrapper's final HTTP/SSE shutdown frame.

@@ -46,7 +46,7 @@ export function BtwPanel({ conversation, draft, disabled, pending, onDraftChange
 									<div className="btw-text" aria-label="곁대화 질문">
 										{turn.question}
 									</div>
-									<strong className="role-label">GJC · 곁대화</strong>
+									<strong className="role-label">gajae · 곁대화</strong>
 									<p className="btw-status" role="status">
 										{statusLabels[turn.status]}
 									</p>
@@ -75,17 +75,17 @@ export function BtwPanel({ conversation, draft, disabled, pending, onDraftChange
 			) : (
 				<div className="btw-empty">
 					<h3>주 작업과 별개로 물어보세요</h3>
-					<p>아직 곁대화가 없습니다. 첫 질문으로 시작하고, 같은 곁대화 안에서 후속 질문을 이어 가세요.</p>
+					<p>아직 곁대화가 없습니다.</p>
 				</div>
 			)}
 			{disabled && (
 				<p className="btw-help" role="status">
-					연결 또는 세션을 사용할 수 없어 보내기와 중지 요청을 할 수 없습니다. 초안은 유지됩니다.
+					연결 또는 세션을 사용할 수 없습니다.
 				</p>
 			)}
 			{pending && (
 				<p className="btw-help" role="status">
-					요청 처리를 기다리는 중… 접수나 응답 완료를 뜻하지 않습니다. 초안은 유지됩니다.
+					응답을 기다리는 중…
 				</p>
 			)}
 			<form

@@ -152,7 +152,11 @@ export interface DesktopSession {
 	id: string;
 	projectId: string;
 	title: string;
-	status: "idle" | "running" | "waiting" | "error";
+	/**
+	 * `done` means at least one visible message exists and the session is otherwise settled
+	 * (not busy, waiting on an answer/gate, or failed); a never-used session stays `idle`.
+	 */
+	status: "idle" | "done" | "running" | "waiting" | "error";
 	queued?: DesktopQueuedInput[];
 	starred: boolean;
 	model?: string;

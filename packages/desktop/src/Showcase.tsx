@@ -2,7 +2,7 @@ import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } fro
 import { useState } from "react";
 import type { DesktopBtwConversation, DesktopBtwTurn } from "../../desktop-host/src/btw-protocol";
 import type { DesktopMcpServer, DesktopMcpSnapshot } from "../../desktop-host/src/mcp-protocol";
-import type { DesktopModelRolePreference } from "../../desktop-host/src/preferences-protocol";
+import type { DesktopModelProfile, DesktopModelRolePreference } from "../../desktop-host/src/preferences-protocol";
 import type {
 	DesktopHistory,
 	DesktopModel,
@@ -61,6 +61,8 @@ function FixtureControls({
 	empty?: boolean;
 }) {
 	const [selectedId, setSelectedId] = useState(fixtureModels[0].id);
+	const [appliedProfile, setAppliedProfile] = useState<string>();
+	const [refreshes, setRefreshes] = useState(0);
 	const [assignments, setAssignments] = useState<Partial<Record<PickerModelRole, string>>>({
 		executor: fixtureModels[2].id,
 		planner: fixtureModels[1].id,
@@ -84,6 +86,49 @@ function FixtureControls({
 		},
 	);
 	const [level, setLevel] = useState<DesktopThinkingLevel>("medium");
+	const profiles: DesktopModelProfile[] = [
+		{
+			id: "design-fixture-default",
+			name: "기본 프로필",
+			description: null,
+			source: "builtin",
+			active: appliedProfile === "design-fixture-default",
+			default: true,
+			roles: [
+				{ id: "default", model: fixtureModels[0].id },
+				{ id: "executor", model: fixtureModels[2].id },
+				{ id: "architect", model: null },
+				{ id: "planner", model: fixtureModels[1].id },
+				{ id: "critic", model: null },
+				{ id: "image", model: null },
+			],
+			capabilities: {
+				selectSession: { available: true, reason: null },
+				persistDefault: { available: true, reason: null },
+			},
+		},
+		{
+			id: "design-fixture-review",
+			name: "리뷰 집중 프로필",
+			description: null,
+			source: "configured",
+			active: appliedProfile === "design-fixture-review",
+			default: false,
+			roles: [
+				{ id: "default", model: fixtureModels[1].id },
+				{ id: "executor", model: null },
+				{ id: "architect", model: null },
+				{ id: "planner", model: fixtureModels[2].id },
+				{ id: "critic", model: fixtureModels[0].id },
+				{ id: "image", model: null },
+			],
+			capabilities: {
+				selectSession: { available: true, reason: null },
+				persistDefault: { available: false, reason: "디자인 예시" },
+			},
+		},
+	];
+	const appliedProfileName = profiles.find(profile => profile.id === appliedProfile)?.name;
 	const models = empty ? [] : fixtureModels;
 	const selectedModel = models.find(model => model.id === selectedId);
 	const thinking: DesktopThinking = {
@@ -103,6 +148,9 @@ function FixtureControls({
 				pending={pending}
 				onSelect={setSelectedId}
 				roles={roles}
+				profiles={profiles}
+				onApplyProfile={setAppliedProfile}
+				onRefresh={() => setRefreshes(value => value + 1)}
 				onAssign={(role, modelId) => {
 					if (role === "default" && modelId) setSelectedId(modelId);
 					else
@@ -116,7 +164,9 @@ function FixtureControls({
 			/>
 			<ReasoningSelect thinking={thinking} disabled={disabled} pending={pending} onChange={setLevel} />
 			<small className="model-control-status fixture-note">
-				{running ? "실행 중 디자인 예시 · 실제 요청 없음" : "디자인 전용 · 실제 모델 아님"}
+				{running
+					? "실행 중 디자인 예시 · 실제 요청 없음"
+					: `디자인 전용 · 실제 모델 아님${appliedProfileName ? ` · 프로필 ${appliedProfileName}` : ""}${refreshes > 0 ? ` · 새로고침 ${refreshes}회` : ""}`}
 			</small>
 		</div>
 	);
@@ -970,7 +1020,7 @@ export default function Showcase() {
 				<p className="muted">
 					선택, 즐겨찾기, 실행 상태는 각각 독립적입니다. 아래 동작은 이 예시 화면에만 적용됩니다.
 				</p>
-				{(["idle", "running", "waiting", "error"] as const).map(status => (
+				{(["idle", "done", "running", "waiting", "error"] as const).map(status => (
 					<SessionRow
 						key={status}
 						session={{ ...session, id: status, status, starred: starred.includes(status) }}
@@ -1174,8 +1224,8 @@ export default function Showcase() {
 			<section id="showcase-models">
 				<h2>실제 컴포넌트 · 모델과 추론 디자인 예시</h2>
 				<p className="muted">
-					84개 명시적 디자인 모델로 검색, 80개 제한과 더 보기, 선택 표시, 방향키와 Home/End를 검토하세요. 실제
-					제공자 연결이나 요청은 없습니다.
+					프리셋/모델 탭, 84개 명시적 디자인 모델 검색, 역할 태그, 즐겨찾기, 새로고침 아이콘과 방향키를 검토하세요.
+					실제 제공자 연결이나 요청은 없습니다.
 				</p>
 				<h3>활성 · 긴 모델 이름 / 두 예시 제공자 / 로컬 선택</h3>
 				<FixtureControls />

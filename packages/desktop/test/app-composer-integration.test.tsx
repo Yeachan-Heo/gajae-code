@@ -277,13 +277,57 @@ async function waitStoredDisposition(page: Page, id: string, disposition: Deskto
 
 const available = { available: true, reason: null };
 const profilePreferences: DesktopPreferences = {
-	profiles: [{ id: "focused", name: "Focused profile", description: null, source: "configured", active: false, default: false, capabilities: { selectSession: available, persistDefault: available } }],
+	profiles: [{
+		id: "focused",
+		name: "Focused profile",
+		description: null,
+		source: "configured",
+		active: false,
+		default: false,
+		roles: [
+			{ id: "default", model: "fixture/model-one" },
+			{ id: "executor", model: "fixture/model-two" },
+			{ id: "architect", model: null },
+			{ id: "planner", model: null },
+			{ id: "critic", model: null },
+			{ id: "image", model: null },
+		],
+		capabilities: { selectSession: available, persistDefault: available },
+	}],
 	roles: [],
 	sampling: [],
 };
 const refreshedPreferences: DesktopPreferences = {
 	...profilePreferences,
 	roles: [{ id: "executor", name: "Executor", configured: true, model: { id: "model-one", provider: "fixture", name: "Model One" }, thinkingLevel: null, configurationResolution: { origin: "runtime", layers: ["runtime"] }, canApply: available, scope: "session", canClear: available }],
+};
+
+const deferralPreferences: DesktopPreferences = {
+	...profilePreferences,
+	roles: [
+		{
+			id: "default",
+			name: "Default",
+			configured: true,
+			model: { id: "model-one", provider: "fixture", name: "Model One" },
+			thinkingLevel: null,
+			configurationResolution: { origin: "runtime", layers: ["runtime"] },
+			canApply: available,
+			scope: "default",
+			canClear: { available: false, reason: "The default model cannot be cleared." },
+		},
+		{
+			id: "executor",
+			name: "Executor",
+			configured: false,
+			model: null,
+			thinkingLevel: null,
+			configurationResolution: { origin: "runtime", layers: ["runtime"] },
+			canApply: available,
+			scope: "session",
+			canClear: { available: false, reason: "No session-owned role choice is present." },
+		},
+	],
 };
 
 async function openPreferences(page: Page) {
@@ -353,14 +397,154 @@ describe("mounted preference ownership", () => {
 			await page.click('.modal-close[aria-label="닫기"]');
 			await page.waitForSelector(".model-trigger:not([disabled])");
 			await page.click(".model-trigger");
-			await page.waitForFunction(() => document.querySelector('.model-option[data-model-id="fixture/model-one"] .model-role-tags')?.textContent?.includes("Executor"));
-			await page.click('.model-option[data-model-id="fixture/model-one"]');
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("모델"))?.click());
+			await page.waitForFunction(() => document.querySelector('.model-option-hit[data-model-id="fixture/model-one"] .model-role-tags')?.textContent?.includes("Executor"));
+			await page.click('.model-option-hit[data-model-id="fixture/model-one"]');
 			await page.waitForSelector(".model-role-choice");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
 			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.apply")).toHaveLength(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 });
+
+
+describe("mounted model selection deferral", () => {
+	test("applies a model chosen during a run once the session settles, without a second request", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() =>
+				window.fixture.setModels([
+					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+					{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+				]),
+			);
+			// Hold the preferences read so the role-capable fixture is authoritative.
+			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
+			await select(page);
+			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(
+				({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }),
+				{ id: read.id, result: deferralPreferences },
+			);
+			await page.waitForSelector(".model-trigger:not([disabled])");
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a", title: "Session A", projectId: "p", status: "running", starred: false,
+						imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [],
+					},
+				}),
+			);
+			await page.waitForFunction(() => document.body.textContent?.includes("작업 중"));
+			await page.click(".model-trigger");
+			await page.waitForSelector(".model-dialog");
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("모델"))?.click(),
+			);
+			await page.click('.model-option-hit[data-model-id="fixture/model-two"]');
+			await page.waitForSelector(".model-role-choice");
+			await page.waitForFunction(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
+			);
+			await page.click(".model-role-option");
+			await page.waitForFunction(() => document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+			expect(
+				(await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set"),
+			).toHaveLength(0);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a", title: "Session A", projectId: "p", status: "done", starred: false,
+						imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [],
+					},
+				}),
+			);
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set"));
+			const applied = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set");
+			expect(applied).toHaveLength(1);
+			expect(applied[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two" });
+			await page.evaluate(({ id }) => window.fixture.response(id, true), { id: applied[0]!.id });
+			await page.waitForFunction(() => !document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
+describe("mounted deferred selection intent", () => {
+	test("merges model and reasoning choices, waits for queued input, and sends one request", async () => {
+		const { context, page } = await fixture();
+		const sessionFrame = (status: DesktopSession["status"], queued: NonNullable<DesktopSession["queued"]>) =>
+			page.evaluate(
+				({ status, queued }) =>
+					window.fixture.emit({
+						type: "session",
+						session: {
+							id: "a", title: "Session A", projectId: "p", status, starred: false,
+							imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+							model: "fixture/model-one",
+							thinking: { level: "low", options: [{ value: "low", label: "낮음" }, { value: "high", label: "높음" }], available: true, scope: "session", mode: "effort" },
+							messages: [],
+							queued,
+						},
+					}) as unknown as Promise<void>,
+				{ status, queued },
+			);
+		try {
+			await page.evaluate(() =>
+				window.fixture.setModels([
+					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: true, thinking: { options: [{ value: "low", label: "낮음" }, { value: "high", label: "높음" }] } },
+					{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: true, thinking: { options: [{ value: "low", label: "낮음" }, { value: "high", label: "높음" }] } },
+				]),
+			);
+			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
+			await select(page);
+			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(
+				({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }),
+				{ id: read.id, result: deferralPreferences },
+			);
+			await sessionFrame("running", []);
+			await page.waitForFunction(() => document.body.textContent?.includes("작업 중"));
+			await page.click(".model-trigger");
+			await page.waitForSelector(".model-dialog");
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("모델"))?.click(),
+			);
+			await page.click('.model-option-hit[data-model-id="fixture/model-two"]');
+			await page.waitForSelector(".model-role-choice");
+			await page.waitForFunction(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
+			);
+			await page.click(".model-role-option");
+			await page.waitForFunction(() => document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+			// A reasoning choice made while busy must merge, not replace, the model choice.
+			await page.click(".reasoning-control .select-trigger");
+			await page.waitForSelector(".select-menu .select-option:not([disabled])");
+			await page.evaluate(() => {
+				const option = [...document.querySelectorAll<HTMLButtonElement>(".select-menu .select-option")].find(
+					item => item.textContent?.includes("높음"),
+				);
+				option?.click();
+			});
+			await page.waitForFunction(() => document.body.textContent?.includes("추론 수준을 작업이 끝난 뒤 적용합니다"));
+			// A settled session that still owns queued input is not settled.
+			await sessionFrame("done", [{ id: "q1", text: "queued follow up", deliverAs: "followUp", cancelable: true }]);
+			await Bun.sleep(300);
+			expect(
+				(await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set"),
+			).toHaveLength(0);
+			await sessionFrame("done", []);
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set"));
+			const applied = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set");
+			expect(applied).toHaveLength(1);
+			expect(applied[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two", thinkingLevel: "high" });
+			await page.evaluate(({ id }) => window.fixture.response(id, true), { id: applied[0]!.id });
+			await page.waitForFunction(() => !document.body.textContent?.includes("작업이 끝난 뒤 적용합니다"));
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
 
 describe("mounted composer delivery recovery", () => {
 	test("short workspace keeps queued inputs and recovery controls reachable", async () => {

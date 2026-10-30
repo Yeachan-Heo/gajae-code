@@ -7,6 +7,7 @@ import {
 	Info,
 	MoreHorizontal,
 	Network,
+	Palette,
 	Pencil,
 	Plus,
 	Settings2,
@@ -31,6 +32,7 @@ import type {
 } from "../../desktop-host/src/mcp-protocol";
 import type { DesktopOperatorFoldResult, DesktopOperatorOperation } from "../../desktop-host/src/operator-protocol";
 import type {
+	DesktopModelProfile,
 	DesktopModelRolePreference,
 	DesktopPreferenceAction,
 	DesktopPreferenceResult,
@@ -85,6 +87,15 @@ import { OperatorPanel } from "./OperatorPanel";
 import { PreferencesPanel } from "./PreferencesPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionInfoPanel } from "./SessionInfoPanel";
+import {
+	applyTheme,
+	DESKTOP_THEMES,
+	type DesktopThemeId,
+	readThemePreference,
+	THEME_IDS,
+	themeLabel,
+	writeThemePreference,
+} from "./themes";
 import "./styles.css";
 
 type Dialog =
@@ -171,9 +182,11 @@ export default function App() {
 		generation: number | null;
 		models: DesktopModel[];
 		roles?: DesktopModelRolePreference[];
+		profiles?: DesktopModelProfile[];
 		loading: boolean;
 		error?: string;
 	}>({ sessionId: "", generation: null, models: [], loading: false });
+	const [theme, setTheme] = useState<DesktopThemeId>(readThemePreference);
 	const [modelCatalogRevision, setModelCatalogRevision] = useState(0);
 	const refreshModelCatalog = useRef(false);
 	const [connection, setConnection] = useState("호스트에 연결하는 중…");
@@ -753,6 +766,7 @@ export default function App() {
 						generation: modelGeneration,
 						models,
 						roles: preferences.roles,
+						profiles: preferences.profiles,
 						loading: false,
 					});
 			})
@@ -770,6 +784,9 @@ export default function App() {
 			alive = false;
 		};
 	}, [selected, connected, modelGeneration, modelOwner, snapshot?.models, modelCatalogRevision]);
+	useEffect(() => {
+		applyTheme(theme);
+	}, [theme]);
 	useEffect(() => {
 		const media = window.matchMedia("(min-width: 1100px)");
 		const update = () => setWide(media.matches);
@@ -806,6 +823,15 @@ export default function App() {
 		if (snapshot && selected && !snapshot.sessions.some(item => item.id === selected)) setSelected("");
 	}, [snapshot, selected]);
 
+	// The SDK serializes model/reasoning selection behind its own fence, and issuing
+	// one while a turn runs makes queued follow-ups wait behind a selection that in
+	// turn waits for idle. Requesting it only once the session is settled keeps both
+	// available without that deadlock.
+	const [deferredSelection, setDeferredSelection] = useState<{
+		ownerKey: string;
+		modelId?: string;
+		thinkingLevel?: string;
+	} | null>(null);
 	const run = useCallback(async (scope: string, action: () => Promise<void>) => {
 		if (locks.current.has(scope)) return;
 		locks.current.add(scope);
@@ -838,6 +864,51 @@ export default function App() {
 			setPending(previous => ({ ...previous, [scope]: false }));
 		}
 	}, []);
+	useEffect(() => {
+		const target = deferredSelection;
+		if (!target) return;
+		// The intent applies only while its own session and control generation stay
+		// selected. Any other owner — another conversation or a retired generation —
+		// can never apply it, so retire it with a notice instead of dropping it silently.
+		if (!session) return;
+		if (`${session.id}:${session.controlGeneration}` !== target.ownerKey) {
+			setDeferredSelection(null);
+			setNotice("대화 상태가 바뀌어 선택한 모델 설정을 적용하지 않았습니다.");
+			return;
+		}
+		const settled =
+			!["running", "waiting", "error"].includes(session.status) &&
+			!session.operatorRunning &&
+			(session.queued?.length ?? 0) === 0;
+		if (!settled) return;
+		const scope = target.modelId === undefined ? `thinking:${target.ownerKey}` : `model:${target.ownerKey}`;
+		// Another request owns the scope; keep the intent so it retries when the scope frees.
+		if (locks.current.has(scope) || pending[scope]) return;
+		const sessionId = session.id;
+		const { modelId, thinkingLevel } = target;
+		// A level only merges into model.set when the target model declares it, so an
+		// incompatible or inherited level cannot reject the model change wholesale.
+		const targetModel = modelId === undefined ? undefined : modelCatalog.models.find(item => item.id === modelId);
+		const merged =
+			thinkingLevel !== undefined &&
+			targetModel?.thinking.options.some(option => option.value === thinkingLevel) === true
+				? thinkingLevel
+				: undefined;
+		const followUp =
+			modelId !== undefined && thinkingLevel !== undefined && merged === undefined ? thinkingLevel : undefined;
+		setDeferredSelection(null);
+		void run(scope, async () => {
+			if (modelId !== undefined)
+				await request("model.set", { sessionId, modelId, ...(merged ? { thinkingLevel: merged } : {}) });
+			else if (thinkingLevel !== undefined) {
+				await request("thinking.set", { sessionId, level: thinkingLevel });
+				return;
+			}
+			// The model change is committed first; a level it does not declare is offered
+			// to the host afterwards so the real reason surfaces instead of being dropped.
+			if (followUp !== undefined) await request("thinking.set", { sessionId, level: followUp });
+		});
+	}, [deferredSelection, session, pending]);
 	const call = (method: DesktopMethod, params: Record<string, unknown> = {}, scope = selected || "global") =>
 		run(scope, async () => {
 			await request(method, params);
@@ -1393,8 +1464,18 @@ export default function App() {
 		const ownerKey = `${owner.id}:${owner.controlGeneration}`;
 		const modelScope = `model:${ownerKey}`;
 		const thinkingScope = `thinking:${ownerKey}`;
-		const busy = owner.status === "running" || owner.status === "waiting";
 		const changing = !!(pending[modelScope] || pending[thinkingScope]);
+		// A running turn cannot take the selection yet; remember it and apply on idle.
+		const busy = owner.status === "running" || owner.status === "waiting" || owner.operatorRunning;
+		const deferred = deferredSelection?.ownerKey === ownerKey ? deferredSelection : null;
+		const deferModel = (modelId: string) =>
+			setDeferredSelection(previous =>
+				previous?.ownerKey === ownerKey ? { ...previous, modelId } : { ownerKey, modelId },
+			);
+		const deferThinking = (thinkingLevel: string) =>
+			setDeferredSelection(previous =>
+				previous?.ownerKey === ownerKey ? { ...previous, thinkingLevel } : { ownerKey, thinkingLevel },
+			);
 		const catalog =
 			modelCatalog.sessionId === owner.id && modelCatalog.generation === owner.controlGeneration
 				? modelCatalog
@@ -1407,16 +1488,42 @@ export default function App() {
 					key={ownerKey}
 					models={catalog?.models ?? []}
 					roles={catalog?.roles ?? []}
+					profiles={catalog?.profiles}
 					onConfigureProviders={openSettings}
 					selectedId={owner.model}
-					disabled={!connected || busy || changing || loadingModels || !!catalog?.error}
+					disabled={!connected || changing}
+					busy={busy}
+					onRefresh={() => {
+						refreshModelCatalog.current = true;
+						setModelCatalogRevision(value => value + 1);
+					}}
+					refreshing={catalog?.loading === true}
+					onApplyProfile={profileId => {
+						if (modelOwnerRef.current !== ownerKey) return;
+						void run(modelScope, async () => {
+							await request<DesktopPreferenceResult>("preferences.apply", {
+								sessionId: owner.id,
+								action: { type: "profile.select", name: profileId, scope: "session" },
+							});
+							if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+						});
+					}}
 					pending={pending[modelScope]}
+					applying={changing}
 					onSelect={modelId => {
-						if (modelOwnerRef.current === ownerKey)
-							void call("model.set", { sessionId: owner.id, modelId }, modelScope);
+						if (modelOwnerRef.current !== ownerKey) return;
+						if (busy) {
+							deferModel(modelId);
+							return;
+						}
+						void call("model.set", { sessionId: owner.id, modelId }, modelScope);
 					}}
 					onAssign={(role, modelId) => {
 						if (modelOwnerRef.current !== ownerKey) return;
+						if (role === "default" && modelId !== null && busy) {
+							deferModel(modelId);
+							return;
+						}
 						void run(modelScope, async () => {
 							if (role === "default" && modelId !== null) {
 								await request("model.set", { sessionId: owner.id, modelId });
@@ -1432,25 +1539,27 @@ export default function App() {
 				/>
 				<ReasoningSelect
 					thinking={owner.thinking}
-					disabled={!connected || busy || changing || !currentModelAvailable}
+					disabled={!connected || changing || !currentModelAvailable}
 					pending={pending[thinkingScope]}
 					onChange={level => {
-						if (modelOwnerRef.current === ownerKey)
-							void call("thinking.set", { sessionId: owner.id, level }, thinkingScope);
+						if (modelOwnerRef.current !== ownerKey) return;
+						if (busy) {
+							deferThinking(level);
+							return;
+						}
+						void call("thinking.set", { sessionId: owner.id, level }, thinkingScope);
 					}}
 				/>
 				<small className="model-control-status" role="status">
 					{loadingModels
-						? "프로젝트 모델 목록을 불러오고 있습니다…"
-						: changing
-							? "선택한 설정을 적용하고 있습니다…"
-							: busy
-								? "작업을 마친 뒤 모델과 추론 수준을 변경할 수 있습니다."
+						? "모델 목록을 불러오는 중…"
+						: deferred
+							? `${deferred.modelId !== undefined && deferred.thinkingLevel !== undefined ? "모델과 추론 수준" : deferred.modelId !== undefined ? "모델" : "추론 수준"}을 작업이 끝난 뒤 적용합니다.`
+							: changing
+								? "선택한 설정을 적용하는 중…"
 								: !currentModelAvailable
-									? "제공자를 등록·연결한 뒤 사용 가능한 모델을 선택하세요."
-									: !owner.thinking?.available
-										? (owner.thinking?.reason ?? "세션을 열면 추론 지원 여부를 확인할 수 있습니다.")
-										: null}
+									? "제공자를 등록·연결한 뒤 모델을 선택하세요."
+									: null}
 				</small>
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
 					<Button disabled={!connected} onClick={openSettings}>
@@ -1462,15 +1571,6 @@ export default function App() {
 						<ErrorBanner>{catalog.error}</ErrorBanner>
 					</div>
 				)}
-				<Button
-					disabled={!connected || busy || changing || loadingModels}
-					onClick={() => {
-						refreshModelCatalog.current = true;
-						setModelCatalogRevision(value => value + 1);
-					}}
-				>
-					목록 다시 불러오기
-				</Button>
 				{[modelScope, thinkingScope].map(
 					scope =>
 						errors[scope] && (
@@ -1778,14 +1878,7 @@ export default function App() {
 					</Button>
 				</header>
 				{connection &&
-					(fatal ? (
-						<ErrorBanner>
-							연결 끊김: {connection} · 초안은 유지됩니다. 창 닫기는 앱을 숨길 뿐입니다. 앱 메뉴의 Quit(종료)으로
-							완전히 종료한 뒤 다시 실행하세요.
-						</ErrorBanner>
-					) : (
-						<p role="status">{connection}</p>
-					))}
+					(fatal ? <ErrorBanner>연결 끊김: {connection}</ErrorBanner> : <p role="status">{connection}</p>)}
 				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
 				{!session && recoveries.map(recoveryPanel)}
 				{Object.entries(errors)
@@ -1799,10 +1892,12 @@ export default function App() {
 							{session.status === "running"
 								? "작업 중"
 								: session.status === "waiting"
-									? "응답이 필요합니다."
+									? "응답 필요"
 									: session.status === "error"
-										? "작업 오류"
-										: "대기"}
+										? "오류"
+										: session.status === "done"
+											? "완료"
+											: "대기"}
 						</div>
 						<div
 							className="conversation"
@@ -1966,7 +2061,6 @@ export default function App() {
 						<h2>
 							{snapshot?.projects.length ? "대화를 선택하거나 새로 시작하세요" : "프로젝트를 열어 시작하세요"}
 						</h2>
-						<p>프로젝트별 대화와 백그라운드 작업을 한곳에서 관리합니다.</p>
 						<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
 							프로젝트 폴더 선택
 						</Button>
@@ -2172,6 +2266,61 @@ export default function App() {
 					{dialog === "settings" && (
 						<>
 							<section>
+								<h3>
+									<Palette aria-hidden="true" /> 테마
+								</h3>
+								<div
+									className="theme-options"
+									role="radiogroup"
+									aria-label="테마"
+									onKeyDown={event => {
+										const radios = [
+											...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+										];
+										const index = THEME_IDS.indexOf(theme);
+										const next =
+											event.key === "Home"
+												? 0
+												: event.key === "End"
+													? radios.length - 1
+													: event.key === "ArrowRight" || event.key === "ArrowDown"
+														? (index + 1) % radios.length
+														: event.key === "ArrowLeft" || event.key === "ArrowUp"
+															? (index - 1 + radios.length) % radios.length
+															: -1;
+										const target = radios[next];
+										if (!target) return;
+										event.preventDefault();
+										target.focus();
+										target.click();
+									}}
+								>
+									{THEME_IDS.map(id => (
+										<Button
+											key={id}
+											className="theme-option"
+											role="radio"
+											aria-checked={theme === id}
+											tabIndex={theme === id ? 0 : -1}
+											onClick={() => {
+												setTheme(id);
+												if (!writeThemePreference(id))
+													setNotice("테마를 저장하지 못했습니다. 이번 실행에만 적용됩니다.");
+											}}
+										>
+											<span
+												className="theme-swatch"
+												aria-hidden="true"
+												style={{
+													background: `linear-gradient(135deg, ${DESKTOP_THEMES[id].accent} 0 55%, ${DESKTOP_THEMES[id].surface} 55% 100%)`,
+												}}
+											/>
+											{themeLabel(id)}
+										</Button>
+									))}
+								</div>
+							</section>
+							<section>
 								<h3>현재 대화 모델과 추론</h3>
 								{session ? modelControls(session) : <p className="muted">대화를 먼저 선택하세요.</p>}
 							</section>
@@ -2191,7 +2340,7 @@ export default function App() {
 											setNotice(
 												saved.catalogRefreshed
 													? "API 키를 저장했습니다."
-													: "API 키는 저장했습니다. 모델 목록을 새로 고치지 못한 대화에서 목록 다시 불러오기로 재시도하세요.",
+													: "API 키는 저장했습니다. 모델 목록은 모델 선택 창에서 새로 고칠 수 있습니다.",
 											);
 									});
 								}}
@@ -2259,9 +2408,6 @@ export default function App() {
 							</section>
 							<section>
 								<h3>기능 지원 현황</h3>
-								<p>
-									공개 SDK에서 제공하는 기능만 실행합니다. 미지원 기능은 #7322 상위 구현이 필요할 수 있습니다.
-								</p>
 								{snapshot?.capabilities.map(capability => (
 									<div className="capability" key={capability.id}>
 										<strong>{capability.label}</strong>
@@ -2274,9 +2420,6 @@ export default function App() {
 					)}
 					{dialog === "commands" && (
 						<>
-							<p className="muted">
-								TUI와 같은 내장 슬래시 명령을 실행합니다. 실행할 수 없는 명령은 실행하지 않고 이유를 표시합니다.
-							</p>
 							<label htmlFor="command-search">명령 검색</label>
 							<input id="command-search" value={filter} onChange={event => setFilter(event.target.value)} />
 							<form

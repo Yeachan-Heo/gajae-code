@@ -627,7 +627,8 @@ describe("desktop streaming lifecycle", () => {
 		await call("delivery.ack", { deliveryId: "prompt-delivery" });
 		expect((await snapshot()).deliveries.some(receipt => receipt.id === "prompt-delivery")).toBe(false);
 		const done = (await snapshot()).sessions[0];
-		expect(done?.status).toBe("idle");
+		// A settled session that finished a turn reports "done"; a never-used session stays "idle".
+		expect(done?.status).toBe("done");
 		expect(done?.messages.map(message => message.text)).toContain("echo: 짧은 작업");
 		const history = await call<DesktopHistory>("history.get", { sessionId: session.id });
 		expect(history.messages.map(message => message.text)).toContain("짧은 작업");
