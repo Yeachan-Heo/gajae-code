@@ -1328,10 +1328,10 @@ export class MCPManager {
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
 		const reportedErrors = new Set<string>();
 		let allowBackgroundLogging = false;
-		let shouldPublishToolSnapshot = true;
 
 		// Prepare connection tasks
 		const connectionTasks: ConnectionTask[] = [];
+		const existingConnections = new Map<string, { connection: MCPServerConnection; epoch: number }>();
 
 		for (const [name, config] of Object.entries(configs)) {
 			if (this.#suppressedServers.has(name)) continue;
@@ -1372,14 +1372,10 @@ export class MCPManager {
 			// Skip if already connected.
 			if (this.#connections.has(name)) {
 				connectedServers.add(name);
-				if (this.#isExactToolPublicationAllowed(name)) {
-					allTools.push(
-						...this.#tools.filter(
-							tool =>
-								(tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
-						),
-					);
-				}
+				existingConnections.set(name, {
+					connection: this.#connections.get(name)!,
+					epoch: this.#disconnectEpochs.get(name) ?? 0,
+				});
 				continue;
 			}
 
@@ -1623,6 +1619,7 @@ export class MCPManager {
 			}
 
 			const cachedTools = new Map<string, MCPToolDefinition[]>();
+			const startupCleanupEpochs = new Map<string, number>();
 			const pendingTasks = connectionTasks.filter(task => task.tracked.status === "pending");
 
 			if (pendingTasks.length > 0) {
@@ -1654,6 +1651,13 @@ export class MCPManager {
 				const startupElapsedMs = Date.now() - startupStartedAt;
 				for (const task of pendingTasks) {
 					if (task.tracked.status !== "pending") continue;
+					if (
+						this.#epoch !== task.connectionEpoch ||
+						(this.#disconnectEpochs.get(task.name) ?? 0) !== task.disconnectEpoch ||
+						this.#serverConfigs.get(task.name) !== task.config
+					) {
+						continue;
+					}
 					if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
 						logger.warn("MCP server still connecting after the startup wait", {
 							path: `mcp:${task.name}`,
@@ -1680,11 +1684,15 @@ export class MCPManager {
 					if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
 						this.#pendingToolLoads.delete(task.name);
 					this.#pendingConnectionControllers.delete(task.name);
-					void this.#disconnectServer(task.name, {
+					const cleanup = this.#disconnectServer(task.name, {
 						preserveConfig: this.#toolsOnly || cachedTools.has(task.name),
 						preserveSource: cachedTools.has(task.name),
 						preserveTools: cachedTools.has(task.name),
-					}).catch(error => {
+					});
+					// This synchronous epoch advance belongs to startup cleanup, not an
+					// external disconnect invalidating the preserved cache fallback.
+					startupCleanupEpochs.set(task.name, this.#disconnectEpochs.get(task.name)!);
+					void cleanup.catch(error => {
 						this.#logLeaseReleaseFailure(task.name, undefined, error);
 					});
 				}
@@ -1696,11 +1704,12 @@ export class MCPManager {
 					const value = task.tracked.value;
 					if (!value) continue;
 					const { connection, serverTools } = value;
-					if (this.#pendingToolLoads.has(name) && this.#pendingToolLoads.get(name) !== task.toolsPromise) continue;
+					if (this.#pendingToolLoads.has(name) && this.#pendingToolLoads.get(name) !== task.toolsPromise) {
+						continue;
+					}
 					if (
 						!this.#isCurrentConnection(name, task.config, task.connectionEpoch, task.disconnectEpoch, connection)
 					) {
-						shouldPublishToolSnapshot = false;
 						continue;
 					}
 					connectedServers.add(name);
@@ -1740,10 +1749,13 @@ export class MCPManager {
 							this.#logLeaseReleaseFailure(name, this.#connections.get(name), error);
 						});
 					}
-					if ((this.#disconnectEpochs.get(name) ?? 0) !== task.disconnectEpoch) {
-						shouldPublishToolSnapshot = false;
-					}
 				} else {
+					if (
+						this.#epoch !== task.connectionEpoch ||
+						(this.#disconnectEpochs.get(name) ?? 0) !== (startupCleanupEpochs.get(name) ?? task.disconnectEpoch)
+					) {
+						continue;
+					}
 					const cached = cachedTools.get(name);
 					if (cached && this.#isExactToolPublicationAllowed(name)) {
 						const source = this.#sources.get(name);
@@ -1768,6 +1780,22 @@ export class MCPManager {
 			}
 		}
 
+		for (const [name, existing] of existingConnections) {
+			if (
+				this.#connections.get(name) !== existing.connection ||
+				(this.#disconnectEpochs.get(name) ?? 0) !== existing.epoch
+			) {
+				continue;
+			}
+			if (!this.#isExactToolPublicationAllowed(name)) continue;
+			allTools.push(
+				...this.#tools.filter(
+					tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+				),
+			);
+			allTools.push(...(this.#shadowedServerTools.get(name) ?? []));
+		}
+
 		// Stable sort by name so the order is independent of connection completion.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(allTools);
@@ -1776,11 +1804,47 @@ export class MCPManager {
 			throw new Error("MCP tool catalog contains duplicate tool names");
 		}
 
-		// Update cached tools
-		if (shouldPublishToolSnapshot) {
-			this.#publishToolCatalog(allTools);
-			this.#notifyToolsChanged();
+		// Preserve owners already published by connection completions, then retain
+		// colliding candidates for promotion when their owner disconnects.
+		if (this.#toolsOnly || allTools.length > 0) {
+			if (!this.#toolsOnly) {
+				const owners = new Map(this.#tools.map(tool => [tool.name, tool]));
+				const addressed = new Set(allTools.map(tool => (tool as MCPTool | DeferredMCPTool).mcpServerName));
+				const candidates = [
+					...allTools,
+					...this.#tools.filter(
+						tool =>
+							!(
+								(tool instanceof MCPTool || tool instanceof DeferredMCPTool) &&
+								addressed.has(tool.mcpServerName)
+							),
+					),
+				].sort((a, b) => {
+					if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+					const owner = owners.get(a.name);
+					const isOwner = (tool: typeof a) =>
+						owner instanceof MCPTool || owner instanceof DeferredMCPTool
+							? (tool instanceof MCPTool || tool instanceof DeferredMCPTool) &&
+								tool.mcpServerName === owner.mcpServerName
+							: false;
+					return Number(isOwner(b)) - Number(isOwner(a));
+				});
+				for (const name of addressed) this.#shadowedServerTools.delete(name);
+				allTools.length = 0;
+				const names = new Set<string>();
+				for (const tool of candidates) {
+					const server = (tool as MCPTool | DeferredMCPTool).mcpServerName;
+					this.#addServerTool(server, tool, allTools, names);
+				}
+				sortMCPToolsByName(allTools);
+			}
+		} else {
+			allTools.splice(0, allTools.length, ...this.#tools);
 		}
+		// Even an empty startup establishes an authoritative current catalog.
+		// Stale candidates above are excluded; unrelated current owners remain.
+		this.#publishToolCatalog(allTools);
+		this.#notifyToolsChanged();
 		allowBackgroundLogging = true;
 		this.#notifyServerControlsChanged();
 
@@ -1804,20 +1868,7 @@ export class MCPManager {
 			// replace another server's tool under the same name: keep the existing tool and
 			// hold the incoming one until the name is free.
 			const publishedNames = new Set(publishedTools.map(tool => tool.name));
-			const shadowed: CustomTool<TSchema, MCPToolDetails>[] = [];
-			for (const tool of tools) {
-				if (publishedNames.has(tool.name)) {
-					logger.warn("Skipping MCP tool whose name is already published by another server", {
-						path: `mcp:${name}`,
-						tool: tool.name,
-					});
-					shadowed.push(tool);
-					continue;
-				}
-				publishedNames.add(tool.name);
-				publishedTools.push(tool);
-			}
-			if (shadowed.length > 0) this.#shadowedServerTools.set(name, shadowed);
+			for (const tool of tools) this.#addServerTool(name, tool, publishedTools, publishedNames);
 		}
 		// This server may have dropped a name another connected server is waiting for.
 		this.#promoteShadowedTools(publishedTools);
@@ -1825,6 +1876,26 @@ export class MCPManager {
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(publishedTools);
 		this.#publishToolCatalog(publishedTools);
+	}
+
+	#addServerTool(
+		name: string,
+		tool: CustomTool<TSchema, MCPToolDetails>,
+		publishedTools: CustomTool<TSchema, MCPToolDetails>[],
+		publishedNames: Set<string>,
+	): void {
+		if (publishedNames.has(tool.name)) {
+			logger.warn("Skipping MCP tool whose name is already published by another server", {
+				path: `mcp:${name}`,
+				tool: tool.name,
+			});
+			const shadowed = this.#shadowedServerTools.get(name) ?? [];
+			shadowed.push(tool);
+			this.#shadowedServerTools.set(name, shadowed);
+			return;
+		}
+		publishedNames.add(tool.name);
+		publishedTools.push(tool);
 	}
 
 	/**
