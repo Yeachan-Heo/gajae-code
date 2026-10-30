@@ -47,50 +47,31 @@ function parseGitignorePatterns(content: string, gitignoreDir: string, baseDir: 
 
 		let pattern = line;
 
-		// Handle trailing slash (directory-only match)
-		// For glob exclude, we treat it as matching the dir and its contents
-		const isDirectoryOnly = pattern.endsWith("/");
-		if (isDirectoryOnly) {
+		// Trailing slash restricts the match to directories; for glob exclude we
+		// treat it like any other pattern that names a directory.
+		if (pattern.endsWith("/")) {
 			pattern = pattern.slice(0, -1);
 		}
 
-		// Handle rooted patterns (start with /)
-		if (pattern.startsWith("/")) {
-			// Rooted pattern: relative to the .gitignore location
-			const absolutePattern = path.join(gitignoreDir, pattern.slice(1));
+		if (pattern.startsWith("/") || (pattern.includes("/") && !pattern.startsWith("**/"))) {
+			// Rooted or containing a middle separator: git anchors these to the
+			// .gitignore's directory
+			const absolutePattern = path.join(gitignoreDir, pattern.startsWith("/") ? pattern.slice(1) : pattern);
 			const relativeToBase = path.relative(baseDir, absolutePattern);
 			if (relativeToBase.startsWith("..")) {
 				// Pattern is outside the search directory, skip
 				continue;
 			}
 			pattern = relativeToBase.replace(/\\/g, "/");
-			if (isDirectoryOnly) {
-				patterns.push(pattern);
-				patterns.push(`${pattern}/**`);
-			} else {
-				patterns.push(pattern);
-			}
-		} else if (pattern.includes("/") && !pattern.startsWith("**/")) {
-			// Separator in the middle: git anchors these to the .gitignore's
-			// directory, same as rooted patterns
-			const absolutePattern = path.join(gitignoreDir, pattern);
-			const relativeToBase = path.relative(baseDir, absolutePattern);
-			if (relativeToBase.startsWith("..")) {
-				// Pattern is outside the search directory, skip
-				continue;
-			}
-			pattern = relativeToBase.replace(/\\/g, "/");
-			patterns.push(pattern);
-			if (isDirectoryOnly) {
-				patterns.push(`${pattern}/**`);
-			}
 		} else {
 			// No middle separator: match file/dir name anywhere in the tree
-			patterns.push(`**/${pattern}`);
-			if (isDirectoryOnly) {
-				patterns.push(`**/${pattern}/**`);
-			}
+			pattern = `**/${pattern}`;
 		}
+
+		// git excludes everything under a matched directory whether or not the
+		// pattern ends in `/` (`dist` ignores `dist/app.js`), but glob matching is
+		// whole-path, so the contents need their own `/**` pattern.
+		patterns.push(pattern, `${pattern}/**`);
 	}
 
 	return patterns;

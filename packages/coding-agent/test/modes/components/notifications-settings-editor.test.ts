@@ -1,22 +1,25 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import {
-	type NotificationsConfigureCommitResult,
-	type NotificationsEditorOperations,
-	type NotificationsEditorPreferences,
-	type NotificationsEditorSetupInput,
-	type NotificationsEditorState,
-	type NotificationsPreflightResult,
-	type NotificationsProviderSetupInput,
-	type NotificationsSaveInactiveResult,
-	NotificationsSettingsEditorComponent,
-	type PreparedNotificationProviderConfiguration,
-} from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
+import type { Settings, SettingsAtomicPatch, SettingsAtomicReceipt } from "@gajae-code/coding-agent/config/settings";
+import { NotificationsSettingsEditorComponent } from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { NotificationProvider } from "@gajae-code/coding-agent/sdk/bus/config";
+import type { NotificationProvider, NotificationSettingsSnapshot } from "@gajae-code/coding-agent/sdk/bus/config";
 import type {
 	NotificationHealthReport,
 	NotificationStatusReport,
 } from "@gajae-code/coding-agent/sdk/bus/notification-service";
+import { createNotificationsEditorOperations } from "@gajae-code/coding-agent/sdk/notification-setup";
+import type {
+	NotificationsConfigureCommitResult,
+	NotificationsEditorOperations,
+	NotificationsEditorPreferences,
+	NotificationsEditorSetupInput,
+	NotificationsEditorState,
+	NotificationsPreflightResult,
+	NotificationsProviderSetupInput,
+	NotificationsSaveInactiveResult,
+	PreparedNotificationProviderConfiguration,
+	PreparedTelegramConfiguration,
+} from "@gajae-code/coding-agent/sdk/notification-setup-contract";
 
 beforeAll(async () => {
 	await initTheme();
@@ -34,7 +37,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 async function flush(): Promise<void> {
-	for (let index = 0; index < 8; index += 1) await Promise.resolve();
+	for (let index = 0; index < 32; index += 1) await Promise.resolve();
 }
 
 function health(overall: "ok" | "warn" | "error" = "warn"): NotificationHealthReport {
@@ -318,7 +321,192 @@ function enterTelegramTokenWithoutChat(component: NotificationsSettingsEditorCom
 	component.handleInput(token);
 }
 
+function realAdapterFixture(inactive = false) {
+	const snapshot: NotificationSettingsSnapshot = {
+		enabled: false,
+		telegram: {
+			sound: "all",
+			rich: { enabled: true },
+			btw: { enabled: true },
+			richDraft: { enabled: false },
+			toolActivity: { enabled: false },
+			streaming: { enabled: true },
+			topics: {},
+		},
+		discord: {},
+		slack: {},
+		redact: false,
+		verbosity: "lean",
+		sessionScope: "all",
+		idleTimeoutMs: 60_000,
+	};
+	const persisted: SettingsAtomicPatch[][] = [];
+	let attempts = 0;
+	let preparations = 0;
+	const receipt = {
+		revisions: [],
+		restore: async () => ({ status: "discarded" }),
+		discard: () => {},
+	} as unknown as SettingsAtomicReceipt;
+	const persist = async (patches: readonly SettingsAtomicPatch[]) => {
+		attempts++;
+		if (attempts === 1) throw new Error("persistence unavailable");
+		persisted.push([...patches]);
+		return receipt;
+	};
+	const settings = {
+		canPersistDurableConfig: () => true,
+		getNotificationSettingsSnapshot: () => snapshot,
+		getAgentDir: () => "/unused-notification-editor-test",
+		commitAtomicBatch: persist,
+	} as unknown as Settings;
+	const operations = createNotificationsEditorOperations(
+		{
+			settings,
+			session: { notificationSessionController: undefined },
+			sessionManager: { getCwd: () => "/unused", getSessionId: () => "editor-test" },
+		},
+		{
+			buildNotificationStatusReport: () => state().status,
+			checkNotificationHealth: async () => health("ok"),
+			resolveTelegramSetupPreflight: async () => ({}),
+			runTelegramSetup: async () => {
+				preparations++;
+				return {
+					ok: true,
+					chatId: "1001",
+					tokenFingerprint: "fingerprint",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				};
+			},
+			proposedTelegramIdentity: async () => ({ status: inactive ? "foreign" : "absent" }),
+			reconcileCommittedTelegramConfiguration: async input => ({
+				status: "activated",
+				receipt: input.receipt,
+				reconnect: "attached",
+			}),
+			saveTelegramInactive: async input => ({
+				status: "saved_inactive",
+				receipt: await persist([
+					{ path: "notifications.telegram.botToken", op: "set", value: input.botToken },
+					{ path: "notifications.telegram.chatId", op: "set", value: input.chatId },
+				]),
+			}),
+			providerRuntime: { activate: async () => {}, deactivate: async () => {} },
+		},
+	);
+	return { operations, persisted, snapshot, attempts: () => attempts, preparations: () => preparations };
+}
+
 describe("NotificationsSettingsEditorComponent", () => {
+	for (const inactive of [false, true]) {
+		it(`re-prepares Telegram after a failed ${inactive ? "inactive save" : "save"} with the real adapter`, async () => {
+			const fixture = realAdapterFixture(inactive);
+			const drafts: PreparedTelegramConfiguration[] = [];
+			const preflight = fixture.operations.preflightProposedIdentity;
+			fixture.operations.preflightProposedIdentity = async (...args) => {
+				const result = await preflight(...args);
+				if (result.draft) drafts.push(result.draft);
+				return result;
+			};
+			const component = new NotificationsSettingsEditorComponent(fixture.operations);
+			const secret = "123456:abcdefghijklmnopqrstuvwxyz_ABCDE";
+			await flush();
+			enterTelegramToken(component, secret);
+			expect(render(component)).not.toContain(secret);
+			component.handleInput("\n");
+			await flush();
+			expect(component.mode).toBe("review");
+			component.handleInput("\n");
+			await flush();
+			expect(component.mode).toBe("chat-entry");
+			expect(render(component, 240)).toContain("fresh setup preflight");
+			expect(render(component, 240)).not.toContain("Retry when ready");
+			expect(render(component)).not.toContain(secret);
+			expect(fixture.persisted).toEqual([]);
+			expect(JSON.stringify(fixture.snapshot)).not.toContain(secret);
+			expect(JSON.stringify(drafts)).not.toContain(secret);
+			await expect(
+				inactive ? fixture.operations.saveInactive(drafts[0]!) : fixture.operations.commitConfigure(drafts[0]!),
+			).rejects.toThrow("draft expired");
+			component.handleInput("1001");
+			component.handleInput("\n");
+			expect(component.mode).toBe("token-entry");
+			expect(fixture.attempts()).toBe(1);
+			component.handleInput(secret);
+			component.handleInput("\n");
+			await flush();
+			expect(component.mode).toBe("review");
+			expect(drafts).toHaveLength(2);
+			expect(drafts[0]).not.toBe(drafts[1]);
+			component.handleInput("\n");
+			await flush();
+			expect(component.mode).toBe("home");
+			expect(fixture.attempts()).toBe(2);
+			expect(fixture.preparations()).toBe(2);
+			expect(render(component)).not.toContain(secret);
+		});
+	}
+
+	for (const throws of [false, true]) {
+		it(`re-prepares provider authority after ${throws ? "a thrown commit" : "a persistence refusal"}`, async () => {
+			const fixture = realAdapterFixture();
+			const drafts: PreparedNotificationProviderConfiguration[] = [];
+			const prepare = fixture.operations.prepareProviderConfiguration;
+			fixture.operations.prepareProviderConfiguration = async input => {
+				const draft = await prepare(input);
+				drafts.push(draft);
+				return draft;
+			};
+			const commit = fixture.operations.commitProviderConfiguration;
+			fixture.operations.commitProviderConfiguration = async draft => {
+				const result = await commit(draft);
+				if (throws && result.outcome === "failed") throw new Error("provider commit refused");
+				return result;
+			};
+			const component = new NotificationsSettingsEditorComponent(fixture.operations);
+			await flush();
+			component.handleInput("\n");
+			select(component, 1);
+			component.handleInput("\n");
+			component.handleInput("\n");
+			const secret = "discord-replacement-secret";
+			const fill = () => {
+				component.handleInput("replace");
+				component.handleInput("\n");
+				component.handleInput(secret);
+				expect(render(component)).not.toContain(secret);
+				component.handleInput("\n");
+				for (const value of ["application", "guild", "channel"]) {
+					component.handleInput(value);
+					component.handleInput("\n");
+				}
+			};
+			fill();
+			await flush();
+			expect(component.mode).toBe("provider-review");
+			component.handleInput("\n");
+			await flush();
+			expect(component.mode).toBe("provider-form");
+			expect(render(component, 240)).toContain("Re-enter secret actions");
+			expect(fixture.persisted).toEqual([]);
+			expect(JSON.stringify(fixture.snapshot)).not.toContain(secret);
+			expect(await commit(drafts[0]!)).toMatchObject({ outcome: "failed", code: "invalid_draft" });
+			expect(fixture.attempts()).toBe(1);
+			fill();
+			await flush();
+			expect(drafts).toHaveLength(2);
+			expect(drafts[0]).not.toBe(drafts[1]);
+			component.handleInput("\n");
+			await flush();
+			expect(component.mode).toBe("provider-actions");
+			expect(fixture.attempts()).toBe(2);
+			expect(render(component)).not.toContain(secret);
+		});
+	}
+
 	it("defaults unsaved Telegram tool activity off and streaming on before asynchronous state loads", () => {
 		const component = new NotificationsSettingsEditorComponent(new FakeNotificationsOperations());
 		select(component, 10);
@@ -464,6 +652,35 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(restoreCalls).toBe(1);
 		expect(operations.reconcileCalls).toBe(0);
 		expect(render(component)).toContain("settings changed at: notifications.telegram.chatId");
+	});
+
+	it.each([
+		"not-restorable",
+		"marker_blocked",
+	] as const)("reports %s without claiming a foreign daemon", async status => {
+		const operations = new FakeNotificationsOperations();
+		operations.commitResult = {
+			status: "blocked_identity",
+			receipt: {} as never,
+			message: "Blocked.",
+			restore: async () =>
+				status === "not-restorable" ? { status: "not-restorable" } : { status: "marker_blocked" },
+			retainCommitted: () => {},
+		};
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		const display = render(component);
+		expect(display).toContain(
+			status === "not-restorable" ? "receipt is not restorable" : "inactive marker could not be restored",
+		);
+		expect(display).not.toContain("foreign daemon");
 	});
 
 	it("retains blocked configuration only when Keep saved (inactive) is explicitly selected", async () => {
@@ -635,7 +852,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(output).toContain("WARNING");
 		expect(output).toContain("Configuration was saved, but post-commit reconciliation or refresh failed.");
 	});
-	it("renders inactive-save observer failure without claiming success", async () => {
+	it("renders inactive-save reconciliation and observer failures without claiming runtime success", async () => {
 		const operations = new FakeNotificationsOperations();
 		operations.preflightProposedIdentity = async input => {
 			input.token.consume();
@@ -655,9 +872,10 @@ describe("NotificationsSettingsEditorComponent", () => {
 			};
 		};
 		operations.saveInactive = async () => ({
-			status: "observer_failed",
+			status: "reconciliation_failed",
 			receipt: {} as never,
-			message: "Telegram configuration was saved inactive, but the settings observer failed.",
+			message:
+				"Telegram configuration was saved inactive, but current-session reconciliation failed and settings observer failed.",
 		});
 		const component = new NotificationsSettingsEditorComponent(operations);
 		await flush();
@@ -669,7 +887,10 @@ describe("NotificationsSettingsEditorComponent", () => {
 		await flush();
 		const output = render(component, 240);
 		expect(output).toContain("WARNING");
-		expect(output).toContain("Telegram configuration was saved inactive, but the settings observer failed.");
+		expect(output).toContain(
+			"Telegram configuration was saved inactive, but current-session reconciliation failed and settings observer failed.",
+		);
+		expect(operations.reconcileCalls).toBe(0);
 	});
 	it("revokes an in-flight prepared provider draft when disposed", async () => {
 		const operations = new FakeNotificationsOperations();

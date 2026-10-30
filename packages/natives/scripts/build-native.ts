@@ -246,6 +246,7 @@ const requiredGeneratedBindingSymbols = [
 	"openRecoveryFsRoot",
 	"rasterizeSvg",
 	"TtyWriter",
+	"reassertRawTty",
 	"repairOwnerOnlyPathSecurityExpected",
 	"structuredPatchHunks",
 	"verifyOwnerOnlyPathSecurityExpected",
@@ -253,6 +254,7 @@ const requiredGeneratedBindingSymbols = [
 	"__gjcInstallTokioRuntime",
 	"PowerAssertion",
 	"currentExecutablePath",
+	"readOwnerOnlyFile",
 	"windowsOrdinalCaseFold",
 ] as const;
 

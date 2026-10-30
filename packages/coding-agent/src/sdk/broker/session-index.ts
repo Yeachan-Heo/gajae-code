@@ -56,6 +56,8 @@ export interface RetentionPolicy {
 	maxAgeMs?: number;
 	maxRows?: number;
 	tombstoneRule?: SessionTombstoneRule;
+	/** Rejection-audit size past which the next write rotates it to `index-audit.jsonl.1`. */
+	auditRotateBytes?: number;
 }
 export interface SessionIndexObservationDeps {
 	/** Test seam for an exact retained process-identity observation. */
@@ -392,12 +394,14 @@ interface ResolvedRetentionPolicy {
 	maxAgeMs: number;
 	maxRows: number;
 	tombstoneRule: SessionTombstoneRule;
+	auditRotateBytes: number;
 }
 const resolvePolicy = (policy: RetentionPolicy): ResolvedRetentionPolicy => ({
 	clock: policy.clock ?? Date.now,
 	maxAgeMs: policy.maxAgeMs ?? DEFAULT_SESSION_RETENTION_MAX_AGE_MS,
 	maxRows: policy.maxRows ?? DEFAULT_SESSION_RETENTION_MAX_ROWS,
 	tombstoneRule: policy.tombstoneRule ?? "retain",
+	auditRotateBytes: policy.auditRotateBytes ?? ROTATE_BYTES,
 });
 
 interface RejectedEvent {
@@ -1012,6 +1016,49 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 	return kept;
 }
 
+/**
+ * Adds the indexSeq of every audit row in [start, end) to `seqs` and returns the
+ * bytes through the last newline (`complete`) and the bytes after it (`tail`).
+ * Callers hold the index lock, so a tail is left by a crashed write, never one in
+ * flight; it is parsed too, so a record that lost only its newline still dedupes.
+ */
+async function readAuditedSeqs(
+	file: string,
+	start: number,
+	end: number,
+	seqs: Set<number>,
+): Promise<{ complete: number; tail: number }> {
+	let h: fs.FileHandle;
+	try {
+		h = await fs.open(file, "r");
+	} catch (error) {
+		if (isEnoent(error)) return { complete: 0, tail: 0 };
+		throw error;
+	}
+	try {
+		const data = Buffer.alloc(end - start);
+		let read = 0;
+		while (read < data.length) {
+			const { bytesRead } = await h.read(data, read, data.length - read, start + read);
+			if (bytesRead <= 0) break;
+			read += bytesRead;
+		}
+		const complete = data.subarray(0, read).lastIndexOf(0x0a) + 1;
+		for (const line of data.subarray(0, read).toString("utf8").split("\n")) {
+			if (!line) continue;
+			try {
+				const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
+				if (typeof record.indexSeq === "number") seqs.add(record.indexSeq);
+			} catch {
+				// Best-effort dedupe seed; a corrupt audit row never blocks the index.
+			}
+		}
+		return { complete, tail: read - complete };
+	} finally {
+		await h.close();
+	}
+}
+
 async function appendSync(file: string, value: string): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
 	let failure: { error: unknown } | undefined;
@@ -1305,8 +1352,8 @@ export class SessionIndex {
 	 * polling refresh path prove "index unchanged" with two stats.
 	 */
 	#changeStamp: SessionIndexChangeStamp | undefined;
-	/** indexSeqs already recorded in the durable audit; null until lazily seeded. */
-	#auditedSeq: Set<number> | null = null;
+	/** indexSeqs recorded in the audit file `ino`, read up to `offset`; null until lazily seeded. */
+	#audited: { seqs: Set<number>; ino: bigint; offset: number } | null = null;
 	constructor(agentDir: string, policy: RetentionPolicy = {}, observationDeps: SessionIndexObservationDeps = {}) {
 		this.#agentDir = agentDir;
 		this.#policy = resolvePolicy(policy);
@@ -1496,33 +1543,60 @@ export class SessionIndex {
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
 		if (this.#corruptSuffix) this.#warnings.push("Corrupt session index entry; replay truncated");
 	}
-	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
+	/**
+	 * Append records for newly-rejected events, deduped against the audit file on disk.
+	 *
+	 * Every audit writer holds the index lock, so catching up on rows other processes
+	 * appended needs only the bytes past this reader's last offset. A view seeded once
+	 * per process went stale in long-lived readers (broker, hosts), which re-archived
+	 * every rejection another process had already written: one install held 1.66 M rows
+	 * for 114 k distinct indexSeqs. An audit larger than the rotation bound and than
+	 * twice the current rejections moves to `index-audit.jsonl.1`, replacing the previous
+	 * generation, before anything reads it, so a cold reader never parses an unbounded
+	 * file; the new generation re-records only what the index still rejects.
+	 */
 	async #writeAuditUnderLock(): Promise<void> {
 		const candidates = auditRecords(this.#events, this.#policy.clock());
 		// The audit log only dedupes rejections, so a reader with none never pays
 		// for loading it.
 		if (candidates.length === 0) return;
-		if (this.#auditedSeq === null) {
-			this.#auditedSeq = new Set();
+		const file = auditFor(this.#agentDir);
+		let stat = await statIndexFile(file);
+		if (
+			stat.exists &&
+			stat.size > this.#policy.auditRotateBytes &&
+			stat.size > 2 * candidates.reduce((sum, record) => sum + JSON.stringify(record).length + 1, 0)
+		) {
 			try {
-				const contents = await fs.readFile(auditFor(this.#agentDir), "utf8");
-				for (const line of contents.split("\n")) {
-					if (!line) continue;
-					try {
-						const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
-						if (typeof record.indexSeq === "number") this.#auditedSeq.add(record.indexSeq);
-					} catch {
-						// Best-effort dedupe seed; a corrupt audit row never blocks the index.
-					}
-				}
+				await fs.rename(file, `${file}.1`);
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				// Rotation only bounds a later read; a failed one must not fail the index operation.
+				logger.warn("sdk broker: session index audit rotation failed", { error: String(error) });
 			}
+			stat = await statIndexFile(file);
 		}
-		const pending = candidates.filter(record => !this.#auditedSeq!.has(record.indexSeq));
+		const seeded = this.#audited;
+		const audited =
+			seeded && stat.exists && seeded.ino === stat.ino && stat.size >= seeded.offset
+				? seeded
+				: { seqs: new Set<number>(), ino: stat.ino, offset: 0 };
+		this.#audited = audited;
+		let tail = 0;
+		if (stat.size > audited.offset) {
+			const read = await readAuditedSeqs(file, audited.offset, stat.size, audited.seqs);
+			audited.offset += read.complete;
+			tail = read.tail;
+		}
+		const pending = candidates.filter(record => !audited.seqs.has(record.indexSeq));
 		if (pending.length === 0) return;
-		await appendSync(auditFor(this.#agentDir), pending.map(record => JSON.stringify(record)).join("\n"));
-		for (const record of pending) this.#auditedSeq.add(record.indexSeq);
+		const rows = pending.map(record => JSON.stringify(record)).join("\n");
+		// Start a new line after a crashed write's tail, so these rows never join it.
+		await appendSync(file, tail > 0 ? `\n${rows}` : rows);
+		for (const record of pending) audited.seqs.add(record.indexSeq);
+		// Nothing else appends while the lock is held, so the file now ends at this write.
+		const written = await statIndexFile(file);
+		audited.ino = written.ino;
+		audited.offset = written.size;
 	}
 	async #scan(): Promise<SessionIndexScan> {
 		let snapshotContents: Buffer | undefined;

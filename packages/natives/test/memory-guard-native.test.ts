@@ -78,4 +78,23 @@ describe("probeWindowsJobMemory", () => {
 			),
 		).toThrow("currentExecutablePath");
 	});
+
+	it("rejects stale same-version bindings without the owner-only reader", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__gjcInstallTokioRuntime: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+		};
+		const validate = (candidate: Record<string, unknown>) =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				candidate,
+				"cached-addon.node",
+			);
+		expect(() => validate(bindings)).toThrow("readOwnerOnlyFile");
+		expect(() => validate({ ...bindings, readOwnerOnlyFile: () => undefined })).not.toThrow();
+	});
 });

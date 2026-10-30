@@ -179,33 +179,43 @@ export type JsonSchemaObject = {
 	const?: unknown;
 };
 
-interface BooleanDef {
+export interface SettingApplication {
+	kind: "next-run" | "host-presentation" | "reload" | "restart";
+	reason: string;
+}
+
+interface SettingApplicationMetadata {
+	/** Absent means application behavior has not been classified for the portable catalog. */
+	application?: SettingApplication;
+}
+
+interface BooleanDef extends SettingApplicationMetadata {
 	type: "boolean";
 	default?: boolean;
 	ui?: UiBoolean;
 }
 
-interface StringDef {
+interface StringDef extends SettingApplicationMetadata {
 	type: "string";
 	default: string | undefined;
 	ui?: UiString;
 }
 
-interface NumberDef {
+interface NumberDef extends SettingApplicationMetadata {
 	type: "number";
 	default: number;
 	validate?: (value: number) => boolean;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> {
+interface EnumDef<T extends readonly string[]> extends SettingApplicationMetadata {
 	type: "enum";
 	values: T;
 	default: T[number];
 	ui?: UiEnum<T>;
 }
 
-interface ArrayDef<T> {
+interface ArrayDef<T> extends SettingApplicationMetadata {
 	type: "array";
 	default: T[];
 	items?: { enum: readonly string[] };
@@ -227,7 +237,7 @@ interface ConstrainedRecordValueDef {
 	description: string;
 }
 
-interface ConstrainedRecordDef<T> {
+interface ConstrainedRecordDef<T> extends SettingApplicationMetadata {
 	type: "constrained-record";
 	default: T;
 	keys: readonly string[];
@@ -236,14 +246,14 @@ interface ConstrainedRecordDef<T> {
 	ui?: UiBase;
 }
 
-interface RecordDef<T> {
+interface RecordDef<T> extends SettingApplicationMetadata {
 	type: "record";
 	default: Record<string, T>;
 	valueSchema?: RecordValueDef;
 	ui?: UiBase;
 }
 
-export interface OptionalObjectDef<T> {
+export interface OptionalObjectDef<T> extends SettingApplicationMetadata {
 	type: "optional-object";
 	default: undefined;
 	jsonSchema: JsonSchemaObject;
@@ -1384,6 +1394,10 @@ export const SETTINGS_SCHEMA = {
 
 	// Sampling
 	temperature: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1402,6 +1416,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1420,6 +1438,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topK: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1437,6 +1459,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	minP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1453,6 +1479,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	presencePenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1470,6 +1500,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	repetitionPenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {

@@ -149,7 +149,7 @@ describe("tmux launch identity provenance", () => {
 			expect(launched.inner).not.toContain(victimState);
 			expect(launched.inner).not.toContain(PLANTED_GJC_SESSION);
 			expect(launched.inner).not.toContain(PLANTED_COORDINATOR);
-			expect(launched.inner).not.toContain(path.join(path.dirname(victimState), "tmux-exit.json"));
+			expect(launched.inner).not.toContain(`GJC_TMUX_OWNER_STATE_DIR='${path.dirname(victimState)}'`);
 			expect(childSessionAssignment(launched.inner)).toBe(launched.sessionName);
 		});
 	});
@@ -181,7 +181,8 @@ describe("tmux launch identity provenance", () => {
 			expect(launched.sessionName).toBe(OPERATOR_SESSION);
 			expect(launched.inner).toContain(OPERATOR_COORDINATOR);
 			expect(launched.inner).toContain(stateFile);
-			expect(launched.inner).toContain(path.join(cwd, "tmux-exit.json"));
+			// The supervised owner state dir follows the operator state file pin.
+			expect(launched.inner).toContain(`GJC_TMUX_OWNER_STATE_DIR='${cwd}'`);
 		});
 	});
 

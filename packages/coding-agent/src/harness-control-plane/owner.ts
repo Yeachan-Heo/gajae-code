@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event-contract";
 import { observeAgentWireFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
@@ -623,6 +624,7 @@ export class RuntimeOwner {
 		} else {
 			try {
 				branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+					env: projectSafeSpawnEnv(),
 					cwd: workspace,
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "ignore"],
@@ -632,6 +634,7 @@ export class RuntimeOwner {
 			}
 			try {
 				const porcelain = execFileSync("git", ["status", "--porcelain"], {
+					env: projectSafeSpawnEnv(),
 					cwd: workspace,
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "ignore"],

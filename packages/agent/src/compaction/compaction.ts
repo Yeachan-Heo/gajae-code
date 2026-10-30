@@ -987,15 +987,21 @@ const SUMMARY_FENCE_OPEN = "<untrusted-content>\n";
 const SUMMARY_FENCE_CLOSE = "\n</untrusted-content>";
 
 /**
- * Closers that would end the summary fence or the surrounding conversation
- * block. Whitespace before ">" still closes the tag, so those spellings go too.
+ * Neutralize sequences that would close wrapper tags used in the compaction prompt
+ * (conversation, untrusted-content, previous-summary, summary), without lossy HTML
+ * entity encoding that corrupts code. We insert zero-width spaces to break the tag
+ * syntax instead. Whitespace before ">" still closes the tag, so those spellings go too.
  */
 function escapeSummaryFenceClosers(text: string): string {
 	return text
-		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/conversation>/gi, "&lt;/conversation>")
-		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "&lt;/conversation>");
+		.replace(/<\/untrusted-content>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/conversation>/gi, "<\u200b/conversation>")
+		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "<\u200b/conversation>")
+		.replace(/<\/previous-summary>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/summary>/gi, "<\u200b/summary>")
+		.replace(/<\/summary[ \t\n\r\f]+>/gi, "<\u200b/summary>");
 }
 
 /**
@@ -1026,6 +1032,18 @@ function outboundSummaryText(text: string, convert: ConvertToLlm): string {
 		if (block.type === "text") return block.text;
 	}
 	return text;
+}
+
+/**
+ * Frame a stored previous summary at the model boundary.
+ * Outbound conversion already ran; this text is not clipped.
+ * Fence and conversation closers stay neutralized, and previous-summary closers are too.
+ */
+export function frameOutboundPreviousSummary(text: string): string {
+	const escaped = escapeSummaryFenceClosers(text)
+		.replace(/<\/previous-summary>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "<\u200b/previous-summary>");
+	return `${SUMMARY_FENCE_OPEN}${escaped}${SUMMARY_FENCE_CLOSE}`;
 }
 
 export async function generateSummary(
@@ -1059,7 +1077,8 @@ export async function generateSummary(
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		const outboundPreviousSummary = outboundSummaryText(previousSummary, options?.convertToLlm ?? convertToLlm);
-		promptText += `<previous-summary>\n${outboundPreviousSummary}\n</previous-summary>\n\n`;
+		const framedPreviousSummary = frameOutboundPreviousSummary(outboundPreviousSummary);
+		promptText += `<previous-summary>\n${framedPreviousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
 	promptText += basePrompt;
@@ -1159,11 +1178,38 @@ export interface HandoffOptions {
 	preferWebsockets?: boolean;
 }
 
+/** Characters of handoff focus or prompt extension kept before framing. */
+export const HANDOFF_UNTRUSTED_FIELD_MAX_CHARS = 4_000;
+
+const HANDOFF_FIELD_OPEN = "<untrusted-content>\n";
+const HANDOFF_FIELD_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Tail-clip, then frame. The fence is the last step so a tail cut cannot drop
+ * the opener or leave a closer outside it.
+ */
+function clipHandoffField(text: string): string {
+	if (text.length <= HANDOFF_UNTRUSTED_FIELD_MAX_CHARS) return text;
+	let start = text.length - HANDOFF_UNTRUSTED_FIELD_MAX_CHARS;
+	// A code-unit cut can begin on a low surrogate and emit an isolated half of a character.
+	const code = text.charCodeAt(start);
+	if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+	return text.slice(start);
+}
+
+function frameHandoffField(text: string): string {
+	const clipped = clipHandoffField(text);
+	const escaped = clipped
+		.replace(/<\s*\/?\s*untrusted-content(?=[\s>/]|$)/gi, tag => tag.replace(/</g, "&lt;"))
+		.replace(/<\s*\/\s*instruction(?=[\s>/]|$)/gi, tag => tag.replace(/</g, "&lt;"));
+	return `${HANDOFF_FIELD_OPEN}${escaped}${HANDOFF_FIELD_CLOSE}`;
+}
+
 export function renderHandoffPrompt(customInstructions?: string, promptExtension?: string): string {
 	if (!customInstructions && !promptExtension) return HANDOFF_DOCUMENT_PROMPT;
 	return prompt.render(handoffDocumentPrompt, {
-		additionalFocus: customInstructions,
-		promptExtension,
+		additionalFocus: customInstructions ? frameHandoffField(customInstructions) : customInstructions,
+		promptExtension: promptExtension ? frameHandoffField(promptExtension) : promptExtension,
 	});
 }
 

@@ -603,6 +603,25 @@ continuation that supplies a different scope or anchor fails with
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
 
+Rows also carry Broker-recorded ownership. `role: "master"` marks a session
+whose index row records a master role, including the caller's own row.
+`spawnedBy: { masterSessionId }` names the master whose `gjc sdk spawn` created
+the session, from Broker spawn authority, which keeps the owner after the child
+closes. `masterSessionId` is the master's lineage owner id, which can differ
+from its current row id after a session switch. `spawnedBy` is omitted when
+the Broker has no spawn authority for the session (for example a spawn that
+never reached host registration), or when recorded authorities disagree. When
+the command runs inside a master session's Bash tool, `spawnedBy.self` is
+`true` for that master's own children and `false` for another master's; the Bash
+tool in a non-master session never passes an inherited owner id through, so
+`self` is absent there. The same fields appear on `gjc sdk session list` and
+`gjc sdk session inspect` rows. The `gjc sdk search` table shows them in the
+`OWNER` column: `self`, `other`, or `spawned` (no viewer) for spawned children,
+`master` for master sessions (`master/self`, `master/other`, or
+`master/spawned` when a master was itself spawned), and `-` otherwise. `role`
+has no self flag, so the caller's own master row also renders as `master`;
+match it against `GJC_SESSION_ID`.
+
 ## Read-only broker observation (`gjc sdk diagnostics broker`)
 
 `gjc sdk diagnostics broker [--agent-dir <dir>] [--expected-generation <id>] [--timeout-ms <ms>] [--json]`

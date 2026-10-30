@@ -102,7 +102,7 @@ import {
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
-import { validateRequiredPromptText } from "../protocol/adapter-validation";
+import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
@@ -2835,9 +2835,7 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 	seen.add(value);
 	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
 	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
+		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
 	);
 }
 async function resolveSdkWorkflowGate(

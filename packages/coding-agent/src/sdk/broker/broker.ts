@@ -148,6 +148,7 @@ import {
 	type SpawnAuthorityV1,
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
+	type SpawnLifecycleOwner,
 	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -173,6 +174,12 @@ export interface BrokerSettings {
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
+	/**
+	 * How long a headless spawn host that acknowledged an endpoint `session.close`
+	 * may take to exit before the substrate close escalates. Defaults to the host's
+	 * own postmortem cleanup deadline.
+	 */
+	spawnHostCloseGraceMs?: number;
 	/**
 	 * Grace before a broker nobody is left to use exits on its own. The clock only
 	 * runs while the index proves no live session host and no open spawn authority,
@@ -225,6 +232,7 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	spawnHostCloseGraceMs: number;
 	abandonedGraceMs: number;
 	reapWhenAbandoned: boolean;
 	restartRequestId?: string;
@@ -519,13 +527,22 @@ export type SpawnQ26Reconciliation = {
 	acceptedAt?: number;
 };
 
+/** Exact registration a spawn waits for, bounded by the original readiness deadline. */
+export interface SpawnRegistrationRequest {
+	childId: string;
+	cwd: string;
+	stateRoot: string;
+	/** Resolved SDK host (not the managed supervisor); registration must match it exactly. */
+	owner: SpawnLifecycleOwner;
+	effectMarker: string;
+	deadlineAt: number;
+}
+
 /** Q26-only host control seam. It never receives or returns durable request material. */
 export interface SpawnPromptLayer {
-	awaitRegistration(input: {
-		childId: string;
-		cwd: string;
-		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }>;
+	awaitRegistration(
+		input: SpawnRegistrationRequest,
+	): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }>;
 	dispatch(input: {
 		sessionId: string;
 		task: string;
@@ -538,6 +555,12 @@ export interface SpawnPromptLayer {
 		clientRef: string;
 		pinned: SpawnHostRegistration;
 	}): Promise<SpawnQ26Reconciliation>;
+	/**
+	 * Ask the exact pinned host to close itself through its authenticated endpoint.
+	 * `accepted` means the host acknowledged `session.close`; anything else leaves the
+	 * close to the substrate provider. Production uses the endpoint attachment.
+	 */
+	close?(input: { sessionId: string; pinned: SpawnHostRegistration }): Promise<"accepted" | "unavailable">;
 }
 
 type SpawnAdmissionInput = {
@@ -645,9 +668,11 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
 
-const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
+const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
+/** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
+const SPAWN_HOST_CLOSE_GRACE_MS = 5_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
 const BROKER_ABANDONED_GRACE_DEFAULT_MS = 120_000;
 const MANAGED_CLOSE_WAIT_MS = 10_000;
@@ -728,10 +753,15 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 /** Exact admission predicate for the child host row published after launch. */
 export function spawnRegistrationMatches(
 	candidate: IndexedSession,
-	expected: { childId: string; cwd: string; stateRoot: string },
+	expected: { childId: string; cwd: string; stateRoot: string; owner: SpawnLifecycleOwner; effectMarker: string },
 ): boolean {
 	return (
 		candidate.sessionId === expected.childId &&
+		// The registered row must be the resolved SDK host for this exact
+		// lifecycle request, never the supervisor or a same-id stranger.
+		candidate.pid === expected.owner.pid &&
+		(candidate.hostIncarnation ?? candidate.processIncarnation) === expected.owner.incarnation &&
+		candidate.lifecycleRequestId === expected.effectMarker &&
 		candidate.endpointGeneration > 0 &&
 		candidate.live &&
 		!candidate.terminal &&
@@ -1687,6 +1717,7 @@ export class Broker {
 	#managedEnrollmentFailed = false;
 	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#spawnPromptLayer: SpawnPromptLayer;
+	#spawnHostClose: NonNullable<SpawnPromptLayer["close"]>;
 	#spawnReapInFlight = false;
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -1741,6 +1772,7 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			spawnHostCloseGraceMs: settings.spawnHostCloseGraceMs ?? SPAWN_HOST_CLOSE_GRACE_MS,
 			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
 			reapWhenAbandoned: settings.reapWhenAbandoned === true,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
@@ -1773,6 +1805,10 @@ export class Broker {
 			dispatch: async input => await this.#dispatchSpawnPrompt(input),
 			reconcile: async input => await this.#reconcileSpawnPrompt(input),
 		};
+		const injectedClose = settings.spawnPromptLayer?.close;
+		this.#spawnHostClose = injectedClose
+			? async input => await injectedClose.call(settings.spawnPromptLayer, input)
+			: async input => await this.#requestSpawnHostClose(input);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -2658,8 +2694,12 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
-				const { pid, processIncarnation: incarnation } = launched.proof;
-				if (pid === undefined || incarnation === undefined) {
+				if (
+					launched.proof.pid === undefined ||
+					!Number.isSafeInteger(launched.proof.pid) ||
+					launched.proof.pid <= 0 ||
+					!safeSpawnOpaque(launched.proof.processIncarnation)
+				) {
 					const failure: SpawnSubstrateFailure = {
 						substrateKind: launched.proof.substrateKind,
 						code: "substrate_proof_failed",
@@ -2755,14 +2795,74 @@ export class Broker {
 						return error("terminal_uncertain", "managed child close is unresolved after its attempt was fenced");
 					}
 				}
+				// The substrate proof names the managed supervisor (cleanup authority);
+				// the lifecycle marker and registration must name the real SDK host.
+				const resolution = await provider.resolveLifecycleOwner(launched.proof, prep.semanticReadyDeadlineAt);
+				if (!resolution.ok || Date.now() >= prep.semanticReadyDeadlineAt) {
+					const reason = resolution.ok ? "owner_deadline" : resolution.code;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "closed" || release === "gone") {
+						const failure: SpawnSubstrateFailure = {
+							substrateKind: launched.proof.substrateKind,
+							code: "lifecycle_owner_unresolved",
+							message: `session.spawn lifecycle owner resolution failed (${reason})`,
+						};
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "pre_send_rejected",
+								failure,
+							})
+						).claim;
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					}
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "uncertain",
+							failure: {
+								substrateKind: launched.proof.substrateKind,
+								code: "child_registration_release_unproven",
+								message: "session.spawn child registration could not prove substrate release",
+							},
+						})
+					).claim;
+					launchedProof = undefined;
+					return error(
+						"terminal_uncertain",
+						`session.spawn lifecycle owner resolution failed (${reason}) and substrate release could not be proven`,
+					);
+				}
+				const { pid, incarnation } = resolution.owner;
+				if (!Number.isSafeInteger(pid) || pid <= 0 || !safeSpawnOpaque(incarnation))
+					throw new Error("Invalid resolved lifecycle owner");
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle owner deadline expired");
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle marker deadline expired");
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
+					owner: resolution.owner,
+					effectMarker: prep.effectMarker,
+					deadlineAt: prep.semanticReadyDeadlineAt,
 				});
-				if (!registration.ok) {
+				if (
+					!registration.ok ||
+					Date.now() >= prep.semanticReadyDeadlineAt ||
+					registration.registration.sessionId !== prep.childId ||
+					registration.registration.pid !== pid ||
+					registration.registration.processIncarnation !== incarnation ||
+					registration.registration.lifecycleRequestId !== prep.effectMarker ||
+					!Number.isSafeInteger(registration.registration.endpointGeneration) ||
+					registration.registration.endpointGeneration <= 0 ||
+					resolveEquivalentPath(registration.registration.cwd) !== resolveEquivalentPath(prep.cwd) ||
+					resolveEquivalentPath(registration.registration.stateRoot) !== resolveEquivalentPath(prep.stateRoot)
+				) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
 					if (release === "closed" || release === "gone") {
@@ -3098,10 +3198,17 @@ export class Broker {
 		if (verdict === "gone") return "gone";
 		if (verdict !== "verified") return "unresolved";
 		try {
-			return (await provider.close(proof)).ok ? "closed" : "unresolved";
+			if ((await provider.close(proof)).ok) return "closed";
 		} catch {
-			// The substrate may survive. The caller still records uncertainty, which
-			// is the honest durable outcome for an unclosed unowned substrate.
+			// Reconciled below: the substrate may survive.
+		}
+		// An unowned substrate can exit on its own while its close runs (a host that gave
+		// up at its readiness cutoff), which fails or refuses the exact close. Its proven
+		// absence releases it exactly as before the close; anything else stays uncertain,
+		// the honest durable outcome for an unclosed unowned substrate.
+		try {
+			return (await provider.verify(proof)) === "gone" ? "gone" : "unresolved";
+		} catch {
 			return "unresolved";
 		}
 	}
@@ -3410,11 +3517,16 @@ export class Broker {
 		childId: string;
 		cwd: string;
 		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }> {
-		const deadline = Date.now() + SPAWN_HOST_REGISTRATION_TIMEOUT_MS;
+		owner: SpawnLifecycleOwner;
+		effectMarker: string;
+		deadlineAt: number;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }> {
+		const deadline = input.deadlineAt;
 		for (;;) {
+			if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false };
 			try {
 				await this.index.refresh();
+				if (Date.now() >= deadline) return { ok: false };
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
 				const row = this.index
@@ -3432,6 +3544,7 @@ export class Broker {
 								endpointGeneration: row.endpointGeneration,
 								pid: row.pid,
 								processIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
 								cwd: row.locator.cwd,
 								stateRoot: row.locator.stateRoot,
 							},
@@ -3441,8 +3554,8 @@ export class Broker {
 			} catch {
 				// A transient index read failure only delays the poll.
 			}
-			if (Date.now() > deadline) return { ok: false };
-			await Bun.sleep(SPAWN_HOST_REGISTRATION_POLL_MS);
+			if (Date.now() >= deadline) return { ok: false };
+			await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
 		}
 	}
 
@@ -3451,7 +3564,8 @@ export class Broker {
 		sessionId: string;
 		/** Endpoint identity captured at registration; the exchange refuses to talk to anything else. */
 		pinned: SpawnHostRegistration;
-		frame: (id: string) => Record<string, unknown>;
+		/** Request for the exact pinned row; `undefined` refuses the exchange before connecting. */
+		frame: (id: string, row: IndexedSession) => Record<string, unknown> | undefined;
 		responseType: string;
 		timeoutMs: number;
 	}): Promise<{ handedOff: boolean; frame?: Record<string, unknown> }> {
@@ -3479,6 +3593,8 @@ export class Broker {
 		const endpoint = await readEndpoint(row);
 		if (!endpoint) return { handedOff: false };
 		const id = randomBytes(16).toString("base64url");
+		const request = input.frame(id, row);
+		if (!request) return { handedOff: false };
 		const settled = Promise.withResolvers<Record<string, unknown> | undefined>();
 		let handedOff = false;
 		let complete = false;
@@ -3505,7 +3621,7 @@ export class Broker {
 				}
 				if (frame.type === "hello") {
 					try {
-						socket?.send(JSON.stringify(input.frame(id)));
+						socket?.send(JSON.stringify(request));
 						handedOff = true;
 					} catch {
 						settle(undefined);
@@ -3579,6 +3695,65 @@ export class Broker {
 		const frame = exchange.frame;
 		if (frame?.ok !== true) return { status: "unknown" };
 		return q26FromResponse(frame);
+	}
+
+	/**
+	 * Authenticated graceful close of the exact pinned host. The host accepts it only
+	 * with the Broker lifecycle marker it was launched with, which its own index row
+	 * carries, so no other caller and no other endpoint can satisfy it.
+	 */
+	async #requestSpawnHostClose(input: {
+		sessionId: string;
+		pinned: SpawnHostRegistration;
+	}): Promise<"accepted" | "unavailable"> {
+		const exchange = await this.#spawnChildExchange({
+			sessionId: input.sessionId,
+			pinned: input.pinned,
+			frame: (id, row) =>
+				row.lifecycleRequestId
+					? {
+							type: "control_request",
+							id,
+							operation: "session.close",
+							input: { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: row.lifecycleRequestId },
+						}
+					: undefined,
+			responseType: "control_response",
+			timeoutMs: SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS,
+		});
+		return exchange.frame?.ok === true ? "accepted" : "unavailable";
+	}
+
+	/**
+	 * A headless host closes through its own endpoint first so it removes its endpoint
+	 * and disposes its session; on Windows a substrate signal is `TerminateProcess`,
+	 * which skips both. Returns the substrate verdict after the attempt; only an
+	 * acknowledged close earns the host's cleanup grace, measured on monotonic time.
+	 */
+	async #closeSpawnHostGracefully(
+		authority: SpawnAuthorityV1,
+		proof: SpawnSubstrateProof,
+		provider: SpawnSubstrateProvider,
+	): Promise<"verified" | "mismatch" | "gone"> {
+		const pinned = spawnPinFromAuthority(authority);
+		if (!pinned) return "verified";
+		let accepted = false;
+		try {
+			accepted = (await this.#spawnHostClose({ sessionId: pinned.sessionId, pinned })) === "accepted";
+		} catch {
+			accepted = false;
+		}
+		// Without an acknowledgement the escalation's own re-verification settles it.
+		if (!accepted) return "verified";
+		const graceMs = this.settings.spawnHostCloseGraceMs;
+		const started = performance.now();
+		for (;;) {
+			const verdict = await provider.verify(proof);
+			if (verdict !== "verified") return verdict;
+			const remaining = graceMs - (performance.now() - started);
+			if (remaining <= 0) return "verified";
+			await Bun.sleep(Math.min(50, remaining));
+		}
 	}
 
 	/**
@@ -3685,9 +3860,23 @@ export class Broker {
 				).authority!;
 			}
 			if (verdict === "verified" || verdict === "gone") {
-				const closedSubstrate = await provider.close(proof);
-				if (!closedSubstrate.ok) return "retained";
-				if ((await provider.verify(proof)) !== "gone") return "retained";
+				// A headless child is closed by the proven absence of its exact process, so one
+				// that exits on its own (after a lost acknowledgement, at the grace boundary,
+				// or before an earlier retained attempt) closes without any signal; its
+				// substrate close would refuse an already-gone identity. A managed substrate
+				// is closed only by its own successful close (the matching terminal verdict).
+				const headless = proof.substrateKind === "headless";
+				let current =
+					verdict === "verified" && headless
+						? await this.#closeSpawnHostGracefully(authority, proof, provider)
+						: verdict;
+				if (current === "verified" || (!headless && current === "gone")) {
+					const closedSubstrate = await provider.close(proof);
+					if (!closedSubstrate.ok && !headless) return "retained";
+					current = await provider.verify(proof);
+					if (!closedSubstrate.ok && current !== "gone") return "retained";
+				}
+				if (current !== "gone") return "retained";
 			} else return "retained";
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
 			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };
@@ -5172,6 +5361,7 @@ export class Broker {
 			...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
+		const spawnOwners = this.#spawnAuthority?.spawnOwnersByChild();
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const {
 				lifecycleRequestId: _lifecycleRequestId,
@@ -5179,7 +5369,12 @@ export class Broker {
 				...publicSession
 			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
+			const spawnOwner = spawnOwners?.get(session.sessionId);
+			return {
+				...publicSession,
+				...(incarnation === undefined ? {} : { endpointIncarnation: incarnation }),
+				...(spawnOwner === undefined ? {} : { spawnedBy: { masterSessionId: spawnOwner } }),
+			};
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);
