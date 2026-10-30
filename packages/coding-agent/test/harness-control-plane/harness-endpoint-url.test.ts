@@ -25,6 +25,10 @@ describe("harness discovery url", () => {
 			"ws://127.0.0.1.:9",
 			"wss://127.0.0.1",
 			"wss://localhost",
+			"ws://127.1:9",
+			"ws://0x7f000001:9",
+			"ws://127.0.0.1:9/steal/..",
+			"ws://127.0.0.1:80",
 		]) {
 			expect(isHarnessLoopbackEndpointUrl(raw)).toBe(true);
 		}
@@ -43,6 +47,8 @@ describe("harness discovery url", () => {
 			"ws://127.0.0.1:9/?#",
 			"ws://example.com:9",
 			"ws://0.0.0.0:9",
+			"ws://127.0.0.1.evil:9",
+			"ws://localhost.evil:9",
 			"",
 		]) {
 			expect(isHarnessLoopbackEndpointUrl(raw)).toBe(false);
