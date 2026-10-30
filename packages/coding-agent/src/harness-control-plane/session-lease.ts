@@ -97,8 +97,12 @@ function ownerSocketPathsMatch(candidate: string, canonical: string): boolean {
 	const left = lexicalOwnerSocketKey(candidate);
 	const right = lexicalOwnerSocketKey(canonical);
 	if (left === null || right === null || !socketBaseNamesMatch(left, right)) return false;
+	// Fast-path: if parent dirs are identical strings, no need for expensive realpath resolution
+	const leftDir = path.dirname(left);
+	const rightDir = path.dirname(right);
+	if (leftDir === rightDir) return true;
 	try {
-		return fsSync.realpathSync(path.dirname(left)) === fsSync.realpathSync(path.dirname(right));
+		return fsSync.realpathSync(leftDir) === fsSync.realpathSync(rightDir);
 	} catch {
 		return false;
 	}
