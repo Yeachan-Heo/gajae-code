@@ -7,7 +7,6 @@ import {
 	Info,
 	MoreHorizontal,
 	Network,
-	Palette,
 	Pencil,
 	Plus,
 	Settings2,
@@ -15,7 +14,7 @@ import {
 	Trash2,
 	X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
 	DesktopActivityDetail,
 	DesktopActivityGateAnswer,
@@ -90,6 +89,7 @@ import { OperatorPanel } from "./OperatorPanel";
 import { PreferencesPanel } from "./PreferencesPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionInfoPanel } from "./SessionInfoPanel";
+import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
 	applyTheme,
 	DESKTOP_THEMES,
@@ -498,6 +498,9 @@ export default function App() {
 	const [diffLoading, setDiffLoading] = useState(false);
 	const [settings, setSettings] = useState<DesktopSetting[] | null>(null);
 	const [settingFilter, setSettingFilter] = useState("");
+	const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+	const settingsPanelPrefix = useId();
+	const settingsPanelsRef = useRef<HTMLDivElement>(null);
 	const [sessionFilter, setSessionFilter] = useState("");
 	const [provider, setProvider] = useState("");
 	const [keyProviders, setKeyProviders] = useState<string[] | null>(null);
@@ -952,7 +955,9 @@ export default function App() {
 			const path = await selectProject();
 			if (path) await request("project.open", { path });
 		});
-	const openSettings = () => {
+	const openSettingsTab = (tab: SettingsTab) => {
+		setSettingsTab(tab);
+		if (settingsPanelsRef.current) settingsPanelsRef.current.scrollTop = 0;
 		const sessionId = selected;
 		const generation = setDialog("settings");
 		setSettings(null);
@@ -969,6 +974,9 @@ export default function App() {
 			}
 		});
 	};
+	// Zero-argument so entry points can pass this by reference without a click
+	// event leaking into the tab state.
+	const openSettings = () => openSettingsTab("general");
 	const saveSetting = (path: string, value: unknown) => {
 		const sessionId = dialogOwner;
 		const generation = dialogGeneration.current;
@@ -1543,7 +1551,7 @@ export default function App() {
 					models={catalog?.models ?? []}
 					roles={catalog?.roles ?? []}
 					profiles={catalog?.profiles}
-					onConfigureProviders={openSettings}
+					onConfigureProviders={() => openSettingsTab("account")}
 					selectedId={deferred?.modelId ?? owner.model}
 					disabled={!connected || changing}
 					onRefresh={() => {
@@ -1622,7 +1630,7 @@ export default function App() {
 								: null}
 				</small>
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
-					<Button disabled={!connected} onClick={openSettings}>
+					<Button disabled={!connected} onClick={() => openSettingsTab("account")}>
 						{t("shell.addProvider")}
 					</Button>
 				)}
@@ -2323,163 +2331,235 @@ export default function App() {
 							<p role="status">{t("shell.activityLoading")}</p>
 						))}
 					{dialog === "settings" && (
-						<>
-							<section>
-								<h3>
-									<Palette aria-hidden="true" /> {t("shell.theme")}
-								</h3>
+						<div className="settings-dialog">
+							<SettingsTabs
+								prefix={settingsPanelPrefix}
+								active={settingsTab}
+								onSelect={tab => {
+									setSettingsTab(tab);
+									if (settingsPanelsRef.current) settingsPanelsRef.current.scrollTop = 0;
+								}}
+							/>
+							{/* Every panel stays mounted and only the active one is visible, so each tab's
+							    aria-controls always resolves and panel-local state survives a switch. */}
+							<div className="settings-panels" ref={settingsPanelsRef}>
 								<div
-									className="theme-options"
-									role="radiogroup"
-									aria-label={t("shell.theme")}
-									onKeyDown={event => {
-										const radios = [
-											...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
-										];
-										const index = THEME_IDS.indexOf(theme);
-										const next =
-											event.key === "Home"
-												? 0
-												: event.key === "End"
-													? radios.length - 1
-													: event.key === "ArrowRight" || event.key === "ArrowDown"
-														? (index + 1) % radios.length
-														: event.key === "ArrowLeft" || event.key === "ArrowUp"
-															? (index - 1 + radios.length) % radios.length
-															: -1;
-										const target = radios[next];
-										if (!target) return;
-										event.preventDefault();
-										target.focus();
-										target.click();
-									}}
+									className="settings-panel"
+									id={settingsPanelId(settingsPanelPrefix, "general")}
+									role="tabpanel"
+									aria-labelledby={settingsTabId(settingsPanelPrefix, "general")}
+									hidden={settingsTab !== "general"}
 								>
-									{THEME_IDS.map(id => (
-										<Button
-											key={id}
-											className="theme-option"
-											role="radio"
-											aria-checked={theme === id}
-											tabIndex={theme === id ? 0 : -1}
-											onClick={() => {
-												setTheme(id);
-												if (!writeThemePreference(id)) setNotice(t("shell.themeSaveFailed"));
+									<SettingsSection
+										id={`${settingsPanelPrefix}-theme`}
+										title={t("shell.theme")}
+										hint={t("shell.themeHint")}
+									>
+										<div
+											className="theme-options"
+											role="radiogroup"
+											aria-label={t("shell.theme")}
+											onKeyDown={event => {
+												const radios = [
+													...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+												];
+												const index = THEME_IDS.indexOf(theme);
+												const next =
+													event.key === "Home"
+														? 0
+														: event.key === "End"
+															? radios.length - 1
+															: event.key === "ArrowRight" || event.key === "ArrowDown"
+																? (index + 1) % radios.length
+																: event.key === "ArrowLeft" || event.key === "ArrowUp"
+																	? (index - 1 + radios.length) % radios.length
+																	: -1;
+												const target = radios[next];
+												if (!target) return;
+												event.preventDefault();
+												target.focus();
+												target.click();
 											}}
 										>
-											<span
-												className="theme-swatch"
-												aria-hidden="true"
-												style={{
-													background: `linear-gradient(135deg, ${DESKTOP_THEMES[id].accent} 0 55%, ${DESKTOP_THEMES[id].surface} 55% 100%)`,
-												}}
-											/>
-											{themeLabel(id)}
-										</Button>
-									))}
+											{THEME_IDS.map(id => (
+												<Button
+													key={id}
+													className="theme-option"
+													role="radio"
+													aria-checked={theme === id}
+													tabIndex={theme === id ? 0 : -1}
+													onClick={() => {
+														setTheme(id);
+														if (!writeThemePreference(id)) setNotice(t("shell.themeSaveFailed"));
+													}}
+												>
+													<span
+														className="theme-swatch"
+														aria-hidden="true"
+														style={{
+															background: `linear-gradient(135deg, ${DESKTOP_THEMES[id].accent} 0 55%, ${DESKTOP_THEMES[id].surface} 55% 100%)`,
+														}}
+													/>
+													{themeLabel(id)}
+												</Button>
+											))}
+										</div>
+									</SettingsSection>
+									<SettingsSection
+										id={`${settingsPanelPrefix}-model`}
+										title={t("shell.currentModelAndReasoning")}
+										hint={t("shell.modelSectionHint")}
+									>
+										{session ? (
+											modelControls(session)
+										) : (
+											<p className="muted">{t("shell.selectConversationFirst")}</p>
+										)}
+									</SettingsSection>
 								</div>
-							</section>
-							<section>
-								<h3>{t("shell.currentModelAndReasoning")}</h3>
-								{session ? (
-									modelControls(session)
-								) : (
-									<p className="muted">{t("shell.selectConversationFirst")}</p>
-								)}
-							</section>
-							<OAuthSettings key={dialogGeneration.current} connected={connected} />
-							<form
-								onSubmit={event => {
-									event.preventDefault();
-									const secret = key;
-									const generation = dialogGeneration.current;
-									setKey("");
-									void run(`auth:${dialogOwner}:${generation}`, async () => {
-										const saved = await request<DesktopCredentialSaveResult>("auth.setKey", {
-											provider,
-											key: secret,
-										});
-										if (dialogGeneration.current === generation)
-											setNotice(
-												saved.catalogRefreshed ? t("shell.apiKeySaved") : t("shell.apiKeySavedNoRefresh"),
-											);
-									});
-								}}
-							>
-								<h3>{t("shell.apiKey")}</h3>
-								<label htmlFor="provider">{t("shell.provider")}</label>
-								<input
-									id="provider"
-									list="providers"
-									value={provider}
-									onChange={event => setProvider(event.target.value)}
-									required
-								/>
-								<datalist id="providers">
-									{(keyProviders ?? []).map(name => (
-										<option key={name} value={name} />
-									))}
-								</datalist>
-								<label htmlFor="api-key">{t("shell.apiKeyHidden")}</label>
-								<input
-									id="api-key"
-									type="password"
-									autoComplete="off"
-									value={key}
-									onChange={event => setKey(event.target.value)}
-									required
-								/>
-								<Button
-									type="submit"
-									disabled={!connected || pending[authScope] || !provider.trim() || !key.trim()}
+								<div
+									className="settings-panel"
+									id={settingsPanelId(settingsPanelPrefix, "account")}
+									role="tabpanel"
+									aria-labelledby={settingsTabId(settingsPanelPrefix, "account")}
+									hidden={settingsTab !== "account"}
 								>
-									{t("shell.saveKey")}
-								</Button>
-							</form>
-							<section>
-								<h3>{t("shell.safeSettings")}</h3>
-								{settings === null ? (
-									<p>{t("shell.loadingSettings")}</p>
-								) : settings.length === 0 ? (
-									<p>{t("shell.noExposedSettings")}</p>
-								) : (
-									<>
-										<label htmlFor="setting-search">{t("shell.searchSettings")}</label>
-										<input
-											id="setting-search"
-											value={settingFilter}
-											placeholder={t("shell.searchSettingsPlaceholder")}
-											onChange={event => setSettingFilter(event.target.value)}
-										/>
-										<p className="muted">
-											{t("shell.settingsMatchCount", {
-												count: filteredSettings.length,
-												total: settings.length,
-											})}
-											{filteredSettings.length > 200 && t("shell.settingsLimitNotice")}
-										</p>
-										{filteredSettings.length === 0 && <p>{t("shell.noMatchingSettings")}</p>}
-										{filteredSettings.slice(0, 200).map(setting => (
-											<SettingField
-												key={`${setting.path}:${textOf(setting.value)}`}
-												setting={setting}
-												pending={!connected || pending[settingsScope]}
-												onSave={value => saveSetting(setting.path, value)}
+									<p className="settings-panel-hint">{t("shell.accountHint")}</p>
+									{/* OAuthSettings renders its own heading and section frame. */}
+									<OAuthSettings key={dialogGeneration.current} connected={connected} />
+									<SettingsSection
+										id={`${settingsPanelPrefix}-key`}
+										title={t("shell.apiKey")}
+										hint={t("shell.apiKeyHint")}
+									>
+										<form
+											className="settings-form"
+											onSubmit={event => {
+												event.preventDefault();
+												const secret = key;
+												const generation = dialogGeneration.current;
+												setKey("");
+												void run(`auth:${dialogOwner}:${generation}`, async () => {
+													const saved = await request<DesktopCredentialSaveResult>("auth.setKey", {
+														provider,
+														key: secret,
+													});
+													if (dialogGeneration.current === generation)
+														setNotice(
+															saved.catalogRefreshed
+																? t("shell.apiKeySaved")
+																: t("shell.apiKeySavedNoRefresh"),
+														);
+												});
+											}}
+										>
+											<label htmlFor="provider">{t("shell.provider")}</label>
+											<input
+												id="provider"
+												list="providers"
+												value={provider}
+												onChange={event => setProvider(event.target.value)}
+												required
 											/>
-										))}
-									</>
-								)}
-							</section>
-							<section>
-								<h3>{t("shell.capabilityStatus")}</h3>
-								{snapshot?.capabilities.map(capability => (
-									<div className="capability" key={capability.id}>
-										<strong>{capability.label}</strong>
-										<span>{capability.available ? t("shell.supported") : t("shell.unavailable")}</span>
-										{capability.reason && <small>{capability.reason}</small>}
-									</div>
-								))}
-							</section>
-						</>
+											<datalist id="providers">
+												{(keyProviders ?? []).map(name => (
+													<option key={name} value={name} />
+												))}
+											</datalist>
+											<label htmlFor="api-key">{t("shell.apiKeyHidden")}</label>
+											<input
+												id="api-key"
+												type="password"
+												autoComplete="off"
+												value={key}
+												onChange={event => setKey(event.target.value)}
+												required
+											/>
+											<Button
+												type="submit"
+												disabled={!connected || pending[authScope] || !provider.trim() || !key.trim()}
+											>
+												{t("shell.saveKey")}
+											</Button>
+										</form>
+									</SettingsSection>
+								</div>
+								<div
+									className="settings-panel"
+									id={settingsPanelId(settingsPanelPrefix, "settings")}
+									role="tabpanel"
+									aria-labelledby={settingsTabId(settingsPanelPrefix, "settings")}
+									hidden={settingsTab !== "settings"}
+								>
+									<SettingsSection
+										id={`${settingsPanelPrefix}-runtime`}
+										title={t("shell.safeSettings")}
+										hint={t("shell.settingsHint")}
+									>
+										{settings === null ? (
+											<p>{t("shell.loadingSettings")}</p>
+										) : settings.length === 0 ? (
+											<p>{t("shell.noExposedSettings")}</p>
+										) : (
+											<>
+												<label htmlFor="setting-search">{t("shell.searchSettings")}</label>
+												<input
+													id="setting-search"
+													value={settingFilter}
+													placeholder={t("shell.searchSettingsPlaceholder")}
+													onChange={event => setSettingFilter(event.target.value)}
+												/>
+												<p className="muted">
+													{t("shell.settingsMatchCount", {
+														count: filteredSettings.length,
+														total: settings.length,
+													})}
+													{filteredSettings.length > 200 && t("shell.settingsLimitNotice")}
+												</p>
+												{filteredSettings.length === 0 && <p>{t("shell.noMatchingSettings")}</p>}
+												{filteredSettings.slice(0, 200).map(setting => (
+													<SettingField
+														key={`${setting.path}:${textOf(setting.value)}`}
+														setting={setting}
+														pending={!connected || pending[settingsScope]}
+														onSave={value => saveSetting(setting.path, value)}
+													/>
+												))}
+											</>
+										)}
+									</SettingsSection>
+								</div>
+								<div
+									className="settings-panel"
+									id={settingsPanelId(settingsPanelPrefix, "capabilities")}
+									role="tabpanel"
+									aria-labelledby={settingsTabId(settingsPanelPrefix, "capabilities")}
+									hidden={settingsTab !== "capabilities"}
+								>
+									<SettingsSection
+										id={`${settingsPanelPrefix}-capabilities`}
+										title={t("shell.capabilityStatus")}
+										hint={t("shell.capabilitiesHint")}
+									>
+										{!snapshot ? (
+											<p role="status">{t("shell.capabilitiesLoading")}</p>
+										) : snapshot.capabilities.length === 0 ? (
+											<p>{t("shell.capabilitiesEmpty")}</p>
+										) : (
+											snapshot.capabilities.map(capability => (
+												<div className="capability" key={capability.id}>
+													<strong>{capability.label}</strong>
+													<span>
+														{capability.available ? t("shell.supported") : t("shell.unavailable")}
+													</span>
+													{capability.reason && <small>{capability.reason}</small>}
+												</div>
+											))
+										)}
+									</SettingsSection>
+								</div>
+							</div>
+						</div>
 					)}
 					{dialog === "commands" && (
 						<>

@@ -531,6 +531,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 				if (!button) throw new Error("settings button missing");
 				(button as HTMLElement).click();
 			});
+			await openSettingsTab();
 			await page.waitForSelector(".setting-field", { timeout: 10000 });
 			const controls = await page.$$eval(".setting-field", forms =>
 				forms.map(form => {
@@ -574,6 +575,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 				);
 				(button as HTMLElement).click();
 			});
+			await openSettingsTab();
 			await page.waitForSelector(".setting-field", { timeout: 10000 });
 			const persisted = await page.evaluate(() => {
 				for (const form of document.querySelectorAll(".setting-field")) {
@@ -749,6 +751,24 @@ async function sendAndSettle(value: string): Promise<FixtureRequest> {
 	await idle();
 	return (await fixture()).requests.at(-1)!;
 }
+// The settings dialog is tabbed; the runtime setting list lives on the Settings tab.
+async function openSettingsTab() {
+	await page.waitForSelector(".settings-tabs", { timeout: 10000 });
+	await page.evaluate(() => {
+		const tab = [...document.querySelectorAll<HTMLButtonElement>(".settings-tab")].find(
+			node => (node.textContent ?? "").trim() === "Runtime",
+		);
+		if (!tab) throw new Error("settings tab missing");
+		tab.click();
+	});
+	await page.waitForSelector(
+		".settings-panel:not([hidden]) .setting-field, .settings-panel:not([hidden]) .settings-hint",
+		{
+			timeout: 10000,
+		},
+	);
+}
+
 async function sessionQueued(): Promise<string | null> {
 	return page.evaluate(() => (document.querySelector(".queued-inputs") as HTMLElement | null)?.innerText ?? null);
 }

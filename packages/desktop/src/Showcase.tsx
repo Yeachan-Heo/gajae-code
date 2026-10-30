@@ -21,6 +21,8 @@ import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionInfoPanel, type SessionInfoPanelProps } from "./SessionInfoPanel";
+import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
+import { DESKTOP_THEMES } from "./themes";
 import "./styles.css";
 
 // Deterministic 768×192 PNG: real intrinsic size exercises responsive preview bounds.
@@ -947,6 +949,133 @@ function FixtureForkPanel() {
 	);
 }
 
+// The settings section renders the shipped tab bar with local fixture state, so the design
+// harness reviews the real contract (ids, aria-controls, keyboard) instead of a mirror.
+const fixtureSettingsThemes = [
+	{ id: "red-claw", label: () => t("showcase.settingsThemeRedClaw") },
+	{ id: "blue-crab", label: () => t("showcase.settingsThemeBlueCrab") },
+	{ id: "codex", label: () => t("showcase.settingsThemeCodex") },
+] as const;
+
+function FixtureSettingsPanels({
+	active,
+	onSaved,
+	prefix,
+	saved,
+}: {
+	active: SettingsTab;
+	onSaved: () => void;
+	prefix: string;
+	saved: boolean;
+}) {
+	return (
+		<div className="settings-panels">
+			<div
+				className="settings-panel"
+				id={settingsPanelId(prefix, "general")}
+				role="tabpanel"
+				aria-labelledby={settingsTabId(prefix, "general")}
+				hidden={active !== "general"}
+			>
+				<SettingsSection
+					id={`${prefix}-theme`}
+					title={t("showcase.settingsThemeTitle")}
+					hint={t("showcase.settingsThemeHint")}
+				>
+					<div className="theme-options" role="radiogroup" aria-label={t("showcase.settingsThemeGroupLabel")}>
+						{fixtureSettingsThemes.map(theme => (
+							<Button
+								key={theme.id}
+								className="theme-option"
+								role="radio"
+								aria-checked={theme.id === "red-claw"}
+								tabIndex={theme.id === "red-claw" ? 0 : -1}
+							>
+								<span
+									className="theme-swatch"
+									aria-hidden="true"
+									style={{
+										background: `linear-gradient(135deg, ${DESKTOP_THEMES[theme.id].accent} 0 55%, ${DESKTOP_THEMES[theme.id].surface} 55% 100%)`,
+									}}
+								/>
+								{theme.label()}
+							</Button>
+						))}
+					</div>
+				</SettingsSection>
+			</div>
+			<div
+				className="settings-panel"
+				id={settingsPanelId(prefix, "account")}
+				role="tabpanel"
+				aria-labelledby={settingsTabId(prefix, "account")}
+				hidden={active !== "account"}
+			>
+				<SettingsSection
+					id={`${prefix}-form`}
+					title={t("showcase.settingsFormTitle")}
+					hint={t("showcase.settingsFormHint")}
+				>
+					<form
+						className="settings-form"
+						onSubmit={event => {
+							event.preventDefault();
+							onSaved();
+						}}
+					>
+						<label htmlFor={`${prefix}-key-field`}>{t("showcase.settingsFormKeyLabel")}</label>
+						<input
+							id={`${prefix}-key-field`}
+							type="password"
+							autoComplete="off"
+							defaultValue={t("showcase.settingsFormKeyValue")}
+							readOnly
+						/>
+						<Button type="submit" className="primary">
+							{t("showcase.settingsFormSave")}
+						</Button>
+					</form>
+					{saved && (
+						<p className="settings-hint" role="status">
+							{t("showcase.settingsFormSaved")}
+						</p>
+					)}
+				</SettingsSection>
+			</div>
+			<div
+				className="settings-panel"
+				id={settingsPanelId(prefix, "settings")}
+				role="tabpanel"
+				aria-labelledby={settingsTabId(prefix, "settings")}
+				hidden={active !== "settings"}
+			>
+				<SettingsSection
+					id={`${prefix}-runtime`}
+					title={t("showcase.settingsRuntimeTitle")}
+					hint={t("showcase.settingsRuntimeHint")}
+				>
+					<p className="muted">{t("showcase.settingsRuntimeBody")}</p>
+				</SettingsSection>
+			</div>
+			<div
+				className="settings-panel"
+				id={settingsPanelId(prefix, "capabilities")}
+				role="tabpanel"
+				aria-labelledby={settingsTabId(prefix, "capabilities")}
+				hidden={active !== "capabilities"}
+			>
+				<SettingsSection
+					id={`${prefix}-capabilities`}
+					title={t("showcase.settingsCapabilitiesTitle")}
+					hint={t("showcase.settingsCapabilitiesHint")}
+				>
+					<p className="muted">{t("showcase.settingsCapabilitiesBody")}</p>
+				</SettingsSection>
+			</div>
+		</div>
+	);
+}
+
 export default function Showcase() {
 	useLocale();
 	const [draft, setDraft] = useState("");
@@ -957,6 +1086,8 @@ export default function Showcase() {
 	const [dialog, setDialog] = useState(false);
 	const [answer, setAnswer] = useState("");
 	const [selected, setSelected] = useState("running");
+	const [fixtureTab, setFixtureTab] = useState<SettingsTab>("general");
+	const [fixtureKeySaved, setFixtureKeySaved] = useState(false);
 	const [starred, setStarred] = useState<string[]>(["idle"]);
 	const session: DesktopSession = {
 		id: "showcase",
@@ -987,6 +1118,7 @@ export default function Showcase() {
 					<a href="#showcase-fork">{t("showcase.navFork")}</a>
 					<a href="#showcase-composers">{t("showcase.navComposers")}</a>
 					<a href="#showcase-settings">{t("showcase.navSettings")}</a>
+					<a href="#showcase-settings-tabs">{t("showcase.navSettingsTabs")}</a>
 				</nav>
 			</header>
 			<section id="showcase-sessions">
@@ -1323,6 +1455,31 @@ export default function Showcase() {
 					pending
 					onSave={() => {}}
 				/>
+			</section>
+			<section id="showcase-settings-tabs">
+				<h2>{t("showcase.settingsTabsHeading")}</h2>
+				<p className="muted">{t("showcase.settingsTabsNote")}</p>
+				<h3>{t("showcase.settingsTabsFullHeading")}</h3>
+				<div className="settings-dialog">
+					<SettingsTabs prefix="showcase-settings" active={fixtureTab} onSelect={setFixtureTab} />
+					<FixtureSettingsPanels
+						prefix="showcase-settings"
+						active={fixtureTab}
+						saved={fixtureKeySaved}
+						onSaved={() => setFixtureKeySaved(true)}
+					/>
+				</div>
+				<h3>{t("showcase.settingsTabsNarrowHeading")}</h3>
+				<div className="settings-dialog" style={{ maxWidth: 320 }}>
+					<SettingsTabs prefix="showcase-narrow" active={fixtureTab} onSelect={setFixtureTab} />
+					{/* Both previews share the demo tab and saved flag, so they behave the same. */}
+					<FixtureSettingsPanels
+						prefix="showcase-narrow"
+						active={fixtureTab}
+						saved={fixtureKeySaved}
+						onSaved={() => setFixtureKeySaved(true)}
+					/>
+				</div>
 			</section>
 			<p className="showcase-result" role="status">
 				{answer || t("showcase.answerIdle")}

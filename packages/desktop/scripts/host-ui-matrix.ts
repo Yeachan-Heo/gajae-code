@@ -219,13 +219,23 @@ try {
   // 7. Settings: 321 scalar entries, filter, and a persisted write.
   setStage("settings");
   await clickText("Settings");
+  // The runtime setting list lives on the Runtime tab of the settings dialog.
+  await page.waitForSelector(".settings-tabs", { timeout: 15000 });
+  await page.evaluate(() => {
+    const tab = [...document.querySelectorAll(".settings-tab")].find((node) => (node.textContent ?? "").trim() === "Runtime");
+    if (!tab) throw new Error("settings tab missing");
+    tab.click();
+  });
   await waitFn(() => ["321", "320", "319", "318"].some((count) => document.body.innerText.includes("Matches: " + count + " of " + count)));
   await page.fill("#setting-search", "retry");
   await waitFn(() => document.body.innerText.toLowerCase().includes("retry."));
   const settingsBody = await body();
   const writable = await page.evaluate(() => {
-    const input = [...document.querySelectorAll("input")].find((item) => item.closest("label") || item.id);
-    return !!input;
+    // Fail loudly rather than widening the search: a hidden panel must not satisfy this probe.
+    const visible = document.querySelector(".settings-panel:not([hidden])");
+    if (!visible) return "no visible settings panel";
+    const input = [...visible.querySelectorAll("input, select")].find((item) => item.closest("label") || item.id);
+    return input ? true : "no labelled input in the visible panel";
   });
   feature("settings", {
     filtered: settingsBody.toLowerCase().includes("retry."),

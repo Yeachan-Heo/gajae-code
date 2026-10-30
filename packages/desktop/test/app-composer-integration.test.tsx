@@ -1103,6 +1103,145 @@ describe("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	test("the command list opens settings on a real tab instead of passing the click event", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("button")]
+					.find(button => button.textContent?.trim() === "Commands")
+					?.click(),
+			);
+			await page.waitForSelector("dialog[open] .command-list");
+			await page.waitForFunction(() =>
+				[...document.querySelectorAll("dialog[open] button")].some(button =>
+					button.textContent?.trim() === "Settings and capability status",
+				),
+			);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("button")]
+					.find(button => button.textContent?.trim() === "Settings and capability status")
+					?.click(),
+			);
+			await page.waitForSelector(".settings-tabs");
+			const state = await page.evaluate(() => ({
+				selected: [...document.querySelectorAll('.settings-tab[aria-selected="true"]')].map(tab => tab.textContent?.trim()),
+				visiblePanels: document.querySelectorAll(".settings-panel:not([hidden])").length,
+				focusableTabs: [...document.querySelectorAll(".settings-tab")].filter(tab => tab.getAttribute("tabindex") === "0").length,
+			}));
+			// A click event must never reach the tab state: it would hide every panel and leave
+			// the whole tab list unreachable from the keyboard.
+			expect(state.selected).toEqual(["General"]);
+			expect(state.visiblePanels).toBe(1);
+			expect(state.focusableTabs).toBe(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("settings dialog opens on the first tab and switches panels without losing the dialog", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".desktop-sidebar button")]
+					.find(button => button.textContent?.trim() === "Settings")
+					?.click(),
+			);
+			await page.waitForSelector(".settings-tabs");
+			const initial = await page.evaluate(() => ({
+				tabs: [...document.querySelectorAll(".settings-tab")].map(tab => tab.textContent?.trim()),
+				selected: [...document.querySelectorAll('.settings-tab[aria-selected="true"]')].map(tab => tab.textContent?.trim()),
+				panels: document.querySelectorAll(".settings-panel").length,
+			}));
+			expect(initial.tabs).toEqual(["General", "Account", "Runtime", "Capabilities"]);
+			expect(initial.selected).toEqual(["General"]);
+			// All four panels stay mounted so every tab's aria-controls resolves; only one is visible.
+			expect(initial.panels).toBe(4);
+			expect(
+				await page.evaluate(() => document.querySelectorAll(".settings-panel:not([hidden])").length),
+			).toBe(1);
+			expect(
+				await page.evaluate(() =>
+					[...document.querySelectorAll(".settings-tab")].every(
+						tab => document.getElementById(tab.getAttribute("aria-controls") ?? "") !== null,
+					),
+				),
+			).toBe(true);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".settings-tab")]
+					.find(tab => tab.textContent?.trim() === "Capabilities")
+					?.click(),
+			);
+			await page.waitForFunction(
+				() => document.querySelector('.settings-tab[aria-selected="true"]')?.textContent?.trim() === "Capabilities",
+			);
+			expect(
+				await page.$eval(".settings-panel:not([hidden])", panel => panel.textContent?.includes("Capability")),
+			).toBe(true);
+			expect(await page.$("dialog[open]")).not.toBeNull();
+			// The Account panel shows the sign-in section's own heading once, and the dialog's
+			// generic section/form margin does not stack inside the panel.
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".settings-tab")]
+					.find(tab => tab.textContent?.trim() === "Account")
+					?.click(),
+			);
+			await page.waitForFunction(
+				() => document.querySelector('.settings-tab[aria-selected="true"]')?.textContent?.trim() === "Account",
+			);
+			const account = await page.evaluate(() => {
+				const panel = document.querySelector(".settings-panel:not([hidden])");
+				const headings = [...(panel?.querySelectorAll("h3") ?? [])].map(heading => heading.textContent?.trim());
+				const section = panel?.querySelector("section");
+				const form = panel?.querySelector("form");
+				return {
+					headings,
+					marginTop: section ? getComputedStyle(section).marginTop : null,
+					formMarginTop: form ? getComputedStyle(form).marginTop : null,
+				};
+			});
+			expect(account.headings.filter(heading => heading === "Account connections")).toHaveLength(1);
+			expect(account.marginTop).toBe("0px");
+			expect(account.formMarginTop).toBe("0px");
+			// Panels are hidden, not unmounted: the same DOM node comes back, which is what keeps
+			// panel-local state (an OAuth provider choice, an unsaved setting draft) alive.
+			await page.evaluate(() => {
+				(window as unknown as { __settingsPanel?: Element | null }).__settingsPanel = document.getElementById(
+					document.querySelector(".settings-tab")?.getAttribute("aria-controls") ?? "",
+				);
+			});
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".settings-tab")]
+					.find(tab => tab.textContent?.trim() === "Runtime")
+					?.click(),
+			);
+			await page.waitForFunction(
+				() => document.querySelector('.settings-tab[aria-selected="true"]')?.textContent?.trim() === "Runtime",
+			);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".settings-tab")]
+					.find(tab => tab.textContent?.trim() === "General")
+					?.click(),
+			);
+			await page.waitForFunction(
+				() =>
+					(window as unknown as { __settingsPanel?: Element | null }).__settingsPanel ===
+					document.getElementById(document.querySelector(".settings-tab")?.getAttribute("aria-controls") ?? ""),
+			);
+			// Reopening returns to the first tab instead of resuming a previous panel.
+			await page.evaluate(() => document.querySelector<HTMLButtonElement>(".modal-close")?.click());
+			await page.waitForFunction(() => !document.querySelector("dialog[open]"));
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".desktop-sidebar button")]
+					.find(button => button.textContent?.trim() === "Settings")
+					?.click(),
+			);
+			await page.waitForSelector(".settings-tabs");
+			expect(
+				await page.evaluate(() => document.querySelector('.settings-tab[aria-selected="true"]')?.textContent?.trim()),
+			).toBe("General");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("fatal and post-accept failure retain payload without automatic replay, including restart", async () => {
 		const { context, page } = await fixture();
 		try {
