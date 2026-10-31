@@ -7,6 +7,7 @@ import {
 	CircleAlert,
 	CircleCheck,
 	CircleHelp,
+	GripVertical,
 	ListChecks,
 	LoaderCircle,
 	Pause,
@@ -16,7 +17,7 @@ import {
 	Target,
 	X,
 } from "lucide-react";
-import type { ButtonHTMLAttributes, ClipboardEventHandler, ReactNode } from "react";
+import type { ButtonHTMLAttributes, ClipboardEventHandler, DragEvent, ReactNode } from "react";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type {
 	DesktopGoal,
@@ -30,6 +31,7 @@ import type {
 import { t } from "./i18n";
 
 import { Markdown } from "./Markdown";
+import { Select } from "./Select";
 
 export function Button({ children, className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
 	return (
@@ -66,6 +68,8 @@ export function SessionRow({
 	onSelect,
 	onStar,
 	onMenu,
+	onDragStart,
+	onDragEnd,
 }: {
 	session: DesktopSession;
 	selected?: boolean;
@@ -73,10 +77,32 @@ export function SessionRow({
 	onStar: () => void;
 	/** Keyboard path for the row menu: the ContextMenu key or Shift+F10. */
 	onMenu?: (x: number, y: number) => void;
+	onDragStart?: (event: DragEvent<HTMLElement>) => void;
+	onDragEnd?: () => void;
 }) {
 	const StatusIcon = statusIcons[session.status];
 	return (
 		<div className={`session-row ${selected ? "selected" : ""}`}>
+			{/* The row itself cannot start a drag: the title is a button, and a pressed button
+			    never promotes a drag to its draggable ancestor. A dedicated grip always can. */}
+			{onDragStart && (
+				<span
+					className="session-grip"
+					role="button"
+					tabIndex={-1}
+					aria-label={t("support.dragToReorder")}
+					title={t("support.dragToReorder")}
+					draggable
+					onDragStart={event => {
+						event.dataTransfer?.setData("text/plain", session.id);
+						if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+						onDragStart(event);
+					}}
+					onDragEnd={onDragEnd}
+				>
+					<GripVertical size={14} aria-hidden="true" />
+				</span>
+			)}
 			<button
 				className="session-select"
 				aria-current={selected ? "page" : undefined}
@@ -700,21 +726,22 @@ export function SettingField({
 				}
 			}}
 		>
-			<label htmlFor={id}>{setting.path}</label>
+			{/* The listbox is not a native field, so the visible label names the control by id. */}
+			<label id={`${id}-label`}>{setting.path}</label>
 			{setting.description && <small>{setting.description}</small>}
 			{setting.choices ? (
-				<select
-					id={id}
-					disabled={!setting.writable || pending}
+				<Select
 					value={value}
-					onChange={event => setValue(event.target.value)}
-				>
-					{setting.choices.map(choice => (
-						<option key={choice}>{choice}</option>
-					))}
-					{/* A hand-edited value outside the curated options must stay visible and saveable. */}
-					{value !== "" && !setting.choices.includes(value) && <option>{value}</option>}
-				</select>
+					// A hand-edited value outside the curated options must stay visible and saveable.
+					options={[
+						...setting.choices.map(choice => ({ value: choice, label: choice })),
+						...(value !== "" && !setting.choices.includes(value) ? [{ value, label: value }] : []),
+					]}
+					ariaLabel={setting.path}
+					ariaLabelledby={`${id}-label`}
+					disabled={!setting.writable || pending}
+					onChange={setValue}
+				/>
 			) : setting.type === "boolean" ? (
 				<input
 					id={id}

@@ -287,6 +287,7 @@ const profilePreferences: DesktopPreferences = {
 		id: "focused",
 		name: "Focused profile",
 		description: null,
+		group: "CODEX",
 		source: "configured",
 		active: false,
 		default: false,
@@ -599,6 +600,8 @@ describe("mounted deferred selection intent", () => {
 			await page.click(".model-trigger");
 			await page.waitForSelector(".model-dialog");
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			// Preset providers start collapsed, so the profile inside the group must be opened.
+			await page.click(".preset-group-head");
 			await page.waitForSelector(".preset-roles");
 			await page.click('.model-option-hit[aria-label="Apply the Focused profile profile to this conversation"]');
 			await Bun.sleep(300);
@@ -1108,6 +1111,44 @@ describe("mounted composer delivery recovery", () => {
 			expect(await page.evaluate(() => [...document.querySelectorAll('.error-banner')].filter(el => el.textContent?.includes('same error')).length)).toBe(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
+
+	test("app settings hold no conversation model or reasoning controls", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("button")]
+					.find(button => button.textContent?.trim() === "Settings")
+					?.click(),
+			);
+			await page.waitForSelector(".settings-tabs");
+			const general = await page.evaluate(() => {
+				const panel = document.querySelector('.settings-panel:not([hidden])');
+				return {
+					hasModelTrigger: !!panel?.querySelector(".model-trigger"),
+					hasReasoning: !!panel?.querySelector(".select-trigger[aria-label^=\"Reasoning level\"]"),
+					hasRoleTags: !!panel?.querySelector(".model-controls"),
+				};
+			});
+			// Model and reasoning belong to the conversation, not to app-wide settings.
+			expect(general).toEqual({ hasModelTrigger: false, hasReasoning: false, hasRoleTags: false });
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".settings-tab")]
+					.find(tab => tab.textContent?.trim() === "Account")
+					?.click(),
+			);
+			const account = await page.evaluate(() => {
+				const panel = document.querySelector(".settings-panel:not([hidden])");
+				return {
+					nativeSelects: panel?.querySelectorAll("select").length ?? 0,
+					listboxes: panel?.querySelectorAll('button[aria-haspopup="listbox"]').length ?? 0,
+				};
+			});
+			// Every choice list uses the app's own listbox instead of a native macOS menu.
+			expect(account.nativeSelects).toBe(0);
+			expect(account.listboxes).toBeGreaterThan(0);
+		} finally { await closeFixture(context, page); }
+	}, 40000);
 
 	test("the command list opens settings on a real tab instead of passing the click event", async () => {
 		const { context, page } = await fixture();
@@ -1817,7 +1858,7 @@ describe("mounted composer delivery recovery", () => {
 			expect(await page.$(".context-menu")).toBeNull();
 
 			// Dragging a conversation onto a sibling asks for the new order, not a mutation of it.
-			await startDrag(".project-group .session-drop", 0);
+			await startDrag(".project-group .session-grip", 0);
 			await dragOver(".project-group .session-drop", 1);
 			expect(
 				await page.evaluate(() =>
@@ -1877,7 +1918,7 @@ describe("mounted composer delivery recovery", () => {
 						?.textContent?.includes("Two") === true,
 			);
 			// An upward drag inserts before its target, and dropping asks for that order too.
-			await startDrag(".project-group .session-drop", 1);
+			await startDrag(".project-group .session-grip", 1);
 			await dragOver(".project-group .session-drop", 0);
 			expect(
 				await page.evaluate(() =>
@@ -1928,7 +1969,7 @@ describe("mounted composer delivery recovery", () => {
 			const foreignBefore = await page.evaluate(
 				() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 			);
-			await startDrag(".project-group .session-drop", 2);
+			await startDrag(".project-group .session-grip", 2);
 			await dragOver(".project-group .session-drop", 0);
 			expect(
 				await page.evaluate(() =>

@@ -129,6 +129,11 @@ async function calls(page: Page): Promise<[string, string | null][]> {
 }
 async function open(page: Page): Promise<void> { await page.click('.model-trigger'); await page.waitForSelector('.model-result-list'); }
 async function choose(page: Page, id: string): Promise<void> { await page.click(`.model-option-hit[data-model-id="${id}"]`); await page.waitForSelector('.model-role-choice'); }
+async function expandPresets(page: Page): Promise<void> {
+	const head = await page.$(".preset-group-head");
+	if (head) await head.click();
+	await page.waitForSelector(".preset-roles");
+}
 async function rows(page: Page): Promise<string[]> { return page.$$eval('.model-option-hit', buttons => buttons.map(button => button.getAttribute('data-model-id') ?? '')); }
 
 const profile = (id: string, name: string, roles: { id: string; model: string | null }[], overrides: Partial<Profile> = {}): Profile => ({
@@ -161,7 +166,7 @@ describe("mounted model picker tabs", () => {
 			await page.type(".model-search input", "m99");
 			expect(await rows(page)).toEqual(["p/m99"]);
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
-			await page.waitForSelector(".preset-roles");
+			await expandPresets(page);
 			expect(await page.$eval(".model-search input", input => (input as HTMLInputElement).value)).toBe("");
 			const presets = await page.$$eval(".model-option-hit", nodes => nodes.map(node => node.textContent ?? ""));
 			expect(presets).toHaveLength(2);
@@ -246,7 +251,7 @@ describe("mounted model picker busy state", () => {
 			// A running conversation keeps every dispatch available: the caller defers the
 			// request instead of the picker refusing it, and nothing explains that in prose.
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
-			await page.waitForSelector(".preset-roles");
+			await expandPresets(page);
 			const presetDisabledIdle = await page.$$eval("#picker-fixture .model-option-hit, dialog .model-option-hit", nodes =>
 				nodes.map(node => (node as HTMLButtonElement).disabled),
 			);

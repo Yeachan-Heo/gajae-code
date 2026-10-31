@@ -2,6 +2,7 @@ import { useId } from "react";
 import type { DesktopHistory } from "../../desktop-host/src/protocol";
 import { Button } from "./components";
 import { t } from "./i18n";
+import { Select } from "./Select";
 
 export interface ForkPanelProps {
 	history: DesktopHistory | null;
@@ -37,26 +38,32 @@ export function ForkPanel({
 			>
 				{t("settings.forkWhole")}
 			</Button>
-			<div>
-				<label htmlFor={`${id}-entry`}>{t("settings.forkEntryLabel")}</label>
-				<select
-					id={`${id}-entry`}
+			<div className="select-field">
+				<label id={`${id}-entry`}>{t("settings.forkEntryLabel")}</label>
+				<Select
 					value={selectedMessage ? selectedEntryId : ""}
+					options={[
+						{ value: "", label: t("settings.forkEntryPlaceholder") },
+						...entries.flatMap((message, index) =>
+							message.entryId
+								? [
+										{
+											value: message.entryId,
+											label: `${index + 1}. ${message.text.slice(0, 100) || t("settings.forkNoText")}`,
+										},
+									]
+								: [],
+						),
+					]}
+					ariaLabel={t("settings.forkEntryLabel")}
+					ariaLabelledby={`${id}-entry`}
 					disabled={locked || entries.length === 0}
-					onChange={event => {
-						const entryId = event.target.value;
+					onChange={entryId => {
 						if (!locked && (entryId === "" || entries.some(message => message.entryId === entryId))) {
 							onSelect(entryId);
 						}
 					}}
-				>
-					<option value="">{t("settings.forkEntryPlaceholder")}</option>
-					{entries.map((message, index) => (
-						<option key={message.entryId} value={message.entryId}>
-							{index + 1}. {message.text.slice(0, 100) || t("settings.forkNoText")}
-						</option>
-					))}
-				</select>
+				/>
 			</div>
 			<div>
 				<label htmlFor={`${id}-preview`}>{t("settings.forkPreviewLabel")}</label>

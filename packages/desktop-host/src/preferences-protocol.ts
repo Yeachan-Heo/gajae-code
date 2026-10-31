@@ -18,6 +18,8 @@ export interface DesktopModelProfile {
 	/** The public profile catalog does not currently provide descriptions. */
 	description: string | null;
 	source: "builtin" | "configured";
+	/** Provider family declared by the profile definition, used to group presets. */
+	group: string | null;
 	active: boolean;
 	default: boolean;
 	capabilities: {

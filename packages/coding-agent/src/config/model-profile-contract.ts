@@ -13,6 +13,8 @@ export interface ModelProfileCatalogItem {
 	id: string;
 	displayName: string;
 	source: "builtin" | "configured";
+	/** The provider family the profile belongs to, as declared by its definition. */
+	providerGroup?: string;
 	available?: boolean;
 }
 
@@ -127,6 +129,7 @@ export function projectModelProfileCatalog(
 				definition.source === "user" || definition.source === "registry"
 					? ("configured" as const)
 					: ("builtin" as const),
+			...(definition.providerGroup ? { providerGroup: definition.providerGroup } : {}),
 		}))
 		.sort((left, right) => left.id.localeCompare(right.id));
 }

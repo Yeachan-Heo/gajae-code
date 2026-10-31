@@ -3,6 +3,7 @@ import type { DesktopAuthProvider, DesktopAuthState } from "../../desktop-host/s
 import { openAuthUrl, request, subscribe } from "./bridge";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
+import { Select } from "./Select";
 
 const statuses = {
 	authorizing: () => t("settings.oauthStatusAuthorizing"),
@@ -138,19 +139,17 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 					{t("settings.oauthReload")}
 				</Button>
 			)}
-			<label htmlFor="oauth-provider">{t("settings.oauthProviderLabel")}</label>
-			<select
-				id="oauth-provider"
-				value={provider}
-				disabled={!connected || !ready || busy || active || providers.length === 0}
-				onChange={event => setProvider(event.target.value)}
-			>
-				{providers.map(item => (
-					<option key={item.id} value={item.id}>
-						{item.name}
-					</option>
-				))}
-			</select>
+			<div className="select-field">
+				<label id="oauth-provider">{t("settings.oauthProviderLabel")}</label>
+				<Select
+					value={provider}
+					options={providers.map(item => ({ value: item.id, label: item.name }))}
+					ariaLabel={t("settings.oauthProviderLabel")}
+					ariaLabelledby="oauth-provider"
+					disabled={!connected || !ready || busy || active || providers.length === 0}
+					onChange={setProvider}
+				/>
+			</div>
 			<div className="actions">
 				<Button
 					disabled={!connected || !ready || busy || active || !provider}

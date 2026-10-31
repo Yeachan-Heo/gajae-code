@@ -193,6 +193,9 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .session-row > .button { border: 0; flex-shrink: 0; }
 .session-star { color: var(--muted); padding: 8px; }
 .session-star[aria-pressed="true"] { color: var(--accent); }
+.session-grip { display: flex; align-items: center; justify-content: center; align-self: stretch; width: 18px; flex-shrink: 0; color: var(--muted); cursor: grab; opacity: 0; }
+.session-row:hover .session-grip, .session-row:focus-within .session-grip { opacity: 1; }
+.session-grip:active { cursor: grabbing; }
 .status { display: inline-flex; align-items: center; gap: 5px; font-size: 0.6875rem; color: var(--muted); }
 .status svg { width: 12px; height: 12px; }
 .status.running { color: var(--status-running); }
@@ -402,8 +405,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-search { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding-left: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
 .model-search > svg { width: 16px; height: 16px; flex-shrink: 0; color: var(--muted); }
 .model-search input { border: 0; background: transparent; padding-left: 0; }
-.model-search:focus-within { border-color: var(--accent); }
-.model-search input:focus-visible { outline-offset: 0; }
+.model-search input:focus-visible { border-color: transparent; box-shadow: none; outline: none; }
 .model-result-list { display: flex; flex-direction: column; gap: 6px; max-height: 44dvh; overflow: auto; margin: 0 0 12px; padding: 4px; list-style: none; }
 .model-result-list li { min-width: 0; }
 .model-result-row { display: flex; min-width: 0; }
@@ -421,11 +423,19 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-tab { flex: 1; justify-content: center; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--muted); font-weight: 550; }
 .model-tab:hover:not(:disabled) { background: color-mix(in srgb, var(--card) 70%, transparent); color: var(--text); }
 .model-tab[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow-rest), inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, var(--border-soft)); }
+/* The search field and its refresh button share one 36px row: the field is a 34px input inside a
+   1px border, so a fixed 34px button sat two pixels short of it. */
 .model-toolbar { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
-.model-toolbar > .model-search { flex: 1; min-width: 0; }
-.model-refresh { flex: none; width: 34px; height: 34px; padding: 0; }
-.preset-roles { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 0.75rem; color: var(--muted); }
-.preset-roles > span + span::before { content: "·"; margin-right: 6px; opacity: 0.7; }
+.model-toolbar > .model-search { flex: 1; min-width: 0; height: 36px; margin-bottom: 0; }
+.model-refresh { flex: none; width: 36px; height: 36px; min-height: 0; padding: 0; }
+.preset-roles { display: flex; flex-direction: column; gap: 2px; font-size: 0.75rem; color: var(--muted); }
+.preset-group-list { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; }
+.preset-group { min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
+.preset-group-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px; padding: 6px 10px; border: 0; background: transparent; text-align: left; }
+.preset-group-head > small { margin-left: auto; color: var(--muted); font-weight: 400; }
+.preset-group-head .disclosure-chevron[data-open] { transform: rotate(90deg); }
+.preset-group .model-result-list { margin: 0; padding: 0 6px 6px; }
+.select-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 /* The tab bar stays pinned while only the active panel scrolls. */
 .modal-content:has(> .settings-dialog) { display: flex; flex-direction: column; overflow: hidden; }
 .settings-dialog { display: flex; flex-direction: column; gap: 16px; min-height: 0; flex: 1; }

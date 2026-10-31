@@ -1180,8 +1180,10 @@ test("real DesktopHost→transport→SDK serializes reasoning/model transitions 
 	expect(JSON.stringify(fixture.snapshot().requests.map(record => record.body.messages))).not.toContain(
 		"canceled owned follow-up",
 	);
-	await call("thinking.set", { sessionId, level: "inherit" });
-	await call("prompt", { sessionId, text: "inherited owned turn" });
+	// The reasoning menu offers concrete levels only, so the session's effort always comes from
+	// an explicit selection. Re-applying the same level keeps the request shape stable.
+	await call("thinking.set", { sessionId, level: "low" });
+	await call("prompt", { sessionId, text: "explicitly low owned turn" });
 	expect(fixture.snapshot().requests.at(-1)!.body).toMatchObject({ model: "qa-reasoning", reasoning_effort: "low" });
 
 	await call("model.set", { sessionId, modelId: `${QA_PROVIDER}/qa-plain`, thinkingLevel: "off" });

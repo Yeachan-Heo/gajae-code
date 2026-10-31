@@ -1,4 +1,4 @@
-import { ChevronDown, Cpu, RefreshCw, Search, Star } from "lucide-react";
+import { ChevronDown, ChevronRight, Cpu, RefreshCw, Search, Star } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useId, useRef, useState } from "react";
 import type {
@@ -26,6 +26,7 @@ const PROFILE_ROLE_LABELS: Record<DesktopModelRoleId, () => string> = {
 	image: () => t("models.roleImage"),
 };
 const FAVORITES_KEY = "gjc.desktop.model-favorites";
+const PRESET_FAVORITES_KEY = "gjc.desktop.preset-favorites";
 
 function searchTerms(query: string): string[] {
 	return query.trim().toLowerCase().split(/\s+/u).filter(Boolean);
@@ -56,18 +57,21 @@ function profileRoleEntries(profile: DesktopModelProfile): { id: DesktopModelRol
 	);
 }
 
-function readFavorites(): { ids: string[]; error: boolean } {
+function readFavorites(key: string, pattern: RegExp): { ids: string[]; error: boolean } {
 	try {
-		const raw = localStorage.getItem(FAVORITES_KEY);
+		const raw = localStorage.getItem(key);
 		if (raw === null) return { ids: [], error: false };
 		const value: unknown = JSON.parse(raw);
 		if (!Array.isArray(value)) return { ids: [], error: true };
-		const ids = value.filter((id): id is string => typeof id === "string" && /^[^/\s]+\/\S+$/u.test(id));
+		const ids = value.filter((id): id is string => typeof id === "string" && pattern.test(id));
 		return { ids: [...new Set(ids)], error: ids.length !== value.length };
 	} catch {
 		return { ids: [], error: true };
 	}
 }
+
+const MODEL_FAVORITE = /^[^/\s]+\/\S+$/u;
+const PRESET_FAVORITE = /^[^/\s]+$/u;
 
 function focusFirstHit(list: HTMLUListElement | null) {
 	list?.querySelector<HTMLButtonElement>(".model-option-hit:not(:disabled)")?.focus();
@@ -130,7 +134,9 @@ export function ModelPicker({
 	const [modelQuery, setModelQuery] = useState("");
 	const [presetQuery, setPresetQuery] = useState("");
 	const [choice, setChoice] = useState<string | null>(null);
-	const [favorites, setFavorites] = useState(readFavorites);
+	const [favorites, setFavorites] = useState(() => readFavorites(FAVORITES_KEY, MODEL_FAVORITE));
+	const [presetFavorites, setPresetFavorites] = useState(() => readFavorites(PRESET_FAVORITES_KEY, PRESET_FAVORITE));
+	const [expandedGroups, setExpandedGroups] = useState<string[]>([]);
 	const modelInput = useRef<HTMLInputElement>(null);
 	const presetInput = useRef<HTMLInputElement>(null);
 	const tabs = useRef<HTMLDivElement>(null);
@@ -161,6 +167,24 @@ export function ModelPicker({
 		)
 		.map(item => item.model);
 	const filteredProfiles = filterProfiles(profileList, presetQuery);
+	// Preset providers mirror the terminal: one collapsed header per family, expanded on demand.
+	// A search expands every group, so a match is never hidden behind a collapsed header.
+	const searchingPresets = presetQuery.trim().length > 0;
+	const presetGroups = ((): [string, DesktopModelProfile[]][] => {
+		const groups = new Map<string, DesktopModelProfile[]>();
+		for (const profile of filteredProfiles) {
+			const key = profile.group ?? t("models.presetGroupOther");
+			const members = groups.get(key);
+			if (members) members.push(profile);
+			else groups.set(key, [profile]);
+		}
+		return [...groups.entries()].sort((left, right) => left[0].localeCompare(right[0]));
+	})();
+	const groupOpen = (group: string) => searchingPresets || expandedGroups.includes(group);
+	const toggleGroup = (group: string) =>
+		setExpandedGroups(previous =>
+			previous.includes(group) ? previous.filter(item => item !== group) : [...previous, group],
+		);
 
 	useEffect(() => {
 		if (!open) return;
@@ -203,6 +227,17 @@ export function ModelPicker({
 			setFavorites({ ids: next, error: false });
 		} catch {
 			setFavorites({ ids: next, error: true });
+		}
+	}
+	function togglePresetFavorite(id: string) {
+		const next = presetFavorites.ids.includes(id)
+			? presetFavorites.ids.filter(item => item !== id)
+			: [...presetFavorites.ids, id];
+		try {
+			localStorage.setItem(PRESET_FAVORITES_KEY, JSON.stringify(next));
+			setPresetFavorites({ ids: next, error: false });
+		} catch {
+			setPresetFavorites({ ids: next, error: true });
 		}
 	}
 	function closeDialog() {
@@ -324,57 +359,119 @@ export function ModelPicker({
 										}}
 									/>
 								</label>
+								<Button
+									className="model-refresh"
+									aria-label={t("models.refreshPresets")}
+									title={t("models.refreshPresets")}
+									disabled={!onRefresh || !!refreshing}
+									onClick={() => onRefresh?.()}
+								>
+									<RefreshCw aria-hidden="true" />
+								</Button>
 							</div>
 							<p className="muted" role="status">
 								{t("models.presetCount", { count: filteredProfiles.length })}
 							</p>
+							{presetFavorites.error && (
+								<p className="model-favorites-error" role="alert">
+									{t("models.presetFavoritesError")}
+								</p>
+							)}
 							{profileList.length === 0 ? (
 								<div className="empty model-empty">{t("models.noPresets")}</div>
 							) : filteredProfiles.length === 0 ? (
 								<div className="empty model-empty">{t("models.noPresetMatches")}</div>
 							) : (
-								<ul
-									ref={presetResults}
-									className="model-result-list"
-									aria-label={t("models.presetResults")}
-									onKeyDown={navigateList}
-								>
-									{filteredProfiles.map(profile => {
-										const entries = profileRoleEntries(profile);
+								<ul className="preset-group-list" aria-label={t("models.presetResults")}>
+									{presetGroups.map(([group, members]) => {
+										const expanded = groupOpen(group);
 										return (
-											<li className="model-result-row" key={profile.id}>
-												<div className="model-option" aria-current={profile.active ? "true" : undefined}>
-													<Button
-														className="model-option-hit"
-														aria-label={t("models.applyPreset", { name: profile.name })}
-														disabled={!onApplyProfile || applying}
-														onClick={() => {
-															if (!onApplyProfile) return;
-															onApplyProfile(profile.id);
-															closeDialog();
-														}}
+											<li className="preset-group" key={group}>
+												<Button
+													className="preset-group-head"
+													aria-expanded={expanded}
+													onClick={() => toggleGroup(group)}
+												>
+													<ChevronRight
+														className="disclosure-chevron"
+														size={14}
+														aria-hidden="true"
+														data-open={expanded || undefined}
+													/>
+													<strong>{group}</strong>
+													<small>
+														{members.length === 1
+															? t("models.presetGroupCountOne")
+															: t("models.presetGroupCount", { count: members.length })}
+													</small>
+												</Button>
+												{expanded && (
+													<ul
+														ref={presetResults}
+														className="model-result-list"
+														aria-label={t("models.presetResults")}
+														onKeyDown={navigateList}
 													>
-														<span className="model-option-main">
-															<strong>{profile.name}</strong>
-															<small>
-																{profile.source === "builtin"
-																	? t("models.presetBuiltin")
-																	: t("models.presetConfigured")}
-																{profile.active ? ` · ${t("models.active")}` : ""}
-																{profile.default ? ` · ${t("models.defaultProfile")}` : ""}
-															</small>
-															{entries.length > 0 && (
-																<span className="preset-roles">
-																	{entries.map(entry => (
-																		<span key={entry.id}>
-																			{entry.label} {entry.model}
-																		</span>
-																	))}
-																</span>
-															)}
-														</span>
-													</Button>
-												</div>
+														{members.map(profile => {
+															const entries = profileRoleEntries(profile);
+															return (
+																<li className="model-result-row" key={profile.id}>
+																	<div
+																		className="model-option"
+																		aria-current={profile.active ? "true" : undefined}
+																	>
+																		<Button
+																			className="model-option-hit"
+																			aria-label={t("models.applyPreset", { name: profile.name })}
+																			disabled={!onApplyProfile || applying}
+																			onClick={() => {
+																				if (!onApplyProfile) return;
+																				onApplyProfile(profile.id);
+																				closeDialog();
+																			}}
+																		>
+																			<span className="model-option-main">
+																				<strong>{profile.name}</strong>
+																				{(profile.active || profile.default) && (
+																					<small>
+																						{profile.active ? t("models.active") : ""}
+																						{profile.active && profile.default ? " · " : ""}
+																						{profile.default ? t("models.defaultProfile") : ""}
+																					</small>
+																				)}
+																				{entries.length > 0 && (
+																					<span className="preset-roles">
+																						{entries.map(entry => (
+																							<span key={entry.id}>
+																								· {entry.label} {entry.model}
+																							</span>
+																						))}
+																					</span>
+																				)}
+																			</span>
+																		</Button>
+																		<Button
+																			className="model-favorite"
+																			aria-label={t("models.starPreset", { name: profile.name })}
+																			aria-pressed={presetFavorites.ids.includes(profile.id)}
+																			onClick={() => togglePresetFavorite(profile.id)}
+																		>
+																			<Star
+																				size={16}
+																				aria-hidden="true"
+																				fill={
+																					presetFavorites.ids.includes(profile.id)
+																						? "currentColor"
+																						: "none"
+																				}
+																			/>
+																		</Button>
+																	</div>
+																</li>
+															);
+														})}
+													</ul>
+												)}
 											</li>
 										);
 									})}

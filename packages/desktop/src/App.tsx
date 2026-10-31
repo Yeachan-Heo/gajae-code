@@ -99,6 +99,7 @@ import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
 import { PreferencesPanel } from "./PreferencesPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
+import { Select } from "./Select";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
@@ -547,7 +548,11 @@ export default function App() {
 		| null
 	>(null);
 	const [dragProject, setDragProject] = useState<string | null>(null);
+	const dragProjectRef = useRef<string | null>(null);
 	const [dragSession, setDragSession] = useState<{ id: string; projectId: string } | null>(null);
+	/** The conversation whose open is still outstanding; its transcript is unknown. */
+	const [opening, setOpening] = useState<string | null>(null);
+	const dragSessionRef = useRef<{ id: string; projectId: string } | null>(null);
 	/** The row under the pointer and which of its edges the dragged item will land on. */
 	const [dropTarget, setDropTarget] = useState<{ key: string; after: boolean } | null>(null);
 	const menuRef = useRef<HTMLDivElement | null>(null);
@@ -1036,7 +1041,10 @@ export default function App() {
 		if (!connected) return;
 		setSelected(item.id);
 		setSidebar(false);
-		void call("session.select", { sessionId: item.id }, `select:${item.id}`);
+		setOpening(item.id);
+		void call("session.select", { sessionId: item.id }, `select:${item.id}`).finally(() => {
+			setOpening(current => (current === item.id ? null : current));
+		});
 	};
 	const openProject = () =>
 		run("global", async () => {
@@ -1803,6 +1811,8 @@ export default function App() {
 	}, [menu]);
 	const clearDrag = () => {
 		setDropTarget(null);
+		dragProjectRef.current = null;
+		dragSessionRef.current = null;
 		setDragProject(null);
 		setDragSession(null);
 	};
@@ -1881,7 +1891,7 @@ export default function App() {
 							onDragOver={event => {
 								// The cue follows the drag state; the payload is read in the drop below, which
 								// is where a browser exposes it.
-								const dragged = dragProject;
+								const dragged = dragProjectRef.current;
 								if (!dragged || dragged === item.id) return;
 								event.preventDefault();
 								const order = (snapshot?.projects ?? []).map(project => project.id);
@@ -1922,8 +1932,10 @@ export default function App() {
 									setMenu({ kind: "project", id: item.id, x: box.left, y: box.bottom });
 								}}
 								onDragStart={event => {
+									dragProjectRef.current = item.id;
 									setDragProject(item.id);
 									event.dataTransfer?.setData("text/plain", item.id);
+									if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
 								}}
 								onDragEnd={clearDrag}
 							>
@@ -1956,8 +1968,6 @@ export default function App() {
 											? `drop-target ${dropTarget.after ? "drop-after" : "drop-before"}`
 											: ""
 									}`}
-									draggable={!searching}
-									title={searching ? t("shell.reorderPausedWhileSearching") : undefined}
 									onContextMenu={event => {
 										event.preventDefault();
 										event.stopPropagation();
@@ -1969,20 +1979,16 @@ export default function App() {
 											y: event.clientY,
 										});
 									}}
-									onDragStart={event => {
-										setDragSession({ id: chat.id, projectId: item.id });
-										event.dataTransfer?.setData("text/plain", chat.id);
-									}}
-									onDragEnd={clearDrag}
 									onDragOver={event => {
-										// The cue follows the drag state; a drag carried by the payload alone is
-										// handled by the drop below, which is where the browser exposes it.
-										const dragged = dragSession?.id;
+										// The cue follows the drag ref, not React state: dragover arrives before the
+										// state committed at dragstart, and a rejected dragover forbids the drop.
+										const dragged = dragSessionRef.current?.id;
 										if (!dragged || dragged === chat.id) return;
 										const order = filtered.map(entry => entry.id);
 										// No cross-workspace move exists, so a foreign conversation gets no cue.
 										if (!order.includes(dragged)) return;
 										event.preventDefault();
+										if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
 										setDropTarget({
 											key: `session:${chat.id}`,
 											after: order.indexOf(dragged) < order.indexOf(chat.id),
@@ -1992,7 +1998,7 @@ export default function App() {
 										setDropTarget(previous => (previous?.key === `session:${chat.id}` ? null : previous))
 									}
 									onDrop={event => {
-										const dragged = event.dataTransfer?.getData("text/plain") || dragSession?.id;
+										const dragged = event.dataTransfer?.getData("text/plain") || dragSessionRef.current?.id;
 										const ids = all.map(session => session.id);
 										if (!dragged || dragged === chat.id || !ids.includes(dragged)) return;
 										event.preventDefault();
@@ -2007,6 +2013,13 @@ export default function App() {
 									<SessionRow
 										session={chat}
 										selected={chat.id === selected}
+										onDragStart={event => {
+											dragSessionRef.current = { id: chat.id, projectId: item.id };
+											event.dataTransfer?.setData("text/plain", chat.id);
+											if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+											setDragSession({ id: chat.id, projectId: item.id });
+										}}
+										onDragEnd={clearDrag}
 										onSelect={() => select(chat)}
 										onMenu={(x, y) => setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })}
 										onStar={() => {
@@ -2059,14 +2072,16 @@ export default function App() {
 				<p role="status">{t("shell.loadingChanges")}</p>
 			) : diffs.length ? (
 				<>
-					<label htmlFor="diff-file">{t("shell.file")}</label>
-					<select id="diff-file" value={diffPath} onChange={event => setDiffPath(event.target.value)}>
-						{diffs.map(file => (
-							<option key={file.path} value={file.path}>
-								{file.status} · {file.path}
-							</option>
-						))}
-					</select>
+					<div className="select-field">
+						<label id="diff-file">{t("shell.file")}</label>
+						<Select
+							value={diffPath}
+							options={diffs.map(file => ({ value: file.path, label: `${file.status} · ${file.path}` }))}
+							ariaLabel={t("shell.file")}
+							ariaLabelledby="diff-file"
+							onChange={setDiffPath}
+						/>
+					</div>
 					<pre className="diff-output">{diffs.find(file => file.path === diffPath)?.patch}</pre>
 				</>
 			) : (
@@ -2362,7 +2377,14 @@ export default function App() {
 									{t("shell.showOlderMessages")}
 								</Button>
 							)}
-							{session.messages.length === 0 && <div className="empty">{t("shell.emptyConversation")}</div>}
+							{session.messages.length === 0 &&
+								(opening === session.id ? (
+									<div className="empty" role="status">
+										{t("shell.loadingConversation")}
+									</div>
+								) : (
+									<div className="empty">{t("shell.emptyConversation")}</div>
+								))}
 							{session.messages.slice(-historyLimit).map(message => (
 								<Message key={message.id} message={message} />
 							))}
@@ -2787,17 +2809,6 @@ export default function App() {
 												</Button>
 											))}
 										</div>
-									</SettingsSection>
-									<SettingsSection
-										id={`${settingsPanelPrefix}-model`}
-										title={t("shell.currentModelAndReasoning")}
-										hint={t("shell.modelSectionHint")}
-									>
-										{session ? (
-											modelControls(session)
-										) : (
-											<p className="muted">{t("shell.selectConversationFirst")}</p>
-										)}
 									</SettingsSection>
 								</div>
 								<div

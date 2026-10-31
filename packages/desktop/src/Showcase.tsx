@@ -116,6 +116,7 @@ function FixtureControls({
 			id: "design-fixture-default",
 			name: t("showcase.profileDefaultName"),
 			description: null,
+			group: "CODEX",
 			source: "builtin",
 			active: appliedProfile === "design-fixture-default",
 			default: true,
@@ -136,6 +137,7 @@ function FixtureControls({
 			id: "design-fixture-review",
 			name: t("showcase.profileReviewName"),
 			description: null,
+			group: "COMBOS",
 			source: "configured",
 			active: appliedProfile === "design-fixture-review",
 			default: false,
@@ -150,6 +152,27 @@ function FixtureControls({
 			capabilities: {
 				selectSession: { available: true, reason: null },
 				persistDefault: { available: false, reason: t("showcase.profileDefaultUnavailable") },
+			},
+		},
+		{
+			id: "design-fixture-local",
+			name: t("showcase.profileLocalName"),
+			description: null,
+			group: "macOS Local (oMLX)",
+			source: "configured",
+			active: false,
+			default: false,
+			roles: [
+				{ id: "default", model: fixtureModels[2].id },
+				{ id: "executor", model: fixtureModels[2].id },
+				{ id: "architect", model: null },
+				{ id: "planner", model: null },
+				{ id: "critic", model: null },
+				{ id: "image", model: null },
+			],
+			capabilities: {
+				selectSession: { available: true, reason: null },
+				persistDefault: { available: true, reason: null },
 			},
 		},
 	];

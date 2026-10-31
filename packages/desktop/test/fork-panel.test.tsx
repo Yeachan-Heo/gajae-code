@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { Children, isValidElement } from "react";
-import type { ChangeEvent, ReactElement, ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopHistory } from "../../desktop-host/src/protocol";
 import { ForkPanel, type ForkPanelProps } from "../src/ForkPanel";
+import { Select } from "../src/Select";
 
 const wholeCopy = "Copy the whole conversation (fork without a selection)";
 const selectedFork = "Fork before the selected message";
@@ -53,12 +54,13 @@ function button(html: string, label: string): string {
 
 interface PanelNodeProps {
 	children?: ReactNode;
+	options?: { value: string; label: string }[];
 	value?: string;
 	readOnly?: boolean;
 	disabled?: boolean;
 	id?: string;
 	"aria-describedby"?: string;
-	onChange?: (event: ChangeEvent<HTMLSelectElement>) => void;
+	onChange?: (value: string) => void;
 	onClick?: () => void;
 }
 
@@ -94,9 +96,14 @@ function node(tree: ReactNode, predicate: (element: ReactElement<PanelNodeProps>
 }
 
 function change(tree: ReactNode, value: string) {
-	const handler = node(tree, element => element.type === "select").props.onChange;
+	const select = node(tree, element => element.type === Select);
+	const handler = select.props.onChange;
 	if (!handler) throw new Error("Missing selection handler");
-	handler({ target: { value } } as ChangeEvent<HTMLSelectElement>);
+	handler(value);
+}
+
+function selectNode(tree: ReactNode) {
+	return node(tree, element => element.type === Select);
 }
 
 function click(tree: ReactNode, label: string) {
@@ -106,15 +113,20 @@ function click(tree: ReactNode, label: string) {
 }
 
 describe("desktop controlled fork body", () => {
-	test("only persisted user entries become numbered native options and duplicate text keeps distinct canonical identities", () => {
+	test("only persisted user entries become numbered choices and duplicate text keeps distinct canonical identities", () => {
 		const tree = capture({ selectedEntryId: "entry:second/日本語" });
-		const options = nodes(tree, element => element.type === "option");
-		expect(options.map(option => option.props.value)).toEqual(["", "entry:first", "entry:second/日本語", "entry:empty"]);
+		const options = selectNode(tree).props.options ?? [];
+		expect(options.map(option => option.value)).toEqual(["", "entry:first", "entry:second/日本語", "entry:empty"]);
+		// The listbox renders one trigger label; the choice list lives in the opened menu.
+		expect(options.map(option => option.label)).toEqual([
+			"Select a user message",
+			`1. ${duplicateText}`,
+			`2. ${duplicateText}`,
+			"3. User message without text",
+		]);
 		const html = render({ selectedEntryId: "entry:second/日本語" });
-		expect(html).toContain('value="entry:second/日本語" selected=""');
-		expect(html).toContain(`1. ${duplicateText}`);
-		expect(html).toContain(`2. ${duplicateText}`);
-		expect(html).toContain("3. User message without text");
+		expect(html).toContain(`<span>2. ${duplicateText}</span>`);
+		expect(html).not.toContain("<select");
 		for (const excluded of ["display-first", "display-second", "display-assistant", "display-unpersisted", "entry:not-user", "Response that cannot be selected", "Message without a persisted entryId"]) {
 			expect(html).not.toContain(excluded);
 		}
@@ -152,7 +164,7 @@ describe("desktop controlled fork body", () => {
 			const tree = capture({ selectedEntryId, onFork: entryId => forks.push(entryId) });
 			expect(button(render({ selectedEntryId }), selectedFork)).toContain('disabled=""');
 			expect(node(tree, element => element.type === "textarea").props.value).toBe("");
-			expect(node(tree, element => element.type === "select").props.value).toBe("");
+			expect(selectNode(tree).props.value).toBe("");
 			click(tree, selectedFork);
 		}
 		expect(forks).toEqual([]);
@@ -196,7 +208,8 @@ describe("desktop controlled fork body", () => {
 			};
 			const html = render(options);
 			for (const label of [wholeCopy, selectedFork, loadMore]) expect(button(html, label)).toContain('disabled=""');
-			expect(html.match(/<select\b[^>]*>/u)?.[0]).toContain('disabled=""');
+			// The listbox is a button-backed control, so its disabled state is on the trigger.
+			expect(html.match(/<button[^>]*aria-haspopup="listbox"[^>]*>/u)?.[0]).toContain('disabled=""');
 			expect(html.match(/<textarea\b[^>]*>/u)?.[0]).not.toContain('disabled=""');
 			const tree = capture(options);
 			expect(node(tree, element => element.type === "textarea").props.value).toBe(duplicateText);
@@ -224,14 +237,20 @@ describe("desktop controlled fork body", () => {
 		expect(loading).not.toContain("<dialog");
 	});
 
-	test("multiple bodies keep select and preview label associations unique", () => {
+	test("multiple bodies keep listbox and preview label associations unique", () => {
 		const html = renderToStaticMarkup(<><ForkPanel {...props()} /><ForkPanel {...props()} /></>);
-		const labels = [...html.matchAll(/<label for="([^"]+)">([^<]+)<\/label>/gu)];
-		expect(labels.map(match => match[2])).toEqual([
-			"User message to fork from", "Selected message preview (read only)",
-			"User message to fork from", "Selected message preview (read only)",
+		// The entry chooser is a listbox, not a labelable native field, so each panel names its own
+		// control with aria-labelledby and the preview keeps its htmlFor association.
+		const chooserLabels = [...html.matchAll(/<label id="([^"]+)">([^<]+)<\/label>/gu)];
+		const previewLabels = [...html.matchAll(/<label for="([^"]+)">([^<]+)<\/label>/gu)];
+		expect(chooserLabels.map(match => match[2])).toEqual(["User message to fork from", "User message to fork from"]);
+		expect(previewLabels.map(match => match[2])).toEqual([
+			"Selected message preview (read only)",
+			"Selected message preview (read only)",
 		]);
-		expect(new Set(labels.map(match => match[1])).size).toBe(4);
-		for (const match of labels) expect(html).toContain(`id="${match[1]}"`);
+		const ids = [...chooserLabels, ...previewLabels].map(match => match[1]);
+		expect(new Set(ids).size).toBe(4);
+		for (const id of chooserLabels.map(match => match[1])) expect(html).toContain(`aria-labelledby="${id}"`);
+		for (const id of previewLabels.map(match => match[1])) expect(html).toContain(`id="${id}"`);
 	});
 });

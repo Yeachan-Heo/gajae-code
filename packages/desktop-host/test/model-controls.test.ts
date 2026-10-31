@@ -192,7 +192,7 @@ describe("desktop model and session reasoning controls", () => {
 			},
 		});
 		expect(session.thinking).toMatchObject({ level: "low", scope: "global config", mode: "budget", available: true });
-		expect(session.thinking?.options.map(option => option.value)).toEqual(["inherit", "off", "low", "high", "max"]);
+		expect(session.thinking?.options.map(option => option.value)).toEqual(["off", "low", "high", "max"]);
 		expect(snapshot.models.find(model => model.id === selector(plain))).toMatchObject({
 			reasoning: false,
 			thinking: { options: [] },
@@ -220,8 +220,12 @@ describe("desktop model and session reasoning controls", () => {
 					frame.type === "session" && frame.session.id === session.id && frame.session.thinking?.level === "max",
 			),
 		).toBe(true);
-		await call("thinking.set", { sessionId: session.id, level: "inherit" });
-		expect(dto(session.id).thinking).toMatchObject({ level: sdk.thinkingLevel ?? null, scope: "global config" });
+		// The resolved level is what the session uses; `inherit` is not an offered choice, so a
+		// request for it is refused instead of silently resetting the scope.
+		await expect(call("thinking.set", { sessionId: session.id, level: "inherit" })).rejects.toThrow(
+			/thinking level/i,
+		);
+		expect(dto(session.id).thinking).toMatchObject({ level: "max", scope: "session" });
 	});
 
 	test("rejects malformed, unknown and discrete-gap efforts before invoking either mutation", async () => {
@@ -275,7 +279,6 @@ describe("desktop model and session reasoning controls", () => {
 		});
 		expect(session.thinking).toMatchObject({ mode: "toggle", available: true });
 		expect(session.thinking?.options.map(option => [option.value, option.label])).toEqual([
-			["inherit", "inherit"],
 			["off", "off"],
 			["high", "on"],
 		]);

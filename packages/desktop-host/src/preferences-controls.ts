@@ -199,6 +199,7 @@ export function createDesktopPreferencesController(session: AgentSession): Deskt
 				id: item.id,
 				name: item.displayName,
 				description: null,
+				group: item.providerGroup ?? null,
 				source: item.source,
 				active: item.id === active,
 				default: item.id === defaultName,

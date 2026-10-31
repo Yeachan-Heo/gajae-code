@@ -6,6 +6,7 @@ export const showcase = {
 	"showcase.reasoningOptionHighDescription": "Checks how a long option wraps.",
 	"showcase.profileDefaultName": "Default profile",
 	"showcase.profileReviewName": "Review-focused profile",
+	"showcase.profileLocalName": "Local macOS profile",
 	"showcase.profileDefaultUnavailable": "Design example",
 	"showcase.reasoningUnavailable": "Design example · no reasoning options available.",
 	"showcase.modelControlsRunning": "Design example while running · no real request",

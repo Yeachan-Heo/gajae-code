@@ -68,10 +68,9 @@ export function projectDesktopThinking(session?: AgentSession): DesktopThinking 
 	const thinking = modelThinking(session.model);
 	return {
 		level: session.thinkingLevel ?? null,
-		options:
-			thinking.options.length > 0
-				? [{ ...getThinkingLevelMetadata("inherit", session.model) }, ...thinking.options]
-				: [],
+		// The resolved level is what the session will use, so `inherit` would be a second name
+		// for the value already shown. Only concrete levels are selectable here.
+		options: thinking.options,
 		scope: session.getThinkingScopeForControl(),
 		available: thinking.options.length > 0,
 		...(thinking.mode ? { mode: thinking.mode } : {}),

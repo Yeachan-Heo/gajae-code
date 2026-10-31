@@ -218,7 +218,7 @@ export interface DesktopModel {
 	provider: string;
 	contextWindow: number;
 	reasoning: boolean;
-	/** Concrete model choices exclude inherit; only session thinking controls inherit. */
+	/** Concrete levels only: the resolved level already reflects any profile default. */
 	thinking: { options: DesktopThinkingOption[]; mode?: DesktopThinkingMode };
 }
 export interface DesktopCapability {

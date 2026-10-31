@@ -49,16 +49,18 @@ describe("desktop setting field control types", () => {
 		expect(html).toContain('value="copy-retain"');
 	});
 
-	test("enums keep a bounded select", () => {
+	test("enums render the app's own listbox, not a native select", () => {
 		const html = render({
 			path: "session.directoryMigration",
 			type: "enum",
 			value: "copy-retain",
 			choices: ["copy-retain", "move"],
 		});
-		expect(control(html)).toContain("<select");
-		expect(html).toContain('<option selected="">copy-retain</option>');
-		expect(html).toContain("<option>move</option>");
+		// A native <select> opened a macOS menu that matched neither the surface styling nor the
+		// keyboard model of the composer's reasoning control.
+		expect(control(html)).not.toContain("<select");
+		expect(html).toContain('aria-haspopup="listbox"');
+		expect(html).toContain("<span>copy-retain</span>");
 		expect(html).not.toContain('type="checkbox"');
 	});
 
@@ -70,8 +72,9 @@ describe("desktop setting field control types", () => {
 
 	test("a hand-edited value outside the option list stays selected", () => {
 		const html = render({ path: "tools.spill", type: "number", value: 30, choices: ["100", "200"] });
-		expect(html).toContain('<option selected="">30</option>');
-		expect(html).toContain("<option>100</option>");
+		// The trigger names the stored value, so an unlisted choice is visible and saveable.
+		expect(html).toContain("<span>30</span>");
+		expect(html).not.toContain("<select");
 	});
 
 	test("read-only settings explain themselves on the save action", () => {
