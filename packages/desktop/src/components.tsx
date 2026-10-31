@@ -88,11 +88,12 @@ export function SessionRow({
 					onMenu(box.left, box.bottom);
 				}}
 			>
-				<span className="session-title">{session.title}</span>
-				<small className={`status ${session.status}`}>
+				{/* One line: the state is a coloured indicator beside the name, not a second row. */}
+				<span className={`session-state ${session.status}`} title={statuses[session.status]()}>
 					<StatusIcon aria-hidden="true" />
-					{statuses[session.status]()}
-				</small>
+					<span className="sr-only">{statuses[session.status]()}</span>
+				</span>
+				<span className="session-title">{session.title}</span>
 			</button>
 		</div>
 	);

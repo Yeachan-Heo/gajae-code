@@ -105,7 +105,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 	text-align: center;
 	line-height: 1.45;
 }
-.button svg, .status svg, .error-banner > svg, .question-heading > svg,
+.button svg, .error-banner > svg, .question-heading > svg,
 .question-pending svg, .tool-disclosure svg, .notice > svg {
 	width: 16px;
 	height: 16px;
@@ -185,14 +185,16 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .session-row { display: flex; align-items: center; border: 1px solid transparent; border-radius: var(--radius-sm); margin: 4px 0; min-width: 0; }
 .session-row:hover { background: var(--surface-2); }
 .session-row.selected { background: var(--card); border-color: var(--border-soft); box-shadow: var(--shadow-rest); }
-.session-select { display: flex; flex: 1; min-width: 0; flex-direction: column; align-items: flex-start; text-align: left; gap: 5px; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 8px; }
-.session-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; word-break: keep-all; line-height: 1.45; }
-.status { display: inline-flex; align-items: center; gap: 5px; font-size: 0.6875rem; color: var(--muted); }
-.status svg { width: 12px; height: 12px; }
-.status.running { color: var(--status-running); }
-.status.waiting { color: var(--status-waiting); }
-.status.done { color: var(--status-done); }
-.status.error { color: var(--status-error); }
+/* One row per conversation: the state indicator sits to the left of the name, so a list of
+   conversations never spends two lines on one entry. */
+.session-select { display: flex; flex: 1; min-width: 0; align-items: center; text-align: left; gap: 7px; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 5px 8px; }
+.session-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere; line-height: 1.45; }
+.session-state { display: inline-flex; flex: none; align-items: center; color: var(--muted); }
+.session-state svg { width: 13px; height: 13px; }
+.session-state.running { color: var(--status-running); }
+.session-state.waiting { color: var(--status-waiting); }
+.session-state.done { color: var(--status-done); }
+.session-state.error { color: var(--status-error); }
 .main-pane { display: flex; flex: 1; min-width: 0; flex-direction: column; min-height: 0; overflow: auto; overscroll-behavior: contain; }
 .toolbar { padding: 12px 20px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; flex-shrink: 0; background: var(--bg); }
 .toolbar-title { flex: 1; min-width: 120px; }

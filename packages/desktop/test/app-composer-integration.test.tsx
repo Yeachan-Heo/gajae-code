@@ -1690,7 +1690,7 @@ describe("mounted composer delivery recovery", () => {
 			await page.evaluate(goalFrame, { status: "active", sessionStatus: "waiting" });
 			// The row status is what carries the waiting state; the goal strip stays as it was.
 			await page.waitForFunction(
-				() => document.querySelector(".session-row .status.waiting") !== null,
+				() => document.querySelector(".session-row .session-state.waiting") !== null,
 			);
 			expect(await openGoalDialog()).toBeNull();
 		} finally {
