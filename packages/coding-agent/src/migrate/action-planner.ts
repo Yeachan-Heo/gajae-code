@@ -11,6 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { FileType, glob } from "@gajae-code/natives";
 import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
+import { YAML } from "bun";
 import { readMCPConfigFile, validateServerName } from "../runtime-mcp/config-writer";
 import { PROTECTED_AGENT_NAMES } from "./adapters";
 import { isSupportedHookEvent, renderHookModule } from "./hook-module";
@@ -806,11 +807,16 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		for (const candidate of result.agentCandidates) {
 			const warnings = [...candidate.warnings];
 			let name = candidate.name;
+			let agentContent = candidate.content;
 			if (PROTECTED_AGENT_NAMES.has(name.toLowerCase())) {
 				name = `${candidate.source}-${name}`;
 				warnings.push(
 					`renamed agent "${candidate.name}" to "${name}" so the bundled ${candidate.name} role stays authoritative`,
 				);
+				// Rewrite the frontmatter to reflect the new name
+				const { frontmatter, body } = parseFrontmatter(agentContent);
+				frontmatter.name = name;
+				agentContent = `---\n${YAML.stringify(frontmatter, null, 2)}---\n${body}`;
 			}
 			if (!validAgentName.test(name)) {
 				actions.push({
@@ -840,7 +846,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					operation: input.force ? "update" : "skip",
 					status: input.force ? "updated" : "skipped_exists",
 					reason: `duplicate agent destination with "${planned.name}"`,
-					...(input.force ? { agent: { content: candidate.content } } : {}),
+					...(input.force ? { agent: { content: agentContent } } : {}),
 				});
 				continue;
 			}
@@ -879,7 +885,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					...base,
 					operation: exists ? "update" : "create",
 					status: exists ? "updated" : "imported",
-					agent: { content: candidate.content },
+					agent: { content: agentContent },
 				});
 			}
 			plannedAgents.set(collisionKey, { name, destination });

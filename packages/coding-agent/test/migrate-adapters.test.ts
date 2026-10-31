@@ -267,3 +267,47 @@ describe("opencode adapter", () => {
 		expect(result.skillCandidates.map(c => c.slug)).toContain("nested");
 	});
 });
+
+
+test("rejects agents with unsupported-only tool restrictions", async () => {
+	await writeFile(
+		".claude/agents/unsupported-only.md",
+		"---\nname: unsupported-agent\ndescription: Agent with unsupported tools\ntools: NotebookEdit, SomeOtherUnsupported\n---\n\nYou are an agent with unsupported tools.\n",
+	);
+
+	const result = await getAdapter("claude-code").collect(adapterOptions());
+	const unsupported = result.agentCandidates.find(candidate => candidate.name === "unsupported-agent");
+
+	// Agent should be rejected (not in candidates)
+	expect(unsupported).toBeUndefined();
+
+	// Should have a diagnostic explaining rejection
+	expect(result.diagnostics).toContainEqual(
+		expect.objectContaining({
+			code: "agent_unsupported_tools_only",
+			message: expect.stringContaining("maps to no supported GJC tools"),
+		}),
+	);
+});
+
+test("accepts agents with mixed supported/unsupported tools, keeping only supported", async () => {
+	await writeFile(
+		".claude/agents/mixed-tools.md",
+		"---\nname: mixed-agent\ndescription: Agent with mixed tools\ntools: Read, NotebookEdit, Grep\n---\n\nYou are an agent with mixed tools.\n",
+	);
+
+	const result = await getAdapter("claude-code").collect(adapterOptions());
+	const mixed = result.agentCandidates.find(candidate => candidate.name === "mixed-agent");
+
+	// Agent should be included (has some supported tools)
+	expect(mixed).toBeDefined();
+	expect(mixed?.name).toBe("mixed-agent");
+
+	// Content should have tools: [supported, supported] (read, grep - lowercased)
+	expect(mixed?.content).toContain("tools:");
+	expect(mixed?.content).toContain("read");
+	expect(mixed?.content).toContain("grep");
+	// NotebookEdit should not appear in the frontmatter tools (but may in the body)
+	const fm = mixed?.content?.split("---")[1] ?? "";
+	expect(fm).not.toContain("NotebookEdit");
+});
