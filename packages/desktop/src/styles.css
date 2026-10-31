@@ -97,7 +97,9 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 	max-width: 100%;
 	min-height: 34px;
 	padding: 6px 10px;
-	border: 1px solid var(--border-soft);
+	/* The design language draws no outline on a button: the surface it gains under the pointer
+	   is what says it is clickable. The transparent border stays so sizes never shift. */
+	border: 1px solid transparent;
 	border-radius: var(--radius-sm);
 	background: transparent;
 	text-align: center;
@@ -113,7 +115,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .button:hover:not(:disabled), summary:hover { background: var(--surface-2); }
 .button:active:not(:disabled) { background: var(--surface); }
 .button.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 600; box-shadow: var(--shadow-rest); }
-.button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
 .button.danger { color: var(--error); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .app-shell { display: flex; height: 100dvh; overflow: hidden; }
