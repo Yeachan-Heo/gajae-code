@@ -10,6 +10,7 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
+import { isIP } from "node:net";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
 import { checkOpenCodexStatus } from "./providers/openai-opencodex-responses";
@@ -45,6 +46,7 @@ import type {
 	OAuthProvider,
 	OAuthProviderId,
 } from "./utils/oauth/types";
+import { isLoopbackHostname } from "./utils/parse-bind";
 import { isSqliteError } from "./utils/sqlite-errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +75,10 @@ export function extractStructuredApiKeyToken(apiKey: string): string | undefined
 export interface MCPOAuthBinding {
 	/** Exact HTTP(S) origin of the MCP resource endpoint. */
 	resourceOrigin: string;
-	/** Exact canonical HTTP(S) token endpoint used to create and refresh the credential. */
+	/**
+	 * Canonical token endpoint used to create and refresh the credential.
+	 * Cleartext http is accepted only for a loopback host. Every other host is https.
+	 */
 	tokenEndpoint: string;
 }
 
@@ -98,8 +103,70 @@ export function resolveMCPOAuthResourceOrigin(value: string): string | undefined
 	return resolveCanonicalHttpUrl(value)?.origin;
 }
 
+/** Dotted IPv4 embedded in an IPv4-mapped IPv6 address (::ffff:0:0/96). */
+function ipv4MappedAddress(hostname: string): string | undefined {
+	const bare = hostname
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "")
+		.replace(/%.*$/, "");
+	if (isIP(bare) !== 6) return undefined;
+	const bytes = ipv6ToBytes(bare);
+	if (!bytes) return undefined;
+	for (let index = 0; index < 10; index++) {
+		if (bytes[index] !== 0) return undefined;
+	}
+	if (bytes[10] !== 0xff || bytes[11] !== 0xff) return undefined;
+	return `${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`;
+}
+
+function ipv6ToBytes(address: string): Uint8Array | undefined {
+	let normalized = address.toLowerCase();
+	const lastColon = normalized.lastIndexOf(":");
+	const tail = lastColon >= 0 ? normalized.slice(lastColon + 1) : "";
+	if (tail.includes(".")) {
+		const parts = tail.split(".").map(part => Number.parseInt(part, 10));
+		if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return undefined;
+		const hi = ((parts[0] << 8) | parts[1]).toString(16);
+		const lo = ((parts[2] << 8) | parts[3]).toString(16);
+		normalized = `${normalized.slice(0, lastColon + 1)}${hi}:${lo}`;
+	}
+	const halves = normalized.split("::");
+	if (halves.length > 2) return undefined;
+	const left = halves[0] ? halves[0].split(":") : [];
+	const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+	const omitted = 8 - left.length - right.length;
+	if ((halves.length === 1 && omitted !== 0) || (halves.length === 2 && omitted < 1)) return undefined;
+	const words = [...left, ...Array.from({ length: omitted }, () => "0"), ...right];
+	if (words.length !== 8 || words.some(word => !/^[0-9a-f]{1,4}$/.test(word))) return undefined;
+	const bytes = new Uint8Array(16);
+	for (let index = 0; index < words.length; index++) {
+		const word = Number.parseInt(words[index] ?? "0", 16);
+		bytes[index * 2] = word >> 8;
+		bytes[index * 2 + 1] = word & 0xff;
+	}
+	return bytes;
+}
+
+/**
+ * Cleartext token traffic has no remote observer only on loopback.
+ * Non-loopback hosts, including special-purpose addresses and their
+ * IPv4-mapped forms, are not a cleartext exception.
+ */
+function cleartextTokenEndpointAllowed(hostname: string): boolean {
+	const normalized = hostname
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "")
+		.replace(/\.$/, "");
+	if (isLoopbackHostname(normalized)) return true;
+	const mapped = ipv4MappedAddress(normalized);
+	return mapped !== undefined && isLoopbackHostname(mapped);
+}
+
 export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined {
-	return resolveCanonicalHttpUrl(value)?.href;
+	const url = resolveCanonicalHttpUrl(value);
+	if (!url) return undefined;
+	if (url.protocol === "http:" && !cleartextTokenEndpointAllowed(url.hostname)) return undefined;
+	return url.href;
 }
 
 export function isCanonicalMCPOAuthBinding(binding: MCPOAuthBinding): boolean {
