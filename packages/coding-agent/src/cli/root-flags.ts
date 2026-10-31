@@ -59,6 +59,9 @@ export const ROOT_LAUNCH_FLAGS = {
 		description: "Explicit session storage directory and lookup override (default uses managed v2 workspace scope)",
 	}),
 	"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
+	confine: Flags.boolean({
+		description: "Confine the session to its cwd and descendants, and store it separately from ordinary sessions",
+	}),
 	models: Flags.string({ description: "Comma-separated model patterns for Alt+N cycling" }),
 	"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
 	"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),

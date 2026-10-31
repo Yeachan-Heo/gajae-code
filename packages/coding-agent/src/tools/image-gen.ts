@@ -30,7 +30,7 @@ import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
-import { resolveReadPath } from "./path-utils";
+import { assertRealpathInsideActiveWorkspace, resolveReadPath } from "./path-utils";
 
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
@@ -1064,6 +1064,7 @@ async function resolveCredentialsForImageModel(
 
 async function loadImageFromPath(imagePath: string, cwd: string): Promise<InlineImageData> {
 	const resolved = resolveReadPath(imagePath, cwd);
+	await assertRealpathInsideActiveWorkspace(resolved);
 	try {
 		const buffer = await Bun.file(resolved).bytes();
 		if (buffer.length > MAX_IMAGE_SIZE) {

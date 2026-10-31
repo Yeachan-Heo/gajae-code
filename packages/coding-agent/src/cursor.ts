@@ -25,7 +25,7 @@ import {
 import { sanitizeText } from "@gajae-code/utils";
 import { assertDeleteInsideWorkspace } from "./cursor-delete-path";
 import { cursorMcpDispatchName } from "./cursor-mcp-name";
-import { resolveToCwd } from "./tools/path-utils";
+import { getActiveWorkspaceConfineRoot, resolveToCwd, runWithWorkspaceConfine } from "./tools/path-utils";
 
 /**
  * Emitter for events this bridge produces.
@@ -45,6 +45,8 @@ interface CursorExecBridgeOptions {
 	getEditReplaceTool?: () => AgentTool | undefined;
 	createSearchTool?: (options: { context?: number; totalMatchLimit?: number }) => AgentTool | undefined;
 	getToolContext?: () => AgentToolContext | undefined;
+	/** Live confined-session root. Absent for an ordinary session. */
+	filesystemRoot?: () => string | undefined;
 	emitEvent?: CursorExecEventEmitter;
 	createEventEmitter?: () => ((event: AgentEvent) => void) | undefined;
 }
@@ -80,6 +82,10 @@ function isCursorExecAdmissionClosedError(error: unknown): boolean {
 		error !== null &&
 		(error as { name?: unknown }).name === "CursorExecAdmissionClosedError"
 	);
+}
+function confineCursorCall<T>(options: CursorExecBridgeOptions, fn: () => T): T {
+	const root = options.filesystemRoot?.() ?? getActiveWorkspaceConfineRoot();
+	return root ? runWithWorkspaceConfine(root, fn) : fn();
 }
 
 async function executeTool(
@@ -125,16 +131,18 @@ async function executeTool(
 		const toolContext = options.getToolContext?.();
 		if (execSignal?.aborted) throw cursorAbortError(execSignal);
 		if (tool.nonAbortable) markNonAbortable?.();
-		result = await tool.execute(
-			toolCallId,
-			args as Record<string, unknown>,
-			// Non-abortable tools receive NO signal, matching agent-loop.ts: their
-			// returned promise must represent actual mutation settlement, so an
-			// untilAborted(signal, ...) rejection cannot make the settlement fence
-			// publish the terminal while the mutation is still running.
-			tool.nonAbortable ? undefined : (execSignal ?? undefined),
-			onUpdate,
-			toolContext,
+		result = await confineCursorCall(options, () =>
+			tool.execute(
+				toolCallId,
+				args as Record<string, unknown>,
+				// Non-abortable tools receive NO signal, matching agent-loop.ts: their
+				// returned promise must represent actual mutation settlement, so an
+				// untilAborted(signal, ...) rejection cannot make the settlement fence
+				// publish the terminal while the mutation is still running.
+				tool.nonAbortable ? undefined : (execSignal ?? undefined),
+				onUpdate,
+				toolContext,
+			),
 		);
 	} catch (error) {
 		if (isCursorExecAdmissionClosedError(error)) throw error;

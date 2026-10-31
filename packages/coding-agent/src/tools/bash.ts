@@ -78,6 +78,7 @@ import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import { longSleepAdvisory } from "./bash-sleep-advisory";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
+import { sandboxedShellCommand } from "./confine-sandbox";
 import {
 	formatArtifactReference,
 	formatStyledTruncationWarning,
@@ -93,6 +94,7 @@ import { steerFoldReasonLine, watchSteerForFold } from "./steer-fold";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+import { directoryEscapesWorkspace } from "./workspace-confine";
 
 export { STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "./steer-fold";
 
@@ -1159,6 +1161,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								options.resolvedEnv,
 							)
 						: await executeBash(options.command, {
+								sandboxRoot: this.session.filesystemRoot,
 								cwd: options.commandCwd,
 								settings: this.session.settings,
 								sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
@@ -1607,6 +1610,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			command = normalizedWorkflowCommand;
 		}
+		if (this.session.filesystemRoot) {
+			if (await directoryEscapesWorkspace(this.session.filesystemRoot, commandCwd)) {
+				throw new ToolError(
+					`Working directory escapes the confined session root (${this.session.filesystemRoot}): ${commandCwd}. This session can only use its cwd and descendants.`,
+				);
+			}
+		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;
 		const timeoutSec = clampTimeout("bash", requestedTimeoutSec);
@@ -1779,6 +1789,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 				try {
 					const result = await executeBash(prepared.command, {
+						sandboxRoot: this.session.filesystemRoot,
 						cwd: prepared.commandCwd,
 						settings: this.session.settings,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:monitor:${id}`,
@@ -1878,6 +1889,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices: pendingNotices,
 		} = prepared;
 		const masterCapability = directMasterSpawn ? resolvedEnv[MASTER_CAPABILITY_ENV] : undefined;
+		if (directMasterSpawn && this.session.filesystemRoot) {
+			throw new ToolError(
+				"Direct master spawn is unavailable in a confined session because the child process is not sandboxed.",
+			);
+		}
 		if (directMasterSpawn && masterCapability !== undefined && !asyncRequested) {
 			return await this.#executeDirectMasterSpawn(
 				command,
@@ -2082,6 +2098,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 		}
 
+		if (this.session.filesystemRoot && clientBridge?.capabilities.terminal && clientBridge.createTerminal) {
+			throw new ToolError(
+				"Client terminal execution is unavailable in a confined session because the bridge host is not sandboxed.",
+			);
+		}
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
 			const clientAdmission = ownedManager?.reserveCapacity();
 			const clientHeadBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
@@ -2746,7 +2767,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let ptyOutcome: BashInteractiveResult | undefined;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
-					command,
+					command: this.session.filesystemRoot
+						? sandboxedShellCommand(command, this.session.filesystemRoot)
+						: command,
 					cwd: commandCwd,
 					settings: this.session.settings,
 					timeoutMs,
@@ -2916,6 +2939,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					// Completion, error, and a fold all settle this foreground wait.
 					.finally(() => awaitingInput.dispose())
 			: await executeBash(command, {
+					sandboxRoot: this.session.filesystemRoot,
 					cwd: commandCwd,
 					settings: this.session.settings,
 					sessionKey: this.session.getSessionId?.() ?? undefined,

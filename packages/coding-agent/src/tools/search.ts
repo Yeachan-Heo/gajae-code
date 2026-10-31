@@ -24,7 +24,7 @@ import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import { formatMatchLine } from "./match-line-format";
 import { formatFullOutputReference, type OutputMeta } from "./output-meta";
-import { resolveReadPath, resolveToolSearchScope } from "./path-utils";
+import { assertRealpathInsideActiveWorkspace, resolveReadPath, resolveToolSearchScope } from "./path-utils";
 import {
 	createCachedComponent,
 	formatCodeFrameLine,
@@ -350,6 +350,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					signal: combinedSignal,
 				});
 				throwIfSearchCancelled();
+				const confinedTargets = [
+					scope.searchPath,
+					...(scope.multiTargets?.map(target => target.basePath) ?? []),
+					...(scope.exactFilePaths ?? []),
+				];
+				for (const target of confinedTargets) await assertRealpathInsideActiveWorkspace(target);
 				const { searchPath, isDirectory, multiTargets, exactFilePaths, missingPaths, immutableSourcePaths } = scope;
 				// When the only input was an archive selector, surface that selector instead
 				// of the temp scratch path the resolver substituted in.

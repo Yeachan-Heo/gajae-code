@@ -307,4 +307,46 @@ describe("browser page text trust boundary", () => {
 			expect(actedText).toEqual([referenceFrame(sample), referenceFrame(JSON.stringify(payload, null, 2))]);
 		}
 	});
+	it("rejects unsandboxed browser processes and local navigation while confined", async () => {
+		let launched = false;
+		acquireBrowserImpl = async kind => {
+			launched = true;
+			return stubBrowser(kind);
+		};
+		const confined = new BrowserTool({ ...session(), filesystemRoot: "/session-root" });
+		await expect(
+			settle(confined.execute("open-spawned", { action: "open", app: { path: "/usr/bin/chrome" }, timeout: 1 })),
+		).rejects.toThrow(/not sandboxed/);
+		await expect(
+			settle(
+				confined.execute("open-connected", {
+					action: "open",
+					app: { cdp_url: "http://127.0.0.1:9222" },
+					timeout: 1,
+				}),
+			),
+		).rejects.toThrow(/not sandboxed/);
+		await expect(
+			settle(confined.execute("open-file", { action: "open", url: " file:///etc/passwd", timeout: 1 })),
+		).rejects.toThrow(/not sandboxed/);
+		await expect(
+			settle(
+				confined.execute("run-composed", {
+					action: "run",
+					code: "const scheme='file:'; await page.goto(scheme+'///etc/passwd')",
+					timeout: 1,
+				}),
+			),
+		).rejects.toThrow(/not sandboxed/);
+		await expect(
+			settle(
+				confined.execute("act-file", {
+					action: "act",
+					actions: [{ verb: "navigate", url: "FILE:///etc/passwd" }],
+					timeout: 1,
+				}),
+			),
+		).rejects.toThrow(/not sandboxed/);
+		expect(launched).toBe(false);
+	});
 });
