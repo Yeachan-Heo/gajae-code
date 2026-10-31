@@ -250,7 +250,11 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .markdown th { background: var(--surface); }
 .message-error { color: var(--error); }
 .message-error .role-label { color: var(--error); }
+/* The disclosure line is a control, so its hover surface follows the same rounded shape as
+   every other control instead of painting a square block. */
 .thinking-disclosure { color: var(--muted); font-size: 0.8125rem; }
+.thinking-disclosure > summary { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: var(--radius-sm); list-style: none; }
+.thinking-disclosure > summary::-webkit-details-marker { display: none; }
 .thinking-disclosure .message-text { padding: 0 12px 12px; }
 .message-image { margin: 8px 0; max-width: 100%; }
 .message-image img { display: block; max-width: 100%; max-height: 320px; width: auto; height: auto; object-fit: contain; }
