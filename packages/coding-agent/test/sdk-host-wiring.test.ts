@@ -4423,6 +4423,76 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 	}
 });
 
+test("SDK host stopped instance leaves its armed prompt deadline out of the durable store (#7342)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-stopped-deadline-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-stopped-deadline-${Date.now()}`;
+	const base = context(cwd, sessionId);
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+	};
+	const deadlineMs = 100;
+	const settings = {
+		get: (key: string) =>
+			key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 5_000 : undefined,
+	} as unknown as Settings;
+	let clockNow = Date.now();
+	const leaseClock = spyOn(Date, "now").mockImplementation(() => clockNow);
+	try {
+		const handlers = start(
+			sessionContext,
+			settings,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "pending-prompt",
+				operation: "turn.prompt",
+				input: { text: "never reaches a terminal" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === "pending-prompt"), "pending-prompt response");
+		expect(frames.find(frame => frame.id === "pending-prompt")).toMatchObject({
+			ok: true,
+			result: { accepted: true },
+		});
+
+		// The instance stops with the prompt still pending; a successor owns the
+		// store from here. Expiring the lease must not let the stopped instance
+		// terminalize the prompt and rewrite the store from its stale record set.
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await closeSocket(socket);
+		const storePath = reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId);
+		const stored = fs.readFileSync(storePath, "utf8");
+		clockNow += deadlineMs * 2;
+		await Bun.sleep(deadlineMs * 3);
+		expect(fs.readFileSync(storePath, "utf8")).toBe(stored);
+		expect(stored).not.toContain("prompt_deadline_exceeded");
+	} finally {
+		leaseClock.mockRestore();
+	}
+});
+
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
 	dirs.push(cwd);

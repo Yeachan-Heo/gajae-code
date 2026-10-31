@@ -6066,6 +6066,12 @@ export function createNotificationsExtension(
 			submission.deadlineTimer = setTimeout(
 				() => {
 					void (async () => {
+						// A stopped runtime no longer owns the session's durable store: a
+						// successor instance may already have hydrated and written it, and
+						// this instance's stale record set would overwrite those rows. Leave
+						// the pending record for restart recovery, as a process exit would
+						// (#7342).
+						if (!runtime || runtime.stopping) return;
 						const current = promptSubmissions.get(key);
 						// Identity fencing: a discarded, evicted or re-accepted submission is
 						// never terminalized by a predecessor's timer.
