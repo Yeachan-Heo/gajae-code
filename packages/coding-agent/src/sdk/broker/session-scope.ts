@@ -1,3 +1,4 @@
+import { normalizePathForComparison } from "@gajae-code/utils/dirs";
 import { canonicalSessionCwd, type SessionLocatorV2, sessionWorktreeRoot } from "./session-index";
 
 export type ScopeNameV1 = "repo" | "pwd" | "global";
@@ -330,8 +331,11 @@ export function scopeMatchesLocator(
 ): boolean {
 	if (scope.resolved === null) return false;
 	if (scope.resolved.kind === "global") return true;
-	if (scope.resolved.kind === "pwd") return locator.cwd === scope.resolved.cwd;
-	return locator.worktreeRoot === scope.resolved.worktreeRoot;
+	if (scope.resolved.kind === "pwd")
+		return normalizePathForComparison(locator.cwd) === normalizePathForComparison(scope.resolved.cwd);
+	// repo kind: both worktreeRoot values must exist and match (case-insensitive on Windows)
+	if (locator.worktreeRoot === null || scope.resolved.worktreeRoot === null) return false;
+	return normalizePathForComparison(locator.worktreeRoot) === normalizePathForComparison(scope.resolved.worktreeRoot);
 }
 
 export function searchRowV1(
