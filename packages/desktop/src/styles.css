@@ -214,7 +214,9 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .message.system { border-left: 2px solid var(--border-soft); padding: 8px 12px; margin: 12px 0; color: var(--muted); font-size: 0.8125rem; }
 .message.tool { padding: 12px 0; }
 .message.tool .role-label { margin-bottom: 4px; }
-.message-text { white-space: pre-wrap; max-height: 60vh; overflow: auto; line-height: 1.7; }
+/* The transcript is the only vertical scroller: a message grows to its full height, so reading
+   a long answer never nests a second scroll inside the conversation. */
+.message-text { white-space: pre-wrap; line-height: 1.7; }
 .markdown { white-space: normal; min-width: 0; }
 .markdown > :last-child { margin-bottom: 0; }
 .markdown p { white-space: pre-wrap; }
@@ -236,7 +238,9 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .markdown-code-copy { min-height: 28px; padding: 3px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); background: var(--card); }
 .markdown-code-copy:hover { background: var(--sidebar); }
 .markdown-code-status { color: var(--muted); }
-.markdown-code-content { margin: 0; padding: 12px; white-space: pre; overflow-wrap: normal; word-break: normal; font-size: 0.8125rem; }
+/* Code scrolls sideways for long lines but never vertically: the transcript owns the only
+   vertical scroll. */
+.markdown-code-content { margin: 0; padding: 12px; white-space: pre; overflow-x: auto; overflow-wrap: normal; word-break: normal; font-size: 0.8125rem; }
 .markdown-table-wrap { max-width: 100%; margin: 12px 0; }
 .markdown table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
 .markdown th, .markdown td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; }

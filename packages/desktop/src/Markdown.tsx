@@ -38,7 +38,7 @@ function CodeBlock({ token, code }: { token: Tokens.Code; code: string }) {
 							: ""}
 				</span>
 			</div>
-			<pre className="markdown-code-content" style={{ overflow: "auto", maxHeight: "24rem" }}>
+			<pre className="markdown-code-content">
 				<code>{code}</code>
 			</pre>
 		</div>
