@@ -201,7 +201,6 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .toolbar-title { flex: 1; min-width: 120px; }
 .toolbar-title small { display: block; margin-bottom: 2px; }
 .toolbar-title h1 { margin: 0; }
-.session-status { flex-shrink: 0; font-size: 0.75rem; color: var(--muted); padding: 8px 24px; border-bottom: 1px solid var(--border-soft); }
 .conversation { flex: 1; overflow: auto; min-height: 0; overscroll-behavior: contain; padding: 8px max(24px, calc((100% - 800px)/2)); overflow-anchor: none; scrollbar-gutter: stable; }
 .message { padding: 20px 0; min-width: 0; }
 .role-label { font-size: 0.75rem; font-weight: 600; display: block; margin-bottom: 8px; color: var(--muted); }
@@ -588,7 +587,6 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 	.mobile-only { display: inline-flex; }
 	.toolbar { padding: 8px 12px; }
 	.conversation { padding: 8px 16px; }
-	.session-status { padding: 8px 16px; }
 	.composer-area { padding: 8px 12px 16px; }
 	.sidebar-drawer nav { max-height: 60dvh; overflow: auto; }
 	.showcase { padding: 16px 8px; }

@@ -1114,6 +1114,37 @@ describe("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	test("the run status lives in the sidebar row, not in the conversation header", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "running",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: false,
+						controlGeneration: 1,
+						messages: [],
+					},
+				}) as unknown as Promise<void>,
+			);
+			await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+			// The composer's stop action and the sidebar row already say a turn is running; a
+			// third copy in the header only pushed the conversation down.
+			const occurrences = await page.evaluate(
+				() => (document.body.textContent ?? "").split("Working").length - 1,
+			);
+			expect(occurrences).toBe(1);
+			expect(await page.$(".main-pane .session-status")).toBeNull();
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("a dropdown pressed a second time closes and stays closed", async () => {
 		const { context, page } = await fixture();
 		try {

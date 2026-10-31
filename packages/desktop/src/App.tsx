@@ -2309,17 +2309,6 @@ export default function App() {
 					))}
 				{session ? (
 					<>
-						<div className="session-status" role="status">
-							{session.status === "running"
-								? t("support.statusRunning")
-								: session.status === "waiting"
-									? t("support.statusWaiting")
-									: session.status === "error"
-										? t("support.statusError")
-										: session.status === "done"
-											? t("support.statusDone")
-											: t("support.statusIdle")}
-						</div>
 						<div
 							className="conversation"
 							ref={conversation}
