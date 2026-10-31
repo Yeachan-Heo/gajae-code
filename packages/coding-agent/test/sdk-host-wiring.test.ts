@@ -7029,6 +7029,90 @@ test("SDK host abort-and-prompt queues a steer instead of stopping a run the con
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("SDK host abort-and-prompt reports a delivered steer as uncertain when its acceptance write fails", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-steer-uncertain-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-steer-uncertain-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const live = { idle: false };
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		abort: () => {
+			throw new Error("a non-owner replacement must not abort the run");
+		},
+	};
+	const acceptanceWrite = failNextReconciliationCommit(sessionFile, sessionId);
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (content, options) => {
+				deliveries.push([content, options]);
+				// The steer is queued; only the durable acceptance write that follows fails.
+				if (options?.deliverAs === "steer") acceptanceWrite.arm();
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const replace = async (id: string) => {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id,
+					operation: "turn.abort_and_prompt",
+					input: { text: "replacement" },
+					idempotencyKey: "uncertain-replacement-key",
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`abort-and-prompt response ${id}`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id);
+		};
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const first = await replace("uncertain-replacement");
+		await acceptanceWrite.failed;
+		expect(first).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer", status: "uncertain" },
+		});
+		// The exact-key retry replays the uncertain steer: it is never delivered twice.
+		expect(await replace("uncertain-replacement-retry")).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer", status: "uncertain" },
+		});
+		expect(deliveries.map(([content, options]) => [content, options?.deliverAs])).toEqual([["replacement", "steer"]]);
+		// Teardown reports the injected persistence failure by contract (#4743).
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		acceptanceWrite.restore();
+	}
+});
+
 test("SDK host turn.abort terminal mode returns no-effect with no active turn", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
 	dirs.push(cwd);

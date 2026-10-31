@@ -11170,6 +11170,97 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("abort_and_prompt replaces the requester's accepted prompt before its agent_start", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-owner-pending-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-owner-pending", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			state.idle = true;
+			const owned = await harness.controlAs("connection-a", "turn.prompt", { text: "owned by a" });
+			expect(owned).toMatchObject({ ok: true, result: { accepted: true } });
+			// Accepted and busy, but agent_start has not adopted connection-a as owner yet.
+			state.idle = false;
+			state.deliveries.length = 0;
+
+			const foreign = await harness.controlAs("connection-b", "turn.abort_and_prompt", { text: "from b" });
+			expect(foreign).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(state.abortCalls).toBe(0);
+
+			state.deliveries.length = 0;
+			const replaced = await harness.controlAs("connection-a", "turn.abort_and_prompt", { text: "from a" });
+			expect(replaced).toMatchObject({ ok: true, result: { accepted: true } });
+			expect(replaced.result).not.toHaveProperty("queuedAs");
+			expect(state.abortCalls).toBe(1);
+			expect(state.deliveries.map(delivery => delivery.content)).toEqual(["from a"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt reports a delivered steer as uncertain when its acceptance write fails", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-uncertain-"));
+		let harness: InvocationHarness | undefined;
+		const originalRename = fsPromises.rename.bind(fsPromises);
+		let failedAcceptance = false;
+		// Fail only the durable write that records the delivered steer as accepted.
+		const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+			if (!failedAcceptance && String(from).includes("reconciliation")) {
+				const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+				if (document.records.some(record => record.kind === "steer" && record.status === "accepted")) {
+					failedAcceptance = true;
+					throw Object.assign(new Error("injected steer acceptance write failure"), { code: "EACCES" });
+				}
+			}
+			await originalRename(from, to);
+		});
+		try {
+			const fixture = await replacementOwnerHarness("replacement-steer-uncertain", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const first = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "delivered once" },
+				"uncertain-key",
+			);
+			expect(failedAcceptance).toBe(true);
+			expect(first).toMatchObject({
+				ok: true,
+				result: { accepted: false, aborted: false, queuedAs: "steer", status: "uncertain" },
+			});
+			// The exact-key retry replays the uncertain steer instead of delivering it again.
+			const retried = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "delivered once" },
+				"uncertain-key",
+			);
+			expect(retried).toMatchObject({
+				ok: true,
+				result: {
+					accepted: false,
+					aborted: false,
+					queuedAs: "steer",
+					status: "uncertain",
+					commandId: first.result?.commandId,
+				},
+			});
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "delivered once", deliverAs: "steer" }]);
+		} finally {
+			renameSpy.mockRestore();
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("abort_and_prompt never stops a run the host started itself", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-host-run-"));
 		let harness: InvocationHarness | undefined;

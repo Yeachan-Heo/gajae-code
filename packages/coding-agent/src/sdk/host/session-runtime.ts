@@ -3181,6 +3181,8 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		failure: QueuedRunStartFailure,
 	) => boolean,
+	/** Connections of accepted own-run submissions whose agent_start has not adopted them yet. */
+	pendingRunOwnerConnectionIds?: () => ReadonlyArray<string | undefined>,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3333,6 +3335,17 @@ function createControlSurface(
 		return seamOwner === undefined
 			? (activePromptOwner.connectionIds?.has(connectionId) ?? false)
 			: seamOwner === connectionId;
+	};
+	// An accepted own-run prompt is adopted as the active owner only at its
+	// agent_start. Between acceptance and that start the session is already busy
+	// with the requester's own work, so it may still replace it. Foreign pending
+	// work, or any run another connection or the host owns, is never replaced.
+	const requesterOwnsReplaceableWork = (connectionId: string): boolean => {
+		if (requesterOwnsActiveRun(connectionId)) return true;
+		const seamOwner = terminalAbortSeams?.getActivePromptOwnerConnectionId?.();
+		if (seamOwner !== undefined || (activePromptOwner.connectionIds?.size ?? 0) > 0) return false;
+		const pendingOwners = pendingRunOwnerConnectionIds?.() ?? [];
+		return pendingOwners.length > 0 && pendingOwners.every(owner => owner === connectionId);
 	};
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
 		if (clientRef === undefined) return undefined;
@@ -4698,11 +4711,22 @@ function createControlSurface(
 		if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
 		try {
 			await dispatch();
-			return { accepted: true, ...(await durable.settleSteer(clientRef, "accepted")) };
 		} catch (error) {
 			const settled = await durable.settleSteer(clientRef, "rejected", error);
 			if (expectedSdkRunToken !== undefined) throw error;
 			return { accepted: false, ...settled };
+		}
+		try {
+			return { accepted: true, ...(await durable.settleSteer(clientRef, "accepted")) };
+		} catch (error) {
+			// The steer is already queued in the session. A failed acceptance write
+			// must not become a durable rejection that invites a second delivery:
+			// record the outcome as uncertain, or keep the in-flight dispatching
+			// record (which replays as uncertain) when that write fails as well.
+			const uncertain = await durable
+				.settleSteer(clientRef, "uncertain", error)
+				.catch(() => durable.lookupSteer(clientRef));
+			return { accepted: false, ...uncertain };
 		}
 	};
 	return {
@@ -4822,7 +4846,7 @@ function createControlSurface(
 			// host itself started) must not stop it. The replacement text degrades
 			// to a queued steer for that run instead.
 			const connectionId = sdkControlRequesterContext.getStore();
-			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsActiveRun(connectionId))
+			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsReplaceableWork(connectionId))
 				return { ...(await sendSteer(text, steerClientRef)), aborted: false, queuedAs: "steer" };
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
@@ -7709,6 +7733,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					void terminalizeAbandonedSubmission(kind, correlation, rejectionRecoveryIntent(failure.error));
 				return true;
 			},
+			() => pending.map(entry => entry.connectionId),
 		);
 		// The person at this terminal did not stop the turn, so say who did. Only a
 		// Broker-routed operator terminal abort that actually stopped a turn is
