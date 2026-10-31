@@ -61,7 +61,7 @@ import {
 	AttachmentPicker,
 	addDesktopAttachmentFiles,
 	type DesktopAttachmentDraft,
-	desktopClipboardImageFiles,
+	desktopClipboardFiles,
 	readyDesktopAttachments,
 } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
@@ -2458,7 +2458,10 @@ export default function App() {
 									)
 								}
 								onPaste={event => {
-									const files = desktopClipboardImageFiles(event.clipboardData);
+									// A paste that carries text stays a text paste; a copied file from Finder
+									// carries none and becomes an attachment.
+									if (event.clipboardData.types.includes("text/plain")) return;
+									const files = desktopClipboardFiles(event.clipboardData);
 									if (!files.length || !connected || draftLocks.current.has(session.id)) return;
 									event.preventDefault();
 									addDesktopAttachmentFiles(

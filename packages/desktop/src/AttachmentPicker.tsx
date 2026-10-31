@@ -138,16 +138,23 @@ export function settleDesktopAttachmentDraft(
 	return next;
 }
 
-/** Only clipboard-authorized image File objects are returned; text paste is left to the composer. */
-export function desktopClipboardImageFiles(clipboard: {
-	items: Iterable<Pick<DataTransferItem, "kind" | "type" | "getAsFile">>;
+/**
+ * Every file the clipboard carries, images and documents alike. `items` is the standard view, but
+ * WebKit reports a Finder copy through `files` alone, so both are read; the item list wins because
+ * it keeps the original file names.
+ */
+export function desktopClipboardFiles(clipboard: {
+	items?: Iterable<Pick<DataTransferItem, "kind" | "type" | "getAsFile">>;
+	files?: ArrayLike<File>;
 }): File[] {
-	return [...clipboard.items]
-		.filter(item => item.kind === "file" && item.type.startsWith("image/"))
+	const fromItems = [...(clipboard.items ?? [])]
+		.filter(item => item.kind === "file")
 		.flatMap(item => {
 			const file = item.getAsFile();
 			return file ? [file] : [];
 		});
+	if (fromItems.length > 0) return fromItems;
+	return Array.from(clipboard.files ?? []);
 }
 
 function formatSize(size: number): string {

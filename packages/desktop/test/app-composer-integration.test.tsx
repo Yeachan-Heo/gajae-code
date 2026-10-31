@@ -1807,6 +1807,34 @@ describe("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("a pasted document attaches while pasted text stays text", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			const paste = (kind: "file" | "text") =>
+				page.evaluate(pasted => {
+					const textarea = document.querySelector(".composer textarea") as HTMLTextAreaElement;
+					const transfer = new DataTransfer();
+					if (pasted === "file") {
+						// A Finder copy arrives as a file item with no plain text beside it.
+						transfer.items.add(new File(["# pasted notes"], "notes.md", { type: "text/markdown" }));
+					} else {
+						transfer.setData("text/plain", "pasted words");
+					}
+					textarea.dispatchEvent(
+						new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }),
+					);
+				}, kind);
+			await paste("file");
+			await page.waitForSelector(".attachment-ready");
+			expect(await page.$eval(".attachment-ready", node => node.textContent)).toContain("notes.md");
+			// The clipboard still belongs to text when it carries text: no attachment, no swallow.
+			await paste("text");
+			await Bun.sleep(150);
+			expect(await page.$$eval(".attachment-ready", nodes => nodes.length)).toBe(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("folds a workspace's conversations away and back", async () => {
 		const { context, page } = await fixture();
 		try {
