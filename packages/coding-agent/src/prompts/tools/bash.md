@@ -5,13 +5,13 @@ Executes bash command in shell session for terminal operations like git, bun, ca
 {{#when restrictionProfile "==" "read-only"}}
 - Do not pass `env` overrides or `pty: true`; read-only bash rejects both.
 - Shell control operators such as `;`, `|`, `&`, `<`, `>`, and command substitution are blocked.
-- Internal URIs (`agent://`, `artifact://`, `rule://`, `local://`) are auto-resolved to filesystem paths without creating parent directories.
+- Internal URIs (`agent://`, `artifact://`, `local://`) are auto-resolved to filesystem paths without creating parent directories. `rule://` auto-resolves only a session, repository, or agent-directory path, a non-Git ancestor `.agent` or `.agents` rule under the trusted home, or a discovered user rule under `.agent/rules`, `.agents/rules`, or the agent directory.
 {{else}}
 - Prefer `env: { NAME: "…" }` for multiline, quote-heavy, or untrusted values; reference as `$NAME`
 - Quote variable expansions like `"$NAME"` to preserve exact content
 - PTY mode is opt-in: set `pty: true` only when the command needs a real terminal (e.g. `sudo`, `ssh` requiring user input); default is `false`
 - Use `;` only when later commands should run regardless of earlier failures
-- Internal URIs (`agent://`, `artifact://`, `rule://`, `local://`) are auto-resolved to filesystem paths
+- Internal URIs (`agent://`, `artifact://`, `local://`) are auto-resolved to filesystem paths. `rule://` auto-resolves only a session, repository, or agent-directory path, a non-Git ancestor `.agent` or `.agents` rule under the trusted home, or a discovered user rule under `.agent/rules`, `.agents/rules`, or the agent directory.
 {{/when}}
 {{#if asyncEnabled}}
 - Use `async: true` for long-running commands when you don't need immediate output; the call returns a background job ID and the result is delivered automatically as a follow-up.

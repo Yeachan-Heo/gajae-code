@@ -1,7 +1,9 @@
 import type * as fsTypes from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent } from "@gajae-code/utils";
+import { getAgentDir, getTrustedHomeDir, isEnoent } from "@gajae-code/utils";
+import { findRepoRoot } from "../capability/fs";
+import { getActiveRules } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import {
 	initializeLocalRoot,
@@ -35,6 +37,10 @@ export interface InternalUrlExpansionOptions {
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
 	ensureLocalParentDirs?: boolean;
+	/** Project directory of the bash session. `rule://` must stay inside its boundary. */
+	sessionCwd?: string;
+	/** Agent directory for this session. User rules use it. */
+	sessionAgentDir?: string;
 }
 
 /**
@@ -249,12 +255,143 @@ function shellEscape(p: string): string {
 	return `'${p.replace(/'/g, "'\\''")}'`;
 }
 
+const SESSION_URL_ESCAPE = "URL is outside this session and cannot be expanded in a bash command";
+
+function pathStaysInside(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function isStrictlyInside(root: string, candidate: string): boolean {
+	const resolvedRoot = path.resolve(root);
+	const resolvedCandidate = path.resolve(candidate);
+	return pathStaysInside(resolvedRoot, resolvedCandidate) && resolvedCandidate !== resolvedRoot;
+}
+
+const PROJECT_RULE_DIR_NAMES = [".agent", ".agents"] as const;
+
+/**
+ * Real path of a rule file in an ancestor `.agent/rules` or `.agents/rules` directory
+ * under the trusted home. Non-Git discovery loads those directories and skips home.
+ */
+async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string): Promise<string | undefined> {
+	const cwd = path.resolve(sessionCwd);
+	const home = path.resolve(getTrustedHomeDir());
+	if (!isStrictlyInside(home, cwd)) return undefined;
+	const lexical = path.resolve(sourcePath);
+	const realTarget = await canonicalPathOrAncestor(lexical, SESSION_URL_ESCAPE);
+	let ancestor = path.dirname(cwd);
+	while (isStrictlyInside(home, ancestor)) {
+		let realAncestor: string;
+		try {
+			realAncestor = await fs.realpath(ancestor);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			realAncestor = ancestor;
+		}
+		if (pathStaysInside(realAncestor, realTarget)) {
+			for (const dirName of PROJECT_RULE_DIR_NAMES) {
+				const ruleDir = path.join(dirName, "rules");
+				if (
+					pathStaysInside(path.join(ancestor, ruleDir), lexical) &&
+					pathStaysInside(path.join(realAncestor, ruleDir), realTarget)
+				) {
+					return realTarget;
+				}
+			}
+		}
+		const parent = path.dirname(ancestor);
+		if (parent === ancestor) break;
+		ancestor = parent;
+	}
+	return undefined;
+}
+
+/**
+ * Real path of an active user rule that stays inside the trusted home
+ * `.agent/rules` or `.agents/rules` directory. Other user-rule roots stay out.
+ */
+async function discoveredUserRulePath(sourcePath: string): Promise<string | undefined> {
+	const home = path.resolve(getTrustedHomeDir());
+	const lexical = path.resolve(sourcePath);
+	const realTarget = await canonicalPathOrAncestor(lexical, SESSION_URL_ESCAPE);
+	for (const rule of getActiveRules()) {
+		if (rule._source.level !== "user") continue;
+		const ruleLexical = path.resolve(rule.path);
+		let realRule: string;
+		try {
+			realRule = await fs.realpath(ruleLexical);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			continue;
+		}
+		if (realRule !== realTarget) continue;
+		for (const dirName of PROJECT_RULE_DIR_NAMES) {
+			const ruleRoot = path.join(home, dirName, "rules");
+			if (!pathStaysInside(ruleRoot, lexical) || !pathStaysInside(ruleRoot, ruleLexical)) continue;
+			let realRoot = ruleRoot;
+			try {
+				realRoot = await fs.realpath(ruleRoot);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			if (pathStaysInside(realRoot, realTarget)) return realTarget;
+		}
+	}
+	return undefined;
+}
+
+function withoutForeignRuleNames(message: string): string {
+	return message
+		.split(/\r?\n/)
+		.filter(line => !line.startsWith("Available:"))
+		.join("\n")
+		.trim();
+}
+
+/** Real path of `lexicalPath` when it stays inside `root`; otherwise undefined. */
+async function containedExpansionPath(root: string, lexicalPath: string): Promise<string | undefined> {
+	const resolvedRoot = path.resolve(root);
+	const resolvedLexical = path.resolve(lexicalPath);
+	let realRoot = resolvedRoot;
+	try {
+		realRoot = await fs.realpath(resolvedRoot);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	const realTarget = await canonicalPathOrAncestor(resolvedLexical, SESSION_URL_ESCAPE);
+	if (!pathStaysInside(realRoot, realTarget)) return undefined;
+	return realTarget;
+}
+
+async function sessionScopedRulePath(
+	sourcePath: string,
+	sessionCwd: string,
+	sessionAgentDir: string | undefined,
+): Promise<string> {
+	const agentDir = sessionAgentDir?.trim() ? sessionAgentDir : getAgentDir();
+	const repoRoot = await findRepoRoot(sessionCwd);
+	for (const root of [repoRoot ?? path.resolve(sessionCwd), path.resolve(agentDir)]) {
+		const contained = await containedExpansionPath(root, sourcePath);
+		if (contained) return contained;
+	}
+	const userRule = await discoveredUserRulePath(sourcePath);
+	if (userRule) return userRule;
+	if (!repoRoot) {
+		const ancestorRule = await discoveredAncestorRulePath(sessionCwd, sourcePath);
+		if (ancestorRule) return ancestorRule;
+	}
+	throw new ToolError(`rule:// ${SESSION_URL_ESCAPE}.`);
+}
+
 async function resolveInternalUrlToPath(
 	rawUrl: string,
 	skills: readonly Skill[],
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
 	ensureLocalParentDirs?: boolean,
+	sessionCwd?: string,
+	sessionAgentDir?: string,
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
@@ -277,6 +414,16 @@ async function resolveInternalUrlToPath(
 		);
 	}
 
+	// The memory store folds `/`, `\`, and `:` in the project path to `-`, so
+	// distinct projects (`/work/acme-api/server`, `/work/acme/api-server`) share
+	// one memory root. No path check can tell which project owns a file there.
+	// `memory://` is a legacy reader-only URI (docs/memory.md), so fail closed.
+	if (scheme === "memory") {
+		throw new ToolError(
+			"memory:// URLs cannot be expanded in bash commands because the memory root is not unique per project; read them through the internal reader instead.",
+		);
+	}
+
 	if (scheme === "local") {
 		if (!localOptions) {
 			throw new ToolError(
@@ -292,6 +439,11 @@ async function resolveInternalUrlToPath(
 		return realTarget;
 	}
 
+	const sessionDirectoryMissing = sessionCwd === undefined || sessionCwd.trim() === "";
+	if (scheme === "rule" && sessionDirectoryMissing) {
+		throw new ToolError("rule:// URLs cannot be expanded in bash commands without a session directory.");
+	}
+
 	if (!internalRouter?.canHandle(url)) {
 		throw new ToolError(
 			`Cannot resolve ${scheme}:// URL in bash command: ${url}\n` +
@@ -304,11 +456,17 @@ async function resolveInternalUrlToPath(
 		resource = await internalRouter.resolve(url);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		throw new ToolError(`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${message}`);
+		throw new ToolError(
+			`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${withoutForeignRuleNames(message)}`,
+		);
 	}
 
 	if (!resource.sourcePath) {
 		throw new ToolError(`${scheme}:// URL resolved without a filesystem path and cannot be used in bash: ${url}`);
+	}
+
+	if (scheme === "rule" && sessionCwd !== undefined) {
+		return sessionScopedRulePath(resource.sourcePath, sessionCwd, sessionAgentDir);
 	}
 
 	return path.resolve(resource.sourcePath);
@@ -332,8 +490,12 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 }
 
 /**
- * Expand filesystem-safe internal URLs in a bash command string. `agent://` and
- * `artifact://` remain internal-reader-only and are rejected before resolution.
+ * Expand filesystem-safe internal URLs in a bash command string. `agent://`,
+ * `artifact://`, and `memory://` remain internal-reader-only and are rejected
+ * before resolution.
+ * `rule://` expands to a session, repository, or agent-directory path, a non-Git
+ * ancestor rule under the trusted home, or a discovered user rule under
+ * `.agent/rules`, `.agents/rules`, or the agent directory.
  */
 export async function expandInternalUrls(command: string, options: InternalUrlExpansionOptions): Promise<string> {
 	if (!command.includes("://") && !command.includes("local:/")) return command;
@@ -356,6 +518,8 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.internalRouter,
 			options.localOptions,
 			options.ensureLocalParentDirs,
+			options.sessionCwd,
+			options.sessionAgentDir,
 		);
 		const replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);
 		expanded = `${expanded.slice(0, index)}${replacement}${expanded.slice(index + token.length)}`;
