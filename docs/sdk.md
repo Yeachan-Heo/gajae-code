@@ -561,10 +561,14 @@ ACP's public contract remains `session/prompt` with `ContentBlock.image`
 (`type: "image"`, base64 `data`, and `mimeType`), negotiated through
 `agentCapabilities.promptCapabilities.image`. See the pinned
 `@agentclientprotocol/sdk` schema and the upstream [content specification](https://agentclientprotocol.com/protocol/content).
-That capability does not advertise `turn.image.*` or `stagedImages`. This SDK
-foundation does **not** change ACP's existing oversized-prompt rejection; a separate
-ACP consumer must bridge standard inline images to staging internally and retain
-the public schema, cancellation, and capability semantics.
+That capability does not advertise `turn.image.*` or `stagedImages`, and the generic
+`_gjc/sdk/control` passthrough keeps refusing them. When a prompt's inline images would
+push the `turn.prompt` frame past 256 KiB, the ACP agent itself stages each image through
+`turn.image.*` (96 KiB chunks, `batchId` = the prompt's `clientRef`) during prompt
+preflight and sends `stagedImages` instead. Images that fit stay inline. Only the
+text-only frame is still bound by the cap: oversized prompt text is rejected before
+dispatch. A cancel, watchdog expiry or staging failure before dispatch discards every
+staged ID, and a definitive `turn.prompt` rejection discards the IDs it was handed.
 
 ### Cancellation outcomes and inactivity limits
 
