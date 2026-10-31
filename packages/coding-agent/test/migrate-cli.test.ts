@@ -134,7 +134,7 @@ describe("runMigrate", () => {
 		);
 		const hookAction = hookActions.find(action => action.status === "imported");
 		expect(hookAction).toMatchObject({ name: "migrated-claude-code.ts", status: "imported" });
-		expect(hookAction?.destination).toBe(path.join(report.destinations.hooksDir, "migrated-claude-code.ts"));
+		expect(hookAction?.destination).toBe(path.join(report.destinations.hooksDir, "post", "migrated-claude-code.ts"));
 		expect(report.summary.byType.hook.imported).toBe(1);
 		const rendered = renderHuman(report);
 		expect(rendered).toContain("Manual actions:");
