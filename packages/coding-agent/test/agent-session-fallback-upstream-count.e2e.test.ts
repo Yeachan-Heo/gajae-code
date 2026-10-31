@@ -212,10 +212,13 @@ describe("AgentSession fallback upstream request counts", () => {
 		// slow-provider timeout policy but gave each transport its own wording
 		// (openai-responses vs openai-completions). Pinning one literal silently
 		// asserted the pre-#3046 generic string, so derive it from the model's api.
-		const firstEventTimeoutMessage = (api: string): string =>
+		// Completions timeouts also carry an elapsed/request-size/endpoint diagnostic suffix.
+		const firstEventTimeoutMessage = (api: string): unknown =>
 			api === "openai-responses"
 				? "OpenAI responses stream timed out while waiting for the first event"
-				: "OpenAI completions stream timed out while waiting for the first event";
+				: expect.stringMatching(
+						/^OpenAI completions stream timed out while waiting for the first event \(elapsed=\d+ms request_bytes=\d+ endpoint=canonical configured_timeout=5ms; override with retry\.streamFirstEventTimeoutMs or PI_STREAM_FIRST_EVENT_TIMEOUT_MS\)$/,
+					);
 		const originalTimeout = Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS;
 		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "5";
 		try {

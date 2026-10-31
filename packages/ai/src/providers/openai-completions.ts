@@ -24,7 +24,7 @@ import {
 	isGroqCompoundReasoningUnsupported,
 	modelSupportsReasoningControl,
 } from "../model-thinking";
-import { calculateCost } from "../models";
+import { calculateCost, type GeneratedProvider, getBundledModels } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
@@ -547,6 +547,69 @@ function getTrailingPartialDeepseekToken(text: string): string {
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
 const OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE = "Provider returned an empty response with zero token usage";
+
+function normalizeEndpointUrl(baseUrl: string | undefined): string | undefined {
+	if (!baseUrl) return undefined;
+	try {
+		const url = new URL(baseUrl);
+		if (url.protocol.toLowerCase() !== "https:" || url.username !== "" || url.password !== "") return undefined;
+		return `${url.host.toLowerCase()}${url.pathname.replace(/\/+$/g, "")}${url.search}`;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Coarse endpoint class for first-event timeout diagnostics. `canonical` means the
+ * request went to the provider's stock endpoint (OpenAI's default host, or the
+ * bundled-catalog base URL of a built-in provider); anything else — a custom
+ * provider, a local proxy, or an overridden base URL — is `custom`. The class
+ * deliberately excludes host, path, credentials, and query parameters.
+ */
+function classifyOpenAICompletionsEndpoint(
+	model: Model<"openai-completions">,
+	resolvedBaseUrl: string | undefined,
+): "canonical" | "custom" {
+	if (model.provider === "openai") {
+		return resolvedBaseUrl !== undefined &&
+			normalizeEndpointUrl(resolvedBaseUrl) === normalizeEndpointUrl(OPENAI_DEFAULT_BASE_URL)
+			? "canonical"
+			: "custom";
+	}
+	const configured = normalizeEndpointUrl(model.baseUrl);
+	if (!configured) return "custom";
+	return getBundledModels(model.provider as GeneratedProvider).some(
+		bundled => bundled.api === "openai-completions" && normalizeEndpointUrl(bundled.baseUrl) === configured,
+	)
+		? "canonical"
+		: "custom";
+}
+
+function measureRequestBytes(body: unknown): number {
+	try {
+		return Buffer.byteLength(JSON.stringify(body) ?? "", "utf8");
+	} catch {
+		return 0;
+	}
+}
+
+export function createOpenAICompletionsFirstEventTimeoutError(args: {
+	elapsedMs: number;
+	requestBytes: number;
+	firstEventTimeoutMs: number | undefined;
+	endpointClass: "canonical" | "custom";
+}): FirstEventTimeoutError {
+	const timeoutLabel = args.firstEventTimeoutMs === undefined ? "disabled" : `${args.firstEventTimeoutMs}ms`;
+	return new FirstEventTimeoutError(
+		`${OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE} (elapsed=${args.elapsedMs}ms request_bytes=${args.requestBytes} endpoint=${args.endpointClass} configured_timeout=${timeoutLabel}; override with retry.streamFirstEventTimeoutMs or PI_STREAM_FIRST_EVENT_TIMEOUT_MS)`,
+		{
+			requestBytes: args.requestBytes,
+			firstEventElapsedMs: args.elapsedMs,
+			firstEventTimeoutMs: args.firstEventTimeoutMs,
+			endpointClass: args.endpointClass,
+		},
+	);
+}
 const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_MAX_RETRIES = 3;
 const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_BASE_DELAY_MS = 2000;
 
@@ -809,17 +872,28 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				output.usage.premiumRequests = premiumRequestsTotal;
 			}
 			stream.push({ type: "start", partial: output });
-			const iterateAttempt = (attemptStream: AsyncIterable<ChatCompletionChunk>) =>
-				iterateWithIdleTimeout(attemptStream, {
+			const iterateAttempt = (attemptStream: AsyncIterable<ChatCompletionChunk>) => {
+				const firstEventWaitStartedAt = Date.now();
+				return iterateWithIdleTimeout(attemptStream, {
 					firstItemTimeoutMs: firstEventTimeoutMs,
 					firstItemErrorMessage: OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE,
 					idleTimeoutMs,
 					errorMessage: "OpenAI completions stream stalled while waiting for the next event",
 					onIdle: () => requestAbortController.abort(),
-					onFirstItemTimeout: () => requestAbortController.abort(),
+					onFirstItemTimeout: () => {
+						abortTracker.abortLocally(
+							createOpenAICompletionsFirstEventTimeoutError({
+								elapsedMs: Date.now() - firstEventWaitStartedAt,
+								requestBytes: measureRequestBytes(rawRequestDump?.body),
+								firstEventTimeoutMs,
+								endpointClass: classifyOpenAICompletionsEndpoint(model, baseUrl),
+							}),
+						);
+					},
 					abortSignal: options?.signal,
 					isProgressItem: isOpenAICompletionsProgressChunk,
 				});
+			};
 			const iterateWithNetworkErrorRetry = async function* (): AsyncGenerator<ChatCompletionChunk> {
 				let attemptStream = openaiStream;
 				let retryAttempt = 0;
