@@ -1,0 +1,288 @@
+[
+  {
+    "functionCall": {
+      "name": "todo_write",
+      "id": "eeEFgsaA",
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].items[0]",
+          "stringValue": "Complete synthetic checks",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].items[0]",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].items[1]",
+          "stringValue": "Build synthetic tables",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].items[1]",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].items[]"
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].phase",
+          "stringValue": "Synthetic",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0].phase",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].list[0]{}"
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].op",
+          "stringValue": "init",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0].op",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[0]{}"
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1].op",
+          "stringValue": "done",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1].op",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1].phase",
+          "stringValue": "Synthetic",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1].phase",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1].task",
+          "stringValue": "Complete synthetic checks",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1].task",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[1]{}"
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2].op",
+          "stringValue": "start",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2].op",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2].phase",
+          "stringValue": "Synthetic",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2].phase",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2].task",
+          "stringValue": "Build synthetic tables",
+          "willContinue": true
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2].task",
+          "stringValue": ""
+        }
+      ],
+      "willContinue": true
+    }
+  },
+  {
+    "functionCall": {
+      "partialArgs": [
+        {
+          "jsonPath": "$.ops[2]{}"
+        }
+      ]
+    }
+  }
+]

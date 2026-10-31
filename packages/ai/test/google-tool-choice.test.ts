@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { buildRequest } from "../src/providers/google-gemini-cli";
 import { buildGoogleGenerateContentParams, mapToolChoice, streamGoogleGenAI } from "../src/providers/google-shared";
 import type { Context, Model, Tool } from "../src/types";
 import {
@@ -49,6 +50,54 @@ describe("Google shared tool choice", () => {
 	it("builds required as ANY", () => {
 		const params = buildGoogleGenerateContentParams(model, context, { toolChoice: "required" });
 		expect(params.config?.toolConfig?.functionCallingConfig?.mode).toBe("ANY");
+	});
+
+	it.each([
+		"gemini-3-pro-preview",
+		"gemini-3.1-pro",
+		"gemini-4-argon",
+	])("enables argument streaming with tools for %s", id => {
+		const params = buildGoogleGenerateContentParams({ ...model, id }, context, {});
+		expect(params.config?.toolConfig?.functionCallingConfig).toEqual({
+			mode: "AUTO",
+			streamFunctionCallArguments: true,
+		});
+		const withoutTools = buildGoogleGenerateContentParams({ ...model, id }, { ...context, tools: [] }, {});
+		expect(withoutTools.config?.toolConfig).toBeUndefined();
+	});
+
+	it.each([
+		"gemini-2.5-pro",
+		"gemini-1.5-pro",
+		"claude-sonnet",
+		"gemini-test",
+	])("does not enable argument streaming for %s", id => {
+		const params = buildGoogleGenerateContentParams({ ...model, id }, context, { toolChoice: "required" });
+		expect(params.config?.toolConfig?.functionCallingConfig).toEqual({ mode: "ANY" });
+	});
+
+	it("keeps streaming with auto-only capability and explicit NONE", () => {
+		const target = { ...model, id: "gemini-4-argon", compat: { toolChoiceSupport: "auto" as const } };
+		const params = buildGoogleGenerateContentParams(target, context, { toolChoice: "required" });
+		expect(params.config?.toolConfig?.functionCallingConfig).toEqual({
+			mode: "AUTO",
+			streamFunctionCallArguments: true,
+		});
+		const none = buildGoogleGenerateContentParams(target, context, { toolChoice: "none" });
+		expect(none.config?.toolConfig?.functionCallingConfig).toEqual({
+			mode: "NONE",
+			streamFunctionCallArguments: true,
+		});
+	});
+
+	it("does not enable native argument streaming on Cloud Code Assist", () => {
+		const request = buildRequest(
+			{ ...model, id: "gemini-4-argon", api: "google-gemini-cli", provider: "google-gemini-cli" },
+			context,
+			"offline-project",
+			{ toolChoice: "required" },
+		);
+		expect(request.request.toolConfig?.functionCallingConfig).toEqual({ mode: "ANY" });
 	});
 
 	it("omits toolConfig for static forced-tool incapability while keeping tools", () => {
