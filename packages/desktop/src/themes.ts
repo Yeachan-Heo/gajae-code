@@ -182,3 +182,38 @@ export function applyTheme(id: DesktopThemeId): void {
 		root.style.setProperty(property, palette[key as keyof typeof CUSTOM_PROPERTIES]);
 	}
 }
+
+export const FONT_SIZE_STORAGE_KEY = "gjc.desktop.font-size";
+/** The root size the layout is designed for; everything else is expressed in rem. */
+export const DEFAULT_FONT_SIZE = 14;
+export const MIN_FONT_SIZE = 11;
+export const MAX_FONT_SIZE = 20;
+
+export function clampFontSize(value: number): number {
+	if (!Number.isFinite(value)) return DEFAULT_FONT_SIZE;
+	return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, Math.round(value)));
+}
+
+/** Unknown or blocked storage falls back to the designed size instead of failing the launch. */
+export function readFontSizePreference(): number {
+	try {
+		const stored = localStorage.getItem(FONT_SIZE_STORAGE_KEY);
+		return stored === null ? DEFAULT_FONT_SIZE : clampFontSize(Number(stored));
+	} catch {
+		return DEFAULT_FONT_SIZE;
+	}
+}
+
+export function writeFontSizePreference(size: number): boolean {
+	try {
+		localStorage.setItem(FONT_SIZE_STORAGE_KEY, String(clampFontSize(size)));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Every size in `styles.css` is in rem, so one root value rescales the whole surface. */
+export function applyFontSize(size: number): void {
+	document.documentElement.style.fontSize = `${clampFontSize(size)}px`;
+}

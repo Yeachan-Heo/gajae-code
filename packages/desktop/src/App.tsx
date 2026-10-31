@@ -104,12 +104,18 @@ import { Select } from "./Select";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
+	applyFontSize,
 	applyTheme,
+	clampFontSize,
 	DESKTOP_THEMES,
 	type DesktopThemeId,
+	MAX_FONT_SIZE,
+	MIN_FONT_SIZE,
+	readFontSizePreference,
 	readThemePreference,
 	THEME_IDS,
 	themeLabel,
+	writeFontSizePreference,
 	writeThemePreference,
 } from "./themes";
 import "./styles.css";
@@ -232,6 +238,10 @@ export default function App() {
 		error?: string;
 	}>({ sessionId: "", generation: null, models: [], loading: false });
 	const [theme, setTheme] = useState<DesktopThemeId>(readThemePreference);
+	/** Root size in pixels; every layout size in `styles.css` is expressed in rem. */
+	const [fontSize, setFontSize] = useState<number>(readFontSizePreference);
+	/** What the field shows while it is being typed in; it may hold a partial number. */
+	const [fontSizeDraft, setFontSizeDraft] = useState(() => String(readFontSizePreference()));
 	const [modelCatalogRevision, setModelCatalogRevision] = useState(0);
 	const refreshModelCatalog = useRef(false);
 	const [connection, setConnection] = useState(t("shell.connecting"));
@@ -878,6 +888,9 @@ export default function App() {
 	useEffect(() => {
 		applyTheme(theme);
 	}, [theme]);
+	useEffect(() => {
+		applyFontSize(fontSize);
+	}, [fontSize]);
 	useEffect(() => {
 		const media = window.matchMedia("(min-width: 1100px)");
 		const update = () => setWide(media.matches);
@@ -2759,6 +2772,64 @@ export default function App() {
 													{themeLabel(id)}
 												</Button>
 											))}
+										</div>
+									</SettingsSection>
+									<SettingsSection
+										id={`${settingsPanelPrefix}-font-size`}
+										title={t("shell.fontSize")}
+										hint={t("shell.fontSizeHint")}
+									>
+										<div className="font-size-control" role="group" aria-label={t("shell.fontSize")}>
+											<Button
+												aria-label={t("shell.fontSizeSmaller")}
+												disabled={fontSize <= MIN_FONT_SIZE}
+												onClick={() => {
+													const next = clampFontSize(fontSize - 1);
+													setFontSize(next);
+													setFontSizeDraft(String(next));
+													if (!writeFontSizePreference(next)) setNotice(t("shell.fontSizeSaveFailed"));
+												}}
+											>
+												−
+											</Button>
+											<input
+												type="number"
+												inputMode="numeric"
+												className="font-size-input"
+												min={MIN_FONT_SIZE}
+												max={MAX_FONT_SIZE}
+												step={1}
+												value={fontSizeDraft}
+												aria-label={t("shell.fontSizePixels")}
+												onChange={event => {
+													// Typing is free-form: a half-typed number stays in the field and only an
+													// in-range value is applied, so "18" is never read as "1".
+													const typed = event.target.value;
+													setFontSizeDraft(typed);
+													const parsed = Number(typed);
+													if (typed.trim() && parsed >= MIN_FONT_SIZE && parsed <= MAX_FONT_SIZE)
+														setFontSize(parsed);
+												}}
+												onBlur={() => {
+													const settled = clampFontSize(Number(fontSizeDraft));
+													setFontSize(settled);
+													setFontSizeDraft(String(settled));
+													if (!writeFontSizePreference(settled)) setNotice(t("shell.fontSizeSaveFailed"));
+												}}
+											/>
+											<Button
+												aria-label={t("shell.fontSizeLarger")}
+												disabled={fontSize >= MAX_FONT_SIZE}
+												onClick={() => {
+													const next = clampFontSize(fontSize + 1);
+													setFontSize(next);
+													setFontSizeDraft(String(next));
+													if (!writeFontSizePreference(next)) setNotice(t("shell.fontSizeSaveFailed"));
+												}}
+											>
+												+
+											</Button>
+											<span className="font-size-unit">{t("shell.fontSizeUnit")}</span>
 										</div>
 									</SettingsSection>
 								</div>

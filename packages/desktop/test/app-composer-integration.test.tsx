@@ -1835,6 +1835,41 @@ describe("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	test("the font size setting rescales the app and survives a relaunch", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() => {
+				const button = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+					item => item.textContent?.trim() === "Settings",
+				);
+				button?.click();
+			});
+			await page.waitForSelector(".font-size-control");
+			// The default is the size the layout was designed for.
+			expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("14px");
+			expect(await page.$eval(".font-size-input", input => (input as HTMLInputElement).value)).toBe("14");
+			await page.click('.font-size-control button[aria-label="Larger text"]');
+			await page.waitForFunction(() => getComputedStyle(document.documentElement).fontSize === "15px");
+			// Typing sets the value directly, and out-of-range input is clamped on entry.
+			await page.click(".font-size-input", { clickCount: 3 });
+			await page.type(".font-size-input", "18");
+			await page.waitForFunction(() => getComputedStyle(document.documentElement).fontSize === "18px");
+			// A value outside the range is only applied once the field is left, where it is clamped.
+			await page.click(".font-size-input", { clickCount: 3 });
+			await page.type(".font-size-input", "99");
+			expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("18px");
+			await page.$eval(".font-size-input", input => (input as HTMLInputElement).blur());
+			await page.waitForFunction(() => getComputedStyle(document.documentElement).fontSize === "20px");
+			await page.waitForFunction(
+				() => localStorage.getItem("gjc.desktop.font-size") === "20",
+			);
+			await page.reload();
+			await select(page);
+			expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("20px");
+		} finally { await closeFixture(context, page); }
+	}, 40000);
+
 	test("folds a workspace's conversations away and back", async () => {
 		const { context, page } = await fixture();
 		try {
