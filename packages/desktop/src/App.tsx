@@ -1647,6 +1647,7 @@ export default function App() {
 						setModelCatalogRevision(value => value + 1);
 					}}
 					refreshing={catalog?.loading === true}
+					loading={loadingModels}
 					onApplyProfile={profileId => {
 						if (modelOwnerRef.current !== ownerKey) return;
 						const action: DesktopPreferenceAction = { type: "profile.select", name: profileId, scope: "session" };
@@ -1708,15 +1709,13 @@ export default function App() {
 						);
 					}}
 				/>
-				<small className="model-control-status" role="status">
-					{loadingModels
-						? t("shell.modelsLoading")
-						: changing
-							? t("models.applyingSelection")
-							: !currentModelAvailable
-								? t("shell.providerRequired")
-								: null}
-				</small>
+				{/* The loading state lives in the model trigger, so no line appears until there is
+				    something the trigger cannot say. */}
+				{!loadingModels && (changing || !currentModelAvailable) && (
+					<small className="model-control-status" role="status">
+						{changing ? t("models.applyingSelection") : t("shell.providerRequired")}
+					</small>
+				)}
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
 					<Button disabled={!connected} onClick={() => openSettingsTab("account")}>
 						{t("shell.addProvider")}

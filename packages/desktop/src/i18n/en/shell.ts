@@ -34,7 +34,6 @@ export const shell = {
 	"shell.foldUnsupported": "The current foreground tool does not support moving to the background.",
 	"shell.foldAlreadyBackgrounded": "The current tool is already in the background.",
 	"shell.foldMoved": "Moved the current foreground tool to the background. This does not mean it has finished.",
-	"shell.modelsLoading": "Loading models…",
 	"shell.providerRequired": "Register or connect a provider, then choose a model.",
 	"shell.addProvider": "Add or connect a provider",
 	"shell.sideChatCommand": "Side chat (/btw)",

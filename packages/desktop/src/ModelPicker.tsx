@@ -104,6 +104,8 @@ export interface ModelPickerProps {
 	onApplyProfile?: (profileId: string) => void;
 	onRefresh?: () => void;
 	refreshing?: boolean;
+	/** The catalog is still arriving, so the trigger names the state instead of a model. */
+	loading?: boolean;
 }
 
 export function ModelPicker({
@@ -120,6 +122,7 @@ export function ModelPicker({
 	onApplyProfile,
 	onRefresh,
 	refreshing,
+	loading = false,
 }: ModelPickerProps) {
 	const tabId = useId();
 	const [open, setOpen] = useState(false);
@@ -245,17 +248,24 @@ export function ModelPicker({
 			<Button
 				className="model-trigger"
 				aria-label={t("models.triggerLabel", {
-					model: current?.name ?? selectedId ?? t("models.notSelected"),
+					model: loading ? t("models.loadingModels") : (current?.name ?? selectedId ?? t("models.notSelected")),
 				})}
 				aria-haspopup="dialog"
 				aria-expanded={open}
+				aria-busy={loading || undefined}
 				disabled={disabled || pending || applying}
-				title={current?.id ?? selectedId ?? t("models.triggerFallbackTitle")}
+				title={
+					loading ? t("models.loadingModels") : (current?.id ?? selectedId ?? t("models.triggerFallbackTitle"))
+				}
 				onClick={openDialog}
 			>
 				<Cpu size={15} aria-hidden="true" />
 				<span>
-					{pending ? t("models.applyingModel") : (current?.name ?? selectedId ?? t("models.selectModel"))}
+					{loading
+						? t("models.loadingModels")
+						: pending
+							? t("models.applyingModel")
+							: (current?.name ?? selectedId ?? t("models.selectModel"))}
 				</span>
 				<ChevronDown size={13} aria-hidden="true" />
 			</Button>

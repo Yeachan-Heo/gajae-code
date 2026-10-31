@@ -47,6 +47,20 @@ describe("desktop model and reasoning controls", () => {
 		expect(absent).toContain('aria-label="Select model: Not selected"');
 	});
 
+	test("the model trigger carries the loading state instead of a separate line", () => {
+		const loading = renderToStaticMarkup(
+			<ModelPicker models={models} selectedId="first/shared" loading onSelect={() => {}} />,
+		);
+		// The catalog is not there yet, so the trigger names the state where the model name goes.
+		expect(loading).toContain(">Loading models…</span>");
+		expect(loading).not.toContain(">Shared code model</span>");
+		expect(loading).toContain('aria-busy="true"');
+		expect(loading).toContain('aria-label="Select model: Loading models…"');
+		const ready = renderToStaticMarkup(<ModelPicker models={models} selectedId="first/shared" onSelect={() => {}} />);
+		expect(ready).toContain(">Shared code model</span>");
+		expect(ready).not.toContain('aria-busy="true"');
+	});
+
 	test("renders only SDK-declared discrete reasoning choices and actual selected value", () => {
 		const html = renderToStaticMarkup(<ReasoningSelect thinking={thinking} onChange={() => {}} />);
 		// The control is a button-triggered listbox, never a native system select.

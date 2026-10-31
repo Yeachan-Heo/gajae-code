@@ -9,7 +9,7 @@
     "dev:ui": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build:ui": "vite build",
     "build:host": "bun scripts/build-host.ts",
-    "build:app": "bun run icons && bun run build:host && tauri build --config src-tauri/tauri.bundle.conf.json",
+    "build:app": "bun run icons && bun run build:host && tauri build --config src-tauri/tauri.bundle.conf.json && bun scripts/sign-bundle.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
     "test": "bun test test",
     "qa:visual": "bun scripts/visual-qa.ts",
