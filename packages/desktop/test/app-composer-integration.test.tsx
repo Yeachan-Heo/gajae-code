@@ -1931,155 +1931,26 @@ describe("mounted composer delivery recovery", () => {
 			expect(closed).toEqual({ projectId: "p" });
 			expect(await page.$(".context-menu")).toBeNull();
 
-			// Conversations reorder with pointer events: a row's title is a button, and a pressed
-			// button never starts an HTML5 drag from its draggable ancestor, which is why the old
-			// dragstart-based path never fired in the app.
-			const sessionRowPoint = (index: number, half: "top" | "bottom") =>
-				page.evaluate(
-					({ index, half }) => {
-						const row = [...document.querySelectorAll<HTMLElement>(".project-group .session-drop")][index];
-						const rect = row!.getBoundingClientRect();
-						return {
-							x: rect.left + rect.width / 2,
-							y: half === "top" ? rect.top + rect.height * 0.25 : rect.top + rect.height * 0.75,
-						};
-					},
-					{ index, half },
-				);
-			const pressRow = async (index: number) => {
-				const point = await sessionRowPoint(index, "top");
-				await page.mouse.move(point.x, point.y);
-				await page.mouse.down();
-				// Past the five-pixel threshold that separates a press from a click.
-				await page.mouse.move(point.x + 2, point.y + 8, { steps: 3 });
-			};
-			const hoverRow = async (index: number, half: "top" | "bottom") => {
-				const point = await sessionRowPoint(index, half);
-				await page.mouse.move(point.x, point.y, { steps: 5 });
-			};
-			await pressRow(0);
-			await hoverRow(1, "bottom");
-			expect(
-				await page.evaluate(() =>
-					[...document.querySelectorAll(".project-group .session-drop")].map(row => ({
-						after: row.classList.contains("drop-after"),
-						before: row.classList.contains("drop-before"),
-					})),
-				),
-			).toEqual([
-				{ after: false, before: false },
-				{ after: true, before: false },
-			]);
-			await page.mouse.up();
-			await page.waitForFunction(() =>
-				window.fixture.requests().some(request => request.method === "session.reorder"),
-			);
-			expect(
-				await page.evaluate(
-					() => window.fixture.requests().find(request => request.method === "session.reorder")?.params,
-				),
-			).toEqual({ projectId: "p", ids: ["s2", "s1"] });
-			// The host publishes the reordered list; mirror it so the upward drag starts from it.
-			await page.evaluate(() => {
-				const make = (id: string, title: string): DesktopSession => ({
-					id,
-					title,
-					projectId: "p",
-					status: "idle",
-					starred: false,
-					imageInput: { supported: true, blocked: false },
-					operatorRunning: false,
-					controlGeneration: 1,
-					messages: [],
-				});
-				window.fixture.emit({
-					type: "snapshot",
-					snapshot: {
-						protocolVersion: 1,
-						projects: [
-							{ id: "p", name: "Project", path: "/project" },
-							{ id: "q", name: "Second", path: "/second" },
-						],
-						sessions: [make("s2", "Two"), make("s1", "One")],
-						models: [],
-						capabilities: [],
-						deliveries: [],
-					},
-				});
-			});
-			await page.waitForFunction(
-				() =>
-					document
-						.querySelector(".project-group .session-row")
-						?.textContent?.includes("Two") === true,
-			);
-			// An upward drag inserts before its target, and dropping asks for that order too.
-			await pressRow(1);
-			await hoverRow(0, "top");
-			expect(
-				await page.evaluate(() =>
-					[...document.querySelectorAll(".project-group .session-drop")].map(row => ({
-						after: row.classList.contains("drop-after"),
-						before: row.classList.contains("drop-before"),
-					})),
-				),
-			).toEqual([
-				{ after: false, before: true },
-				{ after: false, before: false },
-			]);
-			await page.mouse.up();
-			await page.waitForFunction(
-				() => window.fixture.requests().filter(request => request.method === "session.reorder").length === 2,
-			);
-			expect(
-				await page.evaluate(
-					() =>
-						window.fixture.requests().filter(request => request.method === "session.reorder").at(-1)?.params,
-				),
-			).toEqual({ projectId: "p", ids: ["s1", "s2"] });
-			// A conversation carried over another workspace has no destination: no cue, no request.
-			await page.evaluate(() => {
-				window.fixture.emit({
-					type: "snapshot",
-					snapshot: {
-						protocolVersion: 1,
-						projects: [
-							{ id: "p", name: "Project", path: "/project" },
-							{ id: "q", name: "Second", path: "/second" },
-						],
-						sessions: [
-							{ id: "s1", title: "One", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] },
-							{ id: "s2", title: "Two", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] },
-							{ id: "q1", title: "Other", projectId: "q", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] },
-						],
-						models: [],
-						capabilities: [],
-						deliveries: [],
-					},
-				});
-			});
-			// Two projects render before this snapshot too, so the row count is what proves the
-			// foreign conversation arrived.
-			await page.waitForFunction(
-				() => document.querySelectorAll(".project-group .session-drop").length === 3,
-			);
-			const foreignBefore = await page.evaluate(
+			// Conversations are reordered from their context menu only: a row carries no drag
+			// surface, so a pointer drag over one must never reach the host.
+			const reorderBefore = await page.evaluate(
 				() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 			);
-			await pressRow(2);
-			await hoverRow(0, "top");
-			expect(
-				await page.evaluate(() =>
-					[...document.querySelectorAll(".project-group .session-drop")].map(row => row.className),
-				),
-			).not.toContain("drop-after");
+			const firstRow = await page.evaluate(() => {
+				const rect = document.querySelector(".project-group .session-drop")!.getBoundingClientRect();
+				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			});
+			await page.mouse.move(firstRow.x, firstRow.y);
+			await page.mouse.down();
+			await page.mouse.move(firstRow.x + 4, firstRow.y + 40, { steps: 5 });
 			await page.mouse.up();
-			await Bun.sleep(100);
+			await Bun.sleep(150);
 			expect(
 				await page.evaluate(
 					() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 				),
-			).toBe(foreignBefore);
+			).toBe(reorderBefore);
+			expect(await page.$(".project-group .session-drop.dragging")).toBeNull();
 		} finally {
 			await closeFixture(context, page);
 		}

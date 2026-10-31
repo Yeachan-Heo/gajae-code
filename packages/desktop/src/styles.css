@@ -139,22 +139,15 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 
 .project-group { margin: 16px 0 24px; border-radius: var(--radius-md); }
 /* Drag reorder: the dragged row dims, the whole workspace is a drop target. */
-.project-group.dragging, .session-drop.dragging { opacity: 0.45; }
+.project-group.dragging { opacity: 0.45; }
 /* The insertion cue marks where the dragged item will land. */
 /* `--ring` is a box-shadow value, so the highlight joins the cue in one declaration per class:
    an outline could not paint it, and a border would reflow the list under the pointer. */
 .project-group.drop-target { box-shadow: var(--ring); }
-/* The insertion cue sits on the edge the item will actually land on: a downward drag inserts
-   after its target, an upward one before it, so the line follows the real splice. */
-.session-drop.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
-.session-drop.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
 .project-group.drop-before { box-shadow: var(--ring), inset 0 2px 0 var(--accent); }
 .project-group.drop-after { box-shadow: var(--ring), inset 0 -2px 0 var(--accent); }
 .project-heading { cursor: grab; border-radius: var(--radius-xs); }
 .session-drop { border-radius: var(--radius-sm); }
-.session-drop.dragging { cursor: grabbing; }
-/* The row that is being dragged must not swallow the pointer, or it becomes its own drop target. */
-.session-drop.dragging .session-row { pointer-events: none; }
 .show-more { width: 100%; justify-content: center; margin-top: 4px; font-size: 0.75rem; }
 /* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
 .menu-scrim { position: fixed; inset: 0; z-index: 40; border: 0; padding: 0; background: transparent; }

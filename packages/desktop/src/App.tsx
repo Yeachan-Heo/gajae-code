@@ -14,7 +14,6 @@ import {
 	Trash2,
 	X,
 } from "lucide-react";
-import type { PointerEvent as ReactPointerEvent } from "react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
 	DesktopActivityDetail,
@@ -550,23 +549,6 @@ export default function App() {
 	>(null);
 	const [dragProject, setDragProject] = useState<string | null>(null);
 	const dragProjectRef = useRef<string | null>(null);
-	const [dragSession, setDragSession] = useState<{ id: string; projectId: string } | null>(null);
-	/**
-	 * Session rows are reordered with pointer events rather than HTML5 drag and drop: the title of
-	 * a row is a button, and a pressed button never promotes a drag to its draggable ancestor, so
-	 * dragstart never fired and every drop was refused. Pointer tracking starts wherever the user
-	 * presses in the row and only becomes a drag once the pointer actually moves.
-	 */
-	const sessionDrag = useRef<{
-		id: string;
-		projectId: string;
-		startX: number;
-		startY: number;
-		active: boolean;
-		pointerId: number;
-	} | null>(null);
-	/** The click that follows a completed drag must not also select the conversation. */
-	const suppressRowClick = useRef(false);
 	/** The conversation whose open is still outstanding; its transcript is unknown. */
 	const [opening, setOpening] = useState<string | null>(null);
 	/** The row under the pointer and which of its edges the dragged item will land on. */
@@ -1056,11 +1038,6 @@ export default function App() {
 		});
 	const select = (item: DesktopSession) => {
 		if (!connected) return;
-		// The pointerup that ends a reorder drag also dispatches a click on the row.
-		if (suppressRowClick.current) {
-			suppressRowClick.current = false;
-			return;
-		}
 		setSelected(item.id);
 		setSidebar(false);
 		setOpening(item.id);
@@ -1836,7 +1813,6 @@ export default function App() {
 		setDropTarget(null);
 		dragProjectRef.current = null;
 		setDragProject(null);
-		setDragSession(null);
 	};
 	/** Move one item one slot up or down; the keyboard path for list reordering. */
 	const moveProject = (id: string, direction: -1 | 1) => {
@@ -1857,89 +1833,6 @@ export default function App() {
 		setMenu(null);
 		if (connected) void call("session.reorder", { projectId, ids }, "global");
 	};
-	/** The row under a point, or null when the point is over the sidebar but not over a row. */
-	const sessionRowAt = (x: number, y: number): { id: string; projectId: string; after: boolean } | null => {
-		const row = document.elementFromPoint(x, y)?.closest<HTMLElement>(".session-drop[data-session-id]");
-		const id = row?.dataset.sessionId;
-		const projectId = row?.dataset.sessionProject;
-		if (!row || !id || !projectId) return null;
-		const rect = row.getBoundingClientRect();
-		return { id, projectId, after: y > rect.top + rect.height / 2 };
-	};
-	/** Commit the pointer drag that just ended: splice the dragged row around the hovered one. */
-	const commitSessionDrag = (projectId: string, dragged: string, target: string, after: boolean) => {
-		const ids = (snapshot?.sessions ?? []).filter(session => session.projectId === projectId).map(s => s.id);
-		const from = ids.indexOf(dragged);
-		if (from < 0 || !ids.includes(target) || dragged === target) return;
-		ids.splice(from, 1);
-		const anchored = ids.indexOf(target);
-		ids.splice(after ? anchored + 1 : anchored, 0, dragged);
-		if (connected) void call("session.reorder", { projectId, ids }, "global");
-	};
-	// The window listeners are registered once, so they read the newest commit through a ref
-	// instead of capturing the render that installed them.
-	const commitSessionDragRef = useRef(commitSessionDrag);
-	useEffect(() => {
-		commitSessionDragRef.current = commitSessionDrag;
-	});
-	const startSessionDrag = (event: ReactPointerEvent<HTMLDivElement>, chat: DesktopSession, projectId: string) => {
-		// A secondary press belongs to the context menu, and a filtered list has no stable order
-		// to drop into.
-		if (event.button !== 0 || searching) return;
-		sessionDrag.current = {
-			id: chat.id,
-			projectId,
-			startX: event.clientX,
-			startY: event.clientY,
-			active: false,
-			pointerId: event.pointerId,
-		};
-	};
-	useEffect(() => {
-		const move = (event: PointerEvent) => {
-			const drag = sessionDrag.current;
-			if (!drag || event.pointerId !== drag.pointerId) return;
-			if (!drag.active) {
-				// A press that never moves is a click, so the drag only becomes real past a threshold.
-				if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 5) return;
-				drag.active = true;
-				setDragSession({ id: drag.id, projectId: drag.projectId });
-			}
-			event.preventDefault();
-			const hit = sessionRowAt(event.clientX, event.clientY);
-			// No cross-workspace move exists, so a row from another workspace is not a destination.
-			const next =
-				hit && hit.id !== drag.id && hit.projectId === drag.projectId
-					? { key: `session:${hit.id}`, after: hit.after }
-					: null;
-			dropTargetRef.current = next;
-			setDropTarget(next);
-		};
-		const finish = (event: PointerEvent, commit: boolean) => {
-			const drag = sessionDrag.current;
-			if (!drag || event.pointerId !== drag.pointerId) return;
-			sessionDrag.current = null;
-			const target = dropTargetRef.current;
-			if (drag.active) {
-				// The release also dispatches a click; that click must not select the row.
-				suppressRowClick.current = true;
-				if (commit && target) {
-					commitSessionDragRef.current(drag.projectId, drag.id, target.key.slice("session:".length), target.after);
-				}
-			}
-			clearDrag();
-		};
-		const up = (event: PointerEvent) => finish(event, true);
-		const cancel = (event: PointerEvent) => finish(event, false);
-		window.addEventListener("pointermove", move);
-		window.addEventListener("pointerup", up);
-		window.addEventListener("pointercancel", cancel);
-		return () => {
-			window.removeEventListener("pointermove", move);
-			window.removeEventListener("pointerup", up);
-			window.removeEventListener("pointercancel", cancel);
-		};
-	}, []);
 	const closeProject = (projectId: string) => {
 		setMenu(null);
 		if (!connected) return;
@@ -2068,14 +1961,7 @@ export default function App() {
 							{visible.map(chat => (
 								<div
 									key={chat.id}
-									data-session-id={chat.id}
-									data-session-project={item.id}
-									className={`session-drop ${dragSession?.id === chat.id ? "dragging" : ""} ${
-										dropTarget?.key === `session:${chat.id}`
-											? `drop-target ${dropTarget.after ? "drop-after" : "drop-before"}`
-											: ""
-									}`}
-									onPointerDown={event => startSessionDrag(event, chat, item.id)}
+									className="session-drop"
 									onContextMenu={event => {
 										event.preventDefault();
 										event.stopPropagation();
