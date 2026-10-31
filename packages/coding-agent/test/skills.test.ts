@@ -41,9 +41,11 @@ function makeSkill(name: string): Skill {
 describe("parseSkillInvocations", () => {
 	const alpha = makeSkill("alpha");
 	const beta = makeSkill("beta");
+	const gamma = makeSkill("gamma");
 	const skillsByCommandName = new Map([
 		["skill:alpha", alpha],
 		["skill:beta", beta],
+		["skill:gamma", gamma],
 		["alpha", alpha],
 	]);
 
@@ -76,6 +78,20 @@ describe("parseSkillInvocations", () => {
 		]);
 	});
 
+	it("preserves code indentation and repeated spaces outside the removed inline token", () => {
+		const text = 'Explain /skill:alpha\n    run("a  b")';
+		expect(parseSkillInvocations(text, skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args: 'Explain \n    run("a  b")', skill: alpha },
+		]);
+	});
+
+	it("preserves leading and trailing whitespace outside the removed inline token", () => {
+		const text = "  Keep exactly /skill:alpha these spaces  \n";
+		expect(parseSkillInvocations(text, skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args: "  Keep exactly these spaces  \n", skill: alpha },
+		]);
+	});
+
 	it("matches canonical skill invocations case-insensitively", () => {
 		expect(parseSkillInvocations("/Skill:alpha first /SKILL:beta second", skillsByCommandName)).toEqual([
 			{ commandName: "Skill:alpha", args: "first", skill: alpha },
@@ -104,6 +120,141 @@ describe("parseSkillInvocations", () => {
 	it("does not treat aliases or unknown leading skill commands as invocations", () => {
 		expect(parseSkillInvocations("/alpha autocomplete alias is not invocation", skillsByCommandName)).toEqual([]);
 		expect(parseSkillInvocations("/skill:unknown /skill:alpha later", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("keep /skill:unknown in the prompt", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("path/skill:alpha is just a path", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("https://example.test/skill:alpha is a URL", skillsByCommandName)).toEqual([]);
+	});
+
+	it("does not invoke skill commands inside inline code spans (issue #7314)", () => {
+		// Skill command inside backticks should not be invoked
+		expect(parseSkillInvocations("Run this command: `/skill:alpha code`", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("Example: `just /skill:alpha run it`", skillsByCommandName)).toEqual([]);
+
+		// Multiple backtick pairs; only matches outside backticks should be invoked
+		expect(parseSkillInvocations("Run `/skill:alpha` or use /skill:beta instead", skillsByCommandName)).toEqual([
+			{ commandName: "skill:beta", args: "Run `/skill:alpha` or use instead", skill: beta },
+		]);
+
+		// Escaped backticks should not affect matching
+		expect(parseSkillInvocations("Escaped \\`backtick\\` and /skill:alpha should work", skillsByCommandName)).toEqual(
+			[{ commandName: "skill:alpha", args: "Escaped \\`backtick\\` and should work", skill: alpha }],
+		);
+
+		// Multi-backtick inline code spans should not invoke skills
+		expect(parseSkillInvocations("Use ``/skill:alpha`` as literal", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("Example: ```/skill:alpha``` with three backticks", skillsByCommandName)).toEqual(
+			[],
+		);
+
+		// Multi-backtick code spans with text outside should only invoke outside skills
+		expect(parseSkillInvocations("Example ``/skill:alpha`` and /skill:beta works", skillsByCommandName)).toEqual([
+			{ commandName: "skill:beta", args: "Example ``/skill:alpha`` and works", skill: beta },
+		]);
+
+		// Fenced code blocks should not invoke skills
+		expect(
+			parseSkillInvocations("Example:\n```\n/skill:alpha do it\n```\nplease explain", skillsByCommandName),
+		).toEqual([]);
+
+		// Fenced block with skill before and after
+		const fencedBlockTest = parseSkillInvocations(
+			"/skill:alpha start\n```\n/skill:beta\n```\n/skill:gamma done",
+			skillsByCommandName,
+		);
+		// Should find /skill:alpha and /skill:gamma, but not /skill:beta (inside fenced block)
+		expect(fencedBlockTest.length).toBe(2);
+		expect(fencedBlockTest[0]?.commandName).toBe("skill:alpha");
+		expect(fencedBlockTest[1]?.commandName).toBe("skill:gamma");
+	});
+
+	it("CommonMark span permutations: single backticks at line start and elsewhere", () => {
+		// Table-driven test for line-start backtick spans and various CommonMark cases
+		const testCases: Array<{
+			description: string;
+			text: string;
+			expectedCommandCount: number;
+			expectedCommands?: string[];
+		}> = [
+			// Single backtick at line start should be treated as inline code span opener
+			{
+				description: "Single backtick at line start opens inline code span",
+				text: "Notes:\n`npm test` is the cmd, literal: `run /skill:alpha here`",
+				expectedCommandCount: 0,
+			},
+			{
+				description: "Single backtick at line start with skill outside",
+				text: "`example` use /skill:alpha now",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Multiple inline code spans with skills
+			{
+				description: "Multiple single-backtick spans with skill outside",
+				text: "`code1` and /skill:alpha and `code2`",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Mixed fences and inline spans
+			{
+				description: "Fence with inline spans and skills outside",
+				text: "`inline` /skill:alpha\n```\n/skill:beta\n```\n/skill:gamma",
+				expectedCommandCount: 2,
+				expectedCommands: ["skill:alpha", "skill:gamma"],
+			},
+			// CommonMark: only 3+ backticks at line start are fence delimiters
+			{
+				description: "Two backticks at line start are inline, not fence",
+				text: "Start\n``code`` with /skill:alpha",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Non-matching backtick runs inside a span should be treated as literal text
+			{
+				description: "Non-matching backticks inside span are literal text",
+				text: "Show ``a `tick`` then /skill:alpha",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Longer closing fence should close the code block
+			{
+				description: "Longer closing fence closes code block",
+				text: "Example:\n```\n/skill:alpha\n````\n/skill:beta after",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:beta"],
+			},
+			// Equal length fence still closes
+			{
+				description: "Equal length fence closes",
+				text: "Example:\n```\n/skill:alpha\n```\n/skill:beta after",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:beta"],
+			},
+			// Closing fence with text after is not a valid fence (per CommonMark)
+			// /skill:alpha is inside code block and should NOT be invoked
+			{
+				description: "Backticks with text after do not close fence (issue #7321)",
+				text: "Explain:\n```text\n``` not a closing fence\n/skill:alpha run\n```",
+				expectedCommandCount: 0,
+			},
+			// Closing fence with trailing whitespace is valid, so /skill:alpha is outside
+			{
+				description: "Closing fence with trailing whitespace is valid",
+				text: "Explain:\n```text\n```   \n/skill:alpha run",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+		];
+
+		for (const testCase of testCases) {
+			const result = parseSkillInvocations(testCase.text, skillsByCommandName);
+			// Test case: ${testCase.description}
+			expect(result.length).toBe(testCase.expectedCommandCount);
+			if (testCase.expectedCommands) {
+				for (let i = 0; i < testCase.expectedCommands.length; i++) {
+					expect(result[i]?.commandName).toBe(testCase.expectedCommands[i]);
+				}
+			}
+		}
 	});
 });
 
