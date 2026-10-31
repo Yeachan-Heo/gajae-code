@@ -7839,11 +7839,10 @@ export class AgentSession {
 			try {
 				// A terminal that carries owner context must win the exact producer claim;
 				// a superseded run's late agent_end never falls back to a successor's
-				// handle. Externally emitted terminals carry no owner context and own no
-				// run resources, so they keep the ownerless handling path unless a
-				// prompt-owned run is actually active.
+				// handle. For terminals without owner context (e.g. from the current non-SDK
+				// prompt being aborted), allow them through unconditionally.
 				if (event.type === "agent_end" && !maintenanceCheckpoint) {
-					if (terminalOwner ? !terminalClaim?.ok : this.activePromptHandle !== undefined) return;
+					if (terminalOwner && !terminalClaim?.ok) return;
 				}
 				// Terminal publication is ownership-sensitive and is handled above. A
 				// message/turn lifecycle event is different: its canonical transcript
