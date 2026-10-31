@@ -2,10 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	$credentialEnv,
-	$env,
 	$pickCredentialEnv,
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
 	extractHttpStatusFromError,
 	getTrustedHomeDir,
+	readEndpointConfiguration,
 } from "@gajae-code/utils";
 import {
 	attachProviderSafetyStopModelIdentity,
@@ -117,7 +119,7 @@ function hasVertexAdcCredentials(): boolean {
 	return fs.existsSync(path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"));
 }
 
-type KeyResolver = string | (() => string | undefined);
+type KeyResolver = string | ((endpointConfiguration?: EndpointConfiguration) => string | undefined);
 
 export type EnvApiKeyCredentialSource =
 	| { kind: "environment"; name: string }
@@ -171,19 +173,22 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	// GitHub Copilot uses GitHub personal access token
 	"github-copilot": () => $pickCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
-	anthropic: () =>
-		isFoundryEnabled()
+	anthropic: endpointConfiguration =>
+		isFoundryEnabled(endpointConfiguration)
 			? $pickCredentialEnv("ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 			: $pickCredentialEnv("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
 	"gitlab-duo": "GITLAB_TOKEN",
 	// Vertex AI supports either GOOGLE_CLOUD_API_KEY or Application Default Credentials.
-	"google-vertex": () => {
+	"google-vertex": endpointConfiguration => {
 		const googleCloudApiKey = $credentialEnv("GOOGLE_CLOUD_API_KEY");
 		if (googleCloudApiKey) return googleCloudApiKey;
 
 		const hasCredentials = hasVertexAdcCredentials();
-		const hasProject = !!($env.GOOGLE_CLOUD_PROJECT || $env.GCLOUD_PROJECT);
-		const hasLocation = !!$env.GOOGLE_CLOUD_LOCATION;
+		const hasProject = !!(
+			readEndpointConfiguration(endpointConfiguration, "GOOGLE_CLOUD_PROJECT") ||
+			readEndpointConfiguration(endpointConfiguration, "GCLOUD_PROJECT")
+		);
+		const hasLocation = !!readEndpointConfiguration(endpointConfiguration, "GOOGLE_CLOUD_LOCATION");
 		if (hasCredentials && hasProject && hasLocation) {
 			return "<authenticated>";
 		}
@@ -232,9 +237,12 @@ const functionResolverEnvNames: Record<string, readonly string[]> = {
 	"qwen-portal": ["QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"],
 };
 
-function getFunctionResolverEnvNames(provider: string): readonly string[] {
+function getFunctionResolverEnvNames(
+	provider: string,
+	endpointConfiguration?: EndpointConfiguration,
+): readonly string[] {
 	if (provider === "anthropic") {
-		return isFoundryEnabled()
+		return isFoundryEnabled(endpointConfiguration)
 			? ["ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
 			: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"];
 	}
@@ -247,12 +255,13 @@ function getFunctionResolverEnvNames(provider: string): readonly string[] {
  * Provider authentication intentionally excludes cwd/.env values. Project dotenv files are
  * loaded into $env for app/tool execution, but must not silently fund GJC model requests.
  */
-export function getEnvApiKey(provider: string): string | undefined {
+export function getEnvApiKey(provider: string, endpointConfiguration?: EndpointConfiguration): string | undefined {
+	assertEndpointConfiguration(endpointConfiguration);
 	const resolver = serviceProviderMap[provider];
 	if (typeof resolver === "string") {
 		return $credentialEnv(resolver);
 	}
-	return resolver?.();
+	return resolver?.(endpointConfiguration);
 }
 
 /**
@@ -260,9 +269,11 @@ export function getEnvApiKey(provider: string): string | undefined {
  * environment credential. Values are never returned. This intentionally uses
  * the same credential-only environment reader as {@link getEnvApiKey}.
  */
-export function getEnvApiKeyEnvNames(provider: string): string[] {
+export function getEnvApiKeyEnvNames(provider: string, endpointConfiguration?: EndpointConfiguration): string[] {
+	assertEndpointConfiguration(endpointConfiguration);
 	const resolver = serviceProviderMap[provider];
-	const names = typeof resolver === "string" ? [resolver] : getFunctionResolverEnvNames(provider);
+	const names =
+		typeof resolver === "string" ? [resolver] : getFunctionResolverEnvNames(provider, endpointConfiguration);
 	return names.filter(name => {
 		const value = $credentialEnv(name);
 		if (value === undefined) return false;
@@ -279,7 +290,7 @@ export function getEnvApiKeyEnvNames(provider: string): string[] {
 /** Describe the selected source without exposing credential values or unvalidated ADC files. */
 export async function getEnvApiKeyCredentialSource(
 	provider: string,
-	options?: { fetch?: FetchImpl },
+	options?: { fetch?: FetchImpl; endpointConfiguration?: EndpointConfiguration },
 ): Promise<EnvApiKeyCredentialSource | undefined> {
 	return (await getEnvApiKeyCredentialSources(provider, options))[0];
 }
@@ -287,9 +298,9 @@ export async function getEnvApiKeyCredentialSource(
 /** Enumerate usable credential candidates in provider dispatch precedence without exposing credentials. */
 export async function getEnvApiKeyCredentialSources(
 	provider: string,
-	options?: { fetch?: FetchImpl },
+	options?: { fetch?: FetchImpl; endpointConfiguration?: EndpointConfiguration },
 ): Promise<EnvApiKeyCredentialSource[]> {
-	const sources: EnvApiKeyCredentialSource[] = getEnvApiKeyEnvNames(provider).map(
+	const sources: EnvApiKeyCredentialSource[] = getEnvApiKeyEnvNames(provider, options?.endpointConfiguration).map(
 		(name): EnvApiKeyCredentialSource =>
 			provider === "amazon-bedrock" && name === "AWS_BEARER_TOKEN_BEDROCK"
 				? { kind: "aws", source: "bearer-token" }
@@ -297,8 +308,10 @@ export async function getEnvApiKeyCredentialSources(
 	);
 
 	if (provider === "google-vertex") {
-		const project = $credentialEnv("GOOGLE_CLOUD_PROJECT") || $credentialEnv("GCLOUD_PROJECT");
-		const location = $credentialEnv("GOOGLE_CLOUD_LOCATION");
+		const project =
+			readEndpointConfiguration(options?.endpointConfiguration, "GOOGLE_CLOUD_PROJECT") ||
+			readEndpointConfiguration(options?.endpointConfiguration, "GCLOUD_PROJECT");
+		const location = readEndpointConfiguration(options?.endpointConfiguration, "GOOGLE_CLOUD_LOCATION");
 		if (project && location && isValidVertexLocation(location)) {
 			const source = await getVertexCredentialSource({ fetch: options?.fetch });
 			if (source) sources.push({ kind: "google-adc", source });
@@ -321,13 +334,17 @@ export async function getEnvApiKeyCredentialSources(
 /** Resolve Vertex ADC provenance, including metadata-server credentials, without acquiring a token. */
 export async function getGoogleVertexCredentialSource(options?: {
 	fetch?: FetchImpl;
+	endpointConfiguration?: EndpointConfiguration;
 }): Promise<EnvApiKeyCredentialSource | undefined> {
 	return (await getEnvApiKeyCredentialSources("google-vertex", options))[0];
 }
 
 /** Name of the environment variable whose value is selected by `getEnvApiKey`, when identifiable. */
-export async function getEnvApiKeyEnvName(provider: string): Promise<string | undefined> {
-	const source = await getEnvApiKeyCredentialSource(provider);
+export async function getEnvApiKeyEnvName(
+	provider: string,
+	endpointConfiguration?: EndpointConfiguration,
+): Promise<string | undefined> {
+	const source = await getEnvApiKeyCredentialSource(provider, { endpointConfiguration });
 	return source?.kind === "environment" ? source.name : undefined;
 }
 
@@ -459,6 +476,7 @@ export function stream<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 	onStreamCreated?: () => void,
 ): AssistantMessageEventStream {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	assertCustomApiRegistryActive(options?.customApiRegistry);
 	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
@@ -482,7 +500,7 @@ export function stream<TApi extends Api>(
 	}
 
 	if (model.provider === "gitlab-duo") {
-		const apiKey = (options as StreamOptions | undefined)?.apiKey || getEnvApiKey(model.provider);
+		const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration);
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
@@ -538,7 +556,9 @@ export function stream<TApi extends Api>(
 		return streamDevinAcp(model as Model<"devin-acp">, context, (options || {}) as DevinAcpOptions, onStreamCreated);
 	}
 
-	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
+	const apiKey =
+		options?.apiKey ||
+		(model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider, options?.endpointConfiguration));
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
@@ -716,6 +736,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	assertCustomApiRegistryActive(options?.customApiRegistry);
 	assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
@@ -727,7 +748,9 @@ export function streamSimple<TApi extends Api>(
 		};
 		options = markManagedAttemptValidated(options);
 	}
-	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
+	const retryApiKey = options?.onAuthError
+		? (options.apiKey ?? getEnvApiKey(model.provider, options?.endpointConfiguration))
+		: undefined;
 	if (retryApiKey) {
 		const consumerAbortController = new AbortController();
 		const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
@@ -879,7 +902,7 @@ export function streamSimple<TApi extends Api>(
 		return events;
 	}
 
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration);
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
@@ -1092,10 +1115,13 @@ function mapOptionsForApi<TApi extends Api>(
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
 		customApiRegistry: options?.customApiRegistry,
+		endpointConfiguration: options?.endpointConfiguration,
+		fetch: options?.fetch,
 		signal: options?.signal,
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		apiKey: apiKey || options?.apiKey,
+		authCredentialType: options?.authCredentialType,
 		fallbackManaged: options?.fallbackManaged,
 		fallbackAttempt: options?.fallbackAttempt,
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,

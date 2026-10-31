@@ -23298,6 +23298,7 @@ export class AgentSession {
 				apiKey,
 				{
 					...this.#maintenanceProviderTransport(),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -30492,6 +30493,7 @@ export class AgentSession {
 				const branchSummarySettings = this.settings.getGroup("branchSummary");
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...this.#maintenanceProviderTransport(),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
 					model,
 					apiKey,
 					signal: this.#branchSummaryAbortController.signal,
