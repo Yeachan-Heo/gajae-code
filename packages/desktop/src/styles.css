@@ -37,7 +37,6 @@
 	--ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 	--dur: 160ms;
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-	font-size: 100%;
 	line-height: 1.55;
 	color: var(--text);
 	background: var(--bg);
@@ -513,10 +512,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .settings-panel > .oauth-settings .bounded-output { margin-top: 8px; }
 .theme-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin: 8px 0 16px; }
 .theme-option { justify-content: flex-start; gap: 10px; }
-.theme-option[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.theme-option[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .font-size-control { display: flex; align-items: center; gap: 6px; }
-.font-size-control .button { width: 30px; height: 30px; min-height: 0; padding: 0; font-size: 1rem; }
-.font-size-input { width: 4.5em; height: 30px; padding: 0 6px; border: 1px solid var(--input-border); border-radius: var(--radius-xs); background: var(--surface-2); color: var(--text); text-align: center; font: inherit; }
+.font-size-control .button { width: 32px; height: 32px; min-height: 0; padding: 0; font-size: 1rem; }
+/* A field, not a button: it still carries no accent outline, only its own surface. */
+.font-size-input { width: 4.5em; height: 32px; padding: 0 6px; border: 1px solid transparent; border-radius: var(--radius-xs); background: var(--surface-2); color: var(--text); text-align: center; font: inherit; }
+.font-size-input:focus-visible { outline: var(--ring); outline-offset: 1px; }
 .font-size-unit { color: var(--muted); font-size: 0.75rem; }
 .theme-swatch { width: 16px; height: 16px; flex: none; border-radius: var(--radius-pill); border: 1px solid var(--border-soft); }
 .modal h3 > svg { width: 15px; height: 15px; vertical-align: -2px; margin-right: 4px; }
