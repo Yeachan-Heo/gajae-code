@@ -7658,7 +7658,13 @@ export class ModelRegistry {
 		return this.authStorage.hasOAuth(model.provider);
 	}
 
+	/** Effective dispatch kind, including this registry's config and runtime key overrides. */
 	getSessionCredentialType(provider: string, sessionId?: string): "api_key" | "oauth" | undefined {
+		if (
+			this.authStorage.hasRuntimeApiKey(provider) ||
+			this.authStorage.hasConfigApiKey(provider, this.#authStorageConfigOwner)
+		)
+			return "api_key";
 		return this.authStorage.getSessionCredentialType(provider, sessionId);
 	}
 

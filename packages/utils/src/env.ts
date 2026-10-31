@@ -467,6 +467,97 @@ export function $pickCredentialEnv(...keys: string[]): string | undefined {
 	return undefined;
 }
 
+declare const endpointConfigurationBrand: unique symbol;
+
+/** Opaque, immutable snapshot of endpoint routing, never credentials or ADC. */
+export type EndpointConfiguration = {
+	readonly [endpointConfigurationBrand]: true;
+};
+
+const endpointRoutingEnvNames = new Set([
+	"AZURE_OPENAI_RESOURCE_NAME",
+	"AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+	"AZURE_OPENAI_API_VERSION",
+	"GOOGLE_CLOUD_PROJECT",
+	"GCLOUD_PROJECT",
+	"GOOGLE_CLOUD_LOCATION",
+	"CLAUDE_CODE_USE_FOUNDRY",
+]);
+const mergedEndpointRoutingEnvNames = new Set(["AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "AZURE_OPENAI_API_VERSION"]);
+const endpointConfigurationValues = new WeakMap<object, ReadonlyMap<string, string | undefined>>();
+
+function isEndpointRoutingEnvName(name: string): boolean {
+	return endpointRoutingEnvNames.has(name) || (name.endsWith("_BASE_URL") && isSafeEnvName(name));
+}
+
+function readLiveEndpointConfigurationValue(name: string): string | undefined {
+	return mergedEndpointRoutingEnvNames.has(name) ? Bun.env[name] : $credentialEnv(name);
+}
+
+/** Capture routing using each variable's established source policy. */
+export function captureEndpointConfiguration(): EndpointConfiguration {
+	const values = new Map<string, string | undefined>();
+	for (const name of endpointRoutingEnvNames) values.set(name, readLiveEndpointConfigurationValue(name));
+	// Project-only keys may be candidates, but the trusted resolver still rejects
+	// their values. Missing entries remain authoritative absence in this capture.
+	const baseUrlNames = new Set([
+		...Object.keys(inheritedEnv),
+		...Object.keys(agentEnv),
+		...Object.keys(piEnv),
+		...Object.keys(homeEnv),
+		...Object.keys(homeShellEnv),
+		...Object.keys(Bun.env),
+	]);
+	for (const rawName of baseUrlNames) {
+		const name = canonicalEnvKey(rawName);
+		if (name.endsWith("_BASE_URL") && isSafeEnvName(name)) values.set(name, $credentialEnv(name));
+	}
+	const handle = Object.freeze(Object.create(null)) as EndpointConfiguration;
+	endpointConfigurationValues.set(handle, values);
+	return handle;
+}
+
+/** Reject forged or serialized handles before downstream side effects. */
+export function assertEndpointConfiguration(configuration?: EndpointConfiguration): void {
+	if (configuration === undefined) return;
+	if (
+		configuration === null ||
+		(typeof configuration !== "object" && typeof configuration !== "function") ||
+		!endpointConfigurationValues.has(configuration)
+	) {
+		throw new TypeError("Invalid endpoint configuration handle");
+	}
+}
+
+/** A supplied capture never falls back to live state; omission retains live routing. */
+export function readEndpointConfiguration(
+	configuration: EndpointConfiguration | undefined,
+	name: string,
+): string | undefined {
+	const key = canonicalEnvKey(name);
+	if (!isEndpointRoutingEnvName(key)) throw new TypeError(`Not an endpoint-routing environment variable: ${name}`);
+	assertEndpointConfiguration(configuration);
+	if (configuration === undefined) return readLiveEndpointConfigurationValue(key);
+	return endpointConfigurationValues.get(configuration)?.get(key);
+}
+
+/** Only the canonical OpenAI authority/path is replaceable by trusted routing. */
+export function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
+	try {
+		const url = new URL(baseUrl.trim().replace(/\/+$/, ""));
+		return (
+			url.origin === "https://api.openai.com" &&
+			url.username === "" &&
+			url.password === "" &&
+			(url.pathname === "" || url.pathname === "/" || url.pathname === "/v1") &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+
 function parsePositiveInteger(raw: string | undefined): number | undefined {
 	const value = raw?.trim();
 	if (!value || !/^\d+$/.test(value)) return undefined;
