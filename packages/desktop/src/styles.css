@@ -181,7 +181,10 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .goal-action:hover:not(:disabled) { color: var(--accent); background: var(--surface-2); }
 
 .project-heading h2 { flex: 1; margin: 0; min-width: 0; font-size: 0.8125rem; }
-.project-heading .button { flex-shrink: 0; }
+/* The add control is sized in em, so it always matches the height of the name beside it instead
+   of towering over a 13px row. */
+.project-heading .button { flex-shrink: 0; min-height: 0; width: 1.7em; height: 1.7em; padding: 0; font-size: inherit; }
+.project-heading .button svg { width: 1em; height: 1em; }
 /* The chevron folds the workspace's conversation list away; it turns right when folded. */
 .project-toggle { color: var(--muted); padding: 2px 4px; }
 .project-toggle .disclosure-chevron[data-open] { transform: rotate(90deg); }
