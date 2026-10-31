@@ -93,7 +93,14 @@ describe("desktop Markdown clipboard", () => {
 			await page.evaluate(() => {
 				Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => { document.body.dataset.copied = text; } } });
 			});
-			await page.click("#markdown-clipboard-fixture .markdown-code-copy");
+			// The control is an icon: its accessible name carries the label the text used to show.
+		expect(
+			await page.$eval("#markdown-clipboard-fixture .markdown-code-copy", node => ({
+				text: (node.textContent ?? "").trim(),
+				label: node.getAttribute("aria-label"),
+			})),
+		).toEqual({ text: "", label: "Copy code" });
+		await page.click("#markdown-clipboard-fixture .markdown-code-copy");
 			await page.waitForFunction(() => document.querySelector('#markdown-clipboard-fixture [role="status"]')?.textContent === "Copied");
 			expect(await page.evaluate(() => document.body.dataset.copied)).toBe('  const x = "<tag>";\n');
 			expect(await page.evaluate(() => document.body.dataset.copied)).toBe(await page.$eval('#markdown-clipboard-fixture pre code', element => element.textContent));

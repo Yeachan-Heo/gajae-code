@@ -1,4 +1,5 @@
 import { decodeHTMLStrict } from "entities";
+import { Check, Copy } from "lucide-react";
 import { Marked, type MarkedToken, type Token, type Tokens } from "marked";
 import { Fragment, type ReactNode, useState } from "react";
 import { t } from "./i18n";
@@ -27,8 +28,9 @@ function CodeBlock({ token, code }: { token: Tokens.Code; code: string }) {
 		<div className="markdown-code-block">
 			<div className="markdown-code-header">
 				<span className="markdown-code-language">{language}</span>
-				<button type="button" className="markdown-code-copy" onClick={copy}>
-					{t("support.markdownCopyCode")}
+				<button type="button" className="markdown-code-copy" aria-label={t("support.markdownCopyCode")} title={t("support.markdownCopyCode")} onClick={copy}>
+					{/* An icon keeps the header the height of its own line instead of a word-wide button. */}
+					{status === "copied" ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
 				</button>
 				<span className="markdown-code-status" role="status">
 					{status === "copied"

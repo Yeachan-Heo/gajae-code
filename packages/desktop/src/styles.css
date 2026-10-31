@@ -235,8 +235,9 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .markdown-code-block { margin: 12px 0; min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-md); overflow: hidden; background: var(--surface); color: var(--text); }
 .markdown-code-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 0.75rem; }
 .markdown-code-language { margin-right: auto; color: var(--muted); }
-.markdown-code-copy { min-height: 28px; padding: 3px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); background: var(--card); }
-.markdown-code-copy:hover { background: var(--sidebar); }
+/* An icon-only control: weight comes from the hover surface, not from an outline. */
+.markdown-code-copy { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--muted); }
+.markdown-code-copy:hover { background: var(--surface-2); color: var(--text); }
 .markdown-code-status { color: var(--muted); }
 /* Code scrolls sideways for long lines but never vertically: the transcript owns the only
    vertical scroll. */
