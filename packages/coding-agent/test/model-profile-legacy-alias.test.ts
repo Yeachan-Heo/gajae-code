@@ -6,6 +6,7 @@ import { validateModelProfileName } from "../src/config/model-profile-contract";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
+import type { PreparedProfileModelSelection } from "../src/session/agent-session";
 
 const codexModel = {
 	id: "gpt-5.5",
@@ -48,10 +49,24 @@ interface TestSession {
 	model: Model | undefined;
 	thinkingLevel: ThinkingLevel | undefined;
 	readonly sessionId: string;
-	readonly setModelTemporaryCalls: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	disposed: boolean;
+	readonly sessionLifecycle: {
+		readonly generation: number;
+		readonly transitioning: boolean;
+		readonly disposed: boolean;
+	};
+	dispose(): Promise<void>;
+	readonly committedModelSelections: PreparedProfileModelSelection[];
+	prepareModelSelectionForProfileActivation(
+		next: Model,
+		thinkingLevel?: ThinkingLevel,
+		signal?: AbortSignal,
+	): Promise<PreparedProfileModelSelection>;
+	commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection): void;
 	setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel): Promise<void>;
-	setActiveModelProfile(name: string | undefined): void;
+	setActiveModelProfile(name: string | undefined, activatedByThisProcess?: boolean): void;
 	getActiveModelProfile(): string | undefined;
+	getActivatedModelProfile(): string | undefined;
 	getConfiguredModelChain(role: string): readonly string[] | undefined;
 	setConfiguredModelChain(role: string, entries: readonly string[]): void;
 }
@@ -75,15 +90,52 @@ function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
 
 function fakeSession() {
 	let activeModelProfile: string | undefined;
+	let activatedModelProfile: string | undefined;
 	const configuredModelChains = new Map<string, readonly string[]>();
 
 	const session: TestSession = {
 		model: codexModel,
 		thinkingLevel: ThinkingLevel.Low,
 		sessionId: "session-1",
-		setModelTemporaryCalls: [],
+		disposed: false,
+		get sessionLifecycle() {
+			return Object.freeze({ generation: 0, transitioning: false, disposed: session.disposed });
+		},
+		async dispose() {
+			session.disposed = true;
+		},
+		committedModelSelections: [],
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			signal?.throwIfAborted();
+			return {
+				sessionId: session.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: session.model,
+				previousThinkingLevel: session.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection): void {
+			selection.signal?.throwIfAborted();
+			if (
+				session.sessionId !== selection.sessionId ||
+				session.model !== selection.previousModel ||
+				session.thinkingLevel !== selection.previousThinkingLevel
+			)
+				throw new Error("Session changed while publishing profile");
+			session.model = selection.model;
+			session.thinkingLevel = selection.committedThinkingLevel;
+			session.committedModelSelections.push(selection);
+		},
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
-			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
 		},
@@ -93,11 +145,15 @@ function fakeSession() {
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			configuredModelChains.set(role, [...entries]);
 		},
-		setActiveModelProfile(name: string | undefined) {
+		setActiveModelProfile(name: string | undefined, activatedByThisProcess = false) {
 			activeModelProfile = name;
+			activatedModelProfile = activatedByThisProcess ? name : undefined;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getActivatedModelProfile() {
+			return activatedModelProfile === activeModelProfile ? activeModelProfile : undefined;
 		},
 	};
 	return session;
@@ -116,7 +172,11 @@ describe("legacy model profile aliases", () => {
 		});
 
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
-		expect(session.setModelTemporaryCalls).toEqual([{ model: codexSolModel, thinkingLevel: ThinkingLevel.Low }]);
+		expect(session.committedModelSelections).toHaveLength(1);
+		expect(session.model).toBe(codexSolModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:low"]);
+		expect(session.getActivatedModelProfile()).toBe("codex-medium");
 		expect(settings.get("modelProfile.default")).toBe("codex-standard");
 	});
 
@@ -130,6 +190,12 @@ describe("legacy model profile aliases", () => {
 		);
 
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(session.getActivatedModelProfile()).toBe("codex-medium");
+		expect(session.committedModelSelections).toHaveLength(1);
+		expect(session.model).toBe(codexSolModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:low"]);
+		expect(session.disposed).toBe(false);
 		expect(settings.get("modelProfile.default")).toBe("codex-medium");
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
 	});
@@ -178,7 +244,11 @@ describe("legacy model profile aliases", () => {
 		});
 
 		expect(session.getActiveModelProfile()).toBe("codex-pro");
-		expect(session.setModelTemporaryCalls).toEqual([{ model: codexSolModel, thinkingLevel: ThinkingLevel.Medium }]);
+		expect(session.committedModelSelections).toHaveLength(1);
+		expect(session.model).toBe(codexSolModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:medium"]);
+		expect(session.getActivatedModelProfile()).toBe("codex-pro");
 		expect(settings.get("modelProfile.default")).toBe("codex-sol61");
 	});
 
@@ -192,6 +262,12 @@ describe("legacy model profile aliases", () => {
 		);
 
 		expect(session.getActiveModelProfile()).toBe("codex-pro");
+		expect(session.getActivatedModelProfile()).toBe("codex-pro");
+		expect(session.committedModelSelections).toHaveLength(1);
+		expect(session.model).toBe(codexSolModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:medium"]);
+		expect(session.disposed).toBe(false);
 		expect(settings.get("modelProfile.default")).toBe("codex-pro");
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Medium);
 	});

@@ -1,4 +1,8 @@
 import type { ZodType, z } from "zod/v4";
+import type { ThinkingControlMode } from "./thinking-types";
+
+export * from "./thinking-types";
+
 import type { CustomApiRegistry } from "./api-registry";
 import type { ProviderDiagnostic } from "./provider-diagnostic";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
@@ -92,31 +96,6 @@ true satisfies _CheckExhaustive;
 export type OptionsForApi<TApi extends Api> =
 	| StreamOptions
 	| (TApi extends keyof ApiOptionsMap ? ApiOptionsMap[TApi] : never);
-
-/** Canonical thinking transport used by a model. */
-export type ThinkingControlMode =
-	| "effort"
-	| "budget"
-	| "google-level"
-	| "anthropic-adaptive"
-	| "anthropic-budget-effort";
-
-/** Canonical runtime vocabulary for provider thinking transports. */
-export const THINKING_CONTROL_MODES = [
-	"effort",
-	"budget",
-	"google-level",
-	"anthropic-adaptive",
-	"anthropic-budget-effort",
-] as const satisfies readonly ThinkingControlMode[];
-
-type _CheckThinkingControlModes = [
-	Exclude<ThinkingControlMode, (typeof THINKING_CONTROL_MODES)[number]>,
-	Exclude<(typeof THINKING_CONTROL_MODES)[number], ThinkingControlMode>,
-] extends [never, never]
-	? true
-	: false;
-true satisfies _CheckThinkingControlModes;
 
 /** Per-model thinking capabilities used to clamp and map user-facing effort levels. */
 export interface ThinkingConfig {

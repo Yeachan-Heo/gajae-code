@@ -49,6 +49,8 @@ export interface EagerTaskDelegationInput {
 	settings: Settings;
 	/** Active profile, when its bindings are not (yet) installed into settings. */
 	profile?: ModelProfileDefinition;
+	/** Authoritative merged task role selectors for a live session. */
+	agentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>;
 }
 
 /**
@@ -59,10 +61,11 @@ export function collectEffectiveRoleSelectors(input: EagerTaskDelegationInput): 
 	const mapping: RoleSelectorMap = { ...input.profile?.modelMapping };
 	const defaultRole = input.settings.getModelRole("default");
 	if (defaultRole !== undefined) mapping.default = defaultRole;
-	const agentModelOverrides = input.settings.get("task.agentModelOverrides");
+	const agentModelOverrides = input.agentModelOverrides ?? input.settings.get("task.agentModelOverrides");
 	for (const role of VENDOR_SEPARATION_WORKER_ROLES) {
 		const override = agentModelOverrides[role];
 		if (override !== undefined) mapping[role] = override;
+		else if (input.agentModelOverrides !== undefined) delete mapping[role];
 	}
 	return mapping;
 }

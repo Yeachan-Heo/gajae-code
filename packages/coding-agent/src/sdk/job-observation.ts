@@ -1,4 +1,14 @@
-import type { AsyncJob, AsyncJobManager, AsyncJobSnapshotEntry, SubagentLifecycle } from "../async/job-manager";
+import {
+	type AsyncJob,
+	type AsyncJobManager,
+	type AsyncJobSnapshotEntry,
+	type SubagentControlCapabilities,
+	SubagentControlError,
+	type SubagentControlErrorCode,
+	type SubagentControlSuccess,
+	type SubagentControlTarget,
+	type SubagentLifecycle,
+} from "../async/job-manager";
 import { JobsObserver, type JobsSnapshot } from "../modes/jobs-observer";
 import { deleteCronJobById, listCronSnapshots } from "../tools/cron";
 
@@ -12,8 +22,25 @@ export interface CronObservationTarget {
 	createdAt: number;
 }
 
+/** Opaque per-lifecycle CAS token, safe for a host's renderer-ref mapping. */
+export type TaskObservationTarget = SubagentControlTarget;
+
+export type TaskObservationCapabilities = SubagentControlCapabilities;
+
+export interface TaskPauseResult {
+	status: SubagentLifecycle;
+}
+
+export interface TaskResumeResult {
+	status: SubagentLifecycle;
+	jobId?: string;
+	queued: boolean;
+}
+
 /** Canonical detached-task lifecycle, not a live session/control handle. */
 export interface TaskObservation {
+	target: TaskObservationTarget;
+	capabilities: TaskObservationCapabilities;
 	id: string;
 	status: SubagentLifecycle;
 	currentJobId: string | null;
@@ -30,6 +57,7 @@ export interface JobObservationSnapshot extends JobsSnapshot {
 }
 
 export type JobObservationErrorCode =
+	| SubagentControlErrorCode
 	| "invalid_owner"
 	| "disposed"
 	| "not_found"
@@ -52,6 +80,7 @@ export class JobObservation {
 	readonly #manager: AsyncJobManager;
 	readonly #ownerId: string;
 	readonly #observer: JobsObserver;
+	readonly #taskControlScope: string;
 	#disposed = false;
 
 	constructor(manager: AsyncJobManager, ownerId: string) {
@@ -61,6 +90,7 @@ export class JobObservation {
 		}
 		this.#manager = manager;
 		this.#ownerId = ownerId;
+		this.#taskControlScope = manager.getSubagentControlScope();
 		this.#observer = new JobsObserver(manager, ownerId);
 	}
 
@@ -72,15 +102,13 @@ export class JobObservation {
 	getSnapshot(): JobObservationSnapshot {
 		this.#assertActive();
 		const jobs = this.#manager.getJobsSnapshot({ ownerId: this.#ownerId }).jobs;
-		const tasks = this.#manager.getSubagentRecords({ ownerId: this.#ownerId }).map<TaskObservation>(record => ({
-			id: record.subagentId,
-			status: record.status,
-			currentJobId: record.currentJobId,
-			currentJobGeneration: record.currentJobGeneration,
-			terminalGeneration: record.terminalGeneration,
-			requestedModel: record.requestedModel,
-			effectiveModel: record.effectiveModel,
-		}));
+		let tasks: TaskObservation[];
+		try {
+			tasks = this.#manager.getSubagentControlSnapshot(this.#ownerId, this.#taskControlScope);
+		} catch (error) {
+			if (error instanceof SubagentControlError) throw new JobObservationError(error.code);
+			throw error;
+		}
 		return structuredClone({ ...this.#observer.getSnapshot(), jobs, tasks });
 	}
 
@@ -128,6 +156,45 @@ export class JobObservation {
 		// cancel captures the live record synchronously, before invoking lifecycle callbacks.
 		if (!this.#manager.cancel(id, { ownerId: this.#ownerId })) throw new JobObservationError("not_found");
 		return true;
+	}
+
+	#controlTask(
+		target: TaskObservationTarget,
+		action: "cancel" | "pause" | "resume",
+		message?: string,
+	): SubagentControlSuccess {
+		this.#assertActive();
+		// Materialize untrusted accessors before the manager's final CAS, and
+		// recheck disposal because a target getter can dispose this facade.
+		const { id, generation } = target;
+		this.#assertActive();
+		const result = this.#manager.controlOwnedSubagent(
+			this.#ownerId,
+			this.#taskControlScope,
+			{ id, generation },
+			action,
+			message,
+		);
+		if (!result.ok) throw new JobObservationError(result.reason);
+		return result;
+	}
+
+	/** Stop exactly the observed owned task, including retained paused/queued work. */
+	cancelTask(target: TaskObservationTarget): true {
+		this.#controlTask(target, "cancel");
+		return true;
+	}
+
+	/** Requests a cooperative safe-boundary pause; does not claim the run has stopped. */
+	pauseTask(target: TaskObservationTarget): TaskPauseResult {
+		const result = this.#controlTask(target, "pause");
+		return { status: result.status };
+	}
+
+	/** Uses only the original owner-compatible captured runner; admission failures are not success. */
+	resumeTask(target: TaskObservationTarget, message?: string): TaskResumeResult {
+		const result = this.#controlTask(target, "resume", message);
+		return { status: result.status, jobId: result.jobId, queued: result.queued === true };
 	}
 
 	/** createdAt is the existing schedule identity token, not its changing nextFireAt. */
