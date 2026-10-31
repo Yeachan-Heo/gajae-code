@@ -378,6 +378,43 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("runcrate-ai")?.id).toBe("runcrate");
 	});
 
+	it("adds CloudGPU with automatic discovery, system-role instructions and its reasoning field", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "cloudgpu", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.cloudgpu;
+
+		expect(result.providerId).toBe("cloudgpu");
+		expect(result.presetName).toBe("CloudGPU");
+		expect(provider).toMatchObject({
+			baseUrl: "https://cloudgpu.app/v1",
+			api: "openai-completions",
+			apiKeyEnv: "CLOUDGPU_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(provider?.compat).toMatchObject({
+			supportsDeveloperRole: false,
+			reasoningContentField: "reasoning_content",
+		});
+		expect(findProviderPreset("cloudgpu")?.discovery).toEqual({ type: "openai-models-list" });
+		expect(findProviderPreset("cloudgpu-app")?.id).toBe("cloudgpu");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
