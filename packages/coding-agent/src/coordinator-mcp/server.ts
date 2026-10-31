@@ -1615,6 +1615,15 @@ function runtimeAcknowledgementIdentity(
 
 function normalizeRuntimePromptAcknowledgement(result: unknown): RuntimePromptAcknowledgement {
 	const acknowledgement = sdkResultPayload(result);
+	// A degraded steer that was dispatched but whose outcome was not durably
+	// recorded is uncertain, not refused: keep the reservation so the exact-key
+	// retry replays the runtime's recorded steer instead of delivering it again.
+	if (
+		acknowledgement?.accepted === false &&
+		acknowledgement.queuedAs === "steer" &&
+		acknowledgement.status === "uncertain"
+	)
+		throw new SdkClientError("ambiguous", "SDK steer delivery outcome is uncertain.");
 	if (acknowledgement?.accepted !== true)
 		throw new SdkClientError("unavailable", "SDK did not acknowledge prompt delivery.");
 	const queuedAs = Object.hasOwn(acknowledgement, "queuedAs") ? acknowledgement.queuedAs : undefined;
@@ -5503,7 +5512,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					latest.state !== "in_progress"
 				)
 					throw new Error("terminal_uncertain");
-				if (record.response?.ok === true && !pin) throw new Error("terminal_uncertain");
+				// A steer outcome created no workflow turn or prompt request, so it has
+				// no response pin to carry; every other success must be pinned.
+				if (record.response?.ok === true && record.response.delivery !== "steer" && !pin)
+					throw new Error("terminal_uncertain");
 				durableRecord = pin
 					? {
 							...record,
@@ -9631,6 +9643,42 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									throw error;
 								}
 								delegateEffectStarted = true;
+								if (acknowledgement.queued_as === "steer") {
+									// A force delegation onto a run another client owns was queued as a
+									// steer for that run: nothing was superseded and no workflow turn
+									// exists for it, so no turn, event, handoff, or pin is recorded. The
+									// prompt reservation is already discarded; clearing the claim marker
+									// lets a same-key retry re-send the same SDK request, which replays the
+									// runtime's recorded steer instead of queueing it again.
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: false,
+									});
+									const activeTurnId = previousActiveTurn?.turn_id ?? null;
+									const response = {
+										ok: true,
+										workflow: delegateWorkflow,
+										tool_name: name,
+										session_id: sessionId,
+										turn_id: activeTurnId,
+										active_turn_id: activeTurnId,
+										delivery: "steer",
+										queued: false,
+										aborted: false,
+										session: publicCoordinatorSession(session),
+										session_state: publicCoordinatorSessionState(
+											await readSessionState(namespaceDir, sessionId),
+										),
+										result: publicSdkAcknowledgement(acknowledgement),
+										...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
+									};
+									if (creationKey) {
+										await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+										await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+										await services.afterDelegateCreationCompleted?.();
+									}
+									return response;
+								}
 								const turn = await recordAcceptedPrompt(
 									sessionId,
 									taggedPrompt,
@@ -9736,8 +9784,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							: await delegate();
 						// Observation owns the same key flight, not SESSION: force/queue may
 						// now dispatch while the full response awaits its durable commit.
+						// A steer created no workflow turn of its own, so there is nothing to await.
 						const complete =
-							response.ok === true && args.await_completion === true
+							response.ok === true && args.await_completion === true && response.delivery !== "steer"
 								? {
 										...response,
 										completion: await awaitTurnPayload(
