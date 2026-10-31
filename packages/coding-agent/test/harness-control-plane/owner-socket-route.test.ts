@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { execFileSync } from "node:child_process";
 import * as fsSync from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -831,45 +831,52 @@ describe("harness owner socket routing", () => {
 	);
 
 	it.skipIf(process.platform === "win32" || !canSymlink)(
-		"does not follow a pre-planted socket record temp symlink",
+		"fails closed on collisions at the actual socket record temp path",
 		async () => {
 			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
 			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
 			extraDirs.push(socketDir, otherDir);
-			const savedSocket = process.env.GJC_HARNESS_SOCKET_DIR;
-			process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
 			const secret = path.join(root, "record-secret.txt");
 			fsSync.writeFileSync(secret, "secret-bytes", { mode: 0o600 });
-			const owner = new RuntimeOwner({
-				root,
-				sessionId: SID,
-				transport: new IdleTransport(),
-				heartbeatMs: 60_000,
-			});
+			const file = await recordPath();
+			if (!file) throw new Error("missing socket record path");
+			const realOpen = fsSync.openSync;
 			try {
-				const file = await recordPath();
-				expect(file).toBeTruthy();
-				fsSync.mkdirSync(path.dirname(file!), { recursive: true, mode: 0o700 });
-				fsSync.chmodSync(path.dirname(file!), 0o700);
-				fsSync.symlinkSync(secret, `${file}.tmp-${process.pid}`);
-				await owner.start();
-				expect(fsSync.readFileSync(secret, "utf8")).toBe("secret-bytes");
-				expect(fsSync.lstatSync(secret).isFile()).toBe(true);
-				process.env.GJC_HARNESS_SOCKET_DIR = otherDir;
-				const owner2 = new RuntimeOwner({
-					root,
-					sessionId: SID,
-					transport: new IdleTransport(),
-					heartbeatMs: 60_000,
-				});
-				await expect(owner2.start()).rejects.toThrow(/lease_held/);
-				expect((await readLease(root, SID))?.ownerId).toBe(owner.ownerId);
+				for (const kind of ["file", "symlink"]) {
+					let planted = "";
+					const open = spyOn(fsSync, "openSync").mockImplementation(
+						new Proxy(realOpen, {
+							apply(target, receiver, args: Parameters<typeof fsSync.openSync>) {
+								const name = String(args[0]);
+								if (!planted && name.startsWith(`${file}.tmp-`)) {
+									planted = name;
+									if (kind === "file") fsSync.writeFileSync(name, "planted", { mode: 0o600 });
+									else fsSync.symlinkSync(secret, name);
+								}
+								return Reflect.apply(target, receiver, args);
+							},
+						}),
+					);
+					try {
+						await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: socketDir }, async owner => {
+							open.mockRestore();
+							expect(planted).not.toBe("");
+							expect(fsSync.existsSync(file)).toBe(false);
+							expect(fsSync.lstatSync(planted).isSymbolicLink()).toBe(kind === "symlink");
+							if (kind === "file") expect(fsSync.readFileSync(planted, "utf8")).toBe("planted");
+							expect(fsSync.readFileSync(secret, "utf8")).toBe("secret-bytes");
+							const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: otherDir });
+							const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+							expect(body.evidence?.ownerRouted).not.toBe(true);
+							expect((await readLease(root, SID))?.ownerId).toBe(owner.ownerId);
+						});
+					} finally {
+						open.mockRestore();
+					}
+					fsSync.unlinkSync(planted);
+				}
 			} finally {
-				await owner.stop();
-				const file = await recordPath();
-				if (file) fsSync.rmSync(path.dirname(file), { recursive: true, force: true });
-				if (savedSocket === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
-				else process.env.GJC_HARNESS_SOCKET_DIR = savedSocket;
+				fsSync.rmSync(path.dirname(file), { recursive: true, force: true });
 			}
 		},
 		20_000,
