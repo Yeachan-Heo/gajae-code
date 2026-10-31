@@ -1698,7 +1698,7 @@ describe("mounted composer delivery recovery", () => {
 		}
 	}, 40000);
 
-	test("the workspace menu refuses to reorder while a search filter is active", async () => {
+	test("the workspace menu reorders the workspace list", async () => {
 		const { context, page } = await fixture();
 		try {
 			await page.evaluate(() => {
@@ -1729,9 +1729,7 @@ describe("mounted composer delivery recovery", () => {
 				});
 			});
 			await page.waitForFunction(() => document.querySelectorAll(".project-group").length === 2);
-			await page.type("#session-search", "Conversation");
-			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 2);
-			// The second workspace can move up, so only the search filter can disable it.
+			// Both workspaces can move, so the menu offers both directions.
 			await page.evaluate(() => {
 				const heading = document.querySelectorAll(".project-group .project-heading")[1];
 				heading?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
@@ -1748,8 +1746,8 @@ describe("mounted composer delivery recovery", () => {
 				"Move workspace down",
 				"Close workspace",
 			]);
-			// A filtered list cannot name the permutation the host stores, so both move paths stop.
-			expect(items.slice(0, 2).map(item => item.disabled)).toEqual([true, true]);
+			// The second and last workspace can move up but not down.
+			expect(items.slice(0, 2).map(item => item.disabled)).toEqual([false, true]);
 			expect(items[2]?.disabled).toBe(false);
 			await page.keyboard.press("Escape");
 			await page.waitForFunction(() => !document.querySelector(".context-menu"));
@@ -1758,7 +1756,7 @@ describe("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
-	test("keeps the selected conversation listed when it is outside the five-item page", async () => {
+	test("pages a long conversation list five at a time", async () => {
 		const { context, page } = await fixture();
 		try {
 			const seed = () => {
@@ -1787,10 +1785,12 @@ describe("mounted composer delivery recovery", () => {
 			};
 			await page.evaluate(seed);
 			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 5);
-			await page.type("#session-search", "Conversation 7");
-			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 1);
+			// The list pages five at a time and says how many more it holds.
+			expect(await page.$eval(".project-group .show-more", button => button.textContent)).toBe("Show 5 more");
+			await page.click(".project-group .show-more");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 10);
 			await page.evaluate(() => {
-				const seven = document.querySelector(".project-group .session-row .session-select");
+				const seven = document.querySelectorAll(".project-group .session-row .session-select")[6];
 				(seven as HTMLElement | null)?.click();
 			});
 			await page.waitForFunction(
@@ -1798,27 +1798,10 @@ describe("mounted composer delivery recovery", () => {
 					document.querySelector(".project-group .session-row.selected")?.textContent?.includes("Conversation 7") ===
 					true,
 			);
-			// Clearing the search must not hide the conversation the user is reading.
-			await page.evaluate(() => {
-				const field = document.querySelector("#session-search") as HTMLInputElement | null;
-				const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-				if (!field || !setter) return;
-				setter.call(field, "");
-				field.dispatchEvent(new Event("input", { bubbles: true }));
-			});
-			await page.waitForFunction(
-				() =>
-					document.querySelector(".project-group .session-row.selected")?.textContent?.includes("Conversation 7") ===
-						true && document.querySelectorAll(".project-group .session-row").length > 5,
-			);
-			const revealed = await page.evaluate(() => ({
-				rows: document.querySelectorAll(".project-group .session-row").length,
-				selected: document.querySelector(".project-group .session-row.selected")?.textContent,
-			}));
-			expect(revealed.selected).toContain("Conversation 7");
-			// The page grew just far enough to include the selection; the rest is still behind one click.
-			expect(revealed.rows).toBe(7);
-			expect(await page.$eval(".project-group .show-more", button => button.textContent)).toBe("Show 5 more");
+			await page.click(".project-group .show-more");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 12);
+			// Every conversation is reachable once the pages are spent, so the control disappears.
+			expect(await page.$(".project-group .show-more")).toBeNull();
 		} finally {
 			await closeFixture(context, page);
 		}

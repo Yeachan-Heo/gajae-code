@@ -538,8 +538,6 @@ export default function App() {
 	const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
 	const settingsPanelPrefix = useId();
 	const settingsPanelsRef = useRef<HTMLDivElement>(null);
-	const [sessionFilter, setSessionFilter] = useState("");
-	const searching = !!sessionFilter.trim();
 	// Each workspace shows a bounded list; "Show more" grows it by a page.
 	const [sessionLimits, setSessionLimits] = useState<Record<string, number>>({});
 	const [menu, setMenu] = useState<
@@ -1851,29 +1849,15 @@ export default function App() {
 			<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
 				<FolderOpen size={16} aria-hidden="true" /> {t("shell.openProject")}
 			</Button>
-			<label className="sr-only" htmlFor="session-search">
-				{t("shell.searchConversations")}
-			</label>
-			<input
-				id="session-search"
-				className="session-search"
-				value={sessionFilter}
-				placeholder={t("shell.searchConversations")}
-				onChange={event => setSessionFilter(event.target.value)}
-			/>
 			<nav aria-label={t("shell.projectsAndConversations")} onDragEnd={clearDrag}>
 				{(snapshot?.projects ?? []).map(item => {
 					const all = snapshot?.sessions.filter(chat => chat.projectId === item.id) ?? [];
-					const filtered = all.filter(chat =>
-						chat.title.toLowerCase().includes(sessionFilter.trim().toLowerCase()),
-					);
-					// Search shows every match; otherwise the list is paged five at a time.
 					const limit = sessionLimits[item.id] ?? SESSION_PAGE;
 					// Selecting or creating a conversation beyond the page must not hide its own row.
-					const selectedIndex = filtered.findIndex(chat => chat.id === selected);
+					const selectedIndex = all.findIndex(chat => chat.id === selected);
 					const pageSize = Math.max(limit, selectedIndex + 1);
-					const visible = searching ? filtered : filtered.slice(0, pageSize);
-					const remaining = searching ? 0 : filtered.length - visible.length;
+					const visible = all.slice(0, pageSize);
+					const remaining = all.length - visible.length;
 					return (
 						<section
 							className={`project-group ${dragProject === item.id ? "dragging" : ""} ${
@@ -1919,8 +1903,7 @@ export default function App() {
 						>
 							<div
 								className="project-heading"
-								draggable={!searching}
-								title={searching ? t("shell.reorderPausedWhileSearching") : undefined}
+								draggable
 								tabIndex={0}
 								aria-haspopup="menu"
 								onKeyDown={event => {
@@ -1994,9 +1977,6 @@ export default function App() {
 								>
 									{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
 								</Button>
-							)}
-							{all.length > 0 && filtered.length === 0 && (
-								<p className="muted">{t("shell.noMatchingConversations")}</p>
 							)}
 						</section>
 					);
@@ -2163,16 +2143,12 @@ export default function App() {
 			>
 				{menu.kind === "project" ? (
 					<>
-						<Button
-							role="menuitem"
-							disabled={searching || menuProjectIndex <= 0}
-							onClick={() => moveProject(menu.id, -1)}
-						>
+						<Button role="menuitem" disabled={menuProjectIndex <= 0} onClick={() => moveProject(menu.id, -1)}>
 							{t("shell.moveWorkspace")}
 						</Button>
 						<Button
 							role="menuitem"
-							disabled={searching || menuProjectIndex < 0 || menuProjectIndex >= menuProjectCount - 1}
+							disabled={menuProjectIndex < 0 || menuProjectIndex >= menuProjectCount - 1}
 							onClick={() => moveProject(menu.id, 1)}
 						>
 							{t("shell.moveWorkspaceBack")}
@@ -2189,14 +2165,14 @@ export default function App() {
 					<>
 						<Button
 							role="menuitem"
-							disabled={searching || menuSessionIndex <= 0}
+							disabled={menuSessionIndex <= 0}
 							onClick={() => moveSession(menu.projectId, menu.id, -1)}
 						>
 							{t("shell.moveConversationUp")}
 						</Button>
 						<Button
 							role="menuitem"
-							disabled={searching || menuSessionIndex < 0 || menuSessionIndex >= menuSessionCount - 1}
+							disabled={menuSessionIndex < 0 || menuSessionIndex >= menuSessionCount - 1}
 							onClick={() => moveSession(menu.projectId, menu.id, 1)}
 						>
 							{t("shell.moveConversationDown")}
