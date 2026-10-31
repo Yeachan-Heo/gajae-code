@@ -139,14 +139,15 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 /* Drag reorder: the dragged row dims, the whole workspace is a drop target. */
 .project-group.dragging, .session-drop.dragging { opacity: 0.45; }
 /* The insertion cue marks where the dragged item will land. */
-.project-group.drop-target { outline: 2px solid var(--ring); outline-offset: 2px; }
+/* `--ring` is a box-shadow value, so the highlight joins the cue in one declaration per class:
+   an outline could not paint it, and a border would reflow the list under the pointer. */
+.project-group.drop-target { box-shadow: var(--ring); }
 /* The insertion cue sits on the edge the item will actually land on: a downward drag inserts
    after its target, an upward one before it, so the line follows the real splice. */
 .session-drop.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
 .session-drop.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
-/* Inset like the conversation cue: a border would reflow the list under the pointer. */
-.project-group.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
-.project-group.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.project-group.drop-before { box-shadow: var(--ring), inset 0 2px 0 var(--accent); }
+.project-group.drop-after { box-shadow: var(--ring), inset 0 -2px 0 var(--accent); }
 .project-heading { cursor: grab; border-radius: var(--radius-xs); }
 .session-drop { border-radius: var(--radius-sm); }
 .session-drop.dragging { cursor: grabbing; }

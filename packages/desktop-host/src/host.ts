@@ -2438,6 +2438,11 @@ export class DesktopHost {
 		for (const [id, live] of [...this.#live]) {
 			if (live.metadata.projectId !== projectId) continue;
 			this.#cancelQuestions(id);
+			// Queued submissions are cancelled with a receipt, exactly as an abort does: leaving
+			// them "queued" would surface them again the moment the workspace is reopened.
+			for (const tracked of live.queued.values()) {
+				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
+			}
 			this.#live.delete(id);
 			this.#retiredLive.add(live);
 			try {

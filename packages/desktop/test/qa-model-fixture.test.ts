@@ -540,7 +540,9 @@ test("owned real MCP control lifecycle and LSP diagnostics cross the SDK", async
 test("a desktop turn executes a real builtin tool from the full registry", async () => {
 	const { layout, call, send, fixture, frames, session } = await sdkHost();
 	const available = await call<{ available: string[]; active: string[] }>("tools.list", { sessionId: session.id });
-	// The desktop session carries the whole builtin registry, not a reduced subset.
+	// The registry the SDK ships is larger than the list below, so the floor fails if a session
+	// is built from a reduced tool list that happens to contain exactly these names.
+	expect(available.available.length).toBeGreaterThan(11);
 	for (const name of ["read", "write", "edit", "bash", "search", "find", "task", "job", "todo_write", "goal", "ask"])
 		expect(available.available).toContain(name);
 	await call("tools.set", { sessionId: session.id, names: ["read", "bash"] });

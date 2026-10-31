@@ -1742,6 +1742,13 @@ describe("mounted composer delivery recovery", () => {
 				{ dragging: true, after: false, before: false },
 				{ dragging: false, after: true, before: false },
 			]);
+			// The cue has to paint: the ring token is a box-shadow value and cannot be an outline.
+			expect(
+				await page.evaluate(() => {
+					const group = document.querySelector(".project-group.drop-after");
+					return group ? getComputedStyle(group).boxShadow : "none";
+				}),
+			).not.toBe("none");
 			await page.evaluate(() => {
 				const groups = [...document.querySelectorAll(".project-group")] as HTMLElement[];
 				groups[1]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
