@@ -330,8 +330,8 @@ export class SessionSdkHost {
 	}
 
 	async #startHost(): Promise<"started"> {
-		// Allocated before any host state changes, so nothing is emitted under a
-		// generation the authority has not issued.
+		// Allocate before emitting; an unavailable authority leaves the local
+		// generation unreserved until registration can reserve it exactly.
 		const floor = await this.#allocateGeneration();
 		this.#reportedActivityState = undefined;
 		this.events.restart(floor);
@@ -373,15 +373,19 @@ export class SessionSdkHost {
 		const allocate = this.#options.allocateEventGeneration;
 		this.#generationReserved = allocate === undefined;
 		if (!allocate) return 0;
+		const floor = Math.max(Date.now(), this.events.generation + 1);
+		if (!Number.isSafeInteger(floor)) throw new Error("SDK event generation is exhausted.");
 		try {
-			const generation = await allocate(this.#options.sessionId, Date.now());
+			const generation = await allocate(this.#options.sessionId, floor);
+			if (!Number.isSafeInteger(generation) || generation < floor)
+				throw new Error("SDK event generation authority returned an invalid generation.");
 			this.#generationReserved = true;
 			return generation;
 		} catch (error) {
 			logger.warn("sdk: event generation authority unavailable; host stays unpublished until it is reserved", {
 				error: String(error),
 			});
-			return Date.now();
+			return floor;
 		}
 	}
 

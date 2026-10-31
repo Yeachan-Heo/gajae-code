@@ -759,7 +759,7 @@ jobs:
     name: Affected path validation / darwin-arm64 tab-worker smoke
     needs: [affected-plan]
     if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

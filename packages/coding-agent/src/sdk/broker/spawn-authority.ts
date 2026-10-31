@@ -607,6 +607,23 @@ export class SpawnAuthorityStore {
 		return cloneAuthority(this.#authorities.get(lifecycleIdentity));
 	}
 
+	/**
+	 * Spawning master per child session id. A child that more than one recorded
+	 * authority attributes to different owners is omitted: ownership is reported
+	 * only when the durable evidence names exactly one master.
+	 */
+	spawnOwnersByChild(): ReadonlyMap<string, string> {
+		const owners = new Map<string, string>();
+		const conflicted = new Set<string>();
+		for (const authority of this.#authorities.values()) {
+			const prior = owners.get(authority.childId);
+			if (prior !== undefined && prior !== authority.ownerSessionId) conflicted.add(authority.childId);
+			else owners.set(authority.childId, authority.ownerSessionId);
+		}
+		for (const childId of conflicted) owners.delete(childId);
+		return owners;
+	}
+
 	async open(): Promise<void> {
 		await this.#serial(async () => {
 			await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });

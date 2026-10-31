@@ -21,7 +21,45 @@ import {
 	exactReplaceRetained,
 	exactRestore,
 	type NativeExactFileIdentity,
+	type NativeExactUnlinkResult,
 } from "@gajae-code/natives";
+
+export class InstallationAclPresentError extends Error {
+	readonly code = "acl_present";
+
+	constructor(
+		readonly targetPath: string,
+		readonly sourcePath: string,
+		detail: Pick<NativeExactUnlinkResult, "aclFailurePrincipal" | "aclFailureInherited" | "aclFailureSide">,
+	) {
+		const principal = detail.aclFailurePrincipal;
+		const inherited = detail.aclFailureInherited;
+		const side = detail.aclFailureSide;
+		// The native check validates the source before the destination; remediate the object it rejected.
+		const rejectedPath = side === "source" ? sourcePath : targetPath;
+		const parent = path.win32.isAbsolute(rejectedPath)
+			? path.win32.dirname(rejectedPath)
+			: path.dirname(rejectedPath);
+
+		let message = "acl_present";
+		if (principal && typeof inherited === "boolean") {
+			// Format principal for icacls: numeric SIDs need '*' prefix
+			const icaclsPrincipal = principal.startsWith("S-1-") ? `*${principal}` : `"${principal}"`;
+			const sideLabel = side === "source" ? ` on the source file ${sourcePath}` : side ? ` on the ${side} file` : "";
+
+			if (inherited) {
+				// ACE inherited from parent: disable inheritance and remove from parent
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory${sideLabel}. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove ${icaclsPrincipal} && gjc update`;
+			} else {
+				// ACE explicitly set on file: remove from the file itself
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run: icacls "${rejectedPath}" /remove ${icaclsPrincipal} && gjc update`;
+			}
+		}
+
+		super(message);
+		this.name = "InstallationAclPresentError";
+	}
+}
 
 export type ActivationPhase = "staged" | "published" | "verified" | "pending_activation" | "rolled_back" | "uncertain";
 
@@ -484,7 +522,10 @@ export async function updateActivationRecordFile(
 		toNativeIdentity(source.identity),
 		toNativeIdentity(expectedIdentity),
 	);
-	if (!replaced.ok) throw new Error("activation_record_compare_and_swap_failed");
+	if (!replaced.ok) {
+		if (replaced.code === "acl_present") throw new InstallationAclPresentError(recordPath, tempPath, replaced);
+		throw new Error("activation_record_compare_and_swap_failed");
+	}
 	return source.identity;
 }
 
@@ -506,6 +547,8 @@ export interface ReconcileResult {
 	readonly reason?: string;
 	/** Present only for a pre-mutation Windows exact-replacement failure. */
 	readonly windowsErrorCode?: string;
+	readonly aclFailurePrincipal?: string;
+	readonly aclFailureInherited?: boolean;
 	readonly detachedPath?: string;
 	readonly retainedSuccessorPath?: string;
 	readonly retainedPlaceholderPath?: string;
@@ -676,6 +719,13 @@ export async function reconcileActivationRecord(
 				status: "conflict",
 				record,
 				reason: result.code ?? "activation_promotion_failed",
+				...(result.code === "acl_present"
+					? {
+							aclFailurePrincipal: result.aclFailurePrincipal,
+							aclFailureInherited: result.aclFailureInherited,
+							aclFailureSide: result.aclFailureSide,
+						}
+					: {}),
 				...(result.windowsErrorCode ? { windowsErrorCode: result.windowsErrorCode } : {}),
 				...(result.detachedPath !== undefined ? { detachedPath: result.detachedPath } : {}),
 				...(result.retainedSuccessorPath !== undefined

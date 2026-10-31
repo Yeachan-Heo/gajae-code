@@ -27,6 +27,7 @@ import {
 	MANAGED_OWNER_RUN_ID_ENV,
 	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
+import { ensureOwnerLifecycleDirectorySync } from "./owner-lifecycle-path";
 import { prepareOwnerLifecycleRootSync } from "./owner-lifecycle-root";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
@@ -840,9 +841,9 @@ export function createGjcTmuxSession(
 	);
 	const stateFile =
 		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
-		// A managed launch verifies its lifecycle root with no-follow walks, so a
-		// workspace reached through a symlink must be named by its canonical path.
-		(launch && platform !== "win32" ? canonicalManagedStateFile(cwd, derivedStateFile) : derivedStateFile);
+		// Lifecycle writers refuse a link in the state path, so a workspace reached
+		// through a symlink must be named by its canonical path.
+		(platform !== "win32" ? canonicalManagedStateFile(cwd, derivedStateFile) : derivedStateFile);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	if (launch) {
@@ -974,7 +975,7 @@ export function createGjcTmuxSession(
 			(({ attempt }) => {
 				const root = lifecyclePaths(stateDir, sessionId, generation).root;
 				const attemptFile = path.join(root, `attempt-${attempt.token}.json`);
-				fsSync.mkdirSync(root, { recursive: true, mode: 0o700 });
+				if (!ensureOwnerLifecycleDirectorySync(root)) throw new Error("owner_lifecycle_root_unsafe");
 				const descriptor = fsSync.openSync(attemptFile, "wx", 0o600);
 				try {
 					fsSync.writeFileSync(

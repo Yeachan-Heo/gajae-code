@@ -20,6 +20,7 @@ import {
 	activationRecordPath,
 	type DirectoryIdentity,
 	type FileIdentity,
+	InstallationAclPresentError,
 	readActivationRecord,
 	sameDirectoryIdentity,
 	sameFileIdentity,
@@ -322,6 +323,7 @@ export async function repairStandaloneBinary(
 	} catch (error) {
 		const pendingActivation = error instanceof Error && error.message === "installation_pending_activation";
 		const accessDeniedError = error instanceof InstallationAccessDeniedError ? error : undefined;
+		const aclError = error instanceof InstallationAclPresentError ? error : undefined;
 		const repointError = error instanceof ActivationRetryCandidateRepointError ? error : undefined;
 		const reason = pendingActivation
 			? "sharing_violation"
@@ -331,7 +333,8 @@ export async function repairStandaloneBinary(
 					? repointError.reasonCode
 					: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
 						? error.message
-						: "installation_execution_unverified";
+						: (aclError?.code ?? "installation_execution_unverified");
+		if (aclError) logger.warn(aclError.message, { targetPath, code: aclError.code });
 		if (accessDeniedError)
 			logger.warn("Doctor standalone binary restore failed with access denied", {
 				targetPath,

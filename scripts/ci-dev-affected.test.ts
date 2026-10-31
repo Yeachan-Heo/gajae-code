@@ -226,7 +226,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}");
 		expect(workflow).toContain("affected-darwin-arm64-tab-worker-smoke:");
-		expect(workflow).toContain("runs-on: macos-14");
+		expect(workflow).toContain("runs-on: macos-15");
 		expect(workflow).toContain("TARGET_PLATFORM: darwin");
 		expect(workflow).toContain("TARGET_ARCH: arm64");
 		expect(workflow).toContain("process.platform");

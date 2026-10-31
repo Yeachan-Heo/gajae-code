@@ -2806,7 +2806,8 @@ export interface SessionMcpControlPort {
 	getFailedServers(): ReadonlySet<string>;
 	markFailed(name: string): void;
 	clearFailed(name: string): void;
-	restoreAutoload(names: readonly string[]): void;
+	/** Reconnect autoload servers in the background; settles after their tools are published. */
+	restoreAutoload(names: readonly string[]): Promise<void>;
 }
 export interface SessionMcpStatusSnapshot {
 	readonly available: boolean;
@@ -4192,6 +4193,7 @@ export class AgentSession {
 	#exactMcpRetirementCompletion: Promise<void> | undefined;
 	readonly #sessionMcpControlPort: SessionMcpControlPort | undefined;
 	#sessionMcpOverrides = new Map<string, "connected" | "disconnected">();
+	/** MCP tool names skipped because a non-MCP tool already holds them. */
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
@@ -6366,7 +6368,7 @@ export class AgentSession {
 		this.#mandatoryMCPToolNames = new Set(
 			(config.mandatoryMCPToolNames ?? [])
 				.map(name => name.toLowerCase())
-				.filter(name => this.#toolRegistry.has(name)),
+				.filter(name => this.#isRegisteredMcpTool(name)),
 		);
 		this.#constructorMCPToolSelection =
 			config.initialMCPToolSelectionIsExplicit === true
@@ -6783,7 +6785,41 @@ export class AgentSession {
 		await replacement;
 	}
 
-	/** Swap named custom tools and restore authoritative MCP selections as late tools arrive. */
+	/** A mandatory MCP name counts only while an MCP tool is the registered object for it. */
+	#isRegisteredMcpTool(name: string): boolean {
+		const tool = this.#toolRegistry.get(name);
+		return tool !== undefined && isMCPBridgeTool(tool);
+	}
+
+	/** True when a non-MCP tool owns `name`; a mandatory MCP name must never activate it. */
+	#isNameHeldByNonMcpTool(name: string): boolean {
+		const tool = this.#toolRegistry.get(name);
+		return tool !== undefined && !isMCPBridgeTool(tool);
+	}
+
+	/**
+	 * True when `tool` is an MCP tool whose name is already registered by a non-MCP tool
+	 * (for example an extension tool named `mcp__foo_bar`). The existing tool is kept so
+	 * later calls are never redirected to an MCP endpoint; the conflict is logged.
+	 * A registry object in `retiring` is being removed by its owner, so the MCP tool replaces it.
+	 */
+	#isMcpToolNameHeldByOtherTool(tool: CustomTool, retiring?: ReadonlyMap<string, AgentTool>): boolean {
+		if (!isMCPBridgeTool(tool)) return false;
+		const existing = this.#toolRegistry.get(tool.name);
+		if (!existing || isMCPBridgeTool(existing)) return false;
+		if (retiring?.get(tool.name) === existing) return false;
+		logger.warn("Skipping MCP tool whose name is already registered by another tool", {
+			tool: tool.name,
+			serverName: tool.mcpServerName,
+		});
+		return true;
+	}
+
+	/**
+	 * Swap named custom tools and restore authoritative MCP selections as late tools arrive.
+	 * A previous name whose registry entry is a non-MCP tool keeps that tool unless it is the
+	 * object the caller lists in `retiringTools`; another owner of the name is never removed.
+	 */
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
 		nextTools: readonly CustomTool[],
@@ -6793,6 +6829,7 @@ export class AgentSession {
 			activateNewTools?: boolean;
 			inactiveNewToolNames?: readonly string[];
 			persistMCPSelection?: boolean;
+			retiringTools?: ReadonlyMap<string, AgentTool>;
 		},
 	): Promise<void> {
 		while (this.#sessionTransitionKind !== undefined) {
@@ -6805,10 +6842,20 @@ export class AgentSession {
 		const previous = new Set(previousNames);
 		const inactiveNewToolNames = new Set(options?.inactiveNewToolNames ?? []);
 		const previousActive = this.getActiveToolNames();
-		for (const name of previous) this.#toolRegistry.delete(name);
+		const retiring = options?.retiringTools;
+		for (const name of previous) {
+			const tool = this.#toolRegistry.get(name);
+			if (tool && !isMCPBridgeTool(tool) && retiring?.get(name) !== tool) {
+				// The kept tool is not replaced, so it also keeps its active state.
+				previous.delete(name);
+				continue;
+			}
+			this.#toolRegistry.delete(name);
+		}
 		const getCustomToolContext = () => this.#getCustomToolContext();
 		const added: string[] = [];
 		for (const customTool of omitPluginMcpNameShadows(nextTools)) {
+			if (this.#isMcpToolNameHeldByOtherTool(customTool, retiring)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
@@ -6822,8 +6869,8 @@ export class AgentSession {
 		);
 		this.#mandatoryMCPToolNames = new Set(
 			options?.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
-				: retainedMandatory,
+				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
+				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		if (options?.defaultSelectedConventionalMCPToolNames !== undefined) {
 			this.#defaultSelectedConventionalMCPToolNames = new Set(options.defaultSelectedConventionalMCPToolNames);
@@ -11824,6 +11871,22 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#livePromptsInFlight() > 0;
 	}
 
+	/**
+	 * Whether `waitForIdle()` would block right now: a streaming turn, a retry or
+	 * TTSR resume, post-prompt work (idle-flush deliveries, auto-continuations), or
+	 * pending session settlement. Unlike `isStreaming`, this stays true in the gap
+	 * after a turn ends while a scheduled background delivery is still pending.
+	 */
+	get isAwaitingIdle(): boolean {
+		return (
+			this.isStreaming ||
+			this.#retryPromise !== undefined ||
+			this.#ttsrResumePromise !== undefined ||
+			this.#postPromptTasks.size > 0 ||
+			this.#isSessionSettlementPending()
+		);
+	}
+
 	/** Wait until streaming and session settlement work are fully settled. */
 	/**
 	 * Wait until streaming and session settlement work are fully settled.
@@ -12553,6 +12616,10 @@ export class AgentSession {
 							.filter(tool => tool.mcpServerName === name)
 							.map(tool => tool.name),
 					);
+					const recordDisconnected = (): void => {
+						if (server?.autoload) this.#sessionMcpOverrides.set(name, "disconnected");
+						else this.#sessionMcpOverrides.delete(name);
+					};
 					try {
 						await manager.disconnectServer(name);
 						await this.refreshMCPTools(manager.getTools(), {
@@ -12562,11 +12629,13 @@ export class AgentSession {
 						});
 					} catch (error) {
 						await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
+						// The disconnect may have taken effect before the error; record it so a
+						// later /new or session switch still restores an autoload server.
+						if (manager.getConnectionStatus(name) === "disconnected") recordDisconnected();
 						throw error;
 					}
 					this.#commitSessionTransition();
-					if (server?.autoload) this.#sessionMcpOverrides.set(name, "disconnected");
-					else this.#sessionMcpOverrides.delete(name);
+					recordDisconnected();
 					port.clearFailed(name);
 					return { action, name, status: "disconnected", toolCount: 0 };
 				}
@@ -12622,7 +12691,8 @@ export class AgentSession {
 					port.clearFailed(name);
 				}
 				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
-				port.restoreAutoload(restore);
+				// The replacement session's first turn waits for the restored tools.
+				if (restore.length > 0) this.extendStartupTurnBarrier(port.restoreAutoload(restore));
 			},
 			abort: async () => {},
 		};
@@ -13836,9 +13906,15 @@ export class AgentSession {
 			activeMCPToolNames?: string[];
 			mandatoryMCPToolNames?: string[];
 			persistMCPSelection?: boolean;
+			/**
+			 * Registry objects, by name, that the caller installed and is retiring. An incoming MCP
+			 * tool replaces one only while it is still the registered object for that name.
+			 */
+			retiringTools?: ReadonlyMap<string, AgentTool>;
 		} = {},
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+		const retiring = options.retiringTools;
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		for (const name of existingNames) {
 			const tool = this.#toolRegistry.get(name);
@@ -13861,6 +13937,7 @@ export class AgentSession {
 		});
 
 		for (const customTool of omitPluginMcpNameShadows(mcpTools)) {
+			if (this.#isMcpToolNameHeldByOtherTool(customTool, retiring)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
@@ -13875,8 +13952,8 @@ export class AgentSession {
 		);
 		this.#mandatoryMCPToolNames = new Set(
 			options.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
-				: retainedMandatory,
+				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
+				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;

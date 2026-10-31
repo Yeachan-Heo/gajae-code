@@ -16,12 +16,18 @@ import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
+import { ensureOwnerLifecycleDirectorySync } from "../gjc-runtime/owner-lifecycle-path";
 import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "../gjc-runtime/session-state-sidecar";
-import { resolveGjcTmuxBinary, resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
+import {
+	canonicalManagedStateFile,
+	resolveGjcTmuxBinary,
+	resolveGjcTmuxCommand,
+	sanitizeTmuxToken,
+} from "../gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
 	classifyCgroup,
@@ -994,7 +1000,10 @@ export default class Harness extends Command {
 				reason: "tmux-owner-native_session_identity_unavailable",
 			};
 		const socketKey = `gjc-owner-${randomBytes(24).toString("hex")}`;
-		const ownerStateDir = root;
+		// The default root lives under this process's `.gjc`. Resolve a workspace or
+		// `.gjc` reached through a link once, as the launchers do; the private tail
+		// below it stays lexical and must not contain links.
+		const ownerStateDir = canonicalManagedStateFile(process.cwd(), root);
 		let baseline: OwnerGenerationBaseline;
 		try {
 			baseline = captureOwnerGenerationBaselineSync(ownerStateDir, sessionId);
@@ -1004,7 +1013,8 @@ export default class Harness extends Command {
 		const platform = ownerIsolationPlatform();
 		if (platform !== "linux" && !portableProcessStartTime(process.pid))
 			return { started: false, sessionName, socketKey, reason: "tmux-owner-generation_unverifiable" };
-		await fs.mkdir(path.join(ownerStateDir, sessionId, "owner-lifecycle"), { recursive: true, mode: 0o700 });
+		if (!ensureOwnerLifecycleDirectorySync(path.join(ownerStateDir, sessionId, "owner-lifecycle")))
+			return { started: false, sessionName, socketKey, reason: "tmux-owner-lifecycle_root_unsafe" };
 		const ownerGeneration = randomUUID();
 		const envAssignments = [
 			`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`,

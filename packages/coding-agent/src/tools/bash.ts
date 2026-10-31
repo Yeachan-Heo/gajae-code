@@ -35,6 +35,7 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import { MASTER_OWNER_SESSION_ENV } from "../sdk/broker/session-scope";
 import { renderSpawnTable, runSdkSpawn, type SdkSpawnArgs } from "../sdk/cli/master-cli";
 import type {
 	ClientBridgeTerminalExitStatus,
@@ -115,7 +116,6 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
-const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
 // Managed-owner env vars that must be scrubbed from child processes.
 // Exported for testing the env scrubbing behavior.
 export const MANAGED_OWNER_BASH_ENV = [
@@ -1538,7 +1538,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
-		const unsetEnv = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(expandedEnv ?? {}, name));
+		// A non-master session must not pass through an owner id inherited from a
+		// master that started it: `gjc sdk search` and `session list` would then
+		// mark that master's children as this caller's own (`spawnedBy.self`).
+		const unsetEnv = [
+			...COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(expandedEnv ?? {}, name)),
+			...(masterOwnerSessionId ? [] : [MASTER_OWNER_SESSION_ENV]),
+		];
 
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });

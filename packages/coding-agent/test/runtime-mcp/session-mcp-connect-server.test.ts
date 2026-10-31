@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { SourceMeta } from "../../src/capability/types";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { MCPManager } from "../../src/runtime-mcp/manager";
@@ -174,6 +175,71 @@ describe("MCPManager.connectSessionServer", () => {
 		expect(Date.now() - startedAt).toBeLessThan(8_000);
 		expect(manager.getConnectionStatus("slow")).toBe("disconnected");
 		expect(toolsOf(manager, "slow")).toEqual([]);
+	}, 20_000);
+
+	test("a server never replaces another server's tool under the same normalized name", async () => {
+		const { base, log, flag } = makeDir();
+		const warn = vi.spyOn(logger, "warn");
+		cleanups.push(() => warn.mockRestore());
+		const manager = newManager(base);
+		await manager.connectSessionServer("foo-bar", fakeConfig(log, "foo-bar", ["--tools", "grown"]), source);
+		const [owned] = toolsOf(manager, "foo-bar");
+		const ownerOf = (toolName: string | undefined) =>
+			manager
+				.getTools()
+				.filter(tool => tool.name === toolName)
+				.map(tool => tool.mcpServerName);
+
+		// Joining with a colliding tool: the new server's copy is skipped.
+		await manager.connectSessionServer("Foo-Bar", fakeConfig(log, "Foo-Bar", ["--tools", "grown"]), source);
+		expect(toolsOf(manager, "Foo-Bar")).toEqual([]);
+		expect(ownerOf(owned)).toEqual(["foo-bar"]);
+
+		// A later tools/list_changed refresh cannot take the name over either.
+		const growing = fakeConfig(log, "foo.bar", ["--tools", "other", "--grow-on", flag]);
+		await manager.connectSessionServer("foo.bar", growing, source);
+		const before = toolsOf(manager, "foo.bar");
+		expect(before).toHaveLength(1);
+		writeFileSync(flag, "");
+		const deadline = Date.now() + 5000;
+		const skipped = () =>
+			warn.mock.calls.some(
+				([message, context]) =>
+					String(message).includes("already published by another server") &&
+					(context as { path?: string } | undefined)?.path === "mcp:foo.bar",
+			);
+		while (Date.now() < deadline && !skipped()) await Bun.sleep(50);
+		expect(skipped()).toBe(true);
+		expect(toolsOf(manager, "foo.bar")).toEqual(before);
+		expect(ownerOf(owned)).toEqual(["foo-bar"]);
+
+		const tool = manager.getTools().find(item => item.name === owned);
+		const result = await tool?.execute("collision-call", {}, undefined, {} as never);
+		expect(JSON.stringify(result?.content)).toContain("foo-bar ok");
+	}, 20_000);
+
+	test("a held tool is published once the owning server disconnects", async () => {
+		const { base, log } = makeDir();
+		const manager = newManager(base);
+		await manager.connectSessionServer("foo-bar", fakeConfig(log, "foo-bar", ["--tools", "grown"]), source);
+		const [name] = toolsOf(manager, "foo-bar");
+		await manager.connectSessionServer("foo.bar", fakeConfig(log, "foo.bar", ["--tools", "grown"]), source);
+		expect(toolsOf(manager, "foo.bar")).toEqual([]);
+
+		await manager.disconnectServer("foo-bar");
+		expect(toolsOf(manager, "foo.bar")).toEqual([name]);
+		const result = await manager
+			.getTools()
+			.find(tool => tool.name === name)
+			?.execute("promoted-call", {}, undefined, {} as never);
+		expect(JSON.stringify(result?.content)).toContain("foo.bar ok");
+
+		// A disconnected server's held tools are dropped and never promoted later.
+		await manager.connectSessionServer("foo-bar", fakeConfig(log, "foo-bar", ["--tools", "grown"]), source);
+		expect(toolsOf(manager, "foo-bar")).toEqual([]);
+		await manager.disconnectServer("foo-bar");
+		await manager.disconnectServer("foo.bar");
+		expect(manager.getTools()).toEqual([]);
 	}, 20_000);
 
 	test("rejects invalid configs and frozen connection sets without spawning", async () => {

@@ -686,7 +686,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_19_1(): void
+export declare function __piNativesV0_19_2(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -2302,6 +2302,23 @@ export interface NativeExactUnlinkResult {
    * namespace mutation.
    */
   windowsErrorCode?: string
+  /**
+   * ACL failure details: offending principal (account name or SID string).
+   * Present only when code is "acl_present" on Windows exact-replace
+   * pre-mutation failures.
+   */
+  aclFailurePrincipal?: string
+  /**
+   * ACL failure detail: whether the offending ACE is inherited from a parent
+   * directory. Present only when code is "acl_present" on Windows
+   * exact-replace pre-mutation failures.
+   */
+  aclFailureInherited?: boolean
+  /**
+   * ACL failure detail: identifies which path failed ACL validation ("source" or "destination").
+   * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+   */
+  aclFailureSide?: string
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */

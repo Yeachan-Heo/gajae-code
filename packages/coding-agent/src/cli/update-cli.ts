@@ -38,6 +38,7 @@ import {
 	createActivationRecordFile,
 	type DirectoryIdentity,
 	type FileIdentity,
+	InstallationAclPresentError,
 	type ReconcileResult,
 	readActivationRecord,
 	reconcileActivationRecord,
@@ -1166,6 +1167,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 				reason: promoted.reason ?? promoted.status,
 				warning: stagingCleanupWarning,
 			});
+		if (promoted.reason === "acl_present")
+			throw new InstallationAclPresentError(targetPath, record.stagingPath, promoted);
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
 	}
 	record = promoted.record;
@@ -1214,6 +1217,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					toNativeIdentity(record.targetIdentity),
 				);
 				const observed = await snapshotRegularFile(targetPath);
+				if (!restored.ok && restored.code === "acl_present")
+					throw new InstallationAclPresentError(targetPath, backupPath, restored);
 				if (!restored.ok || !observed || !sameFileIdentity(record.backupIdentity, observed.identity))
 					throw new Error("rollback_unverified");
 				await updateActivationRecordFile(

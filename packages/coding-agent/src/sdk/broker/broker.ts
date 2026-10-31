@@ -5361,6 +5361,7 @@ export class Broker {
 			...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
+		const spawnOwners = this.#spawnAuthority?.spawnOwnersByChild();
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const {
 				lifecycleRequestId: _lifecycleRequestId,
@@ -5368,7 +5369,12 @@ export class Broker {
 				...publicSession
 			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
+			const spawnOwner = spawnOwners?.get(session.sessionId);
+			return {
+				...publicSession,
+				...(incarnation === undefined ? {} : { endpointIncarnation: incarnation }),
+				...(spawnOwner === undefined ? {} : { spawnedBy: { masterSessionId: spawnOwner } }),
+			};
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);

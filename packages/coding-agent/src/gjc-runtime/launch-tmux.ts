@@ -26,6 +26,7 @@ import {
 	managedOwnerStateDirAccepted,
 	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
+import { ensureOwnerLifecycleDirectorySync } from "./owner-lifecycle-path";
 import { prepareOwnerLifecycleRootSync } from "./owner-lifecycle-root";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -1423,7 +1424,7 @@ function defaultOwnerIsolationProbe(
 		recordAttempt: ({ attempt }) => {
 			const generation = plan.ownerGeneration ?? plan.sessionName;
 			const root = lifecyclePaths(stateDir, plan.sessionId ?? plan.sessionName, generation).root;
-			fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+			if (!ensureOwnerLifecycleDirectorySync(root)) throw new Error("owner_lifecycle_root_unsafe");
 			const file = path.join(root, `attempt-${attempt.token}.json`);
 			let descriptor: number | undefined;
 			try {

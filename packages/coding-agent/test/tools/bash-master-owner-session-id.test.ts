@@ -140,6 +140,25 @@ describe("issue #5374: session identity on the bash tool-env path", () => {
 		});
 		expect(textOf(result)).toContain("own=master-owner");
 	});
+
+	it("a non-master session does not pass through an inherited master owner id", async () => {
+		const previous = process.env.GJC_MASTER_OWNER_SESSION_ID;
+		process.env.GJC_MASTER_OWNER_SESSION_ID = "outer-master";
+		try {
+			const result = await new BashTool(createSession("nested-session")).execute("call", {
+				command:
+					'[ -n "$GJC_MASTER_OWNER_SESSION_ID" ] && printf "owner=%s" "$GJC_MASTER_OWNER_SESSION_ID" || printf "owner=<unset>"',
+			});
+			expect(textOf(result)).toContain("owner=<unset>");
+			const master = await new BashTool(createSession("master-owner", "master-owner")).execute("call", {
+				command: echoSessionEnv(),
+			});
+			expect(textOf(master)).toContain("owner=master-owner");
+		} finally {
+			if (previous === undefined) delete process.env.GJC_MASTER_OWNER_SESSION_ID;
+			else process.env.GJC_MASTER_OWNER_SESSION_ID = previous;
+		}
+	});
 });
 
 describe("issue #5802: coordinator env isolation at the bash boundary", () => {
@@ -298,7 +317,7 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 			// nightly-2026-08-12 no longer creates for a leaf library crate.
 			await fs.access(path.join(fixtureDir, "target", "debug", "libbash_minimizer_fixture.rlib"));
 			expect(nativeCommand).toBe(command);
-			expect(nativeUnsetEnv).toEqual(coordinatorOnlyEnvNames);
+			expect(nativeUnsetEnv).toEqual([...coordinatorOnlyEnvNames, "GJC_MASTER_OWNER_SESSION_ID"]);
 			expect(nativeMinimizer).toEqual({
 				enabled: true,
 				settingsPath: undefined,

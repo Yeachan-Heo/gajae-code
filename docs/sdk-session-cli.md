@@ -100,9 +100,8 @@ discovery pid is the supervised process itself.
   publication write blocks the process so the event loop cannot reach that
   same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
   TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
-  `SuccessExitStatus`. stderr includes `sdk broker: publication-liveness-timeout`
-  only when that write can finish without waiting. A full stderr pipe does
-  not postpone the SIGKILL. While the event loop is still running, the
+  `SuccessExitStatus`. The watchdog does not write a diagnostic before SIGKILL,
+  so a blocked stderr cannot postpone termination. While the event loop is still running, the
   exit-1 path above is the one that runs.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
@@ -603,6 +602,25 @@ continuation that supplies a different scope or anchor fails with
 
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+Rows also carry Broker-recorded ownership. `role: "master"` marks a session
+whose index row records a master role, including the caller's own row.
+`spawnedBy: { masterSessionId }` names the master whose `gjc sdk spawn` created
+the session, from Broker spawn authority, which keeps the owner after the child
+closes. `masterSessionId` is the master's lineage owner id, which can differ
+from its current row id after a session switch. `spawnedBy` is omitted when
+the Broker has no spawn authority for the session (for example a spawn that
+never reached host registration), or when recorded authorities disagree. When
+the command runs inside a master session's Bash tool, `spawnedBy.self` is
+`true` for that master's own children and `false` for another master's; the Bash
+tool in a non-master session never passes an inherited owner id through, so
+`self` is absent there. The same fields appear on `gjc sdk session list` and
+`gjc sdk session inspect` rows. The `gjc sdk search` table shows them in the
+`OWNER` column: `self`, `other`, or `spawned` (no viewer) for spawned children,
+`master` for master sessions (`master/self`, `master/other`, or
+`master/spawned` when a master was itself spawned), and `-` otherwise. `role`
+has no self flag, so the caller's own master row also renders as `master`;
+match it against `GJC_SESSION_ID`.
 
 ## Read-only broker observation (`gjc sdk diagnostics broker`)
 

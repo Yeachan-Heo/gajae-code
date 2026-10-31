@@ -1113,6 +1113,107 @@ describe("GJC tmux session management", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"names an unmanaged Broker session's state through a linked .gjc directory canonically",
+		async () => {
+			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-unmanaged-symlinked-")));
+			fixtureDirectories.push(root);
+			// The working directory is always physical; a linked `.gjc` is the trusted anchor alias.
+			const workspace = path.join(root, "workspace");
+			const real = path.join(root, "gjc-storage");
+			await fs.mkdir(workspace);
+			await fs.mkdir(real);
+			await fs.symlink(real, path.join(workspace, ".gjc"));
+			let innerCommand = "";
+			__setCreateOwnerIsolationForTests({
+				probe: { readCallerCgroup: () => null, probeServer: () => ({ state: "absent" }) },
+				execute: plan => {
+					if (!plan.ok) throw new Error("expected owner-isolation plan");
+					innerCommand = plan.execution.mode === "direct" ? (plan.execution.argv.at(-1) ?? "") : "";
+					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+				},
+			});
+			const previous = process.cwd();
+			process.chdir(workspace);
+			try {
+				expect(() =>
+					createGjcTmuxSession(
+						{ GJC_TMUX_COMMAND: "tmux", GJC_TMUX_SESSION: "unmanaged" },
+						{ platform: "darwin" },
+					),
+				).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+			} finally {
+				process.chdir(previous);
+			}
+			// Lifecycle writers refuse a link in the state path, so the `.gjc` link is resolved once.
+			expect(/GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(innerCommand)?.[1], innerCommand).toStartWith(
+				`${real}${path.sep}`,
+			);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a scoped unmanaged Broker attempt through a linked state tail without writing through it",
+		async () => {
+			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-unmanaged-tail-link-")));
+			fixtureDirectories.push(root);
+			const workspace = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(workspace);
+			await fs.mkdir(outside, { mode: 0o700 });
+			const run = (cgroup: string | null) => {
+				let planned: { ok: boolean; mode?: string; stateDir?: string } | undefined;
+				__setCreateOwnerIsolationForTests({
+					probe: { readCallerCgroup: () => cgroup, probeServer: () => ({ state: "absent" }) },
+					execute: plan => {
+						const command = plan.ok
+							? plan.execution.mode === "direct"
+								? (plan.execution.argv.at(-1) ?? "")
+								: (JSON.parse(plan.execution.stdin_line) as { tmux_argv: string[] }).tmux_argv.at(-1)
+							: "";
+						planned = {
+							ok: plan.ok,
+							mode: plan.ok ? plan.execution.mode : undefined,
+							stateDir: /GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(command ?? "")?.[1],
+						};
+						return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+					},
+				});
+				const previous = process.cwd();
+				process.chdir(workspace);
+				let error: unknown;
+				try {
+					createGjcTmuxSession(
+						{ GJC_TMUX_COMMAND: "tmux", GJC_TMUX_SESSION: "unmanaged" },
+						{ platform: cgroup ? "linux" : "darwin" },
+					);
+				} catch (caught) {
+					error = caught;
+				} finally {
+					process.chdir(previous);
+				}
+				return { planned, error: String(error) };
+			};
+			// A direct launch names the state dir without recording an attempt.
+			const stateDir = run(null).planned?.stateDir;
+			expect(stateDir).toStartWith(`${workspace}${path.sep}.gjc${path.sep}`);
+			fsSync.rmSync(path.join(workspace, ".gjc"), { recursive: true, force: true });
+			await fs.mkdir(path.dirname(stateDir!), { recursive: true, mode: 0o700 });
+			await fs.symlink(outside, stateDir!);
+			// A Linux service cgroup with no server plans a scoped bootstrap, which records its
+			// attempt before anything executes; the record must not land through the link.
+			const scoped = run("0::/system.slice/gjc-ci.service\n");
+			expect(scoped.error).toBe("Error: gjc_tmux_owner_isolation_scope_unavailable:synchronous_probe_failed");
+			expect(scoped.planned).toBeUndefined();
+			expect(fsSync.readdirSync(outside)).toEqual([]);
+			// Positive control: without the link the same call plans and reaches the scoped bootstrap.
+			fsSync.unlinkSync(stateDir!);
+			const control = run("0::/system.slice/gjc-ci.service\n");
+			expect(control.error).toBe("Error: gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+			expect(control.planned?.mode).toBe("scoped");
+		},
+	);
+
 	it.skipIf(process.platform === "win32").each([
 		["the private state tail links to an empty directory", "tail", false],
 		["the private state tail links to a directory that holds the session", "tail", true],

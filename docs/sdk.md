@@ -1268,6 +1268,10 @@ master session (default scope `repo`). The master receives one bundled
 operating-guidance block appended after custom system-prompt transformation and
 exactly one scoped, no-probe broker peer snapshot immediately before its first
 accepted provider request; idle masters collect nothing.
+Snapshot rows mark other master sessions with `role: "master"` and name each
+child's spawning master with `spawnedBy: { masterSessionId, self }`, so two
+masters in one scope can tell their own children (`self: true`) from each
+other's.
 
 Master orchestration is broker-routed and best effort: scoped discovery via
 `gjc sdk search` (result-level scope envelopes, exact worktree/cwd identity,

@@ -4,7 +4,7 @@ import * as https from "node:https";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getEnvApiKey, type Model } from "@gajae-code/ai/core";
+import { getBundledModel, getEnvApiKey, type Model } from "@gajae-code/ai/core";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -396,6 +396,14 @@ interface OpenAIHostedImageRequest {
 	store: false;
 	stream?: boolean;
 }
+interface CodexImagesRequest {
+	model: string;
+	prompt: string;
+	n: 1;
+	quality: "auto";
+	size?: string;
+	output_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;
+}
 
 interface OpenAIImageGenerationCall {
 	id?: string;
@@ -403,6 +411,9 @@ interface OpenAIImageGenerationCall {
 	result?: string;
 	revised_prompt?: string;
 	status?: string;
+}
+interface CodexImagesResponse {
+	data?: Array<{ b64_json?: string; revised_prompt?: string }>;
 }
 
 interface OpenAIOutputText {
@@ -1237,6 +1248,38 @@ function createOpenAIInlineImage(data: string): InlineImageData {
 	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
 	return { data, mimeType };
 }
+/** Bundled openai-codex gpt-image-* models on the bundled Codex endpoint. A custom model keeps /codex/responses. */
+function getCodexImagesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string | undefined {
+	const bundled = getBundledModel("openai-codex", model.id);
+	if (!bundled?.id.startsWith("gpt-image-")) return undefined;
+	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
+	const url = getCodexRouteUrl(getOpenAIBaseUrl(model, authCredentialType), URL_PATHS.CODEX_IMAGES_GENERATIONS);
+	const bundledUrl = getCodexRouteUrl(
+		getOpenAIBaseUrl(bundled, authCredentialType),
+		URL_PATHS.CODEX_IMAGES_GENERATIONS,
+	);
+	return url === bundledUrl ? url : undefined;
+}
+function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	return {
+		model: model.id,
+		prompt: promptText,
+		n: 1,
+		quality: "auto",
+		output_format: OPENAI_IMAGE_OUTPUT_FORMAT,
+		...(size ? { size } : {}),
+	};
+}
+function collectCodexImagesResult(response: CodexImagesResponse): OpenAIHostedImageResult {
+	const images: InlineImageData[] = [];
+	let revisedPrompt: string | undefined;
+	for (const item of response.data ?? []) {
+		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json));
+		if (item.revised_prompt) revisedPrompt = item.revised_prompt;
+	}
+	return { images, revisedPrompt };
+}
 
 function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): OpenAIHostedImageResult {
 	const images: InlineImageData[] = [];
@@ -1297,15 +1340,31 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 	return getOpenAIBaseUrl(model, authCredentialType);
 }
 
+/** Normalizes on the parsed pathname so the route appears once; the fragment is never sent, so it is dropped. */
+function getCodexRouteUrl(baseUrl: string, route: string): string {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		throw new Error(`Invalid OpenAI Codex base URL: ${baseUrl}`);
+	}
+	let pathname = url.pathname.replace(/\/+$/, "");
+	if (pathname.endsWith(URL_PATHS.CODEX_RESPONSES)) {
+		pathname = pathname.slice(0, -URL_PATHS.CODEX_RESPONSES.length);
+	} else if (pathname.endsWith("/codex")) {
+		pathname = pathname.slice(0, -"/codex".length);
+	}
+	url.pathname = `${pathname}${route}`;
+	url.hash = "";
+	return url.toString();
+}
+
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
 	const baseUrl = getOpenAIBaseUrl(model, authCredentialType);
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
 		return `${baseUrl}/responses`;
 	}
-	const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-	return new URL(URL_PATHS.RESPONSES.slice(1), baseWithSlash)
-		.toString()
-		.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
+	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_RESPONSES);
 }
 
 function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
@@ -1393,10 +1452,17 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const stream = model.api === "openai-codex-responses" || model.provider === "openai-codex";
-	const requestBody = buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
+	const imagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
+	const useImagesApi = imagesUrl !== undefined;
+	if (useImagesApi && inputImages.length > 0) {
+		throw new Error("Codex image edits are not supported on this route.");
+	}
+	const stream = !useImagesApi && (model.api === "openai-codex-responses" || model.provider === "openai-codex");
+	const requestBody = useImagesApi
+		? buildCodexImagesRequest(model, promptText, params)
+		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
 	const response = await fetchImageProvider(
-		getOpenAIResponsesUrl(model, options?.authCredentialType),
+		imagesUrl ?? getOpenAIResponsesUrl(model, options?.authCredentialType),
 		{
 			method: "POST",
 			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
@@ -1413,6 +1479,11 @@ async function generateOpenAIHostedImage(
 		);
 	}
 
+	if (useImagesApi) {
+		const rawText = await readProviderResponseText(response, apiKey, signal);
+		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
+		return redactOpenAIHostedImageResult(collectCodexImagesResult(data), apiKey);
+	}
 	const contentType = response.headers.get("content-type") ?? "";
 	if (stream || contentType.includes("text/event-stream")) {
 		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);

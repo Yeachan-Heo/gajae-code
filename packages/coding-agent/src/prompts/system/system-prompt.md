@@ -230,6 +230,9 @@ For image understanding, call `{{toolRefs.read}}` on the image path; the image i
 - Do not yield non-trivial work without proof: focused tests, e2e, browsing, QA, or an explicit reason verification cannot be run.
 - Test observable behavior, edge values, branch conditions, invariants, and error handling.
 - Do not test defaults or tautologies.
+- When a second fix built on the same assumption fails the same check, test the assumption directly before writing a third fix.
+- Before attributing a measured result (speedup, regression, latency, eval score) to a change, identify the bottleneck or confounder that bounds it and rule out that it measured something else; label attribution you could not verify.
+- When a change alters a shared data contract (key, identifier, serialized format, schema, default), also check the consumers symbol search misses: persisted data, other languages, config and flags, and pinned dependency source.
 </verification>
 </workflow>
 

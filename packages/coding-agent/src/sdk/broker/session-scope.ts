@@ -25,7 +25,57 @@ export type SdkSearchRowV1 = {
 	locator: { cwd: string; worktreeRoot: string | null; stateRoot: string };
 	live: boolean;
 	probe?: "reachable" | "unreachable" | "stale";
+	/** Present when the session's index row records a master role. */
+	role?: "master";
+	/** Present when the Broker recorded exactly one spawning master for this session. */
+	spawnedBy?: SessionSpawnOwnerV1;
 };
+
+/**
+ * The master that spawned a session, from Broker spawn authority. `self` is
+ * viewer-relative and present only when the viewing master identity is known.
+ */
+export type SessionSpawnOwnerV1 = { masterSessionId: string; self?: boolean };
+
+/** Lineage env carrying the master owner identity into a master session's Bash tool. */
+export const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
+
+/** Viewer-free ownership facts projected from one Broker `session.list` entry. */
+export type SessionOwnershipV1 = { role?: "master"; spawnedBy?: { masterSessionId: string } };
+
+/**
+ * Projects the recorded master role and the Broker-recorded spawn owner from a
+ * raw `session.list` entry. Malformed values are omitted, never guessed.
+ */
+export function sessionOwnershipV1(entry: Record<string, unknown>): SessionOwnershipV1 {
+	const masterRole = record(entry.masterRole);
+	const spawnedBy = record(entry.spawnedBy);
+	const masterSessionId = spawnedBy?.masterSessionId;
+	return {
+		...(masterRole?.role === "master" ? { role: "master" as const } : {}),
+		...(typeof masterSessionId === "string" &&
+		masterSessionId.length > 0 &&
+		Object.keys(spawnedBy!).every(key => key === "masterSessionId")
+			? { spawnedBy: { masterSessionId } }
+			: {}),
+	};
+}
+
+/** Marks whether a row's spawning master is the viewing master; unchanged when no viewer is known. */
+export function withSpawnOwnerSelf<T extends { spawnedBy?: SessionSpawnOwnerV1 }>(
+	row: T,
+	viewerMasterSessionId: string | undefined,
+): T {
+	if (row.spawnedBy === undefined || viewerMasterSessionId === undefined || viewerMasterSessionId.length === 0)
+		return row;
+	return {
+		...row,
+		spawnedBy: {
+			masterSessionId: row.spawnedBy.masterSessionId,
+			self: row.spawnedBy.masterSessionId === viewerMasterSessionId,
+		},
+	};
+}
 
 export type SdkSearchResultV1 = {
 	version: 1;
@@ -131,17 +181,33 @@ export function resolvedScopeV1(value: unknown): ResolvedScopeV1 | undefined {
 export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 	const row = record(value);
 	const locator = row === undefined ? undefined : record(row.locator);
+	const spawnedBy = row === undefined || row.spawnedBy === undefined ? undefined : record(row.spawnedBy);
 	if (
 		typeof row?.id !== "string" ||
 		row.id.length === 0 ||
 		(row.live !== true && row.live !== false) ||
 		(row.probe !== undefined && row.probe !== "reachable" && row.probe !== "unreachable" && row.probe !== "stale") ||
+		(row.role !== undefined && row.role !== "master") ||
+		(row.spawnedBy !== undefined &&
+			(!spawnedBy ||
+				typeof spawnedBy.masterSessionId !== "string" ||
+				spawnedBy.masterSessionId.length === 0 ||
+				(spawnedBy.self !== undefined && spawnedBy.self !== true && spawnedBy.self !== false) ||
+				Object.keys(spawnedBy).some(key => key !== "masterSessionId" && key !== "self"))) ||
 		!locator ||
 		typeof locator.cwd !== "string" ||
 		(locator.worktreeRoot !== null && typeof locator.worktreeRoot !== "string") ||
 		typeof locator.stateRoot !== "string" ||
 		Object.keys(locator).some(key => key !== "cwd" && key !== "worktreeRoot" && key !== "stateRoot") ||
-		Object.keys(row).some(key => key !== "id" && key !== "locator" && key !== "live" && key !== "probe")
+		Object.keys(row).some(
+			key =>
+				key !== "id" &&
+				key !== "locator" &&
+				key !== "live" &&
+				key !== "probe" &&
+				key !== "role" &&
+				key !== "spawnedBy",
+		)
 	)
 		return undefined;
 	return {
@@ -149,6 +215,15 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 		locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
 		live: row.live,
 		...(row.probe === undefined ? {} : { probe: row.probe }),
+		...(row.role === undefined ? {} : { role: row.role }),
+		...(spawnedBy === undefined
+			? {}
+			: {
+					spawnedBy: {
+						masterSessionId: spawnedBy.masterSessionId as string,
+						...(spawnedBy.self === undefined ? {} : { self: spawnedBy.self as boolean }),
+					},
+				}),
 	};
 }
 
@@ -259,7 +334,9 @@ export function scopeMatchesLocator(
 	return locator.worktreeRoot === scope.resolved.worktreeRoot;
 }
 
-export function searchRowV1(session: { sessionId: string; locator: SessionLocatorV2; live: boolean }): SdkSearchRowV1 {
+export function searchRowV1(
+	session: { sessionId: string; locator: SessionLocatorV2; live: boolean } & SessionOwnershipV1,
+): SdkSearchRowV1 {
 	return {
 		id: session.sessionId,
 		locator: {
@@ -268,5 +345,7 @@ export function searchRowV1(session: { sessionId: string; locator: SessionLocato
 			stateRoot: session.locator.stateRoot,
 		},
 		live: session.live,
+		...(session.role === undefined ? {} : { role: session.role }),
+		...(session.spawnedBy === undefined ? {} : { spawnedBy: { masterSessionId: session.spawnedBy.masterSessionId } }),
 	};
 }

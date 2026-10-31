@@ -39,6 +39,7 @@ import {
 	type ManagedOwnerShutdownCause,
 	managedOwnerAdmittedChildPid,
 } from "./managed-owner-binding";
+import { ensureOwnerLifecycleDirectorySync, isPlainOwnerLifecycleFile } from "./owner-lifecycle-path";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -1569,7 +1570,7 @@ export async function createOwnerIntent(
 	const intent = ownerIntentRecord(input);
 	if (!isValidOwnerIntent(intent)) throw new Error("owner_intent_invalid");
 	const paths = lifecyclePaths(stateDir, input.session_id, input.generation);
-	await fs.mkdir(paths.root, { recursive: true });
+	if (!ensureOwnerLifecycleDirectorySync(paths.root)) throw new Error("owner_lifecycle_root_unsafe");
 	const priorIntent = await Promise.any(
 		["", ".consumed", ".cancelled", ".expired", ".invalidated"].map(suffix =>
 			fs.access(`${paths.intentFile}${suffix}`),
@@ -1614,28 +1615,37 @@ function configureLockDatabase(database: Database, waitMs: number): void {
 	database.exec(`PRAGMA busy_timeout = ${waitMs}`);
 }
 
-function setLockDatabaseMode(file: string): void {
-	try {
-		fsSync.chmodSync(file, 0o600);
-	} catch {}
+/**
+ * Open a lifecycle lock database only as a plain file in its root. A missing one
+ * is created exclusively, mode 0600, so it is never created at a link's target,
+ * and SQLite opens it with `create: false`. The checks never open a descriptor
+ * on an existing database: closing one would drop the POSIX locks this process
+ * already holds on it through SQLite.
+ */
+function openOwnerLockDatabase(file: string, create: boolean): Database | null {
+	if (create) {
+		try {
+			fsSync.closeSync(fsSync.openSync(file, "wx", 0o600));
+		} catch (error) {
+			if (!isCode(error, "EEXIST")) return null;
+		}
+	}
+	if (!isPlainOwnerLifecycleFile(file)) return null;
+	return new Database(file, { readwrite: true, create: false });
 }
 
 async function acquireSqliteLock(paths: LifecyclePaths, waitMs: number): Promise<string | null> {
 	const deadline = Date.now() + waitMs;
-	try {
-		await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
-	} catch {
-		return null;
-	}
+	if (!ensureOwnerLifecycleDirectorySync(paths.root)) return null;
 	while (Date.now() <= deadline) {
 		if ([...liveSqliteLocks.values()].some(lock => lock.active && lock.file === paths.lockDatabaseFile)) {
 			await Bun.sleep(Math.min(10, Math.max(0, deadline - Date.now())));
 			continue;
 		}
 		try {
-			const database = new Database(paths.lockDatabaseFile);
+			const database = openOwnerLockDatabase(paths.lockDatabaseFile, true);
+			if (!database) return null;
 			try {
-				setLockDatabaseMode(paths.lockDatabaseFile);
 				configureLockDatabase(database, Math.max(0, deadline - Date.now()));
 				database.exec("BEGIN IMMEDIATE");
 				const token = crypto.randomUUID();
@@ -1719,10 +1729,10 @@ function acquireSqliteLockSync(paths: LifecyclePaths, waitMs: number, existingOn
 				!verifyOwnerOnlyPathSecurity(paths.lockDatabaseFile, "file").ok
 			)
 				return null;
-		} else fsSync.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
-		const database = new Database(paths.lockDatabaseFile);
+		} else if (!ensureOwnerLifecycleDirectorySync(paths.root)) return null;
+		const database = openOwnerLockDatabase(paths.lockDatabaseFile, !existingOnly);
+		if (!database) return null;
 		try {
-			setLockDatabaseMode(paths.lockDatabaseFile);
 			configureLockDatabase(database, waitMs);
 			database.exec("BEGIN IMMEDIATE");
 			return database;
@@ -2428,6 +2438,8 @@ function readSupervisorIndex(paths: LifecyclePaths, intent: OwnerIntent) {
 export async function recordManagedOwnerChildExit(stateDir: string, record: ManagedOwnerChildExit): Promise<void> {
 	if (!isManagedOwnerChildExit(record)) throw new Error("managed_owner_child_exit_invalid");
 	const paths = lifecyclePaths(stateDir, record.session_id, record.generation);
+	// The incident below is written by pathname, so the root is verified first.
+	if (!verifyOwnerOnlyPathSecurity(paths.root, "directory").ok) throw new Error("managed_owner_child_exit_unrecorded");
 	if (!record.explained) {
 		// The incident is durable before the record that ends reconciliation, so a
 		// supervisor killed in between never leaves an unexplained exit without it.
@@ -3220,7 +3232,7 @@ async function writeAttempt(
 	attempt: AttemptCapability,
 ): Promise<void> {
 	const root = lifecyclePaths(stateDir, sessionId, generation).root;
-	await fs.mkdir(root, { recursive: true, mode: 0o700 });
+	if (!ensureOwnerLifecycleDirectorySync(root)) throw new Error("owner_lifecycle_root_unsafe");
 	const file = path.join(root, `attempt-${attempt.token}.json`);
 	const handle = await fs.open(file, "wx", 0o600);
 	try {
