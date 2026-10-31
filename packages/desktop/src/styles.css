@@ -124,10 +124,10 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 	flex: 0 0 264px;
 	background: var(--sidebar);
 	border-right: 1px solid var(--border-soft);
-	padding: 16px 12px;
+	padding: 12px 10px;
 	display: flex;
 	flex-direction: column;
-	gap: 12px;
+	gap: 8px;
 	min-height: 0;
 }
 .sidebar nav { overflow: auto; flex: 1; min-height: 0; padding: 0 4px 8px; }
@@ -138,7 +138,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .brand-mark { width: 26px; height: 26px; flex: none; border-radius: var(--radius-xs); }
 
-.project-group { margin: 16px 0 24px; border-radius: var(--radius-md); }
+.project-group { margin: 10px 0 6px; border-radius: var(--radius-md); }
 /* Drag reorder: the dragged row dims, the whole workspace is a drop target. */
 .project-group.dragging { opacity: 0.45; }
 /* The insertion cue marks where the dragged item will land. */
@@ -149,7 +149,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .project-group.drop-after { box-shadow: var(--ring), inset 0 -2px 0 var(--accent); }
 .project-heading { cursor: grab; border-radius: var(--radius-xs); }
 .session-drop { border-radius: var(--radius-sm); }
-.show-more { width: 100%; justify-content: center; margin-top: 4px; font-size: 0.75rem; }
+.show-more { width: 100%; justify-content: center; min-height: 26px; margin-top: 2px; font-size: 0.75rem; }
 /* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
 .menu-scrim { position: fixed; inset: 0; z-index: 40; border: 0; padding: 0; background: transparent; }
 .context-menu { position: fixed; z-index: 41; display: flex; flex-direction: column; gap: 2px; min-width: 200px; padding: 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); }
@@ -188,8 +188,8 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 /* The chevron folds the workspace's conversation list away; it turns right when folded. */
 .project-toggle { color: var(--muted); padding: 2px 4px; }
 .project-toggle .disclosure-chevron[data-open] { transform: rotate(90deg); }
-.path { display: block; overflow-wrap: anywhere; word-break: break-all; font-family: var(--mono); font-size: 0.6875rem; margin: 4px 0 8px; color: var(--muted); }
-.session-row { display: flex; align-items: center; border: 1px solid transparent; border-radius: var(--radius-sm); margin: 4px 0; min-width: 0; }
+.path { display: block; overflow-wrap: anywhere; word-break: break-all; font-family: var(--mono); font-size: 0.6875rem; margin: 1px 0 4px; color: var(--muted); }
+.session-row { display: flex; align-items: center; border: 1px solid transparent; border-radius: var(--radius-sm); margin: 1px 0; min-width: 0; }
 .session-row:hover { background: var(--surface-2); }
 .session-row.selected { background: var(--card); border-color: var(--border-soft); box-shadow: var(--shadow-rest); }
 /* One row per conversation: the state indicator sits to the left of the name, so a list of
