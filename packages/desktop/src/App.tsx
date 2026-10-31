@@ -1,5 +1,6 @@
 import {
 	Activity,
+	ChevronRight,
 	Command,
 	FileDiff,
 	FolderOpen,
@@ -540,6 +541,8 @@ export default function App() {
 	const settingsPanelsRef = useRef<HTMLDivElement>(null);
 	// Each workspace shows a bounded list; "Show more" grows it by a page.
 	const [sessionLimits, setSessionLimits] = useState<Record<string, number>>({});
+	/** Workspaces whose conversation list is folded away; every project starts expanded. */
+	const [collapsedProjects, setCollapsedProjects] = useState<string[]>([]);
 	const [menu, setMenu] = useState<
 		| { kind: "project"; id: string; x: number; y: number }
 		| { kind: "session"; id: string; projectId: string; x: number; y: number }
@@ -1920,6 +1923,28 @@ export default function App() {
 								}}
 								onDragEnd={clearDrag}
 							>
+								<Button
+									className="project-toggle"
+									aria-expanded={!collapsedProjects.includes(item.id)}
+									aria-label={
+										collapsedProjects.includes(item.id)
+											? t("shell.expandConversations", { project: item.name })
+											: t("shell.collapseConversations", { project: item.name })
+									}
+									onClick={() =>
+										setCollapsedProjects(previous =>
+											previous.includes(item.id)
+												? previous.filter(id => id !== item.id)
+												: [...previous, item.id],
+										)
+									}
+								>
+									<ChevronRight
+										className="disclosure-chevron"
+										aria-hidden="true"
+										data-open={collapsedProjects.includes(item.id) ? undefined : true}
+									/>
+								</Button>
 								<h2 title={item.path}>{item.name}</h2>
 								<Button
 									aria-label={t("shell.newConversationIn", { project: item.name })}
@@ -1939,44 +1964,50 @@ export default function App() {
 									<Plus size={15} aria-hidden="true" />
 								</Button>
 							</div>
-							<small className="path">{item.path}</small>
-							{errors[`project:${item.id}`] && <ErrorBanner>{errors[`project:${item.id}`]}</ErrorBanner>}
-							{visible.map(chat => (
-								<div
-									key={chat.id}
-									className="session-drop"
-									onContextMenu={event => {
-										event.preventDefault();
-										event.stopPropagation();
-										setMenu({
-											kind: "session",
-											id: chat.id,
-											projectId: item.id,
-											x: event.clientX,
-											y: event.clientY,
-										});
-									}}
-								>
-									<SessionRow
-										session={chat}
-										selected={chat.id === selected}
-										onSelect={() => select(chat)}
-										onMenu={(x, y) => setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })}
-									/>
-								</div>
-							))}
-							{remaining > 0 && (
-								<Button
-									className="show-more"
-									onClick={() =>
-										setSessionLimits(previous => ({
-											...previous,
-											[item.id]: (previous[item.id] ?? SESSION_PAGE) + SESSION_PAGE,
-										}))
-									}
-								>
-									{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
-								</Button>
+							{!collapsedProjects.includes(item.id) && (
+								<>
+									<small className="path">{item.path}</small>
+									{errors[`project:${item.id}`] && <ErrorBanner>{errors[`project:${item.id}`]}</ErrorBanner>}
+									{visible.map(chat => (
+										<div
+											key={chat.id}
+											className="session-drop"
+											onContextMenu={event => {
+												event.preventDefault();
+												event.stopPropagation();
+												setMenu({
+													kind: "session",
+													id: chat.id,
+													projectId: item.id,
+													x: event.clientX,
+													y: event.clientY,
+												});
+											}}
+										>
+											<SessionRow
+												session={chat}
+												selected={chat.id === selected}
+												onSelect={() => select(chat)}
+												onMenu={(x, y) =>
+													setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })
+												}
+											/>
+										</div>
+									))}
+									{remaining > 0 && (
+										<Button
+											className="show-more"
+											onClick={() =>
+												setSessionLimits(previous => ({
+													...previous,
+													[item.id]: (previous[item.id] ?? SESSION_PAGE) + SESSION_PAGE,
+												}))
+											}
+										>
+											{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
+										</Button>
+									)}
+								</>
 							)}
 						</section>
 					);

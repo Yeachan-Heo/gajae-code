@@ -133,6 +133,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .sidebar nav { overflow: auto; flex: 1; min-height: 0; padding: 0 4px 8px; }
 .sidebar footer { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
 .sidebar-heading, .project-heading, .toolbar, .modal header, .review-pane header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.project-heading { justify-content: flex-start; }
 .sidebar-heading { padding: 4px; }
 .sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .brand-mark { width: 26px; height: 26px; flex: none; border-radius: var(--radius-xs); }
@@ -179,8 +180,11 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .goal-action + .goal-action { margin-left: 0; }
 .goal-action:hover:not(:disabled) { color: var(--accent); background: var(--surface-2); }
 
-.project-heading h2 { margin: 0; min-width: 0; font-size: 0.8125rem; }
+.project-heading h2 { flex: 1; margin: 0; min-width: 0; font-size: 0.8125rem; }
 .project-heading .button { flex-shrink: 0; }
+/* The chevron folds the workspace's conversation list away; it turns right when folded. */
+.project-toggle { color: var(--muted); padding: 2px 4px; }
+.project-toggle .disclosure-chevron[data-open] { transform: rotate(90deg); }
 .path { display: block; overflow-wrap: anywhere; word-break: break-all; font-family: var(--mono); font-size: 0.6875rem; margin: 4px 0 8px; color: var(--muted); }
 .session-row { display: flex; align-items: center; border: 1px solid transparent; border-radius: var(--radius-sm); margin: 4px 0; min-width: 0; }
 .session-row:hover { background: var(--surface-2); }

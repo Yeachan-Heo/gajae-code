@@ -1807,6 +1807,29 @@ describe("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("folds a workspace's conversations away and back", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.waitForSelector(".project-group .project-toggle");
+			expect(await page.$$eval(".project-group .session-row", rows => rows.length)).toBeGreaterThan(0);
+			const toggle = await page.$eval(".project-group .project-toggle", button => ({
+				label: button.getAttribute("aria-label"),
+				expanded: button.getAttribute("aria-expanded"),
+			}));
+			expect(toggle).toEqual({ label: "Hide the conversations of Project", expanded: "true" });
+			await page.click(".project-group .project-toggle");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 0);
+			expect(
+				await page.$eval(".project-group .project-toggle", button => button.getAttribute("aria-expanded")),
+			).toBe("false");
+			// The heading keeps its own controls while folded, so the list can be reopened.
+			expect(await page.$(".project-group .project-heading")).not.toBeNull();
+			await page.click(".project-group .project-toggle");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length > 0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("closes a workspace from its context menu and asks the host to reorder lists", async () => {
 		const { context, page } = await fixture();
 		try {
