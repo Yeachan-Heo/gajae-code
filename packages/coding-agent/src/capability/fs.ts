@@ -5,6 +5,16 @@ import * as path from "node:path";
 const contentCache = new Map<string, string | null>();
 const dirCache = new Map<string, fs.Dirent[]>();
 
+/**
+ * Compute a cache key that includes the containment boundary when present.
+ * This allows caching to work correctly when reading the same file from
+ * different containment boundaries, and prevents cache pollution when
+ * the boundary changes (e.g., when a .git directory is created).
+ */
+function makeCacheKey(abs: string, containmentRoot?: string): string {
+	return containmentRoot ? `${abs}:${containmentRoot}` : abs;
+}
+
 /** Authority used when reading from an explicit-home discovery context. */
 export type ReadScope = "project" | "user" | "native";
 
@@ -272,40 +282,42 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	}
 	if (abs === null) return null;
 	if (!(await isCurrentIsolatedPath(abs, options))) return null;
-	// A contained read must not share the lexical cache with a different boundary.
-	const useCache = !options?.bypassCache && !options?.isolatedHome && !options?.containmentRoot;
-	if (useCache && contentCache.has(abs)) {
-		return contentCache.get(abs) ?? null;
+	// Use cache unless explicitly bypassed or using isolated home (where boundaries may change).
+	// Include the containmentRoot in the cache key to prevent pollution across different boundaries.
+	const useCache = !options?.bypassCache && !options?.isolatedHome;
+	const cacheKey = makeCacheKey(abs, options?.containmentRoot);
+	if (useCache && contentCache.has(cacheKey)) {
+		return contentCache.get(cacheKey) ?? null;
 	}
 	if (!options?.isolatedHome) {
 		const readable = await containedReadPath(abs, options);
 		if (readable === null) {
-			if (useCache) contentCache.set(abs, null);
+			if (useCache) contentCache.set(cacheKey, null);
 			return null;
 		}
 		try {
 			const content = await Bun.file(readable).text();
-			if (useCache) contentCache.set(abs, content);
+			if (useCache) contentCache.set(cacheKey, content);
 			return content;
 		} catch {
-			if (useCache) contentCache.set(abs, null);
+			if (useCache) contentCache.set(cacheKey, null);
 			return null;
 		}
 	}
 
 	const opened = await openIsolatedFile(abs, options);
 	if (!opened) {
-		if (useCache) contentCache.set(abs, null);
+		if (useCache) contentCache.set(cacheKey, null);
 		return null;
 	}
 	try {
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		const content = await opened.handle.readFile({ encoding: "utf8" });
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
-		if (useCache) contentCache.set(abs, content);
+		if (useCache) contentCache.set(cacheKey, content);
 		return content;
 	} catch {
-		if (useCache) contentCache.set(abs, null);
+		if (useCache) contentCache.set(cacheKey, null);
 		return null;
 	} finally {
 		await opened.handle.close();
