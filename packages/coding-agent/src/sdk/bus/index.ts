@@ -2922,11 +2922,20 @@ function sdkControlSurface(
 			// dispatch resolved and the durable settlement failed afterwards, the
 			// steer is still queued in the session, so its handle stays held until
 			// the promotion or removal hook fires.
-			if (!dispatched) admission.abandon();
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
-			};
+			if (!dispatched) {
+				admission.abandon();
+				return {
+					sessionId: ctx.sessionManager.getSessionId(),
+					...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
+				};
+			}
+			// A delivered steer must not be recorded as rejected, which would invite
+			// a second delivery: record it as uncertain, or keep the in-flight
+			// dispatching record (which replays as uncertain) if that write fails too.
+			const uncertain = await skillRecon
+				.settleSteer(normalizedClientRef, "uncertain", error)
+				.catch(() => skillRecon.lookupSteer?.(normalizedClientRef) ?? reservation.result);
+			return { sessionId: ctx.sessionManager.getSessionId(), ...uncertain };
 		}
 	};
 	const resolveModel = (id: string) => {
