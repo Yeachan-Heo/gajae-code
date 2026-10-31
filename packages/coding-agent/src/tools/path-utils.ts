@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,6 +7,82 @@ import { isEnoent } from "@gajae-code/utils/fs-error";
 import { InternalUrlRouter } from "../internal-urls";
 import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
+import {
+	openFileInsideWorkspace,
+	pathEscapesWorkspace,
+	readFileInsideWorkspace,
+	realpathEscapesWorkspace,
+} from "./workspace-confine";
+
+const workspaceConfineRoot = new AsyncLocalStorage<string>();
+
+/** Run tool path resolution confined to `root` for this execution. */
+export function runWithWorkspaceConfine<T>(root: string, fn: () => T): T {
+	return workspaceConfineRoot.run(root, fn);
+}
+
+export function getActiveWorkspaceConfineRoot(): string | undefined {
+	return workspaceConfineRoot.getStore();
+}
+
+function assertInsideActiveWorkspace(resolved: string, original: string): void {
+	const root = workspaceConfineRoot.getStore();
+	if (!root || !pathEscapesWorkspace(root, resolved)) return;
+	throw new ToolError(
+		`Path escapes the confined session root (${root}): ${original}. This session can only use its cwd and descendants.`,
+	);
+}
+
+/** Reject a lexically admitted path whose real target leaves the confined root. */
+export async function assertRealpathInsideActiveWorkspace(resolved: string): Promise<void> {
+	const root = workspaceConfineRoot.getStore();
+	if (!root) return;
+	if (await realpathEscapesWorkspace(root, resolved)) {
+		throw new ToolError(
+			`Path resolves outside the confined session root (${root}): ${resolved}. This session can only use its cwd and descendants.`,
+		);
+	}
+}
+/** Read a confined file without following a final symlink. Ordinary sessions use Bun.file. */
+export async function readFileTextInsideActiveWorkspace(absolutePath: string): Promise<string> {
+	const root = workspaceConfineRoot.getStore();
+	if (!root) return Bun.file(absolutePath).text();
+	return (await readFileInsideWorkspace(root, absolutePath)).toString("utf8");
+}
+
+/** Replace a confined file without following a final symlink. */
+export async function writeFileTextInsideActiveWorkspace(absolutePath: string, content: string): Promise<void> {
+	const root = workspaceConfineRoot.getStore();
+	if (!root) {
+		await Bun.write(absolutePath, content);
+		return;
+	}
+	if (await realpathEscapesWorkspace(root, absolutePath)) {
+		throw new ToolError(
+			`Path resolves outside the confined session root (${root}): ${absolutePath}. This session can only use its cwd and descendants.`,
+		);
+	}
+	let opened: fs.Stats;
+	try {
+		opened = fs.lstatSync(absolutePath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		await Bun.write(absolutePath, content);
+		return;
+	}
+	if (opened.isSymbolicLink()) {
+		throw new ToolError(
+			`Path resolves outside the confined session root (${root}): ${absolutePath}. This session can only use its cwd and descendants.`,
+		);
+	}
+	const handle = await openFileInsideWorkspace(root, absolutePath);
+	try {
+		await handle.truncate(0);
+		await handle.writeFile(content);
+	} finally {
+		await handle.close();
+	}
+}
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
@@ -308,10 +385,9 @@ export function resolveToCwd(filePath: string, cwd: string): string {
 	if (/^\/+$/.test(expanded)) {
 		return cwd;
 	}
-	if (path.isAbsolute(expanded)) {
-		return expanded;
-	}
-	return path.resolve(cwd, expanded);
+	const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+	if (!isInternalUrlPath(filePath)) assertInsideActiveWorkspace(resolved, filePath);
+	return resolved;
 }
 
 export function formatPathRelativeToCwd(
@@ -826,6 +902,12 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		throw new ToolError(`Path not found: ${scopePath}${hint}`);
 	}
 
+	const confinedTargets = [
+		searchPath,
+		...(exactFilePaths ?? []),
+		...(multiTargets?.map(target => target.basePath) ?? []),
+	];
+	for (const target of confinedTargets) await assertRealpathInsideActiveWorkspace(target);
 	return {
 		searchPath,
 		scopePath,

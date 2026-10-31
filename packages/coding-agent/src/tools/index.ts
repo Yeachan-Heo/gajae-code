@@ -184,6 +184,11 @@ export interface AskAnswerSource {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/**
+	 * When set, tool and shell paths must stay inside this directory.
+	 * Undefined for ordinary sessions.
+	 */
+	filesystemRoot?: string;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session will bind a workflow-gate emitter after tool construction. */

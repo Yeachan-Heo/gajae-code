@@ -31,6 +31,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 import { CursorExecHandlers } from "../src/cursor";
+import { getActiveWorkspaceConfineRoot } from "../src/tools/path-utils";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -453,6 +454,26 @@ describe("CursorExecHandlers modern Pi writes", () => {
 			args: create(PiReadExecArgsSchema, { path: "src/a.ts", offset: 5, limit: 3 }),
 		});
 		expect(calls).toEqual([{ path: "src/a.ts:raw:5+3" }]);
+	});
+	it("runs piRead inside the confined session root", async () => {
+		const calls: string[] = [];
+		const readTool = {
+			...makeTool("read"),
+			execute: async () => {
+				calls.push(getActiveWorkspaceConfineRoot() ?? "none");
+				return { content: [{ type: "text" as const, text: "lines" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: "/session",
+			tools: new Map([["read", readTool]]),
+			filesystemRoot: () => "/session",
+		} as never);
+		await handlers.piRead({
+			toolCallId: "read-confined",
+			args: create(PiReadExecArgsSchema, { path: "src/a.ts" }),
+		});
+		expect(calls).toEqual(["/session"]);
 	});
 
 	it("propagates non-throwing edit failures", async () => {

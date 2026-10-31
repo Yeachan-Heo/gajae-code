@@ -68,6 +68,7 @@ import {
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { ArtifactManager } from "../session/artifacts";
 import { registerOwnedIfLineaged } from "../session/terminal-abort";
+import { directoryEscapesWorkspace } from "../tools/workspace-confine";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { loadBundledAgents } from "./agents";
@@ -2482,8 +2483,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 				if (!isIsolated) {
 					await assertExecutionRootMatchesRepositoryBinding(session.cwd, taskRepositoryBinding);
+					if (session.filesystemRoot && (await directoryEscapesWorkspace(session.filesystemRoot, session.cwd))) {
+						throw new Error(`Task cwd escapes the confined session root (${session.filesystemRoot}).`);
+					}
 					const result = await this.#runSubprocess({
 						cwd: session.cwd,
+						parentFilesystemRoot: session.filesystemRoot,
 						agent: effectiveAgent,
 						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
@@ -2573,10 +2578,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const isolationDir = isolationHandle.mergedDir;
 					// Isolated worktrees must preserve the source repository identity (#2901).
 					await assertExecutionRootMatchesRepositoryBinding(isolationDir, taskRepositoryBinding);
+					if (session.filesystemRoot && (await directoryEscapesWorkspace(session.filesystemRoot, isolationDir))) {
+						throw new Error(`Task worktree escapes the confined session root (${session.filesystemRoot}).`);
+					}
 
 					const result = await this.#runSubprocess({
 						cwd: session.cwd,
 						worktree: isolationDir,
+						parentFilesystemRoot: session.filesystemRoot,
 						agent: effectiveAgent,
 						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),

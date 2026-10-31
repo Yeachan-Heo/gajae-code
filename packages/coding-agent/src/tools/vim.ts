@@ -27,7 +27,7 @@ import type { ToolSession } from ".";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { assertEditableFile } from "./auto-generated-guard";
 import { isReadableUrlPath } from "./fetch";
-import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
+import { assertRealpathInsideActiveWorkspace, normalizePathLikeInput, resolveToCwd } from "./path-utils";
 import { enforcePlanModeWrite } from "./plan-mode-guard";
 import { formatDiagnostics, replaceTabs } from "./render-utils";
 import { isSqliteFile, parseSqlitePathCandidates } from "./sqlite-reader";
@@ -471,6 +471,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 
 	async #loadBuffer(targetPath: string): Promise<VimLoadedFile> {
 		const { absolutePath, displayPath } = normalizeTargetPath(targetPath, this.session.cwd);
+		await assertRealpathInsideActiveWorkspace(absolutePath);
 		if (await isSqliteFile(absolutePath)) {
 			throw new ToolError("Edit tool in vim mode does not support SQLite targets in v1");
 		}
@@ -561,6 +562,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 		return untilAborted(signal, async () => {
 			// Resolve file path and get-or-create engine for this buffer
 			const { absolutePath } = normalizeTargetPath(params.file, this.session.cwd);
+			await assertRealpathInsideActiveWorkspace(absolutePath);
 			let engine = this.#engines.get(absolutePath);
 			let isNewBuffer = false;
 			if (!engine) {

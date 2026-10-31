@@ -22,6 +22,7 @@ import {
 	type TerminalArtifactPublisher,
 	truncateHeadBytes,
 } from "../session/streaming-output";
+import { sandboxedShellCommand } from "../tools/confine-sandbox";
 import { formatArtifactReference, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { IsolatedShell } from "./isolated-shell";
@@ -351,6 +352,11 @@ export interface BashExecutorOptions {
 	ignoreShellPrefix?: boolean;
 	/** Skip sourced shell snapshots. Used by constrained read-only shells. */
 	disableShellSnapshot?: boolean;
+	/**
+	 * Run the command inside a process sandbox rooted at this directory.
+	 * The command text cannot leave the root; only macOS provides this boundary.
+	 */
+	sandboxRoot?: string;
 }
 
 export interface BashResult {
@@ -514,7 +520,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	// Apply command prefix if configured and allowed for this execution.
 	const prefixedCommand = configuredPrefix ? `${configuredPrefix} ${command}` : command;
-	const finalCommand = prefixedCommand;
+	const finalCommand = options?.sandboxRoot
+		? sandboxedShellCommand(prefixedCommand, options.sandboxRoot)
+		: prefixedCommand;
 
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({
