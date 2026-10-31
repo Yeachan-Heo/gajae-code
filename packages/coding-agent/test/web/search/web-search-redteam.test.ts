@@ -176,6 +176,12 @@ describe("red-team provider chain resolution", () => {
 		await expect(chainIds(undefined, { preferred: "tavily" })).resolves.toEqual(["duckduckgo"]);
 	});
 
+	it("uses keyless Keenable only when selected, never in auto", async () => {
+		await expect(chainIds(undefined, { preferred: "keenable" })).resolves.toEqual(["keenable", "duckduckgo"]);
+		await expect(chainIds(undefined, { fallback: ["keenable"] })).resolves.toEqual(["keenable", "duckduckgo"]);
+		await expect(chainIds(undefined, { keys: { keenable: "keenable-key" } })).resolves.toEqual(["duckduckgo"]);
+	});
+
 	it("does not inject openai-compatible in a generic no-credential context", async () => {
 		await expect(
 			chainIds({ ...hostedOpenAI, provider: "no-key" }, { auth: ["openai-codex"] }),
