@@ -66,6 +66,7 @@ import {
 import { DesktopOAuthController } from "./oauth";
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
 import { createDesktopPreferencesController, type DesktopPreferencesController } from "./preferences-controls";
+import { ensureCatalogForProfile } from "./profile-activation";
 import type {
 	DesktopActivityUpdate,
 	DesktopCapability,
@@ -888,23 +889,12 @@ export class DesktopHost {
 			if (defaultProfile) {
 				let applied = false;
 				let failure: unknown;
-				for (const attempt of [0, 1]) {
-					try {
-						applied = await result.session.activateModelProfileForControl(defaultProfile);
-						failure = undefined;
-						if (applied) break;
-					} catch (error) {
-						failure = error;
-					}
-					if (attempt === 1) break;
-					// An offline catalog holds only the static models. A profile may name a model
-					// its provider advertises dynamically, so fetch the catalog once and retry
-					// before telling the user the profile could not be applied.
-					try {
-						await registry.refresh("online-if-uncached");
-					} catch (error) {
-						failure ??= error;
-					}
+				await ensureCatalogForProfile(registry, defaultProfile);
+				try {
+					applied = await result.session.activateModelProfileForControl(defaultProfile);
+					failure = undefined;
+				} catch (error) {
+					failure = error;
 				}
 				if (!applied)
 					candidate.notices.push({
@@ -2100,7 +2090,12 @@ export class DesktopHost {
 			return this.#exclusive(live, () => live.mcp.operate(params.ref, params.action));
 		}
 		if (method === "preferences.get") return live.preferences.read();
-		if (method === "preferences.apply") return this.#exclusive(live, () => live.preferences.apply(params.action));
+		if (method === "preferences.apply") {
+			const applied = await this.#exclusive(live, () => live.preferences.apply(params.action));
+			// A profile selection replaces the live model, which the snapshot carries.
+			this.#publishSnapshot();
+			return applied;
+		}
 		if (method === "gate.present" || method === "gate.answer" || method === "gate.withdraw") {
 			const presenter = live.gatePresenter;
 			if (!presenter) throw new Error(live.gateUnavailable ?? "No owned gate presenter for this session");

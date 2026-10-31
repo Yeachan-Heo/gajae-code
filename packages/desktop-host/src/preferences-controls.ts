@@ -22,6 +22,7 @@ import type {
 	DesktopSamplingParameter,
 	DesktopSamplingPreference,
 } from "./preferences-protocol";
+import { ensureCatalogForProfile, profileSelectorsMissingFromCatalog } from "./profile-activation";
 
 const SAMPLING_PARAMETERS: readonly DesktopSamplingParameter[] = [
 	"temperature",
@@ -329,18 +330,31 @@ export function createDesktopPreferencesController(session: AgentSession): Deskt
 		// SDK controls synchronously reserve intent and own admission, predecessor
 		// receipts, lifecycle fencing and ownership CAS. Never nest their admission
 		// or mark the same operator request twice.
-		const pending =
+		// Selecting a profile later must survive the same offline catalog as session creation:
+		// a selector that names a dynamically advertised model resolves only after one fetch,
+		// so the catalog is completed before this single activation attempt. The fetch is only
+		// requested when a qualified selector is actually absent, so the common case stays
+		// synchronous and keeps its admission ordering.
+		const activate = (): Promise<boolean> =>
 			action.scope === "default"
-				? session.setDefaultModelProfileForControl(canonicalName, {
-						persistDefault: true,
-						onBeforeActivation: assertIdentity,
-					})
+				? session
+						.setDefaultModelProfileForControl(canonicalName, {
+							persistDefault: true,
+							onBeforeActivation: assertIdentity,
+						})
+						.then(result => result.changed)
 				: session.activateModelProfileForControl(canonicalName);
+		const pending =
+			profileSelectorsMissingFromCatalog(registry, canonicalName).length === 0
+				? activate()
+				: ensureCatalogForProfile(registry, canonicalName).then(() => activate());
 		const revision = session.getUserModelSelectionRevision();
 		const isCurrent = (): boolean =>
 			identityCurrent() &&
 			generation === operationGeneration &&
-			session.getUserModelSelectionRevision() === revision;
+			// The activation itself advances the selection revision, so resuming a request that
+			// ended exactly where it asked is current; any other selection is a supersession.
+			(session.getUserModelSelectionRevision() === revision || session.getActiveModelProfile() === canonicalName);
 		const assertCurrent = (): void => {
 			assertIdentity();
 			if (!isCurrent())
