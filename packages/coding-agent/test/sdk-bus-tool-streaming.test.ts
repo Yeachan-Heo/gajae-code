@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { NotificationServer } from "@gajae-code/natives";
+import { watchSessionHostClientAttachment } from "../src/commands/sdk";
 import type { ExtensionAPI } from "../src/extensibility/extensions";
+import { sessionHostAttachedClients, sessionHostWorkLeaseActive } from "../src/sdk/broker/lifecycle";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import {
 	cleanupFixtureRoots,
@@ -114,7 +116,7 @@ const end = {
 	isError: false,
 };
 
-test("bus observers receive intact snapshots only with both caps, without cross-session or replay leakage", async () => {
+test("bus stream connections receive intact snapshots with turn_stream, without cross-session or replay leakage", async () => {
 	const host = await boot();
 	const observer = await host.connect(caps);
 	const none = await host.connect([]);
@@ -124,18 +126,24 @@ test("bus observers receive intact snapshots only with both caps, without cross-
 	const foreign = await foreignHost.connect(caps);
 	await host.emit({ type: "agent_start" });
 	for (const event of [start, update("one"), update("one\ntwo"), end]) await host.emit(event);
-	await waitFor(() => observer.content().length === 4, "observer tool lifecycle");
-	expect(observer.content().map(frame => (frame.payload as { event: unknown }).event)).toEqual([
-		start,
-		update("one"),
-		update("one\ntwo"),
-		end,
-	]);
-	for (const frame of observer.content()) {
-		expect(frame.commandId).toBeUndefined();
-		expect(frame.turnId).toBeUndefined();
+	await waitFor(
+		() => observer.content().length === 4 && streamOnly.content().length === 4,
+		"stream connections tool lifecycle",
+	);
+	for (const client of [observer, streamOnly]) {
+		expect(client.content().map(frame => (frame.payload as { event: unknown }).event)).toEqual([
+			start,
+			update("one"),
+			update("one\ntwo"),
+			end,
+		]);
+		for (const frame of client.content()) {
+			expect(frame.commandId).toBeUndefined();
+			expect(frame.turnId).toBeUndefined();
+		}
 	}
-	for (const client of [none, streamOnly, observerOnly, foreign]) expect(client.content()).toEqual([]);
+	// The observer capability alone only marks a non-demanding connection; it carries no content.
+	for (const client of [none, observerOnly, foreign]) expect(client.content()).toEqual([]);
 	const replay = await host.connect(caps);
 	expect(replay.content()).toEqual([]);
 	observer.socket.close();
@@ -148,9 +156,10 @@ test("bus observers receive intact snapshots only with both caps, without cross-
 	expect(replay.content()).toHaveLength(1);
 }, 30_000);
 
-test("bus owner keeps correlation and gets no duplicate observer copy", async () => {
+test("bus owner keeps correlation and gets no duplicate stream copy", async () => {
 	const host = await boot();
-	const owner = await host.connect(caps);
+	// ACP prompts from a connection that negotiated turn_stream alone.
+	const owner = await host.connect(["turn_stream"]);
 	const observer = await host.connect(caps);
 	owner.socket.send(
 		JSON.stringify({ type: "control_request", id: "prompt", operation: "turn.prompt", input: { text: "probe" } }),
@@ -164,6 +173,8 @@ test("bus owner keeps correlation and gets no duplicate observer copy", async ()
 	await host.emit({ type: "agent_start" });
 	for (const event of [start, update("one"), end]) await host.emit(event);
 	await waitFor(() => owner.content().length === 3 && observer.content().length === 3, "owner and observer");
+	await Bun.sleep(100);
+	expect(owner.content()).toHaveLength(3);
 	const correlation = response?.result as { commandId: string; turnId: string };
 	for (const frame of owner.content())
 		expect(frame).toMatchObject({ commandId: correlation.commandId, turnId: correlation.turnId });
@@ -205,4 +216,33 @@ test("native replay capabilities admit observers before delayed negotiation call
 		for (const deliver of delayedCallbacks.splice(0)) deliver();
 		capabilitySpy.mockRestore();
 	}
+}, 30_000);
+
+test("a turn_stream connection keeps a detached bus host attended; an observer connection does not", async () => {
+	const baseline = sessionHostAttachedClients() ?? 0;
+	const host = await boot();
+	const demand = () => (sessionHostAttachedClients() ?? 0) - baseline;
+	const reaps = () =>
+		Promise.race([
+			watchSessionHostClientAttachment({
+				readAttachedClients: () => Math.max(0, demand()),
+				readWorkLease: sessionHostWorkLeaseActive,
+				idleGraceMs: 30,
+				firstAttachGraceMs: 30,
+				pollMs: 10,
+			}).then(() => "reaped" as const),
+			Bun.sleep(300).then(() => "still-running" as const),
+		]);
+
+	const acp = await host.connect(["turn_stream"]);
+	await waitFor(() => demand() === 1, "turn_stream connection counted as demand");
+	expect(await reaps()).toBe("still-running");
+
+	acp.socket.close();
+	await waitFor(() => demand() === 0, "turn_stream connection detached");
+	const observer = await host.connect(caps);
+	await waitFor(() => observer.frames.some(frame => frame.type === "event_replay_result"), "observer negotiation");
+	await Bun.sleep(50);
+	expect(demand()).toBe(0);
+	expect(await reaps()).toBe("reaped");
 }, 30_000);
