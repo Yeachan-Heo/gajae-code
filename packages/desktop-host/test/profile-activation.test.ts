@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { ensureCatalogForProfile, profileSelectorsMissingFromCatalog } from "../src/profile-activation";
+import {
+	ensureCatalogForProfile,
+	ensureCatalogForSettings,
+	profileSelectorsMissingFromCatalog,
+} from "../src/profile-activation";
 
 type FakeProfile = { modelMapping: Record<string, string | string[]> };
 
@@ -73,5 +77,40 @@ describe("profile catalog completion", () => {
 			},
 		);
 		expect(await ensureCatalogForProfile(failing, "p")).toBe(true);
+	});
+});
+
+describe("catalog completion before a session is constructed", () => {
+	const settings = (values: Record<string, unknown>) =>
+		({ get: (key: string) => values[key] }) as unknown as Parameters<typeof ensureCatalogForSettings>[1];
+
+	test("a resumed session's persisted role selector completes the catalog first", async () => {
+		const calls: string[] = [];
+		const registry = fakeRegistry(["opengateway/static-a"], {}, async strategy => {
+			calls.push(strategy);
+		});
+		const target = settings({ modelRoles: { executor: "opengateway/dynamic:high" }, "task.agentModelOverrides": {} });
+		expect(await ensureCatalogForSettings(registry, target)).toBe(true);
+		expect(calls).toEqual(["online"]);
+	});
+
+	test("nothing missing means no fetch, so a warm open stays offline", async () => {
+		const calls: string[] = [];
+		const registry = fakeRegistry(
+			["opengateway/static-a"],
+			{ p: profile({ default: "opengateway/static-a" }) },
+			async strategy => {
+				calls.push(strategy);
+			},
+		);
+		const target = settings({ "modelProfile.default": "p", modelRoles: { executor: "opengateway/static-a" } });
+		expect(await ensureCatalogForSettings(registry, target)).toBe(false);
+		expect(calls).toEqual([]);
+	});
+
+	test("the default profile's own selectors are covered too", async () => {
+		const registry = fakeRegistry(["opengateway/static-a"], { p: profile({ executor: "opengateway/dynamic:high" }) });
+		const target = settings({ "modelProfile.default": "p" });
+		expect(await ensureCatalogForSettings(registry, target)).toBe(true);
 	});
 });

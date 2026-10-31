@@ -2469,7 +2469,7 @@ export default function App() {
 									<AttachmentPicker
 										sessionId={session.id}
 										attachments={attachmentDrafts[session.id] ?? []}
-										supportsImageInput={session.imageInput?.supported === true}
+										supportsImageInput={session.imageInput?.supported !== false}
 										imagesBlocked={session.imageInput?.blocked}
 										disabled={!connected || busyDrafts[session.id]}
 										onChange={changeAttachments}
@@ -2484,7 +2484,7 @@ export default function App() {
 										draft =>
 											draft.status !== "ready" ||
 											(draft.attachment.kind === "image" &&
-												(!session.imageInput?.supported || session.imageInput.blocked)),
+												(session.imageInput?.supported === false || session.imageInput?.blocked === true)),
 									)
 								}
 								onPaste={event => {
@@ -2495,7 +2495,7 @@ export default function App() {
 										{
 											sessionId: session.id,
 											attachments: attachmentDrafts[session.id] ?? [],
-											supportsImageInput: session.imageInput?.supported === true,
+											supportsImageInput: session.imageInput?.supported !== false,
 											imagesBlocked: session.imageInput?.blocked,
 											disabled: !connected || busyDrafts[session.id],
 											onChange: changeAttachments,

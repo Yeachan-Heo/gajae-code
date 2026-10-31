@@ -66,7 +66,7 @@ import {
 import { DesktopOAuthController } from "./oauth";
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
 import { createDesktopPreferencesController, type DesktopPreferencesController } from "./preferences-controls";
-import { ensureCatalogForProfile } from "./profile-activation";
+import { ensureCatalogForProfile, ensureCatalogForSettings } from "./profile-activation";
 import type {
 	DesktopActivityUpdate,
 	DesktopCapability,
@@ -854,6 +854,9 @@ export class DesktopHost {
 		let createdSession: AgentSession | undefined;
 		try {
 			await registry.refresh("offline");
+			// Resuming a session clamps the configured selectors inside construction, where a
+			// missing model aborts the open instead of surfacing as a notice.
+			await ensureCatalogForSettings(registry, settings);
 			const result = await this.#createSession({
 				cwd: project.path,
 				agentDir: this.agentDir,

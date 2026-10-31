@@ -1,4 +1,5 @@
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { Settings } from "@gajae-code/coding-agent/config/settings";
 
 /**
  * A session's model registry is warmed offline for speed, and an offline refresh keeps only
@@ -11,8 +12,8 @@ import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-regist
  * of the profile has no matching model, fetch the catalog once and then activate. A profile
  * that is genuinely broken still fails, with its own error, after the fetch.
  */
-export function profileSelectorsMissingFromCatalog(registry: ModelRegistry, profileName: string): string[] {
-	const profile = registry.getModelProfiles()?.get(profileName);
+export function profileSelectorsMissingFromCatalog(registry: ModelRegistry, profileName: string | undefined): string[] {
+	const profile = profileName ? registry.getModelProfiles()?.get(profileName) : undefined;
 	if (!profile) return [];
 	const catalog = new Set(registry.getAll().map(model => `${model.provider}/${model.id}`));
 	const missing: string[] = [];
@@ -25,6 +26,49 @@ export function profileSelectorsMissingFromCatalog(registry: ModelRegistry, prof
 		}
 	}
 	return missing;
+}
+
+/**
+ * The selectors a session construction will clamp: the default profile's mapping plus every
+ * persisted role binding. Resuming a session applies them inside construction, so they must be
+ * resolvable before the session is built -- not only afterwards.
+ */
+function settingsSelectorsMissingFromCatalog(registry: ModelRegistry, settings: Pick<Settings, "get">): string[] {
+	const missing = profileSelectorsMissingFromCatalog(registry, settings.get("modelProfile.default"));
+	const catalog = new Set(registry.getAll().map(model => `${model.provider}/${model.id}`));
+	const sources: unknown[] = [settings.get("modelRoles"), settings.get("task.agentModelOverrides")];
+	for (const source of sources) {
+		if (!source || typeof source !== "object") continue;
+		for (const selector of Object.values(source)) {
+			for (const value of Array.isArray(selector) ? selector : [selector]) {
+				if (typeof value !== "string" || !value.includes("/")) continue;
+				const trimmed = value.replace(/:(minimal|low|medium|high|xhigh|max)$/i, "");
+				if (!catalog.has(trimmed)) missing.push(value);
+			}
+		}
+	}
+	return missing;
+}
+
+/**
+ * Fetch the catalog once when a session construction would clamp a selector the offline catalog
+ * does not carry. Without this a resumed session fails to open at all: the failure surfaces from
+ * `createAgentSession`, before any post-creation activation can repair the catalog.
+ */
+export async function ensureCatalogForSettings(
+	registry: ModelRegistry,
+	settings: Pick<Settings, "get">,
+	refresh: () => Promise<void> = async () => {
+		await registry.refresh("online");
+	},
+): Promise<boolean> {
+	if (settingsSelectorsMissingFromCatalog(registry, settings).length === 0) return false;
+	try {
+		await refresh();
+	} catch {
+		// Session construction reports the real cause; a failed fetch is not one.
+	}
+	return true;
 }
 
 /** Fetch the catalog once when the active profile cannot be clamped against it. */

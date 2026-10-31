@@ -254,11 +254,6 @@ export function AttachmentPicker({
 			>
 				<Paperclip size={15} aria-hidden="true" />
 			</Button>
-			{!imagesAvailable && (
-				<small className="attachment-hint">
-					{imagesBlocked ? t("support.attachmentImagesBlockedShort") : t("support.attachmentModelNoImageShort")}
-				</small>
-			)}
 			{pending && <small role="status">{t("support.attachmentReading")}</small>}
 			{attachments.length > 0 && (
 				<ul className="attachment-list" aria-label={t("support.attachmentSelected")}>

@@ -183,7 +183,10 @@ describe("browser selection and per-session draft ownership", () => {
 		expect(html).toContain("Remove capture.png");
 		expect(html).toContain("2.0 KiB");
 		expect(html).toContain("Invalid UTF-8");
-		expect(html).toContain("Selected model has no image input");
+		// The picker states the reason only when a file is refused; a permanent hint occupied
+		// a composer row for a condition the user cannot act on.
+		expect(html).not.toContain("no image input");
+		expect(html).not.toContain("blocked in SDK settings");
 		expect(html).toContain('aria-label="Attach file"');
 		expect(html).not.toContain('aria-label="Image paste area"');
 		expect(html).not.toContain('class="attachment-paste"');
