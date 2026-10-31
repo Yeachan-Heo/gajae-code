@@ -1130,7 +1130,6 @@ export default function Showcase() {
 	const [selected, setSelected] = useState("running");
 	const [fixtureTab, setFixtureTab] = useState<SettingsTab>("general");
 	const [fixtureKeySaved, setFixtureKeySaved] = useState(false);
-	const [starred, setStarred] = useState<string[]>(["idle"]);
 	const session: DesktopSession = {
 		id: "showcase",
 		projectId: "fixture",
@@ -1170,14 +1169,9 @@ export default function Showcase() {
 				{(["idle", "done", "running", "waiting", "error"] as const).map(status => (
 					<SessionRow
 						key={status}
-						session={{ ...session, id: status, status, starred: starred.includes(status) }}
+						session={{ ...session, id: status, status, starred: false }}
 						selected={selected === status}
 						onSelect={() => setSelected(status)}
-						onStar={() =>
-							setStarred(current =>
-								current.includes(status) ? current.filter(id => id !== status) : [...current, status],
-							)
-						}
 					/>
 				))}
 			</section>

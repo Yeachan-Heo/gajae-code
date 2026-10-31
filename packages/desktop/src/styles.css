@@ -187,9 +187,6 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .session-row.selected { background: var(--card); border-color: var(--border-soft); box-shadow: var(--shadow-rest); }
 .session-select { display: flex; flex: 1; min-width: 0; flex-direction: column; align-items: flex-start; text-align: left; gap: 5px; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 8px; }
 .session-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; word-break: keep-all; line-height: 1.45; }
-.session-row > .button { border: 0; flex-shrink: 0; }
-.session-star { color: var(--muted); padding: 8px; }
-.session-star[aria-pressed="true"] { color: var(--accent); }
 .status { display: inline-flex; align-items: center; gap: 5px; font-size: 0.6875rem; color: var(--muted); }
 .status svg { width: 12px; height: 12px; }
 .status.running { color: var(--status-running); }

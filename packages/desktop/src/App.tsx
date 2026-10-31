@@ -1979,10 +1979,6 @@ export default function App() {
 										selected={chat.id === selected}
 										onSelect={() => select(chat)}
 										onMenu={(x, y) => setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })}
-										onStar={() => {
-											if (connected)
-												void call("session.star", { sessionId: chat.id, starred: !chat.starred }, "global");
-										}}
 									/>
 								</div>
 							))}

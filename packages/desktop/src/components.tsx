@@ -12,7 +12,6 @@ import {
 	Pause,
 	Play,
 	Square,
-	Star,
 	Target,
 	X,
 } from "lucide-react";
@@ -65,13 +64,11 @@ export function SessionRow({
 	session,
 	selected,
 	onSelect,
-	onStar,
 	onMenu,
 }: {
 	session: DesktopSession;
 	selected?: boolean;
 	onSelect: () => void;
-	onStar: () => void;
 	/** Keyboard path for the row menu: the ContextMenu key or Shift+F10. */
 	onMenu?: (x: number, y: number) => void;
 }) {
@@ -97,14 +94,6 @@ export function SessionRow({
 					{statuses[session.status]()}
 				</small>
 			</button>
-			<Button
-				className="session-star"
-				aria-label={session.starred ? t("support.unstar") : t("support.star")}
-				aria-pressed={session.starred}
-				onClick={onStar}
-			>
-				<Star aria-hidden="true" fill={session.starred ? "currentColor" : "none"} />
-			</Button>
 		</div>
 	);
 }

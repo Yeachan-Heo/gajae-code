@@ -35,8 +35,6 @@ export const support = {
 	"support.statusRunning": "Working",
 	"support.statusWaiting": "Needs input",
 	"support.statusError": "Error",
-	"support.star": "Star session",
-	"support.unstar": "Unstar session",
 	"support.imageUnavailable": "This image cannot be shown.",
 	"support.imageAlt": "Image in the conversation",
 	"support.imageUnavailableWithReason": "This image cannot be shown. {reason}",
