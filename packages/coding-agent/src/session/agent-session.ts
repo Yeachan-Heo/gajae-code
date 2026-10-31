@@ -3917,6 +3917,7 @@ export class AgentSession {
 	/** SDK-controlled permission policy applied before ACP client prompting. Defaults to `allow` so callers
 	 * without a reverse permission provider (TUI, print/headless) run guarded tools; ACP/SDK set this explicitly. */
 	#sdkPermissionMode: "prompt" | "allow" | "deny" = "allow";
+	#permissionEpoch = new AbortController();
 	/** Permission provider registered by a live SDK reverse lease. */
 	#sdkPermissionProvider:
 		| ((
@@ -12301,12 +12302,28 @@ export class AgentSession {
 
 	/** Set the SDK permission policy used by guarded ACP tool execution. */
 	setSdkPermissionMode(mode: "prompt" | "allow" | "deny"): void {
+		if (mode === this.#sdkPermissionMode) return;
+		this.#permissionEpoch.abort();
+		this.#permissionEpoch = new AbortController();
 		this.#sdkPermissionMode = mode;
 	}
 
 	/** Current SDK permission policy for guarded ACP tool execution. */
 	get sdkPermissionMode(): "prompt" | "allow" | "deny" {
 		return this.#sdkPermissionMode;
+	}
+
+	/** Permission-only provider for descendants, fenced by the parent's current policy epoch. */
+	getSdkPermissionProvider(): ClientBridge["requestPermission"] {
+		const provider = this.#sdkPermissionProvider;
+		if (!provider) return undefined;
+		const epoch = this.#permissionEpoch.signal;
+		return async (toolCall, options, signal) => {
+			const combinedSignal = signal ? AbortSignal.any([epoch, signal]) : epoch;
+			if (combinedSignal.aborted) return { outcome: "cancelled" };
+			const outcome = await provider(toolCall, options, combinedSignal);
+			return combinedSignal.aborted ? { outcome: "cancelled" } : outcome;
+		};
 	}
 
 	/** Register or clear the SDK reverse permission provider for this session. */
@@ -12319,7 +12336,11 @@ export class AgentSession {
 			  ) => Promise<ClientBridgePermissionOutcome>)
 			| undefined,
 	): void {
+		if (provider && this.#clientBridge?.capabilities.requestPermission)
+			throw Object.assign(new Error("An ACP permission provider is connected."), { code: "provider_lease_conflict" });
 		this.#sdkPermissionProvider = provider;
+		this.#permissionEpoch.abort();
+		this.#permissionEpoch = new AbortController();
 		this.#acpPermissionDecisions.clear();
 		this.#acpPermissionWrapperVersion++;
 		const activeTools = this.getActiveToolNames()
@@ -13241,16 +13262,6 @@ export class AgentSession {
 
 	/** Wrap guarded tools so SDK permission modes remain fail-closed without a reverse provider. */
 	#wrapToolForAcpPermission<T extends AgentTool>(tool: T): T {
-		const bridge = this.#clientBridge;
-		const requestPermission =
-			this.#sdkPermissionProvider ??
-			(bridge?.capabilities.requestPermission && bridge.requestPermission
-				? (
-						toolCall: ClientBridgePermissionToolCall,
-						options: ClientBridgePermissionOption[],
-						signal?: AbortSignal,
-					) => bridge.requestPermission!(toolCall, options, signal)
-				: undefined);
 		if (!PERMISSION_REQUIRED_TOOLS.has(tool.name)) return tool;
 
 		return new Proxy(tool, {
@@ -13263,6 +13274,11 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
+					const bridge = this.#clientBridge;
+					const requestPermission = this.#sdkPermissionProvider ??
+						(bridge?.capabilities.requestPermission && bridge.requestPermission
+							? (toolCall: ClientBridgePermissionToolCall, options: ClientBridgePermissionOption[], permissionSignal?: AbortSignal) => bridge.requestPermission!(toolCall, options, permissionSignal)
+							: undefined);
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
@@ -13308,9 +13324,12 @@ export class AgentSession {
 					type PermissionRaceResult =
 						| { kind: "permission"; outcome: ClientBridgePermissionOutcome }
 						| { kind: "aborted" };
+					const permissionSignal = signal
+						? AbortSignal.any([signal, this.#permissionEpoch.signal])
+						: this.#permissionEpoch.signal;
 					const { promise: abortPromise, resolve: resolveAbort } = Promise.withResolvers<PermissionRaceResult>();
 					const onAbort = () => resolveAbort({ kind: "aborted" });
-					signal?.addEventListener("abort", onAbort, { once: true });
+					permissionSignal.addEventListener("abort", onAbort, { once: true });
 					let raced: PermissionRaceResult;
 					try {
 						const permissionPromise = requestPermission(
@@ -13329,13 +13348,13 @@ export class AgentSession {
 								),
 							},
 							PERMISSION_OPTIONS,
-							signal,
+							permissionSignal,
 						).then(outcome => ({ kind: "permission" as const, outcome }));
 						raced = await Promise.race([permissionPromise, abortPromise]);
 					} finally {
-						signal?.removeEventListener("abort", onAbort);
+						permissionSignal.removeEventListener("abort", onAbort);
 					}
-					if (raced.kind === "aborted" || signal?.aborted) {
+					if (raced.kind === "aborted" || permissionSignal.aborted) {
 						throw new ToolAbortError("Permission request cancelled");
 					}
 					const outcome = raced.outcome;
@@ -13352,7 +13371,8 @@ export class AgentSession {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "reject_always");
 					}
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
-						throw new ToolError(`Tool call rejected by user (${target.name})`);
+						const comment = typeof outcome.comment === "string" ? outcome.comment.slice(0, 4096) : "";
+						throw new ToolError(`Tool call rejected by user (${target.name})${comment ? `: ${comment}` : ""}`);
 					}
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
@@ -14906,6 +14926,10 @@ export class AgentSession {
 	}
 
 	setClientBridge(bridge: ClientBridge | undefined): void {
+		if (bridge?.capabilities.requestPermission && this.#sdkPermissionProvider)
+			throw Object.assign(new Error("An SDK permission provider is connected."), { code: "provider_lease_conflict" });
+		this.#permissionEpoch.abort();
+		this.#permissionEpoch = new AbortController();
 		this.#clientBridge = bridge;
 		this.#acpPermissionDecisions.clear();
 		this.#acpPermissionWrapperVersion++;

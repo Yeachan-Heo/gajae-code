@@ -37,6 +37,8 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"queue.tool_interrupt_policy.set": "setQueueMode",
 	"todo.replace": "sdkControl",
 	"permission_mode.set": "sdkControl",
+	"permission.channel.set": "setSdkPermissionProvider",
+	"permission.respond": "setSdkPermissionProvider",
 	"skill.invoke": "invokeSkill",
 	"mode.plan.set": "setPlanMode",
 	"mode.goal.operate": "operateGoal",
@@ -65,6 +67,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 // replay authority whose handler returns explicit `unavailable` when the host cannot
 // provide one atomic transcript/ring/idle capture, so it must never be hidden behind a binding gate.
 const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
+	"permission.requests.list": "setSdkPermissionProvider",
 	"skill.list/state": "getSkillState",
 	"config.list/get": "getConfigItems",
 	"session.branch_candidates": "getBranchCandidates",
@@ -81,6 +84,7 @@ export interface SdkSurfacePolicyOptions {
 	bindings: Iterable<string>;
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
+	externalPermissionsAvailable?: boolean;
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -98,6 +102,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
+					(!operation.sdkId.startsWith("permission.") ||
+						(options.externalPermissionsAvailable === true && hasBinding("sdkControl"))) &&
 					(!WORKFLOW_GATE_CONTROL_OPERATIONS.has(operation.sdkId) || options.workflowGateAvailable) &&
 					(!required[operation.sdkId] || hasBinding(required[operation.sdkId]!)),
 			).map(operation => operation.sdkId),
@@ -132,12 +138,14 @@ export function createSdkSurfacePolicyForContext(
 	ctx: ExtensionContext,
 	workflowGateAvailable = false,
 	imageUploadsAvailable = false,
+	externalPermissionsAvailable = false,
 ): SdkSurfacePolicy {
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
 		bindings,
 		workflowGateAvailable,
 		imageUploadsAvailable,
+		externalPermissionsAvailable,
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

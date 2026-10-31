@@ -128,6 +128,7 @@ import {
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import { ExternalPermissionRuntime } from "../host/external-permissions";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
@@ -1261,6 +1262,8 @@ interface SettlementReceipt {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	externalPermissions: ExternalPermissionRuntime;
+	clearPermissionProvider: () => void;
 	imageUploads: PromptImageUploadStore | undefined;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
@@ -2539,6 +2542,7 @@ function sdkQuerySurface(
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	primaryControlSurface: "cli" | "sdk" = "sdk",
 	imageUploadsAvailable = false,
+	externalPermissions?: ExternalPermissionRuntime,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2553,6 +2557,7 @@ function sdkQuerySurface(
 		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 		getRuntimeHost,
+		externalPermissions,
 		primaryControlSurface,
 	}).query;
 }
@@ -2814,6 +2819,7 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	externalPermissions?: ExternalPermissionRuntime,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2828,6 +2834,7 @@ function sdkControlSurface(
 		id: ctx.sessionManager.getSessionId(),
 		api,
 		imageUploadsAvailable,
+		externalPermissions,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -4922,6 +4929,9 @@ export function createNotificationsExtension(
 			}
 		}
 		rt.host.reverse.dispose();
+		const pollingEnabled = rt.externalPermissions.enabled;
+		rt.externalPermissions.dispose();
+		if (pollingEnabled) rt.clearPermissionProvider();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
@@ -5154,6 +5164,7 @@ export function createNotificationsExtension(
 		};
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
+		const externalPermissions = new ExternalPermissionRuntime(id);
 		let host: SessionSdkHost | undefined;
 		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
@@ -5172,6 +5183,10 @@ export function createNotificationsExtension(
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
 					const result = await host!.reverse.request(
 						"permission",
@@ -5184,7 +5199,7 @@ export function createNotificationsExtension(
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
@@ -5193,6 +5208,7 @@ export function createNotificationsExtension(
 							...(typeof response.kind === "string"
 								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
 								: {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -7060,6 +7076,7 @@ export function createNotificationsExtension(
 				() => host,
 				options.primaryControlSurface ?? "sdk",
 				imageUploadsAvailable,
+				externalPermissions,
 			),
 			id,
 			revisions,
@@ -8148,6 +8165,7 @@ export function createNotificationsExtension(
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			externalPermissions,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -8557,6 +8575,17 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				if (
+					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						type: "query_response",
+						id: request.id,
+						ok: false,
+						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -8570,6 +8599,38 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		const setPermissionMode = controlSurface.setPermissionMode;
+		controlSurface.setPermissionMode = async mode => {
+			const result = await setPermissionMode(mode);
+			if (result && typeof result === "object" && "changed" in result && result.changed === true)
+				externalPermissions.cancelPending();
+			return result;
+		};
+		controlSurface.configurePermissionChannel = async input => {
+			if (input.enabled === true && sdkRuntime?.host.reverse.getLease("permission"))
+				throw Object.assign(new Error("A reverse permission provider is connected."), {
+					code: "provider_lease_conflict",
+				});
+			const wasEnabled = externalPermissions.enabled;
+			const result = externalPermissions.configure(input);
+			if (result.enabled) {
+				if (wasEnabled) return result;
+				try {
+					ctx.setSdkPermissionProvider?.((toolCall, permissionOptions, signal) =>
+						externalPermissions.request(toolCall, permissionOptions, signal),
+					);
+					await controlSurface.setPermissionMode("prompt");
+				} catch (error) {
+					externalPermissions.configure({ enabled: false });
+					ctx.setSdkPermissionProvider?.(undefined);
+					throw error;
+				}
+			} else if (!sdkRuntime?.host.reverse.getLease("permission")) {
+				ctx.setSdkPermissionProvider?.(undefined);
+			}
+			return result;
+		};
+		controlSurface.respondPermission = input => externalPermissions.respond(input);
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
 
@@ -8581,6 +8642,8 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			externalPermissions,
+			clearPermissionProvider: () => ctx.setSdkPermissionProvider?.(undefined),
 			imageUploads,
 			releaseAcceptedImage,
 			releaseAcceptedImagesForRun,
