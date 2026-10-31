@@ -2679,6 +2679,63 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 	});
 
+	it("keeps an uncertain degraded steer retryable under its SDK idempotency key", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		// The runtime queued the steer but could not durably record its acceptance;
+		// it replays that uncertain outcome for the same key and never re-sends it.
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.abort_and_prompt"
+					? {
+							accepted: false,
+							commandId: "uncertain-command",
+							turnId: "uncertain-turn",
+							status: "uncertain",
+							aborted: false,
+							queuedAs: "steer",
+						}
+					: { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" },
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "uncertain-initial",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, status: "active" });
+		const args = {
+			session_id: "visible-session",
+			prompt: "steer with an unrecorded outcome",
+			force: true,
+			idempotency_key: "uncertain-force",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({
+			ok: false,
+			error: { code: "ambiguous" },
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({
+			ok: false,
+			error: { code: "ambiguous" },
+		});
+		const replacements = lifecycleControls(controls).filter(control => control.operation === "turn.abort_and_prompt");
+		expect(replacements).toHaveLength(2);
+		expect(new Set(replacements.map(control => control.idempotencyKey)).size).toBe(1);
+		// The reservation stays open for same-key recovery instead of being discarded
+		// as a refusal, and it is never recorded as an accepted prompt.
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			requests: { prompts: Record<string, { operation?: string; phase?: string }> };
+		};
+		expect(
+			Object.values(transaction.requests.prompts)
+				.filter(request => request.operation === "turn.abort_and_prompt")
+				.map(request => request.phase),
+		).toEqual(["remote_started"]);
+	}, 15_000);
+
 	it("surfaces Router request timeout errors without persisting a turn", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -6638,6 +6695,56 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			};
 			return { root, controls, queries, server, open, request };
 		}
+
+		it("keeps the active turn when a force delegate degrades to a steer", async () => {
+			const f = await fixture(true, {
+				controlResult: control =>
+					control.operation === "turn.abort_and_prompt"
+						? {
+								accepted: true,
+								commandId: "steer-command",
+								turnId: "steer-runtime-turn",
+								aborted: false,
+								queuedAs: "steer",
+							}
+						: { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" },
+			});
+			const first = await f.server.callTool("gjc_delegate_execute", { ...f.request, await_completion: false });
+			expect(first).toMatchObject({ ok: true });
+			const firstTurnId = first.turn_id;
+			if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+			const request = { ...f.request, idempotency_key: "delegate-steer", force: true };
+			const degraded = await f.server.callTool("gjc_delegate_execute", request);
+			expect(degraded).toMatchObject({
+				ok: true,
+				workflow: "execute",
+				delivery: "steer",
+				aborted: false,
+				turn_id: firstTurnId,
+				active_turn_id: firstTurnId,
+				result: { command_id: "steer-command", turn_id: "steer-runtime-turn", queued_as: "steer" },
+			});
+			// No workflow turn exists for the steer, so the request neither records nor awaits one.
+			expect(degraded).not.toHaveProperty("turn");
+			expect(degraded).not.toHaveProperty("completion");
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			const transaction = await readSessionTransaction(paths, "visible-session");
+			expect(transaction?.canonical.queue.active_turn_id).toBe(firstTurnId);
+			expect(Object.keys(transaction?.canonical.turns ?? {})).toEqual([firstTurnId]);
+			const receipt = await Bun.file(receiptPath(f.root, request.idempotency_key)).json();
+			expect(receipt.admission).toBeUndefined();
+			expect(receipt.delegate_response_pin).toBeUndefined();
+			const started = await f.server.callTool("gjc_coordinator_watch_events", {
+				after_seq: 0,
+				event_types: ["delegation.started"],
+				timeout_ms: 0,
+			});
+			expect(started).toMatchObject({ ok: true });
+			expect((started.events as unknown[]).length).toBe(1);
+			// The exact-key retry replays the recorded response without dispatching again.
+			expect(await f.server.callTool("gjc_delegate_execute", request)).toEqual(degraded);
+			expect(f.controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(1);
+		});
 
 		for (const mode of ["prompt", "force", "queue"] as const) {
 			it(`recovers a new ${mode} delegate after creation WAL commit before its initial prompt claim`, async () => {
