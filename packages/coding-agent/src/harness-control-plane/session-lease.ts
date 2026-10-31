@@ -287,7 +287,7 @@ function writeOwnerSocketRecord(file: string, record: OwnerSocketRecord): void {
 		return;
 	}
 	if (!storeIdentityHeld(file, ids)) return;
-	const tmp = `${file}.tmp-${process.pid}`;
+	const tmp = `${file}.tmp-${randomBytes(16).toString("hex")}`;
 	const flags = fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY | noFollowFlag();
 	let fd: number | undefined;
 	let created = false;
@@ -318,7 +318,7 @@ function writeOwnerSocketRecord(file: string, record: OwnerSocketRecord): void {
 			try {
 				fsSync.unlinkSync(tmp);
 			} catch {
-				/* The exclusive file is ours; a later publish skips a leftover. */
+				/* The exclusive file is ours. */
 			}
 		}
 	}

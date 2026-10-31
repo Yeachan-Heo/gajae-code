@@ -429,6 +429,42 @@ describe("harness owner socket routing", () => {
 	);
 
 	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"routes across socket environments despite a stale PID temp file or symlink",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			const file = await recordPath();
+			if (!file) throw new Error("missing socket record path");
+			const stale = `${file}.tmp-${process.pid}`;
+			const sentinel = path.join(root, "sentinel");
+			fsSync.writeFileSync(sentinel, "untouched");
+			try {
+				for (const kind of ["file", "symlink"]) {
+					fsSync.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+					if (kind === "file") fsSync.writeFileSync(stale, "stale", { mode: 0o600 });
+					else fsSync.symlinkSync(sentinel, stale);
+					await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: socketDir }, async () => {
+						const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: otherDir });
+						const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+						expect(res.code).toBe(0);
+						expect(body.evidence?.ownerRouted).toBe(true);
+						expect(fsSync.existsSync(file)).toBe(true);
+					});
+					expect(fsSync.existsSync(file)).toBe(false);
+					expect(fsSync.readFileSync(sentinel, "utf8")).toBe("untouched");
+					expect(fsSync.lstatSync(stale).isSymbolicLink()).toBe(kind === "symlink");
+					if (kind === "file") expect(fsSync.readFileSync(stale, "utf8")).toBe("stale");
+					fsSync.unlinkSync(stale);
+				}
+			} finally {
+				fsSync.rmSync(path.dirname(file), { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32" || !canSymlink)(
 		"routes observe through the socket record when the user sets a symlinked socket dir",
 		async () => {
 			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
