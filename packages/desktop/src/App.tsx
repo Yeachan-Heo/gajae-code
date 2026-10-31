@@ -1999,7 +1999,6 @@ export default function App() {
 									{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
 								</Button>
 							)}
-							{all.length === 0 && <p className="muted">{t("shell.startNewConversation")}</p>}
 							{all.length > 0 && filtered.length === 0 && (
 								<p className="muted">{t("shell.noMatchingConversations")}</p>
 							)}
