@@ -112,7 +112,7 @@ describe("approvalGate red-team coercion checks (#317)", () => {
 		expect(decodeApproval(advanced[0]).approved).toBe(true);
 	});
 
-	it("lets broker accept schema-valid request-changes without comments, while decode enforces missing_comments", async () => {
+	it("rejects missing or blank change-request comments before the broker advances", async () => {
 		const advanced: unknown[] = [];
 		const broker = new WorkflowGateBroker("redteam-semantic-comments", new MemoryGateStore(), {
 			advance: (_gate, answer) => {
@@ -121,10 +121,20 @@ describe("approvalGate red-team coercion checks (#317)", () => {
 		});
 		const gate = broker.openGate(approvalGate(), activeContinuation());
 
-		const resolution = await broker.resolve({ gate_id: gate.gate_id, answer: { decision: "request-changes" } });
-		expect(resolution.status).toBe("accepted");
-		expect(advanced).toEqual([{ decision: "request-changes" }]);
-		expectApprovalError(advanced[0], "missing_comments");
+		for (const answer of [
+			{ decision: "request-changes" },
+			{ decision: "request-changes", comments: "" },
+			{ decision: "request-changes", comments: " \n\t" },
+		]) {
+			const resolution = await broker.resolve({ gate_id: gate.gate_id, answer });
+			expect(resolution.status).toBe("rejected");
+			expect(advanced).toEqual([]);
+			expectApprovalError(answer, "missing_comments");
+		}
+		const answer = { decision: "request-changes" as const, comments: "Add the missing rollback evidence." };
+		expect((await broker.resolve({ gate_id: gate.gate_id, answer })).status).toBe("accepted");
+		expect(advanced).toEqual([answer]);
+		expect(decodeApproval(advanced[0])).toEqual({ ...answer, approved: false });
 	});
 });
 

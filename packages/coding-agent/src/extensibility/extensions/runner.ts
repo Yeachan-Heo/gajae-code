@@ -553,6 +553,11 @@ export class ExtensionRunner {
 		return this.#uiContext;
 	}
 
+	/** Bind fresh UI for future contexts without rerunning initialization or changing captured contexts. */
+	setUIContext(uiContext: ExtensionUIContext): void {
+		this.#uiContext = uiContext;
+	}
+
 	hasUI(): boolean {
 		return this.#uiContext !== noOpUIContext;
 	}

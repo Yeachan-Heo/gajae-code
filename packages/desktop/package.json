@@ -1,0 +1,36 @@
+{
+  "name": "@gajae-code/desktop",
+  "version": "0.19.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run icons && bun scripts/dev.ts",
+    "icons": "tauri icon icon.png --output src-tauri/icons",
+    "dev:ui": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build:ui": "vite build",
+    "build:host": "bun scripts/build-host.ts",
+    "build:app": "bun run icons && bun run build:host && tauri build --config src-tauri/tauri.bundle.conf.json && bun scripts/sign-bundle.ts",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
+    "test": "bun test test",
+    "qa:visual": "bun scripts/visual-qa.ts",
+    "qa:host-ui": "bun scripts/host-ui-qa.ts",
+    "lint": "biome lint src test",
+    "fmt": "biome format --write src test"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "entities": "catalog:",
+    "lucide-react": "catalog:",
+    "marked": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "vite": "catalog:",
+    "puppeteer-core": "catalog:",
+    "typescript": "catalog:"
+  }
+}

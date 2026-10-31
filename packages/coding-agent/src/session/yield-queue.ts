@@ -19,6 +19,8 @@ export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
 	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
+	/** Hold delivery admission across draining, message construction and injection. */
+	withIdleAdmission?(body: () => Promise<void>, signal?: AbortSignal): Promise<void>;
 	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
 }
@@ -89,6 +91,24 @@ export class YieldQueue {
 			this.#idleFlushPending = false;
 			this.#idleFlushPendingOwner = undefined;
 		}
+		if (mode === "idle") {
+			try {
+				const deliverySignal = signal ?? this.#options.getIdleFlushSignal?.();
+				if (this.#options.withIdleAdmission) {
+					await this.#options.withIdleAdmission(() => this.#flushEntries(mode, deliverySignal), deliverySignal);
+				} else {
+					await this.#flushEntries(mode, deliverySignal);
+				}
+			} catch (error) {
+				// Admission failed before draining: retain the original entries for a later owned retry.
+				logger.warn("Yield queue idle admission failed", { error: formatError(error) });
+			}
+			return;
+		}
+		await this.#flushEntries(mode, signal);
+	}
+
+	async #flushEntries(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
 		const idleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const entries = this.#drain(kind);
@@ -108,7 +128,7 @@ export class YieldQueue {
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
+				await this.#options.injectIdle(idleMessages, signal);
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}

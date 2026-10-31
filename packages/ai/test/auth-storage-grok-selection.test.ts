@@ -1,10 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import type { UsageLimit, UsageProvider, UsageReport } from "../src/usage";
-import * as oauthUtils from "../src/utils/oauth";
 import type { OAuthCredentials } from "../src/utils/oauth/types";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -77,14 +76,9 @@ describe("AuthStorage Grok hybrid quota ranking", () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-grok-selection-"));
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		usageByAccount.clear();
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
-			const credential = credentials["grok-build"] as OAuthCredentials | undefined;
-			return credential?.accountId ? { apiKey: `api-${credential.accountId}`, newCredentials: credential } : null;
-		});
 	});
 
 	afterEach(async () => {
-		vi.restoreAllMocks();
 		store?.close();
 		store = null;
 		if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
@@ -103,7 +97,7 @@ describe("AuthStorage Grok hybrid quota ranking", () => {
 			{ type: "oauth", ...createCredential("weekly-free") },
 		]);
 
-		expect(await storage.getApiKey("grok-build", "session-balanced")).toBe("api-weekly-free");
+		expect(await storage.getApiKey("grok-build", "session-balanced")).toBe("access-weekly-free");
 	});
 
 	test("earliest-reset mode uses the weekly reset timestamp in a hybrid report", async () => {
@@ -120,6 +114,6 @@ describe("AuthStorage Grok hybrid quota ranking", () => {
 			{ type: "oauth", ...createCredential("soon") },
 		]);
 
-		expect(await storage.getApiKey("grok-build", "session-earliest-reset")).toBe("api-soon");
+		expect(await storage.getApiKey("grok-build", "session-earliest-reset")).toBe("access-soon");
 	});
 });

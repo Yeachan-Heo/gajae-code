@@ -78,6 +78,11 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 		packageName: "pi-walker",
 		rationale: "Vendored upstream filesystem traversal infrastructure behind the native addon boundary.",
 	},
+	{
+		dir: "packages/desktop/src-tauri",
+		packageName: "gjc-desktop",
+		rationale: "Native Tauri window, sidecar process lifecycle, and validated IPC transport; SDK and application business logic stay in TypeScript.",
+	},
 ] as const;
 
 const ALLOWED_NON_CRATE_RUST_FILES = new Set(["packages/coding-agent/test/fixtures/chunk-edit-indent.rs"]);
@@ -89,7 +94,10 @@ const allowlistByPackage = new Map(
 
 const errors: string[] = [];
 
-const crateFiles = await collectRelativeMatches("crates/*/Cargo.toml");
+const crateFiles = [
+	...(await collectRelativeMatches("crates/*/Cargo.toml")),
+	...(await collectRelativeMatches("packages/*/src-tauri/Cargo.toml")),
+].sort();
 for (const cargoTomlPath of crateFiles) {
 	const crateDir = path.posix.dirname(cargoTomlPath);
 	const packageName = await readPackageName(cargoTomlPath);

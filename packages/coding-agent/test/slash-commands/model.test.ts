@@ -25,6 +25,7 @@ function createRuntime() {
 			) => (selector === "claude-sonnet" ? options?.candidates?.[0] : undefined),
 			getAvailable: () => [availableModel],
 		},
+		getAgentModelOverrides: () => settings.get("task.agentModelOverrides"),
 		getAvailableModels: () => [availableModel],
 		setConfiguredModelChain: () => {},
 		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
