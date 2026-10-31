@@ -92,6 +92,16 @@ const waitFn = async (fn, timeout = 30000) => {
     throw new Error("WAIT " + report.stage + ": " + String(error).slice(0, 160) + " BODY=" + (await body()).slice(0, 900));
   }
 };
+const clickComposerSend = async () => {
+  const clicked = await page.evaluate(() => {
+    const button = document.querySelector('.composer-actions button[type="submit"]');
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  });
+  if (!clicked) throw new Error("composer send action was not clickable");
+  await Bun.sleep(120);
+};
 const clickText = async (label) => {
   const ok = await page.evaluate((wanted) => {
     const node = [...document.querySelectorAll("button")].find((item) => (item.innerText || "").trim() === wanted);
@@ -328,7 +338,7 @@ try {
     setter?.call(area, "Hello");
     area.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await clickText("Send");
+  await clickComposerSend();
   await page.waitForTimeout(6000);
   const after = await body();
   feature("promptError", {
@@ -403,7 +413,7 @@ try {
       setter?.call(area, "Reply with exactly: OK");
       area.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await clickText("Send");
+    await clickComposerSend();
     await waitFn(() => {
       const conversation = document.querySelector(".conversation");
       const text = conversation ? conversation.innerText : "";

@@ -111,11 +111,11 @@ export function BtwPanel({ conversation, draft, disabled, pending, onDraftChange
 						}
 					}}
 				/>
-				<div className="composer-actions">
+				<div className="btw-actions">
 					<small id={`${id}-hint`} className="composer-hint">
 						{t("support.btwHint")}
 					</small>
-					<div className="composer-buttons">
+					<div className="btw-buttons">
 						{active && (
 							<Button
 								disabled={!canCancel}

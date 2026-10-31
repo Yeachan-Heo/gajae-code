@@ -198,6 +198,12 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					result = { removed: true };
 				}
 				if (request.method === "activity.get") result = { sessionId: request.params.sessionId, revision: 1, activity: { available: false, reason: "Fixture has no activity backend", sessionGeneration: "fixture-session", connectionGeneration: "fixture-connection" } };
+				if (
+					request.method === "project.close" ||
+					request.method === "project.reorder" ||
+					request.method === "session.reorder"
+				)
+					result = null;
 				if (request.method === "delivery.ack") {
 					result = null;
 					const mode = state.ackMode;
@@ -1014,10 +1020,10 @@ describe("mounted composer delivery recovery", () => {
 		try {
 			await select(page);
 			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] } }));
-			await page.waitForSelector(".composer-delivery select");
-			await page.select(".composer-delivery select", "followUp");
+			// No delivery choice is offered: a prompt typed during a run is queued and steered.
+			expect(await page.$(".composer-delivery")).toBeNull();
 			const request = await send(page, "queued disconnect payload");
-			expect(request.params.deliverAs).toBe("followUp");
+			expect(request.params.deliverAs).toBe("steer");
 			await receipt(page, request, "queued");
 			await waitStoredDisposition(page, request.id, "queued");
 			await page.evaluate((id: string) => window.fixture.response(id, true), request.id);
@@ -1134,6 +1140,875 @@ describe("mounted composer delivery recovery", () => {
 			expect(state.selected).toEqual(["General"]);
 			expect(state.visiblePanels).toBe(1);
 			expect(state.focusableTabs).toBe(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("the composer keeps one icon action beside the model controls and turns it into stop", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "running",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: false,
+						controlGeneration: 1,
+						messages: [],
+					},
+				}),
+			);
+			const idle = await page.evaluate(() => {
+				const footer = document.querySelector(".composer-footer");
+				const controls = footer?.querySelector(".composer-controls");
+				const actions = footer?.querySelector(".composer-actions");
+				const buttons = [...(actions?.querySelectorAll("button") ?? [])];
+				const rowOf = (element: Element | null | undefined) => {
+					if (!element) return null;
+					const box = element.getBoundingClientRect();
+					return { top: Math.round(box.top), height: Math.round(box.height), text: (element.textContent ?? "").trim() };
+				};
+				return {
+					hasFooter: !!footer,
+					controlsInsideFooter: !!controls,
+					actionsInsideFooter: !!actions,
+					buttonCount: buttons.length,
+					buttonType: buttons[0]?.getAttribute("type"),
+					buttonLabel: buttons[0]?.getAttribute("aria-label"),
+					buttonText: (buttons[0]?.textContent ?? "").trim(),
+					selects: [...document.querySelectorAll(".composer select")].length,
+					controlsRow: rowOf(controls?.querySelector(".model-trigger")),
+					reasoningRow: rowOf(controls?.querySelector(".select-trigger")),
+					actionRow: rowOf(buttons[0]),
+				};
+			});
+			// Model trigger, reasoning trigger and the single action share one row.
+			expect(idle.hasFooter).toBe(true);
+			expect(idle.controlsInsideFooter).toBe(true);
+			expect(idle.actionsInsideFooter).toBe(true);
+			expect(idle.buttonCount).toBe(1);
+			expect(idle.buttonType).toBe("button");
+			expect(idle.buttonLabel).toBe("Stop");
+			expect(idle.buttonText).toBe("");
+			expect(idle.selects).toBe(0);
+			// Same line means their vertical bands overlap, which holds even when the model
+			// control adds a status line underneath. The reasoning trigger must be on it too.
+			const bands = [idle.controlsRow, idle.reasoningRow, idle.actionRow];
+			for (const band of bands) expect(band).not.toBeNull();
+			for (const band of bands) {
+				expect((band?.top ?? 0)).toBeGreaterThanOrEqual((idle.actionRow?.top ?? 0) - 0.5);
+				expect((band?.top ?? 0)).toBeLessThan((idle.actionRow?.top ?? 0) + (idle.actionRow?.height ?? 0));
+			}
+			expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+			// The same holds at a phone width: nothing overflows and the action stays on the row.
+			await page.setViewport({ width: 420, height: 900 });
+			await page.waitForFunction(() => window.innerWidth === 420);
+			const narrow = await page.evaluate(() => {
+				const footer = document.querySelector(".composer-footer");
+				const action = footer?.querySelector(".composer-actions button");
+				const trigger = footer?.querySelector(".model-trigger");
+				const rect = (element: Element | null | undefined) =>
+					element ? { top: Math.round(element.getBoundingClientRect().top) } : null;
+				return {
+					actionTop: rect(action)?.top ?? null,
+					triggerTop: rect(trigger)?.top ?? null,
+					overflow: document.documentElement.scrollWidth > window.innerWidth,
+				};
+			});
+			expect(narrow.overflow).toBe(false);
+			expect(narrow.actionTop).toBe(narrow.triggerTop);
+			await page.setViewport({ width: 1400, height: 900 });
+			// Typing during a run turns the same slot back into send, still with no visible text.
+			await page.type(".composer textarea", "steer this run");
+			await page.waitForFunction(
+				() => document.querySelector('.composer-actions button')?.getAttribute("type") === "submit",
+			);
+			const typed = await page.evaluate(() => {
+				const button = document.querySelector(".composer-actions button");
+				return {
+					type: button?.getAttribute("type"),
+					label: button?.getAttribute("aria-label"),
+					text: (button?.textContent ?? "").trim(),
+					delivery: document.querySelectorAll(".composer-delivery").length,
+				};
+			});
+			expect(typed.type).toBe("submit");
+			expect(typed.label).toBe("Send and steer the run");
+			expect(typed.text).toBe("");
+			expect(typed.delivery).toBe(0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("shows the live task list and goal state the builtin tools maintain", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "running",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: false,
+						controlGeneration: 1,
+						messages: [],
+						todos: [
+							{
+								name: "Foundation",
+								tasks: [
+									{ content: "Read the host", status: "completed" },
+									{ content: "Project todos", status: "in_progress" },
+								],
+							},
+							{ name: "UI", tasks: [{ content: "Render the panel", status: "pending" }] },
+						],
+						goal: { objective: "Ship the desktop parity work", status: "active", tokensUsed: 12, timeUsedSeconds: 3 },
+					},
+				}),
+			);
+			await page.waitForSelector(".todo-panel");
+			const collapsed = await page.evaluate(() => ({
+				summary: document.querySelector(".todo-summary")?.textContent,
+				tasks: document.querySelectorAll(".todo-task").length,
+			}));
+			// Collapsed it states progress and the task in flight; the full list needs one click.
+			expect(collapsed.summary).toContain("1/3 tasks done");
+			expect(collapsed.summary).toContain("Project todos");
+			expect(collapsed.tasks).toBe(0);
+			await page.click(".todo-toggle");
+			await page.waitForSelector(".todo-task");
+			const expanded = await page.evaluate(() => ({
+				tasks: [...document.querySelectorAll(".todo-task")].map(task => `${task.className}:${task.textContent}`),
+				phases: [...document.querySelectorAll(".todo-phase h3")].map(heading => heading.textContent),
+				expanded: document.querySelector(".todo-toggle")?.getAttribute("aria-expanded"),
+			}));
+			expect(expanded.expanded).toBe("true");
+			expect(expanded.phases).toEqual(["Foundation", "UI"]);
+			expect(expanded.tasks).toEqual([
+				"todo-task completed:Read the host",
+				"todo-task in_progress:Project todos",
+				"todo-task pending:Render the panel",
+			]);
+			const goal = await page.evaluate(() => ({
+				status: document.querySelector(".goal-status")?.textContent,
+				objective: document.querySelector(".goal-objective")?.textContent,
+				actions: [...document.querySelectorAll(".goal-action")].map(action => action.getAttribute("aria-label")),
+			}));
+			expect(goal.status).toBe("Active goal");
+			expect(goal.objective).toBe("Ship the desktop parity work");
+			expect(goal.actions).toEqual(["Pause goal", "Complete goal", "Drop goal"]);
+			// A running turn owns the session, so the actions are disabled instead of failing silently.
+			const busyDisabled = await page.evaluate(() =>
+				[...document.querySelectorAll(".goal-action")].map(action => (action as HTMLButtonElement).disabled),
+			);
+			expect(busyDisabled).toEqual([true, true, true]);
+			await page.evaluate(() => {
+				(document.querySelector('.goal-action[aria-label="Pause goal"]') as HTMLButtonElement | null)?.click();
+			});
+			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === "goal.operate"))).toBe(false);
+			// Once the turn settles the same strip operates the goal.
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "done",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: false,
+						controlGeneration: 1,
+						messages: [],
+						goal: { objective: "Ship the desktop parity work", status: "active", tokensUsed: 12 },
+					},
+				}),
+			);
+			await page.waitForFunction(
+				() => !(document.querySelector('.goal-action[aria-label="Pause goal"]') as HTMLButtonElement | null)?.disabled,
+			);
+			await page.click('.goal-action[aria-label="Pause goal"]');
+			await page.waitForFunction(() =>
+				window.fixture.requests().some(request => request.method === "goal.operate"),
+			);
+			expect(
+				await page.evaluate(
+					() => window.fixture.requests().find(request => request.method === "goal.operate")?.params,
+				),
+			).toEqual({ sessionId: "a", op: "pause" });
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("shows five conversations per workspace and pages the rest on demand", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => {
+				const make = (id: string, title: string): DesktopSession => ({
+					id,
+					title,
+					projectId: "p",
+					status: "idle",
+					starred: false,
+					imageInput: { supported: true, blocked: false },
+					operatorRunning: false,
+					controlGeneration: 1,
+					messages: [],
+				});
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [{ id: "p", name: "Project", path: "/project" }],
+						sessions: Array.from({ length: 12 }, (_, index) => make(`s${index}`, `Conversation ${index + 1}`)),
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			});
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 5);
+			const paged = await page.evaluate(() => ({
+				rows: [...document.querySelectorAll(".project-group .session-row")].map(row => row.textContent),
+				more: document.querySelector(".project-group .show-more")?.textContent,
+			}));
+			expect(paged.rows).toHaveLength(5);
+			expect(paged.more).toBe("Show 5 more");
+			// Each click appends one page of five, not the whole remainder.
+			await page.click(".project-group .show-more");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 10);
+			expect(await page.$eval(".project-group .show-more", button => button.textContent)).toBe("Show 2 more");
+			// The last click reveals the remainder and the button goes away.
+			await page.click(".project-group .show-more");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 12);
+			expect(await page.$(".project-group .show-more")).toBeNull();
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("the drawer hosts its own context menu and dismisses it before the drawer", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.setViewport({ width: 900, height: 900 });
+			await page.evaluate(() => {
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [{ id: "p", name: "Project", path: "/project" }],
+						sessions: [
+							{
+								id: "s1",
+								title: "One",
+								projectId: "p",
+								status: "idle",
+								starred: false,
+								imageInput: { supported: true, blocked: false },
+								operatorRunning: false,
+								controlGeneration: 1,
+								messages: [],
+							},
+						],
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			});
+			await page.waitForSelector(".mobile-only");
+			await page.evaluate(() => (document.querySelector(".mobile-only") as HTMLElement | null)?.click());
+			await page.waitForSelector("dialog.sidebar-drawer");
+			// The menu must live inside the modal dialog: a top-layer dialog paints over a sibling.
+			await page.evaluate(() => {
+				const heading = document.querySelector("dialog.sidebar-drawer .project-heading") as HTMLElement | null;
+				heading?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 120 }));
+			});
+			await page.waitForSelector("dialog.sidebar-drawer .context-menu");
+			expect(await page.evaluate(() => document.querySelectorAll(".context-menu").length)).toBe(1);
+			// One Escape dismisses the menu and keeps the drawer open.
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector(".context-menu"));
+			expect(await page.$("dialog.sidebar-drawer")).not.toBeNull();
+			// The menu dismissal must not leave the drawer's own close control inert for one click.
+			await page.click("dialog.sidebar-drawer .modal-close");
+			await page.waitForFunction(() => !document.querySelector("dialog.sidebar-drawer"));
+			await page.waitForFunction(() => document.querySelector(".mobile-only") !== null);
+			await page.evaluate(() => (document.querySelector(".mobile-only") as HTMLElement | null)?.click());
+			await page.waitForSelector("dialog.sidebar-drawer");
+			// A dialog over the drawer owns Escape: the drawer must stay behind it.
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
+					.find(button => button.textContent?.trim() === "Commands")
+					?.click(),
+			);
+			await page.waitForSelector("#command-search");
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => document.querySelector("#command-search") === null);
+			expect(await page.$("dialog.sidebar-drawer")).not.toBeNull();
+			// A second Escape closes the drawer itself, with no menu or dialog in the way.
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector("dialog.sidebar-drawer"));
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("the Manage goal dialog offers only the operations the goal state allows", async () => {
+		const { context, page } = await fixture();
+		/** Opens the palette, reports whether "Manage goal" is offered, and opens it when it is. */
+	const openGoalDialog = async () => {
+		// The Commands button lives in the conversation toolbar, not the sidebar.
+		await page.evaluate(() =>
+			[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
+				.find(button => button.textContent?.trim() === "Commands")
+				?.click(),
+		);
+		await page.waitForSelector("#command-search");
+		const manage = await page.evaluate(() => {
+			const button = [...document.querySelectorAll<HTMLButtonElement>(".command-list button")].find(
+				item => item.textContent?.trim() === "Manage goal",
+			);
+			return button ? { disabled: button.disabled } : null;
+		});
+		if (!manage) throw new Error("Manage goal is missing from the command list");
+		if (manage.disabled) {
+			await page.click("dialog[open] .modal-close");
+			await page.waitForFunction(() => !document.querySelector("dialog[open]"));
+			return null;
+		}
+		await page.evaluate(() =>
+			[...document.querySelectorAll<HTMLButtonElement>(".command-list button")]
+				.find(button => button.textContent?.trim() === "Manage goal")
+				?.click(),
+		);
+		await page.waitForSelector("dialog[open] #objective");
+		const offered = await page.evaluate(
+			() =>
+				[...document.querySelectorAll("dialog[open] .actions button")].map(button => button.textContent?.trim()),
+		);
+		// Dismiss through the dialog's own close control; Escape focus rules differ per state.
+		await page.click("dialog[open] .modal-close");
+		await page.waitForFunction(() => !document.querySelector("dialog[open]"));
+		return offered;
+	};
+		// Puppeteer widens the serialized argument, so the status is narrowed back inside the page.
+		const goalFrame = (input: { status: string; sessionStatus: string }) => {
+			const status = input.status === "paused" ? "paused" : "active";
+			window.fixture.emit({
+				type: "session",
+				session: {
+					id: "a",
+					title: "Session A",
+					projectId: "p",
+					status:
+						input.sessionStatus === "running"
+							? "running"
+							: input.sessionStatus === "waiting"
+								? "waiting"
+								: "idle",
+					starred: false,
+					imageInput: { supported: true, blocked: false },
+					operatorRunning: false,
+					controlGeneration: 1,
+					messages: [],
+					goal: { objective: "Ship it", status },
+				},
+			});
+		};
+		try {
+			await select(page);
+			// No goal yet: only creation and reading are meaningful.
+			expect(await openGoalDialog()).toEqual(["Create", "View"]);
+			await page.evaluate(goalFrame, { status: "active", sessionStatus: "idle" });
+			await page.waitForFunction(() => document.querySelector(".goal-status")?.textContent === "Active goal");
+			expect(await openGoalDialog()).toEqual(["View", "Pause", "Complete", "Drop goal"]);
+			await page.evaluate(goalFrame, { status: "paused", sessionStatus: "idle" });
+			await page.waitForFunction(() => document.querySelector(".goal-status")?.textContent === "Paused goal");
+			expect(await openGoalDialog()).toEqual(["View", "Resume", "Drop goal"]);
+			// A turn owns the session, so the host would refuse: the command is not offered at all.
+			await page.evaluate(goalFrame, { status: "active", sessionStatus: "running" });
+			await page.waitForFunction(() => document.querySelector(".goal-status")?.textContent === "Active goal");
+			expect(await openGoalDialog()).toBeNull();
+			// Waiting on an answer is the same situation: the dialog would offer nothing.
+			await page.evaluate(goalFrame, { status: "active", sessionStatus: "waiting" });
+			// The row status is what carries the waiting state; the goal strip stays as it was.
+			await page.waitForFunction(
+				() => document.querySelector(".session-row .status.waiting") !== null,
+			);
+			expect(await openGoalDialog()).toBeNull();
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 40000);
+
+	test("the workspace menu refuses to reorder while a search filter is active", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => {
+				const make = (id: string): DesktopSession => ({
+					id,
+					title: `Conversation ${id}`,
+					projectId: "p",
+					status: "idle",
+					starred: false,
+					imageInput: { supported: true, blocked: false },
+					operatorRunning: false,
+					controlGeneration: 1,
+					messages: [],
+				});
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [
+							{ id: "p", name: "Project", path: "/project" },
+							{ id: "q", name: "Second", path: "/second" },
+						],
+						sessions: [make("s1"), make("s2")],
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			});
+			await page.waitForFunction(() => document.querySelectorAll(".project-group").length === 2);
+			await page.type("#session-search", "Conversation");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 2);
+			// The second workspace can move up, so only the search filter can disable it.
+			await page.evaluate(() => {
+				const heading = document.querySelectorAll(".project-group .project-heading")[1];
+				heading?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
+			});
+			await page.waitForSelector(".context-menu [role=\"menuitem\"]");
+			const items = await page.evaluate(() =>
+				[...document.querySelectorAll(".context-menu [role=\"menuitem\"]")].map(item => ({
+					label: item.textContent?.trim(),
+					disabled: (item as HTMLButtonElement).disabled,
+				})),
+			);
+			expect(items.map(item => item.label)).toEqual([
+				"Move workspace up",
+				"Move workspace down",
+				"Close workspace",
+			]);
+			// A filtered list cannot name the permutation the host stores, so both move paths stop.
+			expect(items.slice(0, 2).map(item => item.disabled)).toEqual([true, true]);
+			expect(items[2]?.disabled).toBe(false);
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector(".context-menu"));
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("keeps the selected conversation listed when it is outside the five-item page", async () => {
+		const { context, page } = await fixture();
+		try {
+			const seed = () => {
+				const make = (id: string, title: string): DesktopSession => ({
+					id,
+					title,
+					projectId: "p",
+					status: "idle",
+					starred: false,
+					imageInput: { supported: true, blocked: false },
+					operatorRunning: false,
+					controlGeneration: 1,
+					messages: [],
+				});
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [{ id: "p", name: "Project", path: "/project" }],
+						sessions: Array.from({ length: 12 }, (_, index) => make(`s${index}`, `Conversation ${index + 1}`)),
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			};
+			await page.evaluate(seed);
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 5);
+			await page.type("#session-search", "Conversation 7");
+			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 1);
+			await page.evaluate(() => {
+				const seven = document.querySelector(".project-group .session-row .session-select");
+				(seven as HTMLElement | null)?.click();
+			});
+			await page.waitForFunction(
+				() =>
+					document.querySelector(".project-group .session-row.selected")?.textContent?.includes("Conversation 7") ===
+					true,
+			);
+			// Clearing the search must not hide the conversation the user is reading.
+			await page.evaluate(() => {
+				const field = document.querySelector("#session-search") as HTMLInputElement | null;
+				const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+				if (!field || !setter) return;
+				setter.call(field, "");
+				field.dispatchEvent(new Event("input", { bubbles: true }));
+			});
+			await page.waitForFunction(
+				() =>
+					document.querySelector(".project-group .session-row.selected")?.textContent?.includes("Conversation 7") ===
+						true && document.querySelectorAll(".project-group .session-row").length > 5,
+			);
+			const revealed = await page.evaluate(() => ({
+				rows: document.querySelectorAll(".project-group .session-row").length,
+				selected: document.querySelector(".project-group .session-row.selected")?.textContent,
+			}));
+			expect(revealed.selected).toContain("Conversation 7");
+			// The page grew just far enough to include the selection; the rest is still behind one click.
+			expect(revealed.rows).toBe(7);
+			expect(await page.$eval(".project-group .show-more", button => button.textContent)).toBe("Show 5 more");
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("closes a workspace from its context menu and asks the host to reorder lists", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => {
+				const make = (id: string, title: string): DesktopSession => ({
+					id,
+					title,
+					projectId: "p",
+					status: "idle",
+					starred: false,
+					imageInput: { supported: true, blocked: false },
+					operatorRunning: false,
+					controlGeneration: 1,
+					messages: [],
+				});
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [
+							{ id: "p", name: "Project", path: "/project" },
+							{ id: "q", name: "Second", path: "/second" },
+						],
+						sessions: [make("s1", "One"), make("s2", "Two")],
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			});
+			await page.waitForFunction(() => document.querySelectorAll(".project-group").length === 2);
+			// Dragging a workspace onto its sibling asks the host for the new order. The steps are
+			// separate tasks because a real drag also spans frames, letting React re-render between.
+			const startDrag = (selector: string, index: number) =>
+				page.evaluate(
+					({ selector, index }) => {
+						const target = [...document.querySelectorAll(selector)][index] as HTMLElement | undefined;
+						target?.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: new DataTransfer() }));
+					},
+					{ selector, index },
+				);
+			const dragOver = (selector: string, index: number) =>
+				page.evaluate(
+					({ selector, index }) => {
+						const target = [...document.querySelectorAll(selector)][index] as HTMLElement | undefined;
+						target?.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true }));
+					},
+					{ selector, index },
+				);
+			await startDrag(".project-group .project-heading", 0);
+			await dragOver(".project-group", 1);
+			// A downward drag inserts after the target, and the cue says so before the drop.
+			expect(
+				await page.evaluate(() =>
+					[...document.querySelectorAll(".project-group")].map(group => ({
+						dragging: group.classList.contains("dragging"),
+						after: group.classList.contains("drop-after"),
+						before: group.classList.contains("drop-before"),
+					})),
+				),
+			).toEqual([
+				{ dragging: true, after: false, before: false },
+				{ dragging: false, after: true, before: false },
+			]);
+			await page.evaluate(() => {
+				const groups = [...document.querySelectorAll(".project-group")] as HTMLElement[];
+				groups[1]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
+			});
+			await page.waitForFunction(() =>
+				window.fixture.requests().some(request => request.method === "project.reorder"),
+			);
+			// A drop that carries only the payload is still applied: the browser exposes the drag
+			// data at drop time, and a fast drag can land before React re-renders the drag state.
+			await page.evaluate(() => {
+				const groups = [...document.querySelectorAll(".project-group")] as HTMLElement[];
+				const transfer = new DataTransfer();
+				transfer.setData("text/plain", "q");
+				groups[0]!.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
+			});
+			await page.waitForFunction(
+				() => window.fixture.requests().filter(request => request.method === "project.reorder").length === 2,
+			);
+			await page.waitForFunction(() =>
+				window.fixture.requests().some(request => request.method === "project.reorder"),
+			);
+			expect(
+				await page.evaluate(
+					() => window.fixture.requests().find(request => request.method === "project.reorder")?.params,
+				),
+			).toEqual({ ids: ["q", "p"] });
+			await page.click(".project-group:first-child .project-heading", { button: "right" });
+			await page.waitForSelector('.context-menu [role="menuitem"]');
+			const items = await page.evaluate(() =>
+				[...document.querySelectorAll('.context-menu [role="menuitem"]')].map(item => item.textContent),
+			);
+			expect(items).toEqual(["Move workspace up", "Move workspace down", "Close workspace"]);
+			// The first workspace cannot move up, and Escape dismisses without acting.
+			const bounds = await page.evaluate(() => {
+				const buttons = [...document.querySelectorAll('.context-menu [role="menuitem"]')];
+				return buttons.map(button => (button as HTMLButtonElement).disabled);
+			});
+			expect(bounds).toEqual([true, false, false]);
+			await page.keyboard.press("Escape");
+			expect(await page.$(".context-menu")).toBeNull();
+			// The same menu opens from the keyboard, which is the non-pointer reorder path.
+			await page.focus(".project-group:first-child .project-heading");
+			await page.keyboard.down("Shift");
+			await page.keyboard.press("F10");
+			await page.keyboard.up("Shift");
+			await page.waitForSelector(".context-menu");
+			const menuBox = await page.evaluate(() => {
+				const menu = document.querySelector(".context-menu")?.getBoundingClientRect();
+				return menu ? { left: menu.left, top: menu.top, right: menu.right } : null;
+			});
+			expect(menuBox?.left ?? -1).toBeGreaterThanOrEqual(8);
+			expect((menuBox?.right ?? 0) <= 1400).toBe(true);
+			await page.evaluate(() => {
+				const close = [...document.querySelectorAll('.context-menu [role="menuitem"]')].find(
+					item => item.textContent === "Close workspace",
+				);
+				(close as HTMLElement | undefined)?.click();
+			});
+			await page.waitForFunction(() =>
+				window.fixture.requests().some(request => request.method === "project.close"),
+			);
+			const closed = await page.evaluate(
+				() => window.fixture.requests().find(request => request.method === "project.close")?.params,
+			);
+			expect(closed).toEqual({ projectId: "p" });
+			expect(await page.$(".context-menu")).toBeNull();
+
+			// Dragging a conversation onto a sibling asks for the new order, not a mutation of it.
+			await startDrag(".project-group .session-drop", 0);
+			await dragOver(".project-group .session-drop", 1);
+			expect(
+				await page.evaluate(() =>
+					[...document.querySelectorAll(".project-group .session-drop")].map(row => ({
+						after: row.classList.contains("drop-after"),
+						before: row.classList.contains("drop-before"),
+					})),
+				),
+			).toEqual([
+				{ after: false, before: false },
+				{ after: true, before: false },
+			]);
+			await page.evaluate(() => {
+				const rows = [...document.querySelectorAll(".project-group .session-drop")] as HTMLElement[];
+				rows[1]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
+			});
+			await page.waitForFunction(() =>
+				window.fixture.requests().some(request => request.method === "session.reorder"),
+			);
+			expect(
+				await page.evaluate(
+					() => window.fixture.requests().find(request => request.method === "session.reorder")?.params,
+				),
+			).toEqual({ projectId: "p", ids: ["s2", "s1"] });
+			// The host publishes the reordered list; mirror it so the upward drag starts from it.
+			await page.evaluate(() => {
+				const make = (id: string, title: string): DesktopSession => ({
+					id,
+					title,
+					projectId: "p",
+					status: "idle",
+					starred: false,
+					imageInput: { supported: true, blocked: false },
+					operatorRunning: false,
+					controlGeneration: 1,
+					messages: [],
+				});
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [
+							{ id: "p", name: "Project", path: "/project" },
+							{ id: "q", name: "Second", path: "/second" },
+						],
+						sessions: [make("s2", "Two"), make("s1", "One")],
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			});
+			await page.waitForFunction(
+				() =>
+					document
+						.querySelector(".project-group .session-row")
+						?.textContent?.includes("Two") === true,
+			);
+			// An upward drag inserts before its target, and dropping asks for that order too.
+			await startDrag(".project-group .session-drop", 1);
+			await dragOver(".project-group .session-drop", 0);
+			expect(
+				await page.evaluate(() =>
+					[...document.querySelectorAll(".project-group .session-drop")].map(row => ({
+						after: row.classList.contains("drop-after"),
+						before: row.classList.contains("drop-before"),
+					})),
+				),
+			).toEqual([
+				{ after: false, before: true },
+				{ after: false, before: false },
+			]);
+			await page.evaluate(() => {
+				const rows = [...document.querySelectorAll(".project-group .session-drop")] as HTMLElement[];
+				rows[0]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
+			});
+			await page.waitForFunction(
+				() => window.fixture.requests().filter(request => request.method === "session.reorder").length === 2,
+			);
+			expect(
+				await page.evaluate(
+					() =>
+						window.fixture.requests().filter(request => request.method === "session.reorder").at(-1)?.params,
+				),
+			).toEqual({ projectId: "p", ids: ["s1", "s2"] });
+			// A conversation carried over another workspace has no destination: no cue, no request.
+			await page.evaluate(() => {
+				window.fixture.emit({
+					type: "snapshot",
+					snapshot: {
+						protocolVersion: 1,
+						projects: [
+							{ id: "p", name: "Project", path: "/project" },
+							{ id: "q", name: "Second", path: "/second" },
+						],
+						sessions: [
+							{ id: "s1", title: "One", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] },
+							{ id: "s2", title: "Two", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] },
+							{ id: "q1", title: "Other", projectId: "q", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] },
+						],
+						models: [],
+						capabilities: [],
+						deliveries: [],
+					},
+				});
+			});
+			await page.waitForFunction(() => document.querySelectorAll(".project-group").length === 2);
+			const foreignBefore = await page.evaluate(
+				() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
+			);
+			await startDrag(".project-group .session-drop", 2);
+			await dragOver(".project-group .session-drop", 0);
+			expect(
+				await page.evaluate(() =>
+					[...document.querySelectorAll(".project-group .session-drop")].map(row => row.className),
+				),
+			).not.toContain("drop-after");
+			await page.evaluate(() => {
+				const rows = [...document.querySelectorAll(".project-group .session-drop")] as HTMLElement[];
+				const transfer = new DataTransfer();
+				transfer.setData("text/plain", "q1");
+				rows[0]!.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
+			});
+			await Bun.sleep(100);
+			expect(
+				await page.evaluate(
+					() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
+				),
+			).toBe(foreignBefore);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("a running turn stays stoppable when its draft cannot be steered", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			// An operator-owned run keeps the draft: sending is blocked, so the slot must be stop.
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "running",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: true,
+						controlGeneration: 1,
+						messages: [],
+					},
+				}),
+			);
+			await page.type(".composer textarea", "typed while the operator owns the turn");
+			await page.waitForFunction(
+				() => document.querySelector(".composer-actions button")?.getAttribute("aria-label") === "Stop",
+			);
+			const slot = await page.evaluate(() => {
+				const button = document.querySelector(".composer-actions button");
+				return { type: button?.getAttribute("type"), disabled: (button as HTMLButtonElement | null)?.disabled, label: button?.getAttribute("aria-label") };
+			});
+			expect(slot.type).toBe("button");
+			expect(slot.disabled).toBe(false);
+			expect(slot.label).toBe("Stop");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("the send-to-stop swap ignores an immediate second click", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "running",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: false,
+						controlGeneration: 1,
+						messages: [],
+					},
+				}),
+			);
+			await page.type(".composer textarea", "steer once");
+			// Click send, then the same pixel again before the slot finishes becoming stop.
+			await page.click(".composer-actions button");
+			await page.waitForFunction(
+				() => document.querySelector(".composer-actions button")?.getAttribute("aria-label") === "Stop",
+			);
+			await page.click(".composer-actions button");
+			expect(await page.evaluate(() => window.fixture.requests().some(request => request.method === "abort"))).toBe(false);
+			expect(await page.evaluate(() => window.fixture.requests().filter(request => request.method === "prompt").length)).toBe(1);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 

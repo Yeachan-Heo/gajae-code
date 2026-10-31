@@ -46,7 +46,11 @@ function expectEverySplit(secrets: readonly string[], source: string, expected: 
 
 describe("desktop host streaming secret redactor", () => {
 	test("masks a known key at every split, including one-character pushes and repeated occurrences", () => {
-		expectEverySplit(["private-token"], "start:private-token:middle:private-token:end", `start:${MARKER}:middle:${MARKER}:end`);
+		expectEverySplit(
+			["private-token"],
+			"start:private-token:middle:private-token:end",
+			`start:${MARKER}:middle:${MARKER}:end`,
+		);
 	});
 
 	test("matches multiline keys without treating newlines as release boundaries", () => {
@@ -188,7 +192,9 @@ describe("desktop host streaming secret redactor", () => {
 	});
 
 	test("a finish-time callback failure cannot return the pending tail", () => {
-		const stream = createDesktopStreamRedactor(["private-token"], () => { throw new Error("callback failed"); });
+		const stream = createDesktopStreamRedactor(["private-token"], () => {
+			throw new Error("callback failed");
+		});
 		expect(stream.push("private-")).toBe("");
 		expect(() => stream.finish()).toThrow(FAILURE);
 		expect(() => stream.push("token")).toThrow(FAILURE);
@@ -206,10 +212,16 @@ describe("desktop host streaming secret redactor", () => {
 	test("rejects reentrancy even when the callback catches the nested failure", () => {
 		let reenter: () => void = () => {};
 		const stream = createDesktopStreamRedactor([], text => {
-			try { reenter(); } catch { /* Outer emission must still fail closed. */ }
+			try {
+				reenter();
+			} catch {
+				/* Outer emission must still fail closed. */
+			}
 			return text;
 		});
-		reenter = () => { stream.push("nested-content"); };
+		reenter = () => {
+			stream.push("nested-content");
+		};
 		expect(() => stream.push("outer-content")).toThrow(FAILURE);
 		expect(() => stream.finish()).toThrow(FAILURE);
 	});

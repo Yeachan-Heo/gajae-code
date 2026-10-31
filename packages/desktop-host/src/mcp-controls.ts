@@ -68,11 +68,23 @@ function object(value: unknown, keys: readonly string[]): Record<string, unknown
 
 function reference(value: unknown): DesktopMcpRef {
 	const parsed = object(value, ["key", "sessionGeneration", "connectionGeneration"]);
-	if (typeof parsed.key !== "string" || !parsed.key || parsed.key.length > 128 ||
-		typeof parsed.connectionGeneration !== "string" || !parsed.connectionGeneration || parsed.connectionGeneration.length > 128 ||
-		typeof parsed.sessionGeneration !== "number" || !Number.isSafeInteger(parsed.sessionGeneration) || parsed.sessionGeneration < 0)
+	if (
+		typeof parsed.key !== "string" ||
+		!parsed.key ||
+		parsed.key.length > 128 ||
+		typeof parsed.connectionGeneration !== "string" ||
+		!parsed.connectionGeneration ||
+		parsed.connectionGeneration.length > 128 ||
+		typeof parsed.sessionGeneration !== "number" ||
+		!Number.isSafeInteger(parsed.sessionGeneration) ||
+		parsed.sessionGeneration < 0
+	)
 		throw new DesktopMcpError("invalid_input");
-	return { key: parsed.key, connectionGeneration: parsed.connectionGeneration, sessionGeneration: parsed.sessionGeneration };
+	return {
+		key: parsed.key,
+		connectionGeneration: parsed.connectionGeneration,
+		sessionGeneration: parsed.sessionGeneration,
+	};
 }
 
 function action(value: unknown): DesktopMcpAction {
@@ -86,14 +98,23 @@ function failure(error: unknown): DesktopMcpError {
 	const descriptor = error && typeof error === "object" ? Object.getOwnPropertyDescriptor(error, "code") : undefined;
 	const code: unknown = descriptor && "value" in descriptor ? descriptor.value : undefined;
 	switch (code) {
-		case "invalid_target": return new DesktopMcpError("invalid_input");
-		case "stale_target": return new DesktopMcpError("stale_target");
-		case "resource_gone": return new DesktopMcpError("stale_session");
-		case "busy": case "MCP_MANAGER_LIFECYCLE_CLOSED": return new DesktopMcpError("busy");
-		case "unsupported": return new DesktopMcpError("unsupported");
-		case "unavailable": return new DesktopMcpError("unavailable");
-		case "unknown_effect": return new DesktopMcpError("unknown_effect");
-		default: return new DesktopMcpError("backend_failure");
+		case "invalid_target":
+			return new DesktopMcpError("invalid_input");
+		case "stale_target":
+			return new DesktopMcpError("stale_target");
+		case "resource_gone":
+			return new DesktopMcpError("stale_session");
+		case "busy":
+		case "MCP_MANAGER_LIFECYCLE_CLOSED":
+			return new DesktopMcpError("busy");
+		case "unsupported":
+			return new DesktopMcpError("unsupported");
+		case "unavailable":
+			return new DesktopMcpError("unavailable");
+		case "unknown_effect":
+			return new DesktopMcpError("unknown_effect");
+		default:
+			return new DesktopMcpError("backend_failure");
 	}
 }
 
@@ -119,15 +140,24 @@ export class DesktopMcpController {
 	#stale = false;
 
 	constructor(result: FactoryResult, options: DesktopMcpOptions) {
-		if (!options || typeof options.connectionGeneration !== "string" || !options.connectionGeneration ||
-			options.connectionGeneration.length > 128 || typeof options.redact !== "function") throw new DesktopMcpError("invalid_input");
+		if (
+			!options ||
+			typeof options.connectionGeneration !== "string" ||
+			!options.connectionGeneration ||
+			options.connectionGeneration.length > 128 ||
+			typeof options.redact !== "function"
+		)
+			throw new DesktopMcpError("invalid_input");
 		this.#session = result.session;
 		this.#manager = result.mcpManager;
 		this.#sessionManager = result.session.sessionManager;
 		this.#sessionId = result.session.sessionId;
 		this.#managerSessionId = this.#sessionManager.getSessionId();
 		this.#owner = result.session.getAgentId();
-		this.#scope = { connectionGeneration: options.connectionGeneration, sessionGeneration: result.session.sessionLifecycle.generation };
+		this.#scope = {
+			connectionGeneration: options.connectionGeneration,
+			sessionGeneration: result.session.sessionLifecycle.generation,
+		};
 		this.#redact = options.redact;
 		this.#assertCurrent();
 	}
@@ -148,8 +178,12 @@ export class DesktopMcpController {
 		}
 		// Only settled same-generation identity drift is permanent ABA evidence.
 		// Preparation may stage these getters and then restore the predecessor.
-		if (this.#session.sessionId !== this.#sessionId || this.#session.sessionManager !== this.#sessionManager ||
-			this.#sessionManager.getSessionId() !== this.#managerSessionId || this.#session.getAgentId() !== this.#owner) {
+		if (
+			this.#session.sessionId !== this.#sessionId ||
+			this.#session.sessionManager !== this.#sessionManager ||
+			this.#sessionManager.getSessionId() !== this.#managerSessionId ||
+			this.#session.getAgentId() !== this.#owner
+		) {
 			this.#stale = true;
 			this.#references.clear();
 			throw new DesktopMcpError("stale_session");
@@ -161,11 +195,19 @@ export class DesktopMcpController {
 			const redacted: unknown = this.#redact(text);
 			if (typeof redacted !== "string") throw new DesktopMcpError("redaction_failed");
 			return redacted.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, DESKTOP_MCP_LIMITS.fieldChars);
-		} catch { throw new DesktopMcpError("redaction_failed"); }
+		} catch {
+			throw new DesktopMcpError("redaction_failed");
+		}
 	}
 
 	getSnapshot(): DesktopMcpSnapshot {
-		const base: DesktopMcpSnapshot = { ...this.#scope, scope: "factory_manager_may_be_shared", available: false, servers: [], truncated: false };
+		const base: DesktopMcpSnapshot = {
+			...this.#scope,
+			scope: "factory_manager_may_be_shared",
+			available: false,
+			servers: [],
+			truncated: false,
+		};
 		try {
 			// Reading status never enters prompt/mutation admission.
 			this.#assertCurrent(true);
@@ -174,8 +216,12 @@ export class DesktopMcpController {
 			const current = snapshot.slice(0, DESKTOP_MCP_LIMITS.servers);
 			const retained = new Set<string>();
 			const servers: DesktopMcpServer[] = current.map(server => {
-				let entry = [...this.#references].find(([, ref]) => ref.target.binding === server.target.binding &&
-					ref.target.name === server.target.name && ref.target.generation === server.target.generation);
+				let entry = [...this.#references].find(
+					([, ref]) =>
+						ref.target.binding === server.target.binding &&
+						ref.target.name === server.target.name &&
+						ref.target.generation === server.target.generation,
+				);
 				if (!entry) {
 					const key = crypto.randomUUID();
 					const ref = { target: { ...server.target }, ordinal: ++this.#ordinal };
@@ -187,8 +233,11 @@ export class DesktopMcpController {
 				return {
 					ref: { ...this.#scope, key },
 					// Configured names can themselves contain URLs or credentials. Keep them private.
-					label: this.#text(`MCP server ${ref.ordinal}`), state: server.state, transport: server.transport,
-					sharing: server.sharing, toolCount: Math.max(0, Math.min(1_000_000, server.toolCount)),
+					label: this.#text(`MCP server ${ref.ordinal}`),
+					state: server.state,
+					transport: server.transport,
+					sharing: server.sharing,
+					toolCount: Math.max(0, Math.min(1_000_000, server.toolCount)),
 					controls: this.#session.sessionLifecycle.transitioning ? [] : [...server.controls],
 				};
 			});
@@ -208,7 +257,8 @@ export class DesktopMcpController {
 			const ref = reference(value);
 			const operation = action(requestedAction);
 			this.#assertCurrent();
-			if (ref.connectionGeneration !== this.#scope.connectionGeneration) throw new DesktopMcpError("stale_connection");
+			if (ref.connectionGeneration !== this.#scope.connectionGeneration)
+				throw new DesktopMcpError("stale_connection");
 			if (ref.sessionGeneration !== this.#scope.sessionGeneration) throw new DesktopMcpError("stale_session");
 			const target = this.#references.get(ref.key)?.target;
 			if (!target) throw new DesktopMcpError("not_found");
@@ -221,13 +271,23 @@ export class DesktopMcpController {
 			});
 			this.#assertCurrent();
 			return { status: result.status, cleanup: result.cleanup, snapshot: this.getSnapshot() };
-		} catch (error) { throw failure(error); }
+		} catch (error) {
+			throw failure(error);
+		}
 	}
 
 	/** Notifications wake only. They never authorize a fresh session/target binding. */
 	onChange(listener: () => void): () => void {
 		this.#assertCurrent(true);
-		const wake = (): void => { if (!this.#disposed) { try { listener(); } catch { /* Isolated host subscriber. */ } } };
+		const wake = (): void => {
+			if (!this.#disposed) {
+				try {
+					listener();
+				} catch {
+					/* Isolated host subscriber. */
+				}
+			}
+		};
 		const unsubscribers = [this.#session.subscribe(wake)];
 		if (this.#manager) {
 			unsubscribers.push(this.#manager.subscribeToServerControlsChanged(wake));

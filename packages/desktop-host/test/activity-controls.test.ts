@@ -8,17 +8,30 @@ import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-age
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { approvalGate, executionGate, questionToGate, type WorkflowGateEmitter } from "@gajae-code/coding-agent/sdk/workflow-gates";
-import { ExtensionRunner, loadExtensionFromFactory, type ExtensionFactory } from "@gajae-code/coding-agent/extensibility/extensions";
+import {
+	type ExtensionFactory,
+	ExtensionRunner,
+	loadExtensionFromFactory,
+} from "@gajae-code/coding-agent/extensibility/extensions";
 import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensions/loader";
-import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import {
+	JobObservation,
+	JobObservationError,
+	type JobObservationErrorCode,
+} from "@gajae-code/coding-agent/sdk/job-observation";
+import {
+	approvalGate,
+	executionGate,
+	questionToGate,
+	type WorkflowGateEmitter,
+} from "@gajae-code/coding-agent/sdk/workflow-gates";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
-import { JobObservation, JobObservationError, type JobObservationErrorCode } from "@gajae-code/coding-agent/sdk/job-observation";
-import { CronTool } from "@gajae-code/coding-agent/tools/cron";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { CronTool } from "@gajae-code/coding-agent/tools/cron";
+import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import {
 	createDesktopActivityController,
 	DESKTOP_ACTIVITY_LIMITS,
@@ -39,7 +52,11 @@ function manager(retentionMs?: number, maxRunningJobs = 200): AsyncJobManager {
 }
 
 /** Real public observation, with a session lifecycle seam; never a provider or global manager. */
-function fixture(value = manager(), owner: string = crypto.randomUUID(), redact: (text: string) => string = text => text) {
+function fixture(
+	value = manager(),
+	owner: string = crypto.randomUUID(),
+	redact: (text: string) => string = text => text,
+) {
 	const observation = new JobObservation(value, owner);
 	observations.push(observation);
 	const listeners = new Set<() => void>();
@@ -48,7 +65,11 @@ function fixture(value = manager(), owner: string = crypto.randomUUID(), redact:
 	const managerSessionId = crypto.randomUUID();
 	const lifecycle = { generation: 0, transitioning: false };
 	const session = {
-		get sessionLifecycle(): { readonly generation: number; readonly transitioning: boolean; readonly disposed: boolean } {
+		get sessionLifecycle(): {
+			readonly generation: number;
+			readonly transitioning: boolean;
+			readonly disposed: boolean;
+		} {
 			return Object.freeze({ ...lifecycle, disposed: session.isDisposed });
 		},
 		sessionManager: { getSessionId: (): string => managerSessionId },
@@ -59,25 +80,42 @@ function fixture(value = manager(), owner: string = crypto.randomUUID(), redact:
 		getWorkflowGateEmitter: (): WorkflowGateEmitter | undefined => undefined,
 		subscribe: (listener: () => void) => {
 			listeners.add(listener);
-			return () => { listeners.delete(listener); };
+			return () => {
+				listeners.delete(listener);
+			};
 		},
 		registerToolSessionCleanup: (cleanup: () => void) => {
 			cleanups.add(cleanup);
-			return () => { cleanups.delete(cleanup); };
+			return () => {
+				cleanups.delete(cleanup);
+			};
 		},
 		registerToolSessionTransitionCleanup: (cleanup: () => void) => {
 			transitions.add(cleanup);
-			return () => { transitions.delete(cleanup); };
+			return () => {
+				transitions.delete(cleanup);
+			};
 		},
 	};
 	const result: Pick<CreateAgentSessionResult, "session" | "jobObservation"> = {
-		session: session as unknown as CreateAgentSessionResult["session"], jobObservation: observation,
+		session: session as unknown as CreateAgentSessionResult["session"],
+		jobObservation: observation,
 	};
 	const options = { connectionGeneration: crypto.randomUUID(), redact };
 	const controller = createDesktopActivityController(result, options);
 	controllers.push(controller);
 	return {
-		value, owner, observation, session, result, options, controller, listeners, cleanups, transitions, lifecycle,
+		value,
+		owner,
+		observation,
+		session,
+		result,
+		options,
+		controller,
+		listeners,
+		cleanups,
+		transitions,
+		lifecycle,
 		disposeSession() {
 			session.isDisposed = true;
 			observation.dispose();
@@ -90,7 +128,8 @@ function fixture(value = manager(), owner: string = crypto.randomUUID(), redact:
 	};
 }
 
-type RemoteEmitter = WorkflowGateEmitter & Required<Pick<WorkflowGateEmitter, "listPendingGates" | "registerGateTerminalController" | "resolveGate">>;
+type RemoteEmitter = WorkflowGateEmitter &
+	Required<Pick<WorkflowGateEmitter, "listPendingGates" | "registerGateTerminalController" | "resolveGate">>;
 
 function assertRemoteEmitter(emitter: WorkflowGateEmitter | undefined): asserts emitter is RemoteEmitter {
 	if (!emitter?.listPendingGates || !emitter.registerGateTerminalController || !emitter.resolveGate)
@@ -122,14 +161,26 @@ async function gateFixture(
 	const session = new AgentSession({
 		agent: new Agent({
 			initialState: {
-				tools: [], messages: sessionManager.buildSessionContext().messages, systemPrompt: [],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+				systemPrompt: [],
 				...(options.compactable ? { model: getBundledModel("anthropic", "claude-sonnet-4-5") } : {}),
 			},
-			getApiKey: () => { throw new Error("No provider turns in activity tests"); },
-			streamFn: () => { throw new Error("No provider turns in activity tests"); },
+			getApiKey: () => {
+				throw new Error("No provider turns in activity tests");
+			},
+			streamFn: () => {
+				throw new Error("No provider turns in activity tests");
+			},
 		}),
-		sessionManager, settings, modelRegistry: registry, extensionRunner,
-		agentDir: root, workflowGatePublication: "local", ownedAsyncJobManager: f.value, agentId: f.owner,
+		sessionManager,
+		settings,
+		modelRegistry: registry,
+		extensionRunner,
+		agentDir: root,
+		workflowGatePublication: "local",
+		ownedAsyncJobManager: f.value,
+		agentId: f.owner,
 		disposeAsyncJobManager: false,
 	});
 	gateCleanups.push(async () => {
@@ -143,20 +194,44 @@ async function gateFixture(
 	assertRemoteEmitter(emitter);
 	const presented = new Set<string>();
 	const retired: string[] = [];
-	const unsubscribe = emitter.onGateEmitted?.(gate => { presented.add(gate.gate_id); });
-	const unregister = terminalController ? emitter.registerGateTerminalController({
-		completeGateInteractions: gateId => {
-			if (!presented.delete(gateId)) throw new Error("Fixture no longer owns the gate presentation");
-			retired.push(gateId);
-			return "retired";
-		},
-		cancelGateInteractions: gateId => { presented.delete(gateId); },
-	}) : undefined;
-	const result: Pick<CreateAgentSessionResult, "session" | "jobObservation"> = { session, jobObservation: f.observation };
+	const unsubscribe = emitter.onGateEmitted?.(gate => {
+		presented.add(gate.gate_id);
+	});
+	const unregister = terminalController
+		? emitter.registerGateTerminalController({
+				completeGateInteractions: gateId => {
+					if (!presented.delete(gateId)) throw new Error("Fixture no longer owns the gate presentation");
+					retired.push(gateId);
+					return "retired";
+				},
+				cancelGateInteractions: gateId => {
+					presented.delete(gateId);
+				},
+			})
+		: undefined;
+	const result: Pick<CreateAgentSessionResult, "session" | "jobObservation"> = {
+		session,
+		jobObservation: f.observation,
+	};
 	const controller = createDesktopActivityController(result, f.options);
 	controllers.push(controller);
-	gateCleanups.push(async () => { controller.dispose(); unsubscribe?.(); unregister?.(); });
-	return { ...f, session, result, controller, emitter, retired, extensionRunner, disposeSession() { void session.dispose(); } };
+	gateCleanups.push(async () => {
+		controller.dispose();
+		unsubscribe?.();
+		unregister?.();
+	});
+	return {
+		...f,
+		session,
+		result,
+		controller,
+		emitter,
+		retired,
+		extensionRunner,
+		disposeSession() {
+			void session.dispose();
+		},
+	};
 }
 
 function gateRef(controller: DesktopActivityController): DesktopActivityRef {
@@ -166,12 +241,17 @@ function gateRef(controller: DesktopActivityController): DesktopActivityRef {
 }
 
 function monitor(value: AsyncJobManager, ownerId: string, id?: string, label = "monitor"): string {
-	return value.register("bash", label, ({ signal }) => {
-		const gate = Promise.withResolvers<string>();
-		if (signal.aborted) gate.resolve("aborted");
-		else signal.addEventListener("abort", () => gate.resolve("aborted"), { once: true });
-		return gate.promise;
-	}, { id, ownerId, metadata: { monitor: true } });
+	return value.register(
+		"bash",
+		label,
+		({ signal }) => {
+			const gate = Promise.withResolvers<string>();
+			if (signal.aborted) gate.resolve("aborted");
+			else signal.addEventListener("abort", () => gate.resolve("aborted"), { once: true });
+			return gate.promise;
+		},
+		{ id, ownerId, metadata: { monitor: true } },
+	);
 }
 
 function snapshot(controller: DesktopActivityController): Extract<DesktopActivitySnapshot, { available: true }> {
@@ -194,16 +274,31 @@ function taskRef(controller: DesktopActivityController, id: string): DesktopActi
 
 function runningTask(value: AsyncJobManager, ownerId: string, id: string) {
 	const gate = Promise.withResolvers<SubagentRunOutcome>();
-	const jobId = value.register("task", id, ({ signal }) => {
-		signal.addEventListener("abort", () => gate.resolve({ kind: "completed", text: "stopped" }), { once: true });
-		return gate.promise;
-	}, { ownerId });
-	value.registerSubagentRecord({ subagentId: id, ownerId, status: "running", currentJobId: jobId, historicalJobIds: [jobId], sessionFile: null, resumable: true });
+	const jobId = value.register(
+		"task",
+		id,
+		({ signal }) => {
+			signal.addEventListener("abort", () => gate.resolve({ kind: "completed", text: "stopped" }), { once: true });
+			return gate.promise;
+		},
+		{ ownerId },
+	);
+	value.registerSubagentRecord({
+		subagentId: id,
+		ownerId,
+		status: "running",
+		currentJobId: jobId,
+		historicalJobIds: [jobId],
+		sessionFile: null,
+		resumable: true,
+	});
 	return { gate, job: value.getJob(jobId)! };
 }
 
 function expectCode(action: () => unknown, code: DesktopActivityErrorCode): void {
-	expect(action).toThrow(expect.objectContaining({ name: "DesktopActivityError", code } satisfies Partial<DesktopActivityError>));
+	expect(action).toThrow(
+		expect.objectContaining({ name: "DesktopActivityError", code } satisfies Partial<DesktopActivityError>),
+	);
 }
 
 afterEach(async () => {
@@ -227,7 +322,10 @@ describe("desktop session-owned activity", () => {
 		expect(snapshot(first.controller).jobs.map(job => job.id)).toEqual([owned]);
 		expect(first.controller.getDetail(ref).output?.text).toBe("owned output");
 		expectCode(() => first.controller.operate(foreignRef, "cancel"), "stale_connection");
-		expectCode(() => first.controller.operate({ ...foreignRef, connectionGeneration: ref.connectionGeneration }, "cancel"), "stale_session");
+		expectCode(
+			() => first.controller.operate({ ...foreignRef, connectionGeneration: ref.connectionGeneration }, "cancel"),
+			"stale_session",
+		);
 		expectCode(() => first.controller.operate({ ...ref, key: foreignRef.key }, "cancel"), "not_found");
 		expectCode(() => first.controller.operate({ ...ref, key: "forged" }, "cancel"), "not_found");
 		expectCode(() => first.controller.getDetail({ ...ref, key: "x".repeat(129) }), "invalid_reference");
@@ -290,7 +388,9 @@ describe("desktop session-owned activity", () => {
 		const id = monitor(f.value, f.owner);
 		const ref = refFor(f.controller, id);
 		let changes = 0;
-		f.controller.onChange(() => { changes++; });
+		f.controller.onChange(() => {
+			changes++;
+		});
 		f.controller.dispose();
 		f.controller.dispose();
 		monitor(f.value, f.owner);
@@ -301,7 +401,10 @@ describe("desktop session-owned activity", () => {
 		expect(f.transitions.size).toBe(0);
 		expect(f.observation.getSnapshot().jobs).toHaveLength(2);
 		expect(f.value.getJob(id)?.status).toBe("running");
-		expect(f.controller.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("disposed") });
+		expect(f.controller.getSnapshot()).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("disposed"),
+		});
 		expectCode(() => f.controller.getDetail(ref), "disposed");
 		expectCode(() => f.controller.operate(ref, "cancel"), "disposed");
 	});
@@ -312,7 +415,10 @@ describe("desktop session-owned activity", () => {
 		const ref = refFor(f.controller, id);
 		f.observation.dispose();
 		expectCode(() => f.controller.operate(ref, "cancel"), "disposed");
-		expect(f.controller.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("disposed") });
+		expect(f.controller.getSnapshot()).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("disposed"),
+		});
 		expect("jobs" in f.controller.getSnapshot()).toBe(false);
 		f.disposeSession();
 		expectCode(() => f.controller.acknowledgeFailures(ref), "disposed");
@@ -335,7 +441,15 @@ describe("desktop session-owned activity", () => {
 	test("notifications without a committed SDK generation preserve exact task, monitor and gate refs", async () => {
 		const f = await gateFixture();
 		const id = monitor(f.value, f.owner);
-		f.value.registerSubagentRecord({ subagentId: "notice-task", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: false });
+		f.value.registerSubagentRecord({
+			subagentId: "notice-task",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: false,
+		});
 		const job = refFor(f.controller, id);
 		const task = taskRef(f.controller, "notice-task");
 		const pending = f.emitter.emitGate(approvalGate());
@@ -343,7 +457,9 @@ describe("desktop session-owned activity", () => {
 		const gate = gateRef(f.controller);
 		const generation = f.session.sessionLifecycle.generation;
 		let wakes = 0;
-		f.controller.onChange(() => { wakes++; });
+		f.controller.onChange(() => {
+			wakes++;
+		});
 		f.session.emitNotice("info", "Catalog notification without transition", "test");
 		expect(wakes).toBeGreaterThan(0);
 		expect(f.session.sessionLifecycle.generation).toBe(generation);
@@ -363,7 +479,14 @@ describe("desktop session-owned activity", () => {
 			api.on("session_before_compact", async event => {
 				entered.resolve();
 				await release.promise;
-				return { compaction: { summary: "Provider-free hook compaction", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, details: {} } };
+				return {
+					compaction: {
+						summary: "Provider-free hook compaction",
+						firstKeptEntryId: event.preparation.firstKeptEntryId,
+						tokensBefore: event.preparation.tokensBefore,
+						details: {},
+					},
+				};
 			});
 		};
 		const f = await gateFixture(true, text => text, { extensionFactory, compactable: true });
@@ -372,9 +495,16 @@ describe("desktop session-owned activity", () => {
 		const lifecycle = f.session.sessionLifecycle;
 		const compaction = f.session.compact();
 		await entered.promise;
-		expect(f.session.sessionLifecycle).toMatchObject({ generation: lifecycle.generation, transitioning: true, disposed: false });
+		expect(f.session.sessionLifecycle).toMatchObject({
+			generation: lifecycle.generation,
+			transitioning: true,
+			disposed: false,
+		});
 		expectCode(() => f.controller.operate(ref, "cancel"), "control_busy");
-		expect(f.controller.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("lifecycle is changing") });
+		expect(f.controller.getSnapshot()).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("lifecycle is changing"),
+		});
 		release.resolve();
 		expect((await compaction).summary).toBe("Provider-free hook compaction");
 		expect(f.session.sessionLifecycle).toEqual(lifecycle);
@@ -405,7 +535,9 @@ describe("desktop session-owned activity", () => {
 		await entered.promise;
 		expect(f.session.sessionLifecycle).toMatchObject({ generation: lifecycle.generation, transitioning: true });
 		expectCode(() => f.controller.getGatePresentation(gate), "control_busy");
-		await expect(f.controller.answerGate(gate, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "control_busy" });
+		await expect(
+			f.controller.answerGate(gate, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "control_busy" });
 		release.resolve();
 		expect(await preparation).toBe(false);
 		expect(f.session.sessionLifecycle).toEqual(lifecycle);
@@ -450,7 +582,9 @@ describe("desktop session-owned activity", () => {
 		expect(await f.session.clearContext()).toBe(true);
 		expect(f.session.sessionId).toBe(originalId);
 		expectCode(() => f.controller.operate(ref, "cancel"), "stale_session");
-		await expect(f.controller.answerGate(gate, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_session" });
+		await expect(
+			f.controller.answerGate(gate, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_session" });
 	});
 
 	test("cleanup notifications alone cannot permanently revoke unchanged generation, but observed illegal identity ABA can", () => {
@@ -475,12 +609,31 @@ describe("desktop session-owned activity", () => {
 		const id = monitor(f.value, f.owner);
 		const ref = refFor(f.controller, id);
 		let reads = 0;
-		const request = { ...ref, get key() { reads++; return reads === 1 ? ref.key : "forged"; } };
+		const request = {
+			...ref,
+			get key() {
+				reads++;
+				return reads === 1 ? ref.key : "forged";
+			},
+		};
 		f.controller.operate(request, "cancel");
 		expect(reads).toBe(1);
 		const second = monitor(f.value, f.owner);
 		const secondRef = refFor(f.controller, second);
-		expectCode(() => f.controller.operate({ ...secondRef, get key() { f.disposeSession(); return secondRef.key; } }, "cancel"), "disposed");
+		expectCode(
+			() =>
+				f.controller.operate(
+					{
+						...secondRef,
+						get key() {
+							f.disposeSession();
+							return secondRef.key;
+						},
+					},
+					"cancel",
+				),
+			"disposed",
+		);
 		expect(f.value.getJob(second)?.status).toBe("running");
 	});
 
@@ -491,7 +644,15 @@ describe("desktop session-owned activity", () => {
 		f.value.markBackgrounded(folded, f.value.getJob(folded)!.generation, "sdk_control");
 		const plain = f.value.register("bash", "ordinary", async () => "done", { ownerId: f.owner });
 		const task = f.value.register("task", "detached", async () => "done", { ownerId: f.owner });
-		f.value.registerSubagentRecord({ subagentId: "paused-task", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: "/private/session.jsonl", resumable: true });
+		f.value.registerSubagentRecord({
+			subagentId: "paused-task",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: "/private/session.jsonl",
+			resumable: true,
+		});
 		const dto = snapshot(f.controller);
 		expect(dto.jobs.find(job => job.id === live)).toMatchObject({ controls: ["cancel"], outputAvailable: true });
 		for (const id of [folded, plain, task]) {
@@ -502,8 +663,10 @@ describe("desktop session-owned activity", () => {
 		}
 		const paused = dto.tasks[0]!;
 		expect(paused).toMatchObject({ status: "paused", controls: ["stop"] });
-		for (const operation of ["pause", "resume"] as const) expectCode(() => f.controller.operate(paused.ref, operation), "unsupported");
-		for (const operation of ["stop", "pause", "resume"] as const) expectCode(() => f.controller.operate(dto.jobs.find(job => job.id === live)!.ref, operation), "unsupported");
+		for (const operation of ["pause", "resume"] as const)
+			expectCode(() => f.controller.operate(paused.ref, operation), "unsupported");
+		for (const operation of ["stop", "pause", "resume"] as const)
+			expectCode(() => f.controller.operate(dto.jobs.find(job => job.id === live)!.ref, operation), "unsupported");
 		expect(JSON.stringify(dto)).not.toContain("/private/session.jsonl");
 		expect(f.value.getJob(live)?.status).toBe("running");
 	});
@@ -512,16 +675,29 @@ describe("desktop session-owned activity", () => {
 		const f = fixture();
 		const run = runningTask(f.value, f.owner, "task-lifecycle");
 		let pauseRequested = false;
-		f.value.registerLiveHandle("task-lifecycle", { requestPause: () => { pauseRequested = true; }, injectMessage: async () => {} });
-		let resumedJob: string | undefined;
-		f.value.registerResumeDescriptor({ subagentId: "task-lifecycle", ownerId: f.owner, data: { secret: "private-resume-payload" } }, id => {
-			resumedJob = f.value.register("task", id, ({ signal }) => {
-				const stopped = Promise.withResolvers<string>();
-				signal.addEventListener("abort", () => stopped.resolve("stopped"), { once: true });
-				return stopped.promise;
-			}, { ownerId: f.owner });
-			return resumedJob;
+		f.value.registerLiveHandle("task-lifecycle", {
+			requestPause: () => {
+				pauseRequested = true;
+			},
+			injectMessage: async () => {},
 		});
+		let resumedJob: string | undefined;
+		f.value.registerResumeDescriptor(
+			{ subagentId: "task-lifecycle", ownerId: f.owner, data: { secret: "private-resume-payload" } },
+			id => {
+				resumedJob = f.value.register(
+					"task",
+					id,
+					({ signal }) => {
+						const stopped = Promise.withResolvers<string>();
+						signal.addEventListener("abort", () => stopped.resolve("stopped"), { once: true });
+						return stopped.promise;
+					},
+					{ ownerId: f.owner },
+				);
+				return resumedJob;
+			},
+		);
 		const running = snapshot(f.controller).tasks[0]!;
 		expect(running.controls).toEqual(["stop", "pause"]);
 		f.controller.operate(running.ref, "pause");
@@ -546,8 +722,19 @@ describe("desktop session-owned activity", () => {
 	test("task refs exclude foreign owner authority, reject record replacement and cannot be modified through DTOs", () => {
 		const f = fixture();
 		const foreign = fixture(f.value);
-		for (const [owner, id] of [[f.owner, "owned-task"], [foreign.owner, "foreign-task"]] as const) {
-			f.value.registerSubagentRecord({ subagentId: id, ownerId: owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: false });
+		for (const [owner, id] of [
+			[f.owner, "owned-task"],
+			[foreign.owner, "foreign-task"],
+		] as const) {
+			f.value.registerSubagentRecord({
+				subagentId: id,
+				ownerId: owner,
+				status: "paused",
+				currentJobId: null,
+				historicalJobIds: [],
+				sessionFile: null,
+				resumable: false,
+			});
 		}
 		const ref = taskRef(f.controller, "owned-task");
 		const other = taskRef(foreign.controller, "foreign-task");
@@ -556,7 +743,15 @@ describe("desktop session-owned activity", () => {
 		dto.controls.length = 0;
 		dto.ref.key = "forged";
 		expect(snapshot(f.controller).tasks[0]?.controls).toEqual(["stop"]);
-		f.value.registerSubagentRecord({ subagentId: "owned-task", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: false });
+		f.value.registerSubagentRecord({
+			subagentId: "owned-task",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: false,
+		});
 		expectCode(() => f.controller.operate(ref, "stop"), "stale_generation");
 		expect(f.value.getSubagentRecord("owned-task")?.status).toBe("paused");
 		f.controller.operate(taskRef(f.controller, "owned-task"), "stop");
@@ -566,16 +761,31 @@ describe("desktop session-owned activity", () => {
 	test("task mutation failures and unsupported resume context do not falsely stop or launch work", () => {
 		const f = fixture();
 		const run = runningTask(f.value, f.owner, "task-failures");
-		f.value.registerLiveHandle("task-failures", { requestPause: () => { throw new Error("private-pause-failure"); }, injectMessage: async () => {} });
+		f.value.registerLiveHandle("task-failures", {
+			requestPause: () => {
+				throw new Error("private-pause-failure");
+			},
+			injectMessage: async () => {},
+		});
 		const old = taskRef(f.controller, "task-failures");
 		expectCode(() => f.controller.operate(old, "pause"), "backend_failure");
 		expectCode(() => f.controller.operate(old, "stop"), "stale_generation");
 		expect(run.job.abortController.signal.aborted).toBe(false);
-		f.value.registerSubagentRecord({ subagentId: "no-runner", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: "/private/retained.jsonl", resumable: true });
+		f.value.registerSubagentRecord({
+			subagentId: "no-runner",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: "/private/retained.jsonl",
+			resumable: true,
+		});
 		const noRunner = snapshot(f.controller).tasks.find(task => task.id === "no-runner")!;
 		expect(noRunner.controls).toEqual(["stop"]);
 		expectCode(() => f.controller.operate(noRunner.ref, "resume"), "unsupported");
-		f.value.registerResumeDescriptor({ subagentId: "no-runner", ownerId: f.owner, data: {} }, () => { throw new Error("private-admission-failure"); });
+		f.value.registerResumeDescriptor({ subagentId: "no-runner", ownerId: f.owner, data: {} }, () => {
+			throw new Error("private-admission-failure");
+		});
 		const current = taskRef(f.controller, "no-runner");
 		expectCode(() => f.controller.operate(current, "resume"), "backend_failure");
 		expect(f.value.getSubagentRecord("no-runner")?.status).toBe("paused");
@@ -584,9 +794,20 @@ describe("desktop session-owned activity", () => {
 	test("queued task stop cancels admission without launching a successor", async () => {
 		const f = fixture(manager(undefined, 1));
 		const busy = runningTask(f.value, f.owner, "busy-task");
-		f.value.registerSubagentRecord({ subagentId: "queued-task", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: true });
+		f.value.registerSubagentRecord({
+			subagentId: "queued-task",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: true,
+		});
 		let launches = 0;
-		f.value.registerResumeDescriptor({ subagentId: "queued-task", ownerId: f.owner, data: {} }, () => { launches++; return undefined; });
+		f.value.registerResumeDescriptor({ subagentId: "queued-task", ownerId: f.owner, data: {} }, () => {
+			launches++;
+			return undefined;
+		});
 		f.controller.operate(taskRef(f.controller, "queued-task"), "resume");
 		const queued = snapshot(f.controller).tasks.find(task => task.id === "queued-task")!;
 		expect(queued).toMatchObject({ status: "queued", controls: ["stop"] });
@@ -599,18 +820,39 @@ describe("desktop session-owned activity", () => {
 
 	test("all SDK lifecycle failure codes map explicitly to safe desktop errors", () => {
 		const f = fixture();
-		f.value.registerSubagentRecord({ subagentId: "error-mapping", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: false });
+		f.value.registerSubagentRecord({
+			subagentId: "error-mapping",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: false,
+		});
 		const ref = taskRef(f.controller, "error-mapping");
 		const expected: Record<JobObservationErrorCode, DesktopActivityErrorCode> = {
-			invalid_owner: "unavailable", read_only: "unsupported", no_live_job: "unsupported", not_running: "unsupported",
-			no_live_handle: "unsupported", already_running: "unsupported", already_queued: "unsupported",
-			context_unavailable: "unsupported", no_runner: "unsupported", control_in_progress: "control_busy",
-			owner_shutdown_in_progress: "control_busy", resume_failed: "backend_failure", disposed: "disposed",
-			not_found: "not_found", stale_generation: "stale_generation", already_terminal: "already_terminal",
+			invalid_owner: "unavailable",
+			read_only: "unsupported",
+			no_live_job: "unsupported",
+			not_running: "unsupported",
+			no_live_handle: "unsupported",
+			already_running: "unsupported",
+			already_queued: "unsupported",
+			context_unavailable: "unsupported",
+			no_runner: "unsupported",
+			control_in_progress: "control_busy",
+			owner_shutdown_in_progress: "control_busy",
+			resume_failed: "backend_failure",
+			disposed: "disposed",
+			not_found: "not_found",
+			stale_generation: "stale_generation",
+			already_terminal: "already_terminal",
 		};
 		const cancel = vi.spyOn(f.observation, "cancelTask");
 		for (const code of Object.keys(expected) as JobObservationErrorCode[]) {
-			cancel.mockImplementation(() => { throw new JobObservationError(code); });
+			cancel.mockImplementation(() => {
+				throw new JobObservationError(code);
+			});
 			expectCode(() => f.controller.operate(ref, "stop"), expected[code]);
 		}
 		expect(f.value.getSubagentRecord("error-mapping")?.status).toBe("paused");
@@ -622,18 +864,32 @@ describe("desktop session-owned activity", () => {
 		const endpointB = crypto.randomUUID();
 		expect(AsyncJobManager.registerForEndpoint(endpointA, value)).toBe(true);
 		const f = fixture(value);
-		value.registerSubagentRecord({ subagentId: "revoked", ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: false });
+		value.registerSubagentRecord({
+			subagentId: "revoked",
+			ownerId: f.owner,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: false,
+		});
 		const ref = taskRef(f.controller, "revoked");
 		expect(AsyncJobManager.rekeyForEndpoint(endpointA, endpointB, value)).toBe(true);
 		expect(AsyncJobManager.rekeyForEndpoint(endpointB, endpointA, value)).toBe(true);
 		expectCode(() => f.controller.operate(ref, "stop"), "stale_generation");
-		expect(f.controller.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("replaced") });
+		expect(f.controller.getSnapshot()).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("replaced"),
+		});
 		expect(value.getSubagentRecord("revoked")?.status).toBe("paused");
 	});
 
 	test("retained completed monitor output remains readable, but cancellation fails explicitly", async () => {
 		const f = fixture();
-		const id = f.value.register("bash", "finished", async () => "done", { ownerId: f.owner, metadata: { monitor: true } });
+		const id = f.value.register("bash", "finished", async () => "done", {
+			ownerId: f.owner,
+			metadata: { monitor: true },
+		});
 		f.value.appendOutput(id, "final output");
 		await f.value.getJob(id)!.promise;
 		await f.value.drainDeliveries({ timeoutMs: 1000 });
@@ -655,14 +911,31 @@ describe("desktop session-owned activity", () => {
 		expect(detail.output?.text).toHaveLength(DESKTOP_ACTIVITY_LIMITS.outputChars);
 		expect(detail.output?.truncated).toBe(true);
 		const serialized = JSON.stringify({ dto, detail });
-		for (const forbidden of [secret, "private-owner", "abortController", "ownerId", "sessionFile", "generation", "\x1b"]) expect(serialized).not.toContain(forbidden);
+		for (const forbidden of [
+			secret,
+			"private-owner",
+			"abortController",
+			"ownerId",
+			"sessionFile",
+			"generation",
+			"\x1b",
+		])
+			expect(serialized).not.toContain(forbidden);
 	});
 
 	test("bounds snapshot arrays and keeps excluded references unaddressable", () => {
 		const f = fixture();
 		for (let i = 0; i < DESKTOP_ACTIVITY_LIMITS.entries + 3; i++) {
 			monitor(f.value, f.owner, `job-${i}`);
-			f.value.registerSubagentRecord({ subagentId: `task-${i}`, ownerId: f.owner, status: "paused", currentJobId: null, historicalJobIds: [], sessionFile: null, resumable: false });
+			f.value.registerSubagentRecord({
+				subagentId: `task-${i}`,
+				ownerId: f.owner,
+				status: "paused",
+				currentJobId: null,
+				historicalJobIds: [],
+				sessionFile: null,
+				resumable: false,
+			});
 		}
 		const dto = snapshot(f.controller);
 		expect(dto.jobs).toHaveLength(DESKTOP_ACTIVITY_LIMITS.entries);
@@ -675,12 +948,26 @@ describe("desktop session-owned activity", () => {
 		const f = fixture();
 		const id = monitor(f.value, f.owner);
 		const ref = refFor(f.controller, id);
-		const failing = createDesktopActivityController(f.result, { ...f.options, redact: () => { throw new Error("private-redactor-secret"); } });
+		const failing = createDesktopActivityController(f.result, {
+			...f.options,
+			redact: () => {
+				throw new Error("private-redactor-secret");
+			},
+		});
 		controllers.push(failing);
-		expect(failing.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("redaction failed") });
+		expect(failing.getSnapshot()).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("redaction failed"),
+		});
 		expect(JSON.stringify(failing.getSnapshot())).not.toContain("private-redactor-secret");
 		let dispose = false;
-		const reentrant = createDesktopActivityController(f.result, { ...f.options, redact: text => { if (dispose) f.disposeSession(); return text; } });
+		const reentrant = createDesktopActivityController(f.result, {
+			...f.options,
+			redact: text => {
+				if (dispose) f.disposeSession();
+				return text;
+			},
+		});
 		controllers.push(reentrant);
 		const reentrantRef = refFor(reentrant, id);
 		dispose = true;
@@ -693,7 +980,9 @@ describe("desktop session-owned activity", () => {
 		const f = fixture();
 		const id = monitor(f.value, f.owner);
 		const ref = refFor(f.controller, id);
-		vi.spyOn(f.observation, "cancelMonitor").mockImplementation(() => { throw new Error("credential=private-backend-secret"); });
+		vi.spyOn(f.observation, "cancelMonitor").mockImplementation(() => {
+			throw new Error("credential=private-backend-secret");
+		});
 		expectCode(() => f.controller.operate(ref, "cancel"), "backend_failure");
 		try {
 			f.controller.operate(ref, "cancel");
@@ -707,7 +996,14 @@ describe("desktop session-owned activity", () => {
 	test("failure acknowledgement is view-local and validates connection/session scope", async () => {
 		const f = fixture();
 		const other = fixture(f.value, f.owner);
-		const id = f.value.register("bash", "failed", async () => { throw new Error("fixture failure"); }, { ownerId: f.owner, metadata: { monitor: true } });
+		const id = f.value.register(
+			"bash",
+			"failed",
+			async () => {
+				throw new Error("fixture failure");
+			},
+			{ ownerId: f.owner, metadata: { monitor: true } },
+		);
 		await f.value.getJob(id)!.promise;
 		await f.value.drainDeliveries({ timeoutMs: 1000 });
 		const dto = snapshot(f.controller);
@@ -724,10 +1020,20 @@ describe("desktop session-owned activity", () => {
 		const other = fixture(f.value);
 		async function cron(owner: string) {
 			const session = {
-				cwd: process.cwd(), hasUI: false, getSessionId: () => "cron-fixture", getAgentId: () => owner,
-				getAsyncJobManager: () => f.value, sendCustomMessage: async () => {}, allocateOutputArtifact: async () => ({}),
+				cwd: process.cwd(),
+				hasUI: false,
+				getSessionId: () => "cron-fixture",
+				getAgentId: () => owner,
+				getAsyncJobManager: () => f.value,
+				sendCustomMessage: async () => {},
+				allocateOutputArtifact: async () => ({}),
 			} as unknown as ToolSession;
-			await new CronTool(session).execute("cron-fixture", { op: "create", cron_expression: "0 * * * *", prompt: "private cron prompt", recurring: true });
+			await new CronTool(session).execute("cron-fixture", {
+				op: "create",
+				cron_expression: "0 * * * *",
+				prompt: "private cron prompt",
+				recurring: true,
+			});
 		}
 		await cron(f.owner);
 		await cron(other.owner);
@@ -736,7 +1042,10 @@ describe("desktop session-owned activity", () => {
 		expect(dto.crons).toHaveLength(1);
 		expect(dto.crons[0]?.controls).toEqual(["delete"]);
 		expect(JSON.stringify(dto)).not.toContain("private cron prompt");
-		expectCode(() => f.controller.operate({ ...dto.crons[0]!.ref, key: foreign.crons[0]!.ref.key }, "delete"), "not_found");
+		expectCode(
+			() => f.controller.operate({ ...dto.crons[0]!.ref, key: foreign.crons[0]!.ref.key }, "delete"),
+			"not_found",
+		);
 		f.controller.operate(dto.crons[0]!.ref, "delete");
 		expect(snapshot(f.controller).crons).toHaveLength(0);
 		expect(snapshot(other.controller).crons).toHaveLength(1);
@@ -746,19 +1055,37 @@ describe("desktop session-owned activity", () => {
 	test("missing observation is unavailable, with real read-only session summaries rather than fabricated jobs", async () => {
 		const f = await gateFixture(false);
 		f.session.setGoalModeState({
-			enabled: true, mode: "active", goal: {
-				id: "private-goal-id", objective: "private goal objective", status: "paused", tokensUsed: 12, timeUsedSeconds: 5,
-				createdAt: Date.now(), updatedAt: Date.now(),
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "private-goal-id",
+				objective: "private goal objective",
+				status: "paused",
+				tokensUsed: 12,
+				timeUsedSeconds: 5,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
 			},
 		});
-		vi.spyOn(f.session, "getEffectiveActiveWorkflowSkillState").mockReturnValue({ skill: "ralplan", sessionId: f.session.sessionManager.getSessionId() });
+		vi.spyOn(f.session, "getEffectiveActiveWorkflowSkillState").mockReturnValue({
+			skill: "ralplan",
+			sessionId: f.session.sessionManager.getSessionId(),
+		});
 		vi.spyOn(f.emitter, "supportsRemoteGateAnswers").mockReturnValue(false);
 		const pending = f.emitter.emitGate(approvalGate({ plan: "private plan" }));
 		void pending.catch(() => {});
 		const controller = createDesktopActivityController({ session: f.session }, f.options);
 		controllers.push(controller);
 		const dto = controller.getSnapshot();
-		expect(dto).toMatchObject({ available: false, reason: expect.stringContaining("no public job observation"), sessionState: { goal: { enabled: true, status: "paused", tokensUsed: 12 }, workflow: { skill: "ralplan" }, gates: { available: true, pending: [{ kind: "approval", stage: "ralplan", answerable: false }] } } });
+		expect(dto).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("no public job observation"),
+			sessionState: {
+				goal: { enabled: true, status: "paused", tokensUsed: 12 },
+				workflow: { skill: "ralplan" },
+				gates: { available: true, pending: [{ kind: "approval", stage: "ralplan", answerable: false }] },
+			},
+		});
 		expect("jobs" in dto).toBe(false);
 		expect(JSON.stringify(dto)).not.toContain("private");
 		expectCode(() => controller.acknowledgeFailures(dto), "unavailable");
@@ -768,10 +1095,16 @@ describe("desktop session-owned activity", () => {
 		const f = fixture();
 		f.session.isDisposed = true;
 		let reads = 0;
-		const controller = createDesktopActivityController({
-			session: f.result.session,
-			get jobObservation(): JobObservation | undefined { reads++; throw new Error("must not instantiate after disposal"); },
-		}, f.options);
+		const controller = createDesktopActivityController(
+			{
+				session: f.result.session,
+				get jobObservation(): JobObservation | undefined {
+					reads++;
+					throw new Error("must not instantiate after disposal");
+				},
+			},
+			f.options,
+		);
 		controllers.push(controller);
 		expect(reads).toBe(0);
 		expect(controller.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("disposed") });
@@ -786,7 +1119,11 @@ describe("desktop session-owned activity", () => {
 		const originalId = f.emitter.listPendingGates()[0]!.gate_id;
 		const presentation = f.controller.getGatePresentation(ref);
 		expect(presentation.gateId).toBe(originalId);
-		expect(presentation.gate).toMatchObject({ ref, truncated: false, content: { title: "[redacted]", plan: "Complete plan" } });
+		expect(presentation.gate).toMatchObject({
+			ref,
+			truncated: false,
+			content: { title: "[redacted]", plan: "Complete plan" },
+		});
 		expect(JSON.stringify(presentation.gate)).not.toContain(originalId);
 		expect(JSON.stringify(f.controller.getSnapshot())).not.toContain(originalId);
 		expect(f.retired).toHaveLength(0);
@@ -813,7 +1150,9 @@ describe("desktop session-owned activity", () => {
 		expectCode(() => f.controller.getGatePresentation(foreignRef), "stale_connection");
 		expectCode(() => f.controller.getGatePresentation({ ...ref, key: foreignRef.key }), "not_found");
 		const original = f.emitter.listPendingGates()[0]!;
-		const list = vi.spyOn(f.emitter, "listPendingGates").mockReturnValue([{ ...original, context: { plan: "successor plan" } }]);
+		const list = vi
+			.spyOn(f.emitter, "listPendingGates")
+			.mockReturnValue([{ ...original, context: { plan: "successor plan" } }]);
 		expectCode(() => f.controller.getGatePresentation(ref), "stale_generation");
 		list.mockRestore();
 		const emitter = vi.spyOn(f.session, "getWorkflowGateEmitter").mockReturnValue(other.emitter);
@@ -827,7 +1166,10 @@ describe("desktop session-owned activity", () => {
 
 	test("trusted-host presentation rechecks binding after redaction and never returns a truncated gate identity", async () => {
 		let replace: (() => void) | undefined;
-		const f = await gateFixture(true, text => { replace?.(); return text; });
+		const f = await gateFixture(true, text => {
+			replace?.();
+			return text;
+		});
 		const other = await gateFixture();
 		const pending = f.emitter.emitGate(approvalGate());
 		void pending.catch(() => {});
@@ -841,7 +1183,9 @@ describe("desktop session-owned activity", () => {
 		emitter.mockRestore();
 		replace = undefined;
 		const bounded = await gateFixture();
-		const large = bounded.emitter.emitGate(approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }));
+		const large = bounded.emitter.emitGate(
+			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
+		);
 		void large.catch(() => {});
 		expectCode(() => bounded.controller.getGatePresentation(gateRef(bounded.controller)), "gate_content_too_large");
 		expect(bounded.retired).toHaveLength(0);
@@ -852,14 +1196,23 @@ describe("desktop session-owned activity", () => {
 		const approval = f.emitter.emitGate(approvalGate({ title: "Review this plan", plan: "Exact plan content" }));
 		void approval.catch(() => {});
 		const ref = gateRef(f.controller);
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "gate_not_presented" });
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "gate_not_presented" });
 		const gate = f.controller.getGate(ref);
-		expect(gate).toMatchObject({ kind: "approval", answerable: true, truncated: false, content: { plan: "Exact plan content" } });
+		expect(gate).toMatchObject({
+			kind: "approval",
+			answerable: true,
+			truncated: false,
+			content: { plan: "Exact plan content" },
+		});
 		// Canonical producers advertise complete answer objects, never primitive decisions.
 		expect(gate.choices.map(choice => choice.label)).toEqual(["approve", "reject"]);
 		expect(gate.optionLabels.map(option => option.label)).toEqual(["approve", "reject"]);
 		const rejection = gate.choices.find(choice => choice.label === "reject")!;
-		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: rejection.key })).resolves.toEqual({ status: "accepted" });
+		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: rejection.key })).resolves.toEqual({
+			status: "accepted",
+		});
 		await expect(approval).resolves.toEqual({ decision: "reject" });
 		expect(f.retired).toHaveLength(1);
 		expectCode(() => f.controller.getGate(ref), "not_found");
@@ -869,22 +1222,42 @@ describe("desktop session-owned activity", () => {
 		const executionPresentation = f.controller.getGate(next);
 		expect(executionPresentation.choices.map(choice => choice.label)).toEqual(["approve", "decline"]);
 		const decline = executionPresentation.choices.find(choice => choice.label === "decline")!;
-		await expect(f.controller.answerGate(next, { kind: "choice", choiceKey: decline.key })).resolves.toEqual({ status: "accepted" });
+		await expect(f.controller.answerGate(next, { kind: "choice", choiceKey: decline.key })).resolves.toEqual({
+			status: "accepted",
+		});
 		await expect(execution).resolves.toEqual({ decision: "decline" });
 		expect(f.retired).toHaveLength(2);
 	});
 
 	test("answers real structured ask selections, custom answers and clarification without made-up choice shapes", async () => {
 		const f = await gateFixture();
-		for (const answer of [{ selected: ["SDK only"] }, { selected: ["Shell"] }, { selected: [], other: true, custom: "Different scope" }, { action: "clarify", question: "Which SDK?" }]) {
-			const pending = f.emitter.emitGate(questionToGate({ id: "scope", question: "Choose the scope", options: [{ label: "SDK only" }, { label: "Shell" }] }));
+		for (const answer of [
+			{ selected: ["SDK only"] },
+			{ selected: ["Shell"] },
+			{ selected: [], other: true, custom: "Different scope" },
+			{ action: "clarify", question: "Which SDK?" },
+		]) {
+			const pending = f.emitter.emitGate(
+				questionToGate({
+					id: "scope",
+					question: "Choose the scope",
+					options: [{ label: "SDK only" }, { label: "Shell" }],
+				}),
+			);
 			void pending.catch(() => {});
 			const ref = gateRef(f.controller);
 			const gate = f.controller.getGate(ref);
 			expect(gate.content.prompt).toBe("Choose the scope");
 			expect(gate.choices.map(choice => choice.label)).toEqual(["SDK only", "Shell"]);
-			for (const invalid of ["SDK only", { selected: ["Unknown"] }, { selected: [], other: true, custom: "   " }, { action: "clarify", question: "   " }]) {
-				await expect(f.controller.answerGate(ref, { kind: "json", json: JSON.stringify(invalid) })).rejects.toMatchObject({ code: "invalid_answer" });
+			for (const invalid of [
+				"SDK only",
+				{ selected: ["Unknown"] },
+				{ selected: [], other: true, custom: "   " },
+				{ action: "clarify", question: "   " },
+			]) {
+				await expect(
+					f.controller.answerGate(ref, { kind: "json", json: JSON.stringify(invalid) }),
+				).rejects.toMatchObject({ code: "invalid_answer" });
 			}
 			const selected = "selected" in answer ? answer.selected?.[0] : undefined;
 			const choice = gate.choices.find(option => option.label === selected);
@@ -898,22 +1271,40 @@ describe("desktop session-owned activity", () => {
 
 	test("opaque choice refs submit only original schema-valid whole values and never redact the submitted value", async () => {
 		const f = await gateFixture(true, text => text.replaceAll("secret", "[redacted]"));
-		const pending = f.emitter.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["secret-value", "reject"] }, options: [{ value: "secret-value", label: "secret label" }, { value: "invalid", label: "invalid whole answer" }], context: { summary: "secret context" } });
+		const pending = f.emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: ["secret-value", "reject"] },
+			options: [
+				{ value: "secret-value", label: "secret label" },
+				{ value: "invalid", label: "invalid whole answer" },
+			],
+			context: { summary: "secret context" },
+		});
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const gate = f.controller.getGate(ref);
 		expect(gate.choices).toHaveLength(1);
 		expect(JSON.stringify(gate)).not.toContain("secret");
 		expect(gate.choices[0]?.label).toBe("[redacted] label");
-		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: "forged" })).rejects.toMatchObject({ code: "invalid_answer" });
-		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: gate.choices[0]!.key })).resolves.toEqual({ status: "accepted" });
+		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: "forged" })).rejects.toMatchObject({
+			code: "invalid_answer",
+		});
+		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: gate.choices[0]!.key })).resolves.toEqual({
+			status: "accepted",
+		});
 		await expect(pending).resolves.toBe("secret-value");
 	});
 
 	test("schema display redacts secrets before JSON escaping while choice answers retain original bytes", async () => {
 		const secret = 'credential"with\nnewline';
 		const f = await gateFixture(true, text => text.replaceAll(secret, "[redacted]"));
-		const pending = f.emitter.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: [secret] }, options: [{ label: secret, value: secret }] });
+		const pending = f.emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: [secret] },
+			options: [{ label: secret, value: secret }],
+		});
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const gate = f.controller.getGate(ref);
@@ -929,12 +1320,31 @@ describe("desktop session-owned activity", () => {
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
-		for (const json of ["{broken", '"approve"', '{"decision":"unknown"}', '{"decision":"request-changes"}', '{"decision":"request-changes","comments":"   "}', "x".repeat(DESKTOP_ACTIVITY_LIMITS.answerBytes + 1), "[".repeat(18) + "0" + "]".repeat(18), "1e400"]) {
-			await expect(f.controller.answerGate(ref, { kind: "json", json })).rejects.toMatchObject({ code: "invalid_answer" });
+		for (const json of [
+			"{broken",
+			'"approve"',
+			'{"decision":"unknown"}',
+			'{"decision":"request-changes"}',
+			'{"decision":"request-changes","comments":"   "}',
+			"x".repeat(DESKTOP_ACTIVITY_LIMITS.answerBytes + 1),
+			"[".repeat(18) + "0" + "]".repeat(18),
+			"1e400",
+		]) {
+			await expect(f.controller.answerGate(ref, { kind: "json", json })).rejects.toMatchObject({
+				code: "invalid_answer",
+			});
 		}
 		expect(f.emitter.listPendingGates()).toHaveLength(1);
-		const resolve = vi.spyOn(f.emitter, "resolveGate").mockResolvedValueOnce({ gate_id: "private", status: "rejected", answer_hash: "private", resolved_at: "private" });
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).resolves.toEqual({ status: "rejected", reason: expect.stringContaining("original gate schema") });
+		const resolve = vi.spyOn(f.emitter, "resolveGate").mockResolvedValueOnce({
+			gate_id: "private",
+			status: "rejected",
+			answer_hash: "private",
+			resolved_at: "private",
+		});
+		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).resolves.toEqual({
+			status: "rejected",
+			reason: expect.stringContaining("original gate schema"),
+		});
 		resolve.mockRestore();
 		await f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' });
 		await expect(pending).resolves.toEqual({ decision: "approve" });
@@ -947,9 +1357,15 @@ describe("desktop session-owned activity", () => {
 		const pending = f.emitter.emitGate(approvalGate());
 		void pending.catch(() => {});
 		const ref = gateRef(controller);
-		expect(controller.getSnapshot()).toMatchObject({ available: false, sessionState: { gates: { available: true } } });
+		expect(controller.getSnapshot()).toMatchObject({
+			available: false,
+			sessionState: { gates: { available: true } },
+		});
 		controller.getGate(ref);
-		await controller.answerGate(ref, { kind: "json", json: '{"decision":"request-changes","comments":"Tighten scope"}' });
+		await controller.answerGate(ref, {
+			kind: "json",
+			json: '{"decision":"request-changes","comments":"Tighten scope"}',
+		});
 		await expect(pending).resolves.toEqual({ decision: "request-changes", comments: "Tighten scope" });
 	});
 
@@ -959,20 +1375,38 @@ describe("desktop session-owned activity", () => {
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
-		await expect(f.controller.answerGate({ ...ref, connectionGeneration: "old" }, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_connection" });
-		await expect(f.controller.answerGate({ ...ref, sessionGeneration: "old" }, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_session" });
-		await expect(f.controller.answerGate({ ...ref, key: "forged" }, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "not_found" });
+		await expect(
+			f.controller.answerGate(
+				{ ...ref, connectionGeneration: "old" },
+				{ kind: "json", json: '{"decision":"approve"}' },
+			),
+		).rejects.toMatchObject({ code: "stale_connection" });
+		await expect(
+			f.controller.answerGate(
+				{ ...ref, sessionGeneration: "old" },
+				{ kind: "json", json: '{"decision":"approve"}' },
+			),
+		).rejects.toMatchObject({ code: "stale_session" });
+		await expect(
+			f.controller.answerGate({ ...ref, key: "forged" }, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "not_found" });
 		const original = f.emitter.listPendingGates()[0]!;
-		const list = vi.spyOn(f.emitter, "listPendingGates").mockReturnValue([{ ...original, runtime_turn_id: "successor-turn" }]);
+		const list = vi
+			.spyOn(f.emitter, "listPendingGates")
+			.mockReturnValue([{ ...original, runtime_turn_id: "successor-turn" }]);
 		expectCode(() => f.controller.getGate(ref), "stale_generation");
 		list.mockReturnValue([{ ...original, context: { title: "changed plan" } }]);
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_generation" });
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_generation" });
 		list.mockReturnValue([{ ...original, schema: { type: "boolean" } }]);
 		expectCode(() => f.controller.getGate(ref), "stale_generation");
 		list.mockRestore();
 		const successor = await gateFixture();
 		vi.spyOn(f.session, "getWorkflowGateEmitter").mockReturnValue(successor.emitter);
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_generation" });
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_generation" });
 		expect(f.retired).toHaveLength(0);
 	});
 
@@ -982,8 +1416,12 @@ describe("desktop session-owned activity", () => {
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
-		const managerIdentity = vi.spyOn(f.session.sessionManager, "getSessionId").mockReturnValue("successor-session-manager-id");
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_session" });
+		const managerIdentity = vi
+			.spyOn(f.session.sessionManager, "getSessionId")
+			.mockReturnValue("successor-session-manager-id");
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_session" });
 		managerIdentity.mockRestore();
 		expectCode(() => f.controller.getGatePresentation(ref), "stale_session");
 		expect(f.retired).toHaveLength(0);
@@ -991,14 +1429,22 @@ describe("desktop session-owned activity", () => {
 
 	test("truncated content cannot become approval authority, and gate DTOs remain detached", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }));
+		const pending = f.emitter.emitGate(
+			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
+		);
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const dto = f.controller.getGate(ref);
-		expect(dto).toMatchObject({ answerable: false, truncated: true, reason: expect.stringContaining("safe display limits") });
+		expect(dto).toMatchObject({
+			answerable: false,
+			truncated: true,
+			reason: expect.stringContaining("safe display limits"),
+		});
 		dto.answerable = true;
 		dto.content.plan = "edited";
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "gate_not_presented" });
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "gate_not_presented" });
 		expect(f.emitter.listPendingGates()).toHaveLength(1);
 		expect(f.retired).toHaveLength(0);
 	});
@@ -1009,11 +1455,18 @@ describe("desktop session-owned activity", () => {
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const remote = vi.spyOn(f.emitter, "supportsRemoteGateAnswers").mockReturnValue(false);
-		expect(f.controller.getGate(ref)).toMatchObject({ answerable: false, reason: expect.stringContaining("does not advertise") });
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "unsupported" });
+		expect(f.controller.getGate(ref)).toMatchObject({
+			answerable: false,
+			reason: expect.stringContaining("does not advertise"),
+		});
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "unsupported" });
 		remote.mockRestore();
 		f.controller.getGate(ref);
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "gate_resolution_failed" });
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "gate_resolution_failed" });
 		await expect(pending).rejects.toThrow("continuation was fenced");
 		expect(f.emitter.listPendingGates()).toHaveLength(0);
 	});
@@ -1033,7 +1486,9 @@ describe("desktop session-owned activity", () => {
 		});
 		const answering = f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' });
 		await entered.promise;
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "gate_busy" });
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "gate_busy" });
 		f.disposeSession();
 		release.resolve();
 		await expect(answering).rejects.toMatchObject({ code: "disposed" });
@@ -1041,7 +1496,10 @@ describe("desktop session-owned activity", () => {
 
 	test("gate redaction and request getter reentrancy cannot bypass final disposal fences", async () => {
 		let dispose: (() => void) | undefined;
-		const f = await gateFixture(true, text => { dispose?.(); return text; });
+		const f = await gateFixture(true, text => {
+			dispose?.();
+			return text;
+		});
 		const pending = f.emitter.emitGate(approvalGate());
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
@@ -1053,7 +1511,15 @@ describe("desktop session-owned activity", () => {
 		void pendingSecond.catch(() => {});
 		const secondRef = gateRef(second.controller);
 		second.controller.getGate(secondRef);
-		await expect(second.controller.answerGate(secondRef, { kind: "json", get json() { second.disposeSession(); return '{"decision":"approve"}'; } })).rejects.toMatchObject({ code: "disposed" });
+		await expect(
+			second.controller.answerGate(secondRef, {
+				kind: "json",
+				get json() {
+					second.disposeSession();
+					return '{"decision":"approve"}';
+				},
+			}),
+		).rejects.toMatchObject({ code: "disposed" });
 		expect(second.retired).toHaveLength(0);
 	});
 
@@ -1066,11 +1532,16 @@ describe("desktop session-owned activity", () => {
 				onGateEmitted: (listener: () => void) => {
 					gateSubscriptions++;
 					listener();
-					return () => { gateSubscriptions--; };
+					return () => {
+						gateSubscriptions--;
+					};
 				},
 			}),
 		};
-		const controller = createDesktopActivityController({ session: session as unknown as CreateAgentSessionResult["session"], jobObservation: f.observation }, f.options);
+		const controller = createDesktopActivityController(
+			{ session: session as unknown as CreateAgentSessionResult["session"], jobObservation: f.observation },
+			f.options,
+		);
 		controllers.push(controller);
 		expectCode(() => controller.onChange(() => controller.dispose()), "disposed");
 		expect(f.listeners.size).toBe(0);
@@ -1080,8 +1551,12 @@ describe("desktop session-owned activity", () => {
 	test("payload-free change subscriptions isolate listeners and can be removed", async () => {
 		const f = fixture();
 		let changes = 0;
-		f.controller.onChange(() => { throw new Error("subscriber failure"); });
-		const unsubscribe = f.controller.onChange(() => { changes++; });
+		f.controller.onChange(() => {
+			throw new Error("subscriber failure");
+		});
+		const unsubscribe = f.controller.onChange(() => {
+			changes++;
+		});
 		monitor(f.value, f.owner);
 		await Bun.sleep(0);
 		expect(changes).toBeGreaterThan(0);

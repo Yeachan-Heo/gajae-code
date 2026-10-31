@@ -69,9 +69,7 @@ export interface DesktopActivityGate extends DesktopActivityGateSummary {
 	maxAnswerBytes: number;
 }
 
-export type DesktopActivityGateAnswer =
-	| { kind: "choice"; choiceKey: string }
-	| { kind: "json"; json: string };
+export type DesktopActivityGateAnswer = { kind: "choice"; choiceKey: string } | { kind: "json"; json: string };
 
 /** Accepted means the response was accepted, not that the user approved execution. */
 export interface DesktopActivityGateAnswerResult {
@@ -81,7 +79,12 @@ export interface DesktopActivityGateAnswerResult {
 
 /** Scalar session summaries; answering is a separate explicit gate operation. */
 export interface DesktopActivitySessionState {
-	goal: { enabled: boolean; status: "active" | "paused" | "complete" | "dropped"; tokensUsed: number; timeUsedSeconds: number } | null;
+	goal: {
+		enabled: boolean;
+		status: "active" | "paused" | "complete" | "dropped";
+		tokensUsed: number;
+		timeUsedSeconds: number;
+	} | null;
 	workflow: { skill: string } | null;
 	gates:
 		| { available: false; reason: string }
@@ -91,19 +94,19 @@ export interface DesktopActivitySessionState {
 export type DesktopActivitySnapshot = DesktopActivityScope & {
 	sessionState?: DesktopActivitySessionState;
 } & (
-	| { available: false; reason: string }
-	| {
-			available: true;
-			jobs: DesktopActivityJob[];
-			tasks: DesktopActivityTask[];
-			crons: DesktopActivityCron[];
-			truncated: { jobs: boolean; tasks: boolean; crons: boolean };
-			activeMonitorCount: number;
-			activeCronCount: number;
-			worstState: "none" | "running" | "failed";
-			failedUnacknowledged: boolean;
-		}
-);
+		| { available: false; reason: string }
+		| {
+				available: true;
+				jobs: DesktopActivityJob[];
+				tasks: DesktopActivityTask[];
+				crons: DesktopActivityCron[];
+				truncated: { jobs: boolean; tasks: boolean; crons: boolean };
+				activeMonitorCount: number;
+				activeCronCount: number;
+				worstState: "none" | "running" | "failed";
+				failedUnacknowledged: boolean;
+		  }
+	);
 
 export interface DesktopActivityDetail {
 	entry: DesktopActivityJob | DesktopActivityTask | DesktopActivityCron;

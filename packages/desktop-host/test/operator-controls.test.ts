@@ -8,8 +8,8 @@ import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import * as pythonExecutor from "@gajae-code/coding-agent/eval/py/executor";
-import * as pythonKernel from "@gajae-code/coding-agent/eval/py/kernel";
 import type { KernelExecuteOptions, KernelExecuteResult } from "@gajae-code/coding-agent/eval/py/kernel";
+import * as pythonKernel from "@gajae-code/coding-agent/eval/py/kernel";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -43,7 +43,11 @@ function streamRedactor(): DesktopOperatorStreamRedactor {
 			pending = retained ? safe.slice(-retained) : "";
 			return retained ? safe.slice(0, -retained) : safe;
 		},
-		finish() { const result = redact(pending); pending = ""; return result; },
+		finish() {
+			const result = redact(pending);
+			pending = "";
+			return result;
+		},
 	};
 }
 
@@ -52,8 +56,11 @@ async function fixture(options: { persisted?: boolean; streaming?: boolean; reda
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-operator-"));
 	await setModelPresetRegistryDisabled({ agentDir: directory, disabled: true });
 	const settings = Settings.isolated({
-		"compaction.enabled": false, "todo.enabled": false,
-		"bash.autoBackground.enabled": false, "python.kernelMode": "session", shellPath: "/bin/sh",
+		"compaction.enabled": false,
+		"todo.enabled": false,
+		"bash.autoBackground.enabled": false,
+		"python.kernelMode": "session",
+		shellPath: "/bin/sh",
 	});
 	const auth = await AuthStorage.create(path.join(directory, "auth.db"));
 	const registry = new ModelRegistry(auth, path.join(directory, "models.yml"), settings, { agentDir: directory });
@@ -64,17 +71,29 @@ async function fixture(options: { persisted?: boolean; streaming?: boolean; reda
 	const ownerId = crypto.randomUUID();
 	const agent = new Agent({
 		initialState: { messages: [], tools: [], systemPrompt: [] },
-		getApiKey: () => { throw new Error("No provider turns in operator tests"); },
-		streamFn: () => { throw new Error("No provider turns in operator tests"); },
+		getApiKey: () => {
+			throw new Error("No provider turns in operator tests");
+		},
+		streamFn: () => {
+			throw new Error("No provider turns in operator tests");
+		},
 	});
 	const session = new AgentSession({
-		agent, sessionManager: manager, settings, modelRegistry: registry, agentDir: directory,
-		ownedAsyncJobManager: jobs, agentId: ownerId,
+		agent,
+		sessionManager: manager,
+		settings,
+		modelRegistry: registry,
+		agentDir: directory,
+		ownedAsyncJobManager: jobs,
+		agentId: ownerId,
 	});
 	const events: DesktopOperatorEvent[] = [];
 	const controllerOptions: DesktopOperatorOptions = {
-		connectionGeneration: crypto.randomUUID(), redact: options.redact ?? redact,
-		emit: event => { events.push(event); },
+		connectionGeneration: crypto.randomUUID(),
+		redact: options.redact ?? redact,
+		emit: event => {
+			events.push(event);
+		},
 		...(options.streaming ? { createStreamRedactor: streamRedactor } : {}),
 	};
 	const controller = createDesktopOperatorController(session, controllerOptions);
@@ -98,7 +117,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
 	throw new Error("Operator condition did not settle within the test deadline");
 }
 
-async function settled(controller: DesktopOperatorController, operation: DesktopOperatorOperation): Promise<DesktopOperatorOperation> {
+async function settled(
+	controller: DesktopOperatorController,
+	operation: DesktopOperatorOperation,
+): Promise<DesktopOperatorOperation> {
 	await waitFor(() => {
 		const status = controller.getOperation({ operationId: operation.operationId }).status;
 		return status !== "running" && status !== "cancel_requested";
@@ -110,7 +132,8 @@ async function settled(controller: DesktopOperatorController, operation: Desktop
 function pythonSeam(execute: (code: string, options?: KernelExecuteOptions) => Promise<KernelExecuteResult>) {
 	const ownedCalls: pythonExecutor.PythonExecutorOptions[] = [];
 	const spy = vi.spyOn(pythonExecutor, "executePython").mockImplementation((code, options) => {
-		if (!options?.kernelOwnerId || !options.signal) throw new Error("AgentSession did not pass its real Python owner and signal");
+		if (!options?.kernelOwnerId || !options.signal)
+			throw new Error("AgentSession did not pass its real Python owner and signal");
 		ownedCalls.push(options);
 		return pythonExecutor.executePythonWithKernel({ execute }, code, options);
 	});
@@ -143,7 +166,10 @@ describe("desktop real session operator controls", () => {
 
 	test("nonzero shell exit is actual completion with its error output, never fabricated success", async () => {
 		const f = await fixture();
-		const result = await settled(f.controller, f.controller.execute({ text: "! printf 'command-error\\n' >&2; exit 7" }));
+		const result = await settled(
+			f.controller,
+			f.controller.execute({ text: "! printf 'command-error\\n' >&2; exit 7" }),
+		);
 		expect(result).toMatchObject({ status: "completed", exitCode: 7 });
 		expect(result.output).toContain("command-error");
 		expect(f.agent.state.messages.at(-1)).toMatchObject({ role: "bashExecution", exitCode: 7 });
@@ -152,15 +178,24 @@ describe("desktop real session operator controls", () => {
 	test("real shell abort stays reachable while execute attempts fail explicitly", async () => {
 		const f = await fixture({ streaming: true });
 		expect(f.controller.isBusy()).toBe(false);
-		const running = f.controller.execute({ text: "! printf 'ready-to-cancel\\n'; sleep 30; printf 'must-not-finish\\n'" });
+		const running = f.controller.execute({
+			text: "! printf 'ready-to-cancel\\n'; sleep 30; printf 'must-not-finish\\n'",
+		});
 		expect(f.controller.isBusy()).toBe(true);
 		await waitFor(() => f.events.some(event => event.operation.output.includes("ready-to-cancel")));
-		expect(() => f.controller.execute({ text: "$ print('another')" })).toThrow(expect.objectContaining({ code: "busy" }));
-		const second = createDesktopOperatorController(f.session, { ...f.controllerOptions, connectionGeneration: "second-connection" });
+		expect(() => f.controller.execute({ text: "$ print('another')" })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		const second = createDesktopOperatorController(f.session, {
+			...f.controllerOptions,
+			connectionGeneration: "second-connection",
+		});
 		try {
 			expect(second.isBusy()).toBe(true);
 			expect(() => second.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "busy" }));
-			expect(() => second.abort({ operationId: running.operationId })).toThrow(expect.objectContaining({ code: "not_found" }));
+			expect(() => second.abort({ operationId: running.operationId })).toThrow(
+				expect.objectContaining({ code: "not_found" }),
+			);
 			expect(await f.controller.fold({})).toEqual({ target: "current_foreground_tool", status: "unsupported" });
 			expect(f.controller.getOperation({ operationId: running.operationId }).status).toBe("running");
 			expect(f.controller.abort({ operationId: running.operationId }).status).toBe("cancel_requested");
@@ -172,8 +207,12 @@ describe("desktop real session operator controls", () => {
 			expect(result.output).not.toContain("must-not-finish");
 			expect(f.session.isBashRunning).toBe(false);
 			expect(f.agent.state.messages.at(-1)).toMatchObject({ role: "bashExecution", cancelled: true });
-			expect(() => f.controller.abort({ operationId: running.operationId })).toThrow(expect.objectContaining({ code: "already_terminal" }));
-		} finally { second.dispose(); }
+			expect(() => f.controller.abort({ operationId: running.operationId })).toThrow(
+				expect.objectContaining({ code: "already_terminal" }),
+			);
+		} finally {
+			second.dispose();
+		}
 	}, 20_000);
 
 	test("$ and $$ call the real Python session path, owned executor sink and context semantics", async () => {
@@ -220,7 +259,11 @@ describe("desktop real session operator controls", () => {
 		expect(result.status).toBe("cancelled");
 		expect(result.exitCode).toBeUndefined();
 		expect(f.session.isEvalRunning).toBe(false);
-		expect(f.agent.state.messages.at(-1)).toMatchObject({ role: "pythonExecution", cancelled: true, excludeFromContext: true });
+		expect(f.agent.state.messages.at(-1)).toMatchObject({
+			role: "pythonExecution",
+			cancelled: true,
+			excludeFromContext: true,
+		});
 	});
 
 	test("Python errors retain nonzero exit and unavailable kernels are not completion", async () => {
@@ -254,7 +297,9 @@ describe("desktop real session operator controls", () => {
 			return OK;
 		});
 		const f = await fixture({ streaming: true });
-		cleanups.push(async () => { release.resolve(); });
+		cleanups.push(async () => {
+			release.resolve();
+		});
 		const running = f.controller.execute({ text: "$ private_code_not_echoed()" });
 		await streamed.promise;
 		const stream = f.controller.getOperation({ operationId: running.operationId });
@@ -287,22 +332,35 @@ describe("desktop real session operator controls", () => {
 			return OK;
 		});
 		const f = await fixture();
-		cleanups.push(async () => { release.resolve(); });
+		cleanups.push(async () => {
+			release.resolve();
+		});
 		const running = f.controller.execute({ text: "$ private_output()" });
 		await entered.promise;
-		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({ output: "", liveOutput: "withheld", status: "running" });
+		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+			output: "",
+			liveOutput: "withheld",
+			status: "running",
+		});
 		expect(JSON.stringify(f.events)).not.toContain("operator-private-");
 		release.resolve();
 		expect((await settled(f.controller, running)).output).toContain("[redacted]");
 		const closed = createDesktopOperatorController(f.session, {
-			connectionGeneration: "closed", redact: () => { throw new Error(secret); },
-			emit: event => { f.events.push(event); },
+			connectionGeneration: "closed",
+			redact: () => {
+				throw new Error(secret);
+			},
+			emit: event => {
+				f.events.push(event);
+			},
 		});
 		try {
 			const result = await settled(closed, closed.execute({ text: "$ private_output()" }));
 			expect(result).toMatchObject({ status: "failed", output: "", error: { code: "redaction_failed" } });
 			expect(JSON.stringify(f.events)).not.toContain(secret);
-		} finally { closed.dispose(); }
+		} finally {
+			closed.dispose();
+		}
 	});
 
 	test("a failing streaming redactor withholds output without pretending the SDK executor has settled", async () => {
@@ -317,41 +375,80 @@ describe("desktop real session operator controls", () => {
 		const f = await fixture();
 		const controller = createDesktopOperatorController(f.session, {
 			...f.controllerOptions,
-			createStreamRedactor: () => ({ push: () => { throw new Error(secret); }, finish: () => "" }),
+			createStreamRedactor: () => ({
+				push: () => {
+					throw new Error(secret);
+				},
+				finish: () => "",
+			}),
 		});
-		cleanups.push(async () => { release.resolve(); controller.dispose(); });
+		cleanups.push(async () => {
+			release.resolve();
+			controller.dispose();
+		});
 		const running = controller.execute({ text: "$ stream_error()" });
 		await entered.promise;
-		expect(controller.getOperation({ operationId: running.operationId })).toMatchObject({ status: "running", output: "", liveOutput: "withheld" });
+		expect(controller.getOperation({ operationId: running.operationId })).toMatchObject({
+			status: "running",
+			output: "",
+			liveOutput: "withheld",
+		});
 		expect(() => controller.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "busy" }));
 		release.resolve();
-		expect(await settled(controller, running)).toMatchObject({ status: "failed", output: "", error: { code: "redaction_failed" } });
+		expect(await settled(controller, running)).toMatchObject({
+			status: "failed",
+			output: "",
+			error: { code: "redaction_failed" },
+		});
 		expect(JSON.stringify(f.events)).not.toContain(secret);
 	});
 
 	test("expired operation references cannot access retained output", async () => {
-		pythonSeam(async (code, options) => { await options?.onChunk?.(code); return OK; });
+		pythonSeam(async (code, options) => {
+			await options?.onChunk?.(code);
+			return OK;
+		});
 		const f = await fixture();
 		const first = await settled(f.controller, f.controller.execute({ text: "$ first_output()" }));
 		for (let index = 0; index < DESKTOP_OPERATOR_LIMITS.operations; index++) {
 			await settled(f.controller, f.controller.execute({ text: `$ retained_output_${index}()` }));
 		}
-		expect(() => f.controller.getOperation({ operationId: first.operationId })).toThrow(expect.objectContaining({ code: "not_found" }));
+		expect(() => f.controller.getOperation({ operationId: first.operationId })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
 	});
 
 	test("strict JSON inputs reject extra fields, empty sources, non-JSON objects and foreign IDs", async () => {
 		const f = await fixture();
 		const execute = vi.spyOn(f.session, "executeBash");
-		for (const value of [null, [], "! true", {}, { text: "plain prompt" }, { text: "!! " }, { text: "$$\n" },
-			{ text: "! true", cwd: "/" }, { text: "! true", timeout: 1 }, { text: "! true", excludeFromContext: true },
-			{ text: `!${"x".repeat(DESKTOP_OPERATOR_LIMITS.inputChars)}` }, { text: "! echo\0" },
-			Object.create({ text: "! true" }), Object.defineProperty({}, "text", { get: () => "! true", enumerable: true })]) {
+		for (const value of [
+			null,
+			[],
+			"! true",
+			{},
+			{ text: "plain prompt" },
+			{ text: "!! " },
+			{ text: "$$\n" },
+			{ text: "! true", cwd: "/" },
+			{ text: "! true", timeout: 1 },
+			{ text: "! true", excludeFromContext: true },
+			{ text: `!${"x".repeat(DESKTOP_OPERATOR_LIMITS.inputChars)}` },
+			{ text: "! echo\0" },
+			Object.create({ text: "! true" }),
+			Object.defineProperty({}, "text", { get: () => "! true", enumerable: true }),
+		]) {
 			expect(() => f.controller.execute(value)).toThrow(expect.objectContaining({ code: "invalid_input" }));
 		}
 		expect(execute).not.toHaveBeenCalled();
-		expect(() => f.controller.getOperation({ operationId: "foreign" })).toThrow(expect.objectContaining({ code: "not_found" }));
-		expect(() => f.controller.abort({ operationId: "foreign" })).toThrow(expect.objectContaining({ code: "not_found" }));
-		expect(() => f.controller.getOperation({ operationId: "foreign", ownerId: f.ownerId })).toThrow(expect.objectContaining({ code: "invalid_input" }));
+		expect(() => f.controller.getOperation({ operationId: "foreign" })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		expect(() => f.controller.abort({ operationId: "foreign" })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		expect(() => f.controller.getOperation({ operationId: "foreign", ownerId: f.ownerId })).toThrow(
+			expect.objectContaining({ code: "invalid_input" }),
+		);
 		await expect(f.controller.fold({ operationId: "foreign" })).rejects.toMatchObject({ code: "invalid_input" });
 	});
 
@@ -363,18 +460,29 @@ describe("desktop real session operator controls", () => {
 		if (!previousFile) throw new Error("Expected the fixture's owned persisted session");
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
-		const unobserved = createDesktopOperatorController(f.session, { ...f.controllerOptions, connectionGeneration: "unobserved-aba" });
-		cleanups.push(async () => { unobserved.dispose(); });
+		const unobserved = createDesktopOperatorController(f.session, {
+			...f.controllerOptions,
+			connectionGeneration: "unobserved-aba",
+		});
+		cleanups.push(async () => {
+			unobserved.dispose();
+		});
 		const previousId = f.session.sessionId;
 		const generation = f.session.sessionLifecycle.generation;
 		expect(await f.session.newSession()).toBe(true);
 		expect(f.session.sessionLifecycle.generation).toBeGreaterThan(generation);
-		expect(() => f.controller.getOperation({ operationId: first.operationId })).toThrow(expect.objectContaining({ code: "stale_session" }));
+		expect(() => f.controller.getOperation({ operationId: first.operationId })).toThrow(
+			expect.objectContaining({ code: "stale_session" }),
+		);
 		expect(await f.session.switchSession(previousFile)).toBe(true);
 		expect(f.session.sessionId).toBe(previousId);
 		expect(() => unobserved.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "stale_session" }));
-		expect(() => f.controller.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "stale_session" }));
-		expect(() => f.controller.abort({ operationId: first.operationId })).toThrow(expect.objectContaining({ code: "stale_session" }));
+		expect(() => f.controller.execute({ text: "! true" })).toThrow(
+			expect.objectContaining({ code: "stale_session" }),
+		);
+		expect(() => f.controller.abort({ operationId: first.operationId })).toThrow(
+			expect.objectContaining({ code: "stale_session" }),
+		);
 		await expect(f.controller.fold({})).rejects.toMatchObject({ code: "stale_session" });
 	}, 20_000);
 
@@ -391,7 +499,9 @@ describe("desktop real session operator controls", () => {
 			await release.promise;
 			throw new Error("fixture preparation failure");
 		});
-		cleanups.push(async () => { release.resolve(); });
+		cleanups.push(async () => {
+			release.resolve();
+		});
 		const generation = f.session.sessionLifecycle.generation;
 		const transition = f.session.newSession();
 		// Observe rejection immediately without starting an async assertion before
@@ -403,13 +513,21 @@ describe("desktop real session operator controls", () => {
 		try {
 			await Promise.race([
 				prepared.promise,
-				outcome.then(result => { throw new Error(`Session transition settled before the preparation checkpoint (${result.status})`); }),
+				outcome.then(result => {
+					throw new Error(`Session transition settled before the preparation checkpoint (${result.status})`);
+				}),
 			]);
 			expect(f.session.sessionLifecycle.transitioning).toBe(true);
 			expect(f.controller.isBusy()).toBe(false);
-			expect(() => f.controller.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "session_transitioning" }));
-			expect(() => f.controller.getOperation({ operationId: completed.operationId })).toThrow(expect.objectContaining({ code: "session_transitioning" }));
-			expect(() => f.controller.abort({ operationId: completed.operationId })).toThrow(expect.objectContaining({ code: "session_transitioning" }));
+			expect(() => f.controller.execute({ text: "! true" })).toThrow(
+				expect.objectContaining({ code: "session_transitioning" }),
+			);
+			expect(() => f.controller.getOperation({ operationId: completed.operationId })).toThrow(
+				expect.objectContaining({ code: "session_transitioning" }),
+			);
+			expect(() => f.controller.abort({ operationId: completed.operationId })).toThrow(
+				expect.objectContaining({ code: "session_transitioning" }),
+			);
 			await expect(f.controller.fold({})).rejects.toMatchObject({ code: "session_transitioning" });
 		} finally {
 			release.resolve();
@@ -423,20 +541,30 @@ describe("desktop real session operator controls", () => {
 		await waitFor(() => !f.session.sessionLifecycle.transitioning);
 		expect(f.session.sessionLifecycle.generation).toBe(generation);
 		expect(f.controller.getOperation({ operationId: completed.operationId })).toEqual(completed);
-		expect((await settled(f.controller, f.controller.execute({ text: "! printf 'still-current\\n'" }))).output).toContain("still-current");
+		expect(
+			(await settled(f.controller, f.controller.execute({ text: "! printf 'still-current\\n'" }))).output,
+		).toContain("still-current");
 	}, 20_000);
 
 	test("controller teardown neither releases unsettled SDK work nor publishes success", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<KernelExecuteResult>();
-		pythonSeam(async () => { entered.resolve(); return release.promise; });
+		pythonSeam(async () => {
+			entered.resolve();
+			return release.promise;
+		});
 		const f = await fixture();
 		const running = f.controller.execute({ text: "$ ignores_cancel_until_released()" });
 		await entered.promise;
 		f.controller.dispose();
 		expect(f.controller.isBusy()).toBe(true);
-		expect(() => f.controller.getOperation({ operationId: running.operationId })).toThrow(expect.objectContaining({ code: "disposed" }));
-		const replacement = createDesktopOperatorController(f.session, { ...f.controllerOptions, connectionGeneration: "replacement" });
+		expect(() => f.controller.getOperation({ operationId: running.operationId })).toThrow(
+			expect.objectContaining({ code: "disposed" }),
+		);
+		const replacement = createDesktopOperatorController(f.session, {
+			...f.controllerOptions,
+			connectionGeneration: "replacement",
+		});
 		try {
 			expect(replacement.isBusy()).toBe(true);
 			expect(() => replacement.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "busy" }));
@@ -446,15 +574,23 @@ describe("desktop real session operator controls", () => {
 			expect(f.session.isEvalRunning).toBe(false);
 			expect(f.controller.isBusy()).toBe(false);
 			expect(f.events.every(event => event.operation.status === "running")).toBe(true);
-			expect((await settled(replacement, replacement.execute({ text: "! printf 'new-owner\\n'" }))).output).toContain("new-owner");
-		} finally { release.resolve(OK); replacement.dispose(); }
+			expect(
+				(await settled(replacement, replacement.execute({ text: "! printf 'new-owner\\n'" }))).output,
+			).toContain("new-owner");
+		} finally {
+			release.resolve(OK);
+			replacement.dispose();
+		}
 	}, 20_000);
 
 	test("session disposal authority fences controls immediately, before cleanup settles", async () => {
 		const f = await fixture();
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		f.session.registerToolSessionCleanup(async () => { entered.resolve(); await release.promise; });
+		f.session.registerToolSessionCleanup(async () => {
+			entered.resolve();
+			await release.promise;
+		});
 		const disposal = f.session.dispose();
 		await entered.promise;
 		expect(f.session.sessionLifecycle.disposed).toBe(true);
@@ -467,15 +603,20 @@ describe("desktop real session operator controls", () => {
 	test("fold uses the actual managed foreground BashTool and leaves its owned command running", async () => {
 		const f = await fixture();
 		const toolSession: ToolSession = {
-			cwd: f.directory, hasUI: false, settings: f.settings,
-			getSessionFile: () => null, getSessionId: () => f.session.sessionId,
-			getSessionSpawns: () => "*", getAgentId: () => f.ownerId,
+			cwd: f.directory,
+			hasUI: false,
+			settings: f.settings,
+			getSessionFile: () => null,
+			getSessionId: () => f.session.sessionId,
+			getSessionSpawns: () => "*",
+			getAgentId: () => f.ownerId,
 			getAsyncJobManager: () => f.jobs,
 			registerForegroundFoldParticipant: adapter => f.session.registerForegroundFoldParticipant(adapter),
 		};
 		const tool = new BashTool(toolSession);
 		const foreground = tool.execute("operator-fold-tool", {
-			command: "printf 'before-fold\\n'; sleep 0.5; printf 'after-fold\\n'", timeout: 10,
+			command: "printf 'before-fold\\n'; sleep 0.5; printf 'after-fold\\n'",
+			timeout: 10,
 		});
 		await waitFor(() => f.session.hasForegroundBashBackgroundRequestHandler());
 		expect(await f.controller.fold({})).toEqual({ target: "current_foreground_tool", status: "folded" });

@@ -135,7 +135,52 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .brand-mark { width: 26px; height: 26px; flex: none; border-radius: var(--radius-xs); }
 
-.project-group { margin: 16px 0 24px; }
+.project-group { margin: 16px 0 24px; border-radius: var(--radius-md); }
+/* Drag reorder: the dragged row dims, the whole workspace is a drop target. */
+.project-group.dragging, .session-drop.dragging { opacity: 0.45; }
+/* The insertion cue marks where the dragged item will land. */
+.project-group.drop-target { outline: 2px solid var(--ring); outline-offset: 2px; }
+/* The insertion cue sits on the edge the item will actually land on: a downward drag inserts
+   after its target, an upward one before it, so the line follows the real splice. */
+.session-drop.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.session-drop.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+/* Inset like the conversation cue: a border would reflow the list under the pointer. */
+.project-group.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.project-group.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.project-heading { cursor: grab; border-radius: var(--radius-xs); }
+.session-drop { border-radius: var(--radius-sm); }
+.session-drop.dragging { cursor: grabbing; }
+.show-more { width: 100%; justify-content: center; margin-top: 4px; font-size: 0.75rem; }
+/* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
+.menu-scrim { position: fixed; inset: 0; z-index: 40; border: 0; padding: 0; background: transparent; }
+.context-menu { position: fixed; z-index: 41; display: flex; flex-direction: column; gap: 2px; min-width: 200px; padding: 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); }
+.context-menu .button { justify-content: flex-start; border: 0; background: transparent; font-size: 0.8125rem; }
+.context-menu .button:hover:not(:disabled) { background: var(--surface-2); }
+/* Task list and goal state sit between the conversation and the composer. */
+.todo-panel, .goal-strip { max-width: 800px; margin: 0 auto 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.todo-panel { padding: 4px; }
+.todo-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text); text-align: left; }
+.todo-toggle:hover { background: var(--surface-2); }
+.todo-toggle > svg:first-child { color: var(--accent); flex: none; }
+.todo-toggle > svg:last-child { margin-left: auto; color: var(--muted); flex: none; }
+.todo-summary { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 0.8125rem; }
+.todo-summary small { color: var(--muted); font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-phases { padding: 4px 8px 10px; }
+.todo-phase h3 { margin: 6px 0 2px; font-size: 0.75rem; color: var(--muted); }
+.todo-phase ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.todo-task { display: flex; align-items: flex-start; gap: 8px; font-size: 0.8125rem; line-height: 1.45; }
+.todo-task > svg { flex: none; margin-top: 3px; width: 14px; height: 14px; }
+.todo-task.completed { color: var(--muted); text-decoration: line-through; }
+.todo-task.completed > svg { color: var(--status-done); }
+.todo-task.in_progress > svg { color: var(--accent); }
+.todo-task.abandoned { color: var(--muted); text-decoration: line-through; }
+.goal-strip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+.goal-status { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 0.75rem; color: var(--muted); }
+.goal-objective { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8125rem; }
+.goal-action { margin-left: auto; padding: 6px; border: 0; background: transparent; color: var(--muted); }
+.goal-action + .goal-action { margin-left: 0; }
+.goal-action:hover:not(:disabled) { color: var(--accent); background: var(--surface-2); }
+
 .project-heading h2 { margin: 0; min-width: 0; font-size: 0.8125rem; }
 .project-heading .button { flex-shrink: 0; }
 .path { display: block; overflow-wrap: anywhere; word-break: break-all; font-family: var(--mono); font-size: 0.6875rem; margin: 4px 0 8px; color: var(--muted); }
@@ -230,15 +275,18 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .composer-input .attachment-list { margin-bottom: 4px; }
 .composer textarea::placeholder { white-space: nowrap; }
 .composer textarea:focus-visible { outline-offset: 0; }
-.composer-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 8px 12px; padding: 10px 0 2px; border-top: 1px solid var(--border-soft); margin-top: 6px; }
+/* Top-aligned, not baseline or centred: the controls block can be taller than the action when
+   the model status line wraps underneath, and the action must stay on the control row. */
+.composer-footer { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; padding: 10px 0 2px; border-top: 1px solid var(--border-soft); margin-top: 6px; }
+/* Zero basis so the controls shrink to the row and never push the action onto a second line;
+   their own content wraps instead. */
+.composer-controls { display: flex; align-items: center; flex: 1 1 0%; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
+/* One row: model, reasoning level and the single send/stop slot share the footer line. */
+.composer-footer .model-controls { flex: 1 1 auto; }
 .composer-controls > * { min-width: 0; max-width: 100%; }
-.composer-controls > label { display: flex; flex-direction: column; gap: 4px; margin: 0; flex: 1 1 140px; color: var(--muted); font-size: 0.75rem; }
-.composer-controls select { color: var(--text); padding: 6px 8px; font-size: 0.8125rem; }
-.composer-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px 12px; flex-wrap: wrap; }
-.composer-delivery { display: flex; flex: 1 1 180px; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
-.composer-delivery label { margin: 0; color: var(--muted); font-size: 0.75rem; }
-.composer-delivery select { flex: 1 1 120px; width: auto; padding: 6px 8px; font-size: 0.8125rem; }
-.composer-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; max-width: 100%; }
+.composer-actions { display: flex; align-items: center; margin-left: auto; flex: none; }
+.composer-action { min-width: 34px; min-height: 34px; aspect-ratio: 1; padding: 0; justify-content: center; border-radius: var(--radius-sm); }
+.composer-action > svg { margin: 0; }
 .error-banner { display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; margin: 8px 0; border: 1px solid color-mix(in srgb, var(--error) 60%, transparent); border-radius: var(--radius-md); color: var(--error); background: var(--error-soft); overflow-wrap: anywhere; white-space: pre-wrap; }
 .error-banner > svg { margin-top: 3px; }
 .error-content { min-width: 0; }
@@ -490,6 +538,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .btw-panel .btw-composer, .showcase .btw-panel .btw-composer { width: 100%; max-width: 100%; margin: 0; }
 .btw-composer label { margin-top: 0; font-size: 0.8125rem; }
 .btw-composer textarea { word-break: keep-all; overflow-wrap: anywhere; }
+/* Side chat keeps its own footer row so it never inherits the composer action slot. */
+.btw-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+.btw-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; max-width: 100%; }
 .modal .btw-panel { margin: 0; }
 .mobile-only { display: none; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
@@ -520,7 +571,6 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 	.modal { padding: 16px; }
 }
 @media (max-width: 480px) {
-	.composer-delivery { flex-basis: 100%; }
 	.model-controls > .model-trigger { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {

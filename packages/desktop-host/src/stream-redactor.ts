@@ -58,16 +58,23 @@ export function createDesktopStreamRedactor(
 			}
 			// Even a secret containing only half a surrogate must not split a pair.
 			for (let index = 0; index + 1 < raw.length; index++) {
-				if (highSurrogate(raw.charCodeAt(index)) && lowSurrogate(raw.charCodeAt(index + 1)) &&
-					(masks[index] || masks[index + 1])) {
+				if (
+					highSurrogate(raw.charCodeAt(index)) &&
+					lowSurrogate(raw.charCodeAt(index + 1)) &&
+					(masks[index] || masks[index + 1])
+				) {
 					masks[index] = 1;
 					masks[index + 1] = 1;
 				}
 			}
 
 			let release = final ? raw.length : Math.max(0, raw.length - overlap);
-			if (!final && release > 0 && highSurrogate(raw.charCodeAt(release - 1)) &&
-				(release === raw.length || lowSurrogate(raw.charCodeAt(release)))) {
+			if (
+				!final &&
+				release > 0 &&
+				highSurrogate(raw.charCodeAt(release - 1)) &&
+				(release === raw.length || lowSurrogate(raw.charCodeAt(release)))
+			) {
 				release--;
 			}
 			const parts: string[] = [];
@@ -100,7 +107,11 @@ export function createDesktopStreamRedactor(
 	}
 
 	return {
-		push(chunk) { return consume(chunk, false); },
-		finish() { return consume("", true); },
+		push(chunk) {
+			return consume(chunk, false);
+		},
+		finish() {
+			return consume("", true);
+		},
 	};
 }

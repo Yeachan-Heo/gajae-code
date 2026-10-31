@@ -41,48 +41,54 @@ export interface DesktopSessionInfoContext {
 
 export type DesktopSessionInfo =
 	| (DesktopSessionInfoUnavailable & {
-		code: "disposed" | "transitioning" | "stale_session" | "backend_failure" | "redaction_failed" | "invalid_catalog_session";
-	})
+			code:
+				| "disposed"
+				| "transitioning"
+				| "stale_session"
+				| "backend_failure"
+				| "redaction_failed"
+				| "invalid_catalog_session";
+	  })
 	| {
-		available: true;
-		metadata: {
-			/** Exact host-owned app catalog identity; never an SDK session/owner identity. */
-			catalogSessionId: string;
-			name: string | null;
-			/** Redacted display text only; not a native path, file selector, or capability. */
-			sessionFileDisplay: string | null;
-			cwd: string;
-			createdAt: string | null;
-			/** Persistence is enabled; this does not certify that pending writes have flushed. */
-			persisted: boolean;
-		};
-		model: { provider: string; id: string; name: string } | null;
-		thinkingLevel: string | null;
-		run: {
-			state: "running" | "compacting" | "retrying" | "settling" | "idle";
-			streaming: boolean;
-			/** SDK raw-executor activity, not a process ledger or physical termination proof. */
-			bashRunning: boolean;
-			pythonRunning: boolean;
-			compacting: boolean;
-			retrying: boolean;
-			postPromptWork: boolean;
-			queuedMessages: number | null;
-		};
-		tools: {
-			available: number | null;
-			pending: number | null;
-			/** Calls/results in the active message list, not the whole persisted tree. */
-			calls: number | null;
-			results: number | null;
-		};
-		/** All transcript assistant/task usage, including inactive branches; may not yet be flushed to disk. */
-		recordedTotals: DesktopSessionInfoUsage | DesktopSessionInfoUnavailable;
-		/** getSessionStats totals over the active in-memory message list, excluding the streaming partial. */
-		activeTotals: DesktopSessionInfoUsage | DesktopSessionInfoUnavailable;
-		/** Provisional SDK counters only; never added to recordedTotals or treated as billed usage. */
-		liveProgress: DesktopSessionInfoUsage | DesktopSessionInfoUnavailable;
-		context: DesktopSessionInfoContext;
-		accountQuota: DesktopSessionInfoUnavailable;
-		actualBilledCost: DesktopSessionInfoUnavailable;
-	};
+			available: true;
+			metadata: {
+				/** Exact host-owned app catalog identity; never an SDK session/owner identity. */
+				catalogSessionId: string;
+				name: string | null;
+				/** Redacted display text only; not a native path, file selector, or capability. */
+				sessionFileDisplay: string | null;
+				cwd: string;
+				createdAt: string | null;
+				/** Persistence is enabled; this does not certify that pending writes have flushed. */
+				persisted: boolean;
+			};
+			model: { provider: string; id: string; name: string } | null;
+			thinkingLevel: string | null;
+			run: {
+				state: "running" | "compacting" | "retrying" | "settling" | "idle";
+				streaming: boolean;
+				/** SDK raw-executor activity, not a process ledger or physical termination proof. */
+				bashRunning: boolean;
+				pythonRunning: boolean;
+				compacting: boolean;
+				retrying: boolean;
+				postPromptWork: boolean;
+				queuedMessages: number | null;
+			};
+			tools: {
+				available: number | null;
+				pending: number | null;
+				/** Calls/results in the active message list, not the whole persisted tree. */
+				calls: number | null;
+				results: number | null;
+			};
+			/** All transcript assistant/task usage, including inactive branches; may not yet be flushed to disk. */
+			recordedTotals: DesktopSessionInfoUsage | DesktopSessionInfoUnavailable;
+			/** getSessionStats totals over the active in-memory message list, excluding the streaming partial. */
+			activeTotals: DesktopSessionInfoUsage | DesktopSessionInfoUnavailable;
+			/** Provisional SDK counters only; never added to recordedTotals or treated as billed usage. */
+			liveProgress: DesktopSessionInfoUsage | DesktopSessionInfoUnavailable;
+			context: DesktopSessionInfoContext;
+			accountQuota: DesktopSessionInfoUnavailable;
+			actualBilledCost: DesktopSessionInfoUnavailable;
+	  };

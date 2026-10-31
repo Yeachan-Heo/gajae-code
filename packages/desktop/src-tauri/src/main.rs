@@ -357,6 +357,9 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "tools.list"
 			| "tools.set"
 			| "goal.operate"
+			| "project.close"
+			| "project.reorder"
+			| "session.reorder"
 			| "shutdown"
 	) {
 		return Err("Unknown engine method".into());
@@ -585,6 +588,24 @@ mod tests {
 			(json!([]), "Invalid request envelope"),
 		] {
 			assert_eq!(encode_engine_request(&request).err().as_deref(), Some(expected));
+		}
+	}
+
+	#[test]
+	fn admits_workspace_layout_methods() {
+		// The renderer's workspace menu and drag reorder depend on these three methods; a method
+		// missing from this admission list fails in the shipping app even though the host supports it.
+		for (method, params) in [
+			("project.close", json!({"projectId": "11111111-1111-4111-8111-111111111111"})),
+			("project.reorder", json!({"ids": ["11111111-1111-4111-8111-111111111111"]})),
+			(
+				"session.reorder",
+				json!({"projectId": "11111111-1111-4111-8111-111111111111", "ids": []}),
+			),
+		] {
+			let request = json!({"id": "layout", "method": method, "params": params});
+			let bytes = encode_engine_request(&request).expect(method);
+			assert_eq!(serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]).unwrap(), request);
 		}
 	}
 

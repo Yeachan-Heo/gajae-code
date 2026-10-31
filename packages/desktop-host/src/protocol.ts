@@ -10,6 +10,9 @@ export const PROTOCOL_VERSION = 1;
 export const DESKTOP_METHODS = [
 	"bootstrap",
 	"project.open",
+	"project.close",
+	"project.reorder",
+	"session.reorder",
 	"session.create",
 	"session.select",
 	"session.rename",
@@ -148,6 +151,21 @@ export interface DesktopThinking {
 	mode?: DesktopThinkingMode;
 	reason?: string;
 }
+export interface DesktopTodoItem {
+	content: string;
+	status: "pending" | "in_progress" | "completed" | "abandoned";
+}
+export interface DesktopTodoPhase {
+	name: string;
+	tasks: DesktopTodoItem[];
+}
+export interface DesktopGoal {
+	objective: string;
+	status: "active" | "paused" | "complete" | "dropped";
+	/** Present only when the SDK reported a value; never zero-filled by the host. */
+	tokensUsed?: number;
+	timeUsedSeconds?: number;
+}
 export interface DesktopSession {
 	id: string;
 	projectId: string;
@@ -168,6 +186,10 @@ export interface DesktopSession {
 	controlGeneration: number | null;
 	/** Present on host projections, including unavailable unopened/no-model sessions. */
 	thinking?: DesktopThinking;
+	/** Live `todo_write` state for the session; omitted when the list is empty. */
+	todos?: DesktopTodoPhase[];
+	/** Active or retained goal state from the `goal` tool; omitted when there is none. */
+	goal?: DesktopGoal;
 	messages: DesktopMessage[];
 	historyTruncated?: boolean;
 	question?: DesktopQuestion;
@@ -184,6 +206,11 @@ export interface DesktopProject {
 	id: string;
 	name: string;
 	path: string;
+	/**
+	 * A closed workspace is hidden with its conversations but keeps its identity, so reopening
+	 * the same directory restores the same project and its sessions. Closing never deletes.
+	 */
+	closed?: boolean;
 }
 export interface DesktopModel {
 	id: string;

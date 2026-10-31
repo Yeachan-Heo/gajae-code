@@ -1,25 +1,31 @@
 import {
 	ArrowUp,
 	Check,
+	ChevronDown,
 	ChevronRight,
 	Circle,
 	CircleAlert,
 	CircleCheck,
 	CircleHelp,
-	ListPlus,
+	ListChecks,
 	LoaderCircle,
+	Pause,
+	Play,
 	Square,
 	Star,
+	Target,
 	X,
 } from "lucide-react";
 import type { ButtonHTMLAttributes, ClipboardEventHandler, ReactNode } from "react";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type {
+	DesktopGoal,
 	DesktopMessage,
 	DesktopMessageBlock,
 	DesktopQuestion,
 	DesktopSession,
 	DesktopSetting,
+	DesktopTodoPhase,
 } from "../../desktop-host/src/protocol";
 import { t } from "./i18n";
 
@@ -59,16 +65,31 @@ export function SessionRow({
 	selected,
 	onSelect,
 	onStar,
+	onMenu,
 }: {
 	session: DesktopSession;
 	selected?: boolean;
 	onSelect: () => void;
 	onStar: () => void;
+	/** Keyboard path for the row menu: the ContextMenu key or Shift+F10. */
+	onMenu?: (x: number, y: number) => void;
 }) {
 	const StatusIcon = statusIcons[session.status];
 	return (
 		<div className={`session-row ${selected ? "selected" : ""}`}>
-			<button className="session-select" aria-current={selected ? "page" : undefined} onClick={onSelect}>
+			<button
+				className="session-select"
+				aria-current={selected ? "page" : undefined}
+				aria-haspopup={onMenu ? "menu" : undefined}
+				onClick={onSelect}
+				onKeyDown={event => {
+					if (!onMenu) return;
+					if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+					event.preventDefault();
+					const box = event.currentTarget.getBoundingClientRect();
+					onMenu(box.left, box.bottom);
+				}}
+			>
 				<span className="session-title">{session.title}</span>
 				<small className={`status ${session.status}`}>
 					<StatusIcon aria-hidden="true" />
@@ -201,6 +222,8 @@ export function Message({ message }: { message: DesktopMessage }) {
 		</article>
 	);
 }
+/** How long the send-to-stop swap ignores activation, so a second click cannot abort a fresh run. */
+const STOP_GRACE_MS = 600;
 export function Composer({
 	value,
 	onChange,
@@ -208,8 +231,6 @@ export function Composer({
 	onStop,
 	busy,
 	disabled,
-	deliverAs,
-	onDeliverAs,
 	onSlash,
 	controls,
 	attachment,
@@ -224,8 +245,6 @@ export function Composer({
 	onStop: () => void;
 	busy: boolean;
 	disabled?: boolean;
-	deliverAs?: "steer" | "followUp";
-	onDeliverAs?: (value: "steer" | "followUp") => void;
 	onSlash?: () => void;
 	controls?: ReactNode;
 	attachment?: ReactNode;
@@ -235,7 +254,6 @@ export function Composer({
 	onPaste?: ClipboardEventHandler<HTMLTextAreaElement>;
 }) {
 	const id = useId();
-	const deliverId = useId();
 	const textarea = useRef<HTMLTextAreaElement>(null);
 	const metrics = useRef<HTMLSpanElement>(null);
 	const composing = useRef(false);
@@ -269,6 +287,21 @@ export function Composer({
 		return () => observer.disconnect();
 	}, []);
 	const canSubmit = !disabled && !sendDisabled && (!busy || allowQueue) && !!(value.trim() || hasAttachments);
+	// While a turn runs the single slot either steers the draft or stops the turn: stop is the
+	// fallback whenever the draft cannot actually be sent, so a run is never left uncontrollable
+	// (empty draft, operator-owned turn, blocked recovery, not-ready attachment).
+	const stopMode = busy && !canSubmit;
+	// Sending clears the draft, which swaps this slot to stop under the same pointer. Ignore that
+	// destructive activation for a moment so an impatient second click cannot abort the run.
+	const lastSubmit = useRef(0);
+	const submit = () => {
+		lastSubmit.current = performance.now();
+		onSend();
+	};
+	const stop = () => {
+		if (performance.now() - lastSubmit.current < STOP_GRACE_MS) return;
+		onStop();
+	};
 	return (
 		<form
 			className="composer"
@@ -276,7 +309,7 @@ export function Composer({
 			data-disabled={disabled || undefined}
 			onSubmit={event => {
 				event.preventDefault();
-				if (canSubmit) onSend();
+				if (canSubmit) submit();
 			}}
 		>
 			<span ref={metrics} className="composer-metrics" aria-hidden="true">
@@ -292,7 +325,9 @@ export function Composer({
 					id={id}
 					value={value}
 					onChange={event => onChange(event.target.value)}
-					placeholder={t("support.composerPlaceholder")}
+					placeholder={
+						busy && allowQueue ? t("support.composerQueuedPlaceholder") : t("support.composerPlaceholder")
+					}
 					rows={1}
 					disabled={disabled}
 					onPaste={onPaste}
@@ -319,45 +354,163 @@ export function Composer({
 						}
 						if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
 							event.preventDefault();
-							if (canSubmit) onSend();
+							if (canSubmit) submit();
 						}
 					}}
 				/>
 			</div>
-			{controls != null && (
-				<div className="composer-controls" role="group" aria-label={t("support.composerControls")}>
-					{controls}
-				</div>
-			)}
-			<div className="composer-actions">
-				{busy && allowQueue && onDeliverAs && (
-					<div className="composer-delivery">
-						<label htmlFor={deliverId}>{t("support.deliverLabel")}</label>
-						<select
-							id={deliverId}
-							value={deliverAs ?? "steer"}
-							disabled={disabled}
-							onChange={event => onDeliverAs(event.target.value === "followUp" ? "followUp" : "steer")}
-						>
-							<option value="steer">{t("support.deliverSteer")}</option>
-							<option value="followUp">{t("support.deliverFollowUp")}</option>
-						</select>
+			<div className="composer-footer">
+				{controls != null && (
+					<div className="composer-controls" role="group" aria-label={t("support.composerControls")}>
+						{controls}
 					</div>
 				)}
-				<div className="composer-buttons">
-					{busy && (
-						<Button onClick={onStop} disabled={disabled}>
+				<div className="composer-actions">
+					{/* One slot: stop while the turn runs with nothing waiting to be sent, otherwise
+					    send. A message typed during a run is queued and steered into that run, as in
+					    the TUI, so no delivery choice is offered anywhere. Icons only. */}
+					{stopMode ? (
+						<Button
+							type="button"
+							className="primary composer-action"
+							disabled={disabled}
+							aria-label={t("support.stop")}
+							title={t("support.stop")}
+							onClick={stop}
+						>
 							<Square aria-hidden="true" />
-							{t("support.stop")}
+						</Button>
+					) : (
+						<Button
+							type="submit"
+							className="primary composer-action"
+							disabled={!canSubmit}
+							aria-label={busy && allowQueue ? t("support.sendSteer") : t("support.send")}
+							title={busy && allowQueue ? t("support.sendSteer") : t("support.send")}
+						>
+							<ArrowUp aria-hidden="true" />
 						</Button>
 					)}
-					<Button type="submit" className="primary" disabled={!canSubmit}>
-						{busy && allowQueue ? <ListPlus aria-hidden="true" /> : <ArrowUp aria-hidden="true" />}
-						{busy && allowQueue ? t("support.queue") : t("support.send")}
-					</Button>
 				</div>
 			</div>
 		</form>
+	);
+}
+const todoStatusIcons = {
+	pending: Circle,
+	in_progress: LoaderCircle,
+	completed: CircleCheck,
+	abandoned: X,
+};
+
+/**
+ * The live `todo_write` list. Collapsed it states the progress and the task in flight; expanded
+ * it shows every task, so the tool's state is visible without reading the tool result.
+ */
+export function TodoPanel({ phases }: { phases: DesktopTodoPhase[] }) {
+	const [open, setOpen] = useState(false);
+	const tasks = phases.flatMap(phase => phase.tasks);
+	if (tasks.length === 0) return null;
+	const done = tasks.filter(task => task.status === "completed").length;
+	const active = tasks.find(task => task.status === "in_progress");
+	return (
+		<section className="todo-panel" aria-label={t("support.todosLabel")}>
+			<button className="todo-toggle" type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
+				<ListChecks aria-hidden="true" />
+				<span className="todo-summary">
+					{t("support.todoProgress", { done, total: tasks.length })}
+					{!open && active && <small>{active.content}</small>}
+				</span>
+				{open ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
+			</button>
+			{open && (
+				<div className="todo-phases">
+					{phases.map((phase, phaseIndex) => (
+						<div className="todo-phase" key={`${phaseIndex}-${phase.name}`}>
+							{phase.name && <h3>{phase.name}</h3>}
+							<ul>
+								{phase.tasks.map((task, index) => {
+									const Icon = todoStatusIcons[task.status];
+									return (
+										<li key={`${task.content}-${index}`} className={`todo-task ${task.status}`}>
+											<Icon aria-hidden="true" />
+											<span>{task.content}</span>
+										</li>
+									);
+								})}
+							</ul>
+						</div>
+					))}
+				</div>
+			)}
+		</section>
+	);
+}
+
+const goalStatusLabels = {
+	active: () => t("support.goalActive"),
+	paused: () => t("support.goalPaused"),
+	complete: () => t("support.goalComplete"),
+	dropped: () => t("support.goalDropped"),
+};
+const goalStatusIcons = {
+	active: Target,
+	paused: Pause,
+	complete: CircleCheck,
+	dropped: X,
+};
+
+/** Goal state from the `goal` tool, with the operations the desktop is allowed to request. */
+export function GoalStrip({
+	goal,
+	pending,
+	busy,
+	onOperate,
+}: {
+	goal: DesktopGoal;
+	pending?: boolean;
+	/** A running turn owns the session, so the host would refuse the change. */
+	busy?: boolean;
+	onOperate: (op: "resume" | "pause" | "complete" | "drop") => void;
+}) {
+	const Icon = goalStatusIcons[goal.status];
+	const actions =
+		goal.status === "active"
+			? (["pause", "complete", "drop"] as const)
+			: goal.status === "paused"
+				? (["resume", "drop"] as const)
+				: (["drop"] as const);
+	const labels = {
+		resume: t("support.goalResume"),
+		pause: t("support.goalPause"),
+		complete: t("support.goalCompleteAction"),
+		drop: t("support.goalDrop"),
+	};
+	return (
+		<section className={`goal-strip ${goal.status}`} aria-label={t("support.goalLabel")}>
+			<span className="goal-status">
+				<Icon aria-hidden="true" />
+				{goalStatusLabels[goal.status]()}
+			</span>
+			<span className="goal-objective" title={goal.objective}>
+				{goal.objective}
+			</span>
+			{actions.map(op => (
+				<Button
+					key={op}
+					className="goal-action"
+					disabled={pending || busy}
+					aria-label={labels[op]}
+					title={labels[op]}
+					onClick={() => onOperate(op)}
+				>
+					{op === "pause" ? <Pause aria-hidden="true" /> : null}
+					{op === "resume" ? <Play aria-hidden="true" /> : null}
+					{op === "complete" ? <Check aria-hidden="true" /> : null}
+					{op === "drop" ? <X aria-hidden="true" /> : null}
+				</Button>
+			))}
+		</section>
 	);
 }
 export function QuestionCard({

@@ -9,12 +9,7 @@ import {
 } from "@gajae-code/ai/core";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { getThinkingLevelMetadata, parseThinkingLevel } from "@gajae-code/coding-agent/thinking";
-import type {
-	DesktopModel,
-	DesktopThinking,
-	DesktopThinkingMode,
-	DesktopThinkingOption,
-} from "./protocol";
+import type { DesktopModel, DesktopThinking, DesktopThinkingMode, DesktopThinkingOption } from "./protocol";
 
 interface ModelThinking {
 	options: DesktopThinkingOption[];

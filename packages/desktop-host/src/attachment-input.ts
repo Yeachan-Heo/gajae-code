@@ -2,9 +2,9 @@ import type { ImageContent } from "@gajae-code/ai/core";
 import {
 	assertDesktopAttachmentRequestSize,
 	DESKTOP_ATTACHMENT_MAX_COUNT,
-	desktopAttachmentBase64Bytes,
 	type DesktopAttachment,
 	type DesktopAttachmentPromptRequest,
+	desktopAttachmentBase64Bytes,
 	isDesktopAttachmentImageMime,
 	validateDesktopAttachmentName,
 	validateDesktopAttachmentText,
@@ -53,8 +53,10 @@ export function validateDesktopAttachmentPromptRequest(value: unknown): DesktopA
 		throw new Error("Invalid attachment prompt parameters.");
 	if (params.deliverAs !== undefined && params.deliverAs !== "steer" && params.deliverAs !== "followUp")
 		throw new Error("Unsupported queued attachment delivery.");
-	if (params.attachments !== undefined && (!Array.isArray(params.attachments) ||
-		params.attachments.length > DESKTOP_ATTACHMENT_MAX_COUNT))
+	if (
+		params.attachments !== undefined &&
+		(!Array.isArray(params.attachments) || params.attachments.length > DESKTOP_ATTACHMENT_MAX_COUNT)
+	)
 		throw new Error("Too many attachments; at most 16 files can be selected.");
 	const attachments = (params.attachments as unknown[] | undefined)?.map(attachment);
 	return {
@@ -82,7 +84,10 @@ export function prepareDesktopAttachmentInput(value: unknown): PreparedDesktopAt
 	const textFiles: string[] = [];
 	for (const input of attachments) {
 		if (input.kind === "image") images.push({ type: "image", mimeType: input.mimeType, data: input.data });
-		else textFiles.push(`--- Attached UTF-8 file: ${JSON.stringify(input.name)} ---\n${input.text}\n--- End attached file ---`);
+		else
+			textFiles.push(
+				`--- Attached UTF-8 file: ${JSON.stringify(input.name)} ---\n${input.text}\n--- End attached file ---`,
+			);
 	}
 	const text = [request.params.text, ...textFiles].filter(part => part.length > 0).join("\n\n");
 	if (!text.trim() && images.length === 0) throw new Error("Prompt must not be empty.");

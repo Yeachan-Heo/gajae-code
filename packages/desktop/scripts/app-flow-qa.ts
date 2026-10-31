@@ -175,8 +175,27 @@ async function typeComposer(value: string) {
 	await (field as NonNullable<typeof field>).click({ clickCount: 3 });
 	await (field as NonNullable<typeof field>).type(value);
 }
+/** The composer action is icon-only: send is the one submit button in the action slot. */
 async function send() {
-	await clickText("Send");
+	const clicked = await page.evaluate(() => {
+		const button = document.querySelector<HTMLButtonElement>('.composer-actions button[type="submit"]');
+		if (!button || button.disabled) return false;
+		button.click();
+		return true;
+	});
+	expect(clicked, "composer send action was not clickable");
+	await Bun.sleep(120);
+}
+/** Stop is the same slot while a turn runs and the draft is empty; only its label says which. */
+async function stop() {
+	const clicked = await page.evaluate(() => {
+		const button = document.querySelector<HTMLButtonElement>('.composer-actions button[aria-label="Stop"]');
+		if (!button || button.disabled) return false;
+		button.click();
+		return true;
+	});
+	expect(clicked, "composer stop action was not clickable");
+	await Bun.sleep(120);
 }
 async function hold() {
 	await page.evaluate(() => (window as never as { __qaFixture: { hold(): Promise<unknown> } }).__qaFixture.hold());
@@ -194,14 +213,24 @@ async function sessionRows(): Promise<string[]> {
 	);
 }
 async function selectSession(title: string) {
-	const opened = await page.evaluate(label => {
-		for (const row of document.querySelectorAll(".session-row")) {
-			if ((row.querySelector(".session-title")?.textContent ?? "").trim() !== label) continue;
-			(row.querySelector(".session-select") as HTMLElement).click();
-			return true;
-		}
-		return false;
-	}, title);
+	const click = (label: string) =>
+		page.evaluate(title => {
+			for (const row of document.querySelectorAll(".session-row")) {
+				if ((row.querySelector(".session-title")?.textContent ?? "").trim() !== title) continue;
+				(row.querySelector(".session-select") as HTMLElement).click();
+				return true;
+			}
+			return false;
+		}, label);
+	let opened = await click(title);
+	// A workspace lists five conversations per page, so reveal pages until the row exists.
+	for (let pageIndex = 0; !opened && pageIndex < 20; pageIndex++) {
+		const more = await page.$(".project-group .show-more");
+		if (!more) break;
+		await more.click();
+		await Bun.sleep(80);
+		opened = await click(title);
+	}
 	expect(opened, `session row ${JSON.stringify(title)} missing`);
 	await waitFor(async () => (await text()).includes(title), `conversation ${JSON.stringify(title)}`);
 	await Bun.sleep(200);
@@ -309,7 +338,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await send();
 			await waitFor(async () => (await status()).includes("Working"), "running status");
 			await waitText("Fixture turn");
-			await clickText("Stop");
+			await stop();
 			await idle();
 			await waitFor(
 				async () => (await fixture()).requests.at(-1)!.state === "aborted",
@@ -329,7 +358,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 			await waitFor(async () => (await status()).includes("Working"), "running status");
 			const held = (await fixture()).requests.at(-1)!;
 			await typeComposer("flow-qa queued turn");
-			await clickText("Add to queue");
+			await send();
 			await waitText("1 queued");
 			expect((await composerValue()) === "", "queued draft stayed in the composer");
 			await release(held.id);

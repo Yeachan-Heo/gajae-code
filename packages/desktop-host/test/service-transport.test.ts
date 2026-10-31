@@ -16,6 +16,7 @@ import {
 } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { DesktopHost } from "../src/host";
 import type { DesktopMcpOperationResult, DesktopMcpServer, DesktopMcpSnapshot } from "../src/mcp-protocol";
 import type { DesktopOperatorOperation } from "../src/operator-protocol";
@@ -192,7 +193,7 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 			for (const capture of captures) expect(capture.session.agent.streamFn).not.toHaveBeenCalled();
 		} finally {
 			loopback.stop(true);
-			await fs.rm(directory, { recursive: true, force: true });
+			await safeRm(directory, { recursive: true, force: true });
 		}
 	});
 	// Scope discovery roots before AuthStorage, Settings or factory initialization.

@@ -537,6 +537,47 @@ test("owned real MCP control lifecycle and LSP diagnostics cross the SDK", async
 	await waitProcessGone(shutdownPid);
 }, 90000);
 
+test("a desktop turn executes a real builtin tool from the full registry", async () => {
+	const { layout, call, send, fixture, frames, session } = await sdkHost();
+	const available = await call<{ available: string[]; active: string[] }>("tools.list", { sessionId: session.id });
+	// The desktop session carries the whole builtin registry, not a reduced subset.
+	for (const name of ["read", "write", "edit", "bash", "search", "find", "task", "job", "todo_write", "goal", "ask"])
+		expect(available.available).toContain(name);
+	await call("tools.set", { sessionId: session.id, names: ["read", "bash"] });
+
+	const target = path.join(layout.root, "tool-target.txt");
+	await Bun.write(target, "fixture tool line\n");
+	const prompt = send("prompt", {
+		sessionId: session.id,
+		text: `qa-tool-call:read:{"path":${JSON.stringify(target)}}`,
+	});
+	await waitFor(() => fixture.snapshot().requests.length === 1, "fixture request");
+	const request = fixture.snapshot().requests[0]!;
+	expect((request.body.tools as Array<{ function: { name: string } }>).map(tool => tool.function.name).sort()).toEqual(
+		["bash", "read"],
+	);
+	expect(fixture.release(request.id)).toBe(true);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "session" &&
+					frame.session.id === session.id &&
+					frame.session.messages.some(
+						message =>
+							message.role === "tool" &&
+							message.toolName === "read" &&
+							message.text.includes("fixture tool line"),
+					),
+			),
+		"read tool result",
+	);
+	// The second model call sees the tool result and finishes the turn normally.
+	await waitFor(() => fixture.snapshot().requests.length === 2, "post-tool request");
+	expect(fixture.snapshot().requests[1]!.held).toBe(false);
+	expect((await prompt).ok).toBe(true);
+}, 60000);
+
 describe("test-only desktop model fixture safety", () => {
 	test("requires explicit fixture opt-in and refuses LIVE before creating state", () => {
 		expect(() => assertFixtureMode({})).toThrow("explicit fixture");

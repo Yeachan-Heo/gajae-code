@@ -71,7 +71,8 @@ function object(value: unknown, keys: readonly string[]): Record<string, unknown
 		throw new DesktopOperatorError("invalid_input");
 	for (const key of keys) {
 		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new DesktopOperatorError("invalid_input");
+		if (!descriptor || !descriptor.enumerable || !("value" in descriptor))
+			throw new DesktopOperatorError("invalid_input");
 	}
 	return value as Record<string, unknown>;
 }
@@ -113,10 +114,17 @@ export class DesktopOperatorController {
 	#folding = false;
 
 	constructor(session: Session, options: DesktopOperatorOptions) {
-		if (typeof options.connectionGeneration !== "string" || !options.connectionGeneration || options.connectionGeneration.length > 128)
+		if (
+			typeof options.connectionGeneration !== "string" ||
+			!options.connectionGeneration ||
+			options.connectionGeneration.length > 128
+		)
 			throw new DesktopOperatorError("invalid_input");
-		if (typeof options.redact !== "function" || typeof options.emit !== "function" ||
-			(options.createStreamRedactor !== undefined && typeof options.createStreamRedactor !== "function"))
+		if (
+			typeof options.redact !== "function" ||
+			typeof options.emit !== "function" ||
+			(options.createStreamRedactor !== undefined && typeof options.createStreamRedactor !== "function")
+		)
 			throw new DesktopOperatorError("invalid_input");
 		this.#session = session;
 		this.#sessionId = session.sessionId;
@@ -132,8 +140,12 @@ export class DesktopOperatorController {
 	#assertCurrent(allowTransition = false): void {
 		const lifecycle = this.#session.sessionLifecycle;
 		if (this.#disposed || lifecycle.disposed) throw new DesktopOperatorError("disposed");
-		if (this.#stale || lifecycle.generation !== this.#generation || this.#session.sessionId !== this.#sessionId ||
-			this.#session.sessionManager.getSessionId() !== this.#managerSessionId) {
+		if (
+			this.#stale ||
+			lifecycle.generation !== this.#generation ||
+			this.#session.sessionId !== this.#sessionId ||
+			this.#session.sessionManager.getSessionId() !== this.#managerSessionId
+		) {
 			this.#stale = true;
 			throw new DesktopOperatorError("stale_session");
 		}
@@ -141,13 +153,22 @@ export class DesktopOperatorController {
 	}
 
 	#current(allowTransition = false): boolean {
-		try { this.#assertCurrent(allowTransition); return true; } catch { return false; }
+		try {
+			this.#assertCurrent(allowTransition);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	#publish(operation: Operation): void {
 		if (!this.#current()) return;
 		// Transport failure is not execution failure or completion evidence.
-		try { this.#emit({ type: "operator.updated", operation: copy(operation) }); } catch { /* The host owns transport recovery. */ }
+		try {
+			this.#emit({ type: "operator.updated", operation: copy(operation) });
+		} catch {
+			/* The host owns transport recovery. */
+		}
 	}
 
 	#text(text: string): string {
@@ -176,7 +197,9 @@ export class DesktopOperatorController {
 			const combined = operation.dto.output + text;
 			operation.dto.outputTruncated ||= combined.length > DESKTOP_OPERATOR_LIMITS.outputChars;
 			operation.dto.output = combined.slice(-DESKTOP_OPERATOR_LIMITS.outputChars);
-		} catch { this.#withhold(operation); }
+		} catch {
+			this.#withhold(operation);
+		}
 		this.#publish(operation);
 	}
 
@@ -196,25 +219,39 @@ export class DesktopOperatorController {
 		const parsed = input(value);
 		if (executions.has(this.#session) || this.#session.isBashRunning || this.#session.isEvalRunning)
 			throw new DesktopOperatorError("busy");
-		if ((parsed.kind === "bash" && typeof this.#session.executeBash !== "function") ||
-			(parsed.kind === "python" && typeof this.#session.executePython !== "function"))
+		if (
+			(parsed.kind === "bash" && typeof this.#session.executeBash !== "function") ||
+			(parsed.kind === "python" && typeof this.#session.executePython !== "function")
+		)
 			throw new DesktopOperatorError("unsupported");
 		let stream: DesktopOperatorStreamRedactor | undefined;
 		try {
 			stream = this.#createStreamRedactor?.();
-			if (this.#createStreamRedactor && (!stream || typeof stream.push !== "function" || typeof stream.finish !== "function"))
+			if (
+				this.#createStreamRedactor &&
+				(!stream || typeof stream.push !== "function" || typeof stream.finish !== "function")
+			)
 				throw new DesktopOperatorError("redaction_failed");
-		} catch { throw new DesktopOperatorError("redaction_failed"); }
+		} catch {
+			throw new DesktopOperatorError("redaction_failed");
+		}
 		this.#assertCurrent();
 		if (executions.has(this.#session) || this.#session.isBashRunning || this.#session.isEvalRunning)
 			throw new DesktopOperatorError("busy");
 		const operation: Operation = {
 			dto: {
-				operationId: crypto.randomUUID(), connectionGeneration: this.#connectionGeneration,
-				sessionGeneration: this.#generation, kind: parsed.kind, excludeFromContext: parsed.excludeFromContext,
-				status: "running", output: "", outputTruncated: false, liveOutput: stream ? "redacted" : "withheld",
+				operationId: crypto.randomUUID(),
+				connectionGeneration: this.#connectionGeneration,
+				sessionGeneration: this.#generation,
+				kind: parsed.kind,
+				excludeFromContext: parsed.excludeFromContext,
+				status: "running",
+				output: "",
+				outputTruncated: false,
+				liveOutput: stream ? "redacted" : "withheld",
 			},
-			stream, privacyFailed: false,
+			stream,
+			privacyFailed: false,
 		};
 		while (this.#operations.size >= DESKTOP_OPERATOR_LIMITS.operations) {
 			const oldest = this.#operations.keys().next().value;
@@ -234,9 +271,10 @@ export class DesktopOperatorController {
 		try {
 			this.#assertCurrent();
 			const onChunk = (chunk: string) => this.#chunk(operation, chunk);
-			const result: ExecutionResult = operation.dto.kind === "bash"
-				? await this.#session.executeBash(source, onChunk, { excludeFromContext })
-				: await this.#session.executePython(source, onChunk, { excludeFromContext });
+			const result: ExecutionResult =
+				operation.dto.kind === "bash"
+					? await this.#session.executeBash(source, onChunk, { excludeFromContext })
+					: await this.#session.executePython(source, onChunk, { excludeFromContext });
 			// Keep settlement private during preparation: a rolled-back transition
 			// must not strand a finished operation as running. Publication and every
 			// control still require non-transitioning authority.
@@ -260,7 +298,8 @@ export class DesktopOperatorController {
 				this.#fail(operation, "redaction_failed");
 			}
 		} catch {
-			if (this.#current(true)) this.#fail(operation, operation.privacyFailed ? "redaction_failed" : "backend_failure");
+			if (this.#current(true))
+				this.#fail(operation, operation.privacyFailed ? "redaction_failed" : "backend_failure");
 		} finally {
 			// Neither disposal, an abort request, nor a fold is settlement proof.
 			if (executions.get(this.#session) === operation) executions.delete(this.#session);
@@ -294,7 +333,9 @@ export class DesktopOperatorController {
 		try {
 			if (operation.dto.kind === "bash") this.#session.abortBash();
 			else this.#session.abortEval();
-		} catch { throw new DesktopOperatorError("backend_failure"); }
+		} catch {
+			throw new DesktopOperatorError("backend_failure");
+		}
 		operation.dto.status = "cancel_requested";
 		this.#publish(operation);
 		return copy(operation);
@@ -306,9 +347,12 @@ export class DesktopOperatorController {
 		object(value, []);
 		if (this.#folding) throw new DesktopOperatorError("busy");
 		const unsupported: DesktopOperatorFoldResult = { target: "current_foreground_tool", status: "unsupported" };
-		if (typeof this.#session.hasForegroundBashBackgroundRequestHandler !== "function" ||
+		if (
+			typeof this.#session.hasForegroundBashBackgroundRequestHandler !== "function" ||
 			typeof this.#session.requestForegroundBashBackgroundOutcome !== "function" ||
-			!this.#session.hasForegroundBashBackgroundRequestHandler()) return unsupported;
+			!this.#session.hasForegroundBashBackgroundRequestHandler()
+		)
+			return unsupported;
 		this.#folding = true;
 		try {
 			const outcome = await this.#session.requestForegroundBashBackgroundOutcome("sdk_control");
@@ -319,7 +363,9 @@ export class DesktopOperatorController {
 		} catch (error) {
 			if (error instanceof DesktopOperatorError) throw error;
 			throw new DesktopOperatorError("backend_failure");
-		} finally { this.#folding = false; }
+		} finally {
+			this.#folding = false;
+		}
 	}
 
 	dispose(): void {
@@ -331,12 +377,17 @@ export class DesktopOperatorController {
 			try {
 				if (active.dto.kind === "bash") this.#session.abortBash();
 				else this.#session.abortEval();
-			} catch { /* Disposal is not a successful abort acknowledgement. */ }
+			} catch {
+				/* Disposal is not a successful abort acknowledgement. */
+			}
 		}
 		this.#operations.clear();
 	}
 }
 
-export function createDesktopOperatorController(session: Session, options: DesktopOperatorOptions): DesktopOperatorController {
+export function createDesktopOperatorController(
+	session: Session,
+	options: DesktopOperatorOptions,
+): DesktopOperatorController {
 	return new DesktopOperatorController(session, options);
 }

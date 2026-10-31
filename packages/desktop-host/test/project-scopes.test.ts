@@ -7,7 +7,14 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { type CreateAgentSessionOptions, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
-import { type DesktopFrame, type DesktopProject, type DesktopRequest, type DesktopSession, type DesktopSetting, parseRequest } from "../src/protocol";
+import {
+	type DesktopFrame,
+	type DesktopProject,
+	type DesktopRequest,
+	type DesktopSession,
+	type DesktopSetting,
+	parseRequest,
+} from "../src/protocol";
 
 let environment: NodeJS.ProcessEnv;
 let agentDir: string;
@@ -43,7 +50,10 @@ async function launch() {
 			return createAgentSession(options);
 		},
 	});
-	cleanups.push(async () => { await host.close(); await fs.rm(directory, { recursive: true, force: true }); });
+	cleanups.push(async () => {
+		await host.close();
+		await fs.rm(directory, { recursive: true, force: true });
+	});
 	const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<T> => {
 		const id = crypto.randomUUID();
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));

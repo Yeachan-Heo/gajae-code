@@ -8,9 +8,12 @@ import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { ExtensionRunner, loadExtensionFromFactory, type ExtensionFactory } from "@gajae-code/coding-agent/extensibility/extensions";
+import {
+	type ExtensionFactory,
+	ExtensionRunner,
+	loadExtensionFromFactory,
+} from "@gajae-code/coding-agent/extensibility/extensions";
 import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensions/loader";
-import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { JobObservation } from "@gajae-code/coding-agent/sdk/job-observation";
 import {
 	approvalGate,
@@ -22,6 +25,7 @@ import {
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { createDesktopActivityController, DESKTOP_ACTIVITY_LIMITS } from "../src/activity-controls";
 import type { DesktopActivityRef } from "../src/activity-protocol";
 import {
@@ -32,14 +36,23 @@ import {
 } from "../src/gate-presentation";
 import type { DesktopGatePresentation, DesktopGatePresentationEvent } from "../src/gate-presentation-protocol";
 
-type RemoteEmitter = WorkflowGateEmitter & Required<Pick<WorkflowGateEmitter,
-	"listPendingGates" | "listWorkflowGateQueryRecords" | "registerGateTerminalController" | "resolveGate"
->>;
+type RemoteEmitter = WorkflowGateEmitter &
+	Required<
+		Pick<
+			WorkflowGateEmitter,
+			"listPendingGates" | "listWorkflowGateQueryRecords" | "registerGateTerminalController" | "resolveGate"
+		>
+	>;
 type RetireEvent = Extract<DesktopGatePresentationEvent, { type: "retire" }>;
 const cleanups: Array<() => Promise<void>> = [];
 
 function assertRemote(emitter: WorkflowGateEmitter | undefined): asserts emitter is RemoteEmitter {
-	if (!emitter?.listPendingGates || !emitter.listWorkflowGateQueryRecords || !emitter.registerGateTerminalController || !emitter.resolveGate)
+	if (
+		!emitter?.listPendingGates ||
+		!emitter.listWorkflowGateQueryRecords ||
+		!emitter.registerGateTerminalController ||
+		!emitter.resolveGate
+	)
 		throw new Error("Expected a genuine public AgentSession default broker emitter");
 }
 
@@ -84,12 +97,14 @@ class CommittedOwner {
 	}
 }
 
-async function fixture(options: {
-	redact?: (text: string) => string;
-	retirementTimeoutMs?: number;
-	extensionFactory?: ExtensionFactory;
-	compactable?: boolean;
-} = {}) {
+async function fixture(
+	options: {
+		redact?: (text: string) => string;
+		retirementTimeoutMs?: number;
+		extensionFactory?: ExtensionFactory;
+		compactable?: boolean;
+	} = {},
+) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-gate-presentation-"));
 	await setModelPresetRegistryDisabled({ agentDir: root, disabled: true });
 	const auth = await AuthStorage.create(path.join(root, "auth.db"));
@@ -111,32 +126,55 @@ async function fixture(options: {
 	const session = new AgentSession({
 		agent: new Agent({
 			initialState: {
-				tools: [], messages: sessionManager.buildSessionContext().messages, systemPrompt: [],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+				systemPrompt: [],
 				...(options.compactable ? { model: getBundledModel("anthropic", "claude-sonnet-4-5") } : {}),
 			},
-			getApiKey: () => { throw new Error("No provider turns in gate presentation tests"); },
-			streamFn: () => { throw new Error("No provider turns in gate presentation tests"); },
+			getApiKey: () => {
+				throw new Error("No provider turns in gate presentation tests");
+			},
+			streamFn: () => {
+				throw new Error("No provider turns in gate presentation tests");
+			},
 		}),
-		sessionManager, settings, modelRegistry: registry, extensionRunner,
-		agentDir: root, workflowGatePublication: "local", ownedAsyncJobManager: jobs,
-		agentId: ownerId, disposeAsyncJobManager: false,
+		sessionManager,
+		settings,
+		modelRegistry: registry,
+		extensionRunner,
+		agentDir: root,
+		workflowGatePublication: "local",
+		ownedAsyncJobManager: jobs,
+		agentId: ownerId,
+		disposeAsyncJobManager: false,
 	});
 	const emitter = session.getWorkflowGateEmitter();
 	assertRemote(emitter);
 	const observation = new JobObservation(jobs, ownerId);
 	const connectionGeneration = crypto.randomUUID();
 	const catalogSessionId = crypto.randomUUID();
-	const activity = createDesktopActivityController({ session, jobObservation: observation }, {
-		connectionGeneration, redact: options.redact ?? (text => text),
-	});
+	const activity = createDesktopActivityController(
+		{ session, jobObservation: observation },
+		{
+			connectionGeneration,
+			redact: options.redact ?? (text => text),
+		},
+	);
 	const ui = new CommittedOwner();
 	const binding: { connectionGeneration: string; catalogSessionId: string; alive: boolean } = {
-		connectionGeneration, catalogSessionId, alive: true,
+		connectionGeneration,
+		catalogSessionId,
+		alive: true,
 	};
 	const presenterOptions: DesktopGatePresenterOptions = {
-		session, activity, connectionGeneration, catalogSessionId,
-		isCurrent: (connection, catalog) => binding.alive && connection === binding.connectionGeneration && catalog === binding.catalogSessionId,
-		emit: ui.emit, retirementTimeoutMs: options.retirementTimeoutMs,
+		session,
+		activity,
+		connectionGeneration,
+		catalogSessionId,
+		isCurrent: (connection, catalog) =>
+			binding.alive && connection === binding.connectionGeneration && catalog === binding.catalogSessionId,
+		emit: ui.emit,
+		retirementTimeoutMs: options.retirementTimeoutMs,
 	};
 	let terminal: WorkflowGateTerminalController | undefined;
 	const register = emitter.registerGateTerminalController.bind(emitter);
@@ -158,7 +196,14 @@ async function fixture(options: {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 	return {
-		session, emitter, activity, presenter, presenterOptions, ui, binding, extensionRunner,
+		session,
+		emitter,
+		activity,
+		presenter,
+		presenterOptions,
+		ui,
+		binding,
+		extensionRunner,
 		terminal(): WorkflowGateTerminalController {
 			if (!terminal) throw new Error("The genuine broker did not register a terminal controller");
 			return terminal;
@@ -166,7 +211,13 @@ async function fixture(options: {
 	};
 }
 
-function ref(activity: { getSnapshot(): { sessionState?: { gates: { available: false; reason: string } | { available: true; pending: Array<{ ref: DesktopActivityRef }> } } } }): DesktopActivityRef {
+function ref(activity: {
+	getSnapshot(): {
+		sessionState?: {
+			gates: { available: false; reason: string } | { available: true; pending: Array<{ ref: DesktopActivityRef }> };
+		};
+	};
+}): DesktopActivityRef {
 	const gates = activity.getSnapshot().sessionState?.gates;
 	if (!gates?.available || !gates.pending[0]) throw new Error("Missing genuine emitted workflow gate");
 	return gates.pending[0].ref;
@@ -174,14 +225,17 @@ function ref(activity: { getSnapshot(): { sessionState?: { gates: { available: f
 
 function observe(emitter: WorkflowGateEmitter, input: OpenGateInput = approvalGate()) {
 	const outcome = { advanced: false, answer: undefined as unknown, rejected: false };
-	const promise = emitter.emitGate(input).then(answer => {
-		outcome.advanced = true;
-		outcome.answer = answer;
-		return answer;
-	}, error => {
-		outcome.rejected = true;
-		throw error;
-	});
+	const promise = emitter.emitGate(input).then(
+		answer => {
+			outcome.advanced = true;
+			outcome.answer = answer;
+			return answer;
+		},
+		error => {
+			outcome.rejected = true;
+			throw error;
+		},
+	);
 	void promise.catch(() => undefined);
 	return { outcome, promise };
 }
@@ -202,11 +256,17 @@ describe("real desktop workflow gate presentation", () => {
 			const workflow = observe(f.emitter, executionGate({ summary: "Exact execution boundary" }));
 			const presentation = f.presenter.present(ref(f.activity));
 			f.ui.commitPresented(f.presenter, presentation);
-			const answering = f.presenter.answer(presentation.id, { kind: "json", json: JSON.stringify({ decision, reason: "Operator decision" }) });
+			const answering = f.presenter.answer(presentation.id, {
+				kind: "json",
+				json: JSON.stringify({ decision, reason: "Operator decision" }),
+			});
 			const retirement = await f.ui.nextRetirement();
 			expect(f.ui.mounted.has(presentation.id)).toBe(true);
 			expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
-			expect(f.emitter.listWorkflowGateQueryRecords()[0]).toMatchObject({ tag: "accepted", post_accept_disposition: "accepted" });
+			expect(f.emitter.listWorkflowGateQueryRecords()[0]).toMatchObject({
+				tag: "accepted",
+				post_accept_disposition: "accepted",
+			});
 			await flush();
 			expect(workflow.outcome.advanced).toBe(false);
 			f.ui.commitRetired(f.presenter, retirement);
@@ -214,7 +274,10 @@ describe("real desktop workflow gate presentation", () => {
 			await expect(workflow.promise).resolves.toEqual({ decision, reason: "Operator decision" });
 			expect(workflow.outcome.answer).toEqual({ decision, reason: "Operator decision" });
 			expect(f.ui.mounted.size).toBe(0);
-			expect(f.emitter.listWorkflowGateQueryRecords()[0]).toMatchObject({ tag: "accepted", post_accept_disposition: "advanced" });
+			expect(f.emitter.listWorkflowGateQueryRecords()[0]).toMatchObject({
+				tag: "accepted",
+				post_accept_disposition: "advanced",
+			});
 		});
 	}
 
@@ -224,10 +287,16 @@ describe("real desktop workflow gate presentation", () => {
 		const gateRef = ref(f.activity);
 		f.activity.getGate(gateRef);
 		f.activity.getGatePresentation(gateRef);
-		expect(() => f.presenter.acknowledgePresented("forged")).toThrow(expect.objectContaining({ code: "invalid_presentation" }));
+		expect(() => f.presenter.acknowledgePresented("forged")).toThrow(
+			expect.objectContaining({ code: "invalid_presentation" }),
+		);
 		const presentation = f.presenter.present(gateRef);
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "not_presented" });
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, "retired")).toThrow(expect.objectContaining({ code: "invalid_retirement" }));
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "not_presented" });
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, "retired")).toThrow(
+			expect.objectContaining({ code: "invalid_retirement" }),
+		);
 		expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
 	});
 
@@ -240,18 +309,28 @@ describe("real desktop workflow gate presentation", () => {
 		const other = foreign.presenter.present(ref(foreign.activity));
 		f.ui.commitPresented(f.presenter, presentation);
 		foreign.ui.commitPresented(foreign.presenter, other);
-		await expect(f.presenter.answer(other.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "invalid_presentation" });
+		await expect(
+			f.presenter.answer(other.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "invalid_presentation" });
 		const answering = f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' });
 		const retirement = await f.ui.nextRetirement();
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, crypto.randomUUID())).toThrow(expect.objectContaining({ code: "invalid_retirement" }));
-		expect(() => foreign.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "invalid_presentation" }));
-		expect(() => f.presenter.acknowledgeRetired(other.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "invalid_presentation" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, crypto.randomUUID())).toThrow(
+			expect.objectContaining({ code: "invalid_retirement" }),
+		);
+		expect(() => foreign.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "invalid_presentation" }),
+		);
+		expect(() => f.presenter.acknowledgeRetired(other.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "invalid_presentation" }),
+		);
 		await flush();
 		expect(workflow.outcome.advanced).toBe(false);
 		expect(foreignWorkflow.outcome.advanced).toBe(false);
 		f.ui.commitRetired(f.presenter, retirement);
 		await expect(answering).resolves.toEqual({ status: "accepted" });
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "invalid_retirement" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "invalid_retirement" }),
+		);
 	});
 
 	test("all issued surfaces, including an uncommitted one, must retire before continuation", async () => {
@@ -266,16 +345,22 @@ describe("real desktop workflow gate presentation", () => {
 		f.ui.commitPresented(f.presenter, second);
 		const answering = f.presenter.answer(first.id, { kind: "json", json: '{"decision":"approve"}' });
 		const retirements = [await f.ui.nextRetirement(), await f.ui.nextRetirement(), await f.ui.nextRetirement()];
-		expect(retirements.map(event => event.presentationId).sort()).toEqual([first.id, second.id, neverCommitted.id].sort());
+		expect(retirements.map(event => event.presentationId).sort()).toEqual(
+			[first.id, second.id, neverCommitted.id].sort(),
+		);
 		f.ui.commitRetired(f.presenter, retirements[1]!);
 		f.ui.commitRetired(f.presenter, retirements[0]!);
 		await flush();
 		expect(workflow.outcome.advanced).toBe(false);
-		await expect(f.presenter.answer(second.id, { kind: "json", json: '{"decision":"reject"}' })).rejects.toMatchObject({ code: "not_presented" });
+		await expect(
+			f.presenter.answer(second.id, { kind: "json", json: '{"decision":"reject"}' }),
+		).rejects.toMatchObject({ code: "not_presented" });
 		f.ui.commitRetired(f.presenter, retirements[2]!);
 		await expect(answering).resolves.toEqual({ status: "accepted" });
 		await expect(workflow.promise).resolves.toEqual({ decision: "approve" });
-		await expect(f.terminal().completeGateInteractions(f.emitter.listWorkflowGateQueryRecords()[0]!.gate_id)).resolves.toBe("already_terminal");
+		await expect(
+			f.terminal().completeGateInteractions(f.emitter.listWorkflowGateQueryRecords()[0]!.gate_id),
+		).resolves.toBe("already_terminal");
 	});
 
 	test("withdrawal hides one exact surface without answering and allows a fresh presentation", async () => {
@@ -292,9 +377,14 @@ describe("real desktop workflow gate presentation", () => {
 		expect(f.emitter.listPendingGates()).toHaveLength(1);
 		const reopened = f.presenter.present(gateRef);
 		expect(reopened.id).not.toBe(first.id);
-		await expect(f.presenter.answer(first.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "not_presented" });
+		await expect(
+			f.presenter.answer(first.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "not_presented" });
 		f.ui.commitPresented(f.presenter, reopened);
-		const answering = f.presenter.answer(reopened.id, { kind: "json", json: '{"decision":"reject","comments":"Not approved"}' });
+		const answering = f.presenter.answer(reopened.id, {
+			kind: "json",
+			json: '{"decision":"reject","comments":"Not approved"}',
+		});
 		f.ui.commitRetired(f.presenter, await f.ui.nextRetirement());
 		await expect(answering).resolves.toEqual({ status: "accepted" });
 		await expect(workflow.promise).resolves.toEqual({ decision: "reject", comments: "Not approved" });
@@ -316,16 +406,23 @@ describe("real desktop workflow gate presentation", () => {
 		const single = f.presenter.withdraw(first.id);
 		const initialRetirement = await f.ui.nextRetirement();
 		let completed = false;
-		const all = f.presenter.withdrawAll().then(() => { completed = true; });
+		const all = f.presenter.withdrawAll().then(() => {
+			completed = true;
+		});
 		const secondRetirement = await f.ui.nextRetirement();
 		const thirdRetirement = await f.ui.nextRetirement();
-		expect(new Set([initialRetirement.presentationId, secondRetirement.presentationId, thirdRetirement.presentationId]))
-			.toEqual(new Set([first.id, second.id, third.id]));
+		expect(
+			new Set([initialRetirement.presentationId, secondRetirement.presentationId, thirdRetirement.presentationId]),
+		).toEqual(new Set([first.id, second.id, third.id]));
 		expect(f.ui.events.filter(event => event.type === "retire")).toHaveLength(3);
 		expect(() => f.presenter.present(gateRef)).toThrow(expect.objectContaining({ code: "busy" }));
-		await expect(f.presenter.answer(third.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "busy" });
+		await expect(
+			f.presenter.answer(third.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "busy" });
 		await expect(f.presenter.withdrawAll()).rejects.toMatchObject({ code: "busy" });
-		expect(() => f.presenter.acknowledgeRetired(secondRetirement.presentationId, initialRetirement.nonce)).toThrow(expect.objectContaining({ code: "invalid_retirement" }));
+		expect(() => f.presenter.acknowledgeRetired(secondRetirement.presentationId, initialRetirement.nonce)).toThrow(
+			expect.objectContaining({ code: "invalid_retirement" }),
+		);
 		f.ui.commitRetired(f.presenter, thirdRetirement);
 		f.ui.commitRetired(f.presenter, initialRetirement);
 		await single;
@@ -354,7 +451,9 @@ describe("real desktop workflow gate presentation", () => {
 		const retirement = await f.ui.nextRetirement();
 		await expect(all).rejects.toMatchObject({ code: "retirement_timeout" });
 		await expect(f.presenter.withdrawAll()).rejects.toMatchObject({ code: "invalid_retirement" });
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "invalid_retirement" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "invalid_retirement" }),
+		);
 		expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
 		expect(f.emitter.listPendingGates()).toHaveLength(1);
 		expect(f.ui.mounted.has(presentation.id)).toBe(true);
@@ -369,8 +468,12 @@ describe("real desktop workflow gate presentation", () => {
 		const retirement = await f.ui.nextRetirement();
 		f.presenter.dispose();
 		await expect(all).rejects.toMatchObject({ code: "revoked" });
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
-		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(expect.objectContaining({ code: "registration_failed" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
+		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(
+			expect.objectContaining({ code: "registration_failed" }),
+		);
 		expect(workflow.outcome.advanced).toBe(false);
 	});
 
@@ -388,7 +491,9 @@ describe("real desktop workflow gate presentation", () => {
 		const id = f.session.sessionId;
 		expect(await f.session.clearContext()).toBe(true);
 		expect(f.session.sessionId).toBe(id);
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
 		// Context clear preserves SDK gate ownership; hiding did not answer it.
 		expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
 	});
@@ -396,13 +501,15 @@ describe("real desktop workflow gate presentation", () => {
 	test("same-generation cancelled preparation leaves an in-flight retirement nonce pending for later authentic ack", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const f = await fixture({ extensionFactory: api => {
-			api.on("session_before_switch", async () => {
-				entered.resolve();
-				await release.promise;
-				return { cancel: true };
-			});
-		} });
+		const f = await fixture({
+			extensionFactory: api => {
+				api.on("session_before_switch", async () => {
+					entered.resolve();
+					await release.promise;
+					return { cancel: true };
+				});
+			},
+		});
 		const workflow = observe(f.emitter);
 		const presentation = f.presenter.present(ref(f.activity));
 		f.ui.commitPresented(f.presenter, presentation);
@@ -411,7 +518,9 @@ describe("real desktop workflow gate presentation", () => {
 		const preparing = f.session.newSession();
 		await entered.promise;
 		f.session.emitNotice("info", "Preparing while a retirement is outstanding", "test");
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "busy" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
 		release.resolve();
 		expect(await preparing).toBe(false);
 		f.ui.commitRetired(f.presenter, retirement);
@@ -448,11 +557,15 @@ describe("real desktop workflow gate presentation", () => {
 			else if (teardown === "presenter") f.presenter.dispose();
 			else if (teardown === "activity") {
 				f.activity.dispose();
-				expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
+				expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+					expect.objectContaining({ code: "revoked" }),
+				);
 			} else {
 				if (teardown === "connection") f.binding.connectionGeneration = crypto.randomUUID();
 				else f.binding.catalogSessionId = crypto.randomUUID();
-				expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
+				expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+					expect.objectContaining({ code: "revoked" }),
+				);
 				// A -> B -> A must not revive an observed/revoked binding.
 				f.binding.connectionGeneration = f.presenterOptions.connectionGeneration;
 				f.binding.catalogSessionId = f.presenterOptions.catalogSessionId;
@@ -460,7 +573,9 @@ describe("real desktop workflow gate presentation", () => {
 			await expect(answering).rejects.toThrow();
 			await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 			expect(workflow.outcome.advanced).toBe(false);
-			expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
+			expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+				expect.objectContaining({ code: "revoked" }),
+			);
 		});
 	}
 
@@ -484,13 +599,15 @@ describe("real desktop workflow gate presentation", () => {
 	test("cancelled real preparation is temporarily busy without deleting committed presentation evidence", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const f = await fixture({ extensionFactory: api => {
-			api.on("session_before_switch", async () => {
-				entered.resolve();
-				await release.promise;
-				return { cancel: true };
-			});
-		} });
+		const f = await fixture({
+			extensionFactory: api => {
+				api.on("session_before_switch", async () => {
+					entered.resolve();
+					await release.promise;
+					return { cancel: true };
+				});
+			},
+		});
 		const workflow = observe(f.emitter);
 		const gateRef = ref(f.activity);
 		const presentation = f.presenter.present(gateRef);
@@ -502,8 +619,12 @@ describe("real desktop workflow gate presentation", () => {
 		f.session.emitNotice("info", "Preparation still owns the transition", "test");
 		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(expect.objectContaining({ code: "busy" }));
 		expect(() => f.presenter.present(gateRef)).toThrow(expect.objectContaining({ code: "busy" }));
-		expect(() => f.presenter.acknowledgePresented(presentation.id)).toThrow(expect.objectContaining({ code: "busy" }));
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "busy" });
+		expect(() => f.presenter.acknowledgePresented(presentation.id)).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "busy" });
 		await expect(f.presenter.withdrawAll()).rejects.toMatchObject({ code: "busy" });
 		expect(f.ui.events.filter(event => event.type === "retire")).toEqual([]);
 		release.resolve();
@@ -516,7 +637,11 @@ describe("real desktop workflow gate presentation", () => {
 	});
 
 	test("failed genuine preparation preserves the exact presentation after rollback", async () => {
-		const f = await fixture({ extensionFactory: api => { api.on("session_before_switch", async () => undefined); } });
+		const f = await fixture({
+			extensionFactory: api => {
+				api.on("session_before_switch", async () => undefined);
+			},
+		});
 		if (!f.extensionRunner) throw new Error("Expected the genuine extension runner");
 		const workflow = observe(f.emitter);
 		const presentation = f.presenter.present(ref(f.activity));
@@ -535,13 +660,23 @@ describe("real desktop workflow gate presentation", () => {
 	test("unchanged genuine compaction temporarily refuses gate controls and preserves issued evidence", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const f = await fixture({ compactable: true, extensionFactory: api => {
-			api.on("session_before_compact", async event => {
-				entered.resolve();
-				await release.promise;
-				return { compaction: { summary: "Provider-free gate continuity compaction", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, details: {} } };
-			});
-		} });
+		const f = await fixture({
+			compactable: true,
+			extensionFactory: api => {
+				api.on("session_before_compact", async event => {
+					entered.resolve();
+					await release.promise;
+					return {
+						compaction: {
+							summary: "Provider-free gate continuity compaction",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					};
+				});
+			},
+		});
 		const workflow = observe(f.emitter);
 		const gateRef = ref(f.activity);
 		const presentation = f.presenter.present(gateRef);
@@ -552,7 +687,9 @@ describe("real desktop workflow gate presentation", () => {
 		f.session.emitNotice("info", "Notification during unchanged compaction", "test");
 		expect(f.session.sessionLifecycle).toMatchObject({ generation: lifecycle.generation, transitioning: true });
 		expect(() => f.presenter.present(gateRef)).toThrow(expect.objectContaining({ code: "busy" }));
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "busy" });
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "busy" });
 		expect(f.ui.events.filter(event => event.type === "retire")).toEqual([]);
 		release.resolve();
 		expect((await compacting).summary).toBe("Provider-free gate continuity compaction");
@@ -575,9 +712,15 @@ describe("real desktop workflow gate presentation", () => {
 		expect(await f.session.clearContext()).toBe(true);
 		expect(f.session.sessionId).toBe(id);
 		expect(f.session.sessionLifecycle.generation).toBeGreaterThan(generation);
-		expect(() => f.presenter.acknowledgePresented(presentation.id)).toThrow(expect.objectContaining({ code: "revoked" }));
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "revoked" });
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, "forged")).toThrow(expect.objectContaining({ code: "revoked" }));
+		expect(() => f.presenter.acknowledgePresented(presentation.id)).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "revoked" });
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, "forged")).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
 		expect(await f.session.clearContext()).toBe(true);
 		expect(() => f.presenter.present(gateRef)).toThrow(expect.objectContaining({ code: "revoked" }));
 		expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
@@ -594,7 +737,9 @@ describe("real desktop workflow gate presentation", () => {
 		f.session.sessionManager = replacement;
 		f.session.emitNotice("info", "Changed manager object without a transition", "test");
 		f.session.sessionManager = original;
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "revoked" });
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "revoked" });
 		expect(workflow.outcome.advanced).toBe(false);
 	});
 
@@ -606,7 +751,9 @@ describe("real desktop workflow gate presentation", () => {
 		f.ui.commitPresented(f.presenter, presentation);
 		await expect(f.session.newSession()).resolves.toBe(true);
 		expect(() => f.presenter.present(gateRef)).toThrow(expect.objectContaining({ code: "revoked" }));
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "revoked" });
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "revoked" });
 		await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 		expect(workflow.outcome.advanced).toBe(false);
 	});
@@ -620,9 +767,13 @@ describe("real desktop workflow gate presentation", () => {
 		const answering = f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' });
 		const retirement = await f.ui.nextRetirement();
 		f.session.setWorkflowGateEmitter(other.emitter);
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
 		f.session.setWorkflowGateEmitter(f.emitter);
-		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(expect.objectContaining({ code: "revoked" }));
+		expect(() => f.presenter.acknowledgeRetired(presentation.id, retirement.nonce)).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
 		await expect(answering).rejects.toThrow();
 		await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 		expect(workflow.outcome.advanced).toBe(false);
@@ -644,7 +795,9 @@ describe("real desktop workflow gate presentation", () => {
 
 	test("an existing genuine controller is never displaced by a second presenter", async () => {
 		const f = await fixture();
-		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(expect.objectContaining({ code: "registration_failed" }));
+		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(
+			expect.objectContaining({ code: "registration_failed" }),
+		);
 		const workflow = observe(f.emitter);
 		const presentation = f.presenter.present(ref(f.activity));
 		f.ui.commitPresented(f.presenter, presentation);
@@ -658,7 +811,9 @@ describe("real desktop workflow gate presentation", () => {
 		const f = await fixture();
 		f.presenter.dispose();
 		const unavailable = vi.spyOn(f.session, "getWorkflowGateEmitter").mockReturnValue(undefined);
-		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(expect.objectContaining({ code: "unavailable" }));
+		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(
+			expect.objectContaining({ code: "unavailable" }),
+		);
 		unavailable.mockRestore();
 		expect(f.ui.events).toEqual([]);
 	});
@@ -668,8 +823,12 @@ describe("real desktop workflow gate presentation", () => {
 		const workflow = observe(f.emitter);
 		f.activity.getGatePresentation(ref(f.activity));
 		const gate = f.emitter.listPendingGates()[0]!;
-		await expect(f.terminal().completeGateInteractions(gate.gate_id)).rejects.toMatchObject({ code: "invalid_presentation" });
-		await expect(f.terminal().completeGateInteractions("foreign-backend-id")).rejects.toMatchObject({ code: "invalid_presentation" });
+		await expect(f.terminal().completeGateInteractions(gate.gate_id)).rejects.toMatchObject({
+			code: "invalid_presentation",
+		});
+		await expect(f.terminal().completeGateInteractions("foreign-backend-id")).rejects.toMatchObject({
+			code: "invalid_presentation",
+		});
 		await expect(f.emitter.resolveGate({ gate_id: gate.gate_id, answer: { decision: "approve" } })).rejects.toThrow();
 		await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 		expect(f.ui.events).toEqual([]);
@@ -702,8 +861,13 @@ describe("real desktop workflow gate presentation", () => {
 		const secret = 'credential"with\nnewline';
 		const f = await fixture({ redact: text => text.replaceAll(secret, "[redacted]") });
 		const workflow = observe(f.emitter, {
-			stage: "ralplan", kind: "approval", schema: { type: "string", enum: [secret, "reject"] },
-			options: [{ value: secret, label: secret }, { value: "reject", label: "Reject" }],
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: [secret, "reject"] },
+			options: [
+				{ value: secret, label: secret },
+				{ value: "reject", label: "Reject" },
+			],
 			context: { summary: secret, artifact_refs: [{ kind: "evidence", path: secret }] },
 		});
 		const gateId = f.emitter.listPendingGates()[0]!.gate_id;
@@ -720,10 +884,15 @@ describe("real desktop workflow gate presentation", () => {
 		f.ui.commitPresented(f.presenter, presentation);
 		// A read/re-presentation rotates adapter keys, not the issued option's original value.
 		f.activity.getGate(gateRef);
-		const answering = f.presenter.answer(presentation.id, { kind: "choice", choiceKey: presentation.gate.choices[0]!.key });
+		const answering = f.presenter.answer(presentation.id, {
+			kind: "choice",
+			choiceKey: presentation.gate.choices[0]!.key,
+		});
 		const retirementA = await f.ui.nextRetirement();
 		const retirementB = await f.ui.nextRetirement();
-		expect(new Set([retirementA.presentationId, retirementB.presentationId])).toEqual(new Set([presentation.id, another.id]));
+		expect(new Set([retirementA.presentationId, retirementB.presentationId])).toEqual(
+			new Set([presentation.id, another.id]),
+		);
 		f.ui.commitRetired(f.presenter, retirementA);
 		f.ui.commitRetired(f.presenter, retirementB);
 		await expect(answering).resolves.toEqual({ status: "accepted" });
@@ -733,12 +902,22 @@ describe("real desktop workflow gate presentation", () => {
 
 	test("truncation and failed redaction cannot issue an answerable surface", async () => {
 		const large = await fixture();
-		const largeWorkflow = observe(large.emitter, approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }));
-		expect(() => large.presenter.present(ref(large.activity))).toThrow(expect.objectContaining({ code: "gate_content_too_large" }));
+		const largeWorkflow = observe(
+			large.emitter,
+			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
+		);
+		expect(() => large.presenter.present(ref(large.activity))).toThrow(
+			expect.objectContaining({ code: "gate_content_too_large" }),
+		);
 		expect(large.ui.events).toEqual([]);
 		expect(largeWorkflow.outcome.advanced).toBe(false);
 		let fail = false;
-		const redaction = await fixture({ redact: text => { if (fail && text.includes("sensitive")) throw new Error("sensitive"); return text; } });
+		const redaction = await fixture({
+			redact: text => {
+				if (fail && text.includes("sensitive")) throw new Error("sensitive");
+				return text;
+			},
+		});
 		const redactedWorkflow = observe(redaction.emitter, approvalGate({ plan: "sensitive" }));
 		const gateRef = ref(redaction.activity);
 		fail = true;
@@ -775,18 +954,24 @@ describe("real desktop workflow gate presentation", () => {
 
 	test("changed original gate or changed redacted display cannot answer an old committed surface", async () => {
 		let redactionEpoch = 0;
-		const f = await fixture({ redact: text => text === "original plan" ? `${text} ${redactionEpoch}` : text });
+		const f = await fixture({ redact: text => (text === "original plan" ? `${text} ${redactionEpoch}` : text) });
 		const workflow = observe(f.emitter, approvalGate({ plan: "original plan" }));
 		const gate = f.emitter.listPendingGates()[0]!;
 		const presentation = f.presenter.present(ref(f.activity));
 		f.ui.commitPresented(f.presenter, presentation);
 		redactionEpoch++;
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_presentation" });
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_presentation" });
 		redactionEpoch--;
 		vi.spyOn(f.emitter, "listPendingGates").mockReturnValue([{ ...gate, context: { plan: "successor" } }]);
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "stale_presentation" });
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_presentation" });
 		expect(workflow.outcome.advanced).toBe(false);
-		expect(() => f.presenter.acknowledgePresented(presentation.id)).toThrow(expect.objectContaining({ code: "revoked" }));
+		expect(() => f.presenter.acknowledgePresented(presentation.id)).toThrow(
+			expect.objectContaining({ code: "revoked" }),
+		);
 	});
 
 	test("accepted gate fingerprints are rechecked after awaiting authentic retirement", async () => {
@@ -798,8 +983,9 @@ describe("real desktop workflow gate presentation", () => {
 		const retirement = await f.ui.nextRetirement();
 		f.ui.commitRetired(f.presenter, retirement);
 		const query = f.emitter.listWorkflowGateQueryRecords.bind(f.emitter);
-		const changed = vi.spyOn(f.emitter, "listWorkflowGateQueryRecords").mockImplementation(() =>
-			query().map(row => ({ ...row, context: { plan: "replacement after ack" } })));
+		const changed = vi
+			.spyOn(f.emitter, "listWorkflowGateQueryRecords")
+			.mockImplementation(() => query().map(row => ({ ...row, context: { plan: "replacement after ack" } })));
 		await expect(answering).rejects.toThrow();
 		await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 		expect(workflow.outcome.advanced).toBe(false);
@@ -812,7 +998,9 @@ describe("real desktop workflow gate presentation", () => {
 		const presentation = f.presenter.present(ref(f.activity));
 		f.ui.commitPresented(f.presenter, presentation);
 		f.presenter.dispose();
-		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(expect.objectContaining({ code: "registration_failed" }));
+		expect(() => createDesktopGatePresenter(f.presenterOptions)).toThrow(
+			expect.objectContaining({ code: "registration_failed" }),
+		);
 		expect(workflow.outcome.advanced).toBe(false);
 		const gate = f.emitter.listPendingGates()[0]!;
 		await expect(f.emitter.resolveGate({ gate_id: gate.gate_id, answer: { decision: "approve" } })).rejects.toThrow();
@@ -826,14 +1014,18 @@ describe("real desktop workflow gate presentation", () => {
 			const workflow = observe(f.emitter);
 			if (phase === "presented") {
 				f.ui.failDelivery = true;
-				expect(() => f.presenter.present(ref(f.activity))).toThrow(expect.objectContaining({ code: "callback_failed" }));
+				expect(() => f.presenter.present(ref(f.activity))).toThrow(
+					expect.objectContaining({ code: "callback_failed" }),
+				);
 				expect(workflow.outcome.advanced).toBe(false);
 				expect(() => f.presenter.present(ref(f.activity))).toThrow(expect.objectContaining({ code: "revoked" }));
 			} else {
 				const presentation = f.presenter.present(ref(f.activity));
 				f.ui.commitPresented(f.presenter, presentation);
 				f.ui.failDelivery = true;
-				await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toThrow();
+				await expect(
+					f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+				).rejects.toThrow();
 				await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 				expect(workflow.outcome.advanced).toBe(false);
 			}
@@ -848,7 +1040,9 @@ describe("real desktop workflow gate presentation", () => {
 		f.ui.onEvent = event => {
 			if (event.type === "retire") f.presenter.acknowledgeRetired(event.presentationId, event.nonce);
 		};
-		await expect(f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toThrow();
+		await expect(
+			f.presenter.answer(presentation.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toThrow();
 		await expect(workflow.promise).rejects.toThrow("continuation was fenced");
 		expect(workflow.outcome.advanced).toBe(false);
 	});
@@ -858,9 +1052,15 @@ describe("real desktop workflow gate presentation", () => {
 		const workflow = observe(f.emitter);
 		const presentation = f.presenter.present(ref(f.activity));
 		f.ui.commitPresented(f.presenter, presentation);
-		await expect(f.presenter.answer(presentation.id, {
-			kind: "json", get json() { f.presenter.revoke(); return '{"decision":"approve"}'; },
-		})).rejects.toMatchObject({ code: "revoked" });
+		await expect(
+			f.presenter.answer(presentation.id, {
+				kind: "json",
+				get json() {
+					f.presenter.revoke();
+					return '{"decision":"approve"}';
+				},
+			}),
+		).rejects.toMatchObject({ code: "revoked" });
 		expect(workflow.outcome.advanced).toBe(false);
 	});
 
@@ -870,8 +1070,12 @@ describe("real desktop workflow gate presentation", () => {
 		const presentation = f.presenter.present(ref(f.activity));
 		f.ui.commitPresented(f.presenter, presentation);
 		for (const json of ['{"decision":"invented"}', '"approve"', '{"decision":"approve","extra":true}', "{"])
-			await expect(f.presenter.answer(presentation.id, { kind: "json", json })).rejects.toMatchObject({ code: "invalid_answer" });
-		await expect(f.presenter.answer(presentation.id, { kind: "choice", choiceKey: "forged" })).rejects.toMatchObject({ code: "invalid_answer" });
+			await expect(f.presenter.answer(presentation.id, { kind: "json", json })).rejects.toMatchObject({
+				code: "invalid_answer",
+			});
+		await expect(f.presenter.answer(presentation.id, { kind: "choice", choiceKey: "forged" })).rejects.toMatchObject({
+			code: "invalid_answer",
+		});
 		expect(f.ui.events.filter(event => event.type === "retire")).toEqual([]);
 		expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
 	});
@@ -889,10 +1093,16 @@ describe("real desktop workflow gate presentation", () => {
 			await withdrawing;
 		}
 		expect(() => f.presenter.present(gateRef)).toThrow(expect.objectContaining({ code: "capacity" }));
-		expect(f.ui.events.filter(event => event.type === "presented")).toHaveLength(DESKTOP_GATE_PRESENTATION_LIMITS.presentations);
+		expect(f.ui.events.filter(event => event.type === "presented")).toHaveLength(
+			DESKTOP_GATE_PRESENTATION_LIMITS.presentations,
+		);
 		if (!first) throw new Error("Missing first retained presentation");
-		await expect(f.presenter.answer(first.id, { kind: "json", json: '{"decision":"approve"}' })).rejects.toMatchObject({ code: "not_presented" });
-		await expect(f.terminal().completeGateInteractions(f.emitter.listPendingGates()[0]!.gate_id)).resolves.toBe("already_terminal");
+		await expect(
+			f.presenter.answer(first.id, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "not_presented" });
+		await expect(f.terminal().completeGateInteractions(f.emitter.listPendingGates()[0]!.gate_id)).resolves.toBe(
+			"already_terminal",
+		);
 		expect(workflow.outcome).toMatchObject({ advanced: false, rejected: false });
 	});
 });

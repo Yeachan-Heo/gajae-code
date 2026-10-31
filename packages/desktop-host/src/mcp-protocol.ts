@@ -2,9 +2,19 @@
 export type DesktopMcpAction = "suspend" | "resume" | "reconnect";
 
 export type DesktopMcpErrorCode =
-	| "invalid_input" | "unavailable" | "disposed" | "stale_session" | "session_transitioning"
-	| "stale_connection" | "not_found" | "stale_target" | "busy" | "unsupported"
-	| "unknown_effect" | "backend_failure" | "redaction_failed";
+	| "invalid_input"
+	| "unavailable"
+	| "disposed"
+	| "stale_session"
+	| "session_transitioning"
+	| "stale_connection"
+	| "not_found"
+	| "stale_target"
+	| "busy"
+	| "unsupported"
+	| "unknown_effect"
+	| "backend_failure"
+	| "redaction_failed";
 
 export interface DesktopMcpScope {
 	connectionGeneration: string;

@@ -67,7 +67,18 @@ import gajaeMark from "./assets/gajae-mark.png";
 import { BtwDialog } from "./BtwDialog";
 import { DesktopRequestError, request, selectProject, subscribe, validateDesktopRequest } from "./bridge";
 import { matchesSlashFilter } from "./command-search";
-import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
+import {
+	Button,
+	Composer,
+	ErrorBanner,
+	GoalStrip,
+	Message,
+	Modal,
+	QuestionCard,
+	SessionRow,
+	SettingField,
+	TodoPanel,
+} from "./components";
 import { restoreAttachments, restoreDraft } from "./composer-draft";
 import {
 	commitDraftAndDelivery,
@@ -134,6 +145,31 @@ const isFinalDelivery = (disposition: DesktopDeliveryReceipt["disposition"]) =>
 const isSettled = (session: DesktopSession) =>
 	!["running", "waiting"].includes(session.status) && !session.operatorRunning && (session.queued?.length ?? 0) === 0;
 
+type GoalOp = "create" | "get" | "resume" | "pause" | "complete" | "drop";
+/**
+ * The same rule the goal strip applies: a running or waiting turn owns the session, so no
+ * operation is offered; otherwise only the operations the current goal state allows.
+ */
+function goalOperationAllowed(op: GoalOp, session: DesktopSession | undefined): boolean {
+	if (session && (session.status === "running" || session.status === "waiting")) return false;
+	const status = session?.goal?.status;
+	switch (op) {
+		case "get":
+			return true;
+		case "create":
+			return status === undefined || status === "complete" || status === "dropped";
+		case "resume":
+			return status === "paused";
+		case "pause":
+		case "complete":
+			return status === "active";
+		case "drop":
+			return status !== undefined;
+	}
+}
+
+/** Conversations listed per workspace before "Show more" appends another page. */
+const SESSION_PAGE = 5;
 export default function App() {
 	useLocale();
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
@@ -502,6 +538,41 @@ export default function App() {
 	const settingsPanelPrefix = useId();
 	const settingsPanelsRef = useRef<HTMLDivElement>(null);
 	const [sessionFilter, setSessionFilter] = useState("");
+	const searching = !!sessionFilter.trim();
+	// Each workspace shows a bounded list; "Show more" grows it by a page.
+	const [sessionLimits, setSessionLimits] = useState<Record<string, number>>({});
+	const [menu, setMenu] = useState<
+		| { kind: "project"; id: string; x: number; y: number }
+		| { kind: "session"; id: string; projectId: string; x: number; y: number }
+		| null
+	>(null);
+	const [dragProject, setDragProject] = useState<string | null>(null);
+	const [dragSession, setDragSession] = useState<{ id: string; projectId: string } | null>(null);
+	/** The row under the pointer and which of its edges the dragged item will land on. */
+	const [dropTarget, setDropTarget] = useState<{ key: string; after: boolean } | null>(null);
+	const menuRef = useRef<HTMLDivElement | null>(null);
+	/**
+	 * One Escape must dismiss only the drawer's context menu. The menu clears first, then the
+	 * modal dialog raises its own close request; this flag tells that request to keep the drawer.
+	 */
+	const keepDrawerOpen = useRef(false);
+	/**
+	 * The menu handles Escape itself, which clears the menu state before the window listener and
+	 * the dialog's cancel handler see the same keypress. The event's own timestamp identifies
+	 * that one keypress, so both later handlers can stand down instead of closing the drawer too.
+	 */
+	const menuEscapeAt = useRef(-1);
+	/**
+	 * Suppresses the drawer's close request for the keypress that just dismissed its menu. The
+	 * request is dispatched during that same keypress, so the flag expires on the next macrotask
+	 * and a later click on the drawer's own close button is never swallowed.
+	 */
+	const armDrawerSuppression = useCallback(() => {
+		keepDrawerOpen.current = true;
+		setTimeout(() => {
+			keepDrawerOpen.current = false;
+		}, 0);
+	}, []);
 	const [provider, setProvider] = useState("");
 	const [keyProviders, setKeyProviders] = useState<string[] | null>(null);
 	const [key, setKey] = useState("");
@@ -523,7 +594,6 @@ export default function App() {
 		question: string;
 		composerText?: string;
 	} | null>(null);
-	const [deliverAs, setDeliverAs] = useState<"steer" | "followUp">("steer");
 	const commandInputRef = useRef<HTMLInputElement>(null);
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
@@ -817,13 +887,31 @@ export default function App() {
 				else openCommands();
 			}
 			if (event.key === "Escape") {
+				if (menuEscapeAt.current === event.timeStamp) return;
+				if (menu) {
+					armDrawerSuppression();
+					setMenu(null);
+					return;
+				}
+				// A dialog owns its own Escape (its cancel request closes it); the drawer and the
+				// review pane stay put so one press never dismisses two layers.
+				if (dialog) return;
 				setSidebar(false);
 				setReview(false);
 			}
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, setDialog]);
+	}, [dialog, closeDialog, menu, sidebar, setDialog]);
+
+	/**
+	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
+	 * owning the next Escape and its drawer suppression. Opening any dialog dismisses it instead.
+	 */
+	useEffect(() => {
+		if (dialog) setMenu(null);
+	}, [dialog]);
+
 	useEffect(() => {
 		follow.current = true;
 		setHistoryLimit(100);
@@ -1028,7 +1116,7 @@ export default function App() {
 				sessionId,
 				text,
 				...(attachments.length ? { attachments } : {}),
-				...(queued ? { deliverAs } : {}),
+				...(queued ? { deliverAs: "steer" as const } : {}),
 			};
 			validateDesktopRequest("prompt", params, id);
 			const entry: DeliveryRecovery = {
@@ -1148,7 +1236,7 @@ export default function App() {
 			const queued = session?.status === "running" || session?.status === "waiting";
 			void run(`command:${sessionId}`, async () => {
 				const id = crypto.randomUUID();
-				const params = { sessionId, text, ...(queued ? { deliverAs } : {}) };
+				const params = { sessionId, text, ...(queued ? { deliverAs: "steer" as const } : {}) };
 				validateDesktopRequest("prompt", params, id);
 				const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
 				const commit = recoveryWork.current.then(async () => {
@@ -1710,6 +1798,42 @@ export default function App() {
 			},
 		},
 	];
+	useEffect(() => {
+		if (!menu) return;
+		menuRef.current?.focus();
+	}, [menu]);
+	const clearDrag = () => {
+		setDropTarget(null);
+		setDragProject(null);
+		setDragSession(null);
+	};
+	/** Move one item one slot up or down; the keyboard path for list reordering. */
+	const moveProject = (id: string, direction: -1 | 1) => {
+		const ids = (snapshot?.projects ?? []).map(project => project.id);
+		const from = ids.indexOf(id);
+		const to = from + direction;
+		if (from < 0 || to < 0 || to >= ids.length) return;
+		ids.splice(to, 0, ...ids.splice(from, 1));
+		setMenu(null);
+		if (connected) void call("project.reorder", { ids }, "global");
+	};
+	const moveSession = (projectId: string, id: string, direction: -1 | 1) => {
+		const ids = (snapshot?.sessions ?? []).filter(session => session.projectId === projectId).map(s => s.id);
+		const from = ids.indexOf(id);
+		const to = from + direction;
+		if (from < 0 || to < 0 || to >= ids.length) return;
+		ids.splice(to, 0, ...ids.splice(from, 1));
+		setMenu(null);
+		if (connected) void call("session.reorder", { projectId, ids }, "global");
+	};
+	const closeProject = (projectId: string) => {
+		setMenu(null);
+		if (!connected) return;
+		const owned = (snapshot?.sessions ?? []).filter(session => session.projectId === projectId);
+		if (owned.some(session => session.id === selected)) setSelected("");
+		// Its own scope: closing must not be dropped because a conversation is being created.
+		void call("project.close", { projectId }, `close-project:${projectId}`);
+	};
 	const sidebarContent = (
 		<>
 			<header className="sidebar-heading">
@@ -1730,53 +1854,189 @@ export default function App() {
 				placeholder={t("shell.searchConversations")}
 				onChange={event => setSessionFilter(event.target.value)}
 			/>
-			<nav aria-label={t("shell.projectsAndConversations")}>
-				{snapshot?.projects.map(item => (
-					<section className="project-group" key={item.id}>
-						<div className="project-heading">
-							<h2 title={item.path}>{item.name}</h2>
-							<Button
-								aria-label={t("shell.newConversationIn", { project: item.name })}
-								disabled={!connected || pending[`project:${item.id}`]}
-								onClick={() =>
-									void run(`project:${item.id}`, async () => {
-										const created = await request<DesktopSession>("session.create", { projectId: item.id });
-										if (created && typeof created.id === "string") {
-											setSelected(created.id);
-											await request("session.select", { sessionId: created.id });
-										}
-									})
-								}
+			<nav aria-label={t("shell.projectsAndConversations")} onDragEnd={clearDrag}>
+				{(snapshot?.projects ?? []).map(item => {
+					const all = snapshot?.sessions.filter(chat => chat.projectId === item.id) ?? [];
+					const filtered = all.filter(chat =>
+						chat.title.toLowerCase().includes(sessionFilter.trim().toLowerCase()),
+					);
+					// Search shows every match; otherwise the list is paged five at a time.
+					const limit = sessionLimits[item.id] ?? SESSION_PAGE;
+					// Selecting or creating a conversation beyond the page must not hide its own row.
+					const selectedIndex = filtered.findIndex(chat => chat.id === selected);
+					const pageSize = Math.max(limit, selectedIndex + 1);
+					const visible = searching ? filtered : filtered.slice(0, pageSize);
+					const remaining = searching ? 0 : filtered.length - visible.length;
+					return (
+						<section
+							className={`project-group ${dragProject === item.id ? "dragging" : ""} ${
+								dropTarget?.key === `project:${item.id}`
+									? `drop-target ${dropTarget.after ? "drop-after" : "drop-before"}`
+									: ""
+							}`}
+							key={item.id}
+							onContextMenu={event => {
+								event.preventDefault();
+								setMenu({ kind: "project", id: item.id, x: event.clientX, y: event.clientY });
+							}}
+							onDragOver={event => {
+								// The cue follows the drag state; the payload is read in the drop below, which
+								// is where a browser exposes it.
+								const dragged = dragProject;
+								if (!dragged || dragged === item.id) return;
+								event.preventDefault();
+								const order = (snapshot?.projects ?? []).map(project => project.id);
+								// The cue marks the edge the drop inserts at, matching the splice below.
+								setDropTarget({
+									key: `project:${item.id}`,
+									after: order.indexOf(dragged) < order.indexOf(item.id),
+								});
+							}}
+							onDragLeave={() =>
+								setDropTarget(previous => (previous?.key === `project:${item.id}` ? null : previous))
+							}
+							onDrop={event => {
+								// The payload is authoritative: a fast drag can drop before React
+								// has re-rendered the handlers with the drag state.
+								const dragged = event.dataTransfer?.getData("text/plain") || dragProject;
+								if (!dragged || dragged === item.id) return;
+								event.preventDefault();
+								const ids = (snapshot?.projects ?? []).map(project => project.id);
+								const from = ids.indexOf(dragged);
+								const to = ids.indexOf(item.id);
+								if (from < 0 || to < 0) return;
+								ids.splice(to, 0, ...ids.splice(from, 1));
+								clearDrag();
+								if (connected) void call("project.reorder", { ids }, "global");
+							}}
+						>
+							<div
+								className="project-heading"
+								draggable={!searching}
+								title={searching ? t("shell.reorderPausedWhileSearching") : undefined}
+								tabIndex={0}
+								aria-haspopup="menu"
+								onKeyDown={event => {
+									if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+									event.preventDefault();
+									const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
+									setMenu({ kind: "project", id: item.id, x: box.left, y: box.bottom });
+								}}
+								onDragStart={event => {
+									setDragProject(item.id);
+									event.dataTransfer?.setData("text/plain", item.id);
+								}}
+								onDragEnd={clearDrag}
 							>
-								<Plus size={15} aria-hidden="true" />
-							</Button>
-						</div>
-						<small className="path">{item.path}</small>
-						{errors[`project:${item.id}`] && <ErrorBanner>{errors[`project:${item.id}`]}</ErrorBanner>}
-						{snapshot.sessions
-							.filter(
-								chat =>
-									chat.projectId === item.id &&
-									chat.title.toLowerCase().includes(sessionFilter.trim().toLowerCase()),
-							)
-							.sort((a, b) => Number(b.starred) - Number(a.starred))
-							.map(chat => (
-								<SessionRow
+								<h2 title={item.path}>{item.name}</h2>
+								<Button
+									aria-label={t("shell.newConversationIn", { project: item.name })}
+									disabled={!connected || pending[`project:${item.id}`]}
+									onClick={() =>
+										void run(`project:${item.id}`, async () => {
+											const created = await request<DesktopSession>("session.create", {
+												projectId: item.id,
+											});
+											if (created && typeof created.id === "string") {
+												setSelected(created.id);
+												await request("session.select", { sessionId: created.id });
+											}
+										})
+									}
+								>
+									<Plus size={15} aria-hidden="true" />
+								</Button>
+							</div>
+							<small className="path">{item.path}</small>
+							{errors[`project:${item.id}`] && <ErrorBanner>{errors[`project:${item.id}`]}</ErrorBanner>}
+							{visible.map(chat => (
+								<div
 									key={chat.id}
-									session={chat}
-									selected={chat.id === selected}
-									onSelect={() => select(chat)}
-									onStar={() => {
-										if (connected)
-											void call("session.star", { sessionId: chat.id, starred: !chat.starred }, "global");
+									className={`session-drop ${dragSession?.id === chat.id ? "dragging" : ""} ${
+										dropTarget?.key === `session:${chat.id}`
+											? `drop-target ${dropTarget.after ? "drop-after" : "drop-before"}`
+											: ""
+									}`}
+									draggable={!searching}
+									title={searching ? t("shell.reorderPausedWhileSearching") : undefined}
+									onContextMenu={event => {
+										event.preventDefault();
+										event.stopPropagation();
+										setMenu({
+											kind: "session",
+											id: chat.id,
+											projectId: item.id,
+											x: event.clientX,
+											y: event.clientY,
+										});
 									}}
-								/>
+									onDragStart={event => {
+										setDragSession({ id: chat.id, projectId: item.id });
+										event.dataTransfer?.setData("text/plain", chat.id);
+									}}
+									onDragEnd={clearDrag}
+									onDragOver={event => {
+										// The cue follows the drag state; a drag carried by the payload alone is
+										// handled by the drop below, which is where the browser exposes it.
+										const dragged = dragSession?.id;
+										if (!dragged || dragged === chat.id) return;
+										const order = filtered.map(entry => entry.id);
+										// No cross-workspace move exists, so a foreign conversation gets no cue.
+										if (!order.includes(dragged)) return;
+										event.preventDefault();
+										setDropTarget({
+											key: `session:${chat.id}`,
+											after: order.indexOf(dragged) < order.indexOf(chat.id),
+										});
+									}}
+									onDragLeave={() =>
+										setDropTarget(previous => (previous?.key === `session:${chat.id}` ? null : previous))
+									}
+									onDrop={event => {
+										const dragged = event.dataTransfer?.getData("text/plain") || dragSession?.id;
+										const ids = all.map(session => session.id);
+										if (!dragged || dragged === chat.id || !ids.includes(dragged)) return;
+										event.preventDefault();
+										const from = ids.indexOf(dragged);
+										const to = ids.indexOf(chat.id);
+										if (from < 0 || to < 0) return;
+										ids.splice(to, 0, ...ids.splice(from, 1));
+										clearDrag();
+										if (connected) void call("session.reorder", { projectId: item.id, ids }, "global");
+									}}
+								>
+									<SessionRow
+										session={chat}
+										selected={chat.id === selected}
+										onSelect={() => select(chat)}
+										onMenu={(x, y) => setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })}
+										onStar={() => {
+											if (connected)
+												void call("session.star", { sessionId: chat.id, starred: !chat.starred }, "global");
+										}}
+									/>
+								</div>
 							))}
-						{!snapshot.sessions.some(chat => chat.projectId === item.id) && (
-							<p className="muted">{t("shell.startNewConversation")}</p>
-						)}
-					</section>
-				))}
+							{remaining > 0 && (
+								<Button
+									className="show-more"
+									onClick={() =>
+										setSessionLimits(previous => ({
+											...previous,
+											[item.id]: (previous[item.id] ?? SESSION_PAGE) + SESSION_PAGE,
+										}))
+									}
+								>
+									{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
+								</Button>
+							)}
+							{all.length === 0 && <p className="muted">{t("shell.startNewConversation")}</p>}
+							{all.length > 0 && filtered.length === 0 && (
+								<p className="muted">{t("shell.noMatchingConversations")}</p>
+							)}
+						</section>
+					);
+				})}
 			</nav>
 			<footer>
 				<Button onClick={openSettings} disabled={!connected}>
@@ -1892,6 +2152,105 @@ export default function App() {
 			</div>
 		) : null;
 	};
+	const menuSession =
+		menu?.kind === "session" ? (snapshot?.sessions ?? []).find(session => session.id === menu.id) : undefined;
+	const menuProjectIndex = menu?.kind === "project" ? (snapshot?.projects ?? []).findIndex(p => p.id === menu.id) : -1;
+	const menuSessionIndex =
+		menu?.kind === "session"
+			? (snapshot?.sessions ?? [])
+					.filter(session => session.projectId === menu.projectId)
+					.map(session => session.id)
+					.indexOf(menu.id)
+			: -1;
+	const menuSessionCount =
+		menu?.kind === "session" ? (snapshot?.sessions ?? []).filter(s => s.projectId === menu.projectId).length : 0;
+	const menuProjectCount = (snapshot?.projects ?? []).length;
+	/** True when the workspace being closed has a turn running, so the label can say it stops. */
+	const menuProjectBusy =
+		menu?.kind === "project" &&
+		(snapshot?.sessions ?? []).some(
+			session => session.projectId === menu.id && (session.status === "running" || session.status === "waiting"),
+		);
+	// The context menu lives inside the drawer while it is open: a modal dialog paints in the
+	// top layer, so a menu rendered beside it would be invisible and inert.
+	const contextMenu = menu && (
+		<>
+			{/* Any click outside dismisses; the menu itself stops propagation. */}
+			<button className="menu-scrim" aria-label={t("shell.dismissMenu")} onClick={() => setMenu(null)} />
+			<div
+				className="context-menu"
+				role="menu"
+				ref={menuRef}
+				tabIndex={-1}
+				onKeyDown={event => {
+					if (event.key !== "Escape") return;
+					event.preventDefault();
+					menuEscapeAt.current = event.timeStamp;
+					// Focused inside the menu: the dialog's cancel request is suppressed here.
+					armDrawerSuppression();
+					setMenu(null);
+				}}
+				style={{
+					left: Math.max(8, Math.min(menu.x, window.innerWidth - 240)),
+					top: Math.max(8, Math.min(menu.y, window.innerHeight - 168)),
+				}}
+			>
+				{menu.kind === "project" ? (
+					<>
+						<Button
+							role="menuitem"
+							disabled={searching || menuProjectIndex <= 0}
+							onClick={() => moveProject(menu.id, -1)}
+						>
+							{t("shell.moveWorkspace")}
+						</Button>
+						<Button
+							role="menuitem"
+							disabled={searching || menuProjectIndex < 0 || menuProjectIndex >= menuProjectCount - 1}
+							onClick={() => moveProject(menu.id, 1)}
+						>
+							{t("shell.moveWorkspaceBack")}
+						</Button>
+						<Button
+							role="menuitem"
+							disabled={!!pending[`project:${menu.id}`]}
+							onClick={() => closeProject(menu.id)}
+						>
+							{menuProjectBusy ? t("shell.closeWorkspaceBusy") : t("shell.closeWorkspace")}
+						</Button>
+					</>
+				) : (
+					<>
+						<Button
+							role="menuitem"
+							disabled={searching || menuSessionIndex <= 0}
+							onClick={() => moveSession(menu.projectId, menu.id, -1)}
+						>
+							{t("shell.moveConversationUp")}
+						</Button>
+						<Button
+							role="menuitem"
+							disabled={searching || menuSessionIndex < 0 || menuSessionIndex >= menuSessionCount - 1}
+							onClick={() => moveSession(menu.projectId, menu.id, 1)}
+						>
+							{t("shell.moveConversationDown")}
+						</Button>
+						{menuSession && (
+							<Button
+								role="menuitem"
+								onClick={() => {
+									setMenu(null);
+									select(menuSession);
+								}}
+							>
+								{t("shell.openConversation")}
+							</Button>
+						)}
+					</>
+				)}
+			</div>
+		</>
+	);
 	return (
 		<div className="app-shell">
 			<aside className="sidebar desktop-sidebar">{sidebarContent}</aside>
@@ -1899,11 +2258,24 @@ export default function App() {
 				<Modal
 					title={t("shell.projectsAndConversations")}
 					className="sidebar-drawer"
-					onClose={() => setSidebar(false)}
+					onClose={() => {
+						// A menu dismissal and the dialog's close request are one Escape, not two.
+						if (keepDrawerOpen.current) {
+							keepDrawerOpen.current = false;
+							return;
+						}
+						if (menu) {
+							setMenu(null);
+							return;
+						}
+						setSidebar(false);
+					}}
 				>
 					{sidebarContent}
+					{contextMenu}
 				</Modal>
 			)}
+			{!sidebar && contextMenu}
 			<main className="main-pane">
 				<header className="toolbar">
 					<Button className="mobile-only" onClick={() => setSidebar(true)}>
@@ -2077,6 +2449,20 @@ export default function App() {
 							</div>
 						)}
 						{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
+						{(session.todos?.length ?? 0) > 0 && <TodoPanel phases={session.todos!} />}
+						{session.goal && (
+							<>
+								<GoalStrip
+									goal={session.goal}
+									pending={!!pending[`goal:${session.id}`]}
+									busy={session.status === "running" || session.status === "waiting"}
+									onOperate={op =>
+										void call("goal.operate", { sessionId: session.id, op }, `goal:${session.id}`)
+									}
+								/>
+								{errors[`goal:${session.id}`] && <ErrorBanner>{errors[`goal:${session.id}`]}</ErrorBanner>}
+							</>
+						)}
 						<div className="composer-area">
 							<Composer
 								controls={modelControls(session)}
@@ -2123,8 +2509,6 @@ export default function App() {
 								onSend={send}
 								onStop={() => void call("abort", { sessionId: selected }, `abort:${selected}`)}
 								busy={session.status === "running" || session.status === "waiting"}
-								deliverAs={deliverAs}
-								onDeliverAs={setDeliverAs}
 								onSlash={openCommands}
 								disabled={!connected || busyDrafts[session.id]}
 							/>
@@ -2604,7 +2988,9 @@ export default function App() {
 												(!!command.needsSession &&
 													(!session ||
 														(!command.allowDuringRun &&
-															(!!pending[selected] || session.status === "running"))))
+															(!!pending[selected] ||
+																session.status === "running" ||
+																session.status === "waiting"))))
 											}
 											onClick={command.action}
 										>
@@ -2763,24 +3149,28 @@ export default function App() {
 										["complete", t("shell.goalComplete")],
 										["drop", t("shell.goalDrop")],
 									] as const
-								).map(([op, label]) => (
-									<Button
-										key={op}
-										disabled={!connected || pending.goal || (op === "create" && !editText.trim())}
-										onClick={() =>
-											void run("goal", async () => {
-												const value = await request("goal.operate", {
-													sessionId: selected,
-													op,
-													...(op === "create" ? { objective: editText } : {}),
-												});
-												setResult(textOf(value));
-											})
-										}
-									>
-										{label}
-									</Button>
-								))}
+								)
+									// The dialog mirrors the strip: only the operations the current goal state
+									// allows, and none while a turn owns the session.
+									.filter(([op]) => goalOperationAllowed(op, session))
+									.map(([op, label]) => (
+										<Button
+											key={op}
+											disabled={!connected || pending.goal || (op === "create" && !editText.trim())}
+											onClick={() =>
+												void run("goal", async () => {
+													const value = await request("goal.operate", {
+														sessionId: selected,
+														op,
+														...(op === "create" ? { objective: editText } : {}),
+													});
+													setResult(textOf(value));
+												})
+											}
+										>
+											{label}
+										</Button>
+									))}
 							</div>
 							{result && <pre className="bounded-output">{result}</pre>}
 						</>

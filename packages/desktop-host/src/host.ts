@@ -87,6 +87,7 @@ import type {
 } from "./protocol";
 import { PROTOCOL_VERSION } from "./protocol";
 import { readDesktopSessionInfo } from "./session-info";
+import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 
 const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
@@ -380,6 +381,19 @@ export interface HostOptions {
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 }
 
+/** A close stops its runs on a budget: a wedged abort must not strand the folder's queue. */
+const CLOSE_ABORT_TIMEOUT_MS = 5_000;
+const CLOSE_TEARDOWN_TIMEOUT_MS = 15_000;
+
+/** Resolves like the promise, or rejects once the budget signal fires. */
+function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) return Promise.reject(new Error("Workspace close timed out"));
+	const timedOut = Promise.withResolvers<never>();
+	const onAbort = () => timedOut.reject(new Error("Workspace close timed out"));
+	signal.addEventListener("abort", onAbort, { once: true });
+	return Promise.race([promise, timedOut.promise]).finally(() => signal.removeEventListener("abort", onAbort));
+}
+
 export class DesktopHost {
 	#dataDir: string;
 	get dataDir(): string {
@@ -406,6 +420,13 @@ export class DesktopHost {
 	#cleanupOwners = new Map<SessionCandidate, Promise<void>>();
 	#pendingForks = new Set<string>();
 	#opening = new Map<string, Promise<LiveSession>>();
+	/**
+	 * One queue per workspace path. Open and close both mutate the same catalog entry, and the
+	 * renderer can issue them together (close a workspace, immediately reopen the folder), so they
+	 * are serialized: a reopen never observes a half-closed workspace, and a close never hides a
+	 * workspace a racing reopen just made usable.
+	 */
+	#projectLocks = new Map<string, Promise<unknown>>();
 	#questions = new Map<string, PendingQuestion>();
 	#auth?: AuthStorage;
 	#oauth?: DesktopOAuthController;
@@ -486,10 +507,13 @@ export class DesktopHost {
 			const projects = catalog.projects.map(value => {
 				const item = record(value);
 				if (!item) throw new Error("Invalid desktop project");
+				if (item.closed !== undefined && typeof item.closed !== "boolean")
+					throw new Error("Invalid desktop project");
 				return {
 					id: identifier(item, "id"),
 					name: requiredString(item, "name", 200),
 					path: requiredString(item, "path"),
+					...(item.closed === true ? { closed: true } : {}),
 				};
 			});
 			const sessions = catalog.sessions.map(value => {
@@ -682,6 +706,8 @@ export class DesktopHost {
 				? { historyTruncated: true }
 				: {}),
 			...(question ? { question } : {}),
+			...projectTodos(live?.sdk),
+			...projectGoal(live?.sdk),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
 		};
@@ -689,9 +715,13 @@ export class DesktopHost {
 	snapshot(): DesktopSnapshot {
 		return {
 			protocolVersion: PROTOCOL_VERSION,
-			projects: this.#catalog.projects.map(project => ({ ...project })),
+			projects: this.#catalog.projects.filter(project => !project.closed).map(project => ({ ...project })),
 			sessions: this.#catalog.sessions
-				.filter(session => !this.#pendingForks.has(session.id))
+				.filter(
+					session =>
+						!this.#pendingForks.has(session.id) &&
+						this.#catalog.projects.some(project => project.id === session.projectId && !project.closed),
+				)
 				.map(session => this.#dto(session, Math.floor(500_000 / Math.max(1, this.#catalog.sessions.length)))),
 			models: this.#registry?.getAvailable().map(projectDesktopModel) ?? [],
 			capabilities: CAPABILITIES.map(capability => ({ ...capability })),
@@ -746,6 +776,9 @@ export class DesktopHost {
 		const id = identifier(params, "sessionId");
 		const metadata = this.#catalog.sessions.find(session => session.id === id);
 		if (!metadata) throw new Error("Session not found");
+		// A closed workspace's conversations stay on disk but are not addressable until it reopens.
+		if (this.#catalog.projects.find(project => project.id === metadata.projectId)?.closed)
+			throw new Error("Workspace is closed. Open the folder again to use this conversation.");
 		return metadata;
 	}
 	async #open(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
@@ -895,6 +928,10 @@ export class DesktopHost {
 	}
 	#publishCandidate(candidate: SessionCandidate): LiveSession {
 		if (this.#closed) throw new Error("Host is closed");
+		// A close can land while this session is still being constructed. Publishing it here would
+		// leave a live conversation (and its runs) inside a workspace the user just closed.
+		if (this.#catalog.projects.find(project => project.id === candidate.metadata.projectId)?.closed)
+			throw new Error("Workspace is closed. Open the folder again to use this conversation.");
 		const live: LiveSession = {
 			...candidate,
 			serviceGeneration: candidate.sdk.sessionLifecycle.generation,
@@ -1734,22 +1771,68 @@ export class DesktopHost {
 		if (method === "project.open") {
 			const resolved = await fs.realpath(requiredString(params, "path"));
 			if (!(await fs.stat(resolved)).isDirectory()) throw new Error("Project must be a directory");
-			let project = this.#catalog.projects.find(item => item.path === resolved);
-			if (!project) {
-				project = {
-					id: crypto.randomUUID(),
-					name: (path.basename(resolved) || resolved).slice(0, 200),
-					path: resolved,
-				};
-				this.#catalog.projects.push(project);
+			return this.#withProject(resolved, () => this.#openProject(resolved));
+		}
+		if (method === "project.close") {
+			const projectId = identifier(params, "projectId");
+			const project = this.#catalog.projects.find(item => item.id === projectId);
+			if (!project) throw new Error("Project not found");
+			return this.#withProject(project.path, () => this.#closeProject(project));
+		}
+		if (method === "project.reorder") {
+			const ids = params.ids;
+			if (!Array.isArray(ids) || ids.some(id => typeof id !== "string")) throw new Error("Invalid project order");
+			const previous = this.#catalog.projects;
+			// The renderer can only order what the snapshot shows, so the request is validated
+			// against the open workspaces and spliced back into the slots closed ones occupy.
+			const visible = previous.filter(project => !project.closed);
+			if (ids.length !== visible.length || new Set(ids).size !== ids.length)
+				throw new Error("Invalid project order");
+			const reordered = ids.map(id => visible.find(project => project.id === id));
+			if (reordered.some(project => !project)) throw new Error("Invalid project order");
+			let cursor = 0;
+			const next = previous.map(project => (project.closed ? project : reordered[cursor++]!));
+			this.#catalog.projects = next;
+			try {
 				await this.#save();
+			} catch (error) {
+				this.#catalog.projects = previous;
+				throw error;
 			}
 			this.#publishSnapshot();
-			return project;
+			return null;
+		}
+		if (method === "session.reorder") {
+			const projectId = identifier(params, "projectId");
+			const ids = params.ids;
+			if (!Array.isArray(ids) || ids.some(id => typeof id !== "string")) throw new Error("Invalid session order");
+			const current = this.#catalog.sessions.filter(session => session.projectId === projectId);
+			if (ids.length !== current.length || new Set(ids).size !== ids.length)
+				throw new Error("Invalid session order");
+			const reordered = ids.map(id => current.find(session => session.id === id));
+			if (reordered.some(session => !session)) throw new Error("Invalid session order");
+			const previous = this.#catalog.sessions;
+			const next: SavedSession[] = [];
+			let cursor = 0;
+			for (const session of previous) {
+				if (session.projectId !== projectId) next.push(session);
+				else next.push(reordered[cursor++]!);
+			}
+			this.#catalog.sessions = next;
+			try {
+				await this.#save();
+			} catch (error) {
+				this.#catalog.sessions = previous;
+				throw error;
+			}
+			this.#publishSnapshot();
+			return null;
 		}
 		if (method === "session.create") {
 			const projectId = identifier(params, "projectId");
-			if (!this.#catalog.projects.some(item => item.id === projectId)) throw new Error("Project not found");
+			const owning = this.#catalog.projects.find(item => item.id === projectId);
+			if (!owning) throw new Error("Project not found");
+			if (owning.closed) throw new Error("Workspace is closed. Open the folder again to use this conversation.");
 			const metadata: SavedSession = { id: crypto.randomUUID(), projectId, title: "New session", starred: false };
 			this.#catalog.sessions.push(metadata);
 			try {
@@ -2336,6 +2419,103 @@ export class DesktopHost {
 			method !== "session.fork" && method !== "session.delete",
 		);
 	}
+	/**
+	 * Hides a workspace's live conversations after its durable close. Teardown failures are
+	 * reported rather than rethrown: the close itself already succeeded and must not be undone
+	 * by an uncooperative abort, but the operator still needs to see that a run was cut short.
+	 */
+	async #teardownProject(projectId: string): Promise<void> {
+		// The close already owns the workspace's queue entry, so teardown must finish on a budget:
+		// an uncooperative abort would otherwise keep every later reopen of this folder waiting.
+		const deadline = AbortSignal.timeout(CLOSE_TEARDOWN_TIMEOUT_MS);
+		// A session that is still opening when the workspace closes must not stay live either:
+		// settling each in-flight open lets its publish path see the closed project and refuse.
+		const opening = [...this.#opening.entries()]
+			.filter(([id]) => this.#catalog.sessions.find(session => session.id === id)?.projectId === projectId)
+			.map(([, promise]) => promise);
+		await Promise.allSettled(opening.map(promise => bounded(promise, deadline)));
+		// Retire each live session independently so one failed teardown cannot leave the rest running.
+		for (const [id, live] of [...this.#live]) {
+			if (live.metadata.projectId !== projectId) continue;
+			this.#cancelQuestions(id);
+			this.#live.delete(id);
+			this.#retiredLive.add(live);
+			try {
+				await live.sdk.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS });
+			} catch (error) {
+				console.error(`Desktop workspace close could not abort session ${id}: ${String(error)}`);
+			}
+			try {
+				await bounded(this.#disposeLive(live), deadline);
+			} catch (error) {
+				console.error(`Desktop workspace close could not dispose session ${id}: ${String(error)}`);
+			}
+		}
+	}
+	/** Serializes open/close for one workspace path; a rejected step does not poison the queue. */
+	#withProject<T>(key: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.#projectLocks.get(key) ?? Promise.resolve();
+		const next = previous.then(operation, operation);
+		const tail = next.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#projectLocks.set(key, tail);
+		void tail.then(() => {
+			if (this.#projectLocks.get(key) === tail) this.#projectLocks.delete(key);
+		});
+		return next;
+	}
+
+	/** Restores a closed workspace, or adds a new one, without racing a close of the same path. */
+	async #openProject(resolved: string): Promise<DesktopProject> {
+		let project = this.#catalog.projects.find(item => item.path === resolved);
+		if (project?.closed) {
+			delete project.closed;
+			try {
+				await this.#save();
+			} catch (error) {
+				project.closed = true;
+				throw error;
+			}
+			this.#publishSnapshot();
+			return project;
+		}
+		if (!project) {
+			project = {
+				id: crypto.randomUUID(),
+				name: (path.basename(resolved) || resolved).slice(0, 200),
+				path: resolved,
+			};
+			this.#catalog.projects.push(project);
+			await this.#save();
+		}
+		this.#publishSnapshot();
+		return project;
+	}
+
+	/**
+	 * Hides a workspace and retires its live conversations. Closing never deletes the directory,
+	 * the sessions or their files, and reopening the path restores the same identity.
+	 */
+	async #closeProject(project: DesktopProject): Promise<null> {
+		const previous = project.closed;
+		project.closed = true;
+		try {
+			await this.#save();
+		} catch (error) {
+			if (previous === undefined) delete project.closed;
+			else project.closed = previous;
+			throw error;
+		}
+		// The workspace leaves the list before teardown, so a conversation click cannot arrive for
+		// a workspace that is already gone.
+		this.#publishSnapshot();
+		await this.#teardownProject(project.id);
+		this.#publishSnapshot();
+		return null;
+	}
+
 	async #deleteSession(live: LiveSession, metadata: SavedSession): Promise<null> {
 		this.#cancelQuestions(metadata.id);
 		live.queued.clear();

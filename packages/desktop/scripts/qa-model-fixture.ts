@@ -383,6 +383,43 @@ export interface ModelFixture {
 	close(): Promise<void>;
 }
 
+/**
+ * Test-only tool-call trigger: a user message containing `qa-tool-call:<name>` makes the mock
+ * model ask for that offered tool, so a desktop turn can execute a real builtin tool.
+ */
+function requestedToolCall(body: Record<string, unknown>): { name: string; arguments: string } | null {
+	if (!Array.isArray(body.tools)) return null;
+	const names = body.tools
+		.map(tool => (tool && typeof tool === "object" ? (tool as { function?: { name?: unknown } }).function?.name : ""))
+		.filter((name): name is string => typeof name === "string");
+	if (names.length === 0) return null;
+	const messages = Array.isArray(body.messages) ? body.messages : [];
+	// Only the newest message can request a call: an older marker must not re-fire after its
+	// tool result has already been returned.
+	const newest = messages.at(-1);
+	if (!newest || typeof newest !== "object") return null;
+	const entry = newest as { role?: unknown; content?: unknown };
+	if (entry.role !== "user") return null;
+	// Wire content is either a string or an array of typed parts.
+	const content = Array.isArray(entry.content)
+		? entry.content
+				.map(part =>
+					part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+						? (part as { text: string }).text
+						: "",
+				)
+				.join("\n")
+		: typeof entry.content === "string"
+			? entry.content
+			: "";
+	const match = /qa-tool-call:([a-z0-9_]+)(?::([^\n]+))?/.exec(content);
+	if (!match) return null;
+	const name = match[1]!;
+	if (!names.includes(name)) throw new Error(`Fixture tool ${name} is not offered`);
+	const argumentText = match[2]?.trim() || "{}";
+	return { name, arguments: JSON.stringify(JSON.parse(argumentText)) };
+}
+
 function isTitleRequest(body: Record<string, unknown>): boolean {
 	const choice = body.tool_choice;
 	if (!choice || typeof choice !== "object" || Array.isArray(choice)) return false;
@@ -540,7 +577,22 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 					const finish = () => {
 						if (record.state !== "held") return;
 						if (heartbeat) clearInterval(heartbeat);
-						if (title) {
+						const toolCall = title ? null : requestedToolCall(body as Record<string, unknown>);
+						if (toolCall) {
+							send(
+								chunk({
+									tool_calls: [
+										{
+											index: 0,
+											id: `qa-tool-call-${record.id}`,
+											type: "function",
+											function: { name: toolCall.name, arguments: toolCall.arguments },
+										},
+									],
+								}),
+							);
+							send(chunk({}, "tool_calls"));
+						} else if (title) {
 							send(
 								chunk({
 									tool_calls: [

@@ -14,7 +14,18 @@ import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "../../desktop-
 import { AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
-import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
+import {
+	Button,
+	Composer,
+	ErrorBanner,
+	GoalStrip,
+	Message,
+	Modal,
+	QuestionCard,
+	SessionRow,
+	SettingField,
+	TodoPanel,
+} from "./components";
 import { ForkPanel, type ForkPanelProps } from "./ForkPanel";
 import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
@@ -1082,7 +1093,6 @@ export default function Showcase() {
 	const [attachments, setAttachments] = useState<DesktopAttachmentDraft[]>([]);
 	const [populatedDraft, setPopulatedDraft] = useState(t("showcase.draftPopulated"));
 	const [runningDraft, setRunningDraft] = useState(t("showcase.draftRunning"));
-	const [deliverAs, setDeliverAs] = useState<"steer" | "followUp">("steer");
 	const [dialog, setDialog] = useState(false);
 	const [answer, setAnswer] = useState("");
 	const [selected, setSelected] = useState("running");
@@ -1116,6 +1126,7 @@ export default function Showcase() {
 					<a href="#showcase-session-info">{t("showcase.navSessionInfo")}</a>
 					<a href="#showcase-btw">{t("showcase.navBtw")}</a>
 					<a href="#showcase-fork">{t("showcase.navFork")}</a>
+					<a href="#showcase-session-state">{t("showcase.navSessionState")}</a>
 					<a href="#showcase-composers">{t("showcase.navComposers")}</a>
 					<a href="#showcase-settings">{t("showcase.navSettings")}</a>
 					<a href="#showcase-settings-tabs">{t("showcase.navSettingsTabs")}</a>
@@ -1367,6 +1378,43 @@ export default function Showcase() {
 				<h2>{t("showcase.forkHeading")}</h2>
 				<FixtureForkPanel />
 			</section>
+			<section id="showcase-session-state">
+				<h2>{t("showcase.sessionStateHeading")}</h2>
+				<p className="muted">{t("showcase.sessionStateNote")}</p>
+				<h3>{t("showcase.sessionStateTodoHeading")}</h3>
+				<TodoPanel
+					phases={[
+						{
+							name: "Foundation",
+							tasks: [
+								{ content: "Read the shipped host projection", status: "completed" },
+								{ content: "Project the live todo list", status: "in_progress" },
+								{ content: "Render the checklist", status: "pending" },
+							],
+						},
+						{ name: "Polish", tasks: [{ content: "Check the collapsed summary", status: "abandoned" }] },
+					]}
+				/>
+				<h3>{t("showcase.sessionStateGoalHeading")}</h3>
+				<GoalStrip
+					goal={{
+						objective: "Ship the desktop parity work end to end",
+						status: "active",
+						tokensUsed: 12,
+						timeUsedSeconds: 3,
+					}}
+					onOperate={() => {}}
+				/>
+				<GoalStrip
+					goal={{
+						objective: "Paused example with its own actions",
+						status: "paused",
+						tokensUsed: 0,
+						timeUsedSeconds: 0,
+					}}
+					onOperate={() => {}}
+				/>
+			</section>
 			<section id="showcase-composers">
 				<h2>{t("showcase.composersHeading")}</h2>
 				<p className="muted">{t("showcase.composersNote")}</p>
@@ -1400,13 +1448,20 @@ export default function Showcase() {
 				/>
 				<h3>{t("showcase.composerRunningHeading")}</h3>
 				<Composer
+					value=""
+					onChange={() => {}}
+					onSend={() => {}}
+					onStop={() => setAnswer(t("showcase.answerStopped"))}
+					busy
+					controls={<FixtureControls running />}
+				/>
+				<h3>{t("showcase.composerRunningDraftHeading")}</h3>
+				<Composer
 					value={runningDraft}
 					onChange={setRunningDraft}
 					onSend={() => setAnswer(t("showcase.answerQueued"))}
 					onStop={() => setAnswer(t("showcase.answerStopped"))}
 					busy
-					deliverAs={deliverAs}
-					onDeliverAs={setDeliverAs}
 					controls={<FixtureControls running />}
 				/>
 				<h3>{t("showcase.composerDisconnectedHeading")}</h3>

@@ -8,9 +8,18 @@ import {
 	type WorkflowGateTerminalController,
 	type WorkflowGateTerminalProof,
 } from "@gajae-code/coding-agent/sdk/workflow-gates";
-import { DesktopActivityError, type DesktopActivityController } from "./activity-controls";
-import type { DesktopActivityGate, DesktopActivityGateAnswer, DesktopActivityGateAnswerResult, DesktopActivityRef } from "./activity-protocol";
-import type { DesktopGatePresentation, DesktopGatePresentationErrorCode, DesktopGatePresentationEvent } from "./gate-presentation-protocol";
+import { type DesktopActivityController, DesktopActivityError } from "./activity-controls";
+import type {
+	DesktopActivityGate,
+	DesktopActivityGateAnswer,
+	DesktopActivityGateAnswerResult,
+	DesktopActivityRef,
+} from "./activity-protocol";
+import type {
+	DesktopGatePresentation,
+	DesktopGatePresentationErrorCode,
+	DesktopGatePresentationEvent,
+} from "./gate-presentation-protocol";
 
 export const DESKTOP_GATE_PRESENTATION_LIMITS = {
 	presentations: 128,
@@ -20,7 +29,8 @@ export const DESKTOP_GATE_PRESENTATION_LIMITS = {
 
 const REASONS: Record<DesktopGatePresentationErrorCode, string> = {
 	unavailable: "This session has no authoritative desktop gate presentation capability.",
-	registration_failed: "A desktop gate terminal controller could not be registered; existing ownership was not replaced.",
+	registration_failed:
+		"A desktop gate terminal controller could not be registered; existing ownership was not replaced.",
 	revoked: "This gate presenter binding has been permanently revoked.",
 	invalid_presentation: "Unknown gate presentation in this binding.",
 	not_presented: "The owning UI has not committed this exact gate presentation.",
@@ -75,20 +85,37 @@ interface PresentationRecord {
 
 /** Project only the immutable SDK gate fields, excluding diagnostic query metadata. */
 function fingerprint(gate: WorkflowGate): string {
-	return crypto.createHash("sha256").update(canonicalJson({
-		type: gate.type, gate_id: gate.gate_id, stage: gate.stage, kind: gate.kind,
-		schema: gate.schema, schema_hash: gate.schema_hash, options: gate.options,
-		context: gate.context, created_at: gate.created_at, required: gate.required,
-		runtime_turn_id: gate.runtime_turn_id,
-	})).digest("hex");
+	return crypto
+		.createHash("sha256")
+		.update(
+			canonicalJson({
+				type: gate.type,
+				gate_id: gate.gate_id,
+				stage: gate.stage,
+				kind: gate.kind,
+				schema: gate.schema,
+				schema_hash: gate.schema_hash,
+				options: gate.options,
+				context: gate.context,
+				created_at: gate.created_at,
+				required: gate.required,
+				runtime_turn_id: gate.runtime_turn_id,
+			}),
+		)
+		.digest("hex");
 }
 
 function displayFingerprint(gate: DesktopActivityGate): string {
-	return crypto.createHash("sha256").update(canonicalJson({
-		...gate,
-		// The adapter deliberately generates fresh choice handles on every complete read.
-		choices: gate.choices.map(({ label, description }) => ({ label, description })),
-	})).digest("hex");
+	return crypto
+		.createHash("sha256")
+		.update(
+			canonicalJson({
+				...gate,
+				// The adapter deliberately generates fresh choice handles on every complete read.
+				choices: gate.choices.map(({ label, description }) => ({ label, description })),
+			}),
+		)
+		.digest("hex");
 }
 
 function freeze<T>(value: T): T {
@@ -133,10 +160,19 @@ export class DesktopGatePresenter {
 	constructor(options: DesktopGatePresenterOptions) {
 		const { session, activity, connectionGeneration, catalogSessionId, isCurrent, emit } = options;
 		const timeout = options.retirementTimeoutMs ?? DESKTOP_GATE_PRESENTATION_LIMITS.retirementTimeoutMs;
-		if (typeof connectionGeneration !== "string" || !connectionGeneration || connectionGeneration.length > 128
-			|| typeof catalogSessionId !== "string" || !catalogSessionId || catalogSessionId.length > 256
-			|| typeof isCurrent !== "function" || typeof emit !== "function"
-			|| !Number.isSafeInteger(timeout) || timeout < 1 || timeout > DESKTOP_GATE_PRESENTATION_LIMITS.maxRetirementTimeoutMs)
+		if (
+			typeof connectionGeneration !== "string" ||
+			!connectionGeneration ||
+			connectionGeneration.length > 128 ||
+			typeof catalogSessionId !== "string" ||
+			!catalogSessionId ||
+			catalogSessionId.length > 256 ||
+			typeof isCurrent !== "function" ||
+			typeof emit !== "function" ||
+			!Number.isSafeInteger(timeout) ||
+			timeout < 1 ||
+			timeout > DESKTOP_GATE_PRESENTATION_LIMITS.maxRetirementTimeoutMs
+		)
 			throw new DesktopGatePresentationError("unavailable");
 		const lifecycle = session.sessionLifecycle;
 		if (lifecycle.disposed || session.isDisposed) throw new DesktopGatePresentationError("revoked");
@@ -153,7 +189,12 @@ export class DesktopGatePresenter {
 		this.#emit = emit;
 		this.#timeout = timeout;
 		const emitter = session.getWorkflowGateEmitter();
-		if (!emitter?.registerGateTerminalController || !emitter.listPendingGates || !emitter.listWorkflowGateQueryRecords || !emitter.resolveGate)
+		if (
+			!emitter?.registerGateTerminalController ||
+			!emitter.listPendingGates ||
+			!emitter.listWorkflowGateQueryRecords ||
+			!emitter.resolveGate
+		)
 			throw new DesktopGatePresentationError("unavailable");
 		this.#emitter = emitter;
 		const snapshot = activity.getSnapshot();
@@ -198,7 +239,9 @@ export class DesktopGatePresenter {
 			this.revoke();
 			return;
 		}
-		try { this.#assertLive(); } catch (error) {
+		try {
+			this.#assertLive();
+		} catch (error) {
 			if (!(error instanceof DesktopGatePresentationError && error.code === "busy")) this.revoke();
 		}
 	}
@@ -213,21 +256,34 @@ export class DesktopGatePresenter {
 		let transitionBusy = false;
 		const checkBinding = () => {
 			const lifecycle = this.#session.sessionLifecycle;
-			if (this.#revoked || lifecycle.disposed || this.#session.isDisposed || lifecycle.generation !== this.#sdkGeneration
-				|| this.#isCurrent(this.#connectionGeneration, this.#catalogSessionId) !== true)
+			if (
+				this.#revoked ||
+				lifecycle.disposed ||
+				this.#session.isDisposed ||
+				lifecycle.generation !== this.#sdkGeneration ||
+				this.#isCurrent(this.#connectionGeneration, this.#catalogSessionId) !== true
+			)
 				throw new DesktopGatePresentationError("revoked");
 			// The host callback can reenter or start a transition. Read the public
 			// authority again before interpreting temporarily staged SDK identities.
 			const current = this.#session.sessionLifecycle;
-			if (this.#revoked || current.disposed || this.#session.isDisposed || current.generation !== this.#sdkGeneration)
+			if (
+				this.#revoked ||
+				current.disposed ||
+				this.#session.isDisposed ||
+				current.generation !== this.#sdkGeneration
+			)
 				throw new DesktopGatePresentationError("revoked");
 			if (current.transitioning) {
 				transitionBusy = true;
 				throw new DesktopGatePresentationError("busy");
 			}
-			if (this.#session.sessionManager !== this.#sessionManager || this.#session.sessionId !== this.#sessionId
-				|| this.#session.sessionManager.getSessionId() !== this.#managerSessionId
-				|| this.#session.getWorkflowGateEmitter() !== this.#emitter)
+			if (
+				this.#session.sessionManager !== this.#sessionManager ||
+				this.#session.sessionId !== this.#sessionId ||
+				this.#session.sessionManager.getSessionId() !== this.#managerSessionId ||
+				this.#session.getWorkflowGateEmitter() !== this.#emitter
+			)
 				throw new DesktopGatePresentationError("revoked");
 		};
 		try {
@@ -236,8 +292,12 @@ export class DesktopGatePresenter {
 			// Redaction inside the activity snapshot can notify or begin preparation.
 			// Check committed authority first, before treating an unavailable view as stale.
 			checkBinding();
-			if (!snapshot.sessionState || snapshot.sessionGeneration !== this.#activityGeneration
-				|| snapshot.connectionGeneration !== this.#connectionGeneration || this.#revoked)
+			if (
+				!snapshot.sessionState ||
+				snapshot.sessionGeneration !== this.#activityGeneration ||
+				snapshot.connectionGeneration !== this.#connectionGeneration ||
+				this.#revoked
+			)
 				throw new DesktopGatePresentationError("revoked");
 		} catch {
 			if (transitionBusy && !this.#revoked) throw new DesktopGatePresentationError("busy");
@@ -250,7 +310,11 @@ export class DesktopGatePresenter {
 
 	#prepare<T>(operation: () => T): T {
 		this.#preparing = true;
-		try { return operation(); } finally { this.#preparing = false; }
+		try {
+			return operation();
+		} finally {
+			this.#preparing = false;
+		}
 	}
 
 	#record(id: string): PresentationRecord {
@@ -262,10 +326,21 @@ export class DesktopGatePresenter {
 
 	#currentFingerprint(gateId: string, accepted = false): string {
 		const pending = this.#emitter.listPendingGates?.().find(gate => gate.gate_id === gateId);
-		const gate = pending ?? (accepted ? this.#emitter.listWorkflowGateQueryRecords?.().find(row =>
-			row.gate_id === gateId && row.tag === "accepted" && row.post_accept_disposition !== "continuation_lost"
-			&& row.post_accept_disposition !== "unknown") : undefined);
-		if (!gate || schemaHash(gate.schema) !== gate.schema_hash) throw new DesktopGatePresentationError("stale_presentation");
+		const gate =
+			pending ??
+			(accepted
+				? this.#emitter
+						.listWorkflowGateQueryRecords?.()
+						.find(
+							row =>
+								row.gate_id === gateId &&
+								row.tag === "accepted" &&
+								row.post_accept_disposition !== "continuation_lost" &&
+								row.post_accept_disposition !== "unknown",
+						)
+				: undefined);
+		if (!gate || schemaHash(gate.schema) !== gate.schema_hash)
+			throw new DesktopGatePresentationError("stale_presentation");
 		return fingerprint(gate);
 	}
 
@@ -303,20 +378,31 @@ export class DesktopGatePresenter {
 		this.#entry();
 		if (this.#withdrawingAll) throw new DesktopGatePresentationError("busy");
 		return this.#prepare(() => {
-			if (this.#records.size >= DESKTOP_GATE_PRESENTATION_LIMITS.presentations) throw new DesktopGatePresentationError("capacity");
+			if (this.#records.size >= DESKTOP_GATE_PRESENTATION_LIMITS.presentations)
+				throw new DesktopGatePresentationError("capacity");
 			// Snapshot untrusted properties before any trusted callback can run.
-			const captured = freeze({ sessionGeneration: ref?.sessionGeneration, connectionGeneration: ref?.connectionGeneration, key: ref?.key });
+			const captured = freeze({
+				sessionGeneration: ref?.sessionGeneration,
+				connectionGeneration: ref?.connectionGeneration,
+				key: ref?.key,
+			});
 			const { gate, gateId } = this.#activity.getGatePresentation(captured);
 			this.#assertLive();
 			if (!gate.answerable || gate.truncated) throw new DesktopGatePresentationError("unavailable");
-			if (this.#answering.has(gateId) || this.#completing.has(gateId)) throw new DesktopGatePresentationError("busy");
+			if (this.#answering.has(gateId) || this.#completing.has(gateId))
+				throw new DesktopGatePresentationError("busy");
 			const target = this.#currentFingerprint(gateId);
 			const previous = [...this.#records.values()].find(record => record.gateId === gateId);
 			if (previous && previous.fingerprint !== target) throw new DesktopGatePresentationError("stale_presentation");
 			const presentation = freeze({ id: crypto.randomUUID(), gate: structuredClone(gate) });
 			const record: PresentationRecord = {
-				id: presentation.id, gateId, fingerprint: target, ref: captured, presentation,
-				display: displayFingerprint(gate), state: "issued",
+				id: presentation.id,
+				gateId,
+				fingerprint: target,
+				ref: captured,
+				presentation,
+				display: displayFingerprint(gate),
+				state: "issued",
 			};
 			// Never evict even terminal/failed evidence into a false not_published proof.
 			this.#records.set(record.id, record);
@@ -331,7 +417,8 @@ export class DesktopGatePresenter {
 		this.#entry();
 		const record = this.#record(id);
 		this.#assertTarget(record);
-		if (record.state !== "issued" && record.state !== "presented") throw new DesktopGatePresentationError("not_presented");
+		if (record.state !== "issued" && record.state !== "presented")
+			throw new DesktopGatePresentationError("not_presented");
 		record.state = "presented";
 	}
 
@@ -340,19 +427,28 @@ export class DesktopGatePresenter {
 		if (this.#withdrawingAll) throw new DesktopGatePresentationError("busy");
 		const record = this.#record(id);
 		if (record.state !== "presented") throw new DesktopGatePresentationError("not_presented");
-		if (this.#answering.has(record.gateId) || this.#completing.has(record.gateId)) throw new DesktopGatePresentationError("busy");
+		if (this.#answering.has(record.gateId) || this.#completing.has(record.gateId))
+			throw new DesktopGatePresentationError("busy");
 		if (!request || typeof request !== "object") throw new DesktopActivityError("invalid_answer");
 		// Read renderer properties before callbacks, then retain no caller-owned objects.
 		const { kind, choiceKey, json } = this.#prepare(() => {
 			const kind = request.kind;
-			return { kind, choiceKey: kind === "choice" ? request.choiceKey : undefined, json: kind === "json" ? request.json : undefined };
+			return {
+				kind,
+				choiceKey: kind === "choice" ? request.choiceKey : undefined,
+				json: kind === "json" ? request.json : undefined,
+			};
 		});
 		this.#answering.add(record.gateId);
 		try {
 			this.#assertTarget(record);
 			const current = this.#prepare(() => this.#activity.getGatePresentation(record.ref));
 			this.#assertTarget(record);
-			if (current.gateId !== record.gateId || displayFingerprint(current.gate) !== record.display || record.state !== "presented")
+			if (
+				current.gateId !== record.gateId ||
+				displayFingerprint(current.gate) !== record.display ||
+				record.state !== "presented"
+			)
 				throw new DesktopGatePresentationError("stale_presentation");
 			let answer: DesktopActivityGateAnswer;
 			if (kind === "choice" && typeof choiceKey === "string") {
@@ -378,7 +474,10 @@ export class DesktopGatePresenter {
 		if (record.retirement) return record.retirement.promise;
 		const deferred = Promise.withResolvers<void>();
 		const retirement: Retirement = {
-			nonce: crypto.randomUUID(), ...deferred, timer: undefined, deadline: performance.now() + this.#timeout,
+			nonce: crypto.randomUUID(),
+			...deferred,
+			timer: undefined,
+			deadline: performance.now() + this.#timeout,
 		};
 		// Keep failed callbacks/timeouts observed even when no terminalization call awaits yet.
 		void retirement.promise.catch(() => undefined);
@@ -395,7 +494,9 @@ export class DesktopGatePresenter {
 		} catch (error) {
 			if (retirement.timer) clearTimeout(retirement.timer);
 			record.state = "failed";
-			retirement.reject(error instanceof DesktopGatePresentationError ? error : new DesktopGatePresentationError("callback_failed"));
+			retirement.reject(
+				error instanceof DesktopGatePresentationError ? error : new DesktopGatePresentationError("callback_failed"),
+			);
 		}
 		return retirement.promise;
 	}
@@ -488,17 +589,29 @@ export class DesktopGatePresenter {
 		// A replacement controller must not forget an unproven old surface. Keep
 		// this revoked controller occupying a live emitter until its SDK owner dies.
 		if (this.#session.isDisposed || [...this.#records.values()].every(record => record.state === "terminal")) {
-			try { this.#unregister?.(); } catch { /* Never restore authority. */ }
+			try {
+				this.#unregister?.();
+			} catch {
+				/* Never restore authority. */
+			}
 			this.#unregister = undefined;
 		}
 		for (const cleanup of this.#cleanups.splice(0).reverse()) {
-			try { cleanup(); } catch { /* Revocation cannot restore authority on cleanup failure. */ }
+			try {
+				cleanup();
+			} catch {
+				/* Revocation cannot restore authority on cleanup failure. */
+			}
 		}
 		for (const record of this.#records.values()) {
 			if (record.state === "terminal" || record.state === "failed") continue;
 			if (!record.retirement && !this.#dispatching) {
 				// Best effort hide request on teardown; its nonce cannot now be acknowledged.
-				try { this.#dispatch({ type: "retire", presentationId: record.id, nonce: crypto.randomUUID() }); } catch { /* No proof. */ }
+				try {
+					this.#dispatch({ type: "retire", presentationId: record.id, nonce: crypto.randomUUID() });
+				} catch {
+					/* No proof. */
+				}
 			}
 			record.state = "failed";
 			if (record.retirement?.timer) clearTimeout(record.retirement.timer);

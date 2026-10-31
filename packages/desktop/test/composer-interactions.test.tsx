@@ -125,7 +125,9 @@ describe("mounted compact composer", () => {
 			await page.focus('.composer textarea'); await page.keyboard.press('Enter');
 			await update(page, 'setSendDisabled', false);
 			await update(page, 'setBusy', true); await update(page, 'setAllowQueue', false);
-			await page.waitForSelector('.composer button[type=submit]:disabled');
+			// A running turn whose draft cannot be steered offers stop instead of a dead send slot.
+			await page.waitForSelector('.composer-actions button[aria-label="Stop"]');
+			expect(await page.evaluate(() => document.querySelectorAll('.composer button[type=submit]').length)).toBe(0);
 			await page.keyboard.press('Enter');
 			await update(page, 'setDisabled', true);
 			await update(page, 'setBusy', false);
