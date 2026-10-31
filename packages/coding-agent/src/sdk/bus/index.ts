@@ -126,7 +126,13 @@ import {
 	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
+import {
+	type AbortScope,
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	dispatchControl,
+	TypedControlError,
+} from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
@@ -2798,6 +2804,7 @@ function sdkControlSurface(
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		reserveSteer?: KindAwareReconciliation["reserveSteer"];
 		settleSteer?: KindAwareReconciliation["settleSteer"];
+		lookupSteer?: KindAwareReconciliation["lookupSteer"];
 	},
 	terminalAbortSeams?: {
 		getTerminalTurnEpoch: () => number | undefined;
@@ -2814,6 +2821,10 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	// Whether `connectionId` may replace the active run: true when no run is
+	// active or the run belongs to that connection's accepted prompt. A run the
+	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
+	requesterOwnsActiveRun: (connectionId: string) => boolean = () => true,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2911,11 +2922,20 @@ function sdkControlSurface(
 			// dispatch resolved and the durable settlement failed afterwards, the
 			// steer is still queued in the session, so its handle stays held until
 			// the promotion or removal hook fires.
-			if (!dispatched) admission.abandon();
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
-			};
+			if (!dispatched) {
+				admission.abandon();
+				return {
+					sessionId: ctx.sessionManager.getSessionId(),
+					...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
+				};
+			}
+			// A delivered steer must not be recorded as rejected, which would invite
+			// a second delivery: record it as uncertain, or keep the in-flight
+			// dispatching record (which replays as uncertain) if that write fails too.
+			const uncertain = await skillRecon
+				.settleSteer(normalizedClientRef, "uncertain", error)
+				.catch(() => skillRecon.lookupSteer?.(normalizedClientRef) ?? reservation.result);
+			return { sessionId: ctx.sessionManager.getSessionId(), ...uncertain };
 		}
 	};
 	const resolveModel = (id: string) => {
@@ -2997,6 +3017,19 @@ function sdkControlSurface(
 		);
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
+	// turn.abort_and_prompt carries the same authority as turn.abort: a
+	// connection replaces only work it owns. Another connection's pending
+	// preflight or a run the requester did not start keeps running.
+	const mayReplaceActiveWork = (connectionId: string | undefined): boolean =>
+		connectionId === undefined ||
+		([...pendingPreflightCancellations.values()].every(entry => entry.connectionId === connectionId) &&
+			requesterOwnsActiveRun(connectionId));
+	const cancelPendingPreflightsForReplacement = async () => {
+		const requesterConnectionId = controlRequesterContext.getStore();
+		if (requesterConnectionId !== undefined && !mayReplaceActiveWork(requesterConnectionId))
+			await cancelPendingPreflightsForConnection(requesterConnectionId);
+		else await cancelPendingPreflights();
+	};
 	const awaitAbortReady = async () => {
 		await cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
@@ -3496,11 +3529,31 @@ function sdkControlSurface(
 				...(outcome.stored ? { replay: outcome.stored } : {}),
 			};
 		},
-		abortAndPrompt: async text => {
+		abortAndPrompt: async (text, idempotencyKey) => {
+			const requesterConnectionId = controlRequesterContext.getStore();
+			// A retry of a request that already degraded to a steer replays that steer,
+			// even when the run it targeted has since ended: the text was delivered once
+			// and must neither be queued again nor start a replacement run.
+			const steerClientRef =
+				skillRecon?.reserveSteer && skillRecon.settleSteer && skillRecon.lookupSteer
+					? abortAndPromptSteerClientRef(idempotencyKey)
+					: undefined;
+			const queueAsSteer = async () => {
+				const steer = await sendSteer(text, steerClientRef);
+				// A durable steer reports its reconciliation status; only an accepted
+				// one acknowledges delivery.
+				const accepted = "accepted" in steer ? steer.accepted : steer.status === "accepted";
+				return { ...steer, accepted, aborted: false, queuedAs: "steer" };
+			};
+			if (steerClientRef !== undefined && skillRecon?.lookupSteer?.(steerClientRef).status !== "unknown")
+				return await queueAsSteer();
+			if (!mayReplaceActiveWork(requesterConnectionId)) return await queueAsSteer();
 			await awaitAbortReady();
-			return await submitPrompt(text, undefined, true, undefined, false, controlRequesterContext.getStore());
+			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},
-		cancelPendingPreflights,
+		// Dispatch cancels pending preflights before the replacement is
+		// serialized; a non-owner cancels only its own.
+		cancelPendingPreflights: cancelPendingPreflightsForReplacement,
 		cancelPendingPreflightsForConnection,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
@@ -8142,12 +8195,27 @@ export function createNotificationsExtension(
 				lookup: selector => kindReconciliation.lookup("skill", selector),
 				reserveSteer: kindReconciliation.reserveSteer,
 				settleSteer: kindReconciliation.settleSteer,
+				lookupSteer: kindReconciliation.lookupSteer,
 			},
 			terminalAbortSeams,
 			// #4743: join fire-and-forget reconciliation producers at teardown.
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			connectionId => {
+				const ownedBy = (correlation: { commandId: string; turnId: string }) =>
+					promptSubmissions.get(promptSubmissionKey(correlation))?.connectionId === connectionId;
+				// Another connection's accepted prompt that has not started yet is
+				// foreign work too: replacing would wait on, then preempt, it.
+				if (
+					!pendingPromptCorrelations.every(ownedBy) ||
+					![...pendingPromptCorrelationsBySdkRunToken.values()].every(ownedBy)
+				)
+					return false;
+				if (runtime?.busy !== true && ctx.isIdle?.() !== false) return true;
+				const active = runtime?.activePromptCorrelation;
+				return active !== undefined && ownedBy(active);
+			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
