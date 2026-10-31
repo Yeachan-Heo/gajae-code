@@ -18,8 +18,12 @@ export interface DesktopModelProfile {
 	/** The public profile catalog does not currently provide descriptions. */
 	description: string | null;
 	source: "builtin" | "configured";
-	/** Provider family declared by the profile definition, used to group presets. */
+	/** Provider family shown in the picker, named exactly as the terminal names it. */
 	group: string | null;
+	/** Position of that family in the terminal's order; null when the terminal does not list it. */
+	groupRank: number | null;
+	/** False when a provider the profile binds has no usable credential. */
+	available: boolean;
 	active: boolean;
 	default: boolean;
 	capabilities: {

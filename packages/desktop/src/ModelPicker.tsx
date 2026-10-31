@@ -161,26 +161,49 @@ export function ModelPicker({
 		.map((model, index) => ({ model, index }))
 		.sort(
 			(a, b) =>
-				rank(a.model.id) - rank(b.model.id) ||
+				// The model in use leads, favorites follow it, then the remaining role assignments,
+				// then catalog order.
+				Number(rank(b.model.id) === 0) - Number(rank(a.model.id) === 0) ||
 				Number(favorites.ids.includes(b.model.id)) - Number(favorites.ids.includes(a.model.id)) ||
+				rank(a.model.id) - rank(b.model.id) ||
 				a.index - b.index,
 		)
 		.map(item => item.model);
 	const filteredProfiles = filterProfiles(profileList, presetQuery);
 	// Preset providers mirror the terminal: one collapsed header per family, expanded on demand.
-	// A search expands every group, so a match is never hidden behind a collapsed header.
+	// A search expands every group, so a match is never hidden behind a collapsed header. Groups
+	// follow the terminal's own order; families it does not list come last, alphabetically.
 	const searchingPresets = presetQuery.trim().length > 0;
 	const presetGroups = ((): [string, DesktopModelProfile[]][] => {
-		const groups = new Map<string, DesktopModelProfile[]>();
+		const groups = new Map<string, { rank: number; members: DesktopModelProfile[] }>();
 		for (const profile of filteredProfiles) {
-			const key = profile.group ?? t("models.presetGroupOther");
-			const members = groups.get(key);
-			if (members) members.push(profile);
-			else groups.set(key, [profile]);
+			const key = profile.group ?? "CUSTOM";
+			const group = groups.get(key);
+			if (group) {
+				group.members.push(profile);
+				continue;
+			}
+			groups.set(key, {
+				rank: profile.groupRank ?? Number.MAX_SAFE_INTEGER,
+				members: [profile],
+			});
 		}
-		return [...groups.entries()].sort((left, right) => left[0].localeCompare(right[0]));
+		return [...groups.entries()]
+			.sort((left, right) => left[1].rank - right[1].rank || left[0].localeCompare(right[0]))
+			.map(([name, group]) => [
+				name,
+				group.members.slice().sort(
+					(a, b) =>
+						// A profile whose providers are unregistered stays visible but moves below every
+						// usable one; favorites lead inside each availability tier.
+						Number(b.available) - Number(a.available) ||
+						Number(presetFavorites.ids.includes(b.id)) - Number(presetFavorites.ids.includes(a.id)) ||
+						a.name.localeCompare(b.name),
+				),
+			]);
 	})();
 	const groupOpen = (group: string) => searchingPresets || expandedGroups.includes(group);
+	const groupHoldsActive = (members: DesktopModelProfile[]) => members.some(profile => profile.active);
 	const toggleGroup = (group: string) =>
 		setExpandedGroups(previous =>
 			previous.includes(group) ? previous.filter(item => item !== group) : [...previous, group],
@@ -385,8 +408,9 @@ export function ModelPicker({
 								<ul className="preset-group-list" aria-label={t("models.presetResults")}>
 									{presetGroups.map(([group, members]) => {
 										const expanded = groupOpen(group);
+										const holdsActive = groupHoldsActive(members);
 										return (
-											<li className="preset-group" key={group}>
+											<li className="preset-group" key={group} data-active={holdsActive || undefined}>
 												<Button
 													className="preset-group-head"
 													aria-expanded={expanded}
@@ -415,7 +439,10 @@ export function ModelPicker({
 														{members.map(profile => {
 															const entries = profileRoleEntries(profile);
 															return (
-																<li className="model-result-row" key={profile.id}>
+																<li
+																	className={`model-result-row${profile.available ? "" : " preset-unavailable"}`}
+																	key={profile.id}
+																>
 																	<div
 																		className="model-option"
 																		aria-current={profile.active ? "true" : undefined}
@@ -423,7 +450,7 @@ export function ModelPicker({
 																		<Button
 																			className="model-option-hit"
 																			aria-label={t("models.applyPreset", { name: profile.name })}
-																			disabled={!onApplyProfile || applying}
+																			disabled={!onApplyProfile || applying || !profile.available}
 																			onClick={() => {
 																				if (!onApplyProfile) return;
 																				onApplyProfile(profile.id);
@@ -454,6 +481,7 @@ export function ModelPicker({
 																			className="model-favorite"
 																			aria-label={t("models.starPreset", { name: profile.name })}
 																			aria-pressed={presetFavorites.ids.includes(profile.id)}
+																			disabled={!profile.available}
 																			onClick={() => togglePresetFavorite(profile.id)}
 																		>
 																			<Star

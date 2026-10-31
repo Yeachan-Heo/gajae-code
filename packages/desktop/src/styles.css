@@ -151,6 +151,8 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .project-heading { cursor: grab; border-radius: var(--radius-xs); }
 .session-drop { border-radius: var(--radius-sm); }
 .session-drop.dragging { cursor: grabbing; }
+/* The row that is being dragged must not swallow the pointer, or it becomes its own drop target. */
+.session-drop.dragging .session-row { pointer-events: none; }
 .show-more { width: 100%; justify-content: center; margin-top: 4px; font-size: 0.75rem; }
 /* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
 .menu-scrim { position: fixed; inset: 0; z-index: 40; border: 0; padding: 0; background: transparent; }
@@ -193,9 +195,6 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .session-row > .button { border: 0; flex-shrink: 0; }
 .session-star { color: var(--muted); padding: 8px; }
 .session-star[aria-pressed="true"] { color: var(--accent); }
-.session-grip { display: flex; align-items: center; justify-content: center; align-self: stretch; width: 18px; flex-shrink: 0; color: var(--muted); cursor: grab; opacity: 0; }
-.session-row:hover .session-grip, .session-row:focus-within .session-grip { opacity: 1; }
-.session-grip:active { cursor: grabbing; }
 .status { display: inline-flex; align-items: center; gap: 5px; font-size: 0.6875rem; color: var(--muted); }
 .status svg { width: 12px; height: 12px; }
 .status.running { color: var(--status-running); }
@@ -425,8 +424,11 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-tab[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow-rest), inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, var(--border-soft)); }
 /* The search field and its refresh button share one 36px row: the field is a 34px input inside a
    1px border, so a fixed 34px button sat two pixels short of it. */
+/* The search field and its refresh button share one 36px row. The field is a label, which
+   inherits the global label margin; leaving that margin in place pushed the field 8px down
+   inside the row and left the button four pixels higher. */
 .model-toolbar { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
-.model-toolbar > .model-search { flex: 1; min-width: 0; height: 36px; margin-bottom: 0; }
+.model-toolbar > .model-search { flex: 1; min-width: 0; height: 36px; margin: 0; }
 .model-refresh { flex: none; width: 36px; height: 36px; min-height: 0; padding: 0; }
 .preset-roles { display: flex; flex-direction: column; gap: 2px; font-size: 0.75rem; color: var(--muted); }
 .preset-group-list { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; }
@@ -435,6 +437,15 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .preset-group-head > small { margin-left: auto; color: var(--muted); font-weight: 400; }
 .preset-group-head .disclosure-chevron[data-open] { transform: rotate(90deg); }
 .preset-group .model-result-list { margin: 0; padding: 0 6px 6px; }
+/* A provider family holding the active preset is marked like the preset itself, so the header
+   answers "where is my current preset?" without expanding every group. */
+.preset-group[data-active] { border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft)); }
+.preset-group[data-active] .preset-group-head strong { color: var(--accent); }
+/* An unregistered provider's presets stay listed but read as unavailable: dimmed text, border
+   and surface instead of prose that would take a row from every entry. */
+.preset-unavailable { opacity: 0.5; }
+.preset-unavailable .model-option { border-color: var(--border-soft); background: transparent; }
+.preset-unavailable .model-option-hit:disabled, .preset-unavailable .model-favorite:disabled { cursor: not-allowed; opacity: 1; }
 .select-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 /* The tab bar stays pinned while only the active panel scrolls. */
 .modal-content:has(> .settings-dialog) { display: flex; flex-direction: column; overflow: hidden; }

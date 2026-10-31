@@ -1,4 +1,5 @@
 import {
+	isModelProfileProviderAvailable,
 	projectModelProfileCatalog,
 	resolveModelProfileName,
 	validateModelProfileName,
@@ -189,17 +190,30 @@ export function createDesktopPreferencesController(session: AgentSession): Deskt
 		assertIdentity();
 		const profiles = registry.getModelProfiles();
 		const catalog = projectModelProfileCatalog(profiles, registry.getError());
+		// A profile is only selectable once every provider it binds is authenticated; the terminal
+		// dims the rest rather than hiding them, and so does the picker.
+		const authenticated = new Set<string>();
+		for (const profile of profiles.values()) {
+			for (const provider of [...profile.requiredProviders, ...(profile.alternativeProviderGroups ?? []).flat()]) {
+				if (!authenticated.has(provider) && registry.hasUsableAuthForProvider(provider)) {
+					authenticated.add(provider);
+				}
+			}
+		}
 		const active = session.getActiveModelProfile();
 		const configuredDefault = settings.getGlobal("modelProfile.default");
 		const defaultName =
 			configuredDefault === undefined ? undefined : resolveModelProfileName(configuredDefault, profiles);
 		return catalog.map(item => {
-			const mapping = profiles.get(item.id)?.modelMapping;
+			const definition = profiles.get(item.id);
+			const mapping = definition?.modelMapping;
 			return {
 				id: item.id,
 				name: item.displayName,
 				description: null,
 				group: item.providerGroup ?? null,
+				groupRank: item.providerGroupRank ?? null,
+				available: definition ? isModelProfileProviderAvailable(definition, authenticated) : false,
 				source: item.source,
 				active: item.id === active,
 				default: item.id === defaultName,

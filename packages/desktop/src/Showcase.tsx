@@ -86,7 +86,9 @@ function FixtureControls({
 	empty?: boolean;
 }) {
 	const [selectedId, setSelectedId] = useState(fixtureModels[0].id);
-	const [appliedProfile, setAppliedProfile] = useState<string>();
+	// The design reference opens on an applied preset so the active provider header and the star
+	// beside it are visible without clicking first.
+	const [appliedProfile, setAppliedProfile] = useState<string>("design-fixture-default");
 	const [refreshes, setRefreshes] = useState(0);
 	const [assignments, setAssignments] = useState<Partial<Record<PickerModelRole, string>>>({
 		executor: fixtureModels[2].id,
@@ -117,6 +119,8 @@ function FixtureControls({
 			name: t("showcase.profileDefaultName"),
 			description: null,
 			group: "CODEX",
+			groupRank: 0,
+			available: true,
 			source: "builtin",
 			active: appliedProfile === "design-fixture-default",
 			default: true,
@@ -138,6 +142,8 @@ function FixtureControls({
 			name: t("showcase.profileReviewName"),
 			description: null,
 			group: "COMBOS",
+			groupRank: 13,
+			available: true,
 			source: "configured",
 			active: appliedProfile === "design-fixture-review",
 			default: false,
@@ -159,6 +165,9 @@ function FixtureControls({
 			name: t("showcase.profileLocalName"),
 			description: null,
 			group: "macOS Local (oMLX)",
+			groupRank: 3,
+			// Shown dimmed: this example provider has no registered credential.
+			available: false,
 			source: "configured",
 			active: false,
 			default: false,

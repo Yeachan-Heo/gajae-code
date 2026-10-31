@@ -1,4 +1,9 @@
-import { formatModelProfileDisplayLabel, type ModelProfileDefinition } from "./model-profiles";
+import {
+	formatModelProfileDisplayLabel,
+	getModelProfilePresentation,
+	type ModelProfileDefinition,
+	modelProfileGroupRank,
+} from "./model-profiles";
 
 export const MODEL_PROFILE_DISCOVERY_QUERY = "models.profiles.list";
 export const MODEL_PROFILE_ERROR_DETAIL_MAX_BYTES = 2048;
@@ -13,8 +18,13 @@ export interface ModelProfileCatalogItem {
 	id: string;
 	displayName: string;
 	source: "builtin" | "configured";
-	/** The provider family the profile belongs to, as declared by its definition. */
+	/**
+	 * The provider family shown in the terminal's preset list, including the `CUSTOM` fallback for
+	 * profiles that declare none, so the app and the terminal name the same group.
+	 */
 	providerGroup?: string;
+	/** Index of that family in the terminal's group order; absent when the family is not listed. */
+	providerGroupRank?: number;
 	available?: boolean;
 }
 
@@ -122,15 +132,20 @@ export function projectModelProfileCatalog(
 ): ModelProfileCatalogItem[] {
 	if (registryError !== undefined) throw new ModelProfileRegistryError();
 	return [...profiles.entries()]
-		.map(([id, definition]) => ({
-			id,
-			displayName: formatModelProfileDisplayLabel(definition),
-			source:
-				definition.source === "user" || definition.source === "registry"
-					? ("configured" as const)
-					: ("builtin" as const),
-			...(definition.providerGroup ? { providerGroup: definition.providerGroup } : {}),
-		}))
+		.map(([id, definition]) => {
+			const providerGroup = getModelProfilePresentation(definition).providerGroup;
+			const providerGroupRank = modelProfileGroupRank(providerGroup);
+			return {
+				id,
+				displayName: formatModelProfileDisplayLabel(definition),
+				source:
+					definition.source === "user" || definition.source === "registry"
+						? ("configured" as const)
+						: ("builtin" as const),
+				providerGroup,
+				...(providerGroupRank === undefined ? {} : { providerGroupRank }),
+			};
+		})
 		.sort((left, right) => left.id.localeCompare(right.id));
 }
 

@@ -25,7 +25,6 @@ export const models = {
 	"models.presetGroup": "Preset provider {name}",
 	"models.presetGroupCount": "{count} presets",
 	"models.presetGroupCountOne": "1 preset",
-	"models.presetGroupOther": "Other presets",
 	"models.starPreset": "Star preset {name}",
 	"models.presetFavoritesError": "Starred presets could not be saved or loaded. You can still apply a preset.",
 	"models.active": "Active",

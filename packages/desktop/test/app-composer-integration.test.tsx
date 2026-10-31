@@ -288,6 +288,8 @@ const profilePreferences: DesktopPreferences = {
 		name: "Focused profile",
 		description: null,
 		group: "CODEX",
+		groupRank: 0,
+		available: true,
 		source: "configured",
 		active: false,
 		default: false,
@@ -1112,6 +1114,78 @@ describe("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	test("a dropdown pressed a second time closes and stays closed", async () => {
+		const { context, page } = await fixture();
+		try {
+			// The reasoning control stays disabled until its model is in the catalog, so the
+			// fixture needs a reasoning-capable model before the menu can open at all.
+			await page.evaluate(() =>
+				window.fixture.setModels([
+					{
+						id: "fixture/model-one",
+						name: "Model One",
+						provider: "fixture",
+						contextWindow: 128000,
+						reasoning: true,
+						thinking: {
+							options: [
+								{ value: "low", label: "Low" },
+								{ value: "high", label: "High" },
+							],
+						},
+					},
+				]),
+			);
+			await select(page);
+			await Bun.sleep(300);
+			// The fixture's own sessions carry no reasoning, so this frame is what enables the menu.
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "idle",
+						starred: false,
+						imageInput: { supported: true, blocked: false },
+						operatorRunning: false,
+						controlGeneration: 1,
+						model: "fixture/model-one",
+						thinking: {
+							level: "low",
+							options: [{ value: "low", label: "Low" }, { value: "high", label: "High" }],
+							available: true,
+							scope: "session",
+							mode: "effort",
+						},
+						messages: [],
+					},
+				}) as unknown as Promise<void>,
+			);
+			await page.waitForSelector(".reasoning-control .select-trigger:not([disabled])");
+			const trigger = await page.evaluate(() => {
+				const rect = document.querySelector(".reasoning-control .select-trigger")!.getBoundingClientRect();
+				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			});
+			const openMenus = async () => page.evaluate(() => document.querySelectorAll(".select-menu").length);
+			await page.mouse.click(trigger.x, trigger.y);
+			await page.waitForSelector(".select-menu");
+			// The press itself closes the menu. Closing on the click instead left the window open for
+			// the host to reopen, which is what turned a second press into close-then-open.
+			await page.mouse.move(trigger.x, trigger.y);
+			await page.mouse.down();
+			await page.waitForFunction(() => document.querySelectorAll(".select-menu").length === 0);
+			await page.mouse.up();
+			// The click that follows the closing press must not reopen it.
+			await Bun.sleep(150);
+			expect(await openMenus()).toBe(0);
+			await page.mouse.click(trigger.x, trigger.y);
+			await page.waitForSelector(".select-menu");
+			expect(await openMenus()).toBe(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("app settings hold no conversation model or reasoning controls", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -1857,9 +1931,34 @@ describe("mounted composer delivery recovery", () => {
 			expect(closed).toEqual({ projectId: "p" });
 			expect(await page.$(".context-menu")).toBeNull();
 
-			// Dragging a conversation onto a sibling asks for the new order, not a mutation of it.
-			await startDrag(".project-group .session-grip", 0);
-			await dragOver(".project-group .session-drop", 1);
+			// Conversations reorder with pointer events: a row's title is a button, and a pressed
+			// button never starts an HTML5 drag from its draggable ancestor, which is why the old
+			// dragstart-based path never fired in the app.
+			const sessionRowPoint = (index: number, half: "top" | "bottom") =>
+				page.evaluate(
+					({ index, half }) => {
+						const row = [...document.querySelectorAll<HTMLElement>(".project-group .session-drop")][index];
+						const rect = row!.getBoundingClientRect();
+						return {
+							x: rect.left + rect.width / 2,
+							y: half === "top" ? rect.top + rect.height * 0.25 : rect.top + rect.height * 0.75,
+						};
+					},
+					{ index, half },
+				);
+			const pressRow = async (index: number) => {
+				const point = await sessionRowPoint(index, "top");
+				await page.mouse.move(point.x, point.y);
+				await page.mouse.down();
+				// Past the five-pixel threshold that separates a press from a click.
+				await page.mouse.move(point.x + 2, point.y + 8, { steps: 3 });
+			};
+			const hoverRow = async (index: number, half: "top" | "bottom") => {
+				const point = await sessionRowPoint(index, half);
+				await page.mouse.move(point.x, point.y, { steps: 5 });
+			};
+			await pressRow(0);
+			await hoverRow(1, "bottom");
 			expect(
 				await page.evaluate(() =>
 					[...document.querySelectorAll(".project-group .session-drop")].map(row => ({
@@ -1871,10 +1970,7 @@ describe("mounted composer delivery recovery", () => {
 				{ after: false, before: false },
 				{ after: true, before: false },
 			]);
-			await page.evaluate(() => {
-				const rows = [...document.querySelectorAll(".project-group .session-drop")] as HTMLElement[];
-				rows[1]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
-			});
+			await page.mouse.up();
 			await page.waitForFunction(() =>
 				window.fixture.requests().some(request => request.method === "session.reorder"),
 			);
@@ -1918,8 +2014,8 @@ describe("mounted composer delivery recovery", () => {
 						?.textContent?.includes("Two") === true,
 			);
 			// An upward drag inserts before its target, and dropping asks for that order too.
-			await startDrag(".project-group .session-grip", 1);
-			await dragOver(".project-group .session-drop", 0);
+			await pressRow(1);
+			await hoverRow(0, "top");
 			expect(
 				await page.evaluate(() =>
 					[...document.querySelectorAll(".project-group .session-drop")].map(row => ({
@@ -1931,10 +2027,7 @@ describe("mounted composer delivery recovery", () => {
 				{ after: false, before: true },
 				{ after: false, before: false },
 			]);
-			await page.evaluate(() => {
-				const rows = [...document.querySelectorAll(".project-group .session-drop")] as HTMLElement[];
-				rows[0]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
-			});
+			await page.mouse.up();
 			await page.waitForFunction(
 				() => window.fixture.requests().filter(request => request.method === "session.reorder").length === 2,
 			);
@@ -1965,23 +2058,22 @@ describe("mounted composer delivery recovery", () => {
 					},
 				});
 			});
-			await page.waitForFunction(() => document.querySelectorAll(".project-group").length === 2);
+			// Two projects render before this snapshot too, so the row count is what proves the
+			// foreign conversation arrived.
+			await page.waitForFunction(
+				() => document.querySelectorAll(".project-group .session-drop").length === 3,
+			);
 			const foreignBefore = await page.evaluate(
 				() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 			);
-			await startDrag(".project-group .session-grip", 2);
-			await dragOver(".project-group .session-drop", 0);
+			await pressRow(2);
+			await hoverRow(0, "top");
 			expect(
 				await page.evaluate(() =>
 					[...document.querySelectorAll(".project-group .session-drop")].map(row => row.className),
 				),
 			).not.toContain("drop-after");
-			await page.evaluate(() => {
-				const rows = [...document.querySelectorAll(".project-group .session-drop")] as HTMLElement[];
-				const transfer = new DataTransfer();
-				transfer.setData("text/plain", "q1");
-				rows[0]!.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
-			});
+			await page.mouse.up();
 			await Bun.sleep(100);
 			expect(
 				await page.evaluate(

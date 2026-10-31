@@ -43,6 +43,9 @@ export function Select({
 	const [anchor, setAnchor] = useState<{ left: number; width: number; bottom: number }>();
 	const control = useRef<HTMLDivElement>(null);
 	const menu = useRef<HTMLUListElement>(null);
+	/** A press while the menu is open closes it on pointerdown; the click that follows must not
+	 * reopen it, in either order the host may dispatch those events. */
+	const closedByPress = useRef(false);
 	const current = options.find(option => option.value === value);
 	const shown = current?.label ?? placeholder ?? value;
 
@@ -141,7 +144,21 @@ export function Select({
 				aria-labelledby={ariaLabelledby}
 				title={title}
 				disabled={disabled}
-				onClick={() => (open ? setOpen(false) : openMenu())}
+				onPointerDown={() => {
+					// Every press re-records the state, so a press that never produced a click (drag
+					// away, context menu) cannot swallow the next one.
+					closedByPress.current = open;
+					if (open) setOpen(false);
+				}}
+				onClick={() => {
+					if (closedByPress.current) {
+						closedByPress.current = false;
+						setOpen(false);
+						return;
+					}
+					if (open) setOpen(false);
+					else openMenu();
+				}}
 				onKeyDown={event => {
 					if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
 					event.preventDefault();

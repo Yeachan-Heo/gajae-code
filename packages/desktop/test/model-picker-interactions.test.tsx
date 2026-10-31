@@ -34,6 +34,9 @@ interface Profile {
 	id: string;
 	name: string;
 	description: string | null;
+	group: string | null;
+	groupRank: number | null;
+	available: boolean;
 	source: "builtin" | "configured";
 	active: boolean;
 	default: boolean;
@@ -140,6 +143,9 @@ const profile = (id: string, name: string, roles: { id: string; model: string | 
 	id,
 	name,
 	description: null,
+	group: null,
+	groupRank: null,
+	available: true,
 	source: "configured",
 	active: false,
 	default: false,
@@ -214,6 +220,85 @@ describe("mounted model picker tabs", () => {
 			await page.click('.model-result-row:has([data-model-id="p/m1"]) .model-favorite');
 			expect(await calls(page)).toEqual([]);
 			expect(await page.$(".model-role-choice")).toBeNull();
+		} finally { await closeComponentFixture(context, page); }
+	});
+
+	test("orders preset providers by the terminal's group order and dims the unusable ones", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [
+				profile("local", "Local", [], { group: "macOS Local (oMLX)", groupRank: 3, available: false }),
+				profile("codex-b", "Codex B", [], { group: "CODEX", groupRank: 0, available: false }),
+				profile("codex-a", "Codex A", [], { group: "CODEX", groupRank: 0, active: true }),
+				// No declared family: the terminal calls this CUSTOM and lists it last.
+				profile("mine", "Mine", [], { group: null, groupRank: null }),
+			]);
+			await open(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-group");
+			expect(await page.$$eval(".preset-group-head", heads => heads.map(head => head.textContent?.replace(/\d+ presets?/, "").trim()))).toEqual([
+				"CODEX",
+				"macOS Local (oMLX)",
+				"CUSTOM",
+			]);
+			// The family holding the current preset is marked, so it is findable while collapsed.
+			expect(await page.$$eval(".preset-group", groups => groups.map(group => group.hasAttribute("data-active")))).toEqual([
+				true,
+				false,
+				false,
+			]);
+			await page.click(".preset-group-head");
+			await page.waitForSelector(".preset-group .model-result-list");
+			// Inside a family the registered profiles lead, with favorites first; unusable ones are
+			// dimmed and refuse both the apply action and starring.
+			expect(
+				await page.$$eval(".preset-group:first-child .model-result-row", rows =>
+					rows.map(row => ({ name: row.querySelector("strong")?.textContent, dimmed: row.classList.contains("preset-unavailable") })),
+				),
+			).toEqual([
+				{ name: "Codex A", dimmed: false },
+				{ name: "Codex B", dimmed: true },
+			]);
+			expect(
+				await page.evaluate(() => {
+					const row = document.querySelectorAll(".preset-group:first-child .model-result-row")[1];
+					return {
+						apply: (row?.querySelector(".model-option-hit") as HTMLButtonElement | null)?.disabled,
+						star: (row?.querySelector(".model-favorite") as HTMLButtonElement | null)?.disabled,
+						text: row?.textContent ?? "",
+					};
+				}),
+			).toEqual({ apply: true, star: true, text: "Codex B" });
+		} finally { await closeComponentFixture(context, page); }
+	}, 30000);
+
+	test("starring a preset lifts it to the top of its own provider family", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [
+				profile("alpha", "Alpha", [], { group: "CODEX", groupRank: 0 }),
+				profile("beta", "Beta", [], { group: "CODEX", groupRank: 0 }),
+			]);
+			await open(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-group-head");
+			await page.click(".preset-group-head");
+			await page.waitForSelector(".preset-group .model-result-row");
+			expect(
+				await page.$$eval(".preset-group .model-result-row strong", nodes => nodes.map(node => node.textContent)),
+			).toEqual(["Alpha", "Beta"]);
+			await page.evaluate(() => {
+				const row = [...document.querySelectorAll(".preset-group .model-result-row")].find(
+					item => item.querySelector("strong")?.textContent === "Beta",
+				);
+				row?.querySelector<HTMLButtonElement>(".model-favorite")?.click();
+			});
+			await page.waitForFunction(
+				() => document.querySelector(".preset-group .model-result-row strong")?.textContent === "Beta",
+			);
+			expect(
+				await page.$$eval(".preset-group .model-result-row strong", nodes => nodes.map(node => node.textContent)),
+			).toEqual(["Beta", "Alpha"]);
 		} finally { await closeComponentFixture(context, page); }
 	});
 });
@@ -294,12 +379,14 @@ describe("mounted model picker", () => {
 		} finally { await closeComponentFixture(context, page); }
 	});
 
-	test("orders all role tags before favorites, and clearing restores catalog position after refresh", async () => {
+	test("puts the model in use first, then favorites, then the other role assignments", async () => {
 		const { context, page } = await fixture(JSON.stringify(['p/m2']));
 		try {
 			await setRoles(page, [role('architect', 'm8'), role('critic', 'm8', false), role('planner', 'm8'), role('executor', 'm8'), role('default', 'm5')]);
 			await open(page);
-			expect((await rows(page)).slice(0, 4)).toEqual(['p/m5', 'p/m8', 'p/m2', 'p/m0']);
+			// p/m5 is the model in use; p/m2 is starred; p/m8 carries every role; the rest keep
+			// catalog order.
+			expect((await rows(page)).slice(0, 4)).toEqual(['p/m5', 'p/m2', 'p/m8', 'p/m0']);
 			expect(await page.$$eval('[data-model-id="p/m8"] .model-role-tag', tags => tags.map(tag => tag.textContent))).toEqual(['Executor', 'Planner', 'Critic', 'Architect']);
 			await choose(page, 'p/m8');
 			await page.click('.model-role-clear');
