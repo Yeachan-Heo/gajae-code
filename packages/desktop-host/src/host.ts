@@ -844,6 +844,9 @@ export class DesktopHost {
 		if (path.resolve(sessionManager.getCwd()) !== path.resolve(project.path))
 			throw new Error("Session project does not match catalog");
 		const settings = await Settings.loadForScope({ cwd: project.path, agentDir: this.agentDir });
+		// One registry per project keeps project-scoped model settings isolated. It is warmed
+		// offline for speed; the online fetch happens only when a profile needs a model the
+		// static catalog does not carry (see the retry below).
 		const registry = new ModelRegistry(this.#auth!, path.join(this.agentDir, "models.yml"), settings, {
 			agentDir: this.agentDir,
 		});
@@ -883,23 +886,35 @@ export class DesktopHost {
 			// default), so the first prompt fails even though the install is configured.
 			const defaultProfile = settings.get("modelProfile.default");
 			if (defaultProfile) {
-				try {
-					const applied = await result.session.activateModelProfileForControl(defaultProfile);
-					if (!applied)
-						candidate.notices.push({
-							id: `profile:${metadata.id}`,
-							role: "system",
-							text: `Could not apply the default model profile (${defaultProfile}). Choose a model in settings.`,
-							isError: true,
-						});
-				} catch (error) {
+				let applied = false;
+				let failure: unknown;
+				for (const attempt of [0, 1]) {
+					try {
+						applied = await result.session.activateModelProfileForControl(defaultProfile);
+						failure = undefined;
+						if (applied) break;
+					} catch (error) {
+						failure = error;
+					}
+					if (attempt === 1) break;
+					// An offline catalog holds only the static models. A profile may name a model
+					// its provider advertises dynamically, so fetch the catalog once and retry
+					// before telling the user the profile could not be applied.
+					try {
+						await registry.refresh("online-if-uncached");
+					} catch (error) {
+						failure ??= error;
+					}
+				}
+				if (!applied)
 					candidate.notices.push({
 						id: `profile:${metadata.id}`,
 						role: "system",
-						text: `Could not apply the default model profile (${defaultProfile}): ${String(error).slice(0, 300)}`,
+						text: failure
+							? `Could not apply the default model profile (${defaultProfile}): ${String(failure).slice(0, 300)}`
+							: `Could not apply the default model profile (${defaultProfile}). Choose a model in settings.`,
 						isError: true,
 					});
-				}
 			}
 			// The SDK reserves a path before it writes a transcript. Use its public
 			// persistence API so even an empty desktop session can be resumed.
