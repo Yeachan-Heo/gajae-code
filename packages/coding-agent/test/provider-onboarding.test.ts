@@ -345,6 +345,39 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("io-intelligence")?.id).toBe("ionet");
 	});
 
+	it("adds Runcrate with automatic discovery and its reasoning field", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "runcrate", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.runcrate;
+
+		expect(result.providerId).toBe("runcrate");
+		expect(result.presetName).toBe("Runcrate");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.runcrate.ai/v1",
+			api: "openai-completions",
+			apiKeyEnv: "RUNCRATE_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(provider?.compat).toMatchObject({ reasoningContentField: "reasoning_content" });
+		expect(findProviderPreset("runcrate-ai")?.id).toBe("runcrate");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
