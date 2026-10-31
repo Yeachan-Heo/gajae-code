@@ -24,6 +24,10 @@ import {
 	type NativeExactUnlinkResult,
 } from "@gajae-code/natives";
 
+function quotePowerShellLiteral(value: string): string {
+	return `'${value.replace(/['‘’‚‛]/g, "$&$&")}'`;
+}
+
 export class InstallationAclPresentError extends Error {
 	readonly code = "acl_present";
 
@@ -43,16 +47,17 @@ export class InstallationAclPresentError extends Error {
 
 		let message = "acl_present";
 		if (principal && typeof inherited === "boolean") {
-			// Format principal for icacls: numeric SIDs need '*' prefix
-			const icaclsPrincipal = principal.startsWith("S-1-") ? `*${principal}` : `"${principal}"`;
+			const icaclsPrincipal = quotePowerShellLiteral(principal.startsWith("S-1-") ? `*${principal}` : principal);
 			const sideLabel = side === "source" ? ` on the source file ${sourcePath}` : side ? ` on the ${side} file` : "";
 
 			if (inherited) {
-				// ACE inherited from parent: disable inheritance and remove from parent
-				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory${sideLabel}. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove ${icaclsPrincipal} && gjc update`;
+				// PowerShell 5.1 misquotes spaced roots ending in a backslash; device paths do not normalize dot segments.
+				const ordinaryRoot =
+					parent.endsWith("\\") && !parent.startsWith("\\\\?\\") && !parent.startsWith("\\\\.\\");
+				const directory = quotePowerShellLiteral(ordinaryRoot ? `${parent}.` : parent);
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory${sideLabel}. Run in PowerShell: icacls ${directory} /inheritance:d; if ($?) { icacls ${directory} /remove ${icaclsPrincipal}; if ($?) { gjc update } }`;
 			} else {
-				// ACE explicitly set on file: remove from the file itself
-				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run: icacls "${rejectedPath}" /remove ${icaclsPrincipal} && gjc update`;
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run in PowerShell: icacls ${quotePowerShellLiteral(rejectedPath)} /remove ${icaclsPrincipal}; if ($?) { gjc update }`;
 			}
 		}
 
