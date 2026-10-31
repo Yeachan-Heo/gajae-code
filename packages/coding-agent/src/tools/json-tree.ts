@@ -52,7 +52,7 @@ export function formatArgsInline(args: Record<string, unknown>, maxWidth: number
 	let result = "";
 	let width = 0;
 	for (const key in args) {
-		if (key in HIDDEN_ARG_KEYS) continue;
+		if (Object.hasOwn(HIDDEN_ARG_KEYS, key)) continue;
 		const value = args[key];
 		const sep = width > 0 ? ARGS_INLINE_PAIR_SEP : "";
 		const sepW = width > 0 ? ARGS_INLINE_PAIR_SEP_WIDTH : 0;
@@ -233,7 +233,7 @@ export function renderJsonTreeLines(
 	// Render root level
 	if (isRecord(value)) {
 		for (const key in value) {
-			if (key in HIDDEN_ARG_KEYS) continue;
+			if (Object.hasOwn(HIDDEN_ARG_KEYS, key)) continue;
 			renderNode(value[key], key, [], true, 1);
 			if (lines.length >= maxLines) {
 				truncated = true;
