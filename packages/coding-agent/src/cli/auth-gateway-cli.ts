@@ -12,8 +12,6 @@
  *   - `token` / `token --regenerate` — manages the gateway bearer token file.
  *   - `status` — prints scoped gateway readiness without token material.
  */
-import * as crypto from "node:crypto";
-import * as path from "node:path";
 import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import {
 	createAuthGatewayModelCatalog,
@@ -33,14 +31,10 @@ import {
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@gajae-code/ai/core";
-import { getConfigRootDir, VERSION } from "@gajae-code/utils";
+import { VERSION } from "@gajae-code/utils";
 import chalk from "chalk";
-import {
-	createSecureTokenFileExclusive,
-	readSecureTokenFile,
-	writeSecureTokenFile,
-} from "../session/secure-token-file";
 import { type AuthBrokerClientConfig, resolveStartupAuthConfig } from "../session/startup-auth-config";
+import { createAuthTokenFile } from "./auth-token-file";
 
 export type AuthGatewayAction = "serve" | "token" | "status" | "check";
 
@@ -115,44 +109,7 @@ function writeCommandFailure(action: AuthGatewayAction, flags: AuthGatewayComman
 	process.exitCode = 1;
 }
 
-function getTokenFilePath(): string {
-	return path.join(getConfigRootDir(), "auth-gateway.token");
-}
-
-async function readToken(): Promise<string | null> {
-	return readSecureTokenFile(getTokenFilePath());
-}
-
-async function writeToken(token: string): Promise<void> {
-	await writeSecureTokenFile(getTokenFilePath(), token);
-}
-
-async function createTokenExclusive(token: string): Promise<boolean> {
-	return createSecureTokenFileExclusive(getTokenFilePath(), token);
-}
-
-function generateToken(): string {
-	return crypto.randomBytes(32).toString("base64url");
-}
-
-async function ensureToken(): Promise<string> {
-	const existing = await readToken();
-	if (existing) return existing;
-	const token = generateToken();
-	if (await createTokenExclusive(token)) return token;
-	// Another concurrent invocation won the create race. Its file may exist
-	// briefly before the winner writes the token, so retry reads without ever
-	// overwriting the winner's file.
-	for (let attempt = 0; attempt < 5; attempt++) {
-		const fromRace = await readToken();
-		if (fromRace) return fromRace;
-		if (attempt < 4) await Bun.sleep(10);
-	}
-	// If the file disappeared, make one final exclusive-create attempt. Never
-	// fall back to an unconditional write after observing EEXIST.
-	if (await createTokenExclusive(token)) return token;
-	throw new Error("Unable to initialize auth-gateway token: another process owns an empty token file.");
-}
+const TOKEN_FILE = createAuthTokenFile("auth-gateway.token", "auth-gateway");
 
 function createBrokerClient(brokerConfig: AuthBrokerClientConfig): AuthBrokerClient {
 	return new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
@@ -271,7 +228,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 			throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
 		}
 		const modelById = new Map(catalog.models.map(model => [model.id, model] as const));
-		const gatewayToken = flags.noAuth ? null : await ensureToken();
+		const gatewayToken = flags.noAuth ? null : await TOKEN_FILE.ensure();
 		const handle = startAuthGateway({
 			storage,
 			hasProviderCredential: () => store.snapshot.credentials.some(entry => entry.provider === provider),
@@ -288,7 +245,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 			currentBearerTokens: gatewayToken
 				? async signal => {
 						if (signal.aborted) return new Set<string>();
-						const current = await readToken();
+						const current = await TOKEN_FILE.read();
 						if (signal.aborted) return new Set<string>();
 						return new Set(current ? [current] : []);
 					}
@@ -300,7 +257,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 		process.stdout.write(`scope: ${provider}\n`);
 		if (gatewayToken) {
-			process.stdout.write(`bearer token: ${getTokenFilePath()} (chmod 0600)\n`);
+			process.stdout.write(`bearer token: ${TOKEN_FILE.path} (chmod 0600)\n`);
 		} else {
 			process.stdout.write(`auth: disabled (--no-auth) — non-browser local clients can call this gateway\n`);
 		}
@@ -346,27 +303,27 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 
 async function runToken(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	if (flags.regenerate) {
-		const next = generateToken();
-		await writeToken(next);
+		const next = TOKEN_FILE.generate();
+		await TOKEN_FILE.write(next);
 		if (flags.json) {
-			process.stdout.write(`${JSON.stringify({ token: next, path: getTokenFilePath() })}\n`);
+			process.stdout.write(`${JSON.stringify({ token: next, path: TOKEN_FILE.path })}\n`);
 		} else {
 			process.stdout.write(`${next}\n`);
 		}
 		return;
 	}
-	const token = await ensureToken();
+	const token = await TOKEN_FILE.ensure();
 	if (flags.json) {
-		process.stdout.write(`${JSON.stringify({ token, path: getTokenFilePath() })}\n`);
+		process.stdout.write(`${JSON.stringify({ token, path: TOKEN_FILE.path })}\n`);
 	} else {
 		process.stdout.write(`${token}\n`);
 	}
 }
 
 async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
-	const token = await readToken();
+	const token = await TOKEN_FILE.read();
 	const brokerConfig = (await resolveStartupAuthConfig()).broker;
-	const tokenFile = getTokenFilePath();
+	const tokenFile = TOKEN_FILE.path;
 	const provider = normalizeProviderScope(flags.provider);
 	if (!brokerConfig) {
 		const status = {
