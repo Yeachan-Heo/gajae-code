@@ -126,7 +126,13 @@ import {
 	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
+import {
+	type AbortScope,
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	dispatchControl,
+	TypedControlError,
+} from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
@@ -3528,12 +3534,6 @@ function sdkControlSurface(
 			// A retry of a request that already degraded to a steer replays that steer,
 			// even when the run it targeted has since ended: the text was delivered once
 			// and must neither be queued again nor start a replacement run.
-			// Generate a deterministic clientRef for abort-and-prompt steers so they are
-			// bound to their originating request and can be replayed on retry (BUG_P2).
-			const abortAndPromptSteerClientRef = (key: string): string => {
-				const hash = crypto.createHash("sha256").update(`abort-and-prompt-steer:${key}`).digest("hex").slice(0, 64);
-				return `abort-and-prompt-steer:${hash}`;
-			};
 			const steerClientRef =
 				skillRecon?.reserveSteer && skillRecon.settleSteer && skillRecon.lookupSteer
 					? abortAndPromptSteerClientRef(idempotencyKey)
