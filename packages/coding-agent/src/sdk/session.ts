@@ -4173,6 +4173,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		const sdkHostEligible =
 			shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true);
+		let latestRegisteredEndpointGeneration: number | undefined;
 		const notificationAdapterService = createLazyService({
 			id: "sdk.notifications.adapters",
 			enabled: () => notificationsExtensionEligible || sdkHostEligible,
@@ -5796,7 +5797,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					ownerSessionId: masterModeContext.ownerSessionId,
 					getSessionId: () => sessionManager.getSessionId(),
 					getOwnerEndpointGeneration: () =>
-						lifecycleStartupCapability?.rollback?.result.endpointGeneration ?? undefined,
+						lifecycleStartupCapability?.rollback?.result.endpointGeneration ?? latestRegisteredEndpointGeneration,
 					scope: masterModeContext.scope,
 					getCwd: getLiveCwd,
 					hasPersistedInjection: () =>
