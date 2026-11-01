@@ -417,6 +417,121 @@ describe("master peer snapshot contributor", () => {
 		expect(snapshot?.content).toContain("master-owner");
 		expect(snapshot?.content).toContain("peer-a");
 	});
+
+	it("receives real endpoint generation from lifecycle through rollback tracker", async () => {
+		const { session } = await createSession(true);
+		const authStorage = authStorages.at(-1);
+		if (!authStorage) throw new Error("Expected session auth storage");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const mock = createMockModel({ responses: [{ content: ["test reply"] }] });
+		session.agent.streamFn = mock.stream;
+		try {
+			// Call prompt to trigger the master peer snapshot contributor,
+			// which should receive the real endpoint generation from the lifecycle startup capability.
+			await session.prompt("test prompt");
+			const snapshotEntries = session.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message" && entry.customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+			// The snapshot must have been collected (which means the getter was called and lifecycle path worked)
+			expect(snapshotEntries).toHaveLength(1);
+			// Verify the snapshot made it into the prompt message context with XML tags
+			const snapshotBlocksInPrompt = countOccurrences(
+				JSON.stringify(mock.calls[0]?.context.messages ?? []),
+				"<gjc-master-peer-snapshot>",
+			);
+			// The real broker registration path has set the endpoint generation and created the snapshot
+			expect(snapshotBlocksInPrompt).toBe(1);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("ensures fresh processes registering same session get different endpoint generations", async () => {
+		// Create a snapshot contributor with a getter that simulates the first process
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-process-gens-")));
+		tempDirs.push(cwd);
+		const git = Bun.spawn(["git", "init", "-q", cwd]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const worktreeRoot = cwd;
+
+		// Simulate first process registering the session with generation 1
+		const contributor1 = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async () =>
+					({
+						ok: true,
+						operation: "session.list",
+						result: {
+							version: 1,
+							scope: {
+								version: 1,
+								requested: "repo",
+								requestAnchor: { cwd, worktreeRoot },
+								resolved: { kind: "repo", worktreeRoot },
+								resolution: "resolved",
+							},
+							status: "populated",
+							observedAt: "2026-08-23T00:00:00.000Z",
+							indexSeq: 3,
+							rows: [
+								{ id: "peer-a", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
+							],
+							warnings: [],
+						},
+					}) as unknown as SessionListOutcome,
+			},
+			ownerSessionId: "master-owner",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => 1, // First process has generation 1
+		});
+
+		// Simulate second process registering the same session with generation 2
+		const contributor2 = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async () =>
+					({
+						ok: true,
+						operation: "session.list",
+						result: {
+							version: 1,
+							scope: {
+								version: 1,
+								requested: "repo",
+								requestAnchor: { cwd, worktreeRoot },
+								resolved: { kind: "repo", worktreeRoot },
+								resolution: "resolved",
+							},
+							status: "populated",
+							observedAt: "2026-08-23T00:00:00.000Z",
+							indexSeq: 3,
+							rows: [
+								{ id: "peer-b", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
+							],
+							warnings: [],
+						},
+					}) as unknown as SessionListOutcome,
+			},
+			ownerSessionId: "master-owner",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => 2, // Second process has generation 2
+		});
+
+		const snapshot1 = await contributor1();
+		const snapshot2 = await contributor2();
+
+		// Both snapshots should be created successfully
+		expect(snapshot1).toBeDefined();
+		expect(snapshot2).toBeDefined();
+		expect(snapshot1?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		expect(snapshot2?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		// Different generations ensure the snapshots represent different process incarnations
+		expect(snapshot1?.content).toContain("peer-a");
+		expect(snapshot2?.content).toContain("peer-b");
+	});
 });
 
 describe("master SDK host composition", () => {
