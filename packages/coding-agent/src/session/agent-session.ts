@@ -4364,6 +4364,8 @@ export class AgentSession {
 		this.#activeLogicalRunId = handle.logicalRunId;
 		this.#activeAttemptScope = handle.scope;
 		this.#logicalRunIdByAttemptScope.set(handle.scope, handle.logicalRunId);
+		// Mid-run maintenance replaces the handle for the same logical run without
+		// re-entering #promptWithMessage, so continuation acceptances are published here.
 		for (const observer of this.#promptRunAcceptedObservers.get(handle.logicalRunId) ?? []) observer(handle);
 	}
 
@@ -11686,6 +11688,7 @@ export class AgentSession {
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
+		this.#promptRunAcceptedObservers.clear();
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;
@@ -15794,25 +15797,23 @@ export class AgentSession {
 		let observedLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
 		const observedHandles = new WeakSet<AttemptRunHandle>();
 		const notifyRunAccepted = (handle: AttemptRunHandle): void => {
-			if (!observer) return;
-			if (handle) {
-				if (observedLogicalRunId !== undefined && handle.logicalRunId !== observedLogicalRunId) return;
-				if (observedHandles.has(handle)) return;
-				observedHandles.add(handle);
-				if (observedLogicalRunId === undefined && !this.#isDisposed) {
-					// Bind only to this invocation's actual first acceptance. Continuations
-					// may replace its scope, but unrelated logical runs cannot inherit it.
-					observedLogicalRunId = handle.logicalRunId;
-					let observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
-					if (!observers) {
-						observers = new Set();
-						this.#promptRunAcceptedObservers.set(observedLogicalRunId, observers);
-					}
-					observers.add(notifyRunAccepted);
+			if (!handle) return;
+			if (observedLogicalRunId !== undefined && handle.logicalRunId !== observedLogicalRunId) return;
+			if (observedHandles.has(handle)) return;
+			observedHandles.add(handle);
+			if (observedLogicalRunId === undefined && !this.#isDisposed) {
+				// Bind only to this invocation's actual first acceptance. Continuations may
+				// replace its scope, but unrelated logical runs cannot inherit it.
+				observedLogicalRunId = handle.logicalRunId;
+				let observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+				if (!observers) {
+					observers = new Set();
+					this.#promptRunAcceptedObservers.set(observedLogicalRunId, observers);
 				}
+				observers.add(notifyRunAccepted);
 			}
 			try {
-				const result: unknown = observer(handle);
+				const result: unknown = observer?.(handle);
 				if (result !== undefined)
 					void Promise.resolve(result).catch(() => logger.warn("Prompt run acceptance observer failed"));
 			} catch {
@@ -15822,12 +15823,7 @@ export class AgentSession {
 		try {
 			await this.#promptInternal(
 				text,
-				observer
-					? {
-							...options,
-							onRunAccepted: notifyRunAccepted,
-						}
-					: options,
+				observer ? { ...options, onRunAccepted: notifyRunAccepted } : options,
 				releaseStartupPromptWaiter,
 			);
 			// Agent-core converts listener failures into an aborted response. Keep a
