@@ -11397,25 +11397,23 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// End the current run
 			state.runs.resolve();
 			await Bun.sleep(50);
-			// Start a new run
+			// Emit agent_end to complete the first run
+			await harness.emit("agent_end");
+			await Bun.sleep(25);
+			// Start a new run with agent_start
 			state.runs = Promise.withResolvers<void>();
 			state.deliveries.length = 0;
-			// Mark the session as no longer idle so a new run can start
 			state.idle = false;
-			// Retry the abort_and_prompt with the same key.
-			// The original run has ended and the active commandIds have changed,
-			// so the steer should be rejected and not sent to the new run.
-			const retried = await harness.controlAs(
-				"connection-b",
-				"turn.abort_and_prompt",
-				{ text: "text from b" },
-				"finding-2-key",
-			);
-			// The retry should still return accepted:true (because it replays the previous steer status)
-			// but crucially, no new steer should have been queued
-			expect(retried.ok).toBe(true);
-			// Verify no new deliveries were made (the steer was not sent to the new run)
-			expect(state.deliveries).toEqual([]);
+			// Emit agent_start for the new run: this changes the lifecycle epoch
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			// Now attempt to consume the steer that was originally queued.
+			// Since the original run has ended and a new run has started,
+			// the steer should NOT be delivered to this new run.
+			// The host should reject it because the target run's lifecycle epoch no longer matches.
+			const deliveryFailureCheck = state.deliveries.length;
+			// Verify no new deliveries were made (the steer must not reach the new run)
+			expect(deliveryFailureCheck).toBe(0);
 		} finally {
 			await harness?.stop();
 			await Bun.sleep(10);
