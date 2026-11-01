@@ -29681,6 +29681,11 @@ export class AgentSession {
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
 		let sessionIdentityCommitted = false;
+		// Committed-switch listeners rebind controllers from the successor file. A
+		// same-file reload whose exact ownership changed still publishes a new
+		// identity, but #rebindSwitchedSessionMode does not run for it, so the
+		// listeners must not detach the live mode either.
+		let differentSessionCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -30075,6 +30080,7 @@ export class AgentSession {
 					);
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
+					differentSessionCommitted = true;
 					// Bind plan before post-commit cleanup. A cleanup failure leaves this
 					// successor active and must not keep the predecessor plan slot.
 					this.#rebindSwitchedSessionMode(sessionContext);
@@ -30344,7 +30350,8 @@ export class AgentSession {
 			}
 			this.#endSessionTransition();
 			if (sessionIdentityCommitted) {
-				for (const listener of [...this.#committedSessionSwitchListeners]) {
+				const committedSwitchListeners = differentSessionCommitted ? [...this.#committedSessionSwitchListeners] : [];
+				for (const listener of committedSwitchListeners) {
 					try {
 						await listener();
 					} catch (error) {
