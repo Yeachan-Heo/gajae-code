@@ -1984,7 +1984,7 @@ export default function App() {
 									{visible.map(chat => (
 										<div
 											key={chat.id}
-											className="session-drop"
+											className="session-item"
 											onContextMenu={event => {
 												event.preventDefault();
 												event.stopPropagation();

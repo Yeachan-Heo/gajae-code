@@ -2037,7 +2037,7 @@ describe("mounted composer delivery recovery", () => {
 				() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 			);
 			const firstRow = await page.evaluate(() => {
-				const rect = document.querySelector(".project-group .session-drop")!.getBoundingClientRect();
+				const rect = document.querySelector(".project-group .session-item")!.getBoundingClientRect();
 				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 			});
 			await page.mouse.move(firstRow.x, firstRow.y);
@@ -2050,7 +2050,7 @@ describe("mounted composer delivery recovery", () => {
 					() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 				),
 			).toBe(reorderBefore);
-			expect(await page.$(".project-group .session-drop.dragging")).toBeNull();
+			expect(await page.$(".project-group .session-item.dragging")).toBeNull();
 		} finally {
 			await closeFixture(context, page);
 		}
