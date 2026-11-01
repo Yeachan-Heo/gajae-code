@@ -7375,7 +7375,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				// is preserved for recovery: replay it instead of re-dispatching the prompt.
 				if ((existing as Record<string, unknown>).steer_disposition) {
 					// The request was discarded but steer disposition is durable recovery authority.
-					throw Object.assign(new Error("steer_converted"), { acknowledged: (existing as Record<string, unknown>).steer_disposition });
+					throw Object.assign(new Error("steer_converted"), {
+						acknowledged: (existing as Record<string, unknown>).steer_disposition,
+					});
 				}
 				// An accepted receipt is durable authority. It is recovered below instead
 				// of sending the same remote idempotency key a second time.
@@ -10709,7 +10711,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								// the steer disposition is durable recovery authority: replay it instead of
 								// re-dispatching the prompt.
 								if (error instanceof Error && (error as Record<string, unknown>).message === "steer_converted")
-									recoveredSteerDisposition = (error as Record<string, unknown>).acknowledged as Record<string, unknown>;
+									recoveredSteerDisposition = (error as Record<string, unknown>).acknowledged as Record<
+										string,
+										unknown
+									>;
 								else throw error;
 							}
 							if (recoveredSteerDisposition) {
