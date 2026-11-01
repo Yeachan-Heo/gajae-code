@@ -32,6 +32,7 @@ import {
 	acquireBinaryUpdateLock,
 	fetchAndVerifyOfficialPinnedCandidate,
 	InstallationAccessDeniedError,
+	InstallationRollbackAclPresentError,
 	isProtectedSourcePathForInstall,
 	replaceBinaryForUpdate,
 	smokeTestPinnedCandidate,
@@ -112,6 +113,7 @@ export type InstallRepairState = "verified" | "not_needed" | "pending_activation
 export interface InstallRepairResult {
 	readonly state: InstallRepairState;
 	readonly reason?: string;
+	readonly diagnostic?: string;
 	readonly recordPath?: string;
 	readonly sideEffectStarted: boolean;
 	/** Native Windows status returned by exact replacement. */
@@ -324,6 +326,36 @@ export async function repairStandaloneBinary(
 		const pendingActivation = error instanceof Error && error.message === "installation_pending_activation";
 		const accessDeniedError = error instanceof InstallationAccessDeniedError ? error : undefined;
 		const aclError = error instanceof InstallationAclPresentError ? error : undefined;
+		const rollbackAcl =
+			error instanceof AggregateError &&
+			error.message === "installation_rollback_unverified" &&
+			error.errors[1] instanceof InstallationAclPresentError
+				? error.errors[1]
+				: undefined;
+		const rawPrincipal = rollbackAcl?.detail.aclFailurePrincipal;
+		const principal =
+			rawPrincipal && rawPrincipal.length <= 184 && /^S-1-\d+(?:-\d+){1,15}$/.test(rawPrincipal)
+				? rawPrincipal
+				: undefined;
+		const side = rollbackAcl?.detail.aclFailureSide;
+		const inherited = rollbackAcl?.detail.aclFailureInherited;
+		const rollbackStage =
+			rollbackAcl instanceof InstallationRollbackAclPresentError
+				? "binary rollback"
+				: "activation record update during rollback";
+		const artifact =
+			side === "source"
+				? rollbackAcl instanceof InstallationRollbackAclPresentError
+					? "retained backup"
+					: "temporary activation record"
+				: side === "destination"
+					? rollbackAcl instanceof InstallationRollbackAclPresentError
+						? "installed binary"
+						: "activation record"
+					: "unknown artifact";
+		const rollbackDiagnostic = rollbackAcl
+			? `Installation failed; ${rollbackStage} was blocked by an ${inherited === true ? "inherited" : inherited === false ? "explicit" : "unknown"} ACL on the ${artifact}${principal ? ` for SID ${principal}` : "; principal omitted"}. Inspect the selected binary's installation directory and activation record locally before retrying.`
+			: undefined;
 		const repointError = error instanceof ActivationRetryCandidateRepointError ? error : undefined;
 		const reason = pendingActivation
 			? "sharing_violation"
@@ -335,6 +367,7 @@ export async function repairStandaloneBinary(
 						? error.message
 						: (aclError?.code ?? "installation_execution_unverified");
 		if (aclError) logger.warn(aclError.message, { targetPath, code: aclError.code });
+		if (rollbackDiagnostic) logger.warn(rollbackDiagnostic, { code: "installation_rollback_unverified" });
 		if (accessDeniedError)
 			logger.warn("Doctor standalone binary restore failed with access denied", {
 				targetPath,
@@ -353,6 +386,7 @@ export async function repairStandaloneBinary(
 		return {
 			state: pendingActivation ? "pending_activation" : started ? "failed" : "blocked",
 			reason,
+			...(rollbackDiagnostic ? { diagnostic: rollbackDiagnostic } : {}),
 			sideEffectStarted: started,
 			before,
 			recordPath,

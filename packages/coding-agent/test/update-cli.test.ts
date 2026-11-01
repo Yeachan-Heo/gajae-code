@@ -10,6 +10,7 @@ import * as installActivation from "../src/cli/install-activation";
 import {
 	buildActivationRecord,
 	createActivationRecordFile,
+	InstallationAclPresentError,
 	readActivationRecord,
 	snapshotDirectory,
 	snapshotRegularFile,
@@ -23,6 +24,7 @@ import {
 	compareVersionsForTest,
 	defaultUserBinaryPathForTest,
 	formatBinaryDownloadFailureMessageForTest,
+	formatInstallationRollbackAclError,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	formatVerifiedBinaryInvocation,
@@ -30,6 +32,7 @@ import {
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
 	InstallationAccessDeniedError,
+	InstallationRollbackAclPresentError,
 	isProtectedSourcePathForTest,
 	isUpdateBackupNameForTest,
 	isUpdateStagingNameForTest,
@@ -1916,6 +1919,75 @@ async function replaceBinaryFixture(options: Omit<BinaryReplacementOptions, "ori
 }
 
 describe("update-cli binary replacement", () => {
+	it("distinguishes an activation-record ACL failure from a binary rollback ACL failure", () => {
+		const acl = new InstallationAclPresentError("record", "staging", {
+			aclFailurePrincipal: "SandboxUsers",
+			aclFailureInherited: false,
+		});
+		const message = formatInstallationRollbackAclError(
+			new AggregateError([new Error("primary"), acl], "installation_rollback_unverified"),
+		);
+		expect(message).toContain("rollback activation record update failed");
+		expect(message).toContain("SandboxUsers");
+		expect(message).not.toContain("gjc update");
+	});
+
+	it("removes retry instructions from an ACL primary when binary rollback is blocked", () => {
+		const detail = { aclFailurePrincipal: "SandboxUsers", aclFailureInherited: false };
+		const primary = new InstallationAclPresentError("record", "staging", detail);
+		const rollback = new InstallationRollbackAclPresentError("binary", "backup  two", detail, false);
+		const message = formatInstallationRollbackAclError(
+			new AggregateError([primary, rollback], "installation_rollback_unverified"),
+		);
+		expect(message).toContain("record");
+		expect(message).toContain("binary");
+		expect(message).toContain("backup  two");
+		expect(message).not.toContain("gjc update");
+		expect(message).not.toContain("icacls");
+	});
+
+	it("reports a rolled-back record ACL failure after removing a newly installed target", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		await writeFixtureFile(tempPath, "new binary");
+		const updateRecord = installActivation.updateActivationRecordFile;
+		const recordSpy = vi
+			.spyOn(installActivation, "updateActivationRecordFile")
+			.mockImplementation(async (record, identity) => {
+				if (record.phase === "rolled_back")
+					throw new InstallationAclPresentError("record", "record-stage", {
+						aclFailurePrincipal: "RecordUsers",
+						aclFailureInherited: false,
+					});
+				return updateRecord(record, identity);
+			});
+		try {
+			let failure: unknown;
+			try {
+				await replaceBinaryFixture({
+					targetPath,
+					tempPath,
+					backupPath: `${targetPath}.bak`,
+					expectedVersion: "1.2.3",
+					verifyInstalledVersion: async () => {
+						throw new Error("verification failed");
+					},
+				});
+			} catch (error) {
+				failure = error;
+			}
+			expect(formatInstallationRollbackAclError(failure)).toContain("rollback activation record update failed");
+			expect(formatInstallationRollbackAclError(failure)).toContain("RecordUsers");
+			expect(await Bun.file(targetPath).exists()).toBe(false);
+			const record = await readActivationRecord(targetPath);
+			expect(record.status).toBe("valid");
+			if (record.status === "valid") expect(record.record.phase).toBe("uncertain");
+		} finally {
+			recordSpy.mockRestore();
+		}
+	});
+
 	it("supersedes a pre-promotion record for an older candidate instead of refusing the newer release (#6096)", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.exe");
@@ -2837,6 +2909,73 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("new binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).text()).toBe("old binary");
+	});
+
+	it("reports the verification failure and rollback ACL diagnostic to the update user", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "new binary");
+		const replaceNative = native.exactReplaceRetained;
+		let calls = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (calls++ === 0) return replaceNative(...args);
+			return {
+				ok: false,
+				code: "acl_present",
+				aclFailurePrincipal: "SandboxUsers",
+				aclFailureInherited: false,
+				aclFailureSide: "source",
+			};
+		});
+		const errors: string[] = [];
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => errors.push(String(message)));
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async () => ({
+						tag: "v999.0.0",
+						version: "999.0.0",
+						registry: DEFAULT_NPM_REGISTRY,
+						warnings: [],
+					}),
+					resolveUpdateTarget: async () => ({ method: "binary", path: targetPath }),
+					performUpdate: async () =>
+						replaceBinaryFixture({
+							targetPath,
+							tempPath,
+							backupPath,
+							expectedVersion: "999.0.0",
+							verifyInstalledVersion: async () => ({
+								ok: false,
+								actual: "999.0.0",
+								path: targetPath,
+								smokeTestFailed: true,
+								smokeTestOutput: `customer-private-sentinel \u001b[31m Authorization: Bearer abcdefghijklmnopqrstuvwxyz ${"x".repeat(1200)}`,
+							}),
+						}),
+					exit: () => undefined as never,
+				},
+			);
+			expect(calls).toBe(2);
+			expect(errors.join("\n")).toContain("installation_rollback_unverified");
+			expect(errors.join("\n")).toContain("installed runtime smoke-test failed");
+			expect(errors.join("\n")).toContain("SandboxUsers");
+			expect(errors.join("\n")).toContain(backupPath);
+			expect(errors.join("\n")).not.toContain("abcdefghijklmnopqrstuvwxyz");
+			expect(errors.join("\n")).not.toContain("customer-private-sentinel");
+			expect(errors.join("\n")).not.toContain("\u001b");
+			expect(errors.join("\n")).not.toContain("x".repeat(600));
+			expect(errors.join("\n")).toContain("Inspect the uncertain activation before retrying");
+			expect(errors.join("\n")).not.toContain("gjc update }");
+			expect(errors.join("\n")).not.toContain("reinstall");
+		} finally {
+			errorSpy.mockRestore();
+			replaceSpy.mockRestore();
+		}
 	});
 
 	it("keeps the replacement only after it reports the expected version", async () => {

@@ -12,6 +12,7 @@ import {
 	type RestoreCandidate,
 	repairStandaloneBinary,
 } from "../src/cli/doctor/install-repairs";
+import * as installActivation from "../src/cli/install-activation";
 import {
 	activationRecordPath,
 	buildActivationRecord,
@@ -278,6 +279,111 @@ describe("doctor standalone install repair: refusals", () => {
 		} finally {
 			warnSpy.mockRestore();
 			replaceSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		["source", "retained backup"],
+		["destination", "installed binary"],
+		[undefined, "unknown artifact"],
+	] as const)("reports the binary rollback ACL role %s", async (side, artifact) => {
+		const f = await fixture();
+		const principal = "S-1-5-32-545";
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const replaceNative = native.exactReplaceRetained;
+		let calls = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (calls++ === 0) return replaceNative(...args);
+			return {
+				ok: false,
+				code: "acl_present",
+				aclFailurePrincipal: principal,
+				aclFailureInherited: false,
+				aclFailureSide: side,
+			};
+		});
+		const warnSpy = vi.spyOn(logger, "warn");
+		const deps = fakeDeps(f);
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				{
+					...deps,
+					smokeCandidate: async file => {
+						if (file === f.target) throw new Error(`${"x".repeat(1000)} secret-sentinel\u001b[31m`);
+						await deps.smokeCandidate(file, candidateFor(f));
+					},
+				},
+			);
+			expect(calls).toBe(2);
+			expect(result).toMatchObject({
+				state: "failed",
+				reason: "installation_rollback_unverified",
+				sideEffectStarted: true,
+			});
+			expect(result.diagnostic).toContain(principal);
+			expect(result.diagnostic).toContain(artifact);
+			expect(result.diagnostic).toContain("Installation failed; binary rollback was blocked");
+			expect(result.diagnostic).not.toContain("secret-sentinel");
+			expect(warnSpy.mock.calls.map(call => String(call[0])).join("\n")).toContain(principal);
+			expect(warnSpy.mock.calls.map(call => String(call[0])).join("\n")).not.toContain("secret-sentinel");
+		} finally {
+			warnSpy.mockRestore();
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		["uncertain", "source", "temporary activation record"],
+		["rolled_back", "destination", "activation record"],
+		["uncertain", undefined, "unknown artifact"],
+	] as const)("identifies an ACL failure writing rollback phase %s on %s", async (phase, side, artifact) => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const updateRecord = installActivation.updateActivationRecordFile;
+		const recordSpy = vi
+			.spyOn(installActivation, "updateActivationRecordFile")
+			.mockImplementation(async (record, identity) => {
+				if (record.phase === phase)
+					throw new installActivation.InstallationAclPresentError("secret-record-path", "secret-record-stage", {
+						aclFailurePrincipal: "secret-principal",
+						aclFailureInherited: true,
+						aclFailureSide: side,
+					});
+				return updateRecord(record, identity);
+			});
+		const deps = fakeDeps(f);
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				{
+					...deps,
+					smokeCandidate: async file => {
+						if (file === f.target) throw new Error("verification failed");
+						await deps.smokeCandidate(file, candidateFor(f));
+					},
+				},
+			);
+			expect(result.reason).toBe("installation_rollback_unverified");
+			expect(result.diagnostic).toContain("activation record update during rollback");
+			expect(result.diagnostic).toContain(artifact);
+			expect(result.diagnostic).toContain("principal omitted");
+			expect(result.diagnostic).not.toContain("secret-");
+			expect(JSON.stringify(warnSpy.mock.calls)).not.toContain("secret-");
+			expect(result.diagnostic).not.toContain("gjc update");
+			const expected =
+				phase === "rolled_back" ? Buffer.concat([ELF_HEADER, Buffer.from("old-runtime")]) : f.candidateBytes;
+			expect((await fs.readFile(f.target)).toString("hex")).toBe(expected.toString("hex"));
+		} finally {
+			warnSpy.mockRestore();
+			recordSpy.mockRestore();
 		}
 	});
 });

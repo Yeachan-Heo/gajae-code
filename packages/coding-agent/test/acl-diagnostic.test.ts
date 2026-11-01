@@ -30,6 +30,17 @@ describe("InstallationAclPresentError", () => {
 		);
 	});
 
+	it("omits automatic retry from inherited ACL rollback guidance", () => {
+		const error = new InstallationAclPresentError(
+			String.raw`C:\Tools\gjc.exe`,
+			STAGED,
+			{ aclFailurePrincipal: "SandboxUsers", aclFailureInherited: true, aclFailureSide: "source" },
+			false,
+		);
+		expect(error.message).toContain(String.raw`icacls 'C:\Users\Alice\.local\bin' /remove 'SandboxUsers' }`);
+		expect(error.message).not.toContain("gjc update");
+	});
+
 	it("falls back to the bare error when both diagnostic fields are absent", () => {
 		const error = new InstallationAclPresentError(String.raw`C:\Tools\gjc.exe`, STAGED, {});
 
