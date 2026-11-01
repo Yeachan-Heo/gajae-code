@@ -427,6 +427,8 @@ export class DesktopHost {
 	#createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	#catalog: Catalog = { version: 1, projects: [], sessions: [] };
 	#deliveries!: DeliveryJournal;
+	/** Process-local only: receipts and snapshots never recreate completion intent. */
+	#completedTasks = new Set<string>();
 	#live = new Map<string, LiveSession>();
 	#managed = new Map<string, ManagedSession>();
 	#managedControlEpoch = 0;
@@ -1585,6 +1587,61 @@ export class DesktopHost {
 		}
 		return { handled: false, text: result.text ?? text, images: result.images ?? images };
 	}
+	#taskCompleted(sessionId: string, identity: ["local", string, number, string] | ["managed", number, string]): void {
+		if (this.#closed) return;
+		const id = JSON.stringify([this.#connectionGeneration, sessionId, ...identity]);
+		if (this.#completedTasks.has(id)) return;
+		this.#completedTasks.add(id);
+		this.#emit({ type: "task-completed", id, sessionId });
+	}
+	#localTaskCompletion(
+		live: LiveSession,
+	): (scope: { lineage: string; generation: number; attemptId: string }) => void {
+		const sdk = live.sdk;
+		const metadata = live.metadata;
+		const desktopSessionId = metadata.id;
+		const sessionId = sdk.sessionId;
+		const manager = sdk.sessionManager;
+		const managerId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = sdk.sessionLifecycle.generation;
+		const cwd = manager.getCwd();
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+		return scope => {
+			const lifecycle = sdk.sessionLifecycle;
+			if (
+				this.#closed ||
+				this.#live.get(metadata.id) !== live ||
+				this.#retiredLive.has(live) ||
+				!this.#catalog.sessions.includes(metadata) ||
+				!project ||
+				!this.#catalog.projects.includes(project) ||
+				project.closed ||
+				project.id !== metadata.projectId ||
+				project.path !== cwd ||
+				lifecycle.disposed ||
+				lifecycle.transitioning ||
+				lifecycle.generation !== generation ||
+				live.sdk !== sdk ||
+				sdk.sessionId !== sessionId ||
+				metadata.id !== desktopSessionId ||
+				sdk.sessionManager !== manager ||
+				manager.getSessionId() !== managerId ||
+				manager.getSessionFile() !== file ||
+				manager.getSessionIdentityGeneration() !== identityGeneration ||
+				manager.getCwd() !== cwd ||
+				typeof scope.lineage !== "string" ||
+				!scope.lineage.trim() ||
+				typeof scope.attemptId !== "string" ||
+				!scope.attemptId.trim() ||
+				!Number.isSafeInteger(scope.generation) ||
+				scope.generation < 0
+			)
+				return;
+			this.#taskCompleted(desktopSessionId, ["local", scope.lineage, scope.generation, scope.attemptId]);
+		};
+	}
 	async #promptDelivery(
 		live: LiveSession,
 		id: string,
@@ -1593,6 +1650,7 @@ export class DesktopHost {
 		alreadyBegun = false,
 		allowGateMutation = false,
 	): Promise<void> {
+		const completeTask = this.#localTaskCompletion(live);
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
 		const input = await this.#extensionInput(live, id, text, images, allowGateMutation);
@@ -1656,6 +1714,8 @@ export class DesktopHost {
 		await this.#delivery(id, {
 			disposition: accepted && owned?.reason === "completed" && owned.assistant ? "completed" : "unknown",
 		});
+		if (accepted && run.started && owned?.reason === "completed" && owned.assistant === "stop")
+			completeTask(run.started.scope);
 	}
 	#recordScopeFailure(
 		live: LiveSession,
@@ -2220,6 +2280,7 @@ export class DesktopHost {
 			}
 			if (text.trimStart().startsWith("/")) await this.#composer(live).initialize();
 			if (live.busy || live.sdk.isStreaming) {
+				const completeTask = this.#localTaskCompletion(live);
 				const input = await this.#extensionInput(live, request.id, text, images);
 				if (input.handled) return null;
 				text = input.text;
@@ -2359,6 +2420,13 @@ export class DesktopHost {
 								disposition,
 								...(disposition === "failed" ? { error: "Prompt failed" } : {}),
 							});
+							if (
+								accepted &&
+								disposition === "completed" &&
+								terminal?.assistant === "stop" &&
+								outcome.disposition === "completed"
+							)
+								completeTask(outcome.attemptScope);
 							if (
 								disposition === "failed" &&
 								outcome.disposition === "completed" &&
@@ -2581,6 +2649,7 @@ export class DesktopHost {
 		if (existing) this.#managed.delete(metadata.id);
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
 		const projectEpoch = this.#managedProjectEpochs.get(project.id) ?? 0;
+		const cwd = project.path;
 		const session = new ManagedSession({
 			agentDir: this.agentDir,
 			cwd: project.path,
@@ -2595,6 +2664,22 @@ export class DesktopHost {
 			},
 			redact: text => this.#redact(text),
 			delivery: (id, changes) => this.#delivery(id, changes),
+			onTaskCompleted: (turnId, desktopEpoch) => {
+				if (
+					!this.#closed &&
+					this.#managed.get(metadata.id) === session &&
+					this.#catalog.sessions.includes(metadata) &&
+					this.#catalog.projects.includes(project) &&
+					project.id === metadata.projectId &&
+					!project.closed &&
+					project.path === cwd &&
+					(this.#managedProjectEpochs.get(project.id) ?? 0) === projectEpoch &&
+					session.controlGeneration === desktopEpoch &&
+					typeof turnId === "string" &&
+					turnId.trim()
+				)
+					this.#taskCompleted(metadata.id, ["managed", desktopEpoch, turnId]);
+			},
 			onChange: () => {
 				if (this.#managed.get(metadata.id) === session && !this.#closed && !project.closed)
 					this.#emit({ type: "session", session: session.dto() });

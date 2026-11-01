@@ -18,6 +18,20 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 		: undefined;
 class ManagedRefusalError extends Error {}
 
+interface CompletionAttachment {
+	attachment: sdkRouter.SessionAttachment;
+	desktopEpoch: number;
+}
+interface ManagedDelivery {
+	kind: "prompt" | "steer";
+	commandId?: string;
+	turnId?: string;
+	completion?: CompletionAttachment;
+	deliveryTerminal?: boolean;
+}
+const confirmedIdentity = (value: unknown): string | undefined =>
+	typeof value === "string" && value.trim() ? value : undefined;
+
 const unavailableInteraction =
 	"This SDK owner cannot present desktop questions or approval screens. Answer in its original control surface.";
 
@@ -31,6 +45,8 @@ export interface ManagedSessionOptions {
 	/** Desktop-issued epoch; the SDK's numeric generation may be reused by a successor. */
 	nextControlGeneration: () => number;
 	onChange: () => void;
+	/** Only a correlated successful Desktop-dispatched prompt/follow-up, never an admission or steer. */
+	onTaskCompleted?: (turnId: string, capturedDesktopEpoch: number) => void;
 	delivery: (
 		id: string,
 		changes: Partial<Pick<DesktopDeliveryReceipt, "disposition" | "sdkSubmissionId" | "error">>,
@@ -59,7 +75,8 @@ export class ManagedSession {
 	#refresh?: Promise<void>;
 	#dirty = false;
 	#timer?: Timer;
-	#deliveries = new Map<string, { kind: "prompt" | "steer"; commandId?: string; turnId?: string }>();
+	#deliveries = new Map<string, ManagedDelivery>();
+	#completedTurns = new Set<string>();
 
 	constructor(options: ManagedSessionOptions) {
 		this.#options = options;
@@ -148,18 +165,49 @@ export class ManagedSession {
 			);
 	}
 
+	#completionCurrent(completion: CompletionAttachment): boolean {
+		return (
+			!this.#closed &&
+			this.#controlEpoch === completion.desktopEpoch &&
+			this.#attachment === completion.attachment &&
+			completion.attachment.isCurrent() &&
+			this.#router.attachment(this.#options.id) === completion.attachment
+		);
+	}
+
+	#hasPendingCompletions(): boolean {
+		let pending = false;
+		for (const [id, selector] of this.#deliveries) {
+			if (!selector.completion) {
+				if (selector.deliveryTerminal) this.#deliveries.delete(id);
+				continue;
+			}
+			if (this.#completionCurrent(selector.completion)) pending = true;
+			else {
+				selector.completion = undefined;
+				if (selector.deliveryTerminal) this.#deliveries.delete(id);
+			}
+		}
+		return pending;
+	}
+
 	async #request(
 		type: "query_request" | "control_request",
 		name: string,
 		input: Record<string, unknown> = {},
 		onDispatch?: () => void,
+		completion?: CompletionAttachment,
 	): Promise<Record<string, unknown>> {
 		if (this.#closed) throw new Error("Desktop session is detached");
 		// Queries can synchronize a new binding. Writes belong to the exact snapshot
 		// the client saw, never whichever owner the router happens to find next.
 		const attachment = type === "control_request" ? this.#attachment : this.#router.attachment(this.#options.id);
 		if (!attachment) throw new Error("SDK owner is unavailable");
-		if (type === "control_request") this.#assertControlAttachment(attachment);
+		const assertAttachment = () => {
+			if (completion && !this.#completionCurrent(completion)) throw new Error("SDK completion owner changed");
+			if (type === "control_request") this.#assertControlAttachment(attachment);
+		};
+		assertAttachment();
 		const response = await this.#router.request(
 			this.#options.id,
 			{
@@ -172,9 +220,10 @@ export class ManagedSession {
 			attachment,
 			{
 				onDispatch,
-				...(type === "control_request" ? { beforeDispatch: () => this.#assertControlAttachment(attachment) } : {}),
+				...(type === "control_request" || completion ? { beforeDispatch: assertAttachment } : {}),
 			},
 		);
+		if (completion) assertAttachment();
 		if (response.ok !== true)
 			throw new Error(`SDK ${name}: ${String(record(response.error)?.code ?? "invalid_response")}`);
 		return response;
@@ -252,7 +301,7 @@ export class ManagedSession {
 		this.#dirty = true;
 		this.#refresh ??= this.#refreshLoop().finally(() => {
 			this.#refresh = undefined;
-			if (this.#dirty) this.#scheduleRefresh();
+			if (this.#hasPendingCompletions() || this.#dirty) this.#scheduleRefresh();
 		});
 		return this.#refresh;
 	}
@@ -305,8 +354,73 @@ export class ManagedSession {
 		}
 	}
 
+	async #completionProof(selector: ManagedDelivery, result: Record<string, unknown>): Promise<void> {
+		const completion = selector.completion;
+		if (selector.kind !== "prompt" || !completion || !this.#completionCurrent(completion)) return;
+		const stopped = record(result.outcome);
+		if (
+			result.status === "failed" ||
+			result.status === "rejected" ||
+			result.error !== undefined ||
+			stopped?.kind === "failed" ||
+			(stopped?.kind === "stopped" &&
+				((typeof stopped.reason === "string" && stopped.reason !== "end_turn") ||
+					(typeof stopped.provenance === "string" && stopped.provenance !== "agent")))
+		) {
+			selector.completion = undefined;
+			return;
+		}
+		const commandId = confirmedIdentity(result.commandId);
+		const turnId = confirmedIdentity(result.turnId);
+		if (
+			!commandId ||
+			!turnId ||
+			(selector.commandId !== undefined && selector.commandId !== commandId) ||
+			(selector.turnId !== undefined && selector.turnId !== turnId)
+		)
+			return;
+		if (!selector.commandId || !selector.turnId) {
+			// A clientRef lookup establishes identities, not terminal notification proof.
+			selector.commandId = commandId;
+			selector.turnId = turnId;
+			const response = await this.#request(
+				"query_request",
+				"turn.result",
+				{ kind: "prompt", commandId, turnId },
+				undefined,
+				completion,
+			);
+			result = record(response.result) ?? {};
+		}
+		const outcome = record(result.outcome);
+		const content = record(result.content);
+		if (
+			result.status !== "terminal_ok" ||
+			result.kind !== "prompt" ||
+			result.receiptState !== "present" ||
+			result.error !== undefined ||
+			outcome?.kind !== "stopped" ||
+			outcome.reason !== "end_turn" ||
+			outcome.provenance !== "agent" ||
+			content?.version !== 1 ||
+			content.type !== "text" ||
+			typeof content.text !== "string" ||
+			!content.text.trim() ||
+			confirmedIdentity(result.commandId) !== commandId ||
+			confirmedIdentity(result.turnId) !== turnId ||
+			!this.#completionCurrent(completion)
+		)
+			return;
+		const key = JSON.stringify([completion.desktopEpoch, turnId]);
+		selector.completion = undefined;
+		if (this.#completedTurns.has(key)) return;
+		this.#completedTurns.add(key);
+		this.#options.onTaskCompleted?.(turnId, completion.desktopEpoch);
+	}
+
 	async #reconcileDeliveries(): Promise<void> {
 		for (const [id, selector] of this.#deliveries) {
+			if (selector.completion && !this.#completionCurrent(selector.completion)) selector.completion = undefined;
 			const response = await this.#request(
 				"query_request",
 				selector.kind === "steer" ? "turn.steer_status" : "turn.result",
@@ -315,30 +429,47 @@ export class ManagedSession {
 					: selector.commandId && selector.turnId
 						? { kind: "prompt", commandId: selector.commandId, turnId: selector.turnId }
 						: { kind: "prompt", clientRef: id },
+				undefined,
+				selector.completion,
 			);
 			const result = record(response.result);
 			const status = result?.status;
 			const disposition =
-				status === "terminal_ok"
-					? "completed"
-					: status === "failed" || status === "rejected"
-						? "failed"
-						: status === "accepted" || status === "in_flight"
-							? "accepted"
-							: undefined;
-			if (disposition) {
+				selector.kind === "steer"
+					? status === "accepted"
+						? "accepted"
+						: status === "rejected"
+							? "failed"
+							: undefined
+					: status === "terminal_ok"
+						? "completed"
+						: status === "failed" || status === "rejected"
+							? "failed"
+							: status === "accepted" || status === "in_flight"
+								? "accepted"
+								: undefined;
+			// Notification-only correlation must not revoke already proven delivery.
+			if (result) await this.#completionProof(selector, result).catch(() => {});
+			if (disposition && !selector.deliveryTerminal) {
 				await this.#options.delivery(id, {
 					disposition,
 					...(typeof result?.commandId === "string" ? { sdkSubmissionId: result.commandId } : {}),
 				});
-				if (disposition === "completed" || disposition === "failed") this.#deliveries.delete(id);
+				selector.deliveryTerminal = disposition === "completed" || disposition === "failed";
 			}
+			// Delivery may be terminal before the SDK enriches its receipt/outcome.
+			// Keep only ephemeral notification intent, without rewriting the journal.
+			if (selector.deliveryTerminal && !selector.completion) this.#deliveries.delete(id);
 		}
 	}
 
 	async prompt(id: string, text: string, deliverAs: unknown): Promise<void> {
 		if (!text.trim()) throw new Error("A message is required");
 		const operation = this.#idle ? "turn.prompt" : deliverAs === "followUp" ? "turn.follow_up" : "turn.steer";
+		const completion: CompletionAttachment | undefined =
+			operation !== "turn.steer" && this.#attachment && this.#controlEpoch !== null
+				? { attachment: this.#attachment, desktopEpoch: this.#controlEpoch }
+				: undefined;
 		let dispatched = false;
 		try {
 			const response = await this.#request(
@@ -361,6 +492,7 @@ export class ManagedSession {
 				kind: operation === "turn.steer" ? "steer" : "prompt",
 				...(commandId ? { commandId } : {}),
 				...(turnId ? { turnId } : {}),
+				...(completion ? { completion } : {}),
 			});
 			await this.#options.delivery(id, {
 				disposition: operation === "turn.follow_up" ? "queued" : "accepted",
@@ -380,6 +512,8 @@ export class ManagedSession {
 								"query_request",
 								operation === "turn.steer" ? "turn.steer_status" : "turn.result",
 								operation === "turn.steer" ? { clientRef: id } : { kind: "prompt", clientRef: id },
+								undefined,
+								completion,
 							)
 						).result,
 					);
@@ -387,7 +521,10 @@ export class ManagedSession {
 						recovered &&
 						["accepted", "in_flight", "terminal_ok", "failed", "rejected"].includes(String(recovered.status))
 					) {
-						this.#deliveries.set(id, { kind: operation === "turn.steer" ? "steer" : "prompt" });
+						this.#deliveries.set(id, {
+							kind: operation === "turn.steer" ? "steer" : "prompt",
+							...(completion ? { completion } : {}),
+						});
 						await this.#reconcileDeliveries();
 						this.#scheduleRefresh();
 						return;

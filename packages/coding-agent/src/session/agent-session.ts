@@ -1256,7 +1256,8 @@ export interface PromptOptions {
 	 * agent execution begins. SDK bus installs a closure that fsyncs acceptance.
 	 */
 	onPreflightAcceptCommit?: () => void | Promise<void>;
-	/** Ordinary model prompt's core acceptance observer, before agent_start; observer errors are contained.
+	/** Ordinary model prompt's core acceptance observer, initially before agent_start, then for replacement
+	 * handles of that exact logical run until prompt settles. Observer errors are contained.
 	 * Does not fire for locally handled commands or skill invocations. Not a persistence fence. */
 	onRunAccepted?: (handle: AttemptRunHandle) => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
@@ -4352,6 +4353,10 @@ export class AgentSession {
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
 	readonly #logicalRunIdByAttemptScope = new WeakMap<AttemptScope, AttemptRunHandle["logicalRunId"]>();
+	readonly #promptRunAcceptedObservers = new Map<
+		AttemptRunHandle["logicalRunId"],
+		Set<(handle: AttemptRunHandle) => void>
+	>();
 	#acceptRunHandle(handle: AttemptRunHandle | undefined): void {
 		// Integration doubles can accept a run without minting a handle; keep the
 		// previously recorded run id rather than throwing inside the callback.
@@ -4359,6 +4364,7 @@ export class AgentSession {
 		this.#activeLogicalRunId = handle.logicalRunId;
 		this.#activeAttemptScope = handle.scope;
 		this.#logicalRunIdByAttemptScope.set(handle.scope, handle.logicalRunId);
+		for (const observer of this.#promptRunAcceptedObservers.get(handle.logicalRunId) ?? []) observer(handle);
 	}
 
 	#turnIndex = 0;
@@ -11524,6 +11530,7 @@ export class AgentSession {
 			this.#disposeDeadlineTimer.unref?.();
 			this.#abortAdmissionEpoch++;
 			this.#isDisposed = true;
+			this.#promptRunAcceptedObservers.clear();
 			this.retireSessionAgentModelOverrides();
 			revokeExactMcpControls(this);
 			// Dispose disconnects the Agent event bridge before bounded abort cleanup;
@@ -15776,24 +15783,42 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
+		const observer = options?.onRunAccepted;
+		let observedLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
+		const observedHandles = new WeakSet<AttemptRunHandle>();
+		const notifyRunAccepted = (handle: AttemptRunHandle): void => {
+			if (!observer) return;
+			if (handle) {
+				if (observedLogicalRunId !== undefined && handle.logicalRunId !== observedLogicalRunId) return;
+				if (observedHandles.has(handle)) return;
+				observedHandles.add(handle);
+				if (observedLogicalRunId === undefined && !this.#isDisposed) {
+					// Bind only to this invocation's actual first acceptance. Continuations
+					// may replace its scope, but unrelated logical runs cannot inherit it.
+					observedLogicalRunId = handle.logicalRunId;
+					let observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+					if (!observers) {
+						observers = new Set();
+						this.#promptRunAcceptedObservers.set(observedLogicalRunId, observers);
+					}
+					observers.add(notifyRunAccepted);
+				}
+			}
+			try {
+				const result: unknown = observer(handle);
+				if (result !== undefined)
+					void Promise.resolve(result).catch(() => logger.warn("Prompt run acceptance observer failed"));
+			} catch {
+				logger.warn("Prompt run acceptance observer failed");
+			}
+		};
 		try {
-			const observer = options?.onRunAccepted;
 			await this.#promptInternal(
 				text,
 				observer
 					? {
 							...options,
-							onRunAccepted: handle => {
-								try {
-									const result: unknown = observer(handle);
-									if (result !== undefined)
-										void Promise.resolve(result).catch(() =>
-											logger.warn("Prompt run acceptance observer failed"),
-										);
-								} catch {
-									logger.warn("Prompt run acceptance observer failed");
-								}
-							},
+							onRunAccepted: notifyRunAccepted,
 						}
 					: options,
 				releaseStartupPromptWaiter,
@@ -15804,6 +15829,11 @@ export class AgentSession {
 			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
 			if (appendRejection) throw appendRejection;
 		} finally {
+			if (observedLogicalRunId !== undefined) {
+				const observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+				observers?.delete(notifyRunAccepted);
+				if (observers?.size === 0) this.#promptRunAcceptedObservers.delete(observedLogicalRunId);
+			}
 			releaseStartupPromptWaiter();
 		}
 	}

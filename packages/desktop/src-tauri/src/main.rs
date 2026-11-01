@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+	collections::HashSet,
 	process::Stdio,
 	sync::{
 		Arc,
@@ -12,6 +13,7 @@ use std::{
 use serde_json::{Value, json};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -127,8 +129,66 @@ fn valid_delivery_receipt(value: &Value) -> bool {
 		.all(|key| receipt.get(*key).is_none_or(Value::is_string))
 }
 
+fn valid_task_completion(value: &Value) -> bool {
+	let Some(frame) = value.as_object() else {
+		return false;
+	};
+	frame.len() == 3
+		&& frame.get("type").and_then(Value::as_str) == Some("task-completed")
+		&& [("id", 2048), ("sessionId", 128)]
+			.iter()
+			.all(|(key, limit)| {
+				frame
+					.get(*key)
+					.and_then(Value::as_str)
+					.is_some_and(|value| {
+						!value.trim().is_empty()
+							&& value.chars().count() <= *limit
+							&& !value.chars().any(char::is_control)
+					})
+			})
+}
+
+/// Ephemeral run IDs are scoped to this host process, never restored from
+/// history.
+#[derive(Default)]
+struct TaskNotifications {
+	seen: HashSet<String>,
+}
+
+impl TaskNotifications {
+	fn deliver<F>(&mut self, frame: &Value, send: F)
+	where
+		F: FnOnce() -> Result<(), String>,
+	{
+		if !valid_task_completion(frame) {
+			return;
+		}
+		let id = frame["id"].as_str().expect("validated task completion ID");
+		if self.seen.insert(id.to_owned()) {
+			if let Err(error) = send() {
+				// Notification/OS failures never become engine or delivery failures. Do
+				// not retry a denied/failed notification after permissions change.
+				eprintln!("Task completion notification unavailable: {error}");
+			}
+		}
+	}
+}
+
 async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle) -> String {
-	read_frames_from(stdout, |value| emit(&app, value)).await
+	let mut notifications = TaskNotifications::default();
+	read_frames_from(stdout, |value| {
+		notifications.deliver(&value, || {
+			app.notification()
+				.builder()
+				.title("Gajae Code")
+				.body("Task completed.")
+				.show()
+				.map_err(|error| error.to_string())
+		});
+		emit(&app, value)
+	})
+	.await
 }
 
 /// Frame reader shared by the supervisor and its tests. `deliver` receives one
@@ -158,6 +218,7 @@ where
 				Ok(value)
 					if match value.get("type").and_then(Value::as_str) {
 						Some("delivery") => value.get("receipt").is_some_and(valid_delivery_receipt),
+						Some("task-completed") => valid_task_completion(&value),
 						Some("response") => value.get("deliveryDisposition").is_none_or(|disposition| {
 							value.get("ok") == Some(&Value::Bool(false))
 								&& matches!(disposition.as_str(), Some("refused" | "failed" | "unknown"))
@@ -780,6 +841,103 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn rejects_malformed_task_completion_before_delivery() {
+		for frame in [
+			json!({"type": "task-completed"}),
+			json!({"type": "task-completed", "id": "", "sessionId": "owner"}),
+			json!({"type": "task-completed", "id": "   ", "sessionId": "owner"}),
+			json!({"type": "task-completed", "id": "bad\nrun", "sessionId": "owner"}),
+			json!({"type": "task-completed", "id": "run", "sessionId": null}),
+			json!({"type": "task-completed", "id": "run", "sessionId": "bad\0owner"}),
+			json!({"type": "task-completed", "id": "x".repeat(2049), "sessionId": "owner"}),
+			json!({"type": "task-completed", "id": "run", "sessionId": "x".repeat(129)}),
+			json!({"type": "task-completed", "id": "run", "sessionId": "owner", "body": "untrusted"}),
+		] {
+			let mut input = serde_json::to_vec(&frame).unwrap();
+			input.push(b'\n');
+			let (error, delivered) = frames(&input, 3).await;
+			assert_eq!(error, "Engine emitted an invalid frame envelope");
+			assert!(delivered.is_empty(), "accepted {frame}");
+		}
+	}
+
+	#[test]
+	fn notifications_deduplicate_actual_runs_but_allow_distinct_runs_and_sessions() {
+		let mut notifications = super::TaskNotifications::default();
+		let mut sent = Vec::new();
+		for (id, session) in
+			[("run-1", "a"), ("run-1", "a"), ("run-2", "a"), ("run-3", "b"), ("run-2", "a")]
+		{
+			notifications.deliver(
+				&json!({"type": "task-completed", "id": id, "sessionId": session}),
+				|| {
+					sent.push((id, session));
+					Ok(())
+				},
+			);
+		}
+		assert_eq!(sent, [("run-1", "a"), ("run-2", "a"), ("run-3", "b")]);
+	}
+
+	#[test]
+	fn historical_state_and_delivery_admission_never_trigger_notifications() {
+		let mut notifications = super::TaskNotifications::default();
+		let mut sent = 0;
+		for frame in [
+			json!({"type": "snapshot", "snapshot": {"sessions": [{"id": "a", "status": "done"}], "deliveries": [{"id": "history", "sessionId": "a", "disposition": "completed"}]}}),
+			json!({"type": "session", "session": {"id": "a", "status": "done"}}),
+			json!({"type": "delivery", "receipt": {"id": "a", "sessionId": "a", "disposition": "accepted"}}),
+			json!({"type": "delivery", "receipt": {"id": "b", "sessionId": "a", "disposition": "completed"}}),
+			json!({"type": "response", "id": "command", "ok": true, "result": {"consumed": true}}),
+		] {
+			notifications.deliver(&frame, || {
+				sent += 1;
+				Ok(())
+			});
+		}
+		assert_eq!(sent, 0);
+		notifications.deliver(
+			&json!({"type": "task-completed", "id": "actual-run", "sessionId": "a"}),
+			|| {
+				sent += 1;
+				Ok(())
+			},
+		);
+		assert_eq!(sent, 1);
+	}
+
+	#[tokio::test]
+	async fn notification_failure_does_not_break_following_engine_frames_or_retry() {
+		let expected = vec![
+			json!({"type": "task-completed", "id": "run-1", "sessionId": "a"}),
+			json!({"type": "response", "id": "send", "ok": true, "result": null}),
+			json!({"type": "task-completed", "id": "run-1", "sessionId": "a"}),
+			json!({"type": "session", "session": {"id": "a", "status": "done"}}),
+			json!({"type": "task-completed", "id": "run-2", "sessionId": "a"}),
+		];
+		let mut bytes = Vec::new();
+		for frame in &expected {
+			bytes.extend(serde_json::to_vec(frame).unwrap());
+			bytes.push(b'\n');
+		}
+		let mut notifications = super::TaskNotifications::default();
+		let mut attempts = 0;
+		let mut delivered = Vec::new();
+		let error = super::read_frames_from(Chunked { data: bytes, at: 0, limit: 7 }, |frame| {
+			notifications.deliver(&frame, || {
+				attempts += 1;
+				Err("OS notifications unavailable".into())
+			});
+			delivered.push(frame);
+			Ok(())
+		})
+		.await;
+		assert_eq!(error, "Engine stdout closed unexpectedly");
+		assert_eq!(attempts, 2);
+		assert_eq!(delivered, expected);
+	}
+
+	#[tokio::test]
 	async fn preserves_activity_gate_and_operator_frames_in_native_order() {
 		let expected = vec![
 			json!({"type": "activity", "update": {"sessionId": "owner", "revision": 2,
@@ -920,6 +1078,7 @@ mod tests {
 fn main() {
 	let app = tauri::Builder::default()
 		.plugin(tauri_plugin_dialog::init())
+		.plugin(tauri_plugin_notification::init())
 		.plugin(tauri_plugin_opener::init())
 		.invoke_handler(tauri::generate_handler![engine_request, select_project, open_auth_url])
 		.setup(|app| {

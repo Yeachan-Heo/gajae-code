@@ -315,12 +315,19 @@ export interface DesktopActivityUpdate {
 	revision: number;
 	activity: DesktopActivitySnapshot;
 }
+/** Ephemeral proof of one successful actual run; never part of a snapshot or receipt. */
+export interface DesktopTaskCompletion {
+	id: string;
+	sessionId: string;
+}
+
 export type DesktopFrame =
 	| { type: "response"; id: string; ok: true; result: unknown }
 	| { type: "response"; id: string; ok: false; error: string; deliveryDisposition?: "refused" | "failed" | "unknown" }
 	| { type: "snapshot"; snapshot: DesktopSnapshot }
 	| { type: "session"; session: DesktopSession }
 	| { type: "delivery"; receipt: DesktopDeliveryReceipt }
+	| ({ type: "task-completed" } & DesktopTaskCompletion)
 	| { type: "auth"; auth: DesktopAuthState }
 	| { type: "activity"; update: DesktopActivityUpdate }
 	| { type: "gate"; sessionId: string; event: DesktopGatePresentationEvent }
