@@ -7532,7 +7532,9 @@ export const MATERIALIZED_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
 export class SessionTitlePersistenceStaleError extends Error {
 	constructor() {
-		super("Session changed before title persistence");
+		// The fence aborts the same publication the persistence layer would abort with
+		// its canonical code, so the code stays first and the detail follows.
+		super("session_persistence_lifecycle_changed: Session changed before title persistence");
 		this.name = "SessionTitlePersistenceStaleError";
 	}
 }
@@ -7896,6 +7898,12 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
+	/**
+	 * A prepared publication abandoned because the logical session changed under it. It is
+	 * deliberately not `#persistError`: the successor session stays writable, but close()
+	 * must still surface the unfinished publication.
+	 */
+	#abandonedPublicationError: Error | undefined;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
@@ -17498,7 +17506,7 @@ export class SessionManager {
 			closeError = error;
 			if (taskStarted) this.#closeRetryPending = true;
 		}
-		const terminalError = closeError ?? this.#persistError;
+		const terminalError = closeError ?? this.#persistError ?? this.#abandonedPublicationError;
 		if (terminalError) throw terminalError;
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -17563,7 +17571,7 @@ export class SessionManager {
 			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 		}
-		let priorPersistError = this.#persistError;
+		let priorPersistError = this.#persistError ?? this.#abandonedPublicationError;
 		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
 			await this.#persistChain.catch(() => {});
 			try {
@@ -18938,7 +18946,6 @@ export class SessionManager {
 		if (!sanitized) return false;
 		const identityGeneration = this.#committedIdentityGeneration;
 		const sessionId = this.#sessionId;
-		const sessionFile = this.#sessionFile;
 		const predecessor = this.#titleMutationTail;
 		const completion = Promise.withResolvers<void>();
 		this.#titleMutationTail = completion.promise;
@@ -18948,7 +18955,6 @@ export class SessionManager {
 			if (
 				this.#committedIdentityGeneration !== identityGeneration ||
 				this.#sessionId !== sessionId ||
-				this.#sessionFile !== sessionFile ||
 				options?.isCurrent?.() === false
 			)
 				return false;
@@ -18963,10 +18969,11 @@ export class SessionManager {
 			const previousHeaderTitle = header?.title;
 			const previousHeaderSource = header?.titleSource;
 			let persistenceStarted = false;
+			// A verified same-owner managed-transcript relocation rewrites `#sessionFile`
+			// without changing the logical session, so ownership is judged by identity
+			// generation and session id; the patch loop follows the relocated path.
 			const samePersistenceOwner = (): boolean =>
-				this.#committedIdentityGeneration === identityGeneration &&
-				this.#sessionId === sessionId &&
-				this.#sessionFile === sessionFile;
+				this.#committedIdentityGeneration === identityGeneration && this.#sessionId === sessionId;
 			const assertTitleOwner = (): void => {
 				if (!samePersistenceOwner() || options?.isCurrent?.() === false)
 					throw new SessionTitlePersistenceStaleError();
@@ -18990,8 +18997,7 @@ export class SessionManager {
 					!persistenceStarted &&
 					this.#titleMutationRevision === revision &&
 					this.#committedIdentityGeneration === identityGeneration &&
-					this.#sessionId === sessionId &&
-					this.#sessionFile === sessionFile
+					this.#sessionId === sessionId
 				) {
 					this.#sessionName = previousName;
 					this.#titleSource = previousSource;
@@ -19005,6 +19011,7 @@ export class SessionManager {
 				}
 				throw error;
 			}
+			this.#abandonedPublicationError = undefined;
 			options?.onApplied?.(sanitized);
 			return true;
 		} finally {
@@ -19095,7 +19102,7 @@ export class SessionManager {
 			onPersistenceStart?.();
 			persistenceStarted = true;
 		};
-		await this.#queuePersistTask(
+		const publication = this.#queuePersistTask(
 			async () => {
 				if (onPersistenceCheck) await SessionManagerTestHooks.beforeTitlePatchPersistence?.();
 				for (let attempt = 0; attempt <= 2; attempt++) {
@@ -19171,6 +19178,15 @@ export class SessionManager {
 				},
 			},
 		);
+		try {
+			await publication;
+		} catch (error) {
+			// The logical session changed under this publication, so the successor stays
+			// writable (`#persistError` is not latched) but the abandoned publication must
+			// still reach close(); a later successful publication supersedes it.
+			if (isPersistenceOwner && !isPersistenceOwner()) this.#abandonedPublicationError ??= toError(error);
+			throw error;
+		}
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
