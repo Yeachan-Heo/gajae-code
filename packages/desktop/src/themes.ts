@@ -213,7 +213,11 @@ export function writeFontSizePreference(size: number): boolean {
 	}
 }
 
-/** Every size in `styles.css` is in rem, so one root value rescales the whole surface. */
+/**
+ * Sets the conversation text size. Every other size in `styles.css` is a rem multiple of the root,
+ * and the root is the text size divided by `0.875`, so the reply text lands on the chosen pixels
+ * and the rest of the surface keeps its designed proportions.
+ */
 export function applyFontSize(size: number): void {
-	document.documentElement.style.fontSize = `${clampFontSize(size)}px`;
+	document.documentElement.style.setProperty("--text-size", `${clampFontSize(size)}px`);
 }

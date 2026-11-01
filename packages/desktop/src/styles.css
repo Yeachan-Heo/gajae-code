@@ -1,8 +1,10 @@
 /* Fallback palette only: applyTheme() writes the selected bundled TUI theme at runtime. */
 :root {
 	color-scheme: dark;
-	/* applyFontSize() overwrites this on the root; every other size is in rem. */
-	font-size: 14px;
+	/* The reader's setting is the size of the conversation text; every other size in this file is
+	   a rem multiple of it, so the root is derived from that size and `body` lands on it exactly. */
+	--text-size: 14px;
+	font-size: calc(var(--text-size) / 0.875);
 	--bg: #110b0b;
 	--sidebar: #1b1010;
 	--card: #221313;

@@ -1835,7 +1835,7 @@ describe("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
-	test("the font size setting rescales the app and survives a relaunch", async () => {
+	test("the font size setting is the size of the conversation text and survives a relaunch", async () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
@@ -1846,27 +1846,30 @@ describe("mounted composer delivery recovery", () => {
 				button?.click();
 			});
 			await page.waitForSelector(".font-size-control");
-			// The default is the size the layout was designed for.
-			expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("14px");
+			// The setting names the size of the reply text, not the root: 14 has to mean that the
+			// conversation itself reads at 14 pixels.
+			expect(await page.evaluate(() => getComputedStyle(document.body).fontSize)).toBe("14px");
 			expect(await page.$eval(".font-size-input", input => (input as HTMLInputElement).value)).toBe("14");
+			expect(await page.$eval(".font-size-input", input => input.closest(".settings-section")?.textContent)).not.toContain(
+				"Scales the whole app",
+			);
 			await page.click('.font-size-control button[aria-label="Larger text"]');
-			await page.waitForFunction(() => getComputedStyle(document.documentElement).fontSize === "15px");
-			// Typing sets the value directly, and out-of-range input is clamped on entry.
+			await page.waitForFunction(() => getComputedStyle(document.body).fontSize === "15px");
+			// Typing sets the value directly, and an out-of-range value waits for the field to be left.
 			await page.click(".font-size-input", { clickCount: 3 });
 			await page.type(".font-size-input", "18");
-			await page.waitForFunction(() => getComputedStyle(document.documentElement).fontSize === "18px");
-			// A value outside the range is only applied once the field is left, where it is clamped.
+			await page.waitForFunction(() => getComputedStyle(document.body).fontSize === "18px");
 			await page.click(".font-size-input", { clickCount: 3 });
 			await page.type(".font-size-input", "99");
-			expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("18px");
+			expect(await page.evaluate(() => getComputedStyle(document.body).fontSize)).toBe("18px");
 			await page.$eval(".font-size-input", input => (input as HTMLInputElement).blur());
-			await page.waitForFunction(() => getComputedStyle(document.documentElement).fontSize === "20px");
+			await page.waitForFunction(() => getComputedStyle(document.body).fontSize === "20px");
 			await page.waitForFunction(
 				() => localStorage.getItem("gjc.desktop.font-size") === "20",
 			);
 			await page.reload();
 			await select(page);
-			expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("20px");
+			expect(await page.evaluate(() => getComputedStyle(document.body).fontSize)).toBe("20px");
 		} finally { await closeFixture(context, page); }
 	}, 40000);
 
