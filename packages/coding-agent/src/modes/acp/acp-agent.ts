@@ -71,6 +71,7 @@ import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } f
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	type AgentSessionEvent,
@@ -79,6 +80,7 @@ import {
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
+import { AcpPromptImageStaging } from "./prompt-image-staging";
 import type { AcpStartupOptions } from "./startup-options";
 import { resolveStartupProvenance } from "./startup-provenance";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -2561,23 +2563,45 @@ export class AcpAgent implements Agent {
 		// Measure the frame the server actually receives, not just the payload: SdkClient
 		// wraps it as {type,operation,input,id} with a UUID id, so a prompt sized just
 		// under the cap would still be killed by CloseCode::Size.
-		const promptFrameBytes = Buffer.byteLength(
-			JSON.stringify({
-				type: "control_request",
-				operation: skillInvocation ? "skill.invoke" : "turn.prompt",
-				input: { ...(skillInvocation ?? { text: payload.text, images: payload.images }), clientRef },
-				// AcpSdkAdapter.control passes `confirm: false` to SdkClient, which serializes
-				// the field even though it is not part of the skill input payload.
-				...(skillInvocation ? { confirm: false } : {}),
-				id: PROMPT_FRAME_ID_PLACEHOLDER,
-			}),
+		const promptFrameBytes = (input: Record<string, unknown>): number =>
+			Buffer.byteLength(
+				JSON.stringify({
+					type: "control_request",
+					operation: skillInvocation ? "skill.invoke" : "turn.prompt",
+					input: { ...input, clientRef },
+					// AcpSdkAdapter.control passes `confirm: false` to SdkClient, which serializes
+					// the field even though it is not part of the skill input payload.
+					...(skillInvocation ? { confirm: false } : {}),
+					id: PROMPT_FRAME_ID_PLACEHOLDER,
+				}),
+			);
+		// Images that do not fit inline are staged losslessly through the host's bounded
+		// `turn.image.*` uploads and referenced by one-shot ID, so only the text-only frame
+		// (with its staged-ID references) is bound by the cap.
+		const stagePromptImages =
+			!skillInvocation &&
+			payload.images.length > 0 &&
+			promptFrameBytes({ text: payload.text, images: payload.images }) > MAX_PROMPT_FRAME_BYTES;
+		const dispatchFrameBytes = promptFrameBytes(
+			skillInvocation ??
+				(stagePromptImages
+					? {
+							text: payload.text,
+							stagedImages: payload.images.map(() => ({ id: PROMPT_FRAME_ID_PLACEHOLDER })),
+						}
+					: { text: payload.text, images: payload.images }),
 		);
-		if (promptFrameBytes > MAX_PROMPT_FRAME_BYTES)
+		if (dispatchFrameBytes > MAX_PROMPT_FRAME_BYTES)
 			throw new AcpSdkAdapterError(
 				"invalid_input",
-				`ACP prompt is ${Math.ceil(promptFrameBytes / 1024)} KiB, over the ${Math.floor(
+				`ACP prompt text is ${Math.ceil(dispatchFrameBytes / 1024)} KiB, over the ${Math.floor(
 					MAX_PROMPT_FRAME_BYTES / 1024,
-				)} KiB transport limit. Attach a smaller or more compressed image.`,
+				)} KiB transport limit. Shorten the prompt text.`,
+			);
+		if (stagePromptImages && payload.images.length > MAX_STAGED_PROMPT_IMAGES)
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				`ACP prompt carries ${payload.images.length} images; at most ${MAX_STAGED_PROMPT_IMAGES} fit when they exceed the inline transport limit.`,
 			);
 		record.publicationGeneration++;
 		// Reset per attempt: a first-turn readiness retry keys on whether THIS attempt was
@@ -2615,6 +2639,17 @@ export class AcpAgent implements Agent {
 			resolve,
 			reject,
 		};
+		const stagedImages = stagePromptImages
+			? new AcpPromptImageStaging(
+					payload.images,
+					clientRef,
+					() =>
+						!waiter.settled &&
+						record.activePrompt === waiter &&
+						!record.cancelRequested &&
+						this.#sessions.get(params.sessionId) === record,
+				)
+			: undefined;
 		try {
 			record.activePrompt = waiter;
 			if (record.pendingPromptAdmission === admissionReservation) record.pendingPromptAdmission = undefined;
@@ -2632,8 +2667,17 @@ export class AcpAgent implements Agent {
 			// The watchdog settles `response`, not this await, so a preflight that never returns
 			// would pin session/prompt open with the caller's promise already rejected. Racing the
 			// settlement lets the re-checks below hand that rejection back to the caller.
+			// Oversize images are staged inside the same preflight window, so a cancel, watchdog
+			// or staging failure takes the existing pre-dispatch settlement paths below.
 			try {
-				await Promise.race([record.adapter.ensureProviders(), settlement]);
+				const preflightAdapter = record.adapter;
+				await Promise.race([
+					(async () => {
+						await preflightAdapter.ensureProviders();
+						if (stagedImages) await stagedImages.stage(preflightAdapter);
+					})(),
+					settlement,
+				]);
 			} catch (error) {
 				waiter.awaitingProviderPreflight = false;
 				if (waiter.settled || record.activePrompt !== waiter) {
@@ -2714,11 +2758,17 @@ export class AcpAgent implements Agent {
 				const submit = async (): Promise<unknown> =>
 					skillInvocation
 						? await promptAdapter.control("skill.invoke", { ...skillInvocation, clientRef })
-						: await promptAdapter.prompt({
-								text: payload.text,
-								clientRef,
-								...(payload.images.length ? { images: payload.images } : {}),
-							});
+						: stagedImages
+							? await stagedImages.submit(
+									promptAdapter,
+									async staged =>
+										await promptAdapter.prompt({ text: payload.text, clientRef, stagedImages: staged }),
+								)
+							: await promptAdapter.prompt({
+									text: payload.text,
+									clientRef,
+									...(payload.images.length ? { images: payload.images } : {}),
+								});
 				let acknowledgement: unknown;
 				try {
 					acknowledgement = await submit();
@@ -3029,6 +3079,8 @@ export class AcpAgent implements Agent {
 				throw error;
 			}
 		} finally {
+			// IDs never handed to turn.prompt (cancel, failure, watchdog) must not hold host quota.
+			stagedImages?.retire();
 			// Exception exits can release ownership without settling the public response.
 			// Wake successor admission without replacing the predecessor's original result.
 			completeOwnership();
