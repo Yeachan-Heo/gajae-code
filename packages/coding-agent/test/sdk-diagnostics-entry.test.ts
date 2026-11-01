@@ -804,7 +804,7 @@ describe("sdk diagnostics public entry (B1)", () => {
 		await fs.mkdir(lifecycleRoot, { recursive: true, mode: 0o700 });
 		try {
 			prepareManagedDirectoryRoot(lifecycleRoot);
-		} catch (e) {
+		} catch {
 			// prepareManagedDirectoryRoot may fail in test environment; ensure directory exists with proper mode
 			await fs.chmod(lifecycleRoot, 0o700);
 		}

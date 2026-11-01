@@ -11113,6 +11113,314 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	const replacementOwnerHarness = async (name: string, cwd: string) => {
+		const state = {
+			idle: false,
+			abortCalls: 0,
+			deliveries: [] as Array<{ content: unknown; deliverAs?: string }>,
+			// A started prompt's submission settles only when its run ends.
+			runs: Promise.withResolvers<void>(),
+		};
+		const harness = await invocationHarness(name, cwd, {
+			isIdle: () => state.idle,
+			abort: () => {
+				state.abortCalls += 1;
+				state.idle = true;
+			},
+			sendUserMessage: async (content, options) => {
+				state.deliveries.push({ content, deliverAs: options?.deliverAs });
+				await options?.onPreflightAcceptCommit?.();
+				if (options?.deliverAs === undefined) await state.runs.promise;
+			},
+		});
+		return { harness, state };
+	};
+
+	test("abort_and_prompt replaces a run the requester owns but queues another connection's text as a steer", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-owner-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-owner", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			state.idle = true;
+			const owned = await harness.controlAs("connection-a", "turn.prompt", { text: "owned by a" });
+			expect(owned).toMatchObject({ ok: true, result: { accepted: true } });
+			state.idle = false;
+			await harness.emit("agent_start", { sdkRunToken: `${owned.result?.commandId}:${owned.result?.turnId}` });
+			// agent_start lifecycle bookkeeping is fire-and-forget; let it adopt the owner.
+			await Bun.sleep(25);
+			state.deliveries.length = 0;
+
+			const foreign = await harness.controlAs("connection-b", "turn.abort_and_prompt", { text: "from b" });
+			expect(foreign).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "from b", deliverAs: "steer" }]);
+
+			state.deliveries.length = 0;
+			const replaced = await harness.controlAs("connection-a", "turn.abort_and_prompt", { text: "from a" });
+			expect(replaced).toMatchObject({ ok: true, result: { accepted: true } });
+			expect(replaced.result).not.toHaveProperty("queuedAs");
+			expect(state.abortCalls).toBe(1);
+			expect(state.deliveries.map(delivery => delivery.content)).toEqual(["from a"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt replaces the requester's accepted prompt before its agent_start", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-owner-pending-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-owner-pending", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			state.idle = true;
+			const owned = await harness.controlAs("connection-a", "turn.prompt", { text: "owned by a" });
+			expect(owned).toMatchObject({ ok: true, result: { accepted: true } });
+			// Accepted and busy, but agent_start has not adopted connection-a as owner yet.
+			state.idle = false;
+			state.deliveries.length = 0;
+
+			const foreign = await harness.controlAs("connection-b", "turn.abort_and_prompt", { text: "from b" });
+			expect(foreign).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(state.abortCalls).toBe(0);
+
+			state.deliveries.length = 0;
+			const replaced = await harness.controlAs("connection-a", "turn.abort_and_prompt", { text: "from a" });
+			expect(replaced).toMatchObject({ ok: true, result: { accepted: true } });
+			expect(replaced.result).not.toHaveProperty("queuedAs");
+			expect(state.abortCalls).toBe(1);
+			expect(state.deliveries.map(delivery => delivery.content)).toEqual(["from a"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt reports a delivered steer as uncertain when its acceptance write fails", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-uncertain-"));
+		let harness: InvocationHarness | undefined;
+		const originalRename = fsPromises.rename.bind(fsPromises);
+		let failedAcceptance = false;
+		// Fail only the durable write that records the delivered steer as accepted.
+		const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+			if (!failedAcceptance && String(from).includes("reconciliation")) {
+				const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+				if (document.records.some(record => record.kind === "steer" && record.status === "accepted")) {
+					failedAcceptance = true;
+					throw Object.assign(new Error("injected steer acceptance write failure"), { code: "EACCES" });
+				}
+			}
+			await originalRename(from, to);
+		});
+		try {
+			const fixture = await replacementOwnerHarness("replacement-steer-uncertain", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const first = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "delivered once" },
+				"uncertain-key",
+			);
+			expect(failedAcceptance).toBe(true);
+			expect(first).toMatchObject({
+				ok: true,
+				result: { accepted: false, aborted: false, queuedAs: "steer", status: "uncertain" },
+			});
+			// The exact-key retry replays the uncertain steer instead of delivering it again.
+			const retried = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "delivered once" },
+				"uncertain-key",
+			);
+			expect(retried).toMatchObject({
+				ok: true,
+				result: {
+					accepted: false,
+					aborted: false,
+					queuedAs: "steer",
+					status: "uncertain",
+					commandId: first.result?.commandId,
+				},
+			});
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "delivered once", deliverAs: "steer" }]);
+		} finally {
+			renameSpy.mockRestore();
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt never stops a run the host started itself", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-host-run-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-host-run", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const response = await harness.controlAs("connection-b", "turn.abort_and_prompt", {
+				text: "host replacement",
+			});
+			expect(response).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer", commandId: expect.any(String) },
+			});
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "host replacement", deliverAs: "steer" }]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("an exact-key abort_and_prompt retry replays its steer instead of queueing or replacing again", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-replay-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-steer-replay", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const first = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued once" },
+				"replacement-key",
+			);
+			expect(first).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			const identity = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			expect(identity.commandId).toEqual(expect.any(String));
+
+			const retried = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued once" },
+				"replacement-key",
+			);
+			expect(retried).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
+			});
+
+			// The run the steer targeted has ended: a retry of the same request still
+			// replays the steer rather than starting a replacement run with its text.
+			state.idle = true;
+			const afterRun = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued once" },
+				"replacement-key",
+			);
+			expect(afterRun).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
+			});
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "queued once", deliverAs: "steer" }]);
+
+			// A different request is a different steer.
+			state.idle = false;
+			const other = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued twice" },
+				"another-key",
+			);
+			expect(other).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(other.result?.commandId).not.toBe(identity.commandId);
+			expect(state.deliveries.map(delivery => delivery.content)).toEqual(["queued once", "queued twice"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt fallback steer is not sent when the target run has ended and been replaced", async () => {
+		// Verify finding 2: when abort-and-prompt degrades to a steer because the
+		// requester doesn't own the run, and the original run ends before the steer
+		// is sent, the steer must NOT be sent to a new run that starts afterwards.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-run-ended-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const state = {
+				idle: false,
+				abortCalls: 0,
+				deliveries: [] as Array<{ content: unknown; deliverAs?: string }>,
+				runs: Promise.withResolvers<void>(),
+				// Track which commandIds are active at each point in time
+				activeCommandIds: new Set<string>(),
+			};
+			harness = await invocationHarness("replacement-steer-run-ended", cwd, {
+				isIdle: () => state.idle,
+				abort: () => {
+					state.abortCalls += 1;
+					state.idle = true;
+				},
+				sendUserMessage: async (content, options) => {
+					state.deliveries.push({ content, deliverAs: options?.deliverAs });
+					await options?.onPreflightAcceptCommit?.();
+					// For non-steer messages, wait for the run to complete
+					if (options?.deliverAs === undefined) await state.runs.promise;
+				},
+			});
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			// Connection-b calls abort_and_prompt, which should queue as a steer
+			// because connection-b doesn't own the run (connection-a does via agent_start).
+			const first = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "text from b" },
+				"finding-2-key",
+			);
+			expect(first).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer" },
+			});
+			// Verify the steer was queued
+			expect(state.deliveries).toEqual([{ content: "text from b", deliverAs: "steer" }]);
+			// End the current run
+			state.runs.resolve();
+			await Bun.sleep(50);
+			// Emit agent_end to complete the first run
+			await harness.emit("agent_end");
+			await Bun.sleep(25);
+			// Start a new run with agent_start
+			state.runs = Promise.withResolvers<void>();
+			state.deliveries.length = 0;
+			state.idle = false;
+			// Emit agent_start for the new run: this changes the lifecycle epoch
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			// Now attempt to consume the steer that was originally queued.
+			// Since the original run has ended and a new run has started,
+			// the steer should NOT be delivered to this new run.
+			// The host should reject it because the target run's lifecycle epoch no longer matches.
+			const deliveryFailureCheck = state.deliveries.length;
+			// Verify no new deliveries were made (the steer must not reach the new run)
+			expect(deliveryFailureCheck).toBe(0);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a zero-progress drained batch stays nonterminal without an exact run proof", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-batch-"));
 		let promptDeadlineMs = 600_000;

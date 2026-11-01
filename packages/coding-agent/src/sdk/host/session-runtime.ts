@@ -118,7 +118,13 @@ import {
 	sanitizeTurnResultContent,
 	type TurnResultContent,
 } from "../turn-result";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl, terminalAbortIdentity } from "./control";
+import {
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	controlRequestFromFrame,
+	dispatchControl,
+	terminalAbortIdentity,
+} from "./control";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
@@ -3175,6 +3181,8 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		failure: QueuedRunStartFailure,
 	) => boolean,
+	/** Connections of accepted own-run submissions whose agent_start has not adopted them yet. */
+	pendingRunOwnerConnectionIds?: () => ReadonlyArray<string | undefined>,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3327,6 +3335,17 @@ function createControlSurface(
 		return seamOwner === undefined
 			? (activePromptOwner.connectionIds?.has(connectionId) ?? false)
 			: seamOwner === connectionId;
+	};
+	// An accepted own-run prompt is adopted as the active owner only at its
+	// agent_start. Between acceptance and that start the session is already busy
+	// with the requester's own work, so it may still replace it. Foreign pending
+	// work, or any run another connection or the host owns, is never replaced.
+	const requesterOwnsReplaceableWork = (connectionId: string): boolean => {
+		if (requesterOwnsActiveRun(connectionId)) return true;
+		const seamOwner = terminalAbortSeams?.getActivePromptOwnerConnectionId?.();
+		if (seamOwner !== undefined || (activePromptOwner.connectionIds?.size ?? 0) > 0) return false;
+		const pendingOwners = pendingRunOwnerConnectionIds?.() ?? [];
+		return pendingOwners.length > 0 && pendingOwners.every(owner => owner === connectionId);
 	};
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
 		if (clientRef === undefined) return undefined;
@@ -4674,6 +4693,57 @@ function createControlSurface(
 			}
 		}
 	};
+	// A steer with a clientRef is reserved durably before dispatch, so a retry of
+	// the same clientRef replays the recorded outcome instead of queueing again.
+	// When a steer is queued as a fallback for a non-owning connection, it must
+	// target only the run it was intended for: if the run ends before the steer
+	// is dispatched, the steer must be rejected to prevent it reaching a new run.
+	const sendSteer = async (
+		text: string,
+		clientRef: string | undefined,
+		expectedSdkRunToken?: string,
+		targetRunEpoch?: number,
+	) => {
+		// Verify the target run hasn't been replaced since abort-and-prompt decided
+		// to degrade to a steer. If the epoch has changed, the original run has ended
+		// and a new run has started, so the steer must not be sent.
+		if (targetRunEpoch !== undefined && targetRunEpoch !== activePromptOwner.lifecycleEpoch) {
+			// The run the steer targeted has ended and been replaced.
+			throw Object.assign(new Error("target_run_ended"), { code: "stale_run" });
+		}
+		const dispatch = () =>
+			sendSdkUserMessage(text, {
+				deliverAs: "steer",
+				...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
+			});
+		if (clientRef === undefined) {
+			const correlation = newCorrelation();
+			await dispatch();
+			return { accepted: true, ...correlation };
+		}
+		const durable = steerReconciliation;
+		const reservation = await durable.reserveSteer(clientRef, text);
+		if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
+		try {
+			await dispatch();
+		} catch (error) {
+			const settled = await durable.settleSteer(clientRef, "rejected", error);
+			if (expectedSdkRunToken !== undefined || targetRunEpoch !== undefined) throw error;
+			return { accepted: false, ...settled };
+		}
+		try {
+			return { accepted: true, ...(await durable.settleSteer(clientRef, "accepted")) };
+		} catch (error) {
+			// The steer is already queued in the session. A failed acceptance write
+			// must not become a durable rejection that invites a second delivery:
+			// record the outcome as uncertain, or keep the in-flight dispatching
+			// record (which replays as uncertain) when that write fails as well.
+			const uncertain = await durable
+				.settleSteer(clientRef, "uncertain", error)
+				.catch(() => durable.lookupSteer(clientRef));
+			return { accepted: false, ...uncertain };
+		}
+	};
 	return {
 		prompt: async (text, images, clientRef, stagedImages) => {
 			const invalid = validateRequiredPromptText("turn.prompt", { text, images, stagedImages });
@@ -4729,28 +4799,7 @@ function createControlSurface(
 		steer: async (text, clientRef, expectedSdkRunToken) => {
 			const invalid = validateRequiredPromptText("turn.steer", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
-			const retainedClientRef = normalizeClientRef(clientRef);
-			const sendSteer = () =>
-				sendSdkUserMessage(text, {
-					deliverAs: "steer",
-					...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
-				});
-			if (retainedClientRef === undefined) {
-				const correlation = newCorrelation();
-				await sendSteer();
-				return { accepted: true, ...correlation };
-			}
-			const durable = steerReconciliation;
-			const reservation = await durable.reserveSteer(retainedClientRef, text);
-			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
-			try {
-				await sendSteer();
-				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
-			} catch (error) {
-				const settled = await durable.settleSteer(retainedClientRef, "rejected", error);
-				if (expectedSdkRunToken !== undefined) throw error;
-				return { accepted: false, ...settled };
-			}
+			return await sendSteer(text, normalizeClientRef(clientRef), expectedSdkRunToken);
 		},
 		followUp: async text => {
 			const invalid = validateRequiredPromptText("turn.follow_up", { text });
@@ -4795,9 +4844,32 @@ function createControlSurface(
 			return { aborted: true };
 		},
 		abortTerminal: terminalAbort,
-		abortAndPrompt: async text => {
+		abortAndPrompt: async (text, idempotencyKey) => {
 			const invalid = validateRequiredPromptText("turn.abort_and_prompt", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
+			// A retry of a request that already degraded to a steer replays that steer,
+			// even when the run it targeted has since ended: the text was delivered once
+			// and must neither be queued again nor start a replacement run.
+			const steerClientRef = abortAndPromptSteerClientRef(idempotencyKey);
+			if (steerClientRef !== undefined) {
+				const prior = steerReconciliation.lookupSteer(steerClientRef);
+				if (prior.status !== "unknown")
+					return { ...(await sendSteer(text, steerClientRef)), aborted: false, queuedAs: "steer" };
+			}
+			// Replacement is the same authority as turn.abort: a connection that
+			// does not own the active run (another client's prompt, or a turn the
+			// host itself started) must not stop it. The replacement text degrades
+			// to a queued steer for that run instead.
+			// Capture the current run's lifecycle epoch so the steer can be verified
+			// to target only the same run. If the run ends before the steer is sent,
+			// the steer will be rejected to prevent delivery to a successor run.
+			const connectionId = sdkControlRequesterContext.getStore();
+			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsReplaceableWork(connectionId))
+				return {
+					...(await sendSteer(text, steerClientRef, undefined, activePromptOwner.lifecycleEpoch)),
+					aborted: false,
+					queuedAs: "steer",
+				};
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
@@ -7683,6 +7755,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					void terminalizeAbandonedSubmission(kind, correlation, rejectionRecoveryIntent(failure.error));
 				return true;
 			},
+			() => pending.map(entry => entry.connectionId),
 		);
 		// The person at this terminal did not stop the turn, so say who did. Only a
 		// Broker-routed operator terminal abort that actually stopped a turn is

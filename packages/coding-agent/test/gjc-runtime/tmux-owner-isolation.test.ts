@@ -606,7 +606,7 @@ describe("closed managed predecessor evidence", () => {
 				const observe = (pid: number) => live.get(pid) ?? { status: "absent" as const };
 				replaceOwnerGenerationSync(stateDir, "session", "generation-a", { state: "absent" });
 				const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session");
-				const root = await seed(stateDir);
+				await seed(stateDir);
 				const publish = () => replaceOwnerGenerationSync(stateDir, "session", "generation-c", baselineA, observe);
 				live.set(4242, { status: "present", incarnation: "supervisor-b" });
 				expect(publish).toThrow("managed_owner_predecessor_live");
