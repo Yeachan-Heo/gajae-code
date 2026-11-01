@@ -215,6 +215,7 @@ function inheritedSubagentApproval(session: ToolSession) {
 	const mode = session.getSdkPermissionMode?.();
 	return {
 		sdkPermissionMode: mode === "deny" || mode === "prompt" ? mode : ("allow" as const),
+		sdkPermissionProvider: session.getSdkPermissionProvider?.(),
 		clientBridge: session.getClientBridge?.(),
 	};
 }
