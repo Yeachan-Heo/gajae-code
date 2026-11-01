@@ -259,7 +259,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		}
 		const source = importable[0]?.source;
 		if (importable.length === 0 || !source) continue;
-		const destination = path.join(input.destinations.hooksDir, `migrated-${source}.ts`);
+		const destination = path.join(input.destinations.hooksDir, "post", `migrated-${source}.ts`);
 		const content = renderHookModule(source, importable);
 		let exists = false;
 		let unsafe = false;
