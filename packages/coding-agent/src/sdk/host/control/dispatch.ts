@@ -318,6 +318,12 @@ function invoke(
 			return surface.cycleThinking();
 		case "permission_mode.set":
 			return surface.setPermissionMode(input.mode);
+		case "permission.channel.set":
+			if (!surface.configurePermissionChannel) invalidInput("External permissions are unavailable.");
+			return surface.configurePermissionChannel(input);
+		case "permission.respond":
+			if (!surface.respondPermission) invalidInput("External permissions are unavailable.");
+			return surface.respondPermission(input);
 		case "queue.steering_mode.set":
 			return surface.setQueueMode("steering", input.mode);
 		case "queue.follow_up_mode.set":

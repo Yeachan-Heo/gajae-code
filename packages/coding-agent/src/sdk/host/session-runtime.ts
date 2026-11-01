@@ -124,6 +124,7 @@ import {
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
+import { ExternalPermissionRuntime } from "./external-permissions";
 import { SessionSdkHost, type SessionSdkHostOptions, TURN_STREAM_CAPABILITY } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "./prompt-image-upload";
@@ -2257,6 +2258,7 @@ export interface SdkSurfaceFactoryOptions {
 	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
 	getRuntimeHost?: () => SessionSdkHost | undefined;
+	externalPermissions?: ExternalPermissionRuntime;
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -2287,6 +2289,7 @@ function createQuerySurface(
 		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 		getRuntimeHost?: () => SessionSdkHost | undefined;
+		externalPermissions?: ExternalPermissionRuntime;
 		primaryControlSurface?: "cli" | "sdk";
 	} = {},
 ): SessionSurface {
@@ -2670,6 +2673,8 @@ function createQuerySurface(
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
 		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
+		getPermissionRequests: input =>
+			options.externalPermissions?.list(input) ?? unavailable("permission.requests.list")(),
 		getAuthProviders: () => [
 			...new Set(ctx.modelRegistry.getAll(getProfileCredentialSessionId()).map(model => model.provider)),
 		],
@@ -2754,6 +2759,7 @@ export function createSdkSurfaceFactory(
 			options.ctx,
 			hasSdkWorkflowGateCapability(options.ctx.workflowGate),
 			options.imageUploadsAvailable,
+			options.externalPermissions !== undefined,
 		);
 	const reconciliation =
 		options.reconciliation ??
@@ -2771,6 +2777,7 @@ export function createSdkSurfaceFactory(
 		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
 		getRuntimeHost: options.getRuntimeHost,
+		externalPermissions: options.externalPermissions,
 		primaryControlSurface: options.primaryControlSurface,
 	});
 	return {
@@ -7217,6 +7224,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			await Promise.race([settled, timeout]);
 		};
 		let runtime: SessionSdkSessionRuntime;
+		const externalPermissions = new ExternalPermissionRuntime(sessionId);
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -7230,6 +7238,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 			getRuntimeHost: () => runtime?.host,
+			externalPermissions,
 			// Origin is explicit at the session bootstrap boundary. The low-level
 			// runtime defaults to SDK for existing embedders; CLI roots pass cli.
 			primaryControlSurface: options.primaryControlSurface ?? "sdk",
@@ -7711,6 +7720,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
 					const result = await runtime.host.reverse.request(
 						"permission",
@@ -7720,13 +7733,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
 							outcome: "selected",
 							optionId: response.optionId,
 							...(typeof response.kind === "string" ? { kind: response.kind as never } : {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -7773,6 +7787,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 		};
+		externalPermissions.installControls(
+			controlSurface,
+			provider => ctx.setSdkPermissionProvider?.(provider),
+			() => Boolean(runtime.host.reverse.getLease("permission")),
+		);
 		runtime = new SessionSdkSessionRuntime({
 			transport,
 			allocateEventGeneration: (sessionId, floor) =>
@@ -7808,6 +7827,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
+				if (
+					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						id: request.id,
+						ok: false,
+						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -7927,6 +7956,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (STREAMED_TURN_EVENT_TYPES.has(event.type)) streamTurnEvent(event, ctx);
 		});
 		const disposeGate = (): void => {
+			const externalPermissionsEnabled = externalPermissions.enabled;
+			externalPermissions.dispose();
+			if (externalPermissionsEnabled) ctx.setSdkPermissionProvider?.(undefined);
 			disposeWorkflowGate?.();
 			disposeFold?.();
 			disposeStream?.();
