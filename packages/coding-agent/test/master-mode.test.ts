@@ -328,6 +328,95 @@ describe("master peer snapshot contributor", () => {
 		expect(message === undefined || message.content.includes("unavailable")).toBe(true);
 		expect(errors).toHaveLength(0);
 	});
+
+	it("calls getOwnerEndpointGeneration lazily at snapshot time", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lazy-gen-")));
+		tempDirs.push(cwd);
+		let getterCallCount = 0;
+		let generationValue: number | undefined;
+		const contributor = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async request => {
+					const scope = (
+						request.target as { scope?: { requestAnchor?: { cwd: string; worktreeRoot: string | null } } }
+					).scope;
+					return resultFor(scope?.requestAnchor?.cwd ?? cwd, scope?.requestAnchor?.worktreeRoot ?? null);
+				},
+			},
+			ownerSessionId: "master-owner",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => {
+				getterCallCount++;
+				return generationValue;
+			},
+		});
+		// Getter is not called during registration
+		expect(getterCallCount).toBe(0);
+		// Getter is called during snapshot collection, before the first provider request
+		const snapshot = await contributor();
+		expect(getterCallCount).toBe(1);
+		expect(snapshot?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		// Verify the getter is called again on retry (before re-collection)
+		generationValue = 42;
+		const retry = await contributor();
+		expect(getterCallCount).toBe(2);
+		expect(retry?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+	});
+
+	it("keeps peer row with different endpoint generation after switch", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-diff-gen-")));
+		tempDirs.push(cwd);
+		// Create a git repository so scope resolution works
+		const git = Bun.spawn(["git", "init", "-q", cwd]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const worktreeRoot = cwd;
+		const contributor = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async () => {
+					// Return a result where master-owner has a different endpoint generation
+					return {
+						ok: true,
+						operation: "session.list",
+						result: {
+							version: 1,
+							scope: {
+								version: 1,
+								requested: "repo",
+								requestAnchor: { cwd, worktreeRoot },
+								resolved: { kind: "repo", worktreeRoot },
+								resolution: "resolved",
+							},
+							status: "populated",
+							observedAt: "2026-08-23T00:00:00.000Z",
+							indexSeq: 3,
+							rows: [
+								{
+									id: "master-owner",
+									locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` },
+									live: true,
+									endpointGeneration: 2,
+								},
+								{ id: "peer-a", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
+							],
+							warnings: [],
+						},
+					} as unknown as SessionListOutcome;
+				},
+			},
+			ownerSessionId: "master-owner",
+			getSessionId: () => "switched",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => 1, // Different from row's generation 2
+		});
+		const snapshot = await contributor();
+		// After switch, master-owner row with different endpoint generation is a real peer
+		expect(snapshot?.content).toContain("master-owner");
+		expect(snapshot?.content).toContain("peer-a");
+	});
 });
 
 describe("master SDK host composition", () => {
