@@ -347,6 +347,7 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "question.answer"
 			| "command.list"
 			| "command.run"
+			| "composer.complete"
 			| "history.get"
 			| "activity.get"
 			| "activity.detail"

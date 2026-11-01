@@ -39,6 +39,7 @@ export const DESKTOP_METHODS = [
 	"question.answer",
 	"command.list",
 	"command.run",
+	"composer.complete",
 	"history.get",
 	"activity.get",
 	"activity.detail",
@@ -247,6 +248,19 @@ export interface DesktopDiff {
 	path: string;
 	status: string;
 	patch: string;
+}
+export interface DesktopCompletionItem {
+	value: string;
+	label: string;
+	description?: string;
+	/** Exact whole-draft replacement from the public TUI provider. */
+	text: string;
+	/** UTF-16 offset in text. */
+	cursor: number;
+}
+export interface DesktopCompletionResult {
+	items: DesktopCompletionItem[];
+	reason?: string;
 }
 export interface DesktopCommand {
 	name: string;

@@ -28,6 +28,7 @@ import type {
 } from "../../desktop-host/src/protocol";
 import { t } from "./i18n";
 
+import { type ComposerAutocompleteSource, useComposerAutocomplete } from "./ComposerAutocomplete";
 import { Markdown } from "./Markdown";
 import { Select } from "./Select";
 
@@ -224,7 +225,7 @@ export function Composer({
 	onStop,
 	busy,
 	disabled,
-	onSlash,
+	autocomplete,
 	controls,
 	attachment,
 	hasAttachments,
@@ -238,7 +239,7 @@ export function Composer({
 	onStop: () => void;
 	busy: boolean;
 	disabled?: boolean;
-	onSlash?: () => void;
+	autocomplete?: ComposerAutocompleteSource;
 	controls?: ReactNode;
 	attachment?: ReactNode;
 	hasAttachments?: boolean;
@@ -250,6 +251,7 @@ export function Composer({
 	const textarea = useRef<HTMLTextAreaElement>(null);
 	const metrics = useRef<HTMLSpanElement>(null);
 	const composing = useRef(false);
+	const completion = useComposerAutocomplete({ value, onChange, textarea, disabled, source: autocomplete });
 	const resize = () => {
 		const element = textarea.current;
 		if (!element) return;
@@ -305,6 +307,7 @@ export function Composer({
 				if (canSubmit) submit();
 			}}
 		>
+			{completion.popup}
 			<span ref={metrics} className="composer-metrics" aria-hidden="true">
 				M
 			</span>
@@ -314,6 +317,10 @@ export function Composer({
 			<div className="composer-input">
 				<textarea
 					ref={textarea}
+					{...completion.aria}
+					onSelect={completion.onSelect}
+					onFocus={completion.onFocus}
+					onBlur={completion.onBlur}
 					id={id}
 					value={value}
 					onChange={event => onChange(event.target.value)}
@@ -325,25 +332,15 @@ export function Composer({
 					onPaste={onPaste}
 					onCompositionStart={() => {
 						composing.current = true;
+						completion.onCompositionStart();
 					}}
 					onCompositionEnd={() => {
 						composing.current = false;
+						completion.onCompositionEnd();
 					}}
 					onKeyDown={event => {
 						if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
-						if (
-							event.key === "/" &&
-							!value &&
-							onSlash &&
-							!event.altKey &&
-							!event.ctrlKey &&
-							!event.metaKey &&
-							!event.shiftKey
-						) {
-							event.preventDefault();
-							onSlash();
-							return;
-						}
+						if (completion.onKeyDown(event)) return;
 						if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
 							event.preventDefault();
 							if (canSubmit) submit();

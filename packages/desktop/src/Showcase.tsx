@@ -1467,7 +1467,23 @@ export default function Showcase() {
 					hasAttachments={attachments.length > 0}
 					onSend={() => setAnswer(t("showcase.answerEmptySent"))}
 					onStop={() => {}}
-					onSlash={() => setAnswer(t("showcase.answerSlash"))}
+					autocomplete={{
+						owner: "showcase-fixture",
+						complete: async (text, cursor) => ({
+							items: Array.from({ length: 24 }, (_, index) => {
+								const file = text.slice(0, cursor).includes("@");
+								const value = file ? `src/fixture-file-${index + 1}.ts` : `fixture-command-${index + 1}`;
+								const replacement = `${file ? "@" : "/"}${value} `;
+								return {
+									value,
+									label: `${file ? "@" : "/"}${value}`,
+									description: "Local showcase fixture · changes the draft only",
+									text: replacement,
+									cursor: replacement.length,
+								};
+							}),
+						}),
+					}}
 					busy={false}
 					controls={<FixtureControls />}
 				/>

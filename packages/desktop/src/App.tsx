@@ -44,6 +44,7 @@ import type {
 	DesktopActivityUpdate,
 	DesktopCommand,
 	DesktopCommandResult,
+	DesktopCompletionResult,
 	DesktopCredentialSaveResult,
 	DesktopDeliveryReceipt,
 	DesktopDiff,
@@ -1262,8 +1263,15 @@ export default function App() {
 			recoveryWork.current = commit.catch(() => {});
 			await commit;
 			try {
-				const result = await request<{ queued?: boolean }>("prompt", params, id);
-				if (result?.queued) setNotice(t("shell.addedToQueue"));
+				const result = await request<({ queued?: boolean } & Partial<DesktopCommandResult>) | null>(
+					"prompt",
+					params,
+					id,
+				);
+				if (selectedRef.current === sessionId) {
+					if (result?.queued) setNotice(t("shell.addedToQueue"));
+					else if (result?.output) setNotice(result.output);
+				}
 			} catch (error) {
 				enqueueRecovery(async () => {
 					const current = recoveriesRef.current.find(item => item.id === id);
@@ -2639,7 +2647,20 @@ export default function App() {
 									)
 								}
 								busy={session.status === "running" || session.status === "waiting"}
-								onSlash={openCommands}
+								autocomplete={
+									connected && session.controlGeneration !== null
+										? {
+												owner: `${session.id}:${session.controlGeneration}`,
+												complete: (text, cursor) =>
+													request<DesktopCompletionResult>("composer.complete", {
+														sessionId: session.id,
+														sessionGeneration: session.controlGeneration,
+														text,
+														cursor,
+													}),
+											}
+										: undefined
+								}
 								disabled={!connected || busyDrafts[session.id]}
 							/>
 						</div>

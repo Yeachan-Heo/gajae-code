@@ -17,7 +17,7 @@ interface FixtureControl {
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
 	failNextAck(mode: "lost" | "error"): void;
 	failPostHandoffDraftSave(count?: number): void;
-	holdPreferences(method: "preferences.get" | "preferences.apply", hold: boolean): void;
+	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
 	receipt(id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]): void;
 	response(id: string, ok: boolean, error?: string, deliveryDisposition?: "refused" | "failed" | "unknown"): void;
@@ -188,6 +188,13 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					const receipt = state.bootReceipt; delete state.bootReceipt; save(state);
 					emit({ type: "delivery", receipt });
 				}
+				if (request.method === "composer.complete") result = {
+					items: Array.from({ length: 24 }, (_, index) => {
+						const value = `fixture-command-${index + 1}`;
+						const text = `/${value} `;
+						return { value, label: `/${value}`, description: "Synthetic mounted App completion · draft only", text, cursor: text.length };
+					}),
+				};
 				if (request.method === "models.list") result = models;
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
@@ -945,6 +952,58 @@ describe("mounted deferred selection intent", () => {
 	}, 30000);
 });
 
+
+describe("mounted composer autocomplete", () => {
+	test("typing slash queries the current owner, opens a bounded popup and only replaces the draft", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type('.composer textarea', '/');
+			await page.waitForSelector('.composer-completions [role="option"]');
+			const query = await page.evaluate(() => window.fixture.requests().find(request => request.method === 'composer.complete'));
+			expect(query?.params).toEqual({ sessionId: 'a', sessionGeneration: 1, text: '/', cursor: 1 });
+			expect(await page.$('dialog[open]')).toBeNull();
+			const menu = await page.$eval('.composer-completions', element => {
+				const box = element.getBoundingClientRect();
+				return { above: box.bottom < document.querySelector('.composer')!.getBoundingClientRect().top, bounded: box.height <= 240, scrollable: element.scrollHeight > element.clientHeight };
+			});
+			expect(menu).toEqual({ above: true, bounded: true, scrollable: true });
+			if (process.env.GJC_DESKTOP_VISUAL_DIR) {
+				await Bun.write(`${process.env.GJC_DESKTOP_VISUAL_DIR}/app-completion-wide.png`, await page.screenshot({ fullPage: true }));
+				await page.setViewport({ width: 390, height: 844 });
+				await Bun.write(`${process.env.GJC_DESKTOP_VISUAL_DIR}/app-completion-narrow.png`, await page.screenshot({ fullPage: true }));
+			}
+			await page.click('.composer-completions [role="option"]');
+			await page.waitForFunction(() => (document.querySelector('.composer textarea') as HTMLTextAreaElement).value === '/fixture-command-1 ');
+			expect(await page.$eval('.composer textarea', element => ({ focus: element === document.activeElement, cursor: (element as HTMLTextAreaElement).selectionStart }))).toEqual({ focus: true, cursor: '/fixture-command-1 '.length });
+			expect(await page.evaluate(() => window.fixture.requests().filter(request => request.method === 'prompt').length)).toBe(0);
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => !!window.fixture.lastPrompt());
+			const prompt = await page.evaluate(() => window.fixture.lastPrompt()!);
+			await page.evaluate(id => {
+				window.fixture.emit({ type: 'delivery', receipt: { id, sessionId: 'a', disposition: 'completed' } });
+				window.fixture.emit({ type: 'response', id, ok: true, result: { consumed: true, output: 'Canonical command output' } });
+			}, prompt.id);
+			await page.waitForFunction(() => document.querySelector('.notice')?.textContent === 'Canonical command output');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a late completion from the previous session cannot replace the current draft", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() => window.fixture.holdPreferences('composer.complete', true));
+			await page.type('.composer textarea', '/old');
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === 'composer.complete'));
+			const old = await page.evaluate(() => window.fixture.requests().find(request => request.method === 'composer.complete')!);
+			await select(page, 1);
+			await page.evaluate(id => window.fixture.emit({ type: 'response', id, ok: true, result: { items: [{ value: 'old', label: 'Stale suggestion', text: '/old-owner ', cursor: 11 }] } }), old.id);
+			expect(await page.$('.composer-completions [role="option"]')).toBeNull();
+			expect(await page.$eval('.composer textarea', element => (element as HTMLTextAreaElement).value)).toBe('');
+			expect(await page.evaluate(() => window.fixture.requests().some(request => request.method === 'prompt'))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
 
 describe("mounted composer delivery recovery", () => {
 	test("short workspace keeps queued inputs and recovery controls reachable", async () => {

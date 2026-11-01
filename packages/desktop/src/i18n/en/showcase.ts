@@ -271,7 +271,6 @@ export const showcase = {
 	"showcase.sessionStateGoalHeading": "Goal states · active and paused actions",
 	"showcase.composerEmptyHeading": "Empty draft · composer and example controls active",
 	"showcase.answerEmptySent": "Sent from the empty-draft design example.",
-	"showcase.answerSlash": "Slash command design example.",
 	"showcase.composerPopulatedHeading": "Written draft · line breaks and keyboard send",
 	"showcase.answerPopulatedSent": "Sent from the written-draft design example.",
 	"showcase.composerRunningHeading": "Running with an empty draft · the slot becomes stop",

@@ -16,6 +16,7 @@ import type {
 	ExtensionUIDialogOptions,
 	InputEventResult,
 } from "@gajae-code/coding-agent/extensibility/extensions";
+import { getBuiltinSlashCommandsForSession } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { initializeExtensions } from "@gajae-code/coding-agent/modes/runtime-init";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import {
@@ -41,6 +42,13 @@ import type {
 } from "./activity-protocol";
 import { prepareDesktopAttachmentInput } from "./attachment-input";
 import { createDesktopBtwController, type DesktopBtwController } from "./btw-controls";
+import {
+	completeDesktopDraft,
+	DesktopComposerCompletion,
+	desktopCompletionTrigger,
+	MANAGED_COMMANDS_UNAVAILABLE,
+	readDesktopCompletionInput,
+} from "./composer-completion";
 import { DeliveryJournal } from "./delivery-journal";
 import { prepareDesktopEnvironment } from "./environment-policy";
 import {
@@ -73,6 +81,7 @@ import type {
 	DesktopCapability,
 	DesktopCommand,
 	DesktopCommandResult,
+	DesktopCompletionResult,
 	DesktopDeliveryReceipt,
 	DesktopDiff,
 	DesktopForkResult,
@@ -94,8 +103,9 @@ import { createDesktopStreamRedactor } from "./stream-redactor";
 
 const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
 	JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
-/** Owned controllers redact complete display fields before producing these DTOs. */
+/** Owned control DTOs are already redacted; completion draft replacements must remain exact. */
 const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
+	"composer.complete",
 	"activity.get",
 	"activity.detail",
 	"activity.operate",
@@ -338,6 +348,7 @@ interface SessionCandidate {
 	notices: DesktopMessage[];
 }
 interface LiveSession extends SessionCandidate {
+	completion?: DesktopComposerCompletion;
 	serviceGeneration: number;
 	titleAbort?: AbortController;
 	unsubscribeActivity: () => void;
@@ -1580,10 +1591,11 @@ export class DesktopHost {
 		text: string,
 		images: ImageContent[],
 		alreadyBegun = false,
+		allowGateMutation = false,
 	): Promise<void> {
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
-		const input = await this.#extensionInput(live, id, text, images, !alreadyBegun);
+		const input = await this.#extensionInput(live, id, text, images, allowGateMutation);
 		if (input.handled) return;
 		accepted = this.#deliveries.list().some(receipt => receipt.id === id && receipt.disposition === "accepted");
 		text = input.text;
@@ -1780,6 +1792,7 @@ export class DesktopHost {
 			await this.close();
 			return null;
 		}
+		if (method === "composer.complete") return this.#complete(params);
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
@@ -2189,6 +2202,23 @@ export class DesktopHost {
 			let { text, images } = attachmentInput;
 			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
 			if (live.operator?.isBusy()) throw new Error("Send the message after the command finishes.");
+			const commandName = /^\s*\/([^\s/]+)(?:\s|$)/.exec(text)?.[1]?.toLowerCase();
+			if (
+				commandName &&
+				(ADVERTISED_COMMANDS.has(commandName) || DESKTOP_OWNED_COMMANDS.has(commandName) || commandName === "btw")
+			) {
+				if (Array.isArray(params.attachments) && params.attachments.length)
+					throw new Error("Slash commands cannot be submitted with attachments.");
+				if (live.busy || live.sdk.isStreaming)
+					throw new Error("Run the command after the current operation finishes.");
+				const result = await this.#command(metadata, text, request.id, true);
+				if (result.refused) await this.#delivery(request.id, { disposition: "refused", error: result.output });
+				else if (result.consumed && result.prompt === undefined && commandName !== "btw")
+					await this.#delivery(request.id, { disposition: "completed" });
+				else if (commandName === "btw") await this.#delivery(request.id, { disposition: "accepted" });
+				return result;
+			}
+			if (text.trimStart().startsWith("/")) await this.#composer(live).initialize();
 			if (live.busy || live.sdk.isStreaming) {
 				const input = await this.#extensionInput(live, request.id, text, images);
 				if (input.handled) return null;
@@ -2468,6 +2498,81 @@ export class DesktopHost {
 			method !== "session.fork" && method !== "session.delete",
 		);
 	}
+	#composer(live: LiveSession): DesktopComposerCompletion {
+		if (live.completion?.isCurrent()) return live.completion;
+		const sdk = live.sdk;
+		const generation = sdk.sessionLifecycle.generation;
+		const sessionId = sdk.sessionId;
+		const manager = sdk.sessionManager;
+		const cwd = manager.getCwd();
+		const project = this.#catalog.projects.find(item => item.id === live.metadata.projectId);
+		let completion: DesktopComposerCompletion;
+		const isCurrent = () => {
+			const lifecycle = sdk.sessionLifecycle;
+			return (
+				!this.#closed &&
+				this.#live.get(live.metadata.id) === live &&
+				!this.#retiredLive.has(live) &&
+				live.completion === completion &&
+				!live.gateMutation &&
+				!!project &&
+				!project.closed &&
+				project.path === cwd &&
+				!lifecycle.disposed &&
+				!lifecycle.transitioning &&
+				lifecycle.generation === generation &&
+				sdk.sessionId === sessionId &&
+				sdk.sessionManager === manager &&
+				manager.getCwd() === cwd
+			);
+		};
+		const tuiCommands = getBuiltinSlashCommandsForSession(sdk.hasExactMcpControls, sdk);
+		const commands = ACP_BUILTIN_SLASH_COMMANDS.filter(command => ADVERTISED_COMMANDS.has(command.name)).map(
+			command => ({
+				...tuiCommands.find(candidate => candidate.name === command.name),
+				name: command.name,
+				description: command.description,
+			}),
+		);
+		commands.push({ name: "btw", description: "Text-only side chat separate from the existing conversation" });
+		completion = new DesktopComposerCompletion(sdk, cwd, commands, isCurrent);
+		live.completion = completion;
+		return completion;
+	}
+
+	async #complete(params: Record<string, unknown>): Promise<DesktopCompletionResult> {
+		const input = readDesktopCompletionInput(params);
+		const metadata = this.#metadata(params);
+		if (metadata.managed) {
+			// A read of suggestions never opens/reconnects an owner on behalf of an old draft.
+			const session = this.#managed.get(metadata.id);
+			const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
+			const cwd = project?.path;
+			const current = () =>
+				!this.#closed &&
+				!!project &&
+				!project.closed &&
+				project.path === cwd &&
+				this.#managed.get(metadata.id) === session &&
+				session?.isAttached === true &&
+				session.controlGeneration === input.sessionGeneration &&
+				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
+			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
+			const trigger = desktopCompletionTrigger(input.text, input.cursor);
+			if (trigger === "slash") return { items: [], reason: MANAGED_COMMANDS_UNAVAILABLE };
+			if (!trigger) return { items: [] };
+			return completeDesktopDraft(input.text, input.cursor, cwd!, [], current);
+		}
+		const live = this.#live.get(metadata.id);
+		if (!live || live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
+			throw new Error("Session changed. Select the conversation again.");
+		await this.#awaitStartup(live);
+		if (live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
+			throw new Error("Session changed. Select the conversation again.");
+		return this.#composer(live).complete(input.text, input.cursor);
+	}
+
 	async #openManaged(metadata: SavedSession): Promise<ManagedSession> {
 		const existing = this.#managed.get(metadata.id);
 		if (existing?.isAttached) return existing;
@@ -2830,7 +2935,12 @@ export class DesktopHost {
 	 * executes exactly the same handlers as text/ACP mode. Commands that only
 	 * exist as TUI modals are not advertised and cannot reach this path.
 	 */
-	async #command(metadata: SavedSession, text: string, requestId: string): Promise<DesktopCommandResult> {
+	async #command(
+		metadata: SavedSession,
+		text: string,
+		requestId: string,
+		alreadyBegun = false,
+	): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
 		await this.#awaitStartup(live);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
@@ -2857,9 +2967,14 @@ export class DesktopHost {
 			// would report success and an unknown name would spend a provider turn.
 			return { consumed: false, refused: true, output: DESKTOP_UNAVAILABLE };
 		// Commands mutate the same session as prompts, so they take the same lock.
-		return this.#exclusive(live, () => this.#runCommand(live, text, requestId), true);
+		return this.#exclusive(live, () => this.#runCommand(live, text, requestId, alreadyBegun), true);
 	}
-	async #runCommand(live: LiveSession, text: string, requestId: string): Promise<DesktopCommandResult> {
+	async #runCommand(
+		live: LiveSession,
+		text: string,
+		requestId: string,
+		alreadyBegun = false,
+	): Promise<DesktopCommandResult> {
 		const chunks: string[] = [];
 		let written = 0;
 		let dropped = false;
@@ -2877,12 +2992,16 @@ export class DesktopHost {
 			settings: live.settings,
 			cwd: live.sdk.sessionManager.getCwd(),
 			output: value => append(String(value)),
-			refreshCommands: () => this.#publishSnapshot(),
+			refreshCommands: () => {
+				live.completion = undefined;
+				this.#publishSnapshot();
+			},
 			reloadPlugins: async () => {
 				// Mirror the TUI runtime so /move leaves the session in a consistent state.
 				const projectPath = await resolveActiveProjectRegistryPath(live.sdk.sessionManager.getCwd());
 				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 				await live.sdk.reloadSkills();
+				live.completion = undefined;
 				this.#publishSnapshot();
 			},
 			notifyTitleChanged: () => this.#syncTitle(live),
@@ -2917,7 +3036,7 @@ export class DesktopHost {
 				// A builtin that returns a prompt starts a real turn, so its failure is the
 				// conversation's failure even though command.run itself is administrative.
 				try {
-					await this.#promptDelivery(live, requestId, forwarded, []);
+					await this.#promptDelivery(live, requestId, forwarded, [], alreadyBegun, true);
 				} catch (error) {
 					if (
 						!live.errorOwner &&

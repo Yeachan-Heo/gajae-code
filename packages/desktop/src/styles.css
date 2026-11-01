@@ -299,6 +299,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .composer-area { padding: 12px 24px 20px; flex-shrink: 0; max-height: 60dvh; overflow: auto; }
 .composer { position: relative; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); padding: 12px; max-width: 800px; min-width: 0; margin: 0 auto; box-shadow: var(--shadow-rest); transition: border-color var(--dur) var(--ease); }
 .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }
+.composer:has(textarea:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .composer[data-disabled] { border-color: var(--border); background: var(--surface); }
 .composer-metrics { position: absolute; width: 1ch; height: 1lh; line-height: 1.55; visibility: hidden; pointer-events: none; }
 .composer-input { min-width: 0; }
@@ -321,6 +322,14 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .composer-actions { display: flex; align-items: center; margin-left: auto; flex: none; }
 .composer-action { min-width: 34px; min-height: 34px; aspect-ratio: 1; padding: 0; justify-content: center; border-radius: var(--radius-sm); }
 .composer-action > svg { margin: 0; }
+/* Portal above the composer: the bounded composer-area must not clip its suggestions. */
+.composer-completions { position: fixed; z-index: 40; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); padding: 4px; }
+.composer-completions [role="option"] { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; min-width: 0; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 9px 12px; text-align: left; overflow-wrap: anywhere; white-space: pre-wrap; }
+.composer-completions [role="option"]:hover, .composer-completions [aria-selected="true"] { background: var(--accent-soft); }
+.composer-completions strong { font-weight: 500; }
+.composer-completions strong, .composer-completions small { min-width: 0; max-width: 100%; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.composer-completions small, .composer-completions > p { color: var(--muted); font-size: 0.8125rem; }
+.composer-completions > p { margin: 0; padding: 9px 12px; }
 .error-banner { display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; margin: 8px 0; border: 1px solid color-mix(in srgb, var(--error) 60%, transparent); border-radius: var(--radius-md); color: var(--error); background: var(--error-soft); overflow-wrap: anywhere; white-space: pre-wrap; }
 .error-banner > svg { margin-top: 3px; }
 .error-content { min-width: 0; }
