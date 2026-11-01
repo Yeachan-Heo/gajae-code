@@ -397,7 +397,7 @@ import {
 	type WorkflowRecoveryZeroProgressMemory,
 } from "../gjc-runtime/workflow-recovery-projection";
 import { GoalRuntime } from "../goals/runtime";
-import type { Goal, GoalModeState } from "../goals/state";
+import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import {
 	buildSkillStopOutput,
@@ -417,7 +417,7 @@ import {
 	type WorkflowGateEmitter,
 } from "../modes/shared/agent-wire/workflow-gate-broker";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
-import type { PlanModeState } from "../plan-mode/state";
+import { type PlanModeState, restoredPlanFilePath } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
@@ -3213,6 +3213,7 @@ export class AgentSession {
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
 	#sessionIdentityChangeListeners = new Set<() => void | Promise<void>>();
+	#committedSessionSwitchListeners = new Set<() => void | Promise<void>>();
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
@@ -11217,6 +11218,12 @@ export class AgentSession {
 		return () => this.#sessionIdentityChangeListeners.delete(listener);
 	}
 
+	/** Fires after a different-file switch commits, including when later cleanup throws. */
+	subscribeCommittedSessionSwitch(listener: () => void | Promise<void>): () => void {
+		this.#committedSessionSwitchListeners.add(listener);
+		return () => this.#committedSessionSwitchListeners.delete(listener);
+	}
+
 	/**
 	 * Temporarily disconnect from agent events.
 	 * User listeners are preserved and will receive events again after resubscribe().
@@ -14502,6 +14509,13 @@ export class AgentSession {
 		}
 	}
 
+	/** Drop plan mode and its reference when plan tool activation does not finish. */
+	clearPlanModeBinding(): void {
+		this.setPlanModeState(undefined);
+		this.#planReferenceSent = false;
+		this.#planReferencePath = "local://PLAN.md";
+	}
+
 	async invokeSkill(
 		name: string,
 		args = "",
@@ -14687,6 +14701,30 @@ export class AgentSession {
 
 	setGoalModeState(state: GoalModeState | undefined): void {
 		this.#applyGoalModeState(state);
+	}
+
+	/**
+	 * The loaded session file is the mode source after a switch to a different
+	 * file. A saved plan is installed only when plan mode is enabled and tools
+	 * are available, and only with a session-scoped plan path. A saved goal is
+	 * installed only when goal mode is enabled; otherwise the goal slot is cleared.
+	 */
+	#rebindSwitchedSessionMode(sessionContext: SessionContext): void {
+		const mode = sessionContext.mode;
+		const planEligible =
+			mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
+		if (planEligible) {
+			const planFilePath = restoredPlanFilePath(sessionContext.modeData?.planFilePath);
+			this.setPlanModeState({ enabled: true, planFilePath });
+		} else {
+			this.clearPlanModeBinding();
+		}
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		this.setGoalModeState(savedGoal ? { enabled: mode === "goal", mode: "active", goal: savedGoal } : undefined);
+		this.#resetInjectedContextSignatures();
 	}
 
 	getWorkflowGateEmitter(): WorkflowGateEmitter | undefined {
@@ -25131,6 +25169,7 @@ export class AgentSession {
 				signal,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				rowId: failedRowId,
+				modelId: candidate.id,
 			});
 		}
 		const inventory = authStorage.listCredentialInventory(candidate.provider);
@@ -25143,7 +25182,7 @@ export class AgentSession {
 				peer.credentialKind !== credentialKind ||
 				failedRowIds.has(peer.id) ||
 				peer.disabled ||
-				!authStorage.isCredentialAvailable(candidate.provider, peer.id)
+				!authStorage.isCredentialAvailable(candidate.provider, peer.id, candidate.id)
 			) {
 				continue;
 			}
@@ -25169,10 +25208,11 @@ export class AgentSession {
 					signal,
 					owner: this.#modelRegistry.getAuthStorageOwner(),
 					rowId: peer.id,
+					modelId: candidate.id,
 				});
 				continue;
 			}
-			if (authStorage.isCredentialAvailable(candidate.provider, peer.id)) {
+			if (authStorage.isCredentialAvailable(candidate.provider, peer.id, candidate.id)) {
 				return { apiKey: resolved.apiKey, credentialRowId: peer.id };
 			}
 		}
@@ -25199,7 +25239,7 @@ export class AgentSession {
 		}
 		if (
 			resolved.credentialRowId !== undefined &&
-			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId, candidate.id)
 		) {
 			if (!this.#hasManagedFallbackCredentialPin(candidate.provider)) {
 				for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
@@ -25207,7 +25247,7 @@ export class AgentSession {
 						resolved = await resolveCurrentSelection();
 						break;
 					}
-					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
+					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)) continue;
 					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
 					try {
 						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
@@ -25238,7 +25278,7 @@ export class AgentSession {
 					if (
 						!alternative.apiKey ||
 						alternative.credentialRowId !== credential.id ||
-						!authStorage.isCredentialAvailable(candidate.provider, credential.id)
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)
 					) {
 						continue;
 					}
@@ -25248,7 +25288,7 @@ export class AgentSession {
 			}
 			if (
 				resolved.credentialRowId !== undefined &&
-				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId, candidate.id)
 			) {
 				return {
 					apiKey: undefined,
@@ -27239,7 +27279,7 @@ export class AgentSession {
 							credential.provider !== storageProvider ||
 							credential.credentialKind !== credentialKind ||
 							triedRows.has(credential.id) ||
-							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)
 						)
 							continue;
 						let credentialKeyResult: { kind: "resolved"; value: string | undefined } | { kind: "aborted" };
@@ -27250,7 +27290,7 @@ export class AgentSession {
 								}),
 							);
 						} catch (error) {
-							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)) {
+							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)) {
 								await rollbackCancelled();
 								throw error;
 							}
@@ -27275,7 +27315,7 @@ export class AgentSession {
 						if (
 							selectedRowId !== credential.id ||
 							selectedKind !== credentialKind ||
-							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)
 						)
 							continue;
 						selectedCredentialRowId = selectedRowId;
@@ -27561,6 +27601,7 @@ export class AgentSession {
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
+				modelId: model.id,
 			});
 			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
 			const trackedCredentialKind = credentialKind ?? beforeKind;
@@ -27575,14 +27616,14 @@ export class AgentSession {
 			if (credentialKind === undefined) return "unchanged";
 			for (const peerId of remainingCredentialIds) {
 				if (triedRows?.has(peerId)) continue;
-				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				if (!authStorage.isCredentialAvailable(provider, peerId, model.id)) continue;
 				let peerApiKey: string | undefined;
 				try {
 					peerApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(peerId) },
 					});
 				} catch (error) {
-					if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+					if (!authStorage.isCredentialAvailable(provider, peerId, model.id)) continue;
 					throw error;
 				}
 				if (!isAuthenticated(peerApiKey)) continue;
@@ -27591,7 +27632,7 @@ export class AgentSession {
 				if (
 					selectedRowId === peerId &&
 					selectedKind === credentialKind &&
-					authStorage.isCredentialAvailable(provider, peerId)
+					authStorage.isCredentialAvailable(provider, peerId, model.id)
 				) {
 					triedRows?.add(selectedRowId);
 					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before
@@ -29640,6 +29681,11 @@ export class AgentSession {
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
 		let sessionIdentityCommitted = false;
+		// Committed-switch listeners rebind controllers from the successor file. A
+		// same-file reload whose exact ownership changed still publishes a new
+		// identity, but #rebindSwitchedSessionMode does not run for it, so the
+		// listeners must not detach the live mode either.
+		let differentSessionCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -30034,6 +30080,10 @@ export class AgentSession {
 					);
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
+					differentSessionCommitted = true;
+					// Bind plan before post-commit cleanup. A cleanup failure leaves this
+					// successor active and must not keep the predecessor plan slot.
+					this.#rebindSwitchedSessionMode(sessionContext);
 					// A checkpoint count and entry id belong to the predecessor file.
 					// Leaving them armed lets a later rewind slice the successor and
 					// branch it from a missing entry, which falls back to the root.
@@ -30299,7 +30349,17 @@ export class AgentSession {
 				}
 			}
 			this.#endSessionTransition();
-			if (sessionIdentityCommitted) await this.notifySessionIdentityChanged();
+			if (sessionIdentityCommitted) {
+				const committedSwitchListeners = differentSessionCommitted ? [...this.#committedSessionSwitchListeners] : [];
+				for (const listener of committedSwitchListeners) {
+					try {
+						await listener();
+					} catch (error) {
+						logger.warn("Committed session switch listener failed", { error: String(error) });
+					}
+				}
+				await this.notifySessionIdentityChanged();
+			}
 		}
 	}
 

@@ -31,6 +31,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-identity listener fan-out for in-process session surfaces; not a user-facing SDK control seam",
 	"agent_session:subscribeSessionIdentityChanges":
 		"internal session-identity subscription used by in-process adapters to follow session replacement; not a user-facing SDK control seam",
+	"agent_session:subscribeCommittedSessionSwitch":
+		"internal committed-switch subscription used by the interactive mode to reconcile plan and goal controllers; not a user-facing SDK control seam",
+	"agent_session:clearPlanModeBinding":
+		"internal plan-mode rollback when plan tool activation fails; not a user-facing SDK control seam",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:mcp":

@@ -1,5 +1,5 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
-import { schemaHash } from "../modes/shared/agent-wire/workflow-gate-schema";
+import * as crypto from "node:crypto";
+import { compileGateSchema, schemaHash, validateGateAnswer } from "../modes/shared/agent-wire/workflow-gate-schema";
 import type { JsonSchema, WorkflowGate } from "../modes/shared/agent-wire/workflow-gate-types";
 import { buildAskGateAnswerSchema, validateAskGateStageState } from "../modes/shared/agent-wire/workflow-gate-types";
 
@@ -260,7 +260,12 @@ export function decodeAskGateV1(gate: WorkflowGate): PrivateAskGateCodecV1 | nul
 		if (
 			!isRecord(option) ||
 			!boundedText(option.label) ||
-			option.value !== option.label ||
+			!isRecord(option.value) ||
+			!sameKeys(option.value, ["selected"]) ||
+			!Object.hasOwn(option.value, "selected") ||
+			!Array.isArray(option.value.selected) ||
+			option.value.selected.length !== 1 ||
+			option.value.selected[0] !== option.label ||
 			labels.includes(option.label)
 		)
 			return null;
@@ -274,6 +279,13 @@ export function decodeAskGateV1(gate: WorkflowGate): PrivateAskGateCodecV1 | nul
 	const multi = gate.context.stage_state.multi as boolean;
 	const allowEmpty = gate.context.stage_state.allow_empty as boolean;
 	if (gate.schema_hash !== schemaHash(askSchema(labels, multi, allowEmpty))) return null;
+	try {
+		const compiled = compileGateSchema(gate.schema);
+		if (compiled.hash !== gate.schema_hash) return null;
+		for (const option of gate.options) if (validateGateAnswer(compiled, gate.gate_id, option.value)) return null;
+	} catch {
+		return null;
+	}
 	return {
 		schema_version: 1,
 		labels,
@@ -368,10 +380,10 @@ export function translateCoordinatorAskAnswer(codec: PrivateAskGateCodecV1, answ
 	return { ...answer, selected: answer.selected.map(id => codec.labels[Number(id.slice(4))]!) };
 }
 export function createAnswerBinding(): string {
-	return randomBytes(32).toString("base64url");
+	return crypto.randomBytes(32).toString("base64url");
 }
 export function answerBindingMatches(binding: string, expected: string): boolean {
 	const left = Buffer.from(binding);
 	const right = Buffer.from(expected);
-	return left.length === right.length && timingSafeEqual(left, right);
+	return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
