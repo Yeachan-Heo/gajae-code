@@ -7,6 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const root = path.resolve(import.meta.dir, "../../..");
@@ -57,6 +58,21 @@ async function handshake(mode: string) {
 }
 
 describe("desktop host internal worker modes", () => {
+	test("SDK child modes reach the real CLI before desktop environment setup", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-sdk-dispatch-"));
+		try {
+			const child = Bun.spawn([process.execPath, entry, "sdk", "--help"], {
+				cwd: root,
+				env: { HOME: home, PATH: "/usr/bin:/bin" },
+				stdin: "ignore", stdout: "pipe", stderr: "pipe",
+			});
+			const [code, output, errors] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+			expect({ code, errors }).toEqual({ code: 0, errors: "" });
+			expect(output).toContain('"id":"sdk/overview/summary"');
+			expect(output).not.toContain('"type":"fatal"');
+		} finally { await fs.rm(home, { recursive: true, force: true }); }
+	}, 30_000);
+
 	test("answers the guardian handshake with an authenticated record", async () => {
 		const { record, token } = await handshake("--internal-bash-shell-worker");
 		// The desktop protocol answers with a fatal frame and no token; the worker

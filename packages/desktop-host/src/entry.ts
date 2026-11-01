@@ -5,6 +5,7 @@
 // internal modes must be dispatched before any desktop host setup: without it the
 // worker lane starts a second desktop host, and its frames arrive on the worker
 // pipe as unauthenticated protocol records, so every bash call fails.
+import { runCli } from "@gajae-code/coding-agent/cli";
 import {
 	BASH_SHELL_RUNTIME_ARG,
 	BASH_SHELL_SUPERVISOR_ARG,
@@ -22,6 +23,11 @@ if (internal === BASH_SHELL_WORKER_ARG) {
 } else if (internal === BASH_SHELL_RUNTIME_ARG) {
 	const { runBashShellWorker } = await import("@gajae-code/coding-agent/exec/bash-shell-worker");
 	await runBashShellWorker();
+} else if (process.argv[2] === "sdk") {
+	// SDK broker/session-host launches use process.execPath, not PATH. The same
+	// compiled image must serve those owned CLI modes without starting a second
+	// desktop protocol host or stripping the SDK's child admission environment.
+	await runCli(process.argv.slice(2));
 } else {
 	// Imported here so the desktop environment policy runs only for a real host
 	// launch, never inside an internal worker process.

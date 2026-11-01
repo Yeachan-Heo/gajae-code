@@ -48,6 +48,31 @@ fn fatal(app: &tauri::AppHandle, error: &str) {
 	let _ = emit(app, json!({"type": "fatal", "error": error}));
 }
 
+/// Release launches own both executables in Contents/MacOS. Prepend that
+/// directory for workflow shell commands and SDK task subprocesses; never
+/// require a separately installed Bun or gjc, and never mutate the user's
+/// global PATH.
+#[cfg(any(not(debug_assertions), test))]
+fn bundled_command(
+	directory: &std::path::Path,
+	inherited_path: Option<&std::ffi::OsStr>,
+) -> Result<Command, String> {
+	let binary = if cfg!(windows) {
+		"gjc-desktop-host.exe"
+	} else {
+		"gjc-desktop-host"
+	};
+	let mut paths = vec![directory.to_path_buf()];
+	let inherited =
+		inherited_path.unwrap_or_else(|| std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"));
+	paths.extend(std::env::split_paths(inherited));
+	let path = std::env::join_paths(paths)
+		.map_err(|error| format!("Cannot assemble bundled command PATH: {error}"))?;
+	let mut command = Command::new(directory.join(binary));
+	command.env("PATH", path);
+	Ok(command)
+}
+
 fn command() -> Result<Command, String> {
 	#[cfg(debug_assertions)]
 	{
@@ -69,12 +94,7 @@ fn command() -> Result<Command, String> {
 		let directory = executable
 			.parent()
 			.ok_or("Cannot locate desktop executable directory")?;
-		let binary = if cfg!(windows) {
-			"gjc-desktop-host.exe"
-		} else {
-			"gjc-desktop-host"
-		};
-		Ok(Command::new(directory.join(binary)))
+		bundled_command(directory, std::env::var_os("PATH").as_deref())
 	}
 }
 
@@ -483,7 +503,46 @@ mod tests {
 	use serde_json::{Value, json};
 	use tokio::io::{AsyncRead, ReadBuf};
 
-	use super::{encode_engine_request, validate_auth_url};
+	use super::{bundled_command, encode_engine_request, validate_auth_url};
+
+	#[test]
+	fn bundled_host_prefers_app_local_cli_without_losing_system_tools() {
+		let directory = std::path::Path::new("/Applications/Gajae Code.app/Contents/MacOS");
+		let inherited = std::ffi::OsStr::new("/usr/bin:/bin:/some/older/gjc/bin");
+		let command = bundled_command(directory, Some(inherited)).unwrap();
+		let command = command.as_std();
+		assert_eq!(command.get_program(), directory.join("gjc-desktop-host"));
+		let path = command
+			.get_envs()
+			.find(|(key, _)| *key == "PATH")
+			.and_then(|(_, value)| value)
+			.unwrap();
+		assert_eq!(std::env::split_paths(path).collect::<Vec<_>>(), vec![
+			directory.to_path_buf(),
+			"/usr/bin".into(),
+			"/bin".into(),
+			"/some/older/gjc/bin".into()
+		]);
+	}
+
+	#[test]
+	fn bundled_host_can_supply_cli_when_finder_provides_no_path() {
+		let directory = std::path::Path::new("/Applications/Gajae Code.app/Contents/MacOS");
+		let command = bundled_command(directory, None).unwrap();
+		let path = command
+			.as_std()
+			.get_envs()
+			.find(|(key, _)| *key == "PATH")
+			.and_then(|(_, value)| value)
+			.unwrap();
+		assert_eq!(std::env::split_paths(path).collect::<Vec<_>>(), vec![
+			directory.to_path_buf(),
+			"/usr/bin".into(),
+			"/bin".into(),
+			"/usr/sbin".into(),
+			"/sbin".into()
+		]);
+	}
 
 	/// Feeds at most `limit` bytes per `poll_read`, the way a pipe hands the
 	/// reader an 8 KiB `BufReader` fill at a time.
@@ -593,8 +652,9 @@ mod tests {
 
 	#[test]
 	fn admits_workspace_layout_methods() {
-		// The renderer's workspace menu and drag reorder depend on these three methods; a method
-		// missing from this admission list fails in the shipping app even though the host supports it.
+		// The renderer's workspace menu and drag reorder depend on these three methods;
+		// a method missing from this admission list fails in the shipping app even
+		// though the host supports it.
 		for (method, params) in [
 			("project.close", json!({"projectId": "11111111-1111-4111-8111-111111111111"})),
 			("project.reorder", json!({"ids": ["11111111-1111-4111-8111-111111111111"]})),
