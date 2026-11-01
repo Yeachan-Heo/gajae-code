@@ -1669,9 +1669,9 @@ export default function App() {
 					}}
 					refreshing={catalog?.loading === true}
 					loading={loadingModels}
-					onApplyProfile={profileId => {
+					onApplyProfile={(profileId, scope) => {
 						if (modelOwnerRef.current !== ownerKey) return;
-						const action: DesktopPreferenceAction = { type: "profile.select", name: profileId, scope: "session" };
+						const action: DesktopPreferenceAction = { type: "profile.select", name: profileId, scope };
 						routePreference(
 							action,
 							() =>
@@ -1690,9 +1690,10 @@ export default function App() {
 							() => deferModel(modelId),
 						);
 					}}
-					onAssign={(role, modelId) => {
+					onAssign={(role, modelId, scope) => {
 						if (modelOwnerRef.current !== ownerKey) return;
-						if (role === "default" && modelId !== null) {
+						if (role !== "default" && scope !== "session") return;
+						if (role === "default" && modelId !== null && scope === "session") {
 							route(
 								() =>
 									void run(modelScope, async () => {

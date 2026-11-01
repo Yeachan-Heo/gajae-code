@@ -421,6 +421,229 @@ describe("mounted model selection deferral", () => {
 	test("applies a model chosen during a run once the session settles, without a second request", async () => {
 		const { context, page } = await fixture();
 		try {
+async function selectionFixture(preferences: DesktopPreferences = deferralPreferences): Promise<{ context: BrowserContext; page: Page }> {
+	const { context, page } = await fixture();
+	try {
+		await page.evaluate(() => {
+			window.fixture.setModels([
+				{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+				{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+			]);
+			window.fixture.holdPreferences("preferences.get", true);
+			window.fixture.holdPreferences("preferences.apply", true);
+		});
+		await select(page);
+		await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.get"));
+		const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+		await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: preferences });
+		await selectionSession(page, "idle");
+		await page.waitForSelector(".model-trigger:not([disabled])");
+		await page.evaluate(() => {
+			const committed = Promise.withResolvers<void>();
+			requestAnimationFrame(() => requestAnimationFrame(() => committed.resolve()));
+			return committed.promise;
+		});
+		return { context, page };
+	} catch (error) {
+		await context.close();
+		throw error;
+	}
+}
+
+async function selectionSession(page: Page, status: DesktopSession["status"], generation = 1): Promise<void> {
+	await page.evaluate(({ status, generation }) => window.fixture.emit({
+		type: "session",
+		session: {
+			id: "a", title: "Session A", projectId: "p", status, starred: false,
+			imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: generation,
+			model: "fixture/model-one", messages: [],
+		},
+	}), { status, generation });
+}
+
+async function openSelectionScope(page: Page, kind: "model" | "profile"): Promise<void> {
+	await page.click(".model-trigger");
+	await page.waitForSelector(".model-dialog");
+	await page.evaluate(kind => document.querySelectorAll<HTMLButtonElement>(".model-tab")[kind === "profile" ? 0 : 1]!.click(), kind);
+	if (kind === "profile") {
+		await page.waitForSelector(".preset-group-head");
+		if (await page.$('.preset-group-head[aria-expanded="false"]')) await page.click(".preset-group-head");
+		await page.waitForSelector('[data-profile-id="focused"]');
+		await page.click('[data-profile-id="focused"]');
+	} else {
+		await page.click('[data-model-id="fixture/model-two"]');
+		await page.waitForSelector(".model-role-option:not([disabled])");
+		await page.click(".model-role-option");
+	}
+	await page.waitForSelector(".model-scope-choice");
+}
+
+async function selectionWrites(page: Page): Promise<DesktopRequest[]> {
+	return (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set" || request.method === "preferences.apply");
+}
+
+describe("mounted model and preset scope confirmation", () => {
+	for (const kind of ["model", "profile"] as const) {
+		for (const scope of ["session", "default"] as const) {
+			test(`${kind} ${scope} confirmation dispatches the exact owner-scoped operation`, async () => {
+				const { context, page } = await selectionFixture();
+				try {
+					await openSelectionScope(page, kind);
+					expect(await selectionWrites(page)).toEqual([]);
+					await page.click(`.model-scope-option[data-scope="${scope}"]`);
+					await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set" || request.method === "preferences.apply"));
+					const writes = await selectionWrites(page);
+					expect(writes).toHaveLength(1);
+					if (kind === "model" && scope === "session") {
+						expect(writes[0]!.method).toBe("model.set");
+						expect(writes[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two" });
+					} else {
+						expect(writes[0]!.method).toBe("preferences.apply");
+						expect(writes[0]!.params).toEqual({
+							sessionId: "a",
+							action: kind === "profile"
+								? { type: "profile.select", name: "focused", scope }
+								: { type: "role.set", role: "default", modelId: "fixture/model-two" },
+						});
+					}
+				} finally { await closeFixture(context, page); }
+			}, 30000);
+		}
+
+		test(`${kind} default intent survives streaming and dispatches once after settling`, async () => {
+			const { context, page } = await selectionFixture();
+			try {
+				await selectionSession(page, "running");
+				await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+				await openSelectionScope(page, kind);
+				await page.click('.model-scope-option[data-scope="default"]');
+				await page.waitForSelector(".model-dialog", { hidden: true });
+				expect(await selectionWrites(page)).toEqual([]);
+				await selectionSession(page, "done");
+				await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
+				const writes = await selectionWrites(page);
+				expect(writes).toHaveLength(1);
+				expect(writes[0]!.method).toBe("preferences.apply");
+				expect(writes[0]!.params).toEqual({
+					sessionId: "a",
+					action: kind === "profile"
+						? { type: "profile.select", name: "focused", scope: "default" }
+						: { type: "role.set", role: "default", modelId: "fixture/model-two" },
+				});
+				await page.evaluate(({ id, kind, preferences }) => window.fixture.emit({
+					type: "response", id, ok: true,
+					result: kind === "profile"
+						? { applied: "profile.select", profileId: "focused", scope: "default", durability: "persisted", preferences }
+						: { applied: "role.set", role: "default", scope: "default", durability: "persisted", preferences },
+				}), { id: writes[0]!.id, kind, preferences: deferralPreferences });
+				await page.waitForSelector(".model-trigger:not([disabled])");
+				await selectionSession(page, "done");
+				await Bun.sleep(150);
+				expect(await selectionWrites(page)).toHaveLength(1);
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+
+		test(`${kind} confirmation cannot outlive its owner's control generation`, async () => {
+			const { context, page } = await selectionFixture();
+			try {
+				await openSelectionScope(page, kind);
+				// Keep a real stale DOM callback, then replace the same session's owner.
+				await page.evaluate(() => {
+					const stale = document.querySelector<HTMLButtonElement>('.model-scope-option[data-scope="default"]')!;
+					document.addEventListener("fixture-stale-selection", () => stale.click(), { once: true });
+				});
+				await selectionSession(page, "idle", 2);
+				await page.waitForSelector(".model-dialog", { hidden: true });
+				await page.evaluate(() => document.dispatchEvent(new Event("fixture-stale-selection")));
+				await selectionSession(page, "done", 2);
+				await Bun.sleep(150);
+				expect(await selectionWrites(page)).toEqual([]);
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+
+		test(`${kind} deferred default is discarded on owner change`, async () => {
+			const { context, page } = await selectionFixture();
+			try {
+				await selectionSession(page, "running");
+				await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+				await openSelectionScope(page, kind);
+				await page.click('.model-scope-option[data-scope="default"]');
+				await page.waitForSelector(".model-dialog", { hidden: true });
+				await selectionSession(page, "idle", 2);
+				await page.waitForFunction(() => !document.body.textContent?.includes("Working"));
+				await selectionSession(page, "done", 2);
+				await Bun.sleep(150);
+				expect(await selectionWrites(page)).toEqual([]);
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+
+		test(`${kind} deferred default cannot follow selection to another conversation`, async () => {
+			const { context, page } = await selectionFixture();
+			try {
+				await selectionSession(page, "running");
+				await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+				await openSelectionScope(page, kind);
+				await page.click('.model-scope-option[data-scope="default"]');
+				await page.waitForSelector(".model-dialog", { hidden: true });
+				await select(page, 1);
+				await selectionSession(page, "done");
+				await Bun.sleep(150);
+				expect(await selectionWrites(page)).toEqual([]);
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+
+		test(`${kind} cancellation and restricted defaults do not write preferences`, async () => {
+			const restricted: DesktopPreferences = {
+				...deferralPreferences,
+				roles: deferralPreferences.roles.map(role => role.id === "default" ? { ...role, canApply: { available: false, reason: "Settings are read-only" } } : role),
+				profiles: deferralPreferences.profiles.map(profile => ({ ...profile, capabilities: { ...profile.capabilities, persistDefault: { available: false, reason: "Settings are read-only" } } })),
+			};
+			const { context, page } = await selectionFixture(restricted);
+			try {
+				await openSelectionScope(page, kind);
+				expect(await page.$eval('.model-scope-option[data-scope="default"]', button => (button as HTMLButtonElement).disabled)).toBe(true);
+				expect(await page.$eval(".model-role-reason", reason => reason.textContent)).toBe("Settings are read-only");
+				await page.click('.model-scope-option[data-scope="default"]');
+				await page.keyboard.press("Escape");
+				await page.waitForSelector(".model-dialog", { hidden: true });
+				expect(await selectionWrites(page)).toEqual([]);
+				await openSelectionScope(page, kind);
+				await page.click(".model-role-cancel");
+				await page.waitForSelector(".model-dialog", { hidden: true });
+				expect(await selectionWrites(page)).toEqual([]);
+				await openSelectionScope(page, kind);
+				await page.click('.model-scope-option[data-scope="session"]');
+				await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set" || request.method === "preferences.apply"));
+				const writes = await selectionWrites(page);
+				expect(writes).toHaveLength(1);
+				expect(writes[0]!.params).toEqual(kind === "profile"
+					? { sessionId: "a", action: { type: "profile.select", name: "focused", scope: "session" } }
+					: { sessionId: "a", modelId: "fixture/model-two" });
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+	}
+
+	test("task roles remain session-only and use the existing busy preference queue", async () => {
+		const { context, page } = await selectionFixture();
+		try {
+			await selectionSession(page, "running");
+			await page.waitForFunction(() => document.body.textContent?.includes("Working"));
+			await page.click(".model-trigger");
+			await page.waitForSelector('[data-model-id="fixture/model-two"]');
+			await page.click('[data-model-id="fixture/model-two"]');
+			await page.waitForSelector(".model-role-option");
+			await page.evaluate(() => document.querySelectorAll<HTMLButtonElement>(".model-role-option")[1]!.click());
+			await page.waitForSelector(".model-dialog", { hidden: true });
+			expect(await selectionWrites(page)).toEqual([]);
+			await selectionSession(page, "done");
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
+			const writes = await selectionWrites(page);
+			expect(writes).toHaveLength(1);
+			expect(writes[0]!.params).toEqual({ sessionId: "a", action: { type: "role.set", role: "executor", modelId: "fixture/model-two" } });
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
 			await page.evaluate(() =>
 				window.fixture.setModels([
 					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
@@ -461,6 +684,8 @@ describe("mounted model selection deferral", () => {
 			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
 			await page.evaluate(() =>
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 				window.fixture.emit({
 					type: "session",
 					session: {
@@ -540,6 +765,8 @@ describe("mounted deferred selection intent", () => {
 			// A reasoning choice made while busy must merge, not replace, the model choice.
 			await page.click(".reasoning-control .select-trigger");
 			await page.waitForSelector(".select-menu .select-option:not([disabled])");
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 			await page.evaluate(() => {
 				const option = [...document.querySelectorAll<HTMLButtonElement>(".select-menu .select-option")].find(
 					item => item.textContent?.includes("High"),
@@ -569,7 +796,7 @@ describe("mounted deferred selection intent", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
-	test("applies a preset and a role change chosen during a run once the session settles", async () => {
+	test("applies a session preset chosen during a run once the session settles", async () => {
 		const { context, page } = await fixture();
 		const sessionFrame = (status: DesktopSession["status"]) =>
 			page.evaluate(
@@ -605,7 +832,9 @@ describe("mounted deferred selection intent", () => {
 			// Preset providers start collapsed, so the profile inside the group must be opened.
 			await page.click(".preset-group-head");
 			await page.waitForSelector(".preset-roles");
-			await page.click('.model-option-hit[aria-label="Apply the Focused profile profile to this conversation"]');
+			await page.click('.model-option-hit[aria-label="Choose preset: Focused profile"]');
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 			await Bun.sleep(300);
 			// A preset chosen mid-run is held, not refused and not written while streaming.
 			expect(
@@ -663,6 +892,8 @@ describe("mounted deferred selection intent", () => {
 			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 			await page.evaluate(() =>
 				window.fixture.emit({
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 					type: "session",
 					session: {
 						id: "a", title: "Session A", projectId: "p", status: "done", starred: false,

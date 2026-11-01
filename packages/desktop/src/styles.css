@@ -544,7 +544,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-role-choice > p { margin: 0; }
 .model-role-back, .model-role-cancel { justify-self: start; }
 .model-role-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.model-role-option { flex: 1 1 180px; justify-content: flex-start; }
+.model-role-option, .model-scope-option { flex: 1 1 180px; justify-content: flex-start; }
+.model-scope-option { background: var(--surface); }
 .model-role-reason { flex-basis: 100%; }
 .model-role-clear { font-size: 0.75rem; }
 .model-favorites-error { color: var(--error); font-size: 0.75rem; }

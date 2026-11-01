@@ -11,6 +11,8 @@ import { Button, Modal } from "./components";
 import { t } from "./i18n";
 
 export type PickerModelRole = "default" | "executor" | "planner" | "critic" | "architect";
+export type PickerSelectionScope = "session" | "default";
+type ScopeChoice = { kind: "model" | "profile"; id: string };
 type PickerTab = "presets" | "models";
 const TAB_ORDER: PickerTab[] = ["presets", "models"];
 const ROLE_ORDER: PickerModelRole[] = ["default", "executor", "planner", "critic", "architect"];
@@ -104,8 +106,8 @@ export interface ModelPickerProps {
 	onConfigureProviders?: () => void;
 	roles?: DesktopModelRolePreference[];
 	profiles?: DesktopModelProfile[];
-	onAssign?: (role: PickerModelRole, modelId: string | null) => void;
-	onApplyProfile?: (profileId: string) => void;
+	onAssign?: (role: PickerModelRole, modelId: string | null, scope: PickerSelectionScope) => void;
+	onApplyProfile?: (profileId: string, scope: PickerSelectionScope) => void;
 	onRefresh?: () => void;
 	refreshing?: boolean;
 	/** The catalog is still arriving, so the trigger names the state instead of a model. */
@@ -134,6 +136,7 @@ export function ModelPicker({
 	const [modelQuery, setModelQuery] = useState("");
 	const [presetQuery, setPresetQuery] = useState("");
 	const [choice, setChoice] = useState<string | null>(null);
+	const [scopeChoice, setScopeChoice] = useState<ScopeChoice | null>(null);
 	const [favorites, setFavorites] = useState(() => readFavorites(FAVORITES_KEY, MODEL_FAVORITE));
 	const [presetFavorites, setPresetFavorites] = useState(() => readFavorites(PRESET_FAVORITES_KEY, PRESET_FAVORITE));
 	const [expandedGroups, setExpandedGroups] = useState<string[]>([]);
@@ -144,10 +147,27 @@ export function ModelPicker({
 	const presetResults = useRef<HTMLUListElement>(null);
 	const back = useRef<HTMLButtonElement>(null);
 	const restoreId = useRef<string | null>(null);
+	const restoreProfile = useRef<string | null>(null);
 	const focusSearch = useRef(false);
 	const profileList = profiles ?? [];
 	const current = models.find(model => model.id === selectedId);
 	const roleFor = (id: PickerModelRole): DesktopModelRolePreference | undefined => roles?.find(role => role.id === id);
+	const scopeProfile =
+		scopeChoice?.kind === "profile" ? profileList.find(profile => profile.id === scopeChoice.id) : undefined;
+	const standalone = !onAssign && !roles;
+	const sessionAvailable =
+		scopeChoice?.kind === "profile"
+			? !!onApplyProfile && !!scopeProfile?.available && !!scopeProfile.capabilities.selectSession.available
+			: !!onAssign || standalone;
+	const defaultAvailable =
+		scopeChoice?.kind === "profile"
+			? !!onApplyProfile && !!scopeProfile?.available && !!scopeProfile.capabilities.persistDefault.available
+			: !!onAssign && !!roleFor("default")?.canApply.available;
+	const sessionReason = scopeProfile?.capabilities.selectSession.reason ?? t("models.roleUnavailable");
+	const defaultReason =
+		(scopeChoice?.kind === "profile"
+			? scopeProfile?.capabilities.persistDefault.reason
+			: roleFor("default")?.canApply.reason) ?? t("models.defaultUnavailable");
 	const matches = (role: PickerModelRole, modelId: string): boolean => {
 		if (role === "default") return selectedId === modelId;
 		const model = roleFor(role)?.model;
@@ -219,9 +239,20 @@ export function ModelPicker({
 
 	useEffect(() => {
 		if (!open) return;
-		if (choice) {
+		if (scopeChoice || choice) {
 			back.current?.focus();
 			return;
+		}
+		if (restoreProfile.current) {
+			const buttons = presetInput.current
+				?.closest('[role="tabpanel"]')
+				?.querySelectorAll<HTMLButtonElement>(".model-option-hit");
+			const button = [...(buttons ?? [])].find(item => item.dataset.profileId === restoreProfile.current);
+			restoreProfile.current = null;
+			if (button) {
+				button.focus();
+				return;
+			}
 		}
 		if (restoreId.current) {
 			const id = restoreId.current;
@@ -237,19 +268,28 @@ export function ModelPicker({
 		if (!focusSearch.current) return;
 		focusSearch.current = false;
 		(tab === "presets" ? presetInput : modelInput).current?.focus();
-	}, [open, choice, tab]);
+	}, [open, choice, scopeChoice, tab]);
 	useEffect(() => {
 		setOpen(false);
 		setChoice(null);
+		setScopeChoice(null);
 		restoreId.current = null;
+		restoreProfile.current = null;
 		focusSearch.current = false;
 	}, [selectedId]);
 	useEffect(() => {
 		if (choice && !models.some(model => model.id === choice)) {
 			focusSearch.current = true;
 			setChoice(null);
+			setScopeChoice(null);
 		}
 	}, [models, choice]);
+	useEffect(() => {
+		if (scopeChoice?.kind === "profile" && !profiles?.some(profile => profile.id === scopeChoice.id)) {
+			focusSearch.current = true;
+			setScopeChoice(null);
+		}
+	}, [profiles, scopeChoice]);
 
 	function toggleFavorite(id: string) {
 		const next = favorites.ids.includes(id) ? favorites.ids.filter(item => item !== id) : [...favorites.ids, id];
@@ -274,20 +314,26 @@ export function ModelPicker({
 	function closeDialog() {
 		setOpen(false);
 		setChoice(null);
+		setScopeChoice(null);
 		restoreId.current = null;
+		restoreProfile.current = null;
 		focusSearch.current = false;
 	}
 	function openDialog() {
 		setModelQuery("");
 		setPresetQuery("");
 		setChoice(null);
+		setScopeChoice(null);
 		restoreId.current = null;
+		restoreProfile.current = null;
 		focusSearch.current = true;
 		setTab(selectedId ? "models" : profileList.length > 0 ? "presets" : "models");
 		setOpen(true);
 	}
 	function showTab(next: PickerTab) {
 		focusSearch.current = false;
+		setScopeChoice(null);
+		restoreProfile.current = null;
 		if (next === "presets" && choice) {
 			restoreId.current = choice;
 			setChoice(null);
@@ -307,6 +353,15 @@ export function ModelPicker({
 		restoreId.current = choice;
 		focusSearch.current = false;
 		setChoice(null);
+	}
+
+	function confirmScope(scope: PickerSelectionScope) {
+		if (applying || !scopeChoice || !(scope === "session" ? sessionAvailable : defaultAvailable)) return;
+		if (scopeChoice.kind === "model" && !models.some(model => model.id === scopeChoice.id)) return;
+		if (scopeChoice.kind === "profile") onApplyProfile?.(scopeChoice.id, scope);
+		else if (onAssign) onAssign("default", scopeChoice.id, scope);
+		else if (scope === "session" && standalone) onSelect(scopeChoice.id);
+		closeDialog();
 	}
 
 	return (
@@ -372,7 +427,62 @@ export function ModelPicker({
 							{t("models.applyingSelection")}
 						</p>
 					)}
-					{tab === "presets" ? (
+					{scopeChoice ? (
+						<div
+							className="model-role-choice model-scope-choice"
+							role="tabpanel"
+							id={`${tabId}-${tab}-panel`}
+							aria-labelledby={`${tabId}-${tab}-tab ${tabId}-scope-title`}
+							aria-describedby={`${tabId}-scope-description`}
+						>
+							<button
+								type="button"
+								ref={back}
+								className="button model-role-back"
+								onClick={() => setScopeChoice(null)}
+							>
+								{t("models.back")}
+							</button>
+							<p id={`${tabId}-scope-title`}>
+								{t("models.chooseScope", {
+									name:
+										scopeProfile?.name ??
+										models.find(model => model.id === scopeChoice.id)?.name ??
+										scopeChoice.id,
+								})}
+							</p>
+							<p id={`${tabId}-scope-description`} className="muted">
+								{t("models.selectionScope")}
+							</p>
+							<div className="model-role-list">
+								{(["session", "default"] as const).map(scope => {
+									const available = scope === "session" ? sessionAvailable : defaultAvailable;
+									const reason = scope === "session" ? sessionReason : defaultReason;
+									return (
+										<div className="model-role-row" key={scope}>
+											<Button
+												className="model-scope-option"
+												data-scope={scope}
+												disabled={!available || applying}
+												aria-describedby={!available ? `${tabId}-${scope}-reason` : undefined}
+												onClick={() => confirmScope(scope)}
+											>
+												{t(scope === "session" ? "models.currentSession" : "models.setDefault")}
+											</Button>
+											{!available && (
+												<small id={`${tabId}-${scope}-reason`} className="model-role-reason">
+													{reason}
+												</small>
+											)}
+										</div>
+									);
+								})}
+							</div>
+							<Button className="model-role-cancel" onClick={closeDialog}>
+								{t("models.cancel")}
+							</Button>
+						</div>
+					) : tab === "presets" ? (
 						<div role="tabpanel" id={`${tabId}-presets-panel`} aria-labelledby={`${tabId}-presets-tab`}>
 							<div className="model-toolbar">
 								<label className="model-search">
@@ -464,12 +574,12 @@ export function ModelPicker({
 																	>
 																		<Button
 																			className="model-option-hit"
-																			aria-label={t("models.applyPreset", { name: profile.name })}
+																			aria-label={t("models.choosePreset", { name: profile.name })}
+																			data-profile-id={profile.id}
 																			disabled={!onApplyProfile || applying || !profile.available}
 																			onClick={() => {
-																				if (!onApplyProfile) return;
-																				onApplyProfile(profile.id);
-																				closeDialog();
+																				restoreProfile.current = profile.id;
+																				setScopeChoice({ kind: "profile", id: profile.id });
 																			}}
 																		>
 																			<span className="model-option-main">
@@ -545,12 +655,13 @@ export function ModelPicker({
 									<div className="model-role-list">
 										{ROLE_ORDER.map(role => {
 											const preference = roleFor(role);
-											const fixtureDefault = role === "default" && !onAssign && !roles;
-											const available = fixtureDefault || (!!onAssign && !!preference?.canApply.available);
+											const available =
+												role === "default"
+													? standalone || !!onAssign
+													: !!onAssign && !!preference?.canApply.available;
 											const reason = preference?.canApply.reason ?? t("models.roleUnavailable");
 											const assigned = matches(role, choice);
-											// Default selects this conversation's model, which the renderer defers; only role
-											// preference writes need a settled session.
+											// Default asks for scope; task roles remain session-only.
 											const canClear =
 												role !== "default" &&
 												assigned &&
@@ -563,8 +674,11 @@ export function ModelPicker({
 														className="model-role-option"
 														disabled={!available || applying}
 														onClick={() => {
-															if (onAssign) onAssign(role, choice);
-															else if (fixtureDefault) onSelect(choice);
+															if (role === "default") {
+																setScopeChoice({ kind: "model", id: choice });
+																return;
+															}
+															onAssign?.(role, choice, "session");
 															closeDialog();
 														}}
 													>
@@ -582,7 +696,7 @@ export function ModelPicker({
 															}
 															onClick={() => {
 																if (canClear) {
-																	onAssign?.(role, null);
+																	onAssign?.(role, null, "session");
 																	closeDialog();
 																}
 															}}
@@ -618,7 +732,7 @@ export function ModelPicker({
 												className="model-role-unavailable-clear"
 												disabled={!onAssign || applying}
 												onClick={() => {
-													onAssign?.(role, null);
+													onAssign?.(role, null, "session");
 													setOpen(false);
 												}}
 											>

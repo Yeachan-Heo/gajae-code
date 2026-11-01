@@ -29,7 +29,7 @@ import {
 import { ForkPanel, type ForkPanelProps } from "./ForkPanel";
 import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
-import { ModelPicker, type PickerModelRole } from "./ModelPicker";
+import { ModelPicker, type PickerModelRole, type PickerSelectionScope } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionInfoPanel, type SessionInfoPanelProps } from "./SessionInfoPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
@@ -90,6 +90,7 @@ function FixtureControls({
 	// beside it are visible without clicking first.
 	const [appliedProfile, setAppliedProfile] = useState<string>("design-fixture-default");
 	const [refreshes, setRefreshes] = useState(0);
+	const [appliedScope, setAppliedScope] = useState<PickerSelectionScope | null>(null);
 	const [assignments, setAssignments] = useState<Partial<Record<PickerModelRole, string>>>({
 		executor: fixtureModels[2].id,
 		planner: fixtureModels[1].id,
@@ -206,9 +207,13 @@ function FixtureControls({
 				onSelect={setSelectedId}
 				roles={roles}
 				profiles={profiles}
-				onApplyProfile={setAppliedProfile}
+				onApplyProfile={(profileId, scope) => {
+					setAppliedProfile(profileId);
+					setAppliedScope(scope);
+				}}
 				onRefresh={() => setRefreshes(value => value + 1)}
-				onAssign={(role, modelId) => {
+				onAssign={(role, modelId, scope) => {
+					setAppliedScope(scope);
 					if (role === "default" && modelId) setSelectedId(modelId);
 					else
 						setAssignments(previous => {
@@ -224,6 +229,9 @@ function FixtureControls({
 				{running
 					? t("showcase.modelControlsRunning")
 					: `${t("showcase.modelControlsIdle")}${appliedProfileName ? t("showcase.modelControlsProfile", { name: appliedProfileName }) : ""}${refreshes > 0 ? t("showcase.modelControlsRefreshes", { count: refreshes }) : ""}`}
+				{appliedScope && (
+					<span> · {t(appliedScope === "session" ? "models.currentSession" : "models.setDefault")}</span>
+				)}
 			</small>
 		</div>
 	);
