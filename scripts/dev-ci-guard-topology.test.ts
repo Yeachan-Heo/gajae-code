@@ -229,6 +229,8 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 			// must both run and require this job rather than only the Ubuntu shards.
 			"packages/coding-agent/src/cli/doctor",
 			"packages/coding-agent/test/doctor-windows-repair-gate.test.ts",
+			"packages/coding-agent/src/cli/install-activation.ts",
+			"packages/coding-agent/test/acl-diagnostic.test.ts",
 		]) {
 			expect(eligibility).toContain(changedPath);
 			expect(producerRequired).toContain(changedPath);
@@ -236,6 +238,9 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 		expect(namedStep(requiredJob(d, "windows-dev-doctor"), "Verify Windows workspace shim and doctor").run).toContain(
 			"bun test ./packages/coding-agent/test/doctor-windows-repair-gate.test.ts",
+		);
+		expect(namedStep(requiredJob(d, "windows-dev-doctor"), "Verify PowerShell ACL remediation").run).toContain(
+			"bun test ./packages/coding-agent/test/acl-diagnostic.test.ts",
 		);
 	});
 
