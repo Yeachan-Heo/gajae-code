@@ -864,6 +864,19 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}${outputSuffix}`;
 }
 
+class InstallationVerificationError extends Error {
+	readonly rollbackMessage: string;
+
+	constructor(result: InstalledVersionVerification, expectedVersion: string) {
+		super(formatVerificationFailure(result, expectedVersion));
+		this.rollbackMessage = result.smokeTestFailed
+			? "installed runtime smoke-test failed"
+			: "installed runtime version verification failed";
+	}
+}
+
+export class InstallationRollbackAclPresentError extends InstallationAclPresentError {}
+
 export function formatVerificationFailureForTest(
 	result: InstalledVersionVerification,
 	expectedVersion: string,
@@ -1176,7 +1189,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	const cleanupWarnings: string[] = [];
 	try {
 		let verification = await options.verifyInstalledVersion(options.expectedVersion);
-		if (!verification.ok) throw new Error(formatVerificationFailure(verification, options.expectedVersion));
+		if (!verification.ok) throw new InstallationVerificationError(verification, options.expectedVersion);
 		const after = await snapshotRegularFile(targetPath);
 		if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
 			throw new Error("installation_postcheck_identity_changed");
@@ -1216,9 +1229,9 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					toNativeIdentity(record.backupIdentity),
 					toNativeIdentity(record.targetIdentity),
 				);
-				const observed = await snapshotRegularFile(targetPath);
 				if (!restored.ok && restored.code === "acl_present")
-					throw new InstallationAclPresentError(targetPath, backupPath, restored);
+					throw new InstallationRollbackAclPresentError(targetPath, backupPath, restored, false);
+				const observed = await snapshotRegularFile(targetPath);
 				if (!restored.ok || !observed || !sameFileIdentity(record.backupIdentity, observed.identity))
 					throw new Error("rollback_unverified");
 				await updateActivationRecordFile(
@@ -1243,6 +1256,33 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 		throw primary;
 	}
+}
+
+function describeAclFailure(error: InstallationAclPresentError): string {
+	const value = (input: string) => {
+		const redacted = redactCrashSecrets(input);
+		return `${JSON.stringify(redacted.slice(0, 512))}${redacted.length > 512 ? " [truncated]" : ""}`;
+	};
+	const { aclFailurePrincipal, aclFailureInherited, aclFailureSide } = error.detail;
+	const side = aclFailureSide === "source" || aclFailureSide === "destination" ? aclFailureSide : "unknown";
+	const inheritance =
+		aclFailureInherited === true ? "inherited" : aclFailureInherited === false ? "explicit" : "unknown";
+	return `acl_present (${inheritance}, ${side}, principal ${aclFailurePrincipal ? value(aclFailurePrincipal) : "unknown"}, source ${value(error.sourcePath)}, destination ${value(error.targetPath)})`;
+}
+
+export function formatInstallationRollbackAclError(error: unknown): string | undefined {
+	if (!(error instanceof AggregateError) || error.message !== "installation_rollback_unverified") return undefined;
+	const [primary, rollback] = error.errors;
+	if (!(rollback instanceof InstallationRollbackAclPresentError)) return undefined;
+	const primaryMessage =
+		primary instanceof InstallationAclPresentError
+			? describeAclFailure(primary)
+			: primary instanceof InstallationVerificationError
+				? primary.rollbackMessage
+				: primary instanceof Error && primary.message === "installation_postcheck_identity_changed"
+					? "installed target identity changed after verification"
+					: "unclassified installation failure";
+	return `${error}: Inspect the uncertain activation before retrying. Primary failure: ${primaryMessage}; rollback binary restore failed: ${describeAclFailure(rollback)}`;
 }
 
 function formatPackageManagerInstallFailure(
@@ -1423,7 +1463,7 @@ export async function fetchAndVerifyOfficialPinnedCandidate(
 
 export async function smokeTestPinnedCandidate(candidate: { version: string }, stagingPath: string): Promise<void> {
 	const verification = await verifyInstalledRuntime(candidate.version, stagingPath);
-	if (!verification.ok) throw new Error(formatVerificationFailure(verification, candidate.version));
+	if (!verification.ok) throw new InstallationVerificationError(verification, candidate.version);
 }
 
 /** Injectable steps of the binary update flow (seams for testing ordering). */
@@ -2213,7 +2253,7 @@ export async function runUpdateCommand(
 		const prefix = installedVersion
 			? `${target.method === "migrate" ? "Standalone binary installed and verified at version" : "Updated to"} ${installedVersion}, but post-update recovery failed`
 			: "Update failed";
-		console.error(chalk.red(`${prefix}: ${err}`));
+		console.error(chalk.red(`${prefix}: ${formatInstallationRollbackAclError(err) ?? err}`));
 		return flushTelemetryBeforeExit();
 	}
 
