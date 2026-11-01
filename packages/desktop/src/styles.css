@@ -135,6 +135,28 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 }
 .sidebar nav { overflow: auto; flex: 1; min-height: 0; padding: 0 4px 8px; }
 .sidebar footer { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+.sidebar-toggle { margin-left: auto; }
+.sidebar-drawer .sidebar-toggle, .project-initials, .compact-more { display: none; }
+/* A compact desktop sidebar remains a navigation rail, not a hidden drawer. Drawer navigation
+   stays full-width on small screens regardless of this local desktop preference. */
+.desktop-sidebar[data-compact] { width: 64px; flex-basis: 64px; padding-inline: 6px; }
+.desktop-sidebar[data-compact] .sidebar-label,
+.desktop-sidebar[data-compact] .project-heading > h2,
+.desktop-sidebar[data-compact] .project-heading > .button:not(.project-toggle),
+.desktop-sidebar[data-compact] .project-toggle > svg,
+.desktop-sidebar[data-compact] .path,
+.desktop-sidebar[data-compact] .session-title { display: none; }
+.desktop-sidebar[data-compact] .sidebar-heading,
+.desktop-sidebar[data-compact] .sidebar-heading strong,
+.desktop-sidebar[data-compact] .project-heading { justify-content: center; }
+.desktop-sidebar[data-compact] .sidebar-heading strong { gap: 0; }
+.desktop-sidebar[data-compact] .project-initials { display: inline; }
+.desktop-sidebar[data-compact] .project-toggle { width: 100%; height: 32px; font-size: 0.8125rem; font-weight: 600; }
+.desktop-sidebar[data-compact] .session-select { justify-content: center; min-height: 32px; padding: 8px; }
+.desktop-sidebar[data-compact] .compact-more { display: block; }
+.desktop-sidebar[data-compact] footer { flex-direction: column; align-items: center; }
+.desktop-sidebar[data-compact] footer > .button { width: 36px; padding-inline: 0; }
+.desktop-sidebar[data-compact] .sidebar-toggle { margin-left: 0; }
 .sidebar-heading, .project-heading, .toolbar, .modal header, .review-pane header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .project-heading { justify-content: flex-start; }
 .sidebar-heading { padding: 4px; }

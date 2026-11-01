@@ -8,6 +8,8 @@ import {
 	Info,
 	MoreHorizontal,
 	Network,
+	PanelLeftClose,
+	PanelLeftOpen,
 	Pencil,
 	Plus,
 	Settings2,
@@ -539,6 +541,20 @@ export default function App() {
 	const dialogGeneration = useRef(0);
 	const [dialogOwner, setDialogOwner] = useState("");
 	const [sidebar, setSidebar] = useState(false);
+	const [compactSidebar, setCompactSidebar] = useState(() => {
+		try {
+			return localStorage.getItem("gjc.desktop.sidebar-compact") === "true";
+		} catch {
+			return false;
+		}
+	});
+	useEffect(() => {
+		try {
+			localStorage.setItem("gjc.desktop.sidebar-compact", String(compactSidebar));
+		} catch {
+			/* A denied local preference must not disable navigation. */
+		}
+	}, [compactSidebar]);
 	const [review, setReview] = useState(false);
 	const [wide, setWide] = useState(() => window.matchMedia("(min-width: 1100px)").matches);
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
@@ -1860,11 +1876,18 @@ export default function App() {
 		<>
 			<header className="sidebar-heading">
 				<strong>
-					<img className="brand-mark" src={gajaeMark} alt="" aria-hidden="true" /> Gajae Code
+					<img className="brand-mark" src={gajaeMark} alt="" aria-hidden="true" />{" "}
+					<span className="sidebar-label">Gajae Code</span>
 				</strong>
 			</header>
-			<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-				<FolderOpen size={16} aria-hidden="true" /> {t("shell.openProject")}
+			<Button
+				className="sidebar-open-project"
+				aria-label={t("shell.openProject")}
+				title={t("shell.openProject")}
+				disabled={!connected || pending.global}
+				onClick={() => void openProject()}
+			>
+				<FolderOpen size={16} aria-hidden="true" /> <span className="sidebar-label">{t("shell.openProject")}</span>
 			</Button>
 			<nav aria-label={t("shell.projectsAndConversations")} onDragEnd={clearDrag}>
 				{(snapshot?.projects ?? []).map(item => {
@@ -1932,6 +1955,7 @@ export default function App() {
 								onDragStart={event => {
 									dragProjectRef.current = item.id;
 									setDragProject(item.id);
+									title={item.name}
 									event.dataTransfer?.setData("text/plain", item.id);
 									if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
 								}}
@@ -1951,6 +1975,9 @@ export default function App() {
 												? previous.filter(id => id !== item.id)
 												: [...previous, item.id],
 										)
+									<span className="project-initials" aria-hidden="true">
+										{Array.from(item.name).slice(0, 2).join("")}
+									</span>
 									}
 								>
 									<ChevronRight
@@ -2004,6 +2031,10 @@ export default function App() {
 												onSelect={() => select(chat)}
 												onMenu={(x, y) =>
 													setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })
+											aria-label={t("shell.showMoreConversations", {
+												count: Math.min(SESSION_PAGE, remaining),
+											})}
+											title={t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
 												}
 											/>
 										</div>
@@ -2018,7 +2049,10 @@ export default function App() {
 												}))
 											}
 										>
-											{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
+											<span className="sidebar-label">
+												{t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
+											</span>
+											<MoreHorizontal className="compact-more" aria-hidden="true" />
 										</Button>
 									)}
 								</>
@@ -2028,8 +2062,22 @@ export default function App() {
 				})}
 			</nav>
 			<footer>
-				<Button onClick={openSettings} disabled={!connected}>
-					<Settings2 size={16} aria-hidden="true" /> {t("shell.settings")}
+				<Button
+					onClick={openSettings}
+					disabled={!connected}
+					aria-label={t("shell.settings")}
+					title={t("shell.settings")}
+				>
+					<Settings2 size={16} aria-hidden="true" /> <span className="sidebar-label">{t("shell.settings")}</span>
+				</Button>
+				<Button
+					className="sidebar-toggle"
+					aria-label={t(compactSidebar ? "shell.expandSidebar" : "shell.collapseSidebar")}
+					title={t(compactSidebar ? "shell.expandSidebar" : "shell.collapseSidebar")}
+					aria-expanded={!compactSidebar}
+					onClick={() => setCompactSidebar(value => !value)}
+				>
+					{compactSidebar ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
 				</Button>
 			</footer>
 		</>
@@ -2240,7 +2288,9 @@ export default function App() {
 	);
 	return (
 		<div className="app-shell">
-			<aside className="sidebar desktop-sidebar">{sidebarContent}</aside>
+			<aside className="sidebar desktop-sidebar" data-compact={compactSidebar || undefined}>
+				{sidebarContent}
+			</aside>
 			{sidebar && (
 				<Modal
 					title={t("shell.projectsAndConversations")}

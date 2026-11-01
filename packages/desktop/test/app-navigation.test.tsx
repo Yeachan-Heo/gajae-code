@@ -35,6 +35,42 @@ async function fixture(holdBootstrap = false): Promise<{ context: BrowserContext
 }
 
 describe("mounted desktop navigation", () => {
+	test("keeps projects and status-only conversations usable in a persistent compact rail", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			expect(await page.$$eval('.desktop-sidebar .project-initials', nodes => nodes.map(node => node.textContent))).toEqual(["pa", "한글"]);
+			expect(await page.$eval('.desktop-sidebar', node => node.getBoundingClientRect().width)).toBe(64);
+			expect(await page.$$eval('.desktop-sidebar .session-title', nodes => nodes.every(node => getComputedStyle(node).display === "none"))).toBe(true);
+			expect(await page.$$eval('.desktop-sidebar .session-state', nodes => nodes.filter(node => node.getBoundingClientRect().width > 0).length)).toBe(4);
+			const newest = '.desktop-sidebar .session-select[title="Newest conversation · Done"]';
+			await page.click(newest);
+			await page.waitForSelector(`${newest}[aria-current="page"]`);
+			expect(await page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "session.select").at(-1)?.params)).toEqual({ sessionId: "new" });
+			await page.reload();
+			await page.waitForSelector('.desktop-sidebar[data-compact] .session-row');
+			expect(await page.$eval('.sidebar-toggle', node => node.getAttribute("aria-expanded"))).toBe("false");
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForFunction(() => !document.querySelector('.desktop-sidebar[data-compact]'));
+			expect(await page.$eval('.desktop-sidebar', node => node.getBoundingClientRect().width)).toBe(264);
+			expect(await page.$$eval('.desktop-sidebar .session-title', nodes => nodes.every(node => node.getBoundingClientRect().width > 0))).toBe(true);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("a desktop compact preference never makes the mobile project drawer icon-only", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.setViewport({ width: 700, height: 800 });
+			await page.click('.toolbar .mobile-only');
+			await page.waitForSelector('dialog.sidebar-drawer');
+			expect(await page.$eval('dialog.sidebar-drawer .session-title', node => node.getBoundingClientRect().width)).toBeGreaterThan(0);
+			expect(await page.$eval('dialog.sidebar-drawer .project-initials', node => getComputedStyle(node).display)).toBe("none");
+			expect(await page.$eval('dialog.sidebar-drawer .sidebar-toggle', node => getComputedStyle(node).display)).toBe("none");
+		} finally { await context.close(); }
+	}, 30000);
+
 	test("centers the connection state instead of flashing the conversation empty state", async () => {
 		const { context, page } = await fixture(true);
 		try {

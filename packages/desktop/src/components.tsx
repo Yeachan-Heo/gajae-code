@@ -77,6 +77,8 @@ export function SessionRow({
 		<div className={`session-row ${selected ? "selected" : ""}`}>
 			<button
 				className="session-select"
+				aria-label={`${session.title} · ${statuses[session.status]()}`}
+				title={`${session.title} · ${statuses[session.status]()}`}
 				aria-current={selected ? "page" : undefined}
 				aria-haspopup={onMenu ? "menu" : undefined}
 				onClick={onSelect}

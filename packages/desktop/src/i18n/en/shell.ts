@@ -48,6 +48,8 @@ export const shell = {
 	"shell.manageGoal": "Manage goal",
 	"shell.exportedConversation": "Exported the conversation to an HTML file.\n\n{path}",
 	"shell.projectsAndConversations": "Projects and conversations",
+	"shell.collapseSidebar": "Collapse sidebar",
+	"shell.expandSidebar": "Expand sidebar",
 	"shell.collapseConversations": "Hide the conversations of {project}",
 	"shell.expandConversations": "Show the conversations of {project}",
 	"shell.showMoreConversations": "Show {count} more",
