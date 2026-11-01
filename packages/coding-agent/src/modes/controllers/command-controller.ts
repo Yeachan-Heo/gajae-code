@@ -2,10 +2,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
+import {
+	collapseUsageLimitsForDisplay,
+	getEnvApiKey,
+	type ToolCall,
+	type UsageLimit,
+	type UsageReport,
+} from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
@@ -109,7 +115,117 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 	].join("\n");
 }
 
-const GH_SHARE_DESTINATION_KEYS = ["GH_HOST", "GH_CONFIG_DIR"] as const;
+const GH_SHARE_TRUST_KEYS = [
+	"GH_HOST",
+	"GH_CONFIG_DIR",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_ENTERPRISE_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"XDG_CONFIG_HOME",
+	"HOME",
+	"USERPROFILE",
+	"APPDATA",
+	"BASH_ENV",
+	"BUN_OPTIONS",
+	"ENV",
+	"ZDOTDIR",
+	"NODE_OPTIONS",
+	"NODE_PATH",
+	"PYTHONHOME",
+	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
+	"JULIA_DEPOT_PATH",
+	"JULIA_LOAD_PATH",
+	"JULIA_PROJECT",
+	"TCL_LIBRARY",
+	"TCLLIBPATH",
+	"LUA_INIT",
+	"LUA_INIT_5_1",
+	"LUA_INIT_5_2",
+	"LUA_INIT_5_3",
+	"LUA_INIT_5_4",
+	"LUA_INIT_5_5",
+	"LUA_PATH",
+	"LUA_CPATH",
+	"LUA_PATH_5_1",
+	"LUA_PATH_5_2",
+	"LUA_PATH_5_3",
+	"LUA_PATH_5_4",
+	"LUA_PATH_5_5",
+	"LUA_CPATH_5_1",
+	"LUA_CPATH_5_2",
+	"LUA_CPATH_5_3",
+	"LUA_CPATH_5_4",
+	"LUA_CPATH_5_5",
+	"R_ENVIRON",
+	"R_ENVIRON_USER",
+	"R_PROFILE",
+	"R_PROFILE_USER",
+	"ELIXIR_ERL_OPTIONS",
+	"ERL_AFLAGS",
+	"ERL_FLAGS",
+	"ERL_ZFLAGS",
+	"BUNDLER_SETUP",
+	"BUNDLE_GEMFILE",
+	"GEM_HOME",
+	"GEM_PATH",
+	"RUBYGEMS_GEMDEPS",
+	"RUBYOPT",
+	"RUBYLIB",
+	"PERL5OPT",
+	"PERL5LIB",
+	"PERLLIB",
+	"JAVA_HOME",
+	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
+	"_JAVA_OPTIONS",
+	"CLASSPATH",
+	"PHPRC",
+	"PHP_INI_SCAN_DIR",
+	"DOTNET_STARTUP_HOOKS",
+	"DOTNET_ROOT",
+	"DOTNET_ROOT_X86",
+	"DOTNET_ROOT_X64",
+	"DOTNET_ROOT_ARM",
+	"DOTNET_ROOT_ARM64",
+	"CORECLR_ENABLE_PROFILING",
+	"DOTNET_ENABLE_PROFILING",
+	"CORECLR_PROFILER",
+	"DOTNET_PROFILER",
+	"CORECLR_PROFILER_PATH",
+	"CORECLR_PROFILER_PATH_32",
+	"CORECLR_PROFILER_PATH_64",
+	"CORECLR_PROFILER_PATH_ARM32",
+	"CORECLR_PROFILER_PATH_ARM64",
+	"DOTNET_PROFILER_PATH",
+	"DOTNET_PROFILER_PATH_32",
+	"DOTNET_PROFILER_PATH_64",
+	"DOTNET_PROFILER_PATH_ARM32",
+	"DOTNET_PROFILER_PATH_ARM64",
+	"PATH",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"OPENSSL_CONF",
+	"OPENSSL_CONF_INCLUDE",
+	"OPENSSL_MODULES",
+	"OPENSSL_ENGINES",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"LD_AUDIT",
+	"DYLD_INSERT_LIBRARIES",
+	"DYLD_LIBRARY_PATH",
+	"DYLD_FRAMEWORK_PATH",
+	"DYLD_FALLBACK_LIBRARY_PATH",
+	"DYLD_FALLBACK_FRAMEWORK_PATH",
+	"DYLD_ROOT_PATH",
+] as const;
+const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUpperCase()));
 
 /**
  * Project dotenv at import, before `/move` changes cwd. Those declarations are
@@ -117,22 +233,101 @@ const GH_SHARE_DESTINATION_KEYS = ["GH_HOST", "GH_CONFIG_DIR"] as const;
  * remove them.
  */
 const ghShareProjectSnapshot = projectEnvSnapshot();
+const ghShareOperatorPath = process.env.PATH;
+const ghShareLaunchRoot = path.resolve(process.cwd());
+
+function isInsideDirectory(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function findCheckoutRoots(directory: string): Promise<string[] | undefined> {
+	const resolvedDirectory = await fs.realpath(directory).catch(() => undefined);
+	if (!resolvedDirectory) return undefined;
+	const roots: string[] = [];
+	let ancestor = resolvedDirectory;
+	while (true) {
+		try {
+			await fs.lstat(path.join(ancestor, ".git"));
+			roots.push(ancestor);
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") return undefined;
+		}
+		const parent = path.dirname(ancestor);
+		if (parent === ancestor) break;
+		ancestor = parent;
+	}
+	return roots;
+}
+
+function isInsideAnyDirectory(roots: readonly string[], candidate: string): boolean {
+	return roots.some(root => isInsideDirectory(root, candidate));
+}
+
+async function resolveGhShareExecutable(): Promise<{ executable: string; searchPath: string } | undefined> {
+	const operatorPath = ghShareOperatorPath;
+	const key = canonicalEnvKey("PATH");
+	const declared = ghShareProjectSnapshot.values[key];
+	if (
+		!operatorPath ||
+		(declared !== undefined && (ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === operatorPath.trim()))
+	)
+		return undefined;
+	const checkoutRoots = new Set<string>();
+	for (const directory of new Set([ghShareLaunchRoot, path.resolve(process.cwd())])) {
+		const roots = await findCheckoutRoots(directory);
+		if (!roots) return undefined;
+		for (const root of roots) checkoutRoots.add(root);
+	}
+	const untrustedDirectories = [...checkoutRoots];
+	const trustedDirectories: string[] = [];
+	const seenDirectories = new Set<string>();
+	let executable: string | undefined;
+	for (const directory of operatorPath.split(path.delimiter)) {
+		if (!path.isAbsolute(directory)) continue;
+		const absoluteDirectory = path.resolve(directory);
+		if (isInsideAnyDirectory(untrustedDirectories, absoluteDirectory)) continue;
+		const realDirectory = await fs.realpath(absoluteDirectory).catch(() => undefined);
+		if (
+			!realDirectory ||
+			isInsideAnyDirectory(untrustedDirectories, realDirectory) ||
+			seenDirectories.has(realDirectory)
+		)
+			continue;
+		const candidate = Bun.which("gh", { PATH: realDirectory });
+		if (candidate) {
+			const absoluteCandidate = path.resolve(candidate);
+			if (isInsideAnyDirectory(untrustedDirectories, absoluteCandidate)) continue;
+			const realExecutable = await fs.realpath(absoluteCandidate).catch(() => undefined);
+			if (!realExecutable || isInsideAnyDirectory(untrustedDirectories, realExecutable)) continue;
+			executable ??= realExecutable;
+		}
+		seenDirectories.add(realDirectory);
+		trustedDirectories.push(realDirectory);
+	}
+	return executable ? { executable, searchPath: trustedDirectories.join(path.delimiter) } : undefined;
+}
 
 /**
- * Environment for the default `/share` `gh` children. A `GH_HOST` or
- * `GH_CONFIG_DIR` that matches the project dotenv is omitted so the repository
- * cannot retarget gist upload or point `gh` at a config directory it shipped.
- * An operator value the project does not declare is kept.
+ * Environment for the default `/share` `gh` children. GitHub CLI routing,
+ * config, authentication, proxy, certificate, shell/runtime startup, executable-search,
+ * and dynamic loader overrides that match the project dotenv are omitted so a repository
+ * cannot redirect the upload, substitute the `gh` binary, authenticate with a
+ * project-provided token, or intercept its HTTPS request. The executable itself
+ * and its child search path use absolute operator PATH directories whose real
+ * paths are outside actual launch and active checkout roots. Operator values the project
+ * does not declare are kept.
  */
-function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const child: NodeJS.ProcessEnv = { ...env };
-	for (const name of GH_SHARE_DESTINATION_KEYS) {
+	for (const name of Object.keys(child)) {
+		if (!GH_SHARE_TRUST_KEY_SET.has(name.toUpperCase())) continue;
 		const raw = child[name];
 		if (typeof raw !== "string") continue;
 		const key = canonicalEnvKey(name);
 		const declared = ghShareProjectSnapshot.values[key];
 		if (declared === undefined) continue;
-		if (!(ghShareProjectSnapshot.dynamic.has(key) || declared === raw || declared === raw.trim())) continue;
+		if (!(ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === raw.trim())) continue;
 		delete child[name];
 		if (process.platform === "win32") {
 			for (const present of Object.keys(child)) {
@@ -140,6 +335,43 @@ function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
 			}
 		}
 	}
+	const ghConfigDirKey = canonicalEnvKey("GH_CONFIG_DIR");
+	const xdgConfigHomeKey = canonicalEnvKey("XDG_CONFIG_HOME");
+	for (const name of Object.keys(child)) {
+		const key = canonicalEnvKey(name);
+		if (key !== ghConfigDirKey && key !== xdgConfigHomeKey) continue;
+		const value = child[name];
+		if (typeof value !== "string" || value.length === 0 || path.isAbsolute(value)) continue;
+		// `gh` children use the filesystem root as cwd to avoid project Bun
+		// preloads, so retain the launch-directory meaning of relative config paths.
+		child[name] = path.resolve(ghShareLaunchRoot, value);
+	}
+	const certFileKey = canonicalEnvKey("SSL_CERT_FILE");
+	const certDirKey = canonicalEnvKey("SSL_CERT_DIR");
+	for (const name of Object.keys(child)) {
+		const key = canonicalEnvKey(name);
+		const value = child[name];
+		if (typeof value !== "string" || value.length === 0) continue;
+		if (key === certFileKey && !path.isAbsolute(value)) {
+			// Certificate overrides retain their launch-directory meaning even
+			// though `gh` children run from the filesystem root.
+			child[name] = path.resolve(ghShareLaunchRoot, value);
+		} else if (key === certDirKey) {
+			child[name] = value
+				.split(path.delimiter)
+				.map(directory =>
+					directory.length > 0 && !path.isAbsolute(directory)
+						? path.resolve(ghShareLaunchRoot, directory)
+						: directory,
+				)
+				.join(path.delimiter);
+		}
+	}
+	const pathKey = canonicalEnvKey("PATH");
+	for (const name of Object.keys(child)) {
+		if (canonicalEnvKey(name) === pathKey) delete child[name];
+	}
+	child.PATH = trustedPath;
 	return child;
 }
 
@@ -291,9 +523,20 @@ export class CommandController {
 			return;
 		}
 
-		const ghEnv = ghShareChildEnv();
+		const ghShare = await resolveGhShareExecutable();
+		if (!ghShare) {
+			this.ctx.showError(
+				"GitHub CLI (gh) is not installed on the trusted operator PATH. Install it from https://cli.github.com/",
+			);
+			return;
+		}
+		const ghShareExecutable = ghShare.executable;
+		// Bun wrappers load project bunfig.toml preloads from their working directory.
+		const ghShareCwd = path.parse(ghShareLaunchRoot).root;
+		const ghEnv = ghShareChildEnv(ghShare.searchPath);
 		try {
-			const authProcess = Bun.spawn(["gh", "auth", "status"], {
+			const authProcess = Bun.spawn([ghShareExecutable, "auth", "status"], {
+				cwd: ghShareCwd,
 				env: ghEnv,
 				stdin: "ignore",
 				stdout: "ignore",
@@ -327,7 +570,8 @@ export class CommandController {
 
 		let cancellationRequested = false;
 		try {
-			const gistProcess = Bun.spawn(["gh", "gist", "create", "--public=false", tmpFile], {
+			const gistProcess = Bun.spawn([ghShareExecutable, "gist", "create", "--public=false", tmpFile], {
+				cwd: ghShareCwd,
 				env: ghEnv,
 				stdin: "ignore",
 				stdout: "pipe",
@@ -538,7 +782,8 @@ export class CommandController {
 			const provider = this.ctx.session.model?.provider;
 			const mode = resolveAppendOnlyMode(setting, provider ?? "");
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
-			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
+			const settingLabel =
+				setting === "auto" ? `${setting} (${provider ?? "?"})` : sanitizeDisplayLine(String(setting));
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
 		}
 		if (stats.sessionMemory) {
@@ -627,8 +872,12 @@ export class CommandController {
 			for (const server of this.ctx.lspServers) {
 				const statusColor = server.status === "ready" ? "success" : server.status === "error" ? "error" : "warning";
 				const statusText =
-					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
-				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
+					server.status === "error" && server.error
+						? `${server.status}: ${sanitizeDisplayLine(server.error)}`
+						: server.status;
+				const fileTypes = server.fileTypes.map(fileType => sanitizeDisplayLine(fileType)).join(", ");
+				const serverLabel = sanitizeDisplayLine(server.name);
+				info += `${theme.fg("dim", `${serverLabel}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${fileTypes})`)}\n`;
 			}
 		}
 
@@ -641,7 +890,7 @@ export class CommandController {
 				for (const name of mcpServers) {
 					const conn = this.ctx.mcpManager.getConnection(name);
 					const toolCount = conn?.tools?.length ?? 0;
-					info += `${theme.fg("dim", `${name}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
+					info += `${theme.fg("dim", `${sanitizeDisplayLine(name)}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
 				}
 			}
 		}
@@ -1663,7 +1912,7 @@ function resolveFraction(limit: UsageLimit): number | undefined {
 
 function resolveProviderUsageTotal(reports: UsageReport[]): number {
 	return reports
-		.flatMap(report => report.limits)
+		.flatMap(report => collapseUsageLimitsForDisplay(report.limits))
 		.map(limit => resolveFraction(limit) ?? 0)
 		.reduce((sum, value) => sum + value, 0);
 }
@@ -1853,14 +2102,35 @@ function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
 	return "exhausted";
 }
 
-function formatAggregateAmount(limits: UsageLimit[]): string {
+/** Horizons that meter one quota pool from both ends. */
+const SIBLING_USAGE_WINDOWS: Readonly<Record<string, string>> = { "5h": "7d", "7d": "5h" };
+
+/**
+ * The quota a window row meters, independent of the horizon in its title.
+ * Providers name rows either by pool ("Gemini") or by window ("Claude 7 Day");
+ * only the pool part can pair a 5-hour row with its weekly row.
+ */
+function usagePoolKey(label: string, windowLabel: string): string {
+	const windowText = windowLabel.trim().toLowerCase();
+	const title = label.trim();
+	if (windowText.length === 0) return title;
+	const lower = title.toLowerCase();
+	if (lower.length !== title.length) return title;
+	const index = lower.lastIndexOf(windowText);
+	if (index < 0) return title;
+	const stripped = (title.slice(0, index) + title.slice(index + windowText.length)).replace(/\s+/g, " ").trim();
+	return stripped.length > 0 ? stripped : title;
+}
+
+function formatAggregateAmount(limits: UsageLimit[], notReportedCount = 0): string {
+	const notReportedSuffix = notReportedCount > 0 ? ` · ${notReportedCount} not reported` : "";
 	const fractions = limits
 		.map(limit => resolveFraction(limit))
 		.filter((value): value is number => value !== undefined);
 	if (fractions.length === limits.length && fractions.length > 0) {
 		const sum = fractions.reduce((total, value) => total + value, 0);
 		const avgRemaining = Math.max(0, ((limits.length - sum) / limits.length) * 100);
-		return `${formatNumber(avgRemaining)}% free`;
+		return `${formatNumber(avgRemaining)}% free${notReportedSuffix}`;
 	}
 
 	const amounts = limits
@@ -1870,10 +2140,10 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 		const totalUsed = amounts.reduce((sum, amount) => sum + (amount.used ?? 0), 0);
 		const totalLimit = amounts.reduce((sum, amount) => sum + (amount.limit ?? 0), 0);
 		const remainingPct = totalLimit > 0 ? Math.max(0, 100 - (totalUsed / totalLimit) * 100) : 0;
-		return `${formatNumber(remainingPct)}% free`;
+		return `${formatNumber(remainingPct)}% free${notReportedSuffix}`;
 	}
 
-	return `${limits.length} accts`;
+	return `${limits.length + notReportedCount} accts`;
 }
 
 /**
@@ -1945,6 +2215,16 @@ function resolveColumnWidth(count: number, available: number, trailing: number):
 	return ideal;
 }
 
+/** One `/usage` row: every account that reports one quota pool at one horizon. */
+interface UsageLimitGroup {
+	label: string;
+	poolKey: string;
+	windowId: string;
+	windowLabel: string;
+	limits: UsageLimit[];
+	reports: UsageReport[];
+}
+
 export function renderUsageReports(
 	reports: UsageReport[],
 	uiTheme: typeof theme,
@@ -1977,17 +2257,31 @@ export function renderUsageReports(
 		const providerName = formatProviderName(provider);
 		const reportIndexes = new Map(providerReports.map((report, index) => [report, index]));
 
-		const limitGroups = new Map<
-			string,
-			{ label: string; windowLabel: string; limits: UsageLimit[]; reports: UsageReport[] }
-		>();
+		const displayLimits = new Map<UsageReport, UsageLimit[]>();
+		const reportedWindows = new Map<UsageReport, Set<string>>();
 		for (const report of providerReports) {
-			for (const limit of report.limits) {
+			const limits = collapseUsageLimitsForDisplay(report.limits);
+			displayLimits.set(report, limits);
+			const windows = new Set<string>();
+			for (const limit of limits) {
+				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
+				const windowLabel = limit.window?.label ?? windowId;
+				windows.add(`${usagePoolKey(formatLimitTitle(limit), windowLabel)}|${windowId}`);
+			}
+			reportedWindows.set(report, windows);
+		}
+
+		const limitGroups = new Map<string, UsageLimitGroup>();
+		for (const report of providerReports) {
+			for (const limit of displayLimits.get(report) ?? []) {
 				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
 				const key = `${formatLimitTitle(limit)}|${windowId}`;
 				const windowLabel = limit.window?.label ?? windowId;
+				const title = formatLimitTitle(limit);
 				const entry = limitGroups.get(key) ?? {
-					label: formatLimitTitle(limit),
+					label: title,
+					poolKey: usagePoolKey(title, windowLabel),
+					windowId,
 					windowLabel,
 					limits: [],
 					reports: [],
@@ -1995,6 +2289,33 @@ export function renderUsageReports(
 				entry.limits.push(limit);
 				entry.reports.push(report);
 				limitGroups.set(key, entry);
+			}
+		}
+
+		// A report that only surfaces one window of a pool — Antigravity's
+		// `fetchAvailableModels` returns just the active bottleneck window —
+		// would otherwise vanish from the sibling row, leaving only the accounts
+		// that happen to be exhausted and reading as "everyone is out". Keep the
+		// column and mark it unreported so the row stays honest.
+		const notReportedLimits = new Set<UsageLimit>();
+		for (const group of limitGroups.values()) {
+			const siblingWindowId = SIBLING_USAGE_WINDOWS[group.windowId];
+			if (!siblingWindowId) continue;
+			const siblingKey = `${group.poolKey}|${siblingWindowId}`;
+			for (const report of providerReports) {
+				const reported = reportedWindows.get(report);
+				if (!reported || reported.has(`${group.poolKey}|${group.windowId}`)) continue;
+				if (!reported.has(siblingKey)) continue;
+				const limit: UsageLimit = {
+					id: `not-reported:${group.poolKey}:${group.windowId}:${reportIndexes.get(report) ?? 0}`,
+					label: group.label,
+					scope: { provider, windowId: group.windowId },
+					amount: { unit: "percent" },
+					status: "unknown",
+				};
+				notReportedLimits.add(limit);
+				group.limits.push(limit);
+				group.reports.push(report);
 			}
 		}
 
@@ -2010,7 +2331,10 @@ export function renderUsageReports(
 				const reportIndex = reportIndexes.get(report) ?? 0;
 				return {
 					report,
-					total: report.limits.reduce((sum, limit) => sum + (resolveFraction(limit) ?? 0), 0),
+					total: collapseUsageLimitsForDisplay(report.limits).reduce(
+						(sum, limit) => sum + (resolveFraction(limit) ?? 0),
+						0,
+					),
 					label: firstLimit
 						? formatAccountLabel(firstLimit, report, reportIndex)
 						: formatUnlimitedReportLabel(report, reportIndex),
@@ -2022,7 +2346,23 @@ export function renderUsageReports(
 			accountRank.set(entry.report, rank);
 		});
 
-		const renderableGroups = Array.from(limitGroups.values()).map(group => {
+		const orderedGroups = Array.from(limitGroups.values());
+		const labelOrder = new Map<string, number>();
+		for (const group of orderedGroups) {
+			if (!labelOrder.has(group.label)) labelOrder.set(group.label, labelOrder.size);
+		}
+		const windowOrder = (windowLabel: string): number => {
+			const lower = windowLabel.toLowerCase();
+			if (lower.includes("5 hour") || lower === "5h") return 0;
+			if (lower.includes("7 day") || lower.includes("weekly") || lower === "7d") return 1;
+			return 2;
+		};
+		orderedGroups.sort((a, b) => {
+			const labelDiff = (labelOrder.get(a.label) ?? 0) - (labelOrder.get(b.label) ?? 0);
+			if (labelDiff !== 0) return labelDiff;
+			return windowOrder(a.windowLabel) - windowOrder(b.windowLabel);
+		});
+		const renderableGroups = orderedGroups.map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
@@ -2036,15 +2376,32 @@ export function renderUsageReports(
 			});
 			const sortedLimits = entries.map(entry => entry.limit);
 			const sortedReports = entries.map(entry => entry.report);
-			return { group, sortedLimits, sortedReports, amountText: formatAggregateAmount(sortedLimits) };
+			const knownLimits = sortedLimits.filter(limit => !notReportedLimits.has(limit));
+			return {
+				group,
+				sortedLimits,
+				sortedReports,
+				knownLimits,
+				notReportedCount: sortedLimits.length - knownLimits.length,
+				amountText: formatAggregateAmount(knownLimits, sortedLimits.length - knownLimits.length),
+			};
 		});
 
 		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
 		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
 		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
 
-		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
-			const status = resolveAggregateStatus(sortedLimits);
+		for (const {
+			group,
+			sortedLimits,
+			sortedReports,
+			knownLimits,
+			notReportedCount,
+			amountText,
+		} of renderableGroups) {
+			const reportedStatus = resolveAggregateStatus(knownLimits);
+			// An unreported window is missing data, not proof of exhaustion.
+			const status = reportedStatus === "exhausted" && notReportedCount > 0 ? "warning" : reportedStatus;
 			const statusIcon = resolveStatusIcon(status, uiTheme);
 
 			const windowSuffix = formatWindowSuffix(group.label, group.windowLabel, uiTheme);

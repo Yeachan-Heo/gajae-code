@@ -1,397 +1,36 @@
-import { BracketedPasteHandler } from "../bracketed-paste";
-import { getKeybindings } from "../keybindings";
-import { extractPrintableText } from "../keys";
-import { KillRing } from "../kill-ring";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
-import {
-	getSegmenter,
-	getWordNavKind,
-	moveWordLeft,
-	moveWordRight,
-	padding,
-	replaceTabs,
-	sliceWithWidth,
-	visibleWidth,
-} from "../utils";
+import { getSegmenter, padding, sliceWithWidth, visibleWidth } from "../utils";
+import { SingleLineEditor } from "./single-line-editor";
 
 const segmenter = getSegmenter();
 
-interface InputState {
-	value: string;
-	cursor: number;
-}
-function insertTextNfcAt(value: string, cursor: number, text: string): { value: string; cursor: number } {
-	const before = value.slice(0, cursor);
-	const after = value.slice(cursor);
-	const beforeWithInsert = (before + text).normalize("NFC");
-	return {
-		value: (beforeWithInsert + after).normalize("NFC"),
-		cursor: beforeWithInsert.length,
-	};
-}
 /**
  * Input component - single-line text input with horizontal scrolling
  */
 export class Input implements Component, Focusable {
-	#value: string = "";
-	#cursor: number = 0; // Cursor position in the value
+	#editor = new SingleLineEditor({
+		onEdit: () => this.onEdit?.(),
+		onSubmit: value => this.onSubmit?.(value),
+		onEscape: () => this.onEscape?.(),
+	});
+
 	onSubmit?: (value: string) => void;
 	onEscape?: () => void;
+	onEdit?: () => void;
 
 	/** Focusable interface - set by TUI when focus changes */
 	focused: boolean = false;
 
-	// Bracketed paste mode buffering
-	#pasteHandler = new BracketedPasteHandler();
-
-	// Kill ring for Emacs-style kill/yank operations
-	#killRing = new KillRing();
-	#lastAction: "kill" | "yank" | "type-word" | null = null;
-
-	// Undo support
-	#undoStack: InputState[] = [];
-
 	getValue(): string {
-		return this.#value;
+		return this.#editor.value;
 	}
 
 	setValue(value: string): void {
-		const normalized = value.normalize("NFC");
-		this.#value = normalized;
-		this.#cursor = normalized.length;
-		this.#lastAction = null;
+		this.#editor.setValue(value);
 	}
 
 	handleInput(data: string): void {
-		// Handle bracketed paste mode
-		const paste =
-			data === "\x1b" && !this.#pasteHandler.hasPendingFrame
-				? ({ handled: false } as const)
-				: this.#pasteHandler.process(data);
-		if (paste.handled) {
-			if (paste.leading.length > 0) this.handleInput(paste.leading);
-			if (paste.pasteContent !== undefined) {
-				this.#handlePaste(paste.pasteContent);
-				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
-				}
-			}
-			return;
-		}
-
-		const kb = getKeybindings();
-
-		// Escape/Cancel
-		if (kb.matches(data, "tui.select.cancel")) {
-			if (this.onEscape) this.onEscape();
-			return;
-		}
-
-		// Undo
-		if (kb.matches(data, "tui.editor.undo")) {
-			this.#undo();
-			return;
-		}
-
-		// Submit
-		if (kb.matches(data, "tui.input.submit") || data === "\n") {
-			if (this.onSubmit) this.onSubmit(this.#value);
-			return;
-		}
-
-		// Deletion
-		if (kb.matches(data, "tui.editor.deleteCharBackward")) {
-			this.#handleBackspace();
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.deleteCharForward")) {
-			this.#handleForwardDelete();
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.deleteWordBackward")) {
-			this.#deleteWordBackwards();
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.deleteWordForward")) {
-			this.#deleteWordForward();
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.deleteToLineStart")) {
-			this.#deleteToLineStart();
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.deleteToLineEnd")) {
-			this.#deleteToLineEnd();
-			return;
-		}
-
-		// Kill ring actions
-		if (kb.matches(data, "tui.editor.yank")) {
-			this.#yank();
-			return;
-		}
-		if (kb.matches(data, "tui.editor.yankPop")) {
-			this.#yankPop();
-			return;
-		}
-
-		// Cursor movement
-		if (kb.matches(data, "tui.editor.cursorLeft")) {
-			this.#lastAction = null;
-			if (this.#cursor > 0) {
-				const beforeCursor = this.#value.slice(0, this.#cursor);
-				const graphemes = [...segmenter.segment(beforeCursor)];
-				const lastGrapheme = graphemes[graphemes.length - 1];
-				this.#cursor -= lastGrapheme ? lastGrapheme.segment.length : 1;
-			}
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.cursorRight")) {
-			this.#lastAction = null;
-			if (this.#cursor < this.#value.length) {
-				const afterCursor = this.#value.slice(this.#cursor);
-				const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
-				this.#cursor += firstGrapheme ? firstGrapheme.segment.length : 1;
-			}
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.cursorLineStart")) {
-			this.#lastAction = null;
-			this.#cursor = 0;
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.cursorLineEnd")) {
-			this.#lastAction = null;
-			this.#cursor = this.#value.length;
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.cursorWordLeft")) {
-			this.#moveWordBackwards();
-			return;
-		}
-
-		if (kb.matches(data, "tui.editor.cursorWordRight")) {
-			this.#moveWordForwards();
-			return;
-		}
-
-		// Regular character input, including Kitty CSI-u text-producing sequences.
-		const printableText = extractPrintableText(data);
-		if (printableText) {
-			this.#insertCharacter(printableText);
-		}
-	}
-
-	#insertCharacter(text: string): void {
-		const isWordChunk = [...segmenter.segment(text)].every(seg => getWordNavKind(seg.segment) !== "whitespace");
-		// Undo coalescing: consecutive word typing coalesces into one undo unit.
-		if (!isWordChunk || this.#lastAction !== "type-word") {
-			this.#pushUndo();
-		}
-		this.#lastAction = "type-word";
-
-		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
-	}
-
-	#handleBackspace(): void {
-		this.#lastAction = null;
-		if (this.#cursor <= 0) {
-			return;
-		}
-
-		this.#pushUndo();
-
-		const beforeCursor = this.#value.slice(0, this.#cursor);
-		const graphemes = [...segmenter.segment(beforeCursor)];
-		const lastGrapheme = graphemes[graphemes.length - 1];
-		const graphemeLength = lastGrapheme ? lastGrapheme.segment.length : 1;
-
-		this.#value = this.#value.slice(0, this.#cursor - graphemeLength) + this.#value.slice(this.#cursor);
-		this.#cursor -= graphemeLength;
-	}
-
-	#handleForwardDelete(): void {
-		this.#lastAction = null;
-		if (this.#cursor >= this.#value.length) {
-			return;
-		}
-
-		this.#pushUndo();
-
-		const afterCursor = this.#value.slice(this.#cursor);
-		const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
-		const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
-
-		this.#value = this.#value.slice(0, this.#cursor) + this.#value.slice(this.#cursor + graphemeLength);
-	}
-
-	#deleteToLineStart(): void {
-		if (this.#cursor === 0) {
-			return;
-		}
-
-		this.#pushUndo();
-		const deletedText = this.#value.slice(0, this.#cursor);
-		this.#killRing.push(deletedText, { prepend: true, accumulate: this.#lastAction === "kill" });
-		this.#lastAction = "kill";
-
-		this.#value = this.#value.slice(this.#cursor);
-		this.#cursor = 0;
-	}
-
-	#deleteToLineEnd(): void {
-		if (this.#cursor >= this.#value.length) {
-			return;
-		}
-
-		this.#pushUndo();
-		const deletedText = this.#value.slice(this.#cursor);
-		this.#killRing.push(deletedText, { prepend: false, accumulate: this.#lastAction === "kill" });
-		this.#lastAction = "kill";
-
-		this.#value = this.#value.slice(0, this.#cursor);
-	}
-
-	#deleteWordBackwards(): void {
-		if (this.#cursor === 0) {
-			return;
-		}
-
-		// Save state before cursor movement (moveWordBackwards resets lastAction).
-		const wasKill = this.#lastAction === "kill";
-		this.#pushUndo();
-
-		const oldCursor = this.#cursor;
-		this.#moveWordBackwards();
-		const deleteFrom = this.#cursor;
-		this.#cursor = oldCursor;
-
-		const deletedText = this.#value.slice(deleteFrom, this.#cursor);
-		this.#killRing.push(deletedText, { prepend: true, accumulate: wasKill });
-		this.#lastAction = "kill";
-
-		this.#value = this.#value.slice(0, deleteFrom) + this.#value.slice(this.#cursor);
-		this.#cursor = deleteFrom;
-	}
-
-	#deleteWordForward(): void {
-		if (this.#cursor >= this.#value.length) {
-			return;
-		}
-
-		// Save state before cursor movement (moveWordForwards resets lastAction).
-		const wasKill = this.#lastAction === "kill";
-		this.#pushUndo();
-
-		const oldCursor = this.#cursor;
-		this.#moveWordForwards();
-		const deleteTo = this.#cursor;
-		this.#cursor = oldCursor;
-
-		const deletedText = this.#value.slice(this.#cursor, deleteTo);
-		this.#killRing.push(deletedText, { prepend: false, accumulate: wasKill });
-		this.#lastAction = "kill";
-
-		this.#value = this.#value.slice(0, this.#cursor) + this.#value.slice(deleteTo);
-	}
-
-	#yank(): void {
-		const text = this.#killRing.peek();
-		if (!text) {
-			return;
-		}
-
-		this.#pushUndo();
-		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
-		this.#lastAction = "yank";
-	}
-
-	#yankPop(): void {
-		if (this.#lastAction !== "yank" || this.#killRing.length <= 1) {
-			return;
-		}
-
-		this.#pushUndo();
-
-		const prevText = this.#killRing.peek() ?? "";
-		this.#value = this.#value.slice(0, this.#cursor - prevText.length) + this.#value.slice(this.#cursor);
-		this.#cursor -= prevText.length;
-
-		this.#killRing.rotate();
-		const text = this.#killRing.peek() ?? "";
-		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
-		this.#lastAction = "yank";
-	}
-
-	#pushUndo(): void {
-		this.#undoStack.push({ value: this.#value, cursor: this.#cursor });
-	}
-
-	#undo(): void {
-		const snapshot = this.#undoStack.pop();
-		if (!snapshot) {
-			return;
-		}
-		this.#value = snapshot.value;
-		this.#cursor = snapshot.cursor;
-		this.#lastAction = null;
-	}
-
-	#moveWordBackwards(): void {
-		if (this.#cursor === 0) {
-			return;
-		}
-		this.#lastAction = null;
-		this.#cursor = moveWordLeft(this.#value, this.#cursor);
-	}
-
-	#moveWordForwards(): void {
-		if (this.#cursor >= this.#value.length) {
-			return;
-		}
-		this.#lastAction = null;
-		this.#cursor = moveWordRight(this.#value, this.#cursor);
-	}
-
-	#handlePaste(pastedText: string): void {
-		this.#lastAction = null;
-		this.#pushUndo();
-
-		// Clean the pasted text — remove newlines and carriage returns, normalize
-		// tabs, AND normalize Unicode to NFC.
-		//
-		// NFC normalization rationale: macOS Finder drag-drops file paths in NFD
-		// (Conjoining Jamo, U+1100..U+11FF). `Bun.stringWidth` counts each
-		// conjoining jamo as a separate cell — a Korean syllable like `화` is
-		// 1 char and 2 cells in NFC, but 2 chars and 3 cells in NFD (ᄒ=2 cells
-		// + ᅪ=1 cell). The terminal renders the NFD sequence as a single
-		// combined syllable (2 cells visible), so the width mismatch shows up
-		// as cursor drift past the visible filename — N×~1.5 cells for a path
-		// with N Korean syllables. NFC normalization at paste time stores the
-		// value in the same form everything else in the codebase assumes.
-		const cleanText = replaceTabs(pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "")).normalize(
-			"NFC",
-		);
-
-		// Insert at cursor position
-		const inserted = insertTextNfcAt(this.#value, this.#cursor, cleanText);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
+		this.#editor.handleInput(data);
 	}
 
 	invalidate(): void {
@@ -399,6 +38,8 @@ export class Input implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		const value = this.#editor.value;
+		const cursor = this.#editor.cursor;
 		// Calculate visible window
 		const prompt = "> ";
 		const availableWidth = width - prompt.length;
@@ -407,9 +48,9 @@ export class Input implements Component, Focusable {
 			return [prompt];
 		}
 
-		const cursorIndex = this.#cursor;
+		const cursorIndex = cursor;
 		// Ensure we always have a grapheme to invert at the cursor (space at end).
-		const displayValue = cursorIndex >= this.#value.length ? `${this.#value} ` : this.#value;
+		const displayValue = cursorIndex >= value.length ? `${value} ` : value;
 
 		const totalCols = visibleWidth(displayValue);
 		const cursorCols = visibleWidth(displayValue.slice(0, cursorIndex));

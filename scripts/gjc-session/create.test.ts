@@ -228,6 +228,27 @@ describe("gjc-session create public owner lifecycle", () => {
 		expect(detachedResult.exitCode).toBe(1); expect(detachedResult.stderr.toString()).toContain("could not determine branch");
 	});
 
+	test("names its default state directory through the physical workspace and keeps an explicit one as given", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-physical-state-"))); roots.push(root);
+		const dir = await worktree(root); const bin = await fixture(root);
+		const linked = path.join(root, "linked-worktree");
+		await fs.symlink(dir, linked);
+		// Locking is not under test; a stand-in keeps hosts without flock(1) on the same path.
+		await executable(path.join(root, "fake-bin", "flock"), "#!/usr/bin/env bash\nexit 0\n");
+		const fakePath = `${path.join(root, "fake-bin")}:${process.env.PATH ?? ""}`;
+		const firstStateDir = async (name: string, overrides: Record<string, string>) => {
+			const log = path.join(root, `${name}.log`);
+			sessions.push({ name, socket: `gjc-${name}` });
+			Bun.spawnSync(["bash", createScript, name, linked], { env: env({ GJC_BIN: bin, GJC_FIXTURE_ISOLATION_LOG: log, PATH: fakePath, ...overrides }), stdout: "pipe", stderr: "pipe" });
+			const first = (await Bun.file(log).text()).split("\n").find(line => line.trim() !== "");
+			return (JSON.parse(first ?? "{}") as { state_dir?: string }).state_dir;
+		};
+		const defaultName = `physical-${Date.now()}`;
+		expect(await firstStateDir(defaultName, {})).toBe(path.join(dir, ".gjc-session-state", defaultName));
+		const explicit = path.join(linked, "explicit-state");
+		expect(await firstStateDir(`explicit-${Date.now()}`, { GJC_SESSION_STATE_DIR: explicit })).toBe(explicit);
+	});
+
 	test("writes worktree baseline and public creation metadata before planning", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-metadata-")); roots.push(root);
 		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root);

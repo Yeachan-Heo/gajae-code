@@ -14,6 +14,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import fc from "fast-check";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
@@ -1066,5 +1067,182 @@ describe("AuthStorage usage cache: API-key credential display", () => {
 			storage.close();
 			vi.restoreAllMocks();
 		}
+	});
+});
+
+describe("AuthStorage usage cache durable payload", () => {
+	const canary = "usage-raw-canary-7f3a9c";
+
+	function usageCachePayloads(store: ObservableStore): string[] {
+		return [...store.cache.entries()]
+			.filter(([key]) => key.startsWith("usage_cache:"))
+			.map(([, entry]) => entry.value);
+	}
+
+	function reportWithRaw(): UsageReport {
+		const report = makeReport("reader@example.com");
+		report.raw = { authorization: `Bearer ${canary}`, nested: { token: canary } };
+		return report;
+	}
+
+	it("omits the provider raw field from the durable usage cache row", async () => {
+		const store = makeStore([oauthRow(1, "reader@example.com")]);
+		const provider: UsageProvider = {
+			id: "anthropic",
+			fetchUsage: async () => reportWithRaw(),
+		};
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: () => provider,
+		});
+		await storage.reload();
+		try {
+			const [health] = await storage.checkCredentials();
+			expect(health?.ok).toBe(true);
+			expect(health?.report && "raw" in health.report).toBe(false);
+
+			const reports = await storage.fetchUsageReports();
+			expect(reports?.[0]?.limits[0]?.amount.used).toBe(42);
+
+			const rows = usageCachePayloads(store);
+			expect(rows.length).toBeGreaterThan(0);
+			for (const row of rows) {
+				const parsed = JSON.parse(row) as { value: unknown };
+				expect(row).not.toContain(canary);
+				expect(JSON.stringify(parsed.value)).not.toContain('"raw"');
+			}
+			const shown = storage.getCachedUsageReport("anthropic", 1);
+			expect(shown?.report.limits[0]?.amount.used).toBe(42);
+			expect(shown?.report.metadata?.email).toBe("reader@example.com");
+			expect("raw" in (shown?.report ?? {})).toBe(false);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("keeps limits and metadata on a cached usage report", async () => {
+		const store = makeStore([oauthRow(1, "reader@example.com")]);
+		const plain = makeReport("reader@example.com");
+		const provider: UsageProvider = {
+			id: "anthropic",
+			fetchUsage: async () => plain,
+		};
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: () => provider,
+		});
+		await storage.reload();
+		try {
+			const first = await storage.fetchUsageReports();
+			expect(first?.[0]?.limits[0]?.amount.used).toBe(42);
+			expect(first?.[0]?.metadata?.email).toBe("reader@example.com");
+			const rows = usageCachePayloads(store);
+			expect(rows.some(row => row.includes("reader@example.com"))).toBe(true);
+			expect(rows.some(row => row.includes('"used":42'))).toBe(true);
+			const second = await storage.fetchUsageReports();
+			expect(second?.[0]?.limits[0]?.amount.used).toBe(42);
+			expect(second?.[0]?.metadata?.email).toBe("reader@example.com");
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("allows a null cooldown row when the probe returns no report", async () => {
+		const store = makeStore([oauthRow(2, "empty@example.com")]);
+		let calls = 0;
+		const provider: UsageProvider = {
+			id: "anthropic",
+			fetchUsage: async () => {
+				calls += 1;
+				return null;
+			},
+		};
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: () => provider,
+		});
+		await storage.reload();
+		try {
+			expect(await storage.fetchUsageReports()).toEqual([]);
+			const rows = usageCachePayloads(store);
+			expect(rows.some(row => (JSON.parse(row) as { value: unknown }).value === null)).toBe(true);
+			expect(await storage.fetchUsageReports()).toEqual([]);
+			expect(calls).toBe(1);
+		} finally {
+			storage.close();
+		}
+	});
+
+	function projectDurableUsage(value: unknown): unknown {
+		if (Array.isArray(value)) return value.map(item => projectDurableUsage(item));
+		if (typeof value !== "object" || value === null) return value;
+		const report = value as { provider?: unknown; fetchedAt?: unknown; limits?: unknown };
+		if (
+			typeof report.provider !== "string" ||
+			typeof report.fetchedAt !== "number" ||
+			!Array.isArray(report.limits)
+		) {
+			return value;
+		}
+		const { raw: _raw, ...safe } = report as { raw?: unknown };
+		return safe;
+	}
+
+	function jsonRoundTrip(value: unknown): unknown {
+		return JSON.parse(JSON.stringify(value));
+	}
+
+	it("property: durable usage cache drops generated raw and keeps the other fields", async () => {
+		const jsonValue = fc.jsonValue({ maxDepth: 2 });
+		const limit = fc.record({
+			id: fc.string({ maxLength: 16 }),
+			label: fc.string({ maxLength: 16 }),
+			scope: fc.record({ provider: fc.constant("anthropic") }),
+			amount: fc.record({
+				used: fc.integer({ min: 0, max: 100 }),
+				limit: fc.integer({ min: 0, max: 100 }),
+				unit: fc.constantFrom("percent", "requests", "tokens"),
+			}),
+		});
+		const report = fc.record({
+			provider: fc.constant("anthropic" as const),
+			fetchedAt: fc.integer({ min: 1, max: 2_000_000_000_000 }),
+			limits: fc.array(limit, { minLength: 1, maxLength: 3 }),
+			metadata: fc.option(fc.dictionary(fc.string({ minLength: 1, maxLength: 12 }), jsonValue, { maxKeys: 3 }), {
+				nil: undefined,
+			}),
+			raw: jsonValue,
+		});
+		await fc.assert(
+			fc.asyncProperty(fc.oneof(report, fc.constant(null)), async generated => {
+				const before = generated === null ? null : structuredClone(generated);
+				const store = makeStore([oauthRow(1, "reader@example.com")]);
+				const provider: UsageProvider = {
+					id: "anthropic",
+					fetchUsage: async () => generated,
+				};
+				const storage = new AuthStorage(store, { usageProviderResolver: () => provider });
+				await storage.reload();
+				try {
+					if (generated !== null) {
+						const [health] = await storage.checkCredentials();
+						expect(health?.ok).toBe(true);
+					}
+					await storage.fetchUsageReports();
+					expect(generated).toEqual(before);
+					const projected = projectDurableUsage(generated);
+					expect(projectDurableUsage(projected)).toEqual(projected);
+					const rows = usageCachePayloads(store);
+					expect(rows.length).toBeGreaterThan(0);
+					for (const row of rows) {
+						const parsed = JSON.parse(row) as { value: unknown };
+						const expected = Array.isArray(parsed.value)
+							? projectDurableUsage(generated === null ? [] : [generated])
+							: projected;
+						expect(jsonRoundTrip(parsed.value)).toEqual(jsonRoundTrip(expected));
+					}
+				} finally {
+					storage.close();
+				}
+			}),
+			{ seed: 535, numRuns: 64 },
+		);
 	});
 });

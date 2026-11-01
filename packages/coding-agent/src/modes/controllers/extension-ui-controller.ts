@@ -659,6 +659,12 @@ export class ExtensionUiController {
 			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
+			// The SDK session runtime streams turn content (message/tool events) and `bash_folded`
+			// to the connection that submitted the turn through these two bindings. Without them a
+			// terminal-hosted session accepts a remote prompt and settles it, but streams no answer.
+			onJobFold: listener => this.ctx.session.onJobFold(listener),
+			// Live observers must not consume the startup fallback notice before the TUI subscribes.
+			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,
@@ -892,6 +898,12 @@ export class ExtensionUiController {
 			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
 			getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 			getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],
+			// The SDK session runtime streams turn content (message/tool events) and `bash_folded`
+			// to the connection that submitted the turn through these two bindings. Without them a
+			// terminal-hosted session accepts a remote prompt and settles it, but streams no answer.
+			onJobFold: listener => this.ctx.session.onJobFold(listener),
+			// Live observers must not consume the startup fallback notice before the TUI subscribes.
+			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
 			sdkControl: this.#sdkControl,

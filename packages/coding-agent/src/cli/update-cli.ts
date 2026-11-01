@@ -38,6 +38,7 @@ import {
 	createActivationRecordFile,
 	type DirectoryIdentity,
 	type FileIdentity,
+	InstallationAclPresentError,
 	type ReconcileResult,
 	readActivationRecord,
 	reconcileActivationRecord,
@@ -863,6 +864,19 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}${outputSuffix}`;
 }
 
+class InstallationVerificationError extends Error {
+	readonly rollbackMessage: string;
+
+	constructor(result: InstalledVersionVerification, expectedVersion: string) {
+		super(formatVerificationFailure(result, expectedVersion));
+		this.rollbackMessage = result.smokeTestFailed
+			? "installed runtime smoke-test failed"
+			: "installed runtime version verification failed";
+	}
+}
+
+export class InstallationRollbackAclPresentError extends InstallationAclPresentError {}
+
 export function formatVerificationFailureForTest(
 	result: InstalledVersionVerification,
 	expectedVersion: string,
@@ -934,6 +948,41 @@ async function repointActivationRecordToRetryCandidate(
 	}
 }
 
+function activationRecordMatchesCandidate(
+	record: ActivationRecordV1,
+	options: BinaryReplacementOptions,
+	staged: { readonly identity: FileIdentity } | undefined,
+): boolean {
+	const digest = options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256;
+	return (
+		(digest === undefined || record.candidate.digest === digest) &&
+		record.candidate.version === options.expectedVersion &&
+		(!options.candidate ||
+			(record.candidate.ref === options.candidate.ref && record.candidate.channel === options.candidate.channel))
+	);
+}
+
+/**
+ * True only for a `staged`/`pending_activation` record whose live target is
+ * still byte- and identity-exact to the recorded baseline (or still absent for
+ * a fresh install), so no promotion ever reached the installed binary.
+ */
+function isSupersedablePrePromotionRecord(
+	record: ActivationRecordV1,
+	targetPath: string,
+	current: { readonly identity: FileIdentity } | undefined,
+): boolean {
+	if (record.phase !== "staged" && record.phase !== "pending_activation") return false;
+	if (path.resolve(record.targetPath) !== targetPath) return false;
+	if (!record.baseline.exists) return current === undefined;
+	return (
+		current !== undefined &&
+		record.targetIdentity !== undefined &&
+		sameFileIdentity(record.targetIdentity, current.identity) &&
+		current.identity.sha256 === record.baseline.digest
+	);
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -957,8 +1006,17 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		throw new Error("installation_original_target_changed");
 	const existing = await readActivationRecord(targetPath);
 	if (existing.status === "malformed" || existing.status === "foreign") throw new Error("activation_record_untrusted");
+	// A pre-promotion record for a different candidate never mutated the install:
+	// its live target is still the recorded baseline. Pinning it would refuse every
+	// later release with activation_transaction_requires_reconciliation (#6096), so
+	// let a fresh transaction supersede it. Anything past promotion stays pinned.
+	const supersedable =
+		existing.status === "valid" &&
+		!activationRecordMatchesCandidate(existing.record, options, undefined) &&
+		isSupersedablePrePromotionRecord(existing.record, targetPath, current);
 	const resumePinned =
 		existing.status === "valid" &&
+		!supersedable &&
 		existing.record.phase !== "verified" &&
 		existing.record.phase !== "rolled_back" &&
 		options.candidate !== undefined;
@@ -983,14 +1041,13 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	let record: ActivationRecordV1;
 	let recordIdentity: FileIdentity;
 	let redundantStage: { readonly path: string; readonly identity: FileIdentity } | undefined;
-	if (existing.status === "valid" && existing.record.phase !== "verified" && existing.record.phase !== "rolled_back") {
-		if (
-			existing.record.candidate.digest !== (options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256) ||
-			existing.record.candidate.version !== options.expectedVersion ||
-			(options.candidate &&
-				(existing.record.candidate.ref !== options.candidate.ref ||
-					existing.record.candidate.channel !== options.candidate.channel))
-		)
+	if (
+		existing.status === "valid" &&
+		!supersedable &&
+		existing.record.phase !== "verified" &&
+		existing.record.phase !== "rolled_back"
+	) {
+		if (!activationRecordMatchesCandidate(existing.record, options, staged))
 			throw new Error("activation_transaction_requires_reconciliation");
 		const currentStagingPath = path.resolve(options.tempPath);
 		const recordedStagingPath = path.resolve(existing.record.stagingPath);
@@ -1123,6 +1180,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 				reason: promoted.reason ?? promoted.status,
 				warning: stagingCleanupWarning,
 			});
+		if (promoted.reason === "acl_present")
+			throw new InstallationAclPresentError(targetPath, record.stagingPath, promoted);
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
 	}
 	record = promoted.record;
@@ -1130,7 +1189,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	const cleanupWarnings: string[] = [];
 	try {
 		let verification = await options.verifyInstalledVersion(options.expectedVersion);
-		if (!verification.ok) throw new Error(formatVerificationFailure(verification, options.expectedVersion));
+		if (!verification.ok) throw new InstallationVerificationError(verification, options.expectedVersion);
 		const after = await snapshotRegularFile(targetPath);
 		if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
 			throw new Error("installation_postcheck_identity_changed");
@@ -1170,6 +1229,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					toNativeIdentity(record.backupIdentity),
 					toNativeIdentity(record.targetIdentity),
 				);
+				if (!restored.ok && restored.code === "acl_present")
+					throw new InstallationRollbackAclPresentError(targetPath, backupPath, restored, false);
 				const observed = await snapshotRegularFile(targetPath);
 				if (!restored.ok || !observed || !sameFileIdentity(record.backupIdentity, observed.identity))
 					throw new Error("rollback_unverified");
@@ -1195,6 +1256,33 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 		throw primary;
 	}
+}
+
+function describeAclFailure(error: InstallationAclPresentError): string {
+	const value = (input: string) => {
+		const redacted = redactCrashSecrets(input);
+		return `${JSON.stringify(redacted.slice(0, 512))}${redacted.length > 512 ? " [truncated]" : ""}`;
+	};
+	const { aclFailurePrincipal, aclFailureInherited, aclFailureSide } = error.detail;
+	const side = aclFailureSide === "source" || aclFailureSide === "destination" ? aclFailureSide : "unknown";
+	const inheritance =
+		aclFailureInherited === true ? "inherited" : aclFailureInherited === false ? "explicit" : "unknown";
+	return `acl_present (${inheritance}, ${side}, principal ${aclFailurePrincipal ? value(aclFailurePrincipal) : "unknown"}, source ${value(error.sourcePath)}, destination ${value(error.targetPath)})`;
+}
+
+export function formatInstallationRollbackAclError(error: unknown): string | undefined {
+	if (!(error instanceof AggregateError) || error.message !== "installation_rollback_unverified") return undefined;
+	const [primary, rollback] = error.errors;
+	if (!(rollback instanceof InstallationRollbackAclPresentError)) return undefined;
+	const primaryMessage =
+		primary instanceof InstallationAclPresentError
+			? describeAclFailure(primary)
+			: primary instanceof InstallationVerificationError
+				? primary.rollbackMessage
+				: primary instanceof Error && primary.message === "installation_postcheck_identity_changed"
+					? "installed target identity changed after verification"
+					: "unclassified installation failure";
+	return `${error}: Inspect the uncertain activation before retrying. Primary failure: ${primaryMessage}; rollback binary restore failed: ${describeAclFailure(rollback)}`;
 }
 
 function formatPackageManagerInstallFailure(
@@ -1375,7 +1463,7 @@ export async function fetchAndVerifyOfficialPinnedCandidate(
 
 export async function smokeTestPinnedCandidate(candidate: { version: string }, stagingPath: string): Promise<void> {
 	const verification = await verifyInstalledRuntime(candidate.version, stagingPath);
-	if (!verification.ok) throw new Error(formatVerificationFailure(verification, candidate.version));
+	if (!verification.ok) throw new InstallationVerificationError(verification, candidate.version);
 }
 
 /** Injectable steps of the binary update flow (seams for testing ordering). */
@@ -2165,7 +2253,7 @@ export async function runUpdateCommand(
 		const prefix = installedVersion
 			? `${target.method === "migrate" ? "Standalone binary installed and verified at version" : "Updated to"} ${installedVersion}, but post-update recovery failed`
 			: "Update failed";
-		console.error(chalk.red(`${prefix}: ${err}`));
+		console.error(chalk.red(`${prefix}: ${formatInstallationRollbackAclError(err) ?? err}`));
 		return flushTelemetryBeforeExit();
 	}
 

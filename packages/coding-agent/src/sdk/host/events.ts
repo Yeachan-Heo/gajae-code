@@ -88,8 +88,16 @@ export class SessionEventStream {
 		if (this.#sessionId !== undefined) outboundRedactBySession.set(this.#sessionId, enabled);
 	}
 
-	restart(): number {
-		this.#generation += 1;
+	/**
+	 * Open the next event namespace. `floor` lets the owning host keep namespaces
+	 * distinct across host instances of one session; within one stream the
+	 * generation still only advances.
+	 */
+	restart(floor = 0): number {
+		if (!Number.isSafeInteger(floor)) throw new Error("SDK event generation floor must be a safe integer.");
+		const next = Math.max(this.#generation + 1, floor);
+		if (!Number.isSafeInteger(next)) throw new Error("SDK event generation is exhausted.");
+		this.#generation = next;
 		this.#seq = 0;
 		this.#frames = [];
 		return this.#generation;

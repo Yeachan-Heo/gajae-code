@@ -31,7 +31,7 @@ Confirmed by this baseline: `streaming-output.ts` `push` (tools), `serializeCano
 
 ## Stability
 
-AC1a.3 passes on the dedicated `macos-14` runner (`native-bench-ab.yml`, suite `profile-stability`, run https://github.com/Yeachan-Heo/gajae-code/actions/runs/36502046414 on dev `1011a4aede`). The job waits for the post-build load to settle below half the cores (1-minute load 1.36 before, 1.45 after), runs one warm-up profile, then two measured `--scenario all` runs compared with `--compare`:
+AC1a.3 passes on the dedicated `macos-15` runner (`native-bench-ab.yml`, suite `profile-stability`, run https://github.com/Yeachan-Heo/gajae-code/actions/runs/36502046414 on dev `1011a4aede`). The job waits for the post-build load to settle below half the cores (1-minute load 1.36 before, 1.45 after), runs one warm-up profile, then two measured `--scenario all` runs compared with `--compare`:
 
 | Scenario | Top-10 overlap |
 |---|---:|

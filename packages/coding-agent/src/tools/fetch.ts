@@ -12,6 +12,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
 import type { AgentStorage } from "../session/agent-storage";
+import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
 import { DEFAULT_MAX_BYTES, type TruncationDirection, truncateContent } from "../session/streaming-output";
 import { CachedOutputBlock } from "../tui/output-block";
 import { renderStatusLine } from "../tui/status-line";
@@ -1559,16 +1560,7 @@ const UNTRUSTED_CONTENT_CLOSE = "</untrusted-content>";
 export const WRAP_PREFIX_CHARS = `${UNTRUSTED_CONTENT_OPEN}\n`.length;
 const WRAP_SUFFIX = `\n${UNTRUSTED_CONTENT_CLOSE}`;
 
-export function escapeUntrustedContent(content: string): string {
-	// HTML and XML accept whitespace between the tag name and ">".
-	return content
-		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>");
-}
-
-export function wrapUntrustedContent(content: string): string {
-	return `${UNTRUSTED_CONTENT_OPEN}\n${escapeUntrustedContent(content)}${WRAP_SUFFIX}`;
-}
+export { escapeUntrustedContent, wrapUntrustedContent };
 
 function isWrappedReadUrlOutput(output: string): boolean {
 	return output.startsWith(`${UNTRUSTED_CONTENT_OPEN}\n`) && output.endsWith(WRAP_SUFFIX);

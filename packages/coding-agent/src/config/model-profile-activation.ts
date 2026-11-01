@@ -89,6 +89,8 @@ type ModelProfileActivationSession = Pick<
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
 	restoreModelSelectionForRollback?: AgentSession["restoreModelSelectionForRollback"];
+	beginModelSelectionUsage?: AgentSession["beginModelSelectionUsage"];
+	recordModelSelectionUsage?: AgentSession["recordModelSelectionUsage"];
 	prepareModelSelectionForProfileActivation?: AgentSession["prepareModelSelectionForProfileActivation"];
 	commitPreparedProfileModelSelection?: AgentSession["commitPreparedProfileModelSelection"];
 	finishPreparedProfileModelSelection?: AgentSession["finishPreparedProfileModelSelection"];
@@ -216,6 +218,8 @@ export interface PreparedModelProfileActivation {
 		| undefined;
 	defaultChainPublished: boolean;
 	defaultModelPublished: boolean;
+	/** MRU order slot claimed when the reload publication committed the profile DEFAULT. */
+	defaultModelPublishedUsageSequence?: number;
 	publishedState: PublishedModelProfileActivationState | undefined;
 	previousDefaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
 	defaultModel: Model<Api> | undefined;
@@ -2058,6 +2062,7 @@ export function publishPreparedModelProfileActivation(
 		prepared.preparedDefaultModelSelection
 	) {
 		prepared.defaultModelPublished = true;
+		prepared.defaultModelPublishedUsageSequence = prepared.session.beginModelSelectionUsage?.();
 		if (!prepared.session.commitPreparedProfileModelSelection) {
 			throw new Error("Session cannot commit a prepared profile model selection");
 		}
@@ -2092,6 +2097,18 @@ export function publishPreparedModelProfileActivation(
 	prepared.publishedState = capturePublishedModelProfileActivationState(prepared);
 }
 
+/**
+ * Record a published profile DEFAULT in the model usage order. Call synchronously
+ * once the enclosing publication finalized, before any await: a user selection
+ * made while a later step (such as a consumer lease) is pending must stay the
+ * most recent usage instead of being overtaken by this older profile choice.
+ */
+export function recordPublishedModelProfileActivationUsage(prepared: PreparedModelProfileActivation): void {
+	const sequence = prepared.defaultModelPublishedUsageSequence;
+	if (!prepared.defaultModelPublished || !prepared.preparedDefaultModelSelection || sequence === undefined) return;
+	prepared.session.recordModelSelectionUsage?.(prepared.preparedDefaultModelSelection.model, sequence);
+}
+
 export async function finishPreparedModelProfileActivation(prepared: PreparedModelProfileActivation): Promise<void> {
 	if (prepared.defaultModelPublished && prepared.preparedDefaultModelSelection) {
 		try {
@@ -2119,6 +2136,7 @@ export async function applyPreparedModelProfileActivation(
 ): Promise<void> {
 	let activationStage = "default chain";
 	let modelMutationStarted = false;
+	let modelMutationUsageSequence: number | undefined;
 	let overridesChanged = false;
 	let modelRolesChanged = false;
 	let persistentMutationStarted = false;
@@ -2173,6 +2191,7 @@ export async function applyPreparedModelProfileActivation(
 					shouldMutate: options.isCurrent,
 					onMutationStarted: () => {
 						modelMutationStarted = true;
+						modelMutationUsageSequence = prepared.session.beginModelSelectionUsage?.();
 					},
 				},
 			);
@@ -2436,6 +2455,12 @@ export async function applyPreparedModelProfileActivation(
 		if (activationWasCancelled) return;
 		throw error;
 	}
+	// Record the profile DEFAULT only after the activation fully succeeded: a failed
+	// or superseded switch rolls back (or yields) without touching the usage order.
+	// A newer choice recorded while the activation awaited (for example, its settings
+	// flush) keeps the MRU head.
+	if (modelMutationStarted && prepared.defaultModel && modelMutationUsageSequence !== undefined)
+		prepared.session.recordModelSelectionUsage?.(prepared.defaultModel, modelMutationUsageSequence);
 	if (!options.deferRuntimePublication) await finishPreparedModelProfileActivation(prepared);
 }
 

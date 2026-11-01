@@ -14,7 +14,6 @@ import {
 	type GjcModelAssignmentTargetId,
 	requiresExplicitThinkingChoice,
 } from "../config/model-registry";
-
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -22,6 +21,7 @@ import {
 	parseModelString,
 	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
+import type { ModelSelectorValue } from "../config/model-selector-value";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getAvailableThemes, getDetectedThemeSettingsPath, setTheme, theme } from "../modes/theme/theme";
@@ -36,7 +36,7 @@ import { PROGRESS_COMMAND_ACP_DESCRIPTION } from "../progress/render-progress";
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
-import type { AgentSession, ExactMcpStatusSnapshot } from "../session/agent-session";
+import type { AgentSession, ExactMcpStatusSnapshot, SessionMcpControlAction } from "../session/agent-session";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
 import {
@@ -293,13 +293,24 @@ function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
-		"Aliases include minimax, zai, alibaba, cline, command-code, goat, and ionet.",
+		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, and runcrate.",
 		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
 		"Credential status: /provider status",
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
 	].join("\n");
+}
+
+const SESSION_MCP_USAGE = "/mcp [status|list|connect <name>|disconnect <name>|reconnect <name>]";
+const SESSION_MCP_ACTIONS: ReadonlySet<string> = new Set<SessionMcpControlAction>([
+	"connect",
+	"disconnect",
+	"reconnect",
+]);
+
+function isSessionMcpAction(value: string): value is SessionMcpControlAction {
+	return SESSION_MCP_ACTIONS.has(value);
 }
 
 function exactMcpDisplayName(name: string): string {
@@ -332,6 +343,116 @@ function renderExactMcpStatus(snapshot: ExactMcpStatusSnapshot): string {
 	return lines.join("\n");
 }
 
+function renderSessionMcpStatus(
+	snapshot: NonNullable<Awaited<ReturnType<AgentSession["getSessionMcpStatusSnapshot"]>>>,
+): string {
+	const lines = ["MCP servers (this session):"];
+	if (!snapshot.available) lines.push("MCP controls are not available in this session.");
+	if (snapshot.servers.length === 0) lines.push("MCP servers: none declared in global or project mcp.json.");
+	for (const server of snapshot.servers) {
+		lines.push(
+			`  ${exactMcpDisplayName(server.name)} · ${server.scope} · ${server.state} · autoload ${server.autoload ? "on" : "off"} · ${server.toolCount} tools${server.declared ? "" : " · not in mcp.json"}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+async function handleSessionMcpTui(
+	command: ParsedSlashCommand,
+	runtime: BuiltinSlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	runtime.ctx.editor.setText("");
+	const args = command.args.trim() ? command.args.trim().split(/\s+/) : [];
+	const subcommand = args[0] ?? "status";
+	if (subcommand === "status" || subcommand === "list") {
+		if (args.length > 1) {
+			runtime.ctx.showError(`Usage: /mcp ${subcommand}`);
+			return commandConsumed();
+		}
+		const snapshot = await runtime.ctx.session.getSessionMcpStatusSnapshot();
+		if (!snapshot) return { prompt: command.text };
+		runtime.ctx.showStatus(renderSessionMcpStatus(snapshot));
+		return commandConsumed();
+	}
+	if (!isSessionMcpAction(subcommand)) {
+		runtime.ctx.showError(`Unknown subcommand: ${exactMcpDisplayName(subcommand)}. Usage: ${SESSION_MCP_USAGE}`);
+		return commandConsumed();
+	}
+	const name = args[1];
+	if (!name || args.length !== 2) {
+		runtime.ctx.showError(`Server name required. Usage: /mcp ${subcommand} <name>`);
+		return commandConsumed();
+	}
+	try {
+		const result = await runtime.ctx.session.controlSessionMcpServer(subcommand, name);
+		if (!result) return { prompt: command.text };
+		const displayName = exactMcpDisplayName(result.name);
+		switch (result.status) {
+			case "connected":
+				runtime.ctx.showStatus(`MCP server "${displayName}" connected (${result.toolCount} tools active).`);
+				break;
+			case "already-connected":
+				runtime.ctx.showWarning(`MCP server "${displayName}" is already connected.`);
+				break;
+			case "still-connecting":
+				runtime.ctx.showWarning(`MCP server "${displayName}" is still connecting.`);
+				break;
+			case "disconnected":
+				runtime.ctx.showStatus(
+					`MCP server "${displayName}" disconnected; its tools were removed for this session.`,
+				);
+				break;
+			case "not-connected":
+				runtime.ctx.showWarning(`MCP server "${displayName}" is not connected.`);
+				break;
+			case "reconnected":
+				runtime.ctx.showStatus(`MCP server "${displayName}" reconnected (${result.toolCount} tools).`);
+				break;
+			case "unknown-server":
+				runtime.ctx.showError(`Unknown MCP server: ${displayName}. Usage: ${SESSION_MCP_USAGE}`);
+				break;
+			case "undeclared":
+				runtime.ctx.showWarning(
+					`MCP server "${displayName}" is no longer in mcp.json; only /mcp disconnect is available.`,
+				);
+				break;
+			case "disabled":
+				runtime.ctx.showError(
+					result.disabledReason === "project-stdio-unapproved"
+						? "Project stdio servers need mcp.enableProjectConfig: true in the user config."
+						: `MCP server "${displayName}" is disabled. Change mcp.json to enable it, then run /mcp connect again.`,
+				);
+				break;
+			case "failed":
+				runtime.ctx.showError(
+					subcommand === "reconnect"
+						? `MCP server "${displayName}" could not be reconnected; its previous tools stay listed.`
+						: `MCP server "${displayName}" could not be connected; session tools are unchanged.`,
+				);
+				break;
+			case "unavailable":
+				runtime.ctx.showError(
+					result.unavailableReason === "shared-pool"
+						? `MCP server "${displayName}" uses a shared connection; /mcp reconnect is not available for it.`
+						: "MCP controls are not available in this session.",
+				);
+				break;
+		}
+	} catch (error) {
+		if ((error as { code?: string } | undefined)?.code === "busy")
+			runtime.ctx.showWarning(`MCP ${subcommand} is unavailable while this session is busy.`);
+		else runtime.ctx.showError(`MCP ${subcommand} failed.`);
+	}
+	return commandConsumed();
+}
+
+/** One status row. Arrays keep the historical comma join; controls never reach the terminal. */
+function formatModelSelectorForStatus(value: ModelSelectorValue | undefined): string {
+	if (value == null) return "(unset)";
+	const raw = typeof value === "string" ? value : value.join(",");
+	return sanitizeDisplayLine(raw);
+}
+
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 	const agentModelOverrides = runtime.settings.get("task.agentModelOverrides");
 	const lines = ["Model assignments:"];
@@ -339,7 +460,9 @@ function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 		const modelSelector =
 			target.settingsPath === "modelRoles" ? runtime.settings.getModelRole(targetId) : agentModelOverrides[targetId];
-		lines.push(`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${modelSelector ?? "(unset)"}`);
+		lines.push(
+			`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${formatModelSelectorForStatus(modelSelector)}`,
+		);
 	}
 	return lines.join("\n");
 }
@@ -1758,7 +1881,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// This builtin is installed statically, but the exact MCP capability is
 			// granted only to root interactive --mcp-config sessions. Preserve the
 			// pristine command namespace for every other session.
-			if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };
+			if (!runtime.ctx.session.hasExactMcpControls && !runtime.ctx.session.hasSessionMcpControls)
+				return { prompt: command.text };
+			if (!runtime.ctx.session.hasExactMcpControls) return handleSessionMcpTui(command, runtime);
 			runtime.ctx.editor.setText("");
 			const args = command.args.trim() ? command.args.trim().split(/\s+/) : [];
 			const subcommand = args[0] ?? "";

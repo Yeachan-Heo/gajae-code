@@ -197,7 +197,13 @@ export async function buildMemoryToolDeveloperInstructions(
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Delete every memory row and memory job in the shared local database, then remove
+ * only the current project's memory directory.
+ *
+ * Database deletion is not scoped to `cwd`. Filesystem cleanup removes the
+ * directory that `getMemoryRoot(agentDir, cwd)` returns. Project paths that
+ * differ only in `/`, `\`, or `:` versus `-` map to the same directory, so that
+ * shared directory is removed too.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -206,6 +212,7 @@ export async function clearMemoryData(agentDir: string, cwd: string): Promise<vo
 	} finally {
 		closeMemoryDb(db);
 	}
+	// Filesystem cleanup is the current project directory only.
 	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
 }
 
@@ -681,23 +688,27 @@ async function runStage1Job(options: {
 async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[]): Promise<void> {
 	const summariesDir = path.join(memoryRoot, "rollout_summaries");
 	await fs.mkdir(summariesDir, { recursive: true });
+	const summariesRoot = path.resolve(summariesDir);
 
 	const keepFiles = new Set<string>();
 	for (const row of outputs) {
-		const stem = formatRolloutFilename(row.threadId, row.rolloutSlug);
-		const filename = `${stem}.md`;
+		const target = rolloutSummaryDestination(summariesRoot, row.threadId, row.rolloutSlug);
+		if (!target) continue;
+		const filename = path.basename(target);
 		keepFiles.add(filename);
 		const body = [`thread_id: ${row.threadId}`, `updated_at: ${row.sourceUpdatedAt}`, "", row.rolloutSummary].join(
 			"\n",
 		);
-		await Bun.write(path.join(summariesDir, filename), `${body.trim()}\n`);
+		await Bun.write(target, `${body.trim()}\n`);
 	}
 
 	const currentFiles = await fs.readdir(summariesDir).catch(() => [] as string[]);
 	for (const file of currentFiles) {
 		if (!file.endsWith(".md")) continue;
 		if (keepFiles.has(file)) continue;
-		await fs.rm(path.join(summariesDir, file), { force: true });
+		const target = containedExistingSummary(summariesRoot, file);
+		if (!target) continue;
+		await fs.rm(target, { force: true });
 	}
 
 	const rawBody = buildRawMemoriesMarkdown(outputs);
@@ -923,6 +934,55 @@ function formatRolloutFilename(threadId: string, rolloutSlug: string | null): st
 		.slice(0, 20);
 	if (!normalized) return threadId;
 	return `${threadId}-${normalized}`;
+}
+
+/** Lexical containment for one summary file name. A backslash is a separator only when the platform says so. */
+function lexicalSummaryTarget(summariesRoot: string, filename: string): string | undefined {
+	if (filename.length === 0 || filename.includes("\0") || filename.includes("/")) return undefined;
+	if (filename === "." || filename === "..") return undefined;
+	if (path.basename(filename) !== filename) return undefined;
+	const target = path.resolve(summariesRoot, filename);
+	const relative = path.relative(summariesRoot, target);
+	if (
+		relative.length === 0 ||
+		relative === ".." ||
+		relative.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relative) ||
+		relative !== filename
+	) {
+		return undefined;
+	}
+	return target;
+}
+
+/** New summary names stay portable: reject separators, including backslash. */
+function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
+	if (filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+/** Existing directory entries may contain a backslash on POSIX. Still refuse a name that leaves the directory. */
+function containedExistingSummary(summariesRoot: string, filename: string): string | undefined {
+	if (!filename.endsWith(".md")) return undefined;
+	if (path.sep === "\\" && filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+function rolloutSummaryDestination(
+	summariesRoot: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return containedSummaryFilename(summariesRoot, `${formatRolloutFilename(threadId, rolloutSlug)}.md`);
+}
+
+/** Test seam for the rollout summary path gate. */
+export function rolloutSummaryDestinationForTesting(
+	summariesDir: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return rolloutSummaryDestination(path.resolve(summariesDir), threadId, rolloutSlug);
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | undefined {

@@ -149,6 +149,9 @@ function upsertArchiveEntry(map: Map<string, ArchiveIndexEntry>, entry: ArchiveI
 		return;
 	}
 
+	// Preserve the first file record as one unit, including zero size and absent mtime.
+	if (!existing.isDirectory) return;
+
 	map.set(entry.path, {
 		...existing,
 		size: existing.size || entry.size,
@@ -313,18 +316,21 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 		}
 		longName = undefined;
 		const normalizedPath = normalizeArchiveEntryPath(rawName);
-		if (!normalizedPath || !isRegular) continue;
+		const isDirectory = typeFlag === 53;
+		if (!normalizedPath || (!isRegular && !isDirectory)) continue;
 		const mtime = tarOctal(header, 136, 12);
 		const mtimeMs = Number.isFinite(mtime) && mtime > 0 ? mtime * 1000 : undefined;
 		entries.push({
 			path: normalizedPath,
-			isDirectory: false,
-			size,
+			isDirectory,
+			size: isDirectory ? 0 : size,
 			mtimeMs,
-			storage: {
-				type: "tar",
-				file: new File([data], normalizedPath, { lastModified: mtimeMs ?? 0 }),
-			},
+			storage: isDirectory
+				? undefined
+				: {
+						type: "tar",
+						file: new File([data], normalizedPath, { lastModified: mtimeMs ?? 0 }),
+					},
 		});
 	}
 	return entries;

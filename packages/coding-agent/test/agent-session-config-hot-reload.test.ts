@@ -1284,10 +1284,181 @@ describe("AgentSession configuration reload", () => {
 			expect(session!.model).toMatchObject({ id: "default-model", baseUrl: "https://before.example/v1" });
 			expect(session!.thinkingLevel).toBe(ThinkingLevel.High);
 			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+			// Neither the failed rebind nor its compensation is a model-usage choice.
+			expect(session!.settings.getStorage()?.getModelUsageOrder()).toEqual([]);
 		} finally {
 			appendModelChangeSpy.mockRestore();
 		}
 	});
+
+	it.each([
+		["records a reloaded profile DEFAULT in the model usage order after publication", undefined],
+		["keeps a reloaded profile DEFAULT out of the model usage order when the models finalizer fails", "models"],
+		["keeps a reloaded profile DEFAULT out of the model usage order when the settings finalizer fails", "settings"],
+	] as const)("%s", async (_label, fail) => {
+		const { configPath, modelsPath } = await createSession({
+			modelId: "default-model",
+			additionalModelId: "manual-model",
+			withProfile: true,
+			profileRoleMapping: true,
+		});
+		await session!.activateModelProfileForControl("active-profile");
+		const storage = session!.settings.getStorage();
+		const before = [...(storage?.getModelUsageOrder() ?? [])];
+		expect(before).toEqual([`${provider}/default-model`]);
+		const originalStageModelsReload = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+		const stageSpy = vi.spyOn(modelRegistry!, "stageModelsConfigReload").mockImplementation(async (...args) => {
+			const stagedModels = await originalStageModelsReload(...args);
+			if (fail === "models") {
+				vi.spyOn(stagedModels, "finalize").mockImplementation(() => {
+					throw new Error("Injected failure after publication");
+				});
+			}
+			return stagedModels;
+		});
+		const settings = session!.settings;
+		const originalPublish = settings.publishGlobalConfigReload.bind(settings);
+		const publishSpy = vi.spyOn(settings, "publishGlobalConfigReload").mockImplementation((...args) => {
+			const publication = originalPublish(...args);
+			if (fail === "settings") {
+				vi.spyOn(publication, "finalize").mockImplementation(() => {
+					throw new Error("Injected settings finalizer failure");
+				});
+			}
+			return publication;
+		});
+		try {
+			const staged = candidate(
+				26,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "manual-model",
+					additionalModelId: "default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					withProfile: true,
+					profileRoleMapping: true,
+				}),
+			);
+			const reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			if (fail) {
+				await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
+				expect(session!.model?.id).toBe("default-model");
+				expect(storage?.getModelUsageOrder()).toEqual(before);
+			} else {
+				await reload;
+				expect(session!.model?.id).toBe("manual-model");
+				expect(storage?.getModelUsageOrder()).toContain(`${provider}/manual-model`);
+			}
+		} finally {
+			stageSpy.mockRestore();
+			publishSpy.mockRestore();
+		}
+	});
+
+	it("keeps a user selection made while the reload waits on another publisher as the most recent usage", async () => {
+		const { configPath, modelsPath } = await createSession({
+			modelId: "default-model",
+			additionalModelId: "manual-model",
+			withProfile: true,
+			profileRoleMapping: true,
+		});
+		await session!.activateModelProfileForControl("active-profile");
+		const storage = session!.settings.getStorage();
+		if (!storage) throw new Error("Expected file-backed agent storage");
+		// Another session sharing this ModelRegistry and agent.db publishes its own reload.
+		const otherSettings = await Settings.loadForScope({ cwd: tempDir!, agentDir: tempDir! });
+		const otherStorage = otherSettings.getStorage();
+		if (!otherStorage) throw new Error("Expected file-backed agent storage for the other session");
+		const otherModel = modelRegistry!.find(provider, "default-model");
+		if (!otherModel) throw new Error("Expected configured test model in the real model registry");
+		const other = new AgentSession({
+			agent: new Agent({ initialState: { model: otherModel, systemPrompt: ["Test"], tools: [] } }),
+			sessionManager: SessionManager.inMemory(),
+			settings: otherSettings,
+			modelRegistry: modelRegistry!,
+		});
+		const nextModels = modelsText({
+			modelId: "manual-model",
+			additionalModelId: "default-model",
+			name: "After",
+			baseUrl: "https://after.example/v1",
+			withProfile: true,
+			profileRoleMapping: true,
+		});
+		const staged = candidate(
+			27,
+			configPath,
+			modelsPath,
+			settingsText({ todoEnabled: false, compactionEnabled: false }),
+			nextModels,
+		);
+		const otherStaged = candidate(
+			28,
+			configPath,
+			modelsPath,
+			settingsText({ todoEnabled: true, compactionEnabled: false }),
+			nextModels,
+		);
+		const recorded: string[] = [];
+		const recordSpies = [storage, otherStorage].map(target => {
+			const recordModelUsage = target.recordModelUsage.bind(target);
+			return vi.spyOn(target, "recordModelUsage").mockImplementation(modelKey => {
+				recorded.push(modelKey);
+				recordModelUsage(modelKey);
+			});
+		});
+		const otherQueued = Promise.withResolvers<void>();
+		const otherHoldsFence = Promise.withResolvers<void>();
+		const releaseOther = Promise.withResolvers<void>();
+		const acquireFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+		let fenceCalls = 0;
+		let otherReload: Promise<unknown> | undefined;
+		const fenceSpy = vi.spyOn(modelRegistry!, "acquirePublicationFence").mockImplementation(async signal => {
+			fenceCalls++;
+			if (fenceCalls === 1) {
+				// This session's reload holds the fence; the other publisher queues behind it.
+				const release = await acquireFence(signal);
+				otherReload = other.reloadConfiguration(otherStaged, new AbortController().signal);
+				await otherQueued.promise;
+				return release;
+			}
+			const pending = acquireFence(signal);
+			otherQueued.resolve();
+			const release = await pending;
+			otherHoldsFence.resolve();
+			await releaseOther.promise;
+			return release;
+		});
+		try {
+			const reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			// The other publisher received the fence when this reload released it, so this
+			// reload's consumer lease (and its finish step) is now waiting.
+			await otherHoldsFence.promise;
+			expect(session!.model?.id).toBe("manual-model");
+			// Cross SQLite's one-second last_used_at granularity between every write.
+			await Bun.sleep(1100);
+			const userModel = modelRegistry!.find(provider, "default-model");
+			if (!userModel) throw new Error("Expected the reloaded user model");
+			await session!.setModel(userModel, "default", { cause: "user-selection" });
+			await Bun.sleep(1100);
+			releaseOther.resolve();
+			await reload;
+			await otherReload;
+
+			expect(session!.model?.id).toBe("default-model");
+			expect(storage.getModelUsageOrder()[0]).toBe(`${provider}/default-model`);
+			expect(recorded.at(-1)).toBe(`${provider}/default-model`);
+		} finally {
+			releaseOther.resolve();
+			fenceSpy.mockRestore();
+			for (const spy of recordSpies) spy.mockRestore();
+			await other.dispose();
+			await otherSettings.close();
+		}
+	}, 20_000);
 
 	it("preserves a reentrant same-effective thinking control during reload rollback", async () => {
 		const { configPath, modelsPath } = await createSession({

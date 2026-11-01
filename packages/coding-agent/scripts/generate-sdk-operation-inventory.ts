@@ -31,6 +31,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-identity listener fan-out for in-process session surfaces; not a user-facing SDK control seam",
 	"agent_session:subscribeSessionIdentityChanges":
 		"internal session-identity subscription used by in-process adapters to follow session replacement; not a user-facing SDK control seam",
+	"agent_session:subscribeCommittedSessionSwitch":
+		"internal committed-switch subscription used by the interactive mode to reconcile plan and goal controllers; not a user-facing SDK control seam",
+	"agent_session:clearPlanModeBinding":
+		"internal plan-mode rollback when plan tool activation fails; not a user-facing SDK control seam",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:mcp":
@@ -113,6 +117,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal rollback compensation, not a user-facing SDK control seam",
 	"agent_session:restoreModelSelectionForRollback":
 		"internal rollback compensation, not a user-facing SDK control seam",
+	"agent_session:beginModelSelectionUsage":
+		"internal model-usage ordering slot for a selection transaction, not a user-facing SDK control seam",
+	"agent_session:recordModelSelectionUsage":
+		"internal model-usage bookkeeping after a completed selection transaction, not a user-facing SDK control seam",
 	"agent_session:materializeActiveDefaultModelProfileAssignment":
 		"internal extension selection materialization seam, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionCleanup":
@@ -167,6 +175,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"test-only parked terminal persistence seam, not a user-facing SDK control seam",
 	"agent_session:flushParkedAgentEndForCoordinatorPersistForTests":
 		"test-only parked terminal flush seam, not a user-facing SDK control seam",
+	"agent_session:waitForAgentEndHandlingForTests":
+		"test-only SDK terminal-event handler completion barrier, not a user-facing SDK control seam",
 	"agent_session:setCancelAndSubmitAbortOutcomeProviderForTests":
 		"test-only cancellation seam, not a user-facing SDK control seam",
 	"agent_session:awaitDisposeCompletion": "test-only disposal completion seam, not a user-facing SDK control seam",
@@ -218,6 +228,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal exact-config MCP status accessor used only by the terminal-only /mcp command; its capability is granted only to root interactive --mcp-config sessions, not a public SDK query",
 	"agent_session:controlExactMcpServer":
 		"internal session-local exact-config MCP suspend/resume/reconnect mutation used only by the terminal-only /mcp command; runtime suppression is not persistent user authority or a public SDK control",
+	"agent_session:getSessionMcpStatusSnapshot":
+		"internal session-local MCP status accessor for session MCP discovery; not exposed as a public SDK operation",
+	"agent_session:getSessionMcpCompletionCandidates":
+		"internal session-local MCP server completion candidates derived from status snapshot; not exposed as a public SDK operation",
+	"agent_session:controlSessionMcpServer":
+		"internal session-local MCP server control mutation for session MCP discovery and connection management; not a public SDK operation",
 	"agent_session:refreshGjcSubskillTools": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:buildDisplaySessionContext": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:buildPreparedDisplaySessionContext": "internal accessor/plumbing, not a user-facing control seam",

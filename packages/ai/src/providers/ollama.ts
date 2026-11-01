@@ -302,29 +302,36 @@ async function* iterateNdjson(stream: ReadableStream<Uint8Array>): AsyncGenerato
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) {
-			break;
-		}
-		buffer += decoder.decode(value, { stream: true });
+	try {
 		while (true) {
-			const newlineIndex = buffer.indexOf("\n");
-			if (newlineIndex < 0) {
+			const { done, value } = await reader.read();
+			if (done) {
 				break;
 			}
-			const line = buffer.slice(0, newlineIndex).trim();
-			buffer = buffer.slice(newlineIndex + 1);
-			if (!line) {
-				continue;
+			buffer += decoder.decode(value, { stream: true });
+			while (true) {
+				const newlineIndex = buffer.indexOf("\n");
+				if (newlineIndex < 0) {
+					break;
+				}
+				const line = buffer.slice(0, newlineIndex).trim();
+				buffer = buffer.slice(newlineIndex + 1);
+				if (!line) {
+					continue;
+				}
+				yield JSON.parse(line) as OllamaChatChunk;
 			}
-			yield JSON.parse(line) as OllamaChatChunk;
 		}
-	}
-	buffer += decoder.decode();
-	const tail = buffer.trim();
-	if (tail) {
-		yield JSON.parse(tail) as OllamaChatChunk;
+		buffer += decoder.decode();
+		const tail = buffer.trim();
+		if (tail) {
+			yield JSON.parse(tail) as OllamaChatChunk;
+		}
+	} finally {
+		// A terminal done chunk or parse error can stop consumption before EOF.
+		// Cancellation must not delay completion when a transport cleanup stalls.
+		void reader.cancel().catch(() => {});
+		reader.releaseLock();
 	}
 }
 

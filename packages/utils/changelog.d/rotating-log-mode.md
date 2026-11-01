@@ -1,3 +1,0 @@
-### Fixed
-
-- On POSIX, the rotating-log directory and the active log file are owner-only when they can be opened. An entry the owner cannot open is left unchanged, and that skip is reported through the configured transports. A file-only logger does not write the terminal. A directory path ending in `/.` is repaired as that directory, so a symlink swapped into the name is not chmodded. Retained dated logs and compressed archives keep their mode. Root aliases, including a directory whose opened inode is the filesystem root, are not chmodded. A symlinked log directory keeps its target mode, while a regular log file reached through it is still tightened. A trailing backslash stays part of a POSIX directory name.

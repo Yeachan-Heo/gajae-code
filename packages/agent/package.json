@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/agent-core",
-	"version": "0.18.12",
+	"version": "0.19.2",
 	"description": "General-purpose agent with transport abstraction, state management, and attachment support",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",
@@ -33,7 +33,6 @@
 	},
 	"dependencies": {
 		"@gajae-code/ai": "catalog:",
-		"@gajae-code/natives": "catalog:",
 		"@gajae-code/utils": "catalog:",
 		"@opentelemetry/api": "catalog:"
 	},

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	computeCrashFingerprint,
+	computeCrashFingerprintV1,
 	computeHandledErrorFingerprint,
 	formatCrashRecordMarker,
 	postmortem,
@@ -27,18 +28,20 @@ function record(fingerprint: string, recordId: string, message: string, body: st
 	);
 }
 
-function boundRecord(recordId: string, message: string, body: string): { fingerprint: string; text: string } {
+function boundRecord(
+	recordId: string,
+	message: string,
+	body: string,
+): { fingerprint: string; version: number; text: string } {
 	const headline = `Error: ${message}`;
 	const stack = `${headline}\n${body}`;
-	const fingerprint = computeCrashFingerprint(
-		{ name: "Error", message, stack },
-		{ installRoot: process.cwd() },
-	).fingerprint;
+	const computed = computeCrashFingerprint({ name: "Error", message, stack }, { installRoot: process.cwd() });
 	return {
-		fingerprint,
+		fingerprint: computed.fingerprint,
+		version: computed.version,
 		text:
 			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] ${headline}\n` +
-			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
+			`${stack}\n${formatCrashRecordMarker(computed.fingerprint, computed.version, recordId)}\n\n`,
 	};
 }
 
@@ -47,13 +50,14 @@ function boundDiagnosticRecord(
 	name: string,
 	message: string,
 	stack: string,
-): { fingerprint: string; text: string } {
-	const fingerprint = computeCrashFingerprint({ name, message, stack }, { installRoot: process.cwd() }).fingerprint;
+): { fingerprint: string; version: number; text: string } {
+	const computed = computeCrashFingerprint({ name, message, stack }, { installRoot: process.cwd() });
 	return {
-		fingerprint,
+		fingerprint: computed.fingerprint,
+		version: computed.version,
 		text:
 			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] ${name}: ${message}\n` +
-			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
+			`${stack}\n${formatCrashRecordMarker(computed.fingerprint, computed.version, recordId)}\n\n`,
 	};
 }
 
@@ -100,17 +104,33 @@ describe("parseCrashRecords", () => {
 		expect(parseCrashRecords(log)).toHaveLength(0);
 	});
 
-	it("accepts only complete v1 records bound to their own diagnostic fingerprint", () => {
+	it("accepts only complete current-version records bound to their own diagnostic fingerprint", () => {
 		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
 		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
 		expect(parseRecoverableCrashRecords(valid.text.trimEnd())).toHaveLength(0);
 	});
 
+	it("recomputes historical v1 markers with the pre-alias normalizer", () => {
+		const message = "failed to authenticate pw=legacy-secret";
+		const headline = `Error: ${message}`;
+		const stack = `${headline}\n    at frame (packages/coding-agent/src/x.ts:1:1)`;
+		const historical = computeCrashFingerprintV1({ name: "Error", message, stack }, { installRoot: process.cwd() });
+		const text =
+			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] ${headline}\n` +
+			`${stack}\n${formatCrashRecordMarker(historical.fingerprint, 1, "3123456789abcdef")}\n\n`;
+
+		expect(historical.fingerprint).toBe("e91ef2ac7473805c195da1947ae9afab");
+		expect(historical.messageClass).toBe("failed to authenticate pw=«redacted»");
+		expect(parseRecoverableCrashRecords(text).map(record => [record.fingerprint, record.fpv])).toEqual([
+			[historical.fingerprint, 1],
+		]);
+	});
+
 	it("accepts a bound record with a serialized object payload after its stack", () => {
 		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
 		const withPayload = valid.text.replace(
-			formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef"),
-			`{"phase":"startup","reason":"pending"}\n${formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef")}`,
+			formatCrashRecordMarker(valid.fingerprint, valid.version, "0123456789abcdef"),
+			`{"phase":"startup","reason":"pending"}\n${formatCrashRecordMarker(valid.fingerprint, valid.version, "0123456789abcdef")}`,
 		);
 		expect(parseRecoverableCrashRecords(withPayload).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
 	});
@@ -122,12 +142,12 @@ describe("parseCrashRecords", () => {
 		const fingerprint = computeHandledErrorFingerprint({ name, message, stack }, { installRoot: process.cwd() });
 		const text =
 			`2026-08-11T12:00:00.000Z pid=4242 [Tool functions.read] ${name}: ${message}\n` +
-			`${stack}\n${formatCrashRecordMarker(fingerprint.fingerprint, 1, "0123456789abcdef")}\n\n`;
+			`${stack}\n${formatCrashRecordMarker(fingerprint.fingerprint, fingerprint.version, "0123456789abcdef")}\n\n`;
 
 		expect(parseRecoverableCrashRecords(text).map(record => record.fingerprint)).toEqual([fingerprint.fingerprint]);
 	});
 
-	it("recovers production v1 records with a colon in the error name", () => {
+	it("recovers current-version records with a colon in the error name", () => {
 		const valid = boundDiagnosticRecord(
 			"1123456789abcdef",
 			"Provider:ProtocolError",
@@ -137,7 +157,7 @@ describe("parseCrashRecords", () => {
 		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
 	});
 
-	it("recovers production v1 records with a multiline message", () => {
+	it("recovers current-version records with a multiline message", () => {
 		const valid = boundDiagnosticRecord(
 			"2123456789abcdef",
 			"Error",
@@ -190,8 +210,8 @@ describe("parseCrashRecords", () => {
 		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
 		const decoy =
 			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] Error: decoy\n` +
-			`${formatCrashRecordMarker(valid.fingerprint, 1, "fedcba9876543210")}\n` +
-			`${formatCrashRecordMarker(valid.fingerprint, 1, "aaaaaaaaaaaaaaaa")}\n\n`;
+			`${formatCrashRecordMarker(valid.fingerprint, valid.version, "fedcba9876543210")}\n` +
+			`${formatCrashRecordMarker(valid.fingerprint, valid.version, "aaaaaaaaaaaaaaaa")}\n\n`;
 		expect(parseRecoverableCrashRecords(decoy)).toHaveLength(0);
 	});
 });

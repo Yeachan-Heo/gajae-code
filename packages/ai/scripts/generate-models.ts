@@ -88,6 +88,7 @@ const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number 
 	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
 	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
 	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+	{ id: "gpt-6.1-terra", name: "GPT-6.1 Terra" },
 	{ id: "gpt-6-luna", name: "GPT-6 Luna" },
 ];
 

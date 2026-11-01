@@ -1,3 +1,0 @@
-### Added
-
-- `gjc migrate` imports Claude Code hooks as a generated `.gjc/hooks/migrated-claude-code.ts` module. `PreToolUse` maps to `tool_call` and keeps the origin contract (a command that exits 2 blocks the tool and its stderr becomes the reason); `PostToolUse` maps to `tool_result`, `SessionStart` to `session_start`, and `Stop` to `turn_end`. Tool matchers are preserved, the payload keeps the origin's field names, and fields this runtime cannot supply are omitted rather than invented. Events with no faithful equivalent (`Notification`, `SubagentStop`, `PreCompact`, `UserPromptSubmit`) are reported as `skipped_unmappable` for manual porting instead of being silently dropped.

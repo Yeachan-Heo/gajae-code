@@ -5,7 +5,7 @@ import type { KernelExecuteOptions, KernelExecuteResult } from "@gajae-code/codi
 class FakeKernel implements PythonKernelExecutor {
 	private result: KernelExecuteResult;
 	private onExecute?: (options?: KernelExecuteOptions) => void;
-	private _exitCode: number | null = null;
+	#exitCode: number | null = null;
 
 	constructor(result: KernelExecuteResult, onExecute?: (options?: KernelExecuteOptions) => void) {
 		this.result = result;
@@ -18,11 +18,11 @@ class FakeKernel implements PythonKernelExecutor {
 	}
 
 	getExitCode(): number | null {
-		return this._exitCode;
+		return this.#exitCode;
 	}
 
 	setExitCode(code: number | null): void {
-		this._exitCode = code;
+		this.#exitCode = code;
 	}
 }
 

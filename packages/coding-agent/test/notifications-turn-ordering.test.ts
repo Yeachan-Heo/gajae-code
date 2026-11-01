@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { kProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
 import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/host/host";
@@ -34,6 +35,7 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = {
 	type: string;
+	id?: string;
 	kind?: string;
 	payload?: Frame;
 	seq?: number;
@@ -46,6 +48,7 @@ type Frame = {
 	cwd?: string;
 	state?: string;
 	updateId?: number;
+	reason?: string;
 };
 
 type TestContextUsage = {
@@ -1251,6 +1254,317 @@ test("lean bounds autonomous settlement composition to the receipt and latest ma
 	}
 }, 30000);
 
+/**
+ * Drives one real-shaped agent-loop turn: assistant text plus tool calls is
+ * followed by the tool results the loop emits as `message_end` before the next
+ * turn starts; a turn without tool calls settles.
+ */
+async function toolLoopTurn(
+	handlers: Map<string, Handler>,
+	ctx: unknown,
+	turnIndex: number,
+	text: string,
+	options: { toolCall?: string; steering?: string } = {},
+): Promise<void> {
+	await handlers.get("turn_start")!({ type: "turn_start", turnIndex }, ctx);
+	if (options.steering)
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: { role: "custom", customType: "async-result", attribution: "agent", content: options.steering },
+			},
+			ctx,
+		);
+	const content: Array<Record<string, unknown>> = [{ type: "text", text }];
+	if (options.toolCall)
+		content.push({ type: "toolCall", id: options.toolCall, name: "bash", arguments: { command: "true" } });
+	const message = { role: "assistant", content, stopReason: options.toolCall ? "toolUse" : "stop" };
+	await handlers.get("message_end")!({ type: "message_end", message }, ctx);
+	if (options.toolCall) {
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "bash", toolCallId: options.toolCall, args: {} },
+			ctx,
+		);
+		await handlers.get("tool_execution_end")!(
+			{
+				type: "tool_execution_end",
+				toolName: "bash",
+				toolCallId: options.toolCall,
+				result: { content: [] },
+				isError: false,
+			},
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: options.toolCall,
+					toolName: "bash",
+					content: [{ type: "text", text: "ok" }],
+				},
+			},
+			ctx,
+		);
+	}
+	await handlers.get("turn_end")!({ type: "turn_end", turnIndex, message }, ctx);
+}
+
+test("lean keeps the final answer when a same-run autonomous follow-up settles after it", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: all five steps are done and verified.";
+		const followUp = "Both background reviews were already handled above.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Work through the instruction file." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Now the code under fix.", { toolCall: "call-0" });
+		await toolLoopTurn(handlers, ctx, 1, "Checking the build output.", { toolCall: "call-1" });
+		await toolLoopTurn(handlers, ctx, 2, "Applying the edit.", { toolCall: "call-2" });
+		await toolLoopTurn(handlers, ctx, 3, finalAnswer);
+		// A queued background result continues the same busy run after the final answer.
+		await toolLoopTurn(handlers, ctx, 4, followUp, { steering: "2 background jobs have completed." });
+		await sleep(150);
+		expect(turnStreams().length).toBe(0);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text.indexOf(finalAnswer)).toBeLessThan(text.indexOf(followUp));
+		expect(text).not.toContain("Now the code under fix.");
+		expect(text).not.toContain("Applying the edit.");
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
+		await sleep(150);
+		expect(turnStreams().length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean keeps a provider-resolved final answer when a same-run async result follows it", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the provider ran the checks and they pass.";
+		const followUp = "The background job finished as well.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Run the checks." } },
+			ctx,
+		);
+		// Devin ACP reports tools its own agent ran as display-only blocks on a
+		// completed turn; the agent loop never dispatches them, so the turn settles.
+		const message = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: finalAnswer },
+				{
+					type: "toolCall",
+					id: "devin-0",
+					name: "bash",
+					arguments: { command: "bun test" },
+					[kProviderResolvedToolCall]: true,
+				},
+			],
+			stopReason: "stop",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message }, ctx);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 0, message }, ctx);
+		await toolLoopTurn(handlers, ctx, 1, followUp, { steering: "1 background job has completed." });
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text.indexOf(finalAnswer)).toBeLessThan(text.indexOf(followUp));
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean does not anchor tool-loop narration when autonomous input steers a run mid-flight", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the migration is complete.";
+		const followUp = "That review result was already applied.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Run the migration." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Reading the schema first.", { toolCall: "call-0" });
+		// A peer message steers into the running loop; the tool work continues.
+		await toolLoopTurn(handlers, ctx, 1, "Noted the peer message; continuing.", {
+			toolCall: "call-1",
+			steering: "peer message",
+		});
+		await toolLoopTurn(handlers, ctx, 2, "Running the migration.", { toolCall: "call-2" });
+		await toolLoopTurn(handlers, ctx, 3, finalAnswer);
+		await toolLoopTurn(handlers, ctx, 4, followUp, { steering: "review complete" });
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text).not.toContain("Reading the schema first.");
+		expect(text).not.toContain("Running the migration.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a tool-using user request keeps its final answer through a later autonomous ask lead-in", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the requested change is merged.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Merge the change." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Rebasing first.", { toolCall: "call-0" });
+		await toolLoopTurn(handlers, ctx, 1, finalAnswer);
+
+		// A queued background result continues the run and asks a follow-up question.
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: { role: "custom", customType: "async-result", attribution: "agent", content: "job done" },
+			},
+			ctx,
+		);
+		const leadIn = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Choose a follow-up action." },
+				{ type: "toolCall", id: "ask-2", name: "ask", arguments: {} },
+			],
+			stopReason: "toolUse",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message: leadIn }, ctx);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-2", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "autonomous ask lead-in");
+		await handlers.get("tool_execution_end")!(
+			{ type: "tool_execution_end", toolName: "ask", toolCallId: "ask-2", result: { content: [] }, isError: false },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "ask-2",
+					toolName: "ask",
+					content: [{ type: "text", text: "A" }],
+				},
+			},
+			ctx,
+		);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 2, message: leadIn }, ctx);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 2, 3000, "retained final answer after ask");
+		expect(turnStreams()[1]!.text).toContain(finalAnswer);
+		expect(turnStreams()[1]!.text).not.toContain("Rebasing first.");
+		expect(finalAnswerOf(turnStreams()[1]!)).toBe(true);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean does not re-emit tool-loop narration after an ask lead-in in the same run", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Pick a deployment target." } },
+			ctx,
+		);
+		await toolLoopTurn(handlers, ctx, 0, "Listing the available targets.", { toolCall: "call-0" });
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		const leadIn = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Choose one:" },
+				{ type: "toolCall", id: "ask-0", name: "ask", arguments: {} },
+			],
+			stopReason: "toolUse",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message: leadIn }, ctx);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-0", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "ask lead-in");
+		expect(turnStreams()[0]!.text).toContain("Choose one:");
+		await handlers.get("tool_execution_end")!(
+			{ type: "tool_execution_end", toolName: "ask", toolCallId: "ask-0", result: { content: [] }, isError: false },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "ask-0",
+					toolName: "ask",
+					content: [{ type: "text", text: "A" }],
+				},
+			},
+			ctx,
+		);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 1, message: leadIn }, ctx);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(200);
+
+		expect(turnStreams().some(f => f.text?.includes("Listing the available targets."))).toBe(false);
+		expect(turnStreams().length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("verbose still streams a finalized turn_stream at each turn_end", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
@@ -1346,56 +1660,152 @@ test("stream-enabled final always carries a messageRef and a late message_update
 }, 30000);
 
 // #4528 lifecycle regression: a daemon-originated user message must be acked
-// `accepted` at session preflight acceptance (before turn_start), and a late
-// admission rejection must ack `rejected` — never a false `accepted`.
+// `accepted` at session preflight acceptance (before turn_start). Pre-acceptance
+// rejection must not accept; a failure after acceptance must still reject.
 test("inbound user_message acks accepted at preflight acceptance and rejected on late failure", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
+	type AcceptanceOptions = {
+		onPreflightAcceptCommit?: () => void;
+		onPreflightAccepted?: () => void;
+	};
+	type Submission = {
+		content: unknown;
+		options: AcceptanceOptions;
+		promise: Promise<void>;
+		resolve: () => void;
+		reject: (reason?: unknown) => void;
+	};
+	const sendCalls: Submission[] = [];
 	try {
-		let admission: "accept" | "reject" = "accept";
-		const sendCalls: Array<Record<string, unknown>> = [];
 		const { handlers, ctx, frames, ws, token, sid } = await setup({
 			sendUserMessageOverride: (content, options) => {
-				sendCalls.push({ content, options });
-				// Simulate AgentSession preflight acceptance: fires before the prompt
-				// (and its turn_start) resolves, like the production session does.
-				const opts = options as { onPreflightAcceptCommit?: () => void } | undefined;
-				if (admission === "accept" && opts?.onPreflightAcceptCommit) opts.onPreflightAcceptCommit();
-				if (admission === "reject") return Promise.reject(new Error("admission rejected"));
-				return new Promise<void>(resolve => setTimeout(resolve, 50));
+				const held = Promise.withResolvers<void>();
+				sendCalls.push({ content, options: options as AcceptanceOptions, ...held });
+				// Return the held promise itself: the bus registers its await continuation
+				// synchronously before the test can release this submission.
+				return held.promise;
 			},
 		});
-		const acks = () =>
-			frames.filter(f => f.type === "inbound_ack").map(f => ({ state: f.state, updateId: f.updateId }));
+		const acks = (updateId: number) =>
+			frames
+				.filter(f => f.type === "inbound_ack" && f.updateId === updateId)
+				.map(f => ({
+					state: f.state,
+					updateId: f.updateId,
+					...(f.reason === undefined ? {} : { reason: f.reason }),
+				}));
+		const submit = async (updateId: number, text: string): Promise<Submission> => {
+			const index = sendCalls.length;
+			ws.send(JSON.stringify({ type: "user_message", sessionId: sid, token, text, updateId }));
+			await waitFor(() => sendCalls.length === index + 1, 3000, `submission ${updateId}`);
+			const call = sendCalls[index]!;
+			expect(call.content).toBe(text);
+			expect(call.options).toHaveProperty("onPreflightAcceptCommit");
+			expect(call.options).toHaveProperty("onPreflightAccepted");
+			return call;
+		};
+		const repeatCallbacks = (call: Submission): void => {
+			call.options.onPreflightAcceptCommit!();
+			call.options.onPreflightAccepted!();
+			call.options.onPreflightAcceptCommit!();
+			call.options.onPreflightAccepted!();
+		};
+		const flushAcks = async (updateId: number): Promise<void> => {
+			// This authenticated socket's correlated replay response follows directed
+			// acks already queued by callbacks, turn_start, and the settled bus await.
+			const id = `inbound-acceptance-${updateId}`;
+			ws.send(JSON.stringify({ type: "event_replay", id, sinceGeneration: 0, sinceSeq: 0 }));
+			await waitFor(
+				() => frames.some(f => f.type === "event_replay_result" && f.id === id),
+				3000,
+				`ack barrier ${updateId}`,
+			);
+		};
+		const rejectSubmission = async (call: Submission): Promise<void> => {
+			call.reject(new Error("admission rejected"));
+			await call.promise.catch(() => {});
+		};
 
 		// --- Accepted path: the ack must land at preflight acceptance, before the
-		// prompt promise settles, and before turn_start fires.
-		ws.send(
-			JSON.stringify({ type: "user_message", sessionId: sid, token, text: "hello from telegram", updateId: 9001 }),
-		);
-		await waitFor(() => acks().length === 1, 3000, "accepted inbound_ack");
-		expect(acks()[0]).toEqual({ state: "accepted", updateId: 9001 });
+		// test releases the prompt promise, and before turn_start fires.
+		const committed = await submit(9001, "hello from telegram");
+		committed.options.onPreflightAcceptCommit!();
+		await waitFor(() => acks(9001).some(a => a.state === "accepted"), 3000, "accepted inbound_ack");
+		repeatCallbacks(committed);
 
-		// turn_start now fires while the (still pending) prompt resolves: the
+		// turn_start now fires while the prompt is still held pending: the
 		// update was already registered, so consumption acks rather than races.
 		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
-		await waitFor(
-			() => acks().some(a => a.state === "consumed" && a.updateId === 9001),
-			3000,
-			"consumed inbound_ack",
-		);
+		await waitFor(() => acks(9001).some(a => a.state === "consumed"), 3000, "consumed inbound_ack");
 		expect(sendCalls.length).toBe(1);
-		expect(sendCalls[0]!.options).toHaveProperty("onPreflightAcceptCommit");
+		repeatCallbacks(committed);
+		committed.resolve();
+		// Await the SAME returned promise, after the bus's earlier continuation:
+		// its synchronous post-await acceptance fallback has now run.
+		await committed.promise;
+		repeatCallbacks(committed);
+		await flushAcks(9001);
+		expect(acks(9001)).toEqual([
+			{ state: "accepted", updateId: 9001 },
+			{ state: "consumed", updateId: 9001 },
+		]);
 
 		// --- Rejected path: a late admission rejection acks rejected, never accepted.
-		admission = "reject";
-		ws.send(JSON.stringify({ type: "user_message", sessionId: sid, token, text: "second try", updateId: 9002 }));
-		await waitFor(() => acks().some(a => a.updateId === 9002), 3000, "rejected inbound_ack");
-		const second = acks().find(a => a.updateId === 9002)!;
-		expect(second.state).toBe("rejected");
-		// Exactly one ack per update id — no accepted-then-rejected contradiction.
-		expect(acks().filter(a => a.updateId === 9002).length).toBe(1);
+		const rejected = await submit(9002, "second try");
+		await rejectSubmission(rejected);
+		await flushAcks(9002);
+		expect(acks(9002)).toEqual([{ state: "rejected", updateId: 9002, reason: "injection_failed" }]);
+
+		// The legacy callback independently accepts; commit is not required first.
+		const legacy = await submit(9003, "legacy acceptance");
+		legacy.options.onPreflightAccepted!();
+		await waitFor(() => acks(9003).some(a => a.state === "accepted"), 3000, "legacy accepted inbound_ack");
+		repeatCallbacks(legacy);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await waitFor(() => acks(9003).some(a => a.state === "consumed"), 3000, "legacy consumed inbound_ack");
+		repeatCallbacks(legacy);
+		legacy.resolve();
+		await legacy.promise;
+		repeatCallbacks(legacy);
+		await flushAcks(9003);
+		expect(acks(9003)).toEqual([
+			{ state: "accepted", updateId: 9003 },
+			{ state: "consumed", updateId: 9003 },
+		]);
+
+		// With no callback, successful settlement must supply acceptance itself.
+		const fallback = await submit(9004, "settlement fallback");
+		fallback.resolve();
+		await fallback.promise;
+		await waitFor(() => acks(9004).some(a => a.state === "accepted"), 3000, "fallback accepted inbound_ack");
+		repeatCallbacks(fallback);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
+		await waitFor(() => acks(9004).some(a => a.state === "consumed"), 3000, "fallback consumed inbound_ack");
+		repeatCallbacks(fallback);
+		await flushAcks(9004);
+		expect(acks(9004)).toEqual([
+			{ state: "accepted", updateId: 9004 },
+			{ state: "consumed", updateId: 9004 },
+		]);
+
+		// Acceptance does not suppress a later rejection: preserve both wire acks.
+		const lateFailure = await submit(9005, "failure after acceptance");
+		lateFailure.options.onPreflightAcceptCommit!();
+		await waitFor(() => acks(9005).some(a => a.state === "accepted"), 3000, "late-failure accepted inbound_ack");
+		repeatCallbacks(lateFailure);
+		await rejectSubmission(lateFailure);
+		repeatCallbacks(lateFailure);
+		await flushAcks(9005);
+		expect(acks(9005)).toEqual([
+			{ state: "accepted", updateId: 9005 },
+			{ state: "rejected", updateId: 9005, reason: "injection_failed" },
+		]);
+		expect(sendCalls.length).toBe(5);
 	} finally {
+		// Do not leave the extension awaiting a held prompt if any assertion fails.
+		for (const call of sendCalls) call.resolve();
+		await Promise.allSettled(sendCalls.map(call => call.promise));
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}

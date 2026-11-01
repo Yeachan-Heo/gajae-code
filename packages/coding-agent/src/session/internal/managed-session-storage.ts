@@ -104,6 +104,12 @@ export class ManagedReplaceError extends Error {
 	/** Path-free Windows NTSTATUS of the underlying pre-mutation failure, when
 	 * the native layer preserved one (e.g. `0xC0000043` for a sharing violation). */
 	readonly windowsErrorCode: string | undefined;
+	/** ACL failure detail: offending principal (account name or SID string).
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailurePrincipal: string | undefined;
+	/** ACL failure detail: whether the offending ACE is inherited from a parent directory.
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailureInherited: boolean | undefined;
 	readonly replacementCause: unknown;
 
 	constructor(result: NativeExactUnlinkResult, cleanupReceiptPath: string, replacementCause?: unknown) {
@@ -117,6 +123,8 @@ export class ManagedReplaceError extends Error {
 		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
 		this.retainedUnknownPath = result.retainedUnknownPath;
 		this.windowsErrorCode = result.windowsErrorCode;
+		this.aclFailurePrincipal = result.aclFailurePrincipal;
+		this.aclFailureInherited = result.aclFailureInherited;
 		this.replacementCause = replacementCause;
 	}
 }
@@ -4107,9 +4115,13 @@ export async function publishManagedFileNoReplace(
 		if (stagingIdentity && (linkPublished || !renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp
 				.lstat(staging, { bigint: true })
-				.then(stat => {
-					if (stat.dev === stagingIdentity?.dev && stat.ino === stagingIdentity.ino) return fsp.unlink(staging);
-					throw new Error("staging_identity_changed");
+				.then(async stat => {
+					if (stat.dev !== stagingIdentity?.dev || stat.ino !== stagingIdentity.ino)
+						throw new Error("staging_identity_changed");
+					await fsp.unlink(staging);
+					// A link-fallback publication is complete only once the staging name is
+					// durably gone; otherwise a crash can restore it and leave nlink=2.
+					if (linkPublished && failure === undefined) await fsyncDirectoryAsync(parent);
 				})
 				.catch(error => {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
@@ -4180,6 +4192,8 @@ export function publishManagedFileNoReplaceSync(
 				throw new Error("staging_identity_changed");
 			}
 			fs.unlinkSync(staging);
+			// See publishManagedFileNoReplace: the fallback is durable only after this.
+			if (linkPublished && failure === undefined) fsyncDirectory(parent);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
 		}

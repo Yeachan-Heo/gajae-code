@@ -180,16 +180,17 @@ describe("doctor broker restart protocol", () => {
 
 	it("restart lease expiry releases its reservation without exiting the owner", async () => {
 		const { dir, broker, discovery } = await fixture();
+		const leaseDurationMs = 2_000;
 		const prepared = await broker.prepareRestart({
 			...discovery,
 			generation: discovery.packageGeneration,
 			requestId: "lease-expiry",
-			deadlineAt: Date.now() + 100,
+			deadlineAt: Date.now() + leaseDurationMs,
 		});
 		expect(prepared.ok).toBe(true);
 		expect(await readBrokerRestartIntent(dir)).not.toBeNull();
 
-		await Bun.sleep(150);
+		await Bun.sleep(leaseDurationMs + 100);
 		expect(await readBrokerRestartIntent(dir)).toBeNull();
 		expect((await broker.handleRequest("session.list", {})).ok).toBe(true);
 		expect(

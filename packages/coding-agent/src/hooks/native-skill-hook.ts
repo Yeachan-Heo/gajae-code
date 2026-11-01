@@ -1,11 +1,13 @@
-import { appendFile, mkdir, stat } from "node:fs/promises";
+import * as fsSync from "node:fs";
+import { lstat, mkdir, open, stat } from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getConfigDirName } from "@gajae-code/utils";
 import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
-import { sessionLogsDir } from "../gjc-runtime/session-layout";
+import { GJC_DIR, sessionLogsDir } from "../gjc-runtime/session-layout";
 import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 import {
 	detectMcpDelegateFlowActivation,
@@ -426,6 +428,135 @@ async function readStdinJson(): Promise<{ payload: HookPayload; parseError: Erro
 	}
 }
 
+const NATIVE_HOOK_LOG_DIR_ERROR = "native hook log directory is not a real directory";
+const NATIVE_HOOK_LOG_FILE_ERROR = "native hook log path is not a regular file";
+const HOOK_LOG_NO_FOLLOW = process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0);
+
+function hookErrno(error: unknown): string | undefined {
+	return error instanceof Error && "code" in error ? String((error as NodeJS.ErrnoException).code) : undefined;
+}
+
+/** Refuse chmod of `/` or the home directory. The log path is always nested under the workspace. */
+function isProtectedHookPath(candidate: string): boolean {
+	const resolved = path.resolve(candidate);
+	if (resolved === path.parse(resolved).root) return true;
+	const home = os.homedir();
+	return home.length > 0 && resolved === path.resolve(home);
+}
+
+function hookLogInside(root: string, candidate: string): boolean {
+	const rel = path.relative(path.resolve(root), path.resolve(candidate));
+	return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+function sameHookFile(left: fsSync.BigIntStats, right: fsSync.BigIntStats): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+}
+
+async function tightenHookDirectory(dir: string): Promise<void> {
+	if (isProtectedHookPath(dir)) throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		handle = await open(dir, fsSync.constants.O_RDONLY | (fsSync.constants.O_DIRECTORY ?? 0) | HOOK_LOG_NO_FOLLOW);
+		const st = await handle.stat();
+		if (!st.isDirectory()) throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+		if (process.platform === "win32" || (st.mode & 0o077) === 0) return;
+		await handle.chmod(0o700);
+		const after = await handle.stat();
+		if (!after.isDirectory() || (after.mode & 0o777) !== 0o700) throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+	} catch (error) {
+		if (error instanceof Error && error.message === NATIVE_HOOK_LOG_DIR_ERROR) throw error;
+		const code = hookErrno(error);
+		if (code === "ELOOP" || code === "ENOTDIR" || code === "EPERM") throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+/**
+ * Create `<cwd>/.gjc/_session-…/logs` without following a symlink component.
+ * A pre-existing `.gjc` directory keeps its mode; the session and logs directories are owner-only.
+ */
+async function ensureHookLogDirectory(cwd: string, logsDir: string): Promise<void> {
+	const root = path.resolve(cwd);
+	const target = path.resolve(logsDir);
+	if (!hookLogInside(root, target) || isProtectedHookPath(target)) throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+	let current = root;
+	for (const part of path.relative(root, target).split(path.sep)) {
+		if (part === "" || part === "." || part === "..") throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+		current = path.join(current, part);
+		let created = false;
+		let currentStat: Awaited<ReturnType<typeof lstat>>;
+		try {
+			currentStat = await lstat(current);
+		} catch (error) {
+			if (hookErrno(error) !== "ENOENT") throw error;
+			try {
+				await mkdir(current, { mode: 0o700 });
+				created = true;
+			} catch (mkdirError) {
+				if (hookErrno(mkdirError) !== "EEXIST") throw mkdirError;
+			}
+			currentStat = await lstat(current);
+		}
+		if (currentStat.isSymbolicLink() || !currentStat.isDirectory()) throw new Error(NATIVE_HOOK_LOG_DIR_ERROR);
+		if (created || part !== GJC_DIR) await tightenHookDirectory(current);
+	}
+}
+
+/** Append mode 0600. An existing symlink, fifo, or non-file is refused before the write. */
+async function appendNativeHookLog(filePath: string, text: string): Promise<void> {
+	let initial: fsSync.BigIntStats | undefined;
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		initial = undefined;
+		try {
+			const named = await lstat(filePath, { bigint: true });
+			if (named.isSymbolicLink() || !named.isFile()) throw new Error(NATIVE_HOOK_LOG_FILE_ERROR);
+			initial = named;
+		} catch (error) {
+			if (hookErrno(error) !== "ENOENT") throw error;
+		}
+		const flags = initial
+			? fsSync.constants.O_WRONLY |
+				fsSync.constants.O_APPEND |
+				HOOK_LOG_NO_FOLLOW |
+				(fsSync.constants.O_NONBLOCK ?? 0)
+			: fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_APPEND;
+		try {
+			handle = await open(filePath, flags, 0o600);
+			break;
+		} catch (error) {
+			const code = hookErrno(error);
+			if (code === "ELOOP" || code === "ENXIO" || code === "ENOTDIR") throw new Error(NATIVE_HOOK_LOG_FILE_ERROR);
+			if (initial === undefined && code === "EEXIST" && attempt === 0) continue;
+			throw error;
+		}
+	}
+	if (!handle) throw new Error(NATIVE_HOOK_LOG_FILE_ERROR);
+	try {
+		const opened = await handle.stat({ bigint: true });
+		const named = await lstat(filePath, { bigint: true });
+		if (
+			!opened.isFile() ||
+			named.isSymbolicLink() ||
+			!named.isFile() ||
+			(initial !== undefined && !sameHookFile(initial, opened)) ||
+			!sameHookFile(opened, named)
+		) {
+			throw new Error(NATIVE_HOOK_LOG_FILE_ERROR);
+		}
+		if (process.platform !== "win32" && (Number(opened.mode) & 0o077) !== 0) {
+			await handle.chmod(0o600);
+			if ((Number((await handle.stat()).mode) & 0o777) !== 0o600) throw new Error(NATIVE_HOOK_LOG_FILE_ERROR);
+		}
+		await handle.writeFile(text);
+	} finally {
+		await handle.close();
+	}
+}
+
 async function logHookError(cwd: string, type: string, error: unknown): Promise<void> {
 	// Bun has already copied the project dotenv into the environment. A value
 	// that matches that snapshot must not select another session's log directory.
@@ -440,12 +571,15 @@ async function logHookError(cwd: string, type: string, error: unknown): Promise<
 		);
 		return;
 	}
+	const now = new Date();
 	const logsDir = sessionLogsDir(cwd, gjcSessionId);
-	await mkdir(logsDir, { recursive: true }).catch(() => {});
-	await appendFile(
-		path.join(logsDir, `native-hook-${new Date().toISOString().split("T")[0]}.jsonl`),
-		`${JSON.stringify({ timestamp: new Date().toISOString(), type, error: error instanceof Error ? error.message : String(error) })}\n`,
-	).catch(() => {});
+	const line = `${JSON.stringify({ timestamp: now.toISOString(), type, error: error instanceof Error ? error.message : String(error) })}\n`;
+	try {
+		await ensureHookLogDirectory(cwd, logsDir);
+		await appendNativeHookLog(path.join(logsDir, `native-hook-${now.toISOString().split("T")[0]}.jsonl`), line);
+	} catch {
+		// Skip a symlink or unusable log path. The hook response is unchanged.
+	}
 }
 
 export async function runGjcNativeSkillHookCli(): Promise<void> {

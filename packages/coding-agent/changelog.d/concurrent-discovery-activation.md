@@ -1,3 +1,0 @@
-### Fixed
-
-- Serialize concurrent discovered-tool activations per session and fence queued or in-flight commits at committed session and MCP catalog boundaries. Revalidate delayed activations against the current MCP catalog, registry identities, prompt generation, and active-tool selection after prompt rebuilds; rebase after prompt refreshes and yield to newer explicit selections. Canceled transitions, manual and automatic compaction, and read-only MCP status snapshots preserve pending activations. Fence branch adoption before fallible MCP retirement, and publish execution-context tool names from active tools, including exact-MCP rollback restoration, so stale rebuilds or failed controls cannot leave mismatched context.

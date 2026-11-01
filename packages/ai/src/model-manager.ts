@@ -669,7 +669,8 @@ function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 	for (const item of value) {
 		if (isModelLike(item) && !isRetiredModel(item)) {
 			const model = enrichModelThinking(item as Model<TApi>);
-			model.longContextPricing = undefined;
+			// Generated policies re-derive tiers; OpenRouter's tier comes from its own discovery payload.
+			if (model.provider !== "openrouter") model.longContextPricing = undefined;
 			models.push({ ...model, name: sanitizeModelDisplayName(model.name, model.id) });
 		}
 	}

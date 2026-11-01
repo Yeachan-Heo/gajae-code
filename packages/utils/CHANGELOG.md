@@ -2,6 +2,118 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Aborted promise waits observe rejections from already-started work instead of letting them reach the process-wide unhandled-rejection handler.
+
+- Crash redaction now masks a credential suffix that directly follows a quoted redaction placeholder (`token="[REDACTED_TOKEN]"secret`). The placeholder exemption shipped in 0.19.0 checked only the quoted text and left that suffix in place.
+
+- Crash redaction now recognizes `pw` password fields, scrubbing credential suffixes attached to single-quoted placeholders while preserving standalone placeholders and following fields. New crash records use fingerprint version 2; recovery preserves v1 marker verification with the historical normalizer.
+
+- Tab display uses explicit EditorConfig tab_width ahead of indent_size and honors unset property overrides across matching sections and nested files.
+
+- Observe failures from already-started operations when a timeout wrapper receives an already-aborted signal, preventing an unrelated unhandled rejection during cancellation.
+
+- A project `.env` can no longer set `PI_COMPILED`. That name is a build-only marker for standalone binaries, and a repository must not be able to make a source process look compiled. A value exported by the launching shell is kept unless it is the same string the project declares.
+
+- Prompt formatting preserves literal content inside longer or mixed Markdown code fences instead of treating shorter or mismatched fence lines as closing delimiters.
+
+- A project `.env` can no longer set `GJC_SDK_DISABLE`. That name is the operator opt-out for SDK hosting, and a repository must not be able to turn hosting off. A shell export is kept unless it matches the project declaration or that declaration is dynamic. An escaped dollar is a literal, and provenance compares Bun's decoded text.
+
+## [0.19.0] - 2026-10-22
+
+### Fixed
+
+- Crash-log redaction now recognizes separated and camelCase account-key credential fields.
+
+- Generic `auth=` fields no longer cause crash redaction to consume the rest of the log line; later fields are independently scrubbed and diagnostic context remains readable while nonstandard `Authorization:` header values stay redacted only through physical or escaped newline boundaries, without swallowing fields after escaped-quote values in serialized JSON.
+
+- Crash redaction preserves diagnostic fields after backtick-quoted authorization values.
+
+- Crash-log credential scrubbing now recognizes credential keys wrapped in raw or escaped backticks.
+
+- Crash logs and HTML exports now redact complete backtick-quoted scalar credential values, including values containing spaces.
+
+- Crash redaction now prefilters credential assignments and containers before invoking expensive matchers, keeping long ordinary diagnostics bounded.
+
+- Crash-log redaction now keeps comma-separated cookie pairs inside the redacted cookie value.
+
+- Crash redaction now recognizes compound camelCase credential suffixes such as `ApiKey`, `SecretKey`, `AccessToken`, `RefreshToken`, `SessionToken`, and `ClientSecret`, including two-letter acronym prefixes such as `DBPassword` and `openAIApiKey`/`OpenAIApiKey`.
+
+- Cookie redaction now preserves following diagnostic fields while still scrubbing semicolon-separated cookie values.
+
+- Crash and HTML export redaction now recognizes credential field names with dotted segments.
+
+- Crash-log and HTML-export redaction now masks encryption and signing key fields.
+
+- Crash redaction now fully masks credentials wrapped in backslash-escaped backticks, including values nested in serialized containers and authorization headers, while preserving following diagnostics.
+
+- Crash redaction now parses escaped single- and double-quote delimiters in serialized credential containers, preventing closing braces or brackets inside quoted values from exposing later secrets.
+
+- Crash redaction now recognizes passphrase labels such as `passphrase`, `sshPassphrase`, and `key_passphrase`.
+- Multi-segment camelCase prefixes such as `gitHubAccessToken`, `azureDevOpsToken`, `myDatabasePassword`, and `GoogleCloudSecretKey` are now recognized without broadening lookalike matches.
+- Durable crash records redact full quoted values, complete bracketed arrays/objects under sensitive labels, and complete Cookie/Set-Cookie header values, including whitespace-bearing, escaped, and unterminated credentials; escaped Cookie newlines preserve following diagnostics. URL userinfo is scrubbed when it contains only a username token or an empty password. Arbitrary unquoted Authorization schemes are redacted through line end, while short Bearer/Basic/Token credentials preserve following diagnostic fields. CamelCase credential fields such as `authToken`, `githubToken`, and `dbPassword` are recognized without matching ordinary lookalike identifiers; long non-credential keys avoid quadratic matching.
+
+- Crash redaction no longer re-masks a value that is already a redaction placeholder (`«redacted-npm-token»`, `[REDACTED_TOKEN]`), so generated commit messages and crash records keep the specific credential type an earlier pass identified. A value that only begins with a placeholder is still masked.
+
+- Crash-log redaction now bounds quoted credential values to their physical line, preserving later diagnostics.
+
+- Crash-log credential redaction now handles long standards-compliant URL schemes without quadratic matching.
+
+- Malformed unterminated credential containers no longer consume later crash-log diagnostic lines.
+
+- Crash redaction preserves diagnostics after escaped credential values before markup delimiters.
+
+- Crash redaction now recognizes password confirmation fields, including snake_case and camelCase variants.
+
+- Credential redaction now recognizes plural cookie fields and redacts cookie-jar containers.
+
+- Crash-log redaction now treats plural and prefixed plural cookie labels as complete multi-pair values.
+
+- Crash redaction now masks commas and semicolons inside unquoted credential values while preserving following field context.
+
+- Crash-log and HTML-export redaction now recognizes abbreviated password keys such as `pwd`, `dbPwd`, and `user_pwd`.
+
+- Crash redaction now consumes shell-concatenated quoted credential values and preserves following colon-delimited diagnostic fields.
+
+- Crash logs and shared HTML now redact URL credentials containing raw `@`, backtick-quoted containers, and complete cookie assignments.
+
+- Crash redaction recognizes separated and camelCase `secret_key_base` credential fields.
+
+- Crash redaction now handles nested serialization escape depth in credential containers and preserves diagnostics after escaped quoted values followed by punctuation.
+
+- Crash redaction now recognizes Azure `SharedAccessKey` connection-string fields without redacting `SharedAccessKeyName` identifiers.
+
+- Crash redaction now recognizes Azure `SharedAccessSignature` connection-string fields without redacting signature-name metadata.
+
+- Crash redaction now keeps shell-escaped delimiters inside unquoted credential values while still stopping at escaped newline boundaries.
+
+- Crash redaction now masks unquoted multiword credential values while preserving later diagnostic fields.
+
+- Crash redaction now recognizes space-separated credential labels such as `API Key` and `Secret Access Key`.
+
+- Crash-log redaction now masks indented bodies of credential-valued YAML literal and folded block scalars while preserving headers and following diagnostics.
+
+- Crash redaction now recognizes YAML anchors and tags before credential block-scalar markers.
+
+- Crash redaction now masks credential block scalars in YAML sequence mappings while preserving sibling fields.
+
+- Home credential files are no longer loaded when the working directory is that home through another path spelling. A lexical path match still skips them, and the same directory reached by a symlink, macOS `/tmp`, or a bind mount is skipped too. A different directory still supplies the home dotenv and shell startup files.
+
+- A project `.env` can no longer hide a harness-directory assignment behind an unquoted backslash before `#`. The provenance check now reads the same value Bun loads, and a different shell value is still kept.
+
+- Frontmatter parsing removes a complete HTML comment in one forward scan, so a long run of unterminated comment openers stays cheap.
+
+- Frontmatter key normalization stores a `__proto__` key as own data, so a kebab-case key in that value cannot replace the returned object's prototype.
+
+- On POSIX, the rotating-log directory and the active log file are owner-only when they can be opened. An entry the owner cannot open is left unchanged, and that skip is reported through the configured transports. A file-only logger does not write the terminal. A directory path ending in `/.` is repaired as that directory, so a symlink swapped into the name is not chmodded. Retained dated logs and compressed archives keep their mode. Root aliases, including a directory whose opened inode is the filesystem root, are not chmodded. A symlinked log directory keeps its target mode, while a regular log file reached through it is still tightened. A trailing backslash stays part of a POSIX directory name.
+
+- The bash tool's shell processes now also drop project-provided `PERLLIB`, `_JAVA_OPTIONS`, npm's `node-options` and `script-shell` (in any case, with `_` or `-`), `RIPGREP_CONFIG_PATH`, `TAR_OPTIONS`, `RSYNC_RSH`, `MAKEFLAGS`, `MAKEFILES`, `SHELLOPTS`, and `PS4` when the value comes from the project `.env`. A repository could previously use them to run its own program from `perl`, `java`, `npm`, `rg` (a config file adding `--pre`), `tar`, `rsync`, `make`, or any `bash -c` (xtrace with a `PS4` command substitution). Project dotenv keys Bun loads that are not shell identifiers (e.g. `npm_config_node-options`) now count as project-declared for provenance. Values the launching shell exported are still honored.
+
 ## [0.18.12] - 2026-10-16
 
 ### Fixed

@@ -1,5 +1,5 @@
 import type { TSchema } from "@gajae-code/ai/core";
-import { $credentialEnv, logger } from "@gajae-code/utils";
+import { $credentialEnv, isCredentialKey, logger, redactCrashSecrets } from "@gajae-code/utils";
 import type { CustomTool, CustomToolResult } from "../extensibility/custom-tools/types";
 import { callMCP } from "../runtime-mcp/json-rpc";
 import type {
@@ -23,6 +23,53 @@ import type {
  */
 export function findApiKey(): string | null {
 	return $credentialEnv("EXA_API_KEY") ?? null;
+}
+
+/** Deep enough for a diagnostic object, and below the call-stack size that throws. Twice this depth must still finish. */
+const MCP_LOG_MAX_DEPTH = 32;
+const MCP_LOG_MAX_NODES = 4096;
+
+/**
+ * Copy a tools/call failure payload for the rotating log.
+ * Credential field names are replaced whole. Other strings go through the crash
+ * redactor so a token shape is masked before it is written. Past the depth or
+ * node cap the rest of the value is omitted. The object sent to the server is
+ * not modified.
+ */
+function redactMcpCallLogValue(value: unknown): unknown {
+	return redactMcpCallLogValueLimited(value, 0, { nodes: 0 });
+}
+
+function redactMcpCallLogValueLimited(value: unknown, depth: number, budget: { nodes: number }): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (typeof value !== "object" || value === null) return value;
+	if (depth >= MCP_LOG_MAX_DEPTH || budget.nodes >= MCP_LOG_MAX_NODES) return "«redacted»";
+	budget.nodes += 1;
+	if (Array.isArray(value)) {
+		return value.map(entry => redactMcpCallLogValueLimited(entry, depth + 1, budget));
+	}
+	const redacted: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value)) {
+		redacted[key] = isCredentialKey(key) ? "«redacted»" : redactMcpCallLogValueLimited(entry, depth + 1, budget);
+	}
+	return redacted;
+}
+
+/** A logging failure must not replace the server error returned to the caller. */
+function logMcpCallError(message: string, toolName: string, args: Record<string, unknown>, error: unknown): void {
+	try {
+		logger.error(message, {
+			toolName,
+			args: redactMcpCallLogValue(args),
+			error: redactMcpCallLogValue(error),
+		});
+	} catch {
+		try {
+			logger.error(message, { toolName });
+		} catch {
+			// The caller still throws the server message.
+		}
+	}
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -125,7 +172,7 @@ export async function callExaTool(
 	})) as MCPCallResponse;
 
 	if (response.error) {
-		logger.error("MCP tools/call error", { toolName, args, error: response.error });
+		logMcpCallError("MCP tools/call error", toolName, args, response.error);
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
@@ -145,7 +192,7 @@ export async function callWebsetsTool(
 	})) as MCPCallResponse;
 
 	if (response.error) {
-		logger.error("Websets MCP tools/call error", { toolName, args, error: response.error });
+		logMcpCallError("Websets MCP tools/call error", toolName, args, response.error);
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 

@@ -64,6 +64,7 @@ import {
 	sdkInternalRuntimeImage,
 } from "../broker/runtime";
 import {
+	allocateSessionEventGeneration,
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
 	SessionIndex,
@@ -101,7 +102,7 @@ import {
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
-import { validateRequiredPromptText } from "../protocol/adapter-validation";
+import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
@@ -123,12 +124,7 @@ import {
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
-import {
-	SESSION_HOST_OBSERVER_CAPABILITY,
-	SessionSdkHost,
-	type SessionSdkHostOptions,
-	TURN_STREAM_CAPABILITY,
-} from "./host";
+import { SessionSdkHost, type SessionSdkHostOptions, TURN_STREAM_CAPABILITY } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -2834,9 +2830,7 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 	seen.add(value);
 	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
 	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
+		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
 	);
 }
 async function resolveSdkWorkflowGate(
@@ -5675,8 +5669,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	/**
 	 * Publish one correlated content frame per owning invocation, plus one
-	 * unpositioned copy for connections that explicitly negotiated observer
-	 * streaming. A shared run therefore lets every submitter attribute the content
+	 * unpositioned copy for connections that negotiated turn streaming. A shared run therefore lets every submitter attribute the content
 	 * to its own prompt without exposing it to ordinary attached clients.
 	 * Content is best-effort and bypasses the lifecycle replay ring; the turn
 	 * producing it is authoritative.
@@ -5699,11 +5692,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					...invocation.correlation,
 				});
 			}
-			// A relay or dashboard can observe a turn submitted by another client. It
-			// explicitly negotiates both the stream and observer capabilities, so give it
-			// the same live content frames without inventing a submitter correlation.
+			// A relay, dashboard or ACP client can follow a turn submitted by another
+			// client or typed in the host's terminal. It negotiates the stream capability,
+			// so give it the same live content frames without inventing a submitter
+			// correlation. Whether it also counts as demand is the observer capability's
+			// concern, not delivery's.
 			current.runtime.sendFrameToCapabilities(
-				[TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY],
+				[TURN_STREAM_CAPABILITY],
 				{ type: "event", kind: event.type, payload },
 				delivered,
 			);
@@ -6725,9 +6720,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * answer.
 	 *
 	 * Correlated content is scoped to the owning invocations of the batch that is
-	 * actually running. Explicit observer connections additionally receive the
-	 * uncorrelated copy, including for agent-owned runs with no SDK submitter.
-	 * A session with no owner or eligible observer pays one capability-map lookup.
+	 * actually running. Connections that negotiated turn streaming additionally
+	 * receive the uncorrelated copy, including for agent-owned runs with no SDK
+	 * submitter. A session with no owner or stream connection pays one
+	 * capability-map lookup.
 	 */
 	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
 		"message_update",
@@ -6740,10 +6736,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
-		const observerConnections = current.runtime.connectionIdsWithCapabilities([
-			TURN_STREAM_CAPABILITY,
-			SESSION_HOST_OBSERVER_CAPABILITY,
-		]);
+		const streamConnections = current.runtime.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]);
 		const batch = activeInvocation
 			? current.openLifecycleBatches.find(candidate =>
 					candidate.invocations.some(
@@ -6758,7 +6751,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			: current.lifecycleActive
 				? (current.attachedInvocations ?? [])
 				: [];
-		if (invocations.length === 0 && observerConnections.length === 0) return;
+		if (invocations.length === 0 && streamConnections.length === 0) return;
 		// Content bypasses the lifecycle replay ring and must never interrupt its producer.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
 		// emitLifecycle("agent_start") awaits durable persistence before it
@@ -7691,6 +7684,31 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				return true;
 			},
 		);
+		// The person at this terminal did not stop the turn, so say who did. Only a
+		// Broker-routed operator terminal abort that actually stopped a turn is
+		// attributed; an idempotent replay of the same request is not announced twice.
+		const attributedOperatorAborts = new Set<string>();
+		const attributeOperatorTerminalAbort = (request: SdkFrame, response: SdkFrame | undefined): void => {
+			if (request.operation !== "turn.abort" || !response || response.ok !== true) return;
+			const input = request.input;
+			if (typeof input !== "object" || input === null || (input as { mode?: unknown }).mode !== "terminal") return;
+			if (!hasBrokerRuntimeAbortCapability(input)) return;
+			const result = response.result;
+			if (typeof result !== "object" || result === null || (result as { turn?: unknown }).turn !== "stopped") return;
+			const key = typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined;
+			if (key !== undefined) {
+				if (attributedOperatorAborts.has(key)) return;
+				if (attributedOperatorAborts.size >= 256) attributedOperatorAborts.clear();
+				attributedOperatorAborts.add(key);
+			}
+			try {
+				ctx.ui.notify("Turn stopped by a remote operator.", "warning");
+			} catch (error) {
+				logger.warn("sdk: operator abort attribution failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
@@ -7757,6 +7775,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			allocateEventGeneration: (sessionId, floor) =>
+				allocateSessionEventGeneration(options.agentDir, sessionId, floor),
 			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),
 			eventRevision: () =>
 				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function"
@@ -7801,6 +7821,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			onRequest: options.onSdkRequest,
 			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
+				attributeOperatorTerminalAbort(request, response);
 				// Strict key validation: a malformed retry (e.g. numeric
 				// idempotencyKey) rejected by dispatch must NEVER hash to the same
 				// key as a legitimate stored string and advance its response state

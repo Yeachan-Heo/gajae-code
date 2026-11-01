@@ -1474,3 +1474,22 @@ describe("model thinking runtime helpers", () => {
 		expect(model.thinking).toBeUndefined();
 	});
 });
+
+describe("supportsAnthropicAdaptiveThinkingDisplay for Sonnet 5+", () => {
+	// Sonnet 5+ defaults adaptive `thinking.display` to "omitted": thinking tokens are billed but no
+	// content streams back unless the request opts in with display: "summarized".
+	it.each([
+		"claude-sonnet-5",
+		"claude-sonnet-5-5",
+		"claude-sonnet-5-5-20261001",
+		"anthropic.claude-sonnet-5-5",
+		"us.anthropic.claude-sonnet-5-5-v1:0",
+	])("opts %s in", id => {
+		expect(supportsAnthropicAdaptiveThinkingDisplay(id)).toBe(true);
+	});
+
+	// Sonnet 4.x adaptive models reject the `display` field.
+	it.each(["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-4-6-20260101"])("keeps %s opted out", id => {
+		expect(supportsAnthropicAdaptiveThinkingDisplay(id)).toBe(false);
+	});
+});

@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 interface TaskListEntry {
@@ -31,6 +32,8 @@ async function listTaskfileTasks(cwd: string): Promise<RunnerTask[] | null> {
 	try {
 		const proc = Bun.spawn(["task", "--list-all", "--json"], {
 			cwd,
+			// Detection runs at session start; without `env`, Bun hands the runner the autoloaded project `.env`.
+			env: projectSafeSpawnEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",

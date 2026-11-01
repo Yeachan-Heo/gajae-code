@@ -175,7 +175,7 @@ describe("bash resource lifecycle", () => {
 			},
 		);
 
-		const deadline = Date.now() + 2_000;
+		const deadline = Date.now() + 8_000;
 		while (!fs.existsSync(pidFile) && Date.now() < deadline) await Bun.sleep(25);
 		expect(fs.existsSync(pidFile)).toBe(true);
 		const ownedPid = Number(fs.readFileSync(pidFile, "utf8"));

@@ -370,4 +370,221 @@ describe("AuthStorage model-scoped usage limits", () => {
 			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(false);
 		}, 20_000);
 	});
+
+	it("separates Google Antigravity Claude/GPT and Gemini pools across ranking and preference caps", async () => {
+		const now = Date.now();
+		const twoHoursIso = new Date(now + 2 * HOUR_MS).toISOString();
+		const fiveHoursIso = new Date(now + 5 * HOUR_MS).toISOString();
+		const twelveHoursIso = new Date(now + 12 * HOUR_MS).toISOString();
+		const threeDaysIso = new Date(now + 80 * HOUR_MS).toISOString();
+
+		// acct-gemini-ok: Claude/GPT weekly is 94.45% used (over 85% cap), but Gemini Argon/Flash 5h is only 23.6% used.
+		// acct-claude-ok: Gemini Argon is 100% exhausted (weekly), Gemini Flash is 0% (untouched 5h), Claude/GPT weekly is 58.16% used.
+		// acct-untouched-claude: Gemini is 100% exhausted (weekly), Claude/GPT is 0% (untouched 5h sliding horizon).
+		const payloads: Record<string, unknown> = {
+			"acct-gemini-ok": {
+				models: {
+					"claude-opus-5-5-high": { quotaInfo: { remainingFraction: 0.0555, resetTime: twelveHoursIso } },
+					"gpt-oss-120b-medium": { quotaInfo: { remainingFraction: 0.0555, resetTime: twelveHoursIso } },
+					"gemini-4-argon-high": { quotaInfo: { remainingFraction: 0.764, resetTime: twoHoursIso } },
+					"gemini-3-flash": { quotaInfo: { remainingFraction: 0.764, resetTime: twoHoursIso } },
+				},
+			},
+			"acct-claude-ok": {
+				models: {
+					"claude-opus-5-5-high": { quotaInfo: { remainingFraction: 0.4184, resetTime: twelveHoursIso } },
+					"gpt-oss-120b-medium": { quotaInfo: { remainingFraction: 0.4184, resetTime: twelveHoursIso } },
+					"gemini-4-argon-high": { quotaInfo: { resetTime: threeDaysIso } },
+					"gemini-3-flash": { quotaInfo: { remainingFraction: 1, resetTime: fiveHoursIso } },
+				},
+			},
+			"acct-untouched-claude": {
+				models: {
+					"claude-opus-5-5-high": { quotaInfo: { remainingFraction: 1, resetTime: fiveHoursIso } },
+					"gpt-oss-120b-medium": { quotaInfo: { remainingFraction: 1, resetTime: fiveHoursIso } },
+					"gemini-4-argon-high": { quotaInfo: { resetTime: threeDaysIso } },
+					"gemini-3-flash": { quotaInfo: { resetTime: threeDaysIso } },
+				},
+			},
+		};
+
+		store?.close();
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "antigravity-pools.db"));
+		authStorage = new AuthStorage(store, {
+			credentialRankingMode: "earliest-reset",
+			credentialPreferences: {
+				"google-antigravity": [
+					{ selector: { kind: "email", value: "acct-gemini-ok@example.com" }, maxUsedFraction: 0.85 },
+					{ selector: { kind: "email", value: "acct-claude-ok@example.com" }, maxUsedFraction: 0.85 },
+					{ selector: { kind: "email", value: "acct-untouched-claude@example.com" }, maxUsedFraction: 0.85 },
+				],
+			},
+			usageFetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+				const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+				const accountId = auth.replace("Bearer access-", "");
+				return new Response(JSON.stringify(payloads[accountId] ?? { models: {} }), { status: 200 });
+			}) as unknown as typeof fetch,
+		});
+		await authStorage.reload();
+		await authStorage.set("google-antigravity", [
+			{ type: "oauth", ...createCredential("acct-gemini-ok"), projectId: "proj-1" },
+			{ type: "oauth", ...createCredential("acct-claude-ok"), projectId: "proj-1" },
+			{ type: "oauth", ...createCredential("acct-untouched-claude"), projectId: "proj-1" },
+		]);
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["google-antigravity"] as OAuthCredentials | undefined;
+			if (!credential?.accountId) return null;
+			return { apiKey: `api-${credential.accountId}`, newCredentials: credential };
+		});
+
+		// 1. Gemini Argon request (exact and base model id): acct-gemini-ok is 23.6% used (< 85% cap),
+		//    not penalized by its 94.45% Claude/GPT usage, while the other two accounts have Argon exhausted.
+		const argonExact = await authStorage.getApiKey("google-antigravity", "agy-argon-1", {
+			modelId: "gemini-4-argon-high",
+		});
+		const argonBase = await authStorage.getApiKey("google-antigravity", "agy-argon-2", {
+			modelId: "gemini-4-argon",
+		});
+		expect(argonExact).toBe("api-acct-gemini-ok");
+		expect(argonBase).toBe("api-acct-gemini-ok");
+
+		// 2. Claude request (exact and pool-matched bundled id): acct-gemini-ok is 94.45% used (>= 85% cap),
+		//    so preference evaluation demotes it and picks acct-claude-ok (58.16% < 85% cap) despite
+		//    acct-claude-ok having 100% exhausted Gemini Argon.
+		const claudeExact = await authStorage.getApiKey("google-antigravity", "agy-claude-1", {
+			modelId: "claude-opus-5-5-high",
+		});
+		const claudeBundled = await authStorage.getApiKey("google-antigravity", "agy-claude-2", {
+			modelId: "claude-opus-4-6-thinking",
+		});
+		expect(claudeExact).toBe("api-acct-claude-ok");
+		expect(claudeBundled).toBe("api-acct-claude-ok");
+
+		// 3. Without preferences, earliest-reset drains an actively ticking 5h/7d window before
+		//    starting an untouched account's sliding 5h horizon, whereas balanced picks the untouched account.
+		store?.close();
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "antigravity-ranking-modes.db"));
+		const earliestStorage = new AuthStorage(store, {
+			credentialRankingMode: "earliest-reset",
+			usageFetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+				const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+				const accountId = auth.replace("Bearer access-", "");
+				return new Response(JSON.stringify(payloads[accountId] ?? { models: {} }), { status: 200 });
+			}) as unknown as typeof fetch,
+		});
+		await earliestStorage.reload();
+		await earliestStorage.set("google-antigravity", [
+			{ type: "oauth", ...createCredential("acct-untouched-claude"), projectId: "proj-1" },
+			{ type: "oauth", ...createCredential("acct-claude-ok"), projectId: "proj-1" },
+		]);
+		// acct-untouched-claude has 0% used with a sliding `now + 5h` horizon; acct-claude-ok has 58.16% used
+		// in an active 7d weekly window expiring in 12h. earliest-reset must drain acct-claude-ok first.
+		const earliestPick = await earliestStorage.getApiKey("google-antigravity", "agy-earliest", {
+			modelId: "claude-opus-5-5-high",
+		});
+		expect(earliestPick).toBe("api-acct-claude-ok");
+		earliestStorage.close();
+
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "antigravity-balanced-mode.db"));
+		const balancedStorage = new AuthStorage(store, {
+			credentialRankingMode: "balanced",
+			usageFetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+				const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+				const accountId = auth.replace("Bearer access-", "");
+				return new Response(JSON.stringify(payloads[accountId] ?? { models: {} }), { status: 200 });
+			}) as unknown as typeof fetch,
+		});
+		await balancedStorage.reload();
+		await balancedStorage.set("google-antigravity", [
+			{ type: "oauth", ...createCredential("acct-claude-ok"), projectId: "proj-1" },
+			{ type: "oauth", ...createCredential("acct-untouched-claude"), projectId: "proj-1" },
+		]);
+		const balancedPick = await balancedStorage.getApiKey("google-antigravity", "agy-balanced", {
+			modelId: "claude-opus-5-5-high",
+		});
+		expect(balancedPick).toBe("api-acct-untouched-claude");
+		balancedStorage.close();
+		store = null;
+		authStorage = null;
+	}, 30_000);
+});
+
+describe("AuthStorage usage report cache schema version", () => {
+	let tempDir = "";
+	let store: SqliteAuthCredentialStore | null = null;
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-usage-cache-schema-"));
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+	});
+
+	afterEach(async () => {
+		store?.close();
+		store = null;
+		if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
+		tempDir = "";
+	});
+
+	it("ignores the pre-pool Antigravity cache row and writes the versioned key", async () => {
+		if (!store) throw new Error("test setup failed");
+		const activeStore = store;
+		const now = Date.now();
+		const fiveHoursIso = new Date(now + 5 * HOUR_MS).toISOString();
+		const storage = new AuthStorage(activeStore, {
+			usageFetch: (async () =>
+				new Response(
+					JSON.stringify({
+						models: { "gemini-3-flash": { quotaInfo: { remainingFraction: 0.5, resetTime: fiveHoursIso } } },
+					}),
+					{ status: 200 },
+				)) as unknown as typeof fetch,
+		});
+		await storage.reload();
+		await storage.set("google-antigravity", [
+			{ type: "oauth", ...createCredential("acct-cache"), projectId: "proj-1" },
+		]);
+
+		// What an older broker left behind: window `default`, per-model label,
+		// no quota-pool split, under the unversioned cache key.
+		const legacyKey =
+			"usage_cache:report:google-antigravity:default:oauth|account:acct-cache|email:acct-cache@example.com|project:proj-1";
+		const legacyReport: UsageReport = {
+			provider: "google-antigravity",
+			fetchedAt: now - HOUR_MS,
+			limits: [
+				{
+					id: "legacy:default",
+					label: "Gemini 3 Flash",
+					scope: { provider: "google-antigravity", windowId: "default" },
+					window: { id: "default", label: "Default", resetsAt: now + HOUR_MS },
+					amount: { unit: "percent", remainingFraction: 0, usedFraction: 1, remaining: 0, used: 100, limit: 100 },
+					status: "exhausted",
+				},
+			],
+		};
+		activeStore.setCache(
+			legacyKey,
+			JSON.stringify({ value: legacyReport, expiresAt: now + 60_000 }),
+			Math.floor((now + 3_600_000) / 1000),
+		);
+
+		try {
+			const [report] = (await storage.fetchUsageReports()) ?? [];
+			// The legacy row was not served: this is a fresh fetch with pool labels.
+			expect(report?.fetchedAt).toBeGreaterThan(now - 60_000);
+			expect(report?.limits.map(limit => limit.label)).toEqual(["Gemini"]);
+			expect(report?.limits[0]?.amount.remainingFraction).toBe(0.5);
+
+			// The new row lives next to, not on top of, the old one.
+			expect(activeStore.getCache(`${legacyKey}|schema:2`, { includeExpired: true })).not.toBeNull();
+			expect(activeStore.getCache(legacyKey, { includeExpired: true })).toContain("legacy:default");
+
+			// Provider-scoped purge still matches both key shapes.
+			activeStore.deleteCachePrefix("usage_cache:report:google-antigravity:");
+			expect(activeStore.getCache(`${legacyKey}|schema:2`, { includeExpired: true })).toBeNull();
+			expect(activeStore.getCache(legacyKey, { includeExpired: true })).toBeNull();
+		} finally {
+			storage.close();
+		}
+	}, 20_000);
 });

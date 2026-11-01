@@ -6,6 +6,7 @@
  */
 
 import { format } from "date-fns";
+import type { ModelTimeSeriesPoint } from "../types";
 
 export const MODEL_COLORS = [
 	"#a78bfa", // violet
@@ -252,6 +253,111 @@ export function buildTopNByModelSeries<T extends ModelKeyedPoint, B>(
 			}),
 		})),
 	};
+}
+
+// Model and provider names are unrestricted strings, so a delimiter-joined key
+// ("a::b" + "c" vs "a" + "b::c") could merge two distinct model/provider pairs.
+// JSON tuple keys cannot collide.
+const modelKey = (model: string, provider: string) => JSON.stringify([model, provider]);
+
+export function buildModelPreferenceSeries(
+	points: ModelTimeSeriesPoint[],
+	topN = 5,
+): {
+	data: Array<{ timestamp: number; total: number; shares: Record<string, number> }>;
+	series: string[];
+} {
+	if (points.length === 0) return { data: [], series: [] };
+
+	const totals = new Map<string, { model: string; provider: string; total: number }>();
+	for (const point of points) {
+		const key = modelKey(point.model, point.provider);
+		const existing = totals.get(key);
+		if (existing) {
+			existing.total += point.requests;
+		} else {
+			totals.set(key, { model: point.model, provider: point.provider, total: point.requests });
+		}
+	}
+
+	const sorted = [...totals.entries()].map(([key, value]) => ({ key, ...value })).sort((a, b) => b.total - a.total);
+	const topEntries = sorted.slice(0, topN);
+	const topKeys = new Set(topEntries.map(entry => entry.key));
+
+	const topModelCounts = new Map<string, number>();
+	for (const entry of topEntries) {
+		topModelCounts.set(entry.model, (topModelCounts.get(entry.model) ?? 0) + 1);
+	}
+
+	const labelByKey = new Map<string, string>();
+	const usedLabels = new Set<string>();
+	// Provider-qualified labels ("foo (bar)") are the existing contract when one
+	// model spans providers, so assign them first: a literal model named like
+	// such a label must not take it over or merge the two series' shares. A
+	// colliding entry is extended with its own provider. Every label is kept
+	// unique; pass 1 still follows topEntries' request-rank order.
+	for (const entry of topEntries) {
+		if ((topModelCounts.get(entry.model) ?? 0) > 1) {
+			let label = `${entry.model} (${entry.provider})`;
+			while (usedLabels.has(label)) label = `${label} (${entry.provider})`;
+			labelByKey.set(entry.key, label);
+			usedLabels.add(label);
+		}
+	}
+	// Pass 2 runs in key order, not request-rank order, so the labels do not
+	// depend on which colliding model happens to have more requests.
+	const singleProviderEntries = topEntries
+		.filter(entry => !labelByKey.has(entry.key))
+		.sort((a, b) => (a.key < b.key ? -1 : 1));
+	for (const entry of singleProviderEntries) {
+		let label = entry.model;
+		while (usedLabels.has(label)) label = `${label} (${entry.provider})`;
+		labelByKey.set(entry.key, label);
+		usedLabels.add(label);
+	}
+
+	const series = topEntries.map(entry => labelByKey.get(entry.key) ?? entry.model);
+	// The synthetic rollup label must be unique among the top-series labels: a
+	// top model can itself be named "Other" (or "Other models", ...), so pick
+	// the first unused label rather than assuming a single rename is enough.
+	let otherLabel = "Other";
+	while (series.includes(otherLabel)) otherLabel = `${otherLabel} models`;
+
+	// Model labels are unrestricted strings. A plain object would resolve
+	// inherited keys like "constructor" from the prototype, silently drop
+	// "__proto__" writes, and let models named "total"/"timestamp" corrupt the
+	// row's own bookkeeping, so buckets accumulate in Maps and label shares
+	// live in their own namespace instead of mixing with row bookkeeping.
+	const dataMap = new Map<number, Map<string, number>>();
+	const dayTotals = new Map<number, number>();
+
+	for (const point of points) {
+		const key = modelKey(point.model, point.provider);
+		const seriesLabel = topKeys.has(key) ? (labelByKey.get(key) ?? point.model) : otherLabel;
+		const bucket = dataMap.get(point.timestamp) ?? new Map<string, number>();
+		bucket.set(seriesLabel, (bucket.get(seriesLabel) ?? 0) + point.requests);
+		dataMap.set(point.timestamp, bucket);
+		dayTotals.set(point.timestamp, (dayTotals.get(point.timestamp) ?? 0) + point.requests);
+	}
+
+	if ([...dataMap.values()].some(row => (row.get(otherLabel) ?? 0) > 0)) {
+		series.push(otherLabel);
+	}
+
+	const data = [...dataMap.entries()]
+		.sort((a, b) => a[0] - b[0])
+		.map(([timestamp, row]) => {
+			const total = dayTotals.get(timestamp) ?? 0;
+			const shares: Array<[string, number]> = [];
+			for (const key of series) {
+				shares.push([key, total > 0 ? ((row.get(key) ?? 0) / total) * 100 : 0]);
+			}
+			// Object.fromEntries stores "__proto__" as an own property instead of
+			// routing the write to the prototype setter.
+			return { timestamp, total, shares: Object.fromEntries(shares) };
+		});
+
+	return { data, series };
 }
 
 /** All Models / By Model segmented toggle — identical UI in every time chart. */

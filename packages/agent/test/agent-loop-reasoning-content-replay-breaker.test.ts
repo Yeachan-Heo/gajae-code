@@ -70,7 +70,7 @@ describe("agentLoop reasoning-content replay circuit breaker", () => {
 		const mock = createMockModel({
 			responses: [{ throw: REASONING_REPLAY_ERROR }, { content: ["recovered"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([prompt], context, config, undefined, mock.stream));
 
@@ -101,7 +101,7 @@ describe("agentLoop reasoning-content replay circuit breaker", () => {
 		const mock = createMockModel({
 			responses: [{ throw: REASONING_REPLAY_ERROR }, { content: ["recovered"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(agentLoop([prompt], context, config, undefined, mock.stream));
 
@@ -130,7 +130,7 @@ describe("agentLoop reasoning-content replay circuit breaker", () => {
 			tools: [],
 		};
 		const mock = createMockModel({ responses: [{ throw: REASONING_REPLAY_ERROR }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([prompt], context, config, undefined, mock.stream));
 
@@ -158,7 +158,7 @@ describe("agentLoop reasoning-content replay circuit breaker", () => {
 				{ content: ["never reached"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([prompt], context, config, undefined, mock.stream));
 
@@ -179,7 +179,7 @@ describe("agentLoop reasoning-content replay circuit breaker", () => {
 			tools: [],
 		};
 		const mock = createMockModel({ responses: [{ throw: "The server had an error (code=server_error)" }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([prompt], context, config, undefined, mock.stream));
 
@@ -219,7 +219,7 @@ describe("agentLoop reasoning-content replay circuit breaker", () => {
 			tools: [],
 		};
 		const mock = createMockModel({ responses: [{ throw: REASONING_REPLAY_ERROR }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(agentLoop([prompt], context, config, undefined, mock.stream));
 

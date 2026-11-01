@@ -256,8 +256,6 @@ async function acceptPrompt(
 		prepareCwd?: (cwd: string) => Promise<void>;
 		/** Replace the settings double, e.g. to opt out of the autosave. */
 		settings?: (cwd: string) => Settings;
-		/** Widen the deadline-schedule capture beyond the default lease window. */
-		scheduleFilter?: (delayMs: number) => boolean;
 	} = {},
 ): Promise<BusSession> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
@@ -296,12 +294,13 @@ async function acceptPrompt(
 				delayMs?: number,
 				...rest: unknown[]
 			) => {
-				// The deadline is armed AFTER the awaited durable accept, so its
-				// remaining delay is the lease minus however long that write took.
-				// Match the whole upper half of the lease window: with the long lease
-				// these cases use, nothing else schedules anywhere near it.
-				const matches = options.scheduleFilter ?? ((delay: number) => delay > leaseMs / 2 && delay <= leaseMs);
-				if (delayMs !== undefined && matches(delayMs)) {
+				// Attribute the timer to its arming site, never to its delay. The bus
+				// starts the SDK broker for its agent dir concurrently with this window,
+				// and that startup arms its own discovery timers (`ensure.ts`
+				// `readBrokerDiscoveryBeforeDeadline`, ~35s out) whose delay overlaps
+				// any lease-shaped filter. Renaming `armPromptDeadline` fails loudly on
+				// the "captured deadline schedule" wait below.
+				if (delayMs !== undefined && /\bat armPromptDeadline \(/.test(new Error().stack ?? "")) {
 					scheduled.push(callback);
 					scheduledDelays.push(delayMs);
 				}
@@ -1486,8 +1485,6 @@ test("the bus arms its deadline at the schema default when the setting read miss
 		{
 			settings: settingsWithoutDeadlineValues,
 			captureSchedule: true,
-			// Nothing else in the accept path schedules anywhere near an hour out.
-			scheduleFilter: delayMs => delayMs > 1_000_000,
 		},
 	);
 	try {

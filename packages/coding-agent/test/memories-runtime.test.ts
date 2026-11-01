@@ -14,6 +14,7 @@ import {
 import * as memoryStorage from "@gajae-code/coding-agent/memories/storage";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend";
 import { getAgentDbPath, Snowflake } from "@gajae-code/utils";
+import fc from "fast-check";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 interface SessionFixture {
@@ -86,6 +87,42 @@ async function runPhase2(
 	const content = context?.messages[0]?.content;
 	const input = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
 	return { input, options };
+}
+
+async function seedPhase2Thread(
+	fx: SessionFixture,
+	threadId: string,
+	rolloutSlug: string | null,
+	summary: string,
+): Promise<void> {
+	const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+	memoryStorage.upsertThreads(db, [
+		{
+			id: threadId,
+			updatedAt: 100,
+			rolloutPath: path.join(fx.sessionDir, "seed.jsonl"),
+			cwd: fx.session.sessionManager.getCwd(),
+			sourceKind: "cli",
+		},
+	]);
+	db.prepare(
+		"INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, generated_at) VALUES (?, ?, ?, ?, ?, ?)",
+	).run(threadId, 100, `raw ${summary}`, summary, rolloutSlug, 100);
+	memoryStorage.enqueueGlobalWatermark(db, 100, fx.session.sessionManager.getCwd(), {
+		forceDirtyWhenNotAdvanced: true,
+	});
+	memoryStorage.closeMemoryDb(db);
+}
+
+function legacyRolloutStem(threadId: string, rolloutSlug: string | null): string {
+	if (!rolloutSlug) return threadId;
+	const normalized = rolloutSlug
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "_")
+		.replace(/_+$/g, "")
+		.slice(0, 20);
+	if (!normalized) return threadId;
+	return `${threadId}-${normalized}`;
 }
 
 async function writeRollout(fx: SessionFixture, threadId: string): Promise<void> {
@@ -607,6 +644,178 @@ describe("memories runtime", () => {
 			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
 			expect(raw.indexOf("## thread-b")).toBeLessThan(raw.indexOf("## thread-a"));
 		});
+	});
+
+	test("phase2 rollout summary thread id cannot write outside summaries", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		const summariesDir = path.join(memoryRoot, "rollout_summaries");
+		const outsideDir = path.join(fx.agentDir, "outside-sink");
+		await fs.mkdir(outsideDir, { recursive: true });
+		const sentinel = path.join(outsideDir, "do-not-delete.md");
+		await fs.writeFile(sentinel, "keep");
+		const threadId = path.relative(summariesDir, path.join(outsideDir, "evil"));
+		expect(threadId.includes("..")).toBe(true);
+		expect(path.isAbsolute(threadId)).toBe(false);
+
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
+		await seedPhase2Thread(fx, threadId, null, "escaped-summary");
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(async () => {
+			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+			expect(raw).toContain("escaped-summary");
+		});
+		expect(await Bun.file(path.join(outsideDir, "evil.md")).exists()).toBe(false);
+		expect(await fs.readFile(sentinel, "utf8")).toBe("keep");
+		const written = await fs.readdir(summariesDir).catch(() => [] as string[]);
+		expect(written.every(name => !name.includes("/") && !name.includes("\\"))).toBe(true);
+	});
+
+	test("phase2 still allows a plain thread id rollout summary", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		const summariesDir = path.join(memoryRoot, "rollout_summaries");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
+		await seedPhase2Thread(fx, "thread-ok", null, "plain-summary");
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(async () => {
+			const text = await fs.readFile(path.join(summariesDir, "thread-ok.md"), "utf8");
+			expect(text).toContain("thread_id: thread-ok");
+			expect(text).toContain("plain-summary");
+		});
+	});
+
+	test.skipIf(path.sep === "\\")(
+		"phase2 prunes an existing in-directory summary name that contains a backslash",
+		async () => {
+			const fx = await createFixture();
+			const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+			const summariesDir = path.join(memoryRoot, "rollout_summaries");
+			await fs.mkdir(summariesDir, { recursive: true });
+			const backslashName = "stale\\name.md";
+			await fs.writeFile(path.join(summariesDir, backslashName), "stale-backslash");
+			await fs.writeFile(path.join(summariesDir, "old.md"), "stale-plain");
+			vi.spyOn(ai, "completeSimple").mockResolvedValue(
+				createAssistantMessage(
+					JSON.stringify({
+						memory_md: "# Memory\n\nMerged",
+						memory_summary: "Merged summary",
+						skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+					}),
+				),
+			);
+			await seedPhase2Thread(fx, "thread-ok", null, "plain-summary");
+			startMemoryStartupTask({
+				session: fx.session,
+				settings: fx.settings,
+				modelRegistry: fx.modelRegistry,
+				agentDir: fx.agentDir,
+				taskDepth: 0,
+			});
+
+			await waitFor(async () => {
+				const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+				expect(raw).toContain("plain-summary");
+				const names = await fs.readdir(summariesDir);
+				expect(names.includes("thread-ok.md")).toBe(true);
+				expect(names.includes("old.md")).toBe(false);
+				expect(names.includes(backslashName)).toBe(false);
+			});
+		},
+	);
+
+	test("property: rollout summary filename containment seed 468", async () => {
+		const memories = await import("@gajae-code/coding-agent/memories");
+		const destination = (
+			memories as {
+				rolloutSummaryDestinationForTesting?: (
+					summariesDir: string,
+					threadId: string,
+					rolloutSlug: string | null,
+				) => string | undefined;
+			}
+		).rolloutSummaryDestinationForTesting;
+		if (typeof destination !== "function") {
+			throw new Error("rollout summary destination seam missing");
+		}
+		const summariesDir = path.join(path.sep, "rollout-summaries-root");
+		const root = path.resolve(summariesDir);
+		const fixed: Array<[string, string | null]> = [
+			["../../../../outside/evil", null],
+			["../outside/evil", "Hello"],
+			["/outside/evil", null],
+			["foo/bar", null],
+			["foo\\bar", null],
+			["a\0b", null],
+			["..\\outside\\evil", "slug"],
+			["thread/../../outside", null],
+		];
+		const assertContained = (threadId: string, rolloutSlug: string | null): void => {
+			const target = destination(summariesDir, threadId, rolloutSlug);
+			const again = destination(summariesDir, threadId, rolloutSlug);
+			const stem = legacyRolloutStem(threadId, rolloutSlug);
+			const filename = `${stem}.md`;
+			const safe =
+				!filename.includes("/") &&
+				!filename.includes("\\") &&
+				!filename.includes("\0") &&
+				filename !== "." &&
+				filename !== ".." &&
+				path.basename(filename) === filename;
+			expect(target).toBe(again);
+			if (!safe) {
+				expect(target).toBeUndefined();
+				return;
+			}
+			const expected = path.resolve(root, filename);
+			expect(target).toBe(expected);
+			expect(path.basename(expected)).toBe(filename);
+			const relative = path.relative(root, expected);
+			expect(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(false);
+			expect(relative).toBe(filename);
+		};
+		expect(fixed.length).toBe(8);
+		for (const [threadId, rolloutSlug] of fixed) assertContained(threadId, rolloutSlug);
+		fc.assert(
+			fc.property(
+				fc.string({ maxLength: 32 }),
+				fc.option(fc.string({ maxLength: 24 }), { nil: null }),
+				(threadId, rolloutSlug) => {
+					assertContained(threadId, rolloutSlug);
+				},
+			),
+			{ seed: 468, numRuns: 64 },
+		);
 	});
 
 	test("phase2 empty-input cleanup removes consolidated files and skills dir", async () => {

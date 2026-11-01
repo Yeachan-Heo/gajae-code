@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	type Api,
@@ -16,16 +15,7 @@ import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
-import {
-	type AutoroutingProvenance,
-	type AutoroutingSetup,
-	buildAutoroutingEnabledPatch,
-	buildAutoroutingSettingsBatch,
-	evaluateAutoroutingProvenanceState,
-	validateAutoroutingSetup,
-} from "../../config/autorouting-contract";
-import { canonicalJsonBytes, generateTierChains } from "../../config/autorouting-generator";
-import { CURATED_TIER_MAP } from "../../config/autorouting-tier-map";
+import type { AutoroutingSetup } from "../../config/autorouting-contract";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
 	activateModelProfile,
@@ -38,7 +28,7 @@ import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from ".
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { type RawSettings, type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
+import { type Settings, settings } from "../../config/settings";
 import type { SettingValue } from "../../config/settings-schema";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -71,41 +61,14 @@ import {
 	suspendInteractiveActivityIndicator,
 } from "../../modes/types";
 import { configureSttFromSettings } from "../../runtime/stt-settings-setup";
-import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
+import { createNotificationsEditorOperations } from "../../sdk/notification-setup";
 import {
-	getCurrentTelegramActivationMarker,
-	getNotificationConfig,
-	isProviderEffectivelyEnabled,
-	isTelegramComplete,
-	maskToken,
-	type NotificationProvider,
-} from "../../sdk/bus/config";
-import {
-	clearTelegramActivationMarker,
-	createTelegramActivationMarker,
-	mutateNotificationProvider,
-	type NotificationProviderConfigurationMutation,
-	type NotificationProviderRuntimeAuthority,
-	observedTelegramActivationMarker,
-	persistTelegramActivationMarker,
-	proposedTelegramIdentity,
-	reconcileCommittedTelegramConfiguration,
-	removeNotificationProvider,
-	removeTelegramConfiguration,
-	saveTelegramInactive,
-	setGlobalNotificationsEnabled,
-} from "../../sdk/bus/notification-orchestration";
-import {
-	buildNotificationStatusReport,
-	checkNotificationHealth,
-	recoverNotifications,
-	sanitizeDiagnostic,
-	sendNotificationTest,
-} from "../../sdk/bus/notification-service";
-import type { NotificationSessionStatus } from "../../sdk/bus/session-control";
-import { ensureTelegramDaemonRunningDetailed, resolveTelegramSetupPreflight } from "../../sdk/bus/telegram-daemon";
-import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
-import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
+	createRoutingSettingsService,
+	RoutingSettingsActivationError,
+	type RoutingSettingsOutcome,
+	type RoutingSettingsPreview,
+	type RoutingSettingsService,
+} from "../../sdk/routing-settings";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
 import type {
 	AgentSessionProfileInstalledOverrideState,
@@ -197,11 +160,6 @@ import { HistorySearchComponent } from "../components/history-search";
 import { HookSelectorComponent } from "../components/hook-selector";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent } from "../components/model-selector";
-import type {
-	NotificationsEditorOperations,
-	PreparedNotificationProviderConfiguration,
-	PreparedTelegramConfiguration,
-} from "../components/notifications-settings-editor";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { isPetAvailable } from "../components/pet-capability";
 import { PetSelectorComponent } from "../components/pet-selector";
@@ -221,7 +179,6 @@ import { SessionObserverOverlayComponent } from "../components/session-observer-
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
 import { SettingsSelectorComponent } from "../components/settings-selector";
-import type { SmartRoutingPreview } from "../components/smart-routing-panel";
 import { TasksPaneComponent } from "../components/tasks-pane";
 import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ThinkingSelectorComponent } from "../components/thinking-selector";
@@ -287,925 +244,6 @@ function formatProviderOnboardingCommandGuide(): string {
 	].join("\n");
 }
 
-export interface NotificationsEditorAdapterContext {
-	settings: Settings;
-	session: Pick<InteractiveModeContext["session"], "notificationSessionController">;
-	sessionManager: Pick<InteractiveModeContext["sessionManager"], "getCwd" | "getSessionId">;
-	notifyConfigChanged?: () => Promise<void> | void;
-}
-
-type TelegramDaemonStopResult = {
-	ok: boolean;
-	message: string;
-	before?: { health?: string };
-};
-
-export interface NotificationsEditorOperationDependencies {
-	getNotificationConfig: typeof getNotificationConfig;
-	getCurrentTelegramActivationMarker: typeof getCurrentTelegramActivationMarker;
-	maskToken: typeof maskToken;
-	buildNotificationStatusReport: typeof buildNotificationStatusReport;
-	checkNotificationHealth: typeof checkNotificationHealth;
-	sendNotificationTest: typeof sendNotificationTest;
-	recoverNotifications: typeof recoverNotifications;
-	sanitizeDiagnostic: typeof sanitizeDiagnostic;
-	ensureTelegramDaemonRunningDetailed: typeof ensureTelegramDaemonRunningDetailed;
-	runTelegramSetup: typeof runTelegramSetup;
-	resolveTelegramSetupPreflight: typeof resolveTelegramSetupPreflight;
-	proposedTelegramIdentity: typeof proposedTelegramIdentity;
-	reconcileCommittedTelegramConfiguration: typeof reconcileCommittedTelegramConfiguration;
-	saveTelegramInactive: typeof saveTelegramInactive;
-	removeTelegramConfiguration: typeof removeTelegramConfiguration;
-
-	reloadTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
-	restartTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
-	stopTelegramDaemon(settings: Settings): Promise<TelegramDaemonStopResult>;
-	providerRuntime?: NotificationProviderRuntimeAuthority;
-}
-
-const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
-	getNotificationConfig,
-	getCurrentTelegramActivationMarker,
-	maskToken,
-	buildNotificationStatusReport,
-	checkNotificationHealth,
-	sendNotificationTest,
-	recoverNotifications,
-	sanitizeDiagnostic,
-	ensureTelegramDaemonRunningDetailed,
-	runTelegramSetup,
-	resolveTelegramSetupPreflight,
-	proposedTelegramIdentity,
-	reconcileCommittedTelegramConfiguration,
-	saveTelegramInactive,
-	removeTelegramConfiguration,
-
-	reloadTelegramDaemon: async settings =>
-		await new TelegramDaemonController(settings).reload({ spawnIfStopped: false }),
-	restartTelegramDaemon: async settings =>
-		await new TelegramDaemonController(settings).reload({ spawnIfStopped: true }),
-	stopTelegramDaemon: async settings => await new TelegramDaemonController(settings).stop(),
-};
-
-function unavailableNotificationSessionStatus(): NotificationSessionStatus {
-	return {
-		eligible: false,
-		locallyEnabled: true,
-		genericSessionEnabled: false,
-		genericEligibilitySource: "none",
-		running: false,
-	};
-}
-
-function unavailableNotificationSessionResult() {
-	return { outcome: "disabled" as const, status: unavailableNotificationSessionStatus() };
-}
-
-function notificationOperationError(
-	services: NotificationsEditorOperationDependencies,
-	error: unknown,
-	token?: string,
-): Error {
-	return new Error(
-		services.sanitizeDiagnostic(error instanceof Error ? error.message : "Notification operation failed.", token),
-	);
-}
-
-/**
- * Concrete service adapter for the direct Notifications settings tab. Secrets remain in this closure's
- * WeakMap and are never exposed through the editor's safe draft contract.
- */
-export function createNotificationsEditorOperations(
-	ctx: NotificationsEditorAdapterContext,
-	overrides: Partial<NotificationsEditorOperationDependencies> = {},
-): NotificationsEditorOperations {
-	const services = { ...notificationEditorOperationDependencies, ...overrides };
-	const drafts = new WeakMap<PreparedTelegramConfiguration, string>();
-	const providerDrafts = new WeakMap<
-		PreparedNotificationProviderConfiguration,
-		{ botToken?: string; appToken?: string }
-	>();
-	const sessionContext = () => ({ sessionManager: ctx.sessionManager });
-	const notifyAfterDurableCommit = async (): Promise<void> => {
-		await ctx.notifyConfigChanged?.();
-	};
-	const reconnect = async () => await services.ensureTelegramDaemonRunningDetailed({ settings: ctx.settings });
-	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> =>
-		await services.resolveTelegramSetupPreflight(ctx.settings);
-	const providerRuntime: NotificationProviderRuntimeAuthority = services.providerRuntime ?? {
-		activate: async provider => {
-			if (provider === "telegram") {
-				const result = await reconnect();
-				if (result === "blocked_identity" || result === "disabled") {
-					throw new Error("Telegram activation failed after the durable save.");
-				}
-				await ctx.session.notificationSessionController?.reconcileCurrentSession(sessionContext());
-				return;
-			}
-			const result = await new ChatDaemonController(ctx.settings, provider).ensure();
-			if (result === "disabled") throw new Error(`${provider} activation failed after the durable save.`);
-		},
-		deactivate: async provider => {
-			if (provider === "telegram") {
-				const result = await services.stopTelegramDaemon(ctx.settings);
-				if (!result.ok) throw new Error(result.message);
-				await ctx.session.notificationSessionController?.reconcileCurrentSession(sessionContext());
-				return;
-			}
-			const result = await new ChatDaemonController(ctx.settings, provider).stop();
-			if (!result.ok) throw new Error(result.message);
-		},
-	};
-
-	return {
-		loadState: async () => {
-			const config = services.getNotificationConfig(ctx.settings);
-			const status = services.buildNotificationStatusReport(ctx.settings);
-			const runtime = async (provider: NotificationProvider) => {
-				const daemon =
-					provider === "telegram"
-						? await new TelegramDaemonController(ctx.settings).status()
-						: await new ChatDaemonController(ctx.settings, provider).status();
-				return daemon.health === "running" ? "ready" : daemon.health === "not_configured" ? "inactive" : "failed";
-			};
-			const [telegramRuntime, discordRuntime, slackRuntime] = await Promise.all([
-				runtime("telegram"),
-				runtime("discord"),
-				runtime("slack"),
-			]);
-			status.telegram.runtime = telegramRuntime;
-			status.discord.runtime = discordRuntime;
-			status.slack.runtime = slackRuntime;
-			return {
-				status,
-				session:
-					ctx.session.notificationSessionController?.query(sessionContext()) ??
-					unavailableNotificationSessionStatus(),
-				preferences: {
-					redact: config.redact,
-					verbosity: config.verbosity,
-					sessionScope: config.sessionScope,
-					richEnabled: config.rich.enabled,
-					richDraftEnabled: config.richDraft.enabled,
-					toolActivityEnabled: config.toolActivity.enabled,
-					streamingEnabled: config.streaming.enabled,
-					sound: config.sound,
-				},
-			};
-		},
-
-		refreshHealth: async ({ probe, provider, signal }) => {
-			if (signal?.aborted) throw new Error("Notification health refresh cancelled.");
-			try {
-				const input: Parameters<typeof checkNotificationHealth>[0] & { signal?: AbortSignal } = {
-					settings: ctx.settings,
-					stateRoot: path.join(ctx.sessionManager.getCwd(), ".gjc", "state"),
-					probe,
-					provider,
-					signal,
-				};
-				const report = await services.checkNotificationHealth(input);
-				if (signal?.aborted) throw new Error("Notification health refresh cancelled.");
-				const token = services.getNotificationConfig(ctx.settings).botToken;
-				return {
-					...report,
-					checks: report.checks.map(check => ({
-						...check,
-						detail: services.sanitizeDiagnostic(check.detail, token),
-					})),
-					reachability: {
-						...report.reachability,
-						detail: services.sanitizeDiagnostic(report.reachability.detail, token),
-					},
-				};
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		sendTest: async provider => {
-			try {
-				const result = await services.sendNotificationTest({
-					settings: ctx.settings,
-					provider,
-					deps: {
-						providerRuntimeStatus: async selected => {
-							const status =
-								selected === "telegram"
-									? await new TelegramDaemonController(ctx.settings).status()
-									: await new ChatDaemonController(ctx.settings, selected).status();
-							return status.health === "running" ? "ready" : "inactive";
-						},
-					},
-				});
-				return {
-					...result,
-					detail: services.sanitizeDiagnostic(
-						result.detail,
-						services.getNotificationConfig(ctx.settings).botToken,
-					),
-				};
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		recover: async () => {
-			try {
-				const result = await services.recoverNotifications({
-					settings: ctx.settings,
-					stateRoot: path.join(ctx.sessionManager.getCwd(), ".gjc", "state"),
-				});
-				return {
-					...result,
-					daemon: {
-						...result.daemon,
-						detail: services.sanitizeDiagnostic(
-							result.daemon.detail,
-							services.getNotificationConfig(ctx.settings).botToken,
-						),
-					},
-				};
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		reconnect: async () => {
-			try {
-				const result = await reconnect();
-				const controller = ctx.session.notificationSessionController;
-				if (result === "blocked_identity") {
-					await controller?.enterBlockedRuntime(sessionContext());
-				} else if (result === "spawned" || result === "reloaded" || result === "attached") {
-					await controller?.clearBlockedRuntime(sessionContext());
-					await controller?.reconcileCurrentSession(sessionContext());
-				}
-				return result;
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		preflightProposedIdentity: async (input, signal) => {
-			const token = input.token.consume();
-			const unknownIdentity = { status: "unknown" as const };
-			if (!token.trim()) {
-				return {
-					status: "error",
-					identity: unknownIdentity,
-					message: "Telegram bot token is required.",
-				};
-			}
-			try {
-				const setup = await services.runTelegramSetup({
-					token,
-					chatId: input.chatId,
-					preflight: await telegramSetupPreflight(),
-					revalidatePreflight: async () => await telegramSetupPreflight(),
-					interactive: false,
-					signal,
-					deps: { fetchImpl: globalThis.fetch },
-				});
-				if (!setup.ok) {
-					return {
-						status: setup.status === "aborted" ? "aborted" : setup.status === "cancelled" ? "cancelled" : "error",
-						identity: unknownIdentity,
-						message: services.sanitizeDiagnostic(setup.detail, token),
-					};
-				}
-				if (signal.aborted) {
-					return {
-						status: "aborted",
-						identity: unknownIdentity,
-						message: "Telegram setup cancelled.",
-					};
-				}
-				const identity = await services.proposedTelegramIdentity({
-					settings: ctx.settings,
-					botToken: token,
-					chatId: setup.chatId,
-					chatDisplay: setup.chatId,
-				});
-				if (signal.aborted) {
-					return {
-						status: "aborted",
-						identity,
-						message: "Telegram setup cancelled.",
-					};
-				}
-				const draft: PreparedTelegramConfiguration = {
-					chatId: setup.chatId,
-					tokenMask: services.maskToken(token),
-					tokenFingerprint: setup.tokenFingerprint,
-					richEnabled: input.richEnabled,
-					richDraftEnabled: input.richDraftEnabled,
-					streamingEnabled: input.streamingEnabled,
-				};
-				drafts.set(draft, token);
-				const pairingMessage =
-					setup.pairingSource === "discovered"
-						? "Telegram private chat discovered and validated."
-						: setup.pairingSource === "reused"
-							? "Stored Telegram private chat validated without polling."
-							: "Supplied Telegram private chat validated.";
-				return {
-					status: "ready",
-					identity,
-					draft,
-					pairingSource: setup.pairingSource,
-					message:
-						identity.status === "foreign" || identity.status === "unknown"
-							? `${pairingMessage} Activation is blocked by the current daemon identity.`
-							: pairingMessage,
-				};
-			} catch (error) {
-				return {
-					status: signal.aborted ? "aborted" : "error",
-					identity: unknownIdentity,
-					message: signal.aborted
-						? "Telegram setup cancelled."
-						: services.sanitizeDiagnostic(
-								error instanceof Error ? error.message : "Telegram setup failed.",
-								token,
-							),
-				};
-			}
-		},
-
-		commitConfigure: async draft => {
-			const token = drafts.get(draft);
-			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
-			let receipt: SettingsAtomicReceipt | undefined;
-			try {
-				const inactiveMarkerToClear = observedTelegramActivationMarker(ctx.settings, token, draft.chatId);
-				receipt = await ctx.settings.commitAtomicBatch([
-					{ path: "notifications.enabled", op: "set", value: true },
-					{ path: "notifications.telegram.botToken", op: "set", value: token },
-					{ path: "notifications.telegram.chatId", op: "set", value: draft.chatId },
-					{ path: "notifications.telegram.enabled", op: "set", value: true },
-					{ path: "notifications.telegram.rich.enabled", op: "set", value: draft.richEnabled },
-					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: draft.richDraftEnabled },
-					{ path: "notifications.telegram.streaming.enabled", op: "set", value: draft.streamingEnabled },
-				]);
-				drafts.delete(draft);
-				const activationMarker = createTelegramActivationMarker({
-					botToken: token,
-					chatId: draft.chatId,
-					state: "blocked",
-					reason: "identity_mismatch",
-				});
-				const controller = ctx.session.notificationSessionController;
-				const activation = await services.reconcileCommittedTelegramConfiguration({
-					receipt,
-					inactiveMarkerToClear,
-					activation: {
-						controller: controller
-							? {
-									enterBlockedRuntime: async () => await controller.enterBlockedRuntime(sessionContext()),
-									clearBlockedRuntime: async () => await controller.clearBlockedRuntime(sessionContext()),
-									reconcileCurrentSession: async () =>
-										await controller.reconcileCurrentSession(sessionContext()),
-								}
-							: {
-									enterBlockedRuntime: async () => undefined,
-									clearBlockedRuntime: async () => undefined,
-									reconcileCurrentSession: async () => undefined,
-								},
-						reconnect,
-						persistInactive: async marker => await persistTelegramActivationMarker(ctx.settings, marker),
-						clearInactive: async marker => await clearTelegramActivationMarker(ctx.settings, marker),
-						marker: activationMarker,
-					},
-				});
-				let observerFailed = false;
-				try {
-					await notifyAfterDurableCommit();
-				} catch {
-					observerFailed = true;
-				}
-				if (activation.status === "blocked_identity") {
-					return {
-						status: "blocked_identity" as const,
-						receipt,
-						message: services.sanitizeDiagnostic(
-							`${activation.message}${observerFailed ? " The settings observer also failed after the durable commit." : ""}`,
-							token,
-						),
-						restore: async () => {
-							const restored = await activation.restore();
-							if (restored.status === "restored" || restored.status === "still_blocked") {
-								await notifyAfterDurableCommit();
-							}
-							return restored;
-						},
-						retainCommitted: () => activation.retainCommitted(),
-					};
-				}
-				if (activation.status === "activation_failed") {
-					return {
-						status: "activation_failed" as const,
-						receipt,
-						message: services.sanitizeDiagnostic(
-							`${activation.message}${observerFailed ? " The settings observer also failed after the durable commit." : ""}`,
-							token,
-						),
-					};
-				}
-				if (observerFailed) {
-					return {
-						status: "observer_failed" as const,
-						receipt,
-						message: "Telegram configuration was saved and activated, but the settings observer failed.",
-					};
-				}
-				return {
-					status: "saved" as const,
-					receipt,
-					message: services.sanitizeDiagnostic("Telegram configuration saved and reconciled.", token),
-				};
-			} catch (error) {
-				if (receipt) {
-					return {
-						status: "activation_failed" as const,
-						receipt,
-						message: "Telegram configuration was saved, but post-commit activation failed.",
-					};
-				}
-				throw notificationOperationError(services, error, token);
-			}
-		},
-
-		saveInactive: async draft => {
-			const token = drafts.get(draft);
-			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
-			try {
-				const result = await services.saveTelegramInactive({
-					settings: ctx.settings,
-					botToken: token,
-					chatId: draft.chatId,
-				});
-				drafts.delete(draft);
-				try {
-					await notifyAfterDurableCommit();
-				} catch {
-					return {
-						status: "observer_failed" as const,
-						receipt: result.receipt,
-						message: "Telegram configuration was saved inactive, but the settings observer failed.",
-					};
-				}
-				return {
-					status: "saved_inactive" as const,
-					receipt: result.receipt,
-					message: "Telegram configuration saved inactive; no runtime activation was requested.",
-				};
-			} catch (error) {
-				throw notificationOperationError(services, error, token);
-			}
-		},
-
-		discardConfigureDraft: draft => {
-			drafts.delete(draft);
-		},
-
-		prepareProviderConfiguration: async input => {
-			const cfg = services.getNotificationConfig(ctx.settings);
-			const consumeSecret = (action: typeof input.botToken): string | undefined => {
-				if (!action.value) return undefined;
-				const value = action.value.consume();
-				return action.action === "replace" ? value : undefined;
-			};
-			const botToken = consumeSecret(input.botToken);
-			const appToken = input.appToken ? consumeSecret(input.appToken) : undefined;
-			if (input.botToken.action === "replace" && !botToken?.trim()) {
-				throw new Error("A non-blank bot token replacement is required.");
-			}
-			if (input.provider === "slack" && input.appToken?.action === "replace" && !appToken?.trim()) {
-				throw new Error("A non-blank Slack app token replacement is required.");
-			}
-			if (input.provider === "discord") {
-				const applicationId = input.applicationId?.trim() || undefined;
-				const guildId = input.guildId?.trim() || undefined;
-				const parentChannelId = input.parentChannelId?.trim() || undefined;
-				const resolvedApplicationId = applicationId ?? cfg.discord.applicationId;
-				const resolvedGuildId = guildId ?? cfg.discord.guildId;
-				const resolvedParentChannelId = parentChannelId ?? cfg.discord.parentChannelId;
-				const removesSecret = input.botToken.action === "remove";
-				if (!removesSecret && (!resolvedApplicationId || !resolvedGuildId || !resolvedParentChannelId)) {
-					throw new Error("Discord application, guild, and parent channel IDs are required.");
-				}
-				if (!removesSecret && input.botToken.action === "keep" && !cfg.discord.botToken) {
-					throw new Error("Discord has no stored bot token to keep.");
-				}
-				const draft: PreparedNotificationProviderConfiguration = {
-					provider: "discord",
-					botTokenDisposition: input.botToken.action,
-					botTokenMask: maskToken(botToken ?? cfg.discord.botToken),
-					...(applicationId === undefined ? {} : { applicationId }),
-					...(guildId === undefined ? {} : { guildId }),
-					...(parentChannelId === undefined ? {} : { parentChannelId }),
-					applicationIdDisplay: resolvedApplicationId,
-					guildIdDisplay: resolvedGuildId,
-					parentChannelIdDisplay: resolvedParentChannelId,
-				};
-				providerDrafts.set(draft, { ...(botToken === undefined ? {} : { botToken }) });
-				return draft;
-			}
-			const workspaceId = input.workspaceId?.trim() || undefined;
-			const channelId = input.channelId?.trim() || undefined;
-			const authorizedUserId = input.authorizedUserId?.trim() || undefined;
-			const resolvedWorkspaceId = workspaceId ?? cfg.slack.workspaceId;
-			const resolvedChannelId = channelId ?? cfg.slack.channelId;
-			const resolvedAuthorizedUserId = authorizedUserId ?? cfg.slack.authorizedUserId;
-			const appDisposition = input.appToken?.action ?? "keep";
-			const removesSecret = input.botToken.action === "remove" || appDisposition === "remove";
-			if (!removesSecret && (!resolvedWorkspaceId || !resolvedChannelId)) {
-				throw new Error("Slack workspace and channel IDs are required.");
-			}
-			if (!removesSecret && input.botToken.action === "keep" && !cfg.slack.botToken) {
-				throw new Error("Slack has no stored bot token to keep.");
-			}
-			if (!removesSecret && appDisposition === "keep" && !cfg.slack.appToken) {
-				throw new Error("Slack has no stored app token to keep.");
-			}
-			const draft: PreparedNotificationProviderConfiguration = {
-				provider: "slack",
-				botTokenDisposition: input.botToken.action,
-				botTokenMask: maskToken(botToken ?? cfg.slack.botToken),
-				appTokenDisposition: appDisposition,
-				appTokenMask: maskToken(appToken ?? cfg.slack.appToken),
-				...(workspaceId === undefined ? {} : { workspaceId }),
-				...(channelId === undefined ? {} : { channelId }),
-				...(authorizedUserId === undefined ? {} : { authorizedUserId }),
-				workspaceIdDisplay: resolvedWorkspaceId,
-				channelIdDisplay: resolvedChannelId,
-				authorizedUserIdDisplay: resolvedAuthorizedUserId,
-			};
-			providerDrafts.set(draft, {
-				...(botToken === undefined ? {} : { botToken }),
-				...(appToken === undefined ? {} : { appToken }),
-			});
-			return draft;
-		},
-
-		commitProviderConfiguration: async draft => {
-			const secrets = providerDrafts.get(draft) ?? {};
-			try {
-				let mutation: NotificationProviderConfigurationMutation;
-				if (draft.provider === "discord") {
-					mutation = {
-						provider: "discord",
-						botToken:
-							draft.botTokenDisposition === "replace"
-								? { action: "replace", value: secrets.botToken ?? "" }
-								: { action: draft.botTokenDisposition },
-						applicationId: draft.applicationId,
-						guildId: draft.guildId,
-						parentChannelId: draft.parentChannelId,
-					};
-				} else {
-					const appDisposition = draft.appTokenDisposition ?? "keep";
-					mutation = {
-						provider: "slack",
-						botToken:
-							draft.botTokenDisposition === "replace"
-								? { action: "replace", value: secrets.botToken ?? "" }
-								: { action: draft.botTokenDisposition },
-						appToken:
-							appDisposition === "replace"
-								? { action: "replace", value: secrets.appToken ?? "" }
-								: { action: appDisposition },
-						workspaceId: draft.workspaceId,
-						channelId: draft.channelId,
-						authorizedUserId: draft.authorizedUserId,
-					};
-				}
-				const removesSecret = draft.botTokenDisposition === "remove" || draft.appTokenDisposition === "remove";
-				const result = await mutateNotificationProvider({
-					settings: ctx.settings,
-					mutation,
-					configureAndActivate: !removesSecret,
-					...(removesSecret ? { desiredEnabled: false } : {}),
-					notifyConfigChanged: notifyAfterDurableCommit,
-					runtime: providerRuntime,
-				});
-				const outcome =
-					result.status === "commit_failed"
-						? "failed"
-						: result.status === "activation_failed" ||
-								result.status === "deactivation_failed" ||
-								result.observerFailed
-							? "degraded"
-							: "success";
-				const observerSuffix =
-					result.status !== "commit_failed" && result.observerFailed
-						? " The settings observer also failed after the durable commit."
-						: "";
-				return {
-					...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
-					outcome,
-					message:
-						(result.status === "activated"
-							? `${draft.provider} configuration saved and activated.`
-							: result.status === "activation_failed"
-								? `${draft.provider} configuration and desired intent were saved, but runtime activation failed.`
-								: result.status === "deactivation_failed"
-									? `${draft.provider} desired-off configuration was saved, but runtime deactivation failed.`
-									: result.status === "commit_failed"
-										? `${draft.provider} configuration was not saved because the CAS commit failed.`
-										: `${draft.provider} configuration saved.`) + observerSuffix,
-				};
-			} finally {
-				providerDrafts.delete(draft);
-			}
-		},
-
-		discardProviderConfiguration: draft => {
-			providerDrafts.delete(draft);
-		},
-
-		setProviderDesired: async (provider, enabled) => {
-			if (provider === "telegram" && enabled) {
-				const config = services.getNotificationConfig(ctx.settings);
-				if (services.getCurrentTelegramActivationMarker(config)) {
-					return {
-						outcome: "failed",
-						message:
-							"Telegram remains inactive because its exact activation marker must be restored or cleared after safe owner readiness.",
-					};
-				}
-			}
-			const mutation: NotificationProviderConfigurationMutation =
-				provider === "telegram"
-					? { provider, botToken: { action: "keep" } }
-					: provider === "discord"
-						? { provider, botToken: { action: "keep" } }
-						: { provider, botToken: { action: "keep" }, appToken: { action: "keep" } };
-			const result = await mutateNotificationProvider({
-				settings: ctx.settings,
-				mutation,
-				desiredEnabled: enabled,
-				notifyConfigChanged: notifyAfterDurableCommit,
-				runtime: providerRuntime,
-			});
-			const outcome =
-				result.status === "commit_failed"
-					? "failed"
-					: result.status === "activation_failed" ||
-							result.status === "deactivation_failed" ||
-							result.observerFailed
-						? "degraded"
-						: "success";
-			return {
-				...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
-				outcome,
-				message:
-					(result.status === "activation_failed"
-						? `${provider} desired intent was saved, but activation failed.`
-						: result.status === "deactivation_failed"
-							? `${provider} desired-off intent was saved, but deactivation failed.`
-							: result.status === "commit_failed"
-								? `${provider} desired intent was not saved because the CAS commit failed.`
-								: `${provider} desired intent ${enabled ? "enabled" : "disabled"}.`) +
-					(result.status !== "commit_failed" && result.observerFailed
-						? " The settings observer also failed after the durable commit."
-						: ""),
-			};
-		},
-
-		removeProvider: async provider => {
-			if (provider === "telegram") {
-				return { message: "Use the Telegram removal action to preserve root-registration fencing." };
-			}
-			const result = await removeNotificationProvider({
-				settings: ctx.settings,
-				provider,
-				runtime: providerRuntime,
-				notifyConfigChanged: notifyAfterDurableCommit,
-			});
-			const degraded =
-				result.status === "deactivation_failed" || ("observerFailed" in result && result.observerFailed);
-			return {
-				...("receipt" in result && result.receipt ? { receipt: result.receipt } : {}),
-				outcome:
-					result.status === "commit_failed" || result.status === "commit_failed_after_teardown"
-						? "failed"
-						: degraded
-							? "degraded"
-							: "success",
-				message:
-					(result.status === "removed"
-						? `${provider} configuration removed.`
-						: result.status === "deactivation_failed"
-							? `${provider} configuration was removed, but runtime deactivation failed.`
-							: `${provider} configuration removal failed.`) +
-					("observerFailed" in result && result.observerFailed
-						? " The settings observer also failed after the durable commit."
-						: ""),
-			};
-		},
-
-		enableGlobally: async () => {
-			const result = await setGlobalNotificationsEnabled({
-				settings: ctx.settings,
-				enabled: true,
-				notifyConfigChanged: notifyAfterDurableCommit,
-				runtime: providerRuntime,
-			});
-			const degraded =
-				result.status === "global_activation_partial" || ("observerFailed" in result && result.observerFailed);
-			return {
-				...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
-				outcome: result.status === "commit_failed" ? "failed" : degraded ? "degraded" : "success",
-				message:
-					(result.status === "global_activation_partial"
-						? `Global notifications were enabled, but activation failed for ${result.failed.join(", ")}.`
-						: result.status === "commit_failed"
-							? "Global notifications were not enabled because the CAS commit failed."
-							: "Global notifications enabled using stored provider intent.") +
-					(result.status !== "commit_failed" && result.observerFailed
-						? " The settings observer also failed after the durable commit."
-						: ""),
-			};
-		},
-
-		disableGlobally: async () => {
-			const result = await setGlobalNotificationsEnabled({
-				settings: ctx.settings,
-				enabled: false,
-				notifyConfigChanged: notifyAfterDurableCommit,
-				runtime: providerRuntime,
-			});
-			const degraded =
-				result.status === "global_deactivation_partial" || ("observerFailed" in result && result.observerFailed);
-			return {
-				...(result.status === "commit_failed" ? {} : { receipt: result.receipt }),
-				outcome: result.status === "commit_failed" ? "failed" : degraded ? "degraded" : "success",
-				message:
-					(result.status === "global_deactivation_partial"
-						? `Global notifications were disabled, but teardown failed for ${result.failed.join(", ")}.`
-						: result.status === "commit_failed"
-							? "Global notifications were not disabled because the CAS commit failed."
-							: "Global notifications disabled; provider configuration and desired intent were preserved.") +
-					(result.status !== "commit_failed" && result.observerFailed
-						? " The settings observer also failed after the durable commit."
-						: ""),
-			};
-		},
-
-		removeTelegram: async () => {
-			const controller = ctx.session.notificationSessionController;
-			let runtimePrepared = false;
-			try {
-				const result = await services.removeTelegramConfiguration({
-					settings: ctx.settings,
-					removal: {
-						stopAndUnregister: async () => {
-							if (controller) await controller.enterBlockedRuntime(sessionContext());
-							runtimePrepared = true;
-							const stopped = await services.stopTelegramDaemon(ctx.settings);
-							if (!stopped.ok) throw new Error(stopped.message);
-						},
-					},
-				});
-				const postCommitFailures: string[] = [];
-				if (runtimePrepared && controller) {
-					try {
-						await controller.clearBlockedRuntime(sessionContext());
-						await controller.reconcileCurrentSession(sessionContext());
-					} catch {
-						postCommitFailures.push("current-session reconciliation failed");
-					}
-				}
-				try {
-					await notifyAfterDurableCommit();
-				} catch {
-					postCommitFailures.push("settings observer failed");
-				}
-				return {
-					receipt: result.receipt,
-					outcome: postCommitFailures.length === 0 ? "success" : "degraded",
-					globallyDisabled: result.globallyDisabled,
-					message: `Telegram configuration removed without changing the global master.${
-						postCommitFailures.length === 0 ? "" : ` Post-commit ${postCommitFailures.join(" and ")}.`
-					}`,
-				};
-			} catch (error) {
-				if (runtimePrepared) {
-					const restored = await reconnect();
-					if (restored !== "blocked_identity" && controller) {
-						await controller.clearBlockedRuntime(sessionContext());
-						await controller.reconcileCurrentSession(sessionContext());
-					}
-				}
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		setSessionLocal: async enabled => {
-			const controller = ctx.session.notificationSessionController;
-			if (!controller) return unavailableNotificationSessionResult();
-			try {
-				return await controller.setLocalEnabled(sessionContext(), enabled);
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		commitPreferences: async preferences => {
-			let daemonWasRunningForDisable = false;
-			try {
-				const before = services.getNotificationConfig(ctx.settings);
-				const disablingToolActivity =
-					isProviderEffectivelyEnabled(before, "telegram") &&
-					isTelegramComplete(before) &&
-					before.toolActivity.enabled &&
-					!preferences.toolActivityEnabled;
-				if (disablingToolActivity) {
-					const stopped = await services.stopTelegramDaemon(ctx.settings);
-					if (!stopped.ok)
-						throw new Error(
-							`Notification preferences were not saved because daemon stop failed: ${stopped.message}`,
-						);
-					daemonWasRunningForDisable = stopped.before?.health === "running";
-				}
-
-				let receipt: SettingsAtomicReceipt;
-				try {
-					receipt = await ctx.settings.commitAtomicBatch([
-						{ path: "notifications.redact", op: "set", value: preferences.redact },
-						{ path: "notifications.verbosity", op: "set", value: preferences.verbosity },
-						{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
-						{ path: "notifications.telegram.sound", op: "set", value: preferences.sound },
-						{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
-						{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
-						{ path: "notifications.telegram.streaming.enabled", op: "set", value: preferences.streamingEnabled },
-						{
-							path: "notifications.telegram.toolActivity.enabled",
-							op: "set",
-							value: preferences.toolActivityEnabled,
-						},
-					]);
-				} catch (error) {
-					if (daemonWasRunningForDisable) {
-						try {
-							const restarted = await services.restartTelegramDaemon(ctx.settings);
-							if (!restarted.ok) throw new Error(restarted.message);
-						} catch (restartError) {
-							const commitMessage = error instanceof Error ? error.message : String(error);
-							const restartMessage = restartError instanceof Error ? restartError.message : String(restartError);
-							throw new Error(
-								`Notification preference commit failed (${commitMessage}) and daemon restart failed (${restartMessage}).`,
-								{ cause: new AggregateError([error, restartError]) },
-							);
-						}
-					}
-					throw error;
-				}
-
-				const postCommitFailures: string[] = [];
-				const config = services.getNotificationConfig(ctx.settings);
-				if (isProviderEffectivelyEnabled(config, "telegram") && isTelegramComplete(config)) {
-					try {
-						const reload = daemonWasRunningForDisable
-							? await services.restartTelegramDaemon(ctx.settings)
-							: await services.reloadTelegramDaemon(ctx.settings);
-						if (!reload.ok) postCommitFailures.push(`daemon reload failed: ${reload.message}`);
-					} catch {
-						postCommitFailures.push("daemon reload failed");
-					}
-				}
-				try {
-					await notifyAfterDurableCommit();
-				} catch {
-					postCommitFailures.push("settings observer failed");
-				}
-				return {
-					receipt,
-					outcome: postCommitFailures.length === 0 ? "success" : "degraded",
-					message:
-						postCommitFailures.length === 0
-							? "Notification preferences saved atomically."
-							: `Notification preferences were saved, but post-commit ${postCommitFailures.join(" and ")}.`,
-				};
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-
-		reconcileCurrentSession: async () => {
-			const controller = ctx.session.notificationSessionController;
-			if (!controller) return unavailableNotificationSessionResult();
-			try {
-				return await controller.reconcileCurrentSession(sessionContext());
-			} catch (error) {
-				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
-			}
-		},
-	};
-}
-
 interface DefaultAssignmentRollbackSnapshot {
 	model: Model<Api> | undefined;
 	thinkingLevel: ThinkingLevel | undefined;
@@ -1223,35 +261,8 @@ interface DefaultAssignmentRollbackSnapshot {
 	fallbackRuntimeState: DefaultFallbackRuntimeState;
 }
 
-function sameCanonicalAutoroutingValue(left: unknown, right: unknown): boolean {
-	const leftBytes = canonicalJsonBytes(left);
-	const rightBytes = canonicalJsonBytes(right);
-	if (leftBytes.length !== rightBytes.length) return false;
-	for (let index = 0; index < leftBytes.length; index++) {
-		if (leftBytes[index] !== rightBytes[index]) return false;
-	}
-	return true;
-}
-
-function rawAutoroutingState(current: RawSettings): {
-	provenance?: AutoroutingProvenance;
-	setup?: AutoroutingSetup;
-	tiers?: unknown;
-} {
-	const task = current.task;
-	if (!task || typeof task !== "object" || Array.isArray(task)) return {};
-	const autorouting = (task as Record<string, unknown>).autorouting;
-	if (!autorouting || typeof autorouting !== "object" || Array.isArray(autorouting)) return {};
-	const record = autorouting as Record<string, unknown>;
-	return {
-		provenance: record.provenance as AutoroutingProvenance | undefined,
-		setup: record.setup as AutoroutingSetup | undefined,
-		tiers: record.tiers,
-	};
-}
-
 export class SelectorController {
-	#smartRoutingInFlight?: Promise<unknown>;
+	#smartRouting: RoutingSettingsService;
 	#modelSelector?: ModelSelectorComponent;
 	#settingsSelector?: SettingsSelectorComponent;
 	#statusLinePreview?: Partial<StatusLineSettings>;
@@ -1271,6 +282,13 @@ export class SelectorController {
 		private readonly clipboard: (text: string) => void = copyToClipboard,
 	) {
 		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
+		this.#smartRouting = createRoutingSettingsService({
+			settings: ctx.settings,
+			getCatalog: () => ctx.session.modelRegistry.getAll(ctx.session.credentialSessionId),
+			getProviderOrder: () => ctx.session.modelRegistry.autoroutingProviderOrder(),
+			isScoped: () => (ctx.session.scopedModels?.length ?? 0) > 0,
+			activate: ctx.notifyConfigChanged ? () => ctx.notifyConfigChanged!() : undefined,
+		});
 	}
 
 	#captureDefaultAssignmentRollback(): DefaultAssignmentRollbackSnapshot {
@@ -1463,7 +481,7 @@ export class SelectorController {
 
 	#applyStatusLineSettings(): void {
 		this.ctx.statusLine.updateSettings({
-			...buildStatusLineSettings(this.ctx.settings),
+			...buildStatusLineSettings(this.ctx.session.settings),
 			...(this.#statusLinePreviewActive ? this.#statusLinePreview : undefined),
 		});
 	}
@@ -1972,6 +990,7 @@ export class SelectorController {
 
 				const selector = new SettingsSelectorComponent(
 					{
+						settings: this.ctx.session.settings,
 						availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
 						thinkingLevel: this.ctx.session.thinkingLevel,
 						availableThemes,
@@ -2000,7 +1019,7 @@ export class SelectorController {
 							});
 						},
 						onThemeCommit: async (path, themeName, previousTheme) => {
-							if (!settings.canWriteDurableConfig()) {
+							if (!this.ctx.session.settings.canWriteDurableConfig()) {
 								this.ctx.showError(
 									"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
 								);
@@ -2019,7 +1038,7 @@ export class SelectorController {
 								return false;
 							}
 							try {
-								settings.set(path, themeName);
+								this.ctx.session.settings.set(path, themeName);
 							} catch (error) {
 								await restoreThemePreview(previousTheme);
 								this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -2060,7 +1079,7 @@ export class SelectorController {
 							const availableWidth =
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getPreviewContentForSettings(availableWidth, {
-								...buildStatusLineSettings(settings),
+								...buildStatusLineSettings(this.ctx.session.settings),
 								...previewSettings,
 							});
 						},
@@ -2068,7 +1087,7 @@ export class SelectorController {
 							const availableWidth =
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getPreviewPartsForSettings(availableWidth, {
-								...buildStatusLineSettings(settings),
+								...buildStatusLineSettings(this.ctx.session.settings),
 								...previewSettings,
 							});
 						},
@@ -2083,7 +1102,7 @@ export class SelectorController {
 							let editor: ProviderOrderEditorComponent | undefined;
 							const context = new ProviderOrderContext(
 								this.ctx.session.modelRegistry,
-								this.ctx.settings,
+								this.ctx.session.settings,
 								() => {
 									editor?.refresh();
 									this.ctx.ui.requestRender();
@@ -2113,7 +1132,7 @@ export class SelectorController {
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings
-							this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
+							this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.session.settings));
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
@@ -2375,9 +1394,9 @@ export class SelectorController {
 			case "stt.enabled":
 				if (value === true) {
 					void configureSttFromSettings({
-						modelName: settings.get("stt.modelName"),
-						setEnabled: enabled => settings.set("stt.enabled", enabled),
-						flush: () => settings.flushOrThrow(),
+						modelName: this.ctx.session.settings.get("stt.modelName"),
+						setEnabled: enabled => this.ctx.session.settings.set("stt.enabled", enabled),
+						flush: () => this.ctx.session.settings.flushOrThrow(),
 						showStatus: message => this.ctx.showStatus(message),
 						showError: message => this.ctx.showError(message),
 					});
@@ -2445,36 +1464,6 @@ export class SelectorController {
 				});
 				break;
 			}
-			case "temperature": {
-				const temp = typeof value === "number" ? value : Number(value);
-				this.ctx.session.agent.temperature = temp >= 0 ? temp : undefined;
-				break;
-			}
-			case "topP": {
-				const topP = typeof value === "number" ? value : Number(value);
-				this.ctx.session.agent.topP = topP >= 0 ? topP : undefined;
-				break;
-			}
-			case "topK": {
-				const topK = typeof value === "number" ? value : Number(value);
-				this.ctx.session.agent.topK = topK >= 0 ? topK : undefined;
-				break;
-			}
-			case "minP": {
-				const minP = typeof value === "number" ? value : Number(value);
-				this.ctx.session.agent.minP = minP >= 0 ? minP : undefined;
-				break;
-			}
-			case "presencePenalty": {
-				const presencePenalty = typeof value === "number" ? value : Number(value);
-				this.ctx.session.agent.presencePenalty = presencePenalty >= 0 ? presencePenalty : undefined;
-				break;
-			}
-			case "repetitionPenalty": {
-				const repetitionPenalty = typeof value === "number" ? value : Number(value);
-				this.ctx.session.agent.repetitionPenalty = repetitionPenalty >= 0 ? repetitionPenalty : undefined;
-				break;
-			}
 			case "statusLine.showActionHints": {
 				this.ctx.updateEditorChrome();
 				break;
@@ -2501,7 +1490,7 @@ export class SelectorController {
 			case "statusLineGitShowUntracked":
 			case "statusLineTimeFormat":
 			case "statusLineTimeShowSeconds": {
-				this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
+				this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.session.settings));
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 				break;
@@ -2509,7 +1498,8 @@ export class SelectorController {
 			case "irc.enabled":
 			case "irc.sidebar.enabled":
 				this.ctx.applyIrcSidebarAvailability(
-					this.ctx.settings.get("irc.enabled") === true && this.ctx.settings.get("irc.sidebar.enabled") === true,
+					this.ctx.session.settings.get("irc.enabled") === true &&
+						this.ctx.session.settings.get("irc.sidebar.enabled") === true,
 				);
 				break;
 
@@ -2556,7 +1546,7 @@ export class SelectorController {
 				{
 					session: this.ctx.session,
 					modelRegistry: this.ctx.session.modelRegistry,
-					settings: this.ctx.settings,
+					settings: this.ctx.session.settings,
 					profileName,
 				},
 				{ persistDefault },
@@ -2567,207 +1557,70 @@ export class SelectorController {
 		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
 	}
 
-	/** Generate the immutable preview used by the smart-routing panel. */
-	previewSmartRouting(draft: AutoroutingSetup): SmartRoutingPreview {
-		const issues = validateAutoroutingSetup(draft);
-		if (issues.length > 0)
-			throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
-		const setup = structuredClone(draft);
-		const generated = generateTierChains(setup, CURATED_TIER_MAP, [
-			...this.ctx.session.modelRegistry.getAll(this.ctx.session.credentialSessionId),
-		]);
-		const provenance: AutoroutingProvenance = {
-			schema: 1,
-			source: structuredClone(generated.sourceIdentity),
-			declarationFingerprint: generated.declarationFingerprint,
-			tiersFingerprint: generated.tiersFingerprint,
-		};
-		return {
-			setup,
-			tiers: structuredClone(generated.tiers),
-			provenance,
-			sourceIdentity: structuredClone(generated.sourceIdentity),
-		};
+	previewSmartRouting(draft: AutoroutingSetup): RoutingSettingsPreview {
+		return this.#smartRouting.previewSmartRouting(draft);
 	}
 
-	#assertSmartRoutingWritable(): void {
-		if ((this.ctx.session.scopedModels?.length ?? 0) > 0) {
-			throw new Error("Smart-routing settings are read-only in a --models-scoped session.");
+	async #runSmartRoutingIntent<T extends RoutingSettingsOutcome>(
+		label: string,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		this.ctx.showStatus(`${label} smart-routing settings…`);
+		let result: T;
+		try {
+			result = await operation();
+		} catch (error) {
+			this.#updateSmartRoutingUi(() => this.ctx.showError(error instanceof Error ? error.message : String(error)));
+			this.#updateSmartRoutingUi(() => this.ctx.ui.requestRender());
+			throw error;
 		}
-		if (!this.ctx.settings.canWriteDurableConfig()) {
-			throw new Error("Cannot change smart-routing settings while durable config is unavailable.");
-		}
-	}
-
-	#assertSmartRoutingNotHandEdited(
-		preview: SmartRoutingPreview,
-		allowHandEdit: boolean,
-		current?: { provenance?: AutoroutingProvenance; tiers?: unknown },
-	): void {
-		if (allowHandEdit) return;
-		const provenance = current?.provenance ?? this.ctx.settings.get("task.autorouting.provenance");
-		const currentTiers = current?.tiers ?? this.ctx.settings.get("task.autorouting.tiers");
-		if (!provenance || currentTiers === undefined) return;
-		const state = evaluateAutoroutingProvenanceState(provenance, {
-			catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
-			mapFingerprint: preview.sourceIdentity.mapFingerprint,
-			tiers: currentTiers,
-		});
-		if (!state.handEdited) return;
-		throw Object.assign(
-			new Error("Generated autorouting tiers were hand-edited; explicit confirmation is required."),
-			{ code: "autorouting-hand-edited" },
+		this.#updateSmartRoutingUi(() =>
+			this.ctx.showStatus(
+				`${label} smart-routing settings ${result.durability === "persisted" ? "saved" : "updated in memory"}.`,
+			),
 		);
+		this.#updateSmartRoutingUi(() => this.ctx.ui.requestRender());
+		return result;
 	}
 
-	async #runSmartRoutingIntent<T>(label: string, operation: () => Promise<T>): Promise<T> {
-		if (this.#smartRoutingInFlight) throw new Error("Another smart-routing operation is already in progress.");
-		const task = (async () => {
-			this.ctx.showStatus(`${label} smart-routing settings…`);
-			try {
-				const result = await operation();
-				await this.ctx.notifyConfigChanged?.();
-				this.ctx.showStatus(`${label} smart-routing settings saved.`);
-				this.ctx.ui.requestRender();
-				return result;
-			} catch (error) {
-				this.ctx.showError(error instanceof Error ? error.message : String(error));
-				this.ctx.ui.requestRender();
-				throw error;
-			} finally {
-				this.#smartRoutingInFlight = undefined;
-			}
-		})();
-		this.#smartRoutingInFlight = task;
-		return task;
+	#updateSmartRoutingUi(update: () => void): void {
+		try {
+			update();
+		} catch {
+			logger.warn("Smart-routing UI update failed", { classification: "smart-routing-ui-update-failed" });
+		}
 	}
-	#reportSmartRoutingValidationError(error: unknown): never {
-		this.ctx.showError(error instanceof Error ? error.message : String(error));
-		this.ctx.ui.requestRender();
-		throw error;
+
+	#refreshSmartRoutingUi(selector: ModelSelectorComponent, preview?: RoutingSettingsPreview): void {
+		try {
+			selector.refreshSmartRoutingState(preview);
+		} catch {
+			this.#updateSmartRoutingUi(() => selector.markSmartRoutingEffectiveStateUnknown());
+		}
 	}
 
 	async applySmartRouting(
 		draft: AutoroutingSetup,
-		options?: { preview?: SmartRoutingPreview; confirmHandEdit?: boolean },
-	): Promise<SmartRoutingPreview> {
-		let preview: SmartRoutingPreview;
-		try {
-			this.#assertSmartRoutingWritable();
-			const issues = validateAutoroutingSetup(draft);
-			if (issues.length > 0) {
-				throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
-			}
-			preview = options?.preview ?? this.previewSmartRouting(draft);
-			const regenerated = this.previewSmartRouting(draft);
-			if (!sameCanonicalAutoroutingValue(preview.setup, regenerated.setup)) {
-				throw new Error("Smart-routing preview does not match the draft being applied.");
-			}
-			if (
-				!sameCanonicalAutoroutingValue(preview.tiers, regenerated.tiers) ||
-				!sameCanonicalAutoroutingValue(preview.provenance, regenerated.provenance)
-			) {
-				// Never persist caller-supplied tier/provenance bytes that diverge from
-				// the declaration. Continue with the fresh canonical payload so Apply
-				// remains exactly the generated preview for legitimate callers.
-				preview = regenerated;
-			}
-			this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true);
-		} catch (error) {
-			return this.#reportSmartRoutingValidationError(error);
-		}
-		return this.#runSmartRoutingIntent("Apply", async () => {
-			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
-				this.#assertSmartRoutingNotHandEdited(
-					preview,
-					options?.confirmHandEdit === true,
-					rawAutoroutingState(current),
-				);
-				return buildAutoroutingSettingsBatch({
-					tiers: preview.tiers,
-					setup: preview.setup,
-					provenance: preview.provenance,
-				});
-			});
-			return preview;
-		});
+		options?: { preview?: RoutingSettingsPreview; confirmHandEdit?: boolean },
+	): Promise<RoutingSettingsPreview> {
+		return (await this.#runSmartRoutingIntent("Apply", () => this.#smartRouting.applySmartRouting(draft, options)))
+			.preview;
 	}
 
-	/**
-	 * Reorder a recorded declaration into current provider priority and drop entries
-	 * the catalog no longer offers. Comparison uses normalized ids while the result
-	 * keeps the catalog's spelling, because the generator matches provider prefixes
-	 * case-sensitively.
-	 */
-	#reseedProvidersFromPolicy(setup: AutoroutingSetup): AutoroutingSetup {
-		const order = this.ctx.session.modelRegistry.autoroutingProviderOrder();
-		const declared = new Set(setup.providers.map(provider => provider.trim().toLowerCase()));
-		const providers = order.filter(provider => declared.has(provider.trim().toLowerCase()));
-		return { ...structuredClone(setup), providers };
-	}
-
-	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<SmartRoutingPreview> {
-		let preview: SmartRoutingPreview;
-		let expectedSetup: AutoroutingSetup;
-		try {
-			this.#assertSmartRoutingWritable();
-			const setup = this.ctx.settings.get("task.autorouting.setup");
-			const issues = validateAutoroutingSetup(setup);
-			if (issues.length > 0 || setup === undefined) {
-				throw new Error("Cannot refresh smart routing without a valid recorded setup.");
-			}
-			expectedSetup = setup;
-			// Reseed the recorded declaration against the current provider priority:
-			// reorder to policy order and drop providers the catalog no longer offers.
-			// Refusing an empty result keeps a dead declaration from being persisted.
-			const reseeded = this.#reseedProvidersFromPolicy(setup);
-			if (reseeded.providers.length === 0) {
-				throw new Error("No declared providers remain in the catalog; smart routing was not updated.");
-			}
-			preview = this.previewSmartRouting(reseeded);
-			this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true);
-		} catch (error) {
-			return this.#reportSmartRoutingValidationError(error);
-		}
-		return this.#runSmartRoutingIntent("Refresh", async () => {
-			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
-				const currentState = rawAutoroutingState(current);
-				if (!sameCanonicalAutoroutingValue(currentState.setup, expectedSetup)) {
-					throw new Error(
-						"Smart-routing setup changed while refresh was preparing; refresh again to use current settings.",
-					);
-				}
-				this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true, currentState);
-				return buildAutoroutingSettingsBatch({
-					tiers: preview.tiers,
-					setup: preview.setup,
-					provenance: preview.provenance,
-				});
-			});
-			return preview;
-		});
+	async refreshSmartRouting(options?: {
+		preview?: RoutingSettingsPreview;
+		confirmHandEdit?: boolean;
+	}): Promise<RoutingSettingsPreview> {
+		return (await this.#runSmartRoutingIntent("Refresh", () => this.#smartRouting.refreshSmartRouting(options)))
+			.preview;
 	}
 
 	async clearGeneratedSetup(): Promise<void> {
-		try {
-			this.#assertSmartRoutingWritable();
-		} catch (error) {
-			return this.#reportSmartRoutingValidationError(error);
-		}
-		return this.#runSmartRoutingIntent("Clear", async () => {
-			await this.ctx.settings.commitAtomicBatchWithCurrent(() => buildAutoroutingSettingsBatch({ clear: true }));
-		});
+		await this.#runSmartRoutingIntent("Clear", () => this.#smartRouting.clearGeneratedSetup());
 	}
 
 	async setAutoroutingEnabled(enabled: boolean): Promise<void> {
-		try {
-			this.#assertSmartRoutingWritable();
-		} catch (error) {
-			return this.#reportSmartRoutingValidationError(error);
-		}
-		return this.#runSmartRoutingIntent("Toggle", async () => {
-			await this.ctx.settings.commitAtomicBatchWithCurrent(() => [buildAutoroutingEnabledPatch(enabled)]);
-		});
+		await this.#runSmartRoutingIntent("Toggle", () => this.#smartRouting.setAutoroutingEnabled(enabled));
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean; smartRoutingOnly?: boolean }): void {
@@ -2789,25 +1642,48 @@ export class SelectorController {
 				this.ctx.session.scopedModels,
 				async selection => {
 					if (selection.kind === "smartRouting") {
-						switch (selection.intent.kind) {
-							case "apply":
-								await this.applySmartRouting(selection.intent.draft, {
-									preview: selection.intent.preview,
-									confirmHandEdit: selection.intent.confirmHandEdit,
-								});
-								break;
-							case "refresh":
-								await this.refreshSmartRouting({ confirmHandEdit: selection.intent.confirmHandEdit });
-								break;
-							case "clear":
-								await this.clearGeneratedSetup();
-								break;
-							case "toggle":
-								await this.setAutoroutingEnabled(selection.intent.enabled);
-								break;
+						try {
+							switch (selection.intent.kind) {
+								case "apply": {
+									const preview = await this.applySmartRouting(selection.intent.draft, {
+										preview: selection.intent.preview,
+										confirmHandEdit: selection.intent.confirmHandEdit,
+									});
+									this.#refreshSmartRoutingUi(modelSelector, preview);
+									return preview;
+								}
+								case "refresh": {
+									const preview = await this.refreshSmartRouting({
+										preview: selection.intent.preview,
+										confirmHandEdit: selection.intent.confirmHandEdit,
+									});
+									this.#refreshSmartRoutingUi(modelSelector, preview);
+									return preview;
+								}
+								case "clear":
+									await this.clearGeneratedSetup();
+									break;
+								case "toggle":
+									await this.setAutoroutingEnabled(selection.intent.enabled);
+									break;
+							}
+							this.#refreshSmartRoutingUi(modelSelector);
+							return;
+						} catch (error) {
+							if (
+								error instanceof RoutingSettingsActivationError &&
+								(error.rollback === "conflict" ||
+									error.rollback === "failed" ||
+									error.rollback === "not-restorable")
+							) {
+								if (error.durability === "persisted") {
+									this.#updateSmartRoutingUi(() => modelSelector.invalidateSmartRoutingState());
+								} else {
+									this.#refreshSmartRoutingUi(modelSelector);
+								}
+							}
+							throw error;
 						}
-						modelSelector.refreshSmartRoutingState();
-						return;
 					}
 					const isTrackedSingleAssignment =
 						selection.kind === "assignment" && selection.role !== null && selection.roles === undefined;
@@ -2826,8 +1702,15 @@ export class SelectorController {
 							return;
 						}
 						if (selection.kind === "profile") {
-							await this.#applyModelProfile(selection.profileName, selection.setDefault);
+							// Activation waits for the session to go idle before it takes the
+							// selection admission. Close the selector first so Enter is not a
+							// silent no-op that leaves the menu mounted until the session settles.
 							done();
+							if (this.ctx.session.isAwaitingIdle) {
+								this.ctx.showStatus("Model profile change queued until the agent is idle.");
+							}
+							this.ctx.ui.requestRender();
+							await this.#applyModelProfile(selection.profileName, selection.setDefault);
 							this.ctx.ui.requestRender();
 							return;
 						}
@@ -2879,6 +1762,7 @@ export class SelectorController {
 
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
+							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
 							let materializedProfile = false;
 							try {
@@ -2887,8 +1771,11 @@ export class SelectorController {
 										selector: defaultSelector,
 										thinkingLevel,
 										cause: "user-selection",
+										// Recorded below once every assignment succeeded; a rollback leaves no usage.
+										recordUsage: false,
 										onMutationStarted: () => {
 											defaultMutationStarted = true;
+											defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 										},
 									});
 									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
@@ -2926,7 +1813,11 @@ export class SelectorController {
 								activeModelProfile:
 									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 							});
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+							// A DEFAULT pick awaited setModel: a newer recorded choice keeps the MRU head.
+							if (defaultUsageSequence !== undefined)
+								this.ctx.session.recordModelSelectionUsage(model, defaultUsageSequence);
+							else if (!includesDefault)
+								this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							await this.ctx.notifyConfigChanged?.();
@@ -2949,6 +1840,7 @@ export class SelectorController {
 							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
+							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
@@ -2959,8 +1851,11 @@ export class SelectorController {
 									selector: selectedSelector,
 									thinkingLevel,
 									cause: "user-selection",
+									// Recorded below once the assignment succeeded; a rollback leaves no usage.
+									recordUsage: false,
 									onMutationStarted: () => {
 										defaultMutationStarted = true;
+										defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 									},
 								});
 								assignmentMutationStarted = true;
@@ -2985,6 +1880,9 @@ export class SelectorController {
 								);
 							}
 							refreshRoleAssignments();
+							// setModel awaited: a newer recorded choice keeps the MRU head.
+							if (defaultUsageSequence !== undefined)
+								this.ctx.session.recordModelSelectionUsage(model, defaultUsageSequence);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
@@ -3050,6 +1948,8 @@ export class SelectorController {
 						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 					smartRoutingPreview: draft => this.previewSmartRouting(draft),
+					smartRoutingDiscardPreview: preview => this.#smartRouting.discardPreview(preview),
+					smartRoutingStateUnknown: () => this.#smartRouting.stateUnknown,
 					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);
@@ -3377,6 +2277,7 @@ export class SelectorController {
 					}
 
 					try {
+						this.ctx.promptSuggestion?.clear();
 						const result = await this.ctx.session.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
@@ -3512,6 +2413,7 @@ export class SelectorController {
 			return true;
 		}
 
+		this.ctx.promptSuggestion?.clear();
 		const detached = await this.ctx.session.newSession();
 		if (this.ctx.isStopped?.()) return false;
 		if (!detached) {
@@ -3544,6 +2446,7 @@ export class SelectorController {
 	#resumeInFlight = false;
 
 	async handleResumeSession(sessionPath: string): Promise<void> {
+		this.ctx.promptSuggestion?.clear();
 		if (this.#resumeInFlight) {
 			this.ctx.showStatus("Resume already in progress");
 			return;
@@ -3960,6 +2863,23 @@ export class SelectorController {
 									this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
 								},
 								onAddAccount: async () => {
+									selector.stopValidation();
+									done();
+									await this.#handleOAuthLogin(selectedProviderId, options);
+								},
+								onReloginAccount: async (credentialId: number) => {
+									const authStorage = this.ctx.session.modelRegistry.authStorage;
+									const removalTargets = authStorage.listCredentialRemovalTargets(selectedProviderId);
+									const targetToRemove = removalTargets.find(target => target.id === credentialId);
+									if (targetToRemove) {
+										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [
+											targetToRemove,
+										]);
+										if (result.kind !== "removed") {
+											this.ctx.showError("Failed to clear disabled credential. Retry or re-login manually.");
+											return;
+										}
+									}
 									selector.stopValidation();
 									done();
 									await this.#handleOAuthLogin(selectedProviderId, options);

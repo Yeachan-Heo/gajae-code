@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Accept a Windows executable owned by `BUILTIN\Administrators` and carrying the default profile DACL (`SYSTEM`/`Administrators` full control, read/execute for others) during exact replacement, so `gjc update` no longer fails with `owner_mismatch` or `acl_present` on elevated or stock `%LOCALAPPDATA%` installs. Write grants to any other principal are still refused (issues #6096, #6916).
+
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- `astMatch` runs ast-grep patterns against an in-memory source string with an explicit language (a language alias, or a file extension resolved like a path's, e.g. `scss` as CSS), returning paged matches, the total match count, and non-fatal parse diagnostics.
+
+### Fixed
+
+- Expose Windows `access_denied` in canonical-directory identity and owner-only security result types so callers represent ACL-denied operations and classify them accurately (issue #6618).
+- Add handle-derived exact unlink for empty staged files whose host-side identity capture fails, preserving replacement files installed at the original pathname.
+
+- Native builds reject `CROSS_TARGET`, `TARGET_PLATFORM`, and `TARGET_ARCH` values that would place the addon or the temporary build directory outside the package `native` directory.
+
+- Report a denied staged-source or destination-parent open in Windows `renameNoReplacePath` as a pre-mutation `access_denied` instead of `owner_mismatch`, so file-lock publication retries the transient denial rather than failing with `Failed to publish file lock: owner_mismatch` (for example `terminal_persistence` notices on cloud-synced or Administrators-owned `.gjc` directories).
+
 ## [0.18.12] - 2026-10-16
 
 ### Fixed

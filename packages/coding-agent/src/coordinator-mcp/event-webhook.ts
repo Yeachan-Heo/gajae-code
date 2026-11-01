@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import { withFileLock } from "../config/file-lock";
+import { type AddressResolver, guardedPublicFetch } from "../web/insane/url-guard";
 import { writeCoordinatorAtomic } from "./durability";
 
 /**
@@ -66,23 +67,33 @@ export interface WebhookDelivery {
 }
 
 /** Default `WebhookDelivery` over `fetch`: POST, 2xx = ok, no redirects, abort on timeout. */
-export function createDefaultEventWebhookDelivery(): WebhookDelivery {
+export function createDefaultEventWebhookDelivery(hooks: { resolver?: AddressResolver } = {}): WebhookDelivery {
 	return {
-		async post(body, options) {
-			const response = await fetch(options.url, {
-				method: "POST",
-				redirect: "error",
-				signal: options.signal,
-				headers: {
-					"content-type": "application/json",
-					...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-				},
-				body,
-			});
-			// Drain the body so the socket is reusable, then treat non-2xx as failure.
-			await response.text().catch(() => "");
-			if (!response.ok) return { ok: false, status: response.status, error: `http_${response.status}` };
-			return { ok: true, status: response.status, error: null };
+		async post(body, request) {
+			const headers = {
+				"content-type": "application/json",
+				...(request.token ? { authorization: `Bearer ${request.token}` } : {}),
+			};
+			// http loopback is the existing local-sink exception. Every other destination,
+			// including https to a literal or a name, goes through the shared public fetch
+			// guard so the resolved address is the one that is connected.
+			if (isLoopbackHttpWebhook(request.url)) {
+				const response = await fetch(request.url, {
+					method: "POST",
+					redirect: "error",
+					signal: request.signal,
+					headers,
+					body,
+				});
+				return webhookResponseOutcome(response);
+			}
+			const guarded = await guardedPublicFetch(
+				request.url,
+				{ method: "POST", signal: request.signal, headers, body },
+				{ resolver: hooks.resolver },
+			);
+			if (!guarded.ok) return { ok: false, status: null, error: guarded.reason };
+			return webhookResponseOutcome(guarded.response);
 		},
 		sleep: async ms => {
 			await Bun.sleep(ms);
@@ -99,6 +110,24 @@ const WEBHOOK_BACKOFF_BASE_MS = 500;
 const WEBHOOK_BACKOFF_CAP_MS = 15_000;
 const WEBHOOK_ERROR_CAP = 240;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+
+export function isLoopbackHttpWebhook(rawUrl: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return false;
+	}
+	const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+	return parsed.protocol === "http:" && LOOPBACK_HOSTS.has(hostname);
+}
+
+async function webhookResponseOutcome(response: Response): Promise<WebhookPostOutcome> {
+	// Drain the body so the socket is reusable, then treat non-2xx as failure.
+	await response.text().catch(() => "");
+	if (!response.ok) return { ok: false, status: response.status, error: `http_${response.status}` };
+	return { ok: true, status: response.status, error: null };
+}
 
 /**
  * Trusted-source resolution for the five webhook variables. Egress destination

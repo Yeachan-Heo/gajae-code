@@ -264,7 +264,7 @@ describe.skipIf(process.platform !== "linux")("managed artifact reads stay bound
 		// the previously retained identity reports
 		// `managed_range_generation_mismatch`. Both refuse, and the outside file must
 		// never be read either way, so assert the refusal set rather than the winner.
-		await expect(manager.readRange(id)).rejects.toThrow(/^(?:source_changed|managed_range_generation_mismatch)$/);
+		await expect(manager.readRange(id)).rejects.toThrow(/^(?:source_changed|managed_range_generation_mismatch)$/u);
 		expect(replaced).toBe(true);
 		expect(await fsp.readFile(outside, "utf8")).toBe("path-backed outside secret");
 	});

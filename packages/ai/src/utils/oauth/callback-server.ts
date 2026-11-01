@@ -242,6 +242,15 @@ export abstract class OAuthCallbackFlow {
 			}
 		}
 
+		// Compare against this login's own state before any branch settles the
+		// promise. A missing or different state is not this attempt: return 400
+		// and leave the login waiting, the same way an error callback already does.
+		// Issuer failure is still settled only after the state matches, and still
+		// uses the generic message computed above rather than request error text.
+		if (expectedState && state !== expectedState) {
+			return new Response("State mismatch", { status: 400 });
+		}
+
 		if (issuerFailure) {
 			resultState = { ok: false, error: issuerFailure };
 		} else if (error) {
@@ -253,8 +262,6 @@ export abstract class OAuthCallbackFlow {
 			resultState = { ok: false, error: `Authorization failed: ${errorDescription}` };
 		} else if (!code) {
 			resultState = { ok: false, error: "Missing authorization code" };
-		} else if (expectedState && state !== expectedState) {
-			resultState = { ok: false, error: "State mismatch - possible CSRF attack" };
 		} else {
 			resultState = { ok: true, code, state };
 		}

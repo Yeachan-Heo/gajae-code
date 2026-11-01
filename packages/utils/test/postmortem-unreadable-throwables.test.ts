@@ -221,7 +221,7 @@ const throwables: readonly Throwables[] = [
 				exitCode: 7,
 				stderr: "Authorization=Bearer sk-abcdefghijklmnopqrstuvwxyz012345",
 			}),
-		keeps: ['"exitCode":7', '"stderr":"Authorization=«redacted»"'],
+		keeps: ['"exitCode":7', '"stderr":"Authorization=«redacted-auth»"'],
 		omits: ["Bearer sk-", "abcdefghijklmnopqrstuvwxyz012345"],
 	},
 	{

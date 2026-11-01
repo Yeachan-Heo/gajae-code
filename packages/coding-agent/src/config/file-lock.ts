@@ -22,6 +22,7 @@ import {
 import { logger } from "@gajae-code/utils";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 
 export interface FileLockOptions {
 	staleMs?: number;
@@ -592,7 +593,7 @@ export function processStartTime(pid: number): string | null {
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
-			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+			env: { ...projectSafeSpawnEnv(), LC_ALL: "C", LANG: "C", TZ: "UTC" },
 		});
 		if (result.exitCode !== 0) return null;
 		const startTime = new TextDecoder().decode(result.stdout).trim();
@@ -1277,7 +1278,16 @@ async function classifyFileLockRemovalTransition(
 	// A sibling record survives rename and scrub without mutating the captured tree.
 	const recordedOwner = await readRemovalTransitionOwnerRecord(transitionPath);
 	if (recordedOwner) {
-		if (lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)) return "active";
+		if (
+			await retainedRemovalRecordIsForeignHost(
+				transitionPath,
+				recordedOwner.owner,
+				orphanAgeMs,
+				ownerHostId,
+				previousOwnerHostIds,
+			)
+		)
+			return "active";
 		if (
 			canonicalLockDeviceId(transition.dev).toString() !== recordedOwner.rootDev ||
 			canonicalLockFileId(transition.ino).toString() !== recordedOwner.rootIno
@@ -2657,6 +2667,66 @@ function lockRecordIsForeignHost(
 	return info.owner_host_id !== ownerHostId && !previousOwnerHostIds.includes(info.owner_host_id ?? "");
 }
 
+/**
+ * Host attribution for a `.removing.owner` record whose transition directory is
+ * still on disk.
+ *
+ * Host-qualified records, and every record judged by an acquirer that carries no
+ * host identity, follow `lockRecordIsForeignHost`. A hostless record judged by a
+ * host-qualified acquirer has no provenance: it was written by a remover that
+ * stamped no host id, either a build that predates host-id stamping on this
+ * machine or a hostless caller sharing the volume. While that remover could still
+ * be mid-removal it stays foreign, so a live remover on another host is never
+ * probed. Once the record and every entry of the captured tree have been
+ * quiescent for the orphan adoption age, the record carries strictly more
+ * evidence than an ownerless transition, which is adopted at the same age, so its
+ * pid is judged locally instead of wedging the lock forever. Any tree that cannot
+ * be captured, and any timestamp that is not finite or lies in the future, keeps
+ * the record foreign.
+ */
+async function retainedRemovalRecordIsForeignHost(
+	transitionPath: string,
+	owner: LockInfo,
+	orphanAgeMs: number,
+	ownerHostId: string | undefined,
+	previousOwnerHostIds: readonly string[],
+): Promise<boolean> {
+	if (owner.owner_host_id !== undefined || ownerHostId === undefined)
+		return lockRecordIsForeignHost(owner, ownerHostId, previousOwnerHostIds);
+	let recordMtimeNs: bigint;
+	try {
+		recordMtimeNs = (await fs.lstat(removalRecordPath(transitionPath), { bigint: true })).mtimeNs;
+	} catch (error) {
+		if (isEnoent(error) || isTransientReleaseError(error)) return true;
+		throw error;
+	}
+	if (!(await isNativeExactRemovalUsable())) return true;
+	let captured: NativeDirectoryTreeResult;
+	try {
+		captured = nativeFileLockBindings().snapshotDirectoryTree(transitionPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return true;
+		throw error;
+	}
+	if (!captured.ok || !captured.snapshot || captured.snapshot.entries.length === 0) return true;
+	const now = Date.now();
+	const quiescent = (mtimeNs: bigint): boolean => {
+		const ageMs = now - Number(mtimeNs / 1_000_000n);
+		return Number.isFinite(ageMs) && ageMs >= orphanAgeMs;
+	};
+	if (!quiescent(recordMtimeNs)) return true;
+	for (const entry of captured.snapshot.entries) {
+		let mtimeNs: bigint;
+		try {
+			mtimeNs = BigInt(entry.mtimeNs);
+		} catch {
+			return true;
+		}
+		if (!quiescent(mtimeNs)) return true;
+	}
+	return false;
+}
+
 async function staleLockSnapshot(
 	lockPath: string,
 	_staleMs: number,
@@ -2893,11 +2963,12 @@ async function tryAcquireLock(
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	const stagingIdentity = currentFileLockStagingIdentity();
+	const stagingHostIdentity = ownerHostId === undefined ? "" : `h${fileLockStagingIdentityHash(ownerHostId)}.`;
 	const pendingPath = derivedFileLockPath(
 		lockPath,
 		stagingIdentity
-			? `.pending.${process.pid}.${stagingIdentity}.${crypto.randomBytes(12).toString("base64url")}`
-			: `.pending.${process.pid}.${crypto.randomUUID()}`,
+			? `.pending.${process.pid}.${stagingHostIdentity}${stagingIdentity}.${crypto.randomBytes(12).toString("base64url")}`
+			: `.pending.${process.pid}.${stagingHostIdentity}${crypto.randomUUID()}`,
 	);
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
@@ -3570,7 +3641,10 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	await ensureLockParent(path.dirname(lockPath));
 	await retryPendingStagingCleanups(lockPath, retryBudget);
 	try {
-		await reapOrphanedLockStagingDirs(lockPath);
+		await reapOrphanedLockStagingDirs(lockPath, {
+			ownerHostId: opts.ownerHostId,
+			previousOwnerHostIds: opts.previousOwnerHostIds,
+		});
 	} catch (error) {
 		logger.debug("Failed to reap orphaned file-lock staging directories", { lockPath, error: String(error) });
 	}
@@ -3820,13 +3894,18 @@ export async function withFileLock<T>(
 }
 
 type FileLockStagingIdentity = { kind: "process_incarnation" | "start_time"; value: string };
-type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity };
+type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity; ownerHostIdHash?: string };
+
+const FILE_LOCK_STAGING_UNVERIFIED_GRACE_MS = 60_000;
+const FILE_LOCK_STAGING_REAPER_BATCH_SIZE = 64;
+const FILE_LOCK_STAGING_REAPER_MAX_CURSORS = 256;
+const fileLockStagingReaperCursors = new Map<string, string>();
 
 const FILE_LOCK_STAGING_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const FILE_LOCK_STAGING_NAME_WITH_IDENTITY =
-	/^(?:.+\.lock|\.gjc-lock-[0-9a-f]{64})\.pending\.([1-9]\d*)\.([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
+	/^(?:.+\.lock|\.gjc-lock-[0-9a-f]{64})\.pending\.([1-9]\d*)\.(?:h([A-Za-z0-9_-]{16})\.)?([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
 const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(
-	`^(?:.+\\.lock|\\.gjc-lock-[0-9a-f]{64})\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`,
+	`^(?:.+\\.lock|\\.gjc-lock-[0-9a-f]{64})\\.pending\\.([1-9]\\d*)\\.(?:h([A-Za-z0-9_-]{16})\\.)?${FILE_LOCK_STAGING_UUID}$`,
 );
 const FILE_LOCK_STAGING_REMOVING_SUFFIX = ".removing";
 function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
@@ -3839,10 +3918,12 @@ function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
 	if (!match) return null;
 	const pid = Number(match[1]);
 	if (!Number.isSafeInteger(pid)) return null;
-	if (!current) return { pid };
-	const encodedIdentity = current[2] ?? "";
+	const ownerHostIdHash = match[2];
+	if (!current) return { pid, ...(ownerHostIdHash === undefined ? {} : { ownerHostIdHash }) };
+	const encodedIdentity = current[3] ?? "";
 	return {
 		pid,
+		...(ownerHostIdHash === undefined ? {} : { ownerHostIdHash }),
 		identity: {
 			kind: encodedIdentity.startsWith("i") ? "process_incarnation" : "start_time",
 			value: encodedIdentity.slice(1),
@@ -3854,6 +3935,18 @@ function fileLockStagingIdentityHash(identity: string): string {
 	// Ninety-six bits are sufficient to disambiguate process generations while
 	// keeping the sibling name within the old component-length envelope.
 	return crypto.createHash("sha256").update(identity, "utf8").digest("base64url").slice(0, 16);
+}
+
+function fileLockStagingHostIdentityIsLocal(
+	ownerHostIdHash: string | undefined,
+	ownerHostId: string | undefined,
+	previousOwnerHostIds: readonly string[],
+): boolean {
+	if (ownerHostId === undefined || ownerHostIdHash === undefined) return false;
+	if (fileLockStagingIdentityHash(ownerHostId) === ownerHostIdHash) return true;
+	return previousOwnerHostIds.some(
+		previousOwnerHostId => fileLockStagingIdentityHash(previousOwnerHostId) === ownerHostIdHash,
+	);
 }
 
 /**
@@ -3882,11 +3975,49 @@ export interface FileLockStagingResult {
 	reason: string;
 }
 
+function fileLockStagingOwnerStatus(owner: FileLockOwnerToken, status: OwnerLiveness): OwnerLiveness {
+	if (owner.process_incarnation) {
+		const incarnation = processIncarnation(owner.pid);
+		if (incarnation !== null) return incarnation === owner.process_incarnation ? "alive" : "dead";
+	}
+	if (owner.start_time_format === PROCESS_START_TIME_FORMAT && owner.start_time && owner.start_time !== "unknown") {
+		const startTime = processStartTime(owner.pid);
+		if (startTime !== null) return startTime === owner.start_time ? "alive" : "dead";
+	}
+	return status;
+}
+
+function fileLockStagingIsOldUnverifiedDirectory(snapshot: NativeDirectoryTreeSnapshot): boolean {
+	const root = snapshot.entries.find(entry => entry.relativePath === "");
+	const info = snapshot.entries.find(entry => entry.relativePath === "info");
+	if (
+		root?.kind !== "directory" ||
+		snapshot.entries.length !== (info ? 2 : 1) ||
+		(info && (info.kind !== "file" || info.size !== "0" || info.nlink !== "1"))
+	)
+		return false;
+	try {
+		const newestModificationNs = snapshot.entries.reduce((newest, entry) => {
+			const modifiedNs = BigInt(entry.mtimeNs);
+			return modifiedNs > newest ? modifiedNs : newest;
+		}, 0n);
+		const nowNs = BigInt(Date.now()) * 1_000_000n;
+		return (
+			newestModificationNs <= nowNs &&
+			nowNs - newestModificationNs >= BigInt(FILE_LOCK_STAGING_UNVERIFIED_GRACE_MS) * 1_000_000n
+		);
+	} catch {
+		return false;
+	}
+}
+
 /** Observe identity before probing; neither a replacement nor a symlink inherits the verdict. */
 export async function inspectFileLockStagingDir(
 	stagingPath: string,
 	probe: (pid: number) => OwnerLiveness = ownerLiveness,
 	remove = false,
+	ownerHostId?: string,
+	previousOwnerHostIds: readonly string[] = [],
 ): Promise<FileLockStagingResult> {
 	const kept: FileLockStagingResult = {
 		path: stagingPath,
@@ -3897,6 +4028,13 @@ export async function inspectFileLockStagingDir(
 	const nameOwner = fileLockStagingOwner(path.basename(stagingPath));
 	if (!nameOwner) return kept;
 	const namePid = nameOwner.pid;
+	const nameHostIdentityIsLocal = fileLockStagingHostIdentityIsLocal(
+		nameOwner.ownerHostIdHash,
+		ownerHostId,
+		previousOwnerHostIds,
+	);
+	if (nameOwner.ownerHostIdHash !== undefined && !nameHostIdentityIsLocal)
+		return { ...kept, pid: namePid, reason: "host_qualified_staging_owner" };
 	const canonical = await canonicalLockPathPreservingFinal(stagingPath);
 	// A winning acquirer publishes (renames) its staging directory concurrently, so the
 	// candidate can disappear between the caller's readdir and this observation.
@@ -3948,6 +4086,7 @@ export async function inspectFileLockStagingDir(
 		return kept;
 	const observation = await readFileLockObservationForGc(canonical);
 	let pid: number;
+	let status: OwnerLiveness;
 	if (observation) {
 		if (
 			observation.identity.rootDev !== captured.snapshot.rootDev ||
@@ -3955,19 +4094,27 @@ export async function inspectFileLockStagingDir(
 		)
 			return kept;
 		pid = observation.info.pid;
-		if (observation.info.owner_host_id !== undefined) return { ...kept, pid, reason: "host_qualified_staging_owner" };
+		if (
+			nameOwner.ownerHostIdHash !== undefined &&
+			(observation.info.owner_host_id === undefined ||
+				nameOwner.ownerHostIdHash !== fileLockStagingIdentityHash(observation.info.owner_host_id))
+		)
+			return { ...kept, pid, reason: "host_qualified_staging_owner" };
+		if (lockRecordIsForeignHost(observation.info, ownerHostId, previousOwnerHostIds))
+			return { ...kept, pid, reason: "host_qualified_staging_owner" };
+		status = fileLockStagingOwnerStatus(observation.info, pid === namePid ? namePidStatus : probe(pid));
 	} else {
-		// Missing info is the only case where the filename is ownership evidence.
-		try {
-			await fs.lstat(path.join(canonical, "info"));
-			return kept;
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-		}
-		if (captured.snapshot.entries.some(entry => entry.relativePath !== "")) return kept;
+		// An empty or missing info file has no owner identity. Reclaim it only after
+		// the directory and its empty info file, if any, have been unchanged long
+		// enough for an interrupted publisher to be safely distinguished from a
+		// slow or paused live owner. The staging name must also prove its host,
+		// because the PID in a foreign host's name has no local liveness meaning.
+		// Non-empty malformed info remains fail-closed.
+		if (!nameHostIdentityIsLocal || !fileLockStagingIsOldUnverifiedDirectory(captured.snapshot))
+			return { ...kept, pid: namePid, reason: "unverified_staging_directory" };
 		pid = namePid;
+		status = namePidStatus;
 	}
-	let status = pid === namePid ? namePidStatus : probe(pid);
 	if (pid === process.pid && observation && !ownerIncarnationChanged(observation.info)) status = "alive";
 	if (status === "alive" && observation && ownerIncarnationChanged(observation.info)) status = "dead";
 	const result: FileLockStagingResult = {
@@ -3975,7 +4122,7 @@ export async function inspectFileLockStagingDir(
 		pid,
 		status,
 		removed: false,
-		reason: `file_lock_staging_owner_${status}`,
+		reason: observation ? `file_lock_staging_owner_${status}` : `unverified_staging_directory_owner_${status}`,
 	};
 	if (status !== "dead" || !remove) return result;
 	if (path.basename(canonical).endsWith(FILE_LOCK_STAGING_REMOVING_SUFFIX)) {
@@ -4004,45 +4151,15 @@ export async function inspectFileLockStagingDir(
 		const removal = await removeFileLockDirForGc(canonical, observation.info, observation.identity);
 		return { ...result, removed: removal === "removed", reason: removal };
 	}
-	if (!(await isNativeExactRemovalUsable())) {
-		const removal = await removeVerifiedLockDirWithoutNative(canonical, captured.snapshot);
-		return { ...result, removed: removal === "removed", reason: removal };
-	}
-	const removal = await exactRemoveLockTree(canonical, captured.snapshot);
-	if (
-		removal.detachedPath &&
-		path.resolve(removal.detachedPath) !== path.resolve(canonical) &&
-		!removal.retainedSuccessorPath &&
-		!removal.retainedPlaceholderPath &&
-		!removal.retainedUnknownPath
-	) {
-		let detached: BigIntStats | null;
-		try {
-			detached = await fs.lstat(removal.detachedPath, { bigint: true });
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-			detached = null;
-		}
-		if (
-			detached?.isDirectory() &&
-			!detached.isSymbolicLink() &&
-			canonicalLockDeviceId(detached.dev).toString() === captured.snapshot.rootDev &&
-			canonicalLockFileId(detached.ino).toString() === captured.snapshot.rootIno
-		) {
-			try {
-				await fs.rmdir(removal.detachedPath);
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
-			await clearRemovalRecord(removal.detachedPath);
-			return { ...result, removed: true, reason: "removed" };
-		}
-	}
-	return { ...result, removed: removal.ok, reason: removal.ok ? "removed" : (removal.code ?? "cleanup_failed") };
+	const removal = await removeVerifiedLockDirWithoutNative(canonical, captured.snapshot);
+	return { ...result, removed: removal === "removed", reason: removal };
 }
 
 /** Bounded opportunistic cleanup; the acquisition caller treats failures as diagnostic only. */
-export async function reapOrphanedLockStagingDirs(lockPath: string): Promise<{
+export async function reapOrphanedLockStagingDirs(
+	lockPath: string,
+	options: Pick<FileLockOptions, "ownerHostId" | "previousOwnerHostIds"> = {},
+): Promise<{
 	removed: string[];
 	retained: FileLockStagingResult[];
 }> {
@@ -4050,13 +4167,41 @@ export async function reapOrphanedLockStagingDirs(lockPath: string): Promise<{
 	const parent = path.dirname(lockPath);
 	const prefix = `${path.basename(lockPath)}.pending.`;
 	const boundedPrefix = `.gjc-lock-${crypto.createHash("sha256").update(path.basename(lockPath)).digest("hex")}.pending.`;
-	const entries = await fs.readdir(parent);
-	let candidates = 0;
-	for (const entry of entries) {
-		if ((!entry.startsWith(prefix) && !entry.startsWith(boundedPrefix)) || fileLockStagingOwnerPid(entry) === null)
-			continue;
-		if (++candidates > 64) break;
-		const result = await inspectFileLockStagingDir(path.join(parent, entry), ownerLiveness, true);
+	const candidates = (await fs.readdir(parent))
+		.filter(
+			entry =>
+				(entry.startsWith(prefix) || entry.startsWith(boundedPrefix)) && fileLockStagingOwnerPid(entry) !== null,
+		)
+		.sort();
+	if (candidates.length <= FILE_LOCK_STAGING_REAPER_BATCH_SIZE) fileLockStagingReaperCursors.delete(lockPath);
+	let startIndex = 0;
+	if (candidates.length > FILE_LOCK_STAGING_REAPER_BATCH_SIZE) {
+		const cursor = fileLockStagingReaperCursors.get(lockPath);
+		if (cursor !== undefined) {
+			const nextIndex = candidates.findIndex(entry => entry > cursor);
+			if (nextIndex >= 0) startIndex = nextIndex;
+		} else {
+			startIndex = crypto.randomInt(candidates.length);
+		}
+	}
+	const inspected = Math.min(candidates.length, FILE_LOCK_STAGING_REAPER_BATCH_SIZE);
+	for (let index = 0; index < inspected; index++) {
+		const entry = candidates[(startIndex + index) % candidates.length]!;
+		if (candidates.length > FILE_LOCK_STAGING_REAPER_BATCH_SIZE) {
+			fileLockStagingReaperCursors.delete(lockPath);
+			fileLockStagingReaperCursors.set(lockPath, entry);
+			if (fileLockStagingReaperCursors.size > FILE_LOCK_STAGING_REAPER_MAX_CURSORS) {
+				const oldestPath = fileLockStagingReaperCursors.keys().next().value;
+				if (oldestPath !== undefined) fileLockStagingReaperCursors.delete(oldestPath);
+			}
+		}
+		const result = await inspectFileLockStagingDir(
+			path.join(parent, entry),
+			ownerLiveness,
+			true,
+			options.ownerHostId,
+			options.previousOwnerHostIds,
+		);
 		if (result.removed) summary.removed.push(result.path);
 		else summary.retained.push(result);
 	}

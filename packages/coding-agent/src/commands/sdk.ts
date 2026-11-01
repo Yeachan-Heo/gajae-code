@@ -1214,7 +1214,7 @@ export async function runSessionHost(
 						cwd,
 						agentDir,
 						sessionManager: opened?.sessionManager,
-						...(mcpConfigPath ? { mcpConfigPath } : {}),
+						...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),

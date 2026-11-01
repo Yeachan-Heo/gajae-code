@@ -478,6 +478,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#sessionBuiltinMcpVisible = false;
+	#sessionBuiltinSessionMcpVisible = false;
 	#slashCommandRefreshVersion = 0;
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
@@ -773,12 +774,22 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 		});
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribeCommittedSessionSwitch(() => {
+				if (this.#stopped) return;
+				return this.#applySwitchedSessionMode();
+			}),
+		);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
 		this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;
-		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.#sessionBuiltinMcpVisible);
+		this.#sessionBuiltinSessionMcpVisible = this.session.hasSessionMcpControls;
+		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(
+			this.#sessionBuiltinMcpVisible,
+			this.#sessionBuiltinSessionMcpVisible ? this.session : undefined,
+		);
 		const activeProvider = this.session.model?.provider;
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
@@ -1171,6 +1182,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#subscribeToAgent();
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribeSessionIdentityChanges(async () => {
+				// Any committed identity change (extension tree navigation, reload, ...) stales the suggestion.
+				this.promptSuggestion.clear();
 				try {
 					await this.refreshSlashCommandState();
 				} catch (error) {
@@ -1269,15 +1282,21 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#refreshSessionBuiltinSlashCommandVisibility(cwd: string): void {
 		const hasExactMcpControls = this.session.hasExactMcpControls;
-		if (hasExactMcpControls === this.#sessionBuiltinMcpVisible) return;
+		const hasSessionMcpControls = this.session.hasSessionMcpControls;
+		if (
+			hasExactMcpControls === this.#sessionBuiltinMcpVisible &&
+			hasSessionMcpControls === this.#sessionBuiltinSessionMcpVisible
+		)
+			return;
 
 		const previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(command => command.name));
 		this.#baseSlashCommands = [
-			...getBuiltinSlashCommandsForSession(hasExactMcpControls),
+			...getBuiltinSlashCommandsForSession(hasExactMcpControls, hasSessionMcpControls ? this.session : undefined),
 			...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),
 		];
 		this.#sessionBuiltinMcpVisible = hasExactMcpControls;
+		this.#sessionBuiltinSessionMcpVisible = hasSessionMcpControls;
 		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...previousSlashCommandTail];
 		this.editor.setAutocompleteProvider(
 			this.#inputController.createAutocompleteProvider(this.#resolvedSlashCommands, cwd),
@@ -1736,6 +1755,30 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#goalModeController.handleSessionEvent(event);
 	}
 
+	/** Match the plan and goal controllers and the mode gate to the session a switch just committed. */
+	async #applySwitchedSessionMode(): Promise<void> {
+		const sessionContext = this.sessionManager.buildSessionContext();
+		const mode = sessionContext.mode;
+		this.#modeGate.exit("plan");
+		this.#planModeController.setEnabledForCompatibility(false);
+		this.#planModeController.setPausedForCompatibility(false);
+		this.#planModeController.setPlanFilePathForCompatibility(undefined);
+		try {
+			await this.#goalModeController.detachForSessionSwitch();
+			if (mode === "goal" || mode === "goal_paused")
+				await this.#goalModeController.restoreFromSession(sessionContext);
+			else if (mode === "plan" || mode === "plan_paused")
+				await this.#planModeController.restoreFromSession(sessionContext);
+		} finally {
+			const planActive = this.#planModeController.enabled || this.#planModeController.paused;
+			this.#updatePlanModeStatus(
+				planActive
+					? { enabled: this.#planModeController.enabled, paused: this.#planModeController.paused }
+					: undefined,
+			);
+		}
+	}
+
 	/** Restore mode state from session entries on resume. */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -1911,6 +1954,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const draftText = selectShutdownDraft(this.editor.getText(), hadActiveBtw);
 		if (hadActiveBtw) this.pendingImages = [];
+		this.promptSuggestion.clear();
 		this.#btwController.dispose();
 
 		// Flush pending session writes before shutdown.
@@ -2395,6 +2439,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#prepareSessionSwitch(cleanupPreviousSessionUi?: () => void): void {
 		const errors: unknown[] = [];
+		this.promptSuggestion.clear();
 		try {
 			this.#btwController.dispose();
 		} catch (error) {

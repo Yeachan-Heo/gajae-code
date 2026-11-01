@@ -432,6 +432,64 @@ export function createCustomMessage(
 }
 
 /**
+ * Same closer escape as URL and tool framing: whitespace between the tag name
+ * and ">" still closes the element, so those spellings are neutralized too.
+ */
+export function escapeUntrustedContent(content: string): string {
+	return content
+		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>");
+}
+
+export function wrapUntrustedContent(content: string): string {
+	return `<untrusted-content>\n${escapeUntrustedContent(content)}\n</untrusted-content>`;
+}
+
+/**
+ * Break reserved prompt tags in workspace rule text so a rule file cannot close
+ * `<system-interrupt>` or `<system-reminder>`. Ordinary markup such as `<Button>`
+ * stays intact.
+ */
+export function neutralizeReservedPromptTag(value: string): string {
+	return value.replace(
+		/<\/?\s*(?:system-interrupt|system-reminder|untrusted-content|rules)(?=[\s>/]|$)/gi,
+		tag => `&lt;${tag.slice(1)}`,
+	);
+}
+
+/** Attribute-encode a TTSR name or path, and neutralize reserved tags in the body. */
+export function ttsrPromptFields(rule: { name: string; path: string; content: string }): {
+	name: string;
+	path: string;
+	content: string;
+} {
+	return {
+		name: escapePromptMetadata(rule.name),
+		path: escapePromptMetadata(rule.path),
+		content: neutralizeReservedPromptTag(rule.content),
+	};
+}
+
+/**
+ * Frame stored `!` / `$` text at the model boundary. The command runner already
+ * cut the excerpt that was recorded; do not slice this string again.
+ */
+function frameStoredLocalExecution(text: string): string {
+	return wrapUntrustedContent(text);
+}
+
+/**
+ * Frame debug and bisect tool text at the model boundary. Output capture, the
+ * bisect receipt, and pre-admission spill already cut the excerpt; do not slice
+ * this string again.
+ */
+function frameDebugToolResult(message: ToolResultMessage): (TextContent | ImageContent)[] {
+	const content = getPrunedToolResultContent(message);
+	if (message.toolName !== "debug" && message.toolName !== "bisect") return content;
+	return content.map(block => (block.type === "text" ? { ...block, text: wrapUntrustedContent(block.text) } : block));
+}
+
+/**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
@@ -449,7 +507,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
-						content: [{ type: "text", text: bashExecutionToText(m) }],
+						content: [{ type: "text", text: frameStoredLocalExecution(bashExecutionToText(m)) }],
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
@@ -459,7 +517,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
-						content: [{ type: "text", text: pythonExecutionToText(m) }],
+						content: [{ type: "text", text: frameStoredLocalExecution(pythonExecutionToText(m)) }],
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
@@ -533,7 +591,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "toolResult":
 					return {
 						...m,
-						content: getPrunedToolResultContent(m as ToolResultMessage),
+						content: frameDebugToolResult(m as ToolResultMessage),
 						attribution: m.attribution ?? "agent",
 					};
 				default:

@@ -35,7 +35,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("Hello")],
 			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				sessionId: "logical-session",
 				providerSessionId: "opaque-provider-session",
@@ -62,7 +62,7 @@ describe("agentLoop with AgentMessage", () => {
 		const stream = agentLoop(
 			[createUserMessage("Hello")],
 			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
-			{ model: mock.model, convertToLlm: identityConverter, sessionId: "logical-session" },
+			{ model: mock, convertToLlm: identityConverter, sessionId: "logical-session" },
 			undefined,
 			(model, context, options) => {
 				captured.push({ sessionId: options?.sessionId, providerSessionId: options?.providerSessionId });
@@ -89,7 +89,7 @@ describe("agentLoop with AgentMessage", () => {
 				[createUserMessage("Hello")],
 				{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
 				{
-					model: mock.model,
+					model: mock,
 					convertToLlm: identityConverter,
 					...(testCase.timeout === undefined ? {} : { streamFirstEventTimeoutMs: testCase.timeout }),
 				},
@@ -115,7 +115,7 @@ describe("agentLoop with AgentMessage", () => {
 		};
 
 		const mock = createMockModel({ responses: [{ content: ["Hi there!"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
@@ -148,7 +148,7 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [],
 		};
 		const mock = createMockModel();
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const controller = new AbortController();
 		// The mock provider would reject without a configured response; we want the
 		// agent's abort path to kick in before any event is emitted. Use a raw stream
@@ -186,7 +186,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("start")],
 			{ systemPrompt: [""], messages: [], tools: [] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				getSyntheticRecoveryMessage: async () => {
 					recoveryPolled++;
@@ -232,7 +232,7 @@ describe("agentLoop with AgentMessage", () => {
 		let convertedMessages: Message[] = [];
 		const mock = createMockModel({ responses: [{ content: ["Response"] }] });
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: messages => {
 				// Filter out notifications, convert rest
 				convertedMessages = messages
@@ -269,7 +269,7 @@ describe("agentLoop with AgentMessage", () => {
 
 		const mock = createMockModel({ responses: [{ content: ["Response"] }] });
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			transformContext: async messages => {
 				// Keep only last 2 messages (prune old ones)
 				transformedMessages = messages.slice(-2);
@@ -328,7 +328,7 @@ describe("agentLoop with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			getToolContext: toolCall => ({ toolCall }) as AgentToolContext,
 		};
@@ -376,7 +376,7 @@ describe("agentLoop with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			shouldPause: () => {
 				pauseChecks += 1;
@@ -422,7 +422,7 @@ describe("agentLoop with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			shouldPause: () => pauseRequested,
 			getSteeringMessages: async () => {
@@ -479,7 +479,7 @@ describe("agentLoop with AgentMessage", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, mock.stream);
@@ -531,7 +531,7 @@ describe("agentLoop with AgentMessage", () => {
 		const stream = agentLoop(
 			[createUserMessage("echo something")],
 			context,
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			inspectingStream,
 		);
@@ -587,7 +587,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("echo something")],
 			context,
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				getFollowUpMessages: async () => {
 					if (suppliedFollowUp) return [];
@@ -644,7 +644,7 @@ describe("agentLoop with AgentMessage", () => {
 		const stream = agentLoop(
 			[createUserMessage("echo something")],
 			{ systemPrompt: [""], messages: [], tools: [tool] },
-			{ model: mock.model, convertToLlm: identityConverter, toolChoice: "required" },
+			{ model: mock, convertToLlm: identityConverter, toolChoice: "required" },
 			undefined,
 			inspectingStream,
 		);
@@ -692,7 +692,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("echo something")],
 			{ systemPrompt: [""], messages: [], tools: [tool] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				getToolChoice: () => {
 					const choice = queuedChoices.shift();
@@ -755,7 +755,7 @@ describe("agentLoop with AgentMessage", () => {
 		const stream = agentLoop(
 			[createUserMessage("echo something")],
 			{ systemPrompt: [""], messages: [], tools: [tool] },
-			{ model: mock.model, convertToLlm: identityConverter, appendOnlyContext },
+			{ model: mock, convertToLlm: identityConverter, appendOnlyContext },
 			undefined,
 			inspectingStream,
 		);
@@ -804,7 +804,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("echo something")],
 			context,
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				appendOnlyContext,
 				getFollowUpMessages: async () => {
@@ -874,7 +874,7 @@ describe("agentLoop with AgentMessage", () => {
 			return mock.stream(...args);
 		};
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			appendOnlyContext,
 			convertToLlm: messages => {
 				conversionSizes.push(messages.length);
@@ -943,7 +943,7 @@ describe("agentLoop with AgentMessage", () => {
 		const detailed = agentLoopDetailed(
 			[createUserMessage("echo something")],
 			{ systemPrompt: [""], messages: [], tools: [tool] },
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			inspectingStream,
 		);
@@ -1002,7 +1002,7 @@ describe("agentLoop with AgentMessage", () => {
 		const stream = agentLoop(
 			[createUserMessage("echo something")],
 			context,
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			inspectingStream,
 		);
@@ -1050,7 +1050,7 @@ describe("agentLoop with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			intentTracing: true,
 		};
@@ -1104,7 +1104,7 @@ describe("agentLoop with AgentMessage", () => {
 		const stream = agentLoop(
 			[createUserMessage("run")],
 			context,
-			{ model: mock.model, convertToLlm: identityConverter, intentTracing: true },
+			{ model: mock, convertToLlm: identityConverter, intentTracing: true },
 			undefined,
 			mock.stream,
 		);
@@ -1245,7 +1245,7 @@ describe("agentLoop with AgentMessage", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("start")], context, config, undefined, mock.stream);
@@ -1289,7 +1289,7 @@ describe("agentLoop with AgentMessage", () => {
 
 		const abortController = new AbortController();
 		const mock = createMockModel();
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		// Custom stream: emit a partial start with a tool call, abort, then push done.
 		// The mock provider doesn't model "abort between start and done"; do it inline.
@@ -1352,7 +1352,7 @@ describe("agentLoop with AgentMessage", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const stream = agentLoop([createUserMessage("start")], context, config, abortController.signal, mock.stream);
 
 		const completion = (async () => {
@@ -1413,7 +1413,7 @@ describe("agentLoop with AgentMessage", () => {
 					[createUserMessage("wait")],
 					context,
 					{
-						model: mock.model,
+						model: mock,
 						convertToLlm: identityConverter,
 						shouldPause: () => pauseOnAbort,
 					},
@@ -1463,7 +1463,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("start")],
 			{ systemPrompt: [""], messages: [], tools: [] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				getSyntheticRecoveryMessage: async () => {
 					recoveryPolls++;
@@ -1509,7 +1509,7 @@ describe("agentLoop with AgentMessage", () => {
 			[createUserMessage("start")],
 			{ systemPrompt: [""], messages: [], tools: [] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				getFollowUpMessages: async () => {
 					if (followUpDequeued) return [];
@@ -1584,7 +1584,7 @@ describe("agentLoop with AgentMessage", () => {
 		});
 
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			toolInterruptPolicy: "abort_tools",
 			getSteeringMessages: async () => {
@@ -1681,7 +1681,7 @@ it("refreshes tools and system prompt between same-turn model calls", async () =
 		],
 	});
 	const config: AgentLoopConfig = {
-		model: mock.model,
+		model: mock,
 		convertToLlm: identityConverter,
 		syncContextBeforeModelCall: async currentContext => {
 			currentContext.systemPrompt = [activeSystemPrompt];
@@ -1710,7 +1710,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 		};
 
 		const mock = createMockModel();
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		expect(() => agentLoopContinue(context, config)).toThrow("Cannot continue: no messages in context");
 	});
@@ -1725,7 +1725,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 		};
 
 		const mock = createMockModel({ responses: [{ content: ["Response"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
@@ -1770,7 +1770,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 
 		const mock = createMockModel({ responses: [{ content: ["Response to hook"] }] });
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: messages => {
 				// Convert hookMessage to user message
 				return messages
@@ -1828,7 +1828,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			beforeToolCall: async () => ({ block: true, reason: "policy: blocked" }),
 		};
@@ -1874,7 +1874,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			beforeToolCall: async ({ args }) => {
 				(args as { value: string | number }).value = 123;
@@ -1915,7 +1915,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			afterToolCall: async ({ args, isError }) => {
 				seen.push({ args, isError });
@@ -1978,7 +1978,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			afterToolCall: async () => {
 				throw new Error("hook exploded");
@@ -2010,7 +2010,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 			responses: [{ content: ["first"] }, { content: ["second"] }],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onBeforeYield: () => {
 				hookCalls++;
@@ -2050,7 +2050,7 @@ describe("agentLoop - empty response overflow detection", () => {
 				},
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const events: AgentEvent[] = [];
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
@@ -2084,7 +2084,7 @@ describe("agentLoop - empty response overflow detection", () => {
 			[createUserMessage("Make a change")],
 			context,
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 			},
 			undefined,
@@ -2139,7 +2139,7 @@ describe("agentLoop - empty response overflow detection", () => {
 		const stream = agentLoop(
 			[createUserMessage("Make a change")],
 			context,
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			streamFn,
 		);
@@ -2165,7 +2165,7 @@ describe("agentLoop - empty response overflow detection", () => {
 		const mock = createMockModel({
 			responses: [{ content: [""], stopReason: "stop", usage: { input: 0, output: 0 } }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
 		for await (const _ of stream) {
@@ -2195,7 +2195,7 @@ describe("agentLoop - empty response overflow detection", () => {
 				},
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
 		for await (const _ of stream) {
@@ -2227,7 +2227,7 @@ describe("agentLoop - empty response overflow detection", () => {
 				},
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
 		for await (const _ of stream) {

@@ -153,6 +153,10 @@ describe("SDK operation inventory", () => {
 				"internal agent-event settlement barrier, not a user-facing SDK control seam",
 			],
 			[
+				"agent_session:waitForAgentEndHandlingForTests",
+				"test-only SDK terminal-event handler completion barrier, not a user-facing SDK control seam",
+			],
+			[
 				"agent_session:abortPromptAndWait",
 				"internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
 			],

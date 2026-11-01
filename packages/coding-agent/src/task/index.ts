@@ -233,6 +233,22 @@ function inheritedPlanMode(session: ToolSession): { planModeState?: PlanModeStat
 	};
 }
 
+/** Parent bash posture for a task child. Blank prefixes are not a restriction. */
+function inheritedBashRestriction(session: ToolSession): {
+	bashRestrictionProfile?: ToolSession["bashRestrictionProfile"];
+	parentBashAllowedPrefixes?: string[];
+} {
+	const profile = session.bashRestrictionProfile;
+	const prefixes = (session.bashAllowedPrefixes ?? [])
+		.map(prefix => prefix.trim())
+		.filter(prefix => prefix.length > 0);
+	if (!profile && prefixes.length === 0) return {};
+	return {
+		...(profile ? { bashRestrictionProfile: profile } : {}),
+		...(prefixes.length > 0 ? { parentBashAllowedPrefixes: prefixes } : {}),
+	};
+}
+
 function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
 	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
 }
@@ -2524,6 +2540,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						inheritedServiceTier: session.serviceTier,
 						...inheritedSubagentApproval(session),
 						...inheritedPlanMode(session),
+						...inheritedBashRestriction(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -2615,6 +2632,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						inheritedServiceTier: session.serviceTier,
 						...inheritedSubagentApproval(session),
 						...inheritedPlanMode(session),
+						...inheritedBashRestriction(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,

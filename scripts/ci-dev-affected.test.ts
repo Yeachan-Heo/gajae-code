@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isPackageTestPath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, omittedPackageTestPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import fc from "fast-check";
 import { enumerateTestFiles } from "./run-bun-test-files";
 import {
 	runSdkProductionHostIsolated,
@@ -225,7 +226,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}");
 		expect(workflow).toContain("affected-darwin-arm64-tab-worker-smoke:");
-		expect(workflow).toContain("runs-on: macos-14");
+		expect(workflow).toContain("runs-on: macos-15");
 		expect(workflow).toContain("TARGET_PLATFORM: darwin");
 		expect(workflow).toContain("TARGET_ARCH: arm64");
 		expect(workflow).toContain("process.platform");
@@ -1109,6 +1110,48 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(tampered.stderr).toContain("digest mismatch");
 	});
 
+	test("a PR plan that drops an existing package test fails validation", async () => {
+		const testFile = "packages/ai/test/openai-codex.test.ts";
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-omit-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const planFile = path.join(tempDir, "plan.json");
+		const generated = await runScript(["--matrix-json"], testFile, {
+			GITHUB_OUTPUT: outputFile,
+			CI_DEV_PLAN_MODE: "pr",
+			GITHUB_EVENT_NAME: "pull_request",
+		});
+		expect(generated.exitCode).toBe(0);
+		const generatedKeys = (JSON.parse(generated.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key);
+		expect(generatedKeys).toContain(`test:${testFile}`);
+		const original = await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).text();
+		await Bun.write(planFile, original);
+		const output = await Bun.file(outputFile).text();
+		const digest = output.split("\n").find(line => line.startsWith("plan_digest="))?.slice("plan_digest=".length);
+		expect(digest).toBeDefined();
+		const kept = await runScript(["--validate-plan"], testFile, {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: sourceSha,
+			CI_DEV_PLAN_MODE: "pr",
+			GITHUB_EVENT_NAME: "pull_request",
+		});
+		expect(kept.exitCode).toBe(0);
+		const parsed = JSON.parse(original) as { tasks: Array<{ key: string }> };
+		const stripped = JSON.stringify({ ...parsed, tasks: parsed.tasks.filter(task => task.key !== `test:${testFile}`) });
+		await Bun.write(planFile, stripped);
+		const strippedDigest = new Bun.CryptoHasher("sha256").update(stripped).digest("hex");
+		const omitted = await runScript(["--validate-plan"], testFile, {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: strippedDigest,
+			CI_DEV_PLAN_SOURCE_SHA: sourceSha,
+			CI_DEV_PLAN_MODE: "pr",
+			GITHUB_EVENT_NAME: "pull_request",
+		});
+		expect(omitted.exitCode).toBe(1);
+		expect(omitted.stderr).toContain(`affected-plan-invalid: changed package test omitted from canonical plan: ${testFile}`);
+	}, 120_000);
+
 	test("--task runs exactly the selected planned task", async () => {
 		const { stdout, exitCode } = await runScript(["--task=affected-dry-run"], "scripts/ci-dev-affected.ts");
 		expect(exitCode).toBe(0);
@@ -1445,7 +1488,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
-		expect(keys).not.toContain("check:@gajae-code/coding-agent");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
 
 		const entries = describeTasks(tasks);
 		const liveShard = entries.find(entry => entry.key === "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
@@ -1463,10 +1506,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
-	test("a source file with a directly-named test maps exclusively to that test", () => {
+	test("a source file with a directly-named test maps to that test plus the owning package check", () => {
 		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
 		expect(tasks.map(task => task.key)).toEqual([
 			"test:packages/coding-agent/test/edit/foo.test.ts",
+			"check:@gajae-code/coding-agent",
 			"native-linux-x64",
 		]);
 	});
@@ -1611,6 +1655,74 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const missing = "packages/coding-agent/test/write-acp-fs-missing.test.ts";
 		const tasks = planTargetedTasks([missing], targetingPackages, [...testFiles, missing], true);
 		expect(tasks.map(task => task.key)).not.toContain(`test:${missing}`);
+	});
+	test("an existing package test omitted from discovery still emits its focused task", () => {
+		const testFile = "packages/ai/test/openai-codex.test.ts";
+		const tasks = planTargetedTasks([testFile], [...targetingPackages, aiPackage], []);
+		expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
+		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual(["bun", "test", testFile]);
+	});
+	test("an added package test omitted from discovery still emits its focused task", () => {
+		const added = "packages/ai/test/orphan-tool-result-note.test.ts";
+		const indexed = [
+			"packages/ai/test/openai-codex.test.ts",
+			"packages/ai/test/openai-responses-history-payload.test.ts",
+		];
+		const tasks = planTargetedTasks(
+			[
+				"packages/ai/src/providers/openai-responses-shared.ts",
+				"packages/ai/src/providers/openai-codex/request-transformer.ts",
+				...indexed,
+				added,
+			],
+			[...targetingPackages, aiPackage],
+			indexed,
+		);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain(`test:${added}`);
+		expect(keys).toContain(`test:${indexed[0]}`);
+		expect(keys).toContain(`test:${indexed[1]}`);
+		expect(omittedPackageTestPaths(
+			[added, ...indexed, "packages/ai/src/providers/openai-responses-shared.ts"],
+			keys,
+		)).toEqual([]);
+	});
+	test("a missing package test and a source file stay off the focused-task contract", () => {
+		const missing = "packages/ai/test/not-a-real-selection-gap.test.ts";
+		const source = "packages/ai/src/providers/openai-responses-shared.ts";
+		const tasks = planTargetedTasks([missing, source], [...targetingPackages, aiPackage], []);
+		const keys = tasks.map(task => task.key);
+		expect(keys).not.toContain(`test:${missing}`);
+		expect(keys).not.toContain(`test:${source}`);
+		expect(keys).toContain("check:@gajae-code/ai");
+		expect(omittedPackageTestPaths([missing, source], keys)).toEqual([]);
+		expect(isPackageTestPath(source)).toBe(false);
+		expect(isPackageTestPath(missing)).toBe(true);
+	});
+	test("property: package test omission is exactly an existing file without its focused task", () => {
+		const packageTest = fc.stringMatching(/^packages\/[a-z]{1,8}\/test\/[a-z]{1,8}\.test\.ts$/);
+		const sourceFile = fc.stringMatching(/^packages\/[a-z]{1,8}\/src\/[a-z]{1,8}\.ts$/);
+		fc.assert(
+			fc.property(
+				fc.uniqueArray(packageTest, { minLength: 1, maxLength: 6 }),
+				fc.uniqueArray(sourceFile, { minLength: 0, maxLength: 4 }),
+				fc.boolean(),
+				(tests, sources, onDisk) => {
+					const present = new Set(onDisk ? tests : []);
+					const keys = tests.filter(testFile => present.has(testFile)).map(testFile => `test:${testFile}`);
+					const paths = [...tests, ...sources, "scripts/ci-dev-affected.test.ts"];
+					const exists = (changedPath: string) => present.has(changedPath);
+					expect(omittedPackageTestPaths(paths, keys, exists)).toEqual([]);
+					const dropped = tests.find(testFile => present.has(testFile));
+					if (dropped) {
+						const without = keys.filter(key => key !== `test:${dropped}`);
+						expect(omittedPackageTestPaths(paths, without, exists)).toEqual([dropped]);
+					}
+					expect(omittedPackageTestPaths(["packages/ai/src/note.ts"], [], exists)).toEqual([]);
+				},
+			),
+			{ seed: 7277, numRuns: 64 },
+		);
 	});
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
@@ -1861,6 +1973,77 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	// package or root work in by its path.
 	test("changelog fragments plan nothing on their own", () => {
 		expect(targeted(["packages/coding-agent/changelog.d/5491-rebase-free-release-notes.md"])).toEqual([]);
+	});
+
+	test("runtime Markdown keeps direct consumer tests in PR plans without broad suites", () => {
+		for (const changed of [
+			"packages/coding-agent/src/prompts/agents/planner.md",
+			"packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md",
+			"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+		]) {
+			const keys = targeted([changed]).map(task => task.key);
+			expect(keys).toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(false);
+		}
+	});
+
+	test("prompt fragments select their actual consumers before skipping CLI smoke", () => {
+		for (const [fragment, consumer] of [
+			["browser-aside", "sdk-browser-aside-backend.test.ts"],
+			["ralplan-persistence", "gjc-runtime/ralplan-worktree-root.test.ts"],
+		]) {
+			const keys = targeted([`packages/coding-agent/src/prompts/agent-fragments/${fragment}.md`]).map(task => task.key);
+			expect(keys).toContain(`test:packages/coding-agent/test/${consumer}`);
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).not.toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+			expect(keys).not.toContain("cli-smoke");
+		}
+	});
+
+	test("unmapped prompt fragments keep CLI smoke rather than an unrelated definitions test", () => {
+		for (const fragment of ["restricted-bash", "future-fragment"]) {
+			const keys = targeted([`packages/coding-agent/src/prompts/agent-fragments/${fragment}.md`]).map(task => task.key);
+			expect(keys).toContain("cli-smoke");
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).not.toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+		}
+	});
+
+	test("push plans retain runtime Markdown coverage and root README stays cheap", () => {
+		const roleKeys = planTasks(["packages/coding-agent/src/prompts/agents/planner.md"], targetingPackages).map(task => task.key);
+		expect(roleKeys).toContain("check:@gajae-code/coding-agent");
+		expect(roleKeys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(true);
+		const deepInterviewKeys = planTasks(["packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md"], targetingPackages).map(task => task.key);
+		expect(deepInterviewKeys).toContain("deep-interview-definitions");
+		expect(deepInterviewKeys).toContain("deep-interview-runtime");
+		expect(planTasks(["README.md"], targetingPackages)).toEqual([]);
+		expect(targeted(["README.md", "packages/coding-agent/CHANGELOG.md"])).toEqual([]);
+	});
+
+	test("mixed prose and runtime Markdown plans retain both bounded gates exactly once", () => {
+		const keys = targeted(["docs/guide.md", "packages/coding-agent/src/prompts/agents/planner.md", "packages/coding-agent/src/prompts/agents/critic.md"]).map(task => task.key);
+		expect(keys.filter(key => key === "test:packages/coding-agent/test/default-gjc-definitions.test.ts")).toHaveLength(1);
+		expect(keys).toContain(EMBEDDED_DOCS_GATE_KEY);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
+	});
+
+	test("other bundled source Markdown retains owning package checks and smoke", () => {
+		const keys = targeted(["packages/agent/src/compaction/prompts/compaction-summary-context.md"]).map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/agent-core");
+		expect(keys).toContain("cli-smoke");
+	});
+
+	test("custom provider recipes select runtime loader validation in both planning modes", () => {
+		for (const tasks of [targeted(["docs/custom-providers-and-multi-account.md"]), planTasks(["docs/custom-providers-and-multi-account.md"], packages)]) {
+			const keys = tasks.map(task => task.key);
+			expect(keys).toContain("test:packages/coding-agent/test/custom-provider-docs.test.ts");
+			expect(keys).toContain(EMBEDDED_DOCS_GATE_KEY);
+			expect(keys).toContain("native-linux-x64");
+		}
 	});
 
 	// docs/ is the source the embedded docs index is generated from, so shipping a

@@ -1,6 +1,6 @@
 # Rust porting Phase 4 re-profile
 
-This is the post-vendoring CPU profile that the Rust porting plan's Phase 4 requires. It was produced by the session-replay harness (`bun run bench:profile -- --scenario all`) on the dedicated `macos-14` runner (`native-bench-ab.yml`, suite `profile-stability`). The runner waited for the 1-minute load to settle below half the cores and ran one warm-up profile before the measured runs. Raw profiles stay in the workflow artifacts; only aggregated function names and shares are recorded here.
+This is the post-vendoring CPU profile that the Rust porting plan's Phase 4 requires. It was produced by the session-replay harness (`bun run bench:profile -- --scenario all`) on the dedicated `macos-15` runner (`native-bench-ab.yml`, suite `profile-stability`). The runner waited for the 1-minute load to settle below half the cores and ran one warm-up profile before the measured runs. Raw profiles stay in the workflow artifacts; only aggregated function names and shares are recorded here.
 
 - Run: https://github.com/Yeachan-Heo/gajae-code/actions/runs/36502046414
 - Git SHA: `1011a4aedecaab7aa0913b1d84fb00172b2e5a61` (post-vendoring dev), Bun `1.4.0`, host `darwin/arm64`, sampling interval 100 µs

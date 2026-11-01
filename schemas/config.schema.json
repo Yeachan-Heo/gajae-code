@@ -1576,7 +1576,7 @@
 		},
 		"promptSuggestions": {
 			"type": "boolean",
-			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+			"description": "Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 			"default": false
 		},
 		"telemetry": {

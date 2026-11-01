@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Stats message rows drop credential shapes from provider error text before they are stored.
+
+- Stats folder attribution reads the session header's recorded `cwd`, so sessions stored under the v2 managed `v2-<digest>` directories show their real project path in the `gjc stats` folder summary and dashboard instead of the opaque digest; existing databases re-parse sessions once to repair stored folder values.
+
+- The Model Preference chart no longer drops or merges series when model names collide with reserved property names, provider-qualified labels, or the "Other" rollup.
+
+- The stats dashboard treated `?range=constructor` and `?range=__proto__` as inherited `Object` members instead of unknown ranges, bypassing the documented 24-hour fallback and returning unfiltered stats. Unknown range names now always fall back to the last 24 hours.
+
+## [0.19.0] - 2026-10-22
+
 ## [0.18.12] - 2026-10-16
 
 ### Fixed

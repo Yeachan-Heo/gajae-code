@@ -1804,3 +1804,115 @@ describe("openArchive inflate caps", () => {
 		}),
 	);
 });
+
+describe("archive index fidelity", () => {
+	function indexHeader(name: string, body: Uint8Array | undefined, mtime: number): Uint8Array {
+		const header = ustarHeader(name, body?.byteLength ?? 0, body === undefined ? "5" : "0");
+		header.set(new TextEncoder().encode(`${mtime.toString(8).padStart(11, "0")}\0`), 136);
+		header.fill(0x20, 148, 156);
+		const checksum = header.reduce((sum, byte) => sum + byte, 0);
+		header.set(new TextEncoder().encode(`${checksum.toString(8).padStart(6, "0")}\0 `), 148);
+		return header;
+	}
+
+	async function withIndexArchive(
+		ext: "tar" | "tar.gz",
+		members: Array<{ name: string; text?: string; mtime?: number }>,
+		run: (archive: Awaited<ReturnType<typeof openArchive>>) => Promise<void>,
+	): Promise<void> {
+		const chunks: Uint8Array[] = [];
+		for (const member of members) {
+			const body = member.text === undefined ? undefined : new TextEncoder().encode(member.text);
+			chunks.push(indexHeader(member.name, body, member.mtime ?? 100));
+			if (body) chunks.push(pad512(body));
+		}
+		chunks.push(new Uint8Array(1024));
+		const bytes = concat(chunks);
+		await withFile(`index.${ext}`, ext === "tar.gz" ? gzipSync(bytes) : bytes, async file => {
+			await run(await openArchive(file));
+		});
+	}
+
+	for (const ext of ["tar", "tar.gz"] as const) {
+		test(`${ext} preserves normalized explicit empty and nested directories`, async () => {
+			await withIndexArchive(ext, [{ name: "./empty/" }, { name: "outer/empty/" }], async archive => {
+				expect(archive.listDirectory().map(entry => entry.name)).toEqual(["empty", "outer"]);
+				for (const dir of ["empty", "outer/empty"]) {
+					expect(archive.getNode(dir)).toMatchObject({ path: dir, isDirectory: true, size: 0 });
+					expect(archive.listDirectory(dir)).toEqual([]);
+					await expect(archive.readFile(dir)).rejects.toThrow(/is a directory/);
+				}
+				expect(archive.listDirectory("outer").map(entry => entry.name)).toEqual(["empty"]);
+			});
+		});
+
+		test(`${ext} retains populated directories and file-over-directory precedence`, async () => {
+			await withIndexArchive(
+				ext,
+				[
+					{ name: "full/" },
+					{ name: "full/a.txt", text: "hello" },
+					{ name: "dir-first/" },
+					{ name: "dir-first", text: "first" },
+					{ name: "file-first", text: "second" },
+					{ name: "file-first/" },
+				],
+				async archive => {
+					expect(archive.listDirectory("full").map(entry => entry.name)).toEqual(["a.txt"]);
+					for (const [name, text] of [
+						["full/a.txt", "hello"],
+						["dir-first", "first"],
+						["file-first", "second"],
+					]) {
+						const entry = await archive.readFile(name!);
+						expect(new TextDecoder().decode(entry.bytes)).toBe(text);
+						expect(entry.size).toBe(entry.bytes.byteLength);
+						expect(archive.getNode(name)?.isDirectory).toBe(false);
+					}
+				},
+			);
+		});
+
+		test(`${ext} does not borrow a later duplicate mtime`, async () => {
+			await withIndexArchive(
+				ext,
+				[
+					{ name: "a.txt", text: "", mtime: 0 },
+					{ name: "a.txt", text: "next", mtime: 200 },
+				],
+				async archive => {
+					const entry = await archive.readFile("a.txt");
+					expect(entry.mtimeMs).toBeUndefined();
+					expect(entry.size).toBe(0);
+					expect(entry.bytes.byteLength).toBe(0);
+				},
+			);
+		});
+
+		for (const [first, second] of [
+			["", "newer"],
+			["old", ""],
+			["old", "newer"],
+			["old", "new"],
+		]) {
+			test(`${ext} keeps the first duplicate file atomically (${first!.length}->${second!.length})`, async () => {
+				await withIndexArchive(
+					ext,
+					[
+						{ name: "a.txt", text: first, mtime: 100 },
+						{ name: "a.txt", text: second, mtime: 200 },
+					],
+					async archive => {
+						const entry = await archive.readFile("a.txt");
+						expect(new TextDecoder().decode(entry.bytes)).toBe(first);
+						expect(entry.size).toBe(entry.bytes.byteLength);
+						expect(entry.size).toBe(first!.length);
+						expect(entry.mtimeMs).toBe(100_000);
+						expect(archive.getNode("a.txt")).toMatchObject({ size: first!.length, mtimeMs: 100_000 });
+						expect(archive.listDirectory()[0]).toMatchObject({ size: first!.length, mtimeMs: 100_000 });
+					},
+				);
+			});
+		}
+	}
+});

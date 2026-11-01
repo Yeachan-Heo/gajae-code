@@ -98,6 +98,7 @@ import {
 } from "./model-preset-registry";
 import {
 	ModelProfileReplacementRequiredError,
+	readDurableModelProfileOwnership,
 	readDurableModelProfileOwnershipFromRaw,
 	UnresolvedModelProfileOwnershipError,
 } from "./model-profile-ownership";
@@ -486,6 +487,25 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(
 		model => model.id.toLowerCase() === modelId.toLowerCase(),
 	)?.api as Api | undefined;
+}
+
+/**
+ * A catalog that mixes chat rows with image, audio, video or embedding rows
+ * opts into `discovery.outputModalities`: only rows whose advertised
+ * `output_modalities` all fall inside that list are admitted, so non-chat
+ * entries never become chat-completion models. Rows without the field are
+ * not admitted either, because they cannot be classified. Providers without
+ * the setting keep admitting every safe row.
+ */
+function admitsDiscoveredOutputModalities(discovery: ProviderDiscovery, item: Record<string, unknown>): boolean {
+	const allowed = discovery.outputModalities;
+	if (allowed === undefined) return true;
+	const advertised = item.output_modalities;
+	return (
+		Array.isArray(advertised) &&
+		advertised.length > 0 &&
+		advertised.every(modality => typeof modality === "string" && allowed.includes(modality))
+	);
 }
 
 function resolveModelApiOverrideFromDiscovery(
@@ -1295,6 +1315,9 @@ function fingerprintConfiguredDiscoveryRequestShape(
 		api: providerConfig.api,
 		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
 		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+		...(providerConfig.discovery.outputModalities
+			? { outputModalities: [...providerConfig.discovery.outputModalities].sort() }
+			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
@@ -4374,7 +4397,17 @@ export class ModelRegistry {
 					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
 				);
 			}
-			await this.#writeCheckedModelsConfig(checkedConfig.data);
+			await this.#writeCheckedModelsConfig(checkedConfig.data, () => {
+				// A settings write can claim this profile while the batch is suspended on
+				// the filesystem. The claim wins: refuse before the deletion reaches disk,
+				// otherwise the durable owner would point at a profile that no longer exists.
+				const live = this.#settings;
+				if (!live) return;
+				const currentOwnership = readDurableModelProfileOwnership(live);
+				if (currentOwnership.marker.kind === "profile" && currentOwnership.marker.profile === normalizedName) {
+					throw new ModelProfileReplacementRequiredError(normalizedName);
+				}
+			});
 			deletedProfile = profile;
 			return [];
 		});
@@ -4404,7 +4437,7 @@ export class ModelRegistry {
 		return { current, profile };
 	}
 
-	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
+	async #writeCheckedModelsConfig(config: ModelsConfig, beforeCommit?: () => void): Promise<void> {
 		const configPath = this.#modelsConfigFile.path();
 		const parentPath = path.dirname(configPath);
 		await fs.mkdir(parentPath, { recursive: true, mode: 0o700 });
@@ -4413,6 +4446,10 @@ export class ModelRegistry {
 		// still reach the same file. The final name stays lexical, so a symlink
 		// at models.yml is still opened with O_NOFOLLOW.
 		const parent = await fs.realpath(parentPath);
+		// Runs after every await in this write path so a caller can re-assert a
+		// precondition that another actor may have changed while the write was
+		// suspended, before any bytes reach the file.
+		beforeCommit?.();
 		writeExplicitOwnerOnlyTextSync(path.join(parent, path.basename(configPath)), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
@@ -5954,6 +5991,7 @@ export class ModelRegistry {
 			// check, so IDs that appear only between requests cannot enter
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			if (!admitsDiscoveredOutputModalities(providerConfig.discovery, item)) continue;
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same
@@ -8035,7 +8073,7 @@ export class ModelRegistry {
 		const probe = circuit.probe;
 		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
 		if (probeOwner !== undefined) {
-			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 30_000) };
 		}
 		return false;
 	}

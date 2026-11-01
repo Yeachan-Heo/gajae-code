@@ -134,7 +134,7 @@ describe("agent loop prompt-prefix telemetry", () => {
 			tools: [],
 		};
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			promptPrefixTracker: new PromptPrefixTracker(),
 			convertToLlm: (messages: AgentMessage[]) =>
 				messages.filter((m): m is Message => m.role === "user" || m.role === "assistant"),
@@ -156,7 +156,7 @@ describe("agent loop prompt-prefix telemetry", () => {
 	it("starts a new prefix lineage after Agent.reset()", async () => {
 		const mock = createMockModel({ responses: Array.from({ length: 3 }, () => ({ content: ["ack"] })) });
 		const agent = new Agent({
-			initialState: { model: mock.model, systemPrompt: ["s"], tools: [], messages: [] },
+			initialState: { model: mock, systemPrompt: ["s"], tools: [], messages: [] },
 			streamFn: mock.stream,
 		});
 		const lastPrefix = () =>
@@ -178,7 +178,7 @@ describe("agent loop prompt-prefix telemetry", () => {
 		const mock = createMockModel();
 		const context: AgentContext = { systemPrompt: ["s"], messages: [createUserMessage("hi")], tools: [] };
 		const turn = await run(context, {
-			model: mock.model,
+			model: mock,
 			convertToLlm: (messages: AgentMessage[]) => messages.filter((m): m is Message => m.role === "user"),
 		});
 		expect(turn.promptPrefix).toBeUndefined();

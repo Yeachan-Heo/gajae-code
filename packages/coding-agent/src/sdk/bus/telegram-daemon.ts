@@ -4191,6 +4191,12 @@ interface AttachmentSession {
 	};
 }
 
+/** The exact closed attachment fenced by an authorized session_closed. */
+interface ClosedEndpointTombstone {
+	chatId: string;
+	attachmentKey: string;
+}
+
 interface ModelChoiceRoute {
 	/** Exact transport socket that rendered this choice. */
 	session: AttachmentSession;
@@ -4648,8 +4654,12 @@ export class TelegramNotificationDaemon {
 	private readonly preservedInitiatorTopics = new Set<string>();
 	/** Non-identity frames held until identity creates the correct thread. */
 	private readonly pendingThreadedFrames = new Map<string, PendingThreadedFrame[]>();
-	/** Durable endpoint leases for sessions that already sent an authorized session_closed. */
-	private readonly closedEndpointKeys = new Map<string, TopicEndpointBinding>();
+	/**
+	 * Exact attachments that already sent an authorized session_closed, keyed by
+	 * logical session. The tombstone fences that attachment's late frames; a
+	 * successor attachment resuming the same session id is not the closed endpoint.
+	 */
+	private readonly closedEndpointKeys = new Map<string, ClosedEndpointTombstone>();
 	/** Endpoints rejected by strict topic admission are not retried until their authority changes. */
 	readonly #rejectedTopicEndpointKeys = new Map<string, string>();
 	readonly #rejectedTopicCleanupTimers = new Map<string, Timer | NodeJS.Timeout>();
@@ -5306,6 +5316,7 @@ export class TelegramNotificationDaemon {
 	attachmentRoutingHarnessForTest() {
 		return {
 			attach: (subscription: NotificationSubscription) => this.#onAttachment(subscription),
+			ready: (subscription: NotificationSubscription) => this.#onAttachmentReady(subscription),
 			remove: async (
 				subscription: NotificationSubscription,
 				reason: "removed" | "replaced" | "replaced_same_generation",
@@ -5436,12 +5447,16 @@ export class TelegramNotificationDaemon {
 					"ephemeral_turn_v1",
 				],
 			});
+			// A stored cursor positions only the host generation that produced it. A
+			// resumed session's host opens a new generation, and replaying from another
+			// generation answers with a generation reset that strict admission refuses.
 			const cursor = this.topics.replayCursor(session.sessionId);
+			const currentCursor = cursor?.generation === session.replayGeneration ? cursor : undefined;
 			await this.#sendAttachment(session, {
 				type: "event_replay",
 				id: session.replayId,
-				sinceGeneration: cursor?.generation ?? session.replayGeneration,
-				sinceSeq: cursor?.seq ?? 0,
+				sinceGeneration: session.replayGeneration,
+				sinceSeq: currentCursor?.seq ?? 0,
 				capabilities: [TOOL_ACTIVITY_CAPABILITY],
 			});
 		} catch (error) {
@@ -5793,10 +5808,16 @@ export class TelegramNotificationDaemon {
 					await this.#withRecoveryBindingClaim(async () => {
 						if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
 
-						const closedBinding = this.#endpointBinding(session);
+						const closedBinding: ClosedEndpointTombstone = {
+							chatId: String(this.opts.chatId),
+							attachmentKey: session.attachmentKey,
+						};
 						const closedBindingMatches = () => {
 							const current = this.closedEndpointKeys.get(logicalSessionId);
-							return current?.chatId === closedBinding.chatId;
+							return (
+								current?.chatId === closedBinding.chatId &&
+								current.attachmentKey === closedBinding.attachmentKey
+							);
 						};
 						const closeTopicAuthority = this.topics.captureArchiveAuthority(logicalSessionId);
 						const previousClosedBinding = this.closedEndpointKeys.get(logicalSessionId);
@@ -5814,7 +5835,7 @@ export class TelegramNotificationDaemon {
 								this.topics.restoreArchiveAuthority(closeTopicAuthority);
 								if (previousClosedBinding === undefined) this.closedEndpointKeys.delete(logicalSessionId);
 								else if (closedBindingMatches())
-									this.closedEndpointKeys.set(session.sessionId, previousClosedBinding);
+									this.closedEndpointKeys.set(logicalSessionId, previousClosedBinding);
 							},
 						);
 						if (
@@ -6518,6 +6539,18 @@ export class TelegramNotificationDaemon {
 		return this.toolShutdownBarrier;
 	}
 
+	/**
+	 * Replay admission is the only path that binds an attachment to a topic, so a
+	 * refusal silences that attachment until the session re-attaches. Leave local
+	 * evidence of the refusal instead of dropping the subscription silently.
+	 */
+	#dropRejectedRecovery(session: AttachmentSession, cause: string): void {
+		logger.warn(
+			`notifications: Telegram refused attachment recovery for session ${session.sessionId}: ${cause}; its notifications stop until the session re-attaches`,
+		);
+		this.#dropSession(session, "recovery_rejected");
+	}
+
 	#dropSession(session: AttachmentSession, reason: string): void {
 		// Capture the exact callback lease before revoking recovery authority. A
 		// predecessor transport can remain keyed by its own session id after a
@@ -6992,8 +7025,7 @@ export class TelegramNotificationDaemon {
 	): boolean {
 		if (this.#droppedSessions.has(session)) return false;
 		if (!this.#topicAdmissionAllows(session)) return false;
-		const closedBinding = this.closedEndpointKeys.get(logicalSessionId);
-		if (closedBinding && closedBinding.chatId === String(this.opts.chatId)) return false;
+		if (this.#isClosedEndpoint(logicalSessionId, String(this.opts.chatId), session)) return false;
 		if (!session.logicalSessionIdTrusted) return true;
 		// Trusted leases require both the current transport socket and exact logical owner.
 		if (this.sessions.get(session.sessionId) !== session) return false;
@@ -7288,11 +7320,25 @@ export class TelegramNotificationDaemon {
 		};
 	}
 
+	/**
+	 * Whether `session` is the exact attachment that closed `logicalSessionId` in
+	 * this chat. A later attachment for the same id is a resumed successor: it was
+	 * published by a new host registration, and only replay authentication plus
+	 * the inactive-successor topic rotation decide whether it may bind.
+	 */
+	#isClosedEndpoint(
+		logicalSessionId: string | undefined,
+		chatId: string,
+		session: AttachmentSession | undefined,
+	): boolean {
+		if (logicalSessionId === undefined) return false;
+		const closed = this.closedEndpointKeys.get(logicalSessionId);
+		return closed?.chatId === chatId && (session === undefined || closed.attachmentKey === session.attachmentKey);
+	}
+
 	#endpointAuthority(binding: TopicEndpointBinding, excludedSession?: AttachmentSession) {
-		const tombstoned = [...this.closedEndpointKeys.entries()].some(
-			([sessionId, closed]) => closed.chatId === binding.chatId && sessionId === binding.logicalSessionId,
-		);
-		if (tombstoned) return { state: "ambiguous" as const };
+		if (this.#isClosedEndpoint(binding.logicalSessionId, binding.chatId, excludedSession))
+			return { state: "ambiguous" as const };
 		const authority = this.topics.endpointAuthority(binding, excludedSession);
 		const competingLiveClaim = [...this.sessions.values()].some(
 			session => session !== excludedSession && this.#logicalSessionId(session) === binding.logicalSessionId,
@@ -10348,7 +10394,10 @@ export class TelegramNotificationDaemon {
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
 			if (!replayCandidateSessionId) {
-				this.#dropSession(session, "recovery_rejected");
+				this.#dropRejectedRecovery(
+					session,
+					`no admissible identity (endpoint authority ${endpointAuthority.state})`,
+				);
 				return;
 			}
 			const recovered = await this.#recoverTopicBinding(
@@ -10361,14 +10410,17 @@ export class TelegramNotificationDaemon {
 			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
 				if (session.replayGeneration === msg.generation && session.recoveryLease?.state !== "pending")
-					this.#dropSession(session, "recovery_rejected");
+					this.#dropRejectedRecovery(
+						session,
+						`topic binding refused (topic authority ${this.topics.get(replayCandidateSessionId)?.authorityState ?? "none"})`,
+					);
 				return;
 			}
 			if (
 				!this.#ownsLiveOpenEndpoint(session, endpointBinding) ||
 				!this.#leaseAllows(session, this.#logicalSessionId(session))
 			) {
-				this.#dropSession(session, "recovery_rejected");
+				this.#dropRejectedRecovery(session, "recovered lease is not current");
 				return;
 			}
 			session.replayPending = false;

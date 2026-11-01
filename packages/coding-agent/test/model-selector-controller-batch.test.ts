@@ -37,6 +37,7 @@ function createControllerContext() {
 			selector?: string;
 			thinkingLevel?: ThinkingLevel;
 			onMutationStarted?: () => void;
+			recordUsage?: boolean;
 		};
 	}> = [];
 	const setModelTemporary = vi.fn(
@@ -88,6 +89,7 @@ function createControllerContext() {
 				selector?: string;
 				thinkingLevel?: ThinkingLevel;
 				onMutationStarted?: () => void;
+				recordUsage?: boolean;
 			},
 		) {
 			setModelCalls.push({ model: nextModel, role, options });
@@ -98,6 +100,8 @@ function createControllerContext() {
 		},
 		markUserModelSelection,
 		setModelTemporary,
+		recordModelSelectionUsage: vi.fn(),
+		beginModelSelectionUsage: () => 1,
 		setDefaultFallbackRuntimeModel,
 		async restoreModelSelectionForRollback(nextModel: Model | undefined, thinkingLevel: ThinkingLevel | undefined) {
 			this.model = nextModel;
@@ -266,6 +270,7 @@ describe("SelectorController model batch assignments", () => {
 				options: {
 					cause: "user-selection",
 					onMutationStarted: expect.any(Function),
+					recordUsage: false,
 					selector: "provider-a/selected",
 					thinkingLevel: ThinkingLevel.Inherit,
 				},
@@ -579,6 +584,7 @@ describe("SelectorController model batch assignments", () => {
 				options: {
 					cause: "user-selection",
 					onMutationStarted: expect.any(Function),
+					recordUsage: false,
 					selector: "provider-a/selected",
 					thinkingLevel: ThinkingLevel.High,
 				},

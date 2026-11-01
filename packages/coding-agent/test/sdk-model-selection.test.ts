@@ -385,6 +385,48 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		await session.dispose();
 	});
 
+	for (const modelId of ["namespace/catalog-model", "catalog-model"]) {
+		test(`restores a CLI-owned discovered model with id ${modelId}`, async () => {
+			const provider = "runtime-catalog";
+			const registry = modelRegistry;
+			authStorage.setRuntimeApiKey(provider, "test-key");
+			using _refreshableProviders = vi.spyOn(registry, "getRefreshableProviders").mockReturnValue([provider]);
+			using refresh = vi.spyOn(registry, "refreshProvider").mockImplementation(async providerId => {
+				registry.registerProvider(providerId, {
+					baseUrl: "http://127.0.0.1:9/v1",
+					apiKey: "RUNTIME_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: modelId,
+							name: "Discovered Catalog Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+						},
+					],
+				});
+			});
+			const sessionManager = SessionManager.inMemory(tempDir);
+			sessionManager.appendModelChange(`${provider}/${modelId}`, "default");
+
+			const { session, modelFallbackMessage } = await createAgentSession({
+				...buildSessionOptions(undefined, sessionManager),
+				settings: Settings.isolated(),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			try {
+				expect(session.model).toMatchObject({ provider, id: modelId });
+				expect(modelFallbackMessage).toBeUndefined();
+				expect(refresh).toHaveBeenCalled();
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
 	test("rechecks a recovered saved chain after startup extensions register its model", async () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,

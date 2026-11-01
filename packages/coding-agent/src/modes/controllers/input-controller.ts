@@ -668,6 +668,10 @@ export class InputController {
 				this.#resetEscapeGestures();
 				return;
 			}
+			if (this.ctx.promptSuggestion?.tryCancelOnEscape()) {
+				this.#resetEscapeGestures();
+				return;
+			}
 			if (this.#handlePendingSteerInterrupt()) return;
 			if (this.#handleCancellableWorkEscape({ maintenance: true, retry: "escape" })) {
 				this.#resetEscapeGestures();
@@ -967,13 +971,12 @@ export class InputController {
 			});
 		}
 
-		// Tab on an empty composer accepts the pending ghost-text prompt suggestion.
+		// Tab on an empty composer accepts the ghost-text next-prompt suggestion.
 		this.ctx.editor.onTab = (text: string) => this.ctx.promptSuggestion?.tryAcceptOnTab(text) === true;
 
 		this.ctx.editor.onUndo = text => this.#restorePendingImagesAfterPlaceholderUndo(text);
 		this.ctx.editor.onChange = (text: string) => {
 			this.#resetEscapeGestures();
-			this.ctx.promptSuggestion?.notifyEditorChanged(text);
 			const wasBashMode = this.ctx.isBashMode;
 			const wasBashNoContext = this.ctx.isBashNoContext;
 			const wasPythonMode = this.ctx.isPythonMode;
@@ -1009,6 +1012,8 @@ export class InputController {
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		this.#imagePlaceholderDeletionUndo = undefined;
 		text = text.trim();
+		// Any submission supersedes a pending or shown next-prompt suggestion.
+		if (text) this.ctx.promptSuggestion?.clear();
 		const submittedBashMode = this.ctx.isBashMode;
 		const submittedBashNoContext = this.ctx.isBashNoContext;
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
@@ -2275,7 +2280,7 @@ export class InputController {
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
 			moveCursorToLineStart: () => this.ctx.editor.moveToLineStart(),
 			moveCursorToLineEnd: () => this.ctx.editor.moveToLineEnd(),
-			getPromptSuggestion: () => this.ctx.promptSuggestion?.current ?? null,
+			getPromptSuggestion: () => this.ctx.promptSuggestion?.visible ?? null,
 		});
 	}
 

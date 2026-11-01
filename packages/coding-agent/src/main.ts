@@ -21,9 +21,11 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@gajae-code/utils";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import chalk from "chalk";
 import { selectAppendSystemPromptFile } from "./cli/append-system-prompt";
-import type { Args } from "./cli/args";
+import { type Args, resolvePlanModelOverride } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { fetchGithubChannelRelease } from "./cli/github-release";
 import { buildInitialMessage } from "./cli/initial-message";
@@ -70,6 +72,7 @@ import type { MCPManager } from "./runtime-mcp";
 // Leaf path, not the barrel: the capability registry must stay out of the
 // runtime-mcp import graph that every root command would otherwise load.
 import { attachExactMcpControls } from "./runtime-mcp/redaction";
+import { issueSessionMcpControlGrant } from "./runtime-mcp/session-controls-grant";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -257,8 +260,6 @@ export function resolveAcpStartupOptions(
 		| "resume"
 		| "sessionDir"
 		| "skills"
-		| "slow"
-		| "smol"
 		| "plan"
 		| "systemPrompt"
 		| "thinking"
@@ -299,8 +300,6 @@ export function resolveAcpStartupOptions(
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
 		...(parsed.skills !== undefined ? ["--skills"] : []),
-		...(parsed.slow ? ["--slow"] : []),
-		...(parsed.smol ? ["--smol"] : []),
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
 		...(parsed.tmux ? ["--tmux"] : []),
@@ -1942,34 +1941,6 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 	return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
 }
 
-export interface ModelRoleOverrides {
-	smol?: string;
-	slow?: string;
-	plan?: string;
-}
-
-/**
- * Resolve the ephemeral `smol`/`slow`/`plan` model-role overrides.
- *
- * Precedence per role is CLI flag > documented `GJC_*_MODEL` > legacy
- * `PI_*_MODEL`, matching the repo-wide GJC-first/PI-fallback convention.
- * Resolution reads the process environment via `$pickenv`, which trims values
- * and treats empty/whitespace as unset; it is deliberately kept separate from
- * credential env resolution (`$credentialEnv`/`$pickCredentialEnv`). The
- * function is pure and stateless, so it reads fresh each call and a later
- * invocation never inherits an earlier one's values.
- */
-export function resolveModelRoleOverrides(parsed: Pick<Args, "smol" | "slow" | "plan">): ModelRoleOverrides {
-	const overrides: ModelRoleOverrides = {};
-	const smol = parsed.smol ?? $pickenv("GJC_SMOL_MODEL", "PI_SMOL_MODEL");
-	const slow = parsed.slow ?? $pickenv("GJC_SLOW_MODEL", "PI_SLOW_MODEL");
-	const plan = parsed.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
-	if (smol) overrides.smol = smol;
-	if (slow) overrides.slow = slow;
-	if (plan) overrides.plan = plan;
-	return overrides;
-}
-
 /**
  * Apply the `--no-pty` / `--no-title` terminal-control flags to the environment.
  *
@@ -1990,11 +1961,41 @@ export function applyTerminalControlFlagsToEnv(
 		env.PI_NO_TITLE = "1";
 	}
 }
+
+/**
+ * Whether the live `HERDR_BIN_PATH` must not be used as Herdr's executable.
+ *
+ * A static project declaration is rejected when the live value is that
+ * declaration, including surrounding whitespace. A dynamic declaration is
+ * ambiguous with Bun's preload, so any live value is rejected and Herdr falls
+ * back to `PATH`. A shell export is kept when the project declaration is
+ * absent or is a different static string.
+ */
+export function rejectProjectHerdrBinPath(
+	runtime: string | undefined,
+	declared: string | undefined,
+	dynamic: boolean,
+): boolean {
+	if (runtime === undefined) return false;
+	if (dynamic) return true;
+	if (declared === undefined) return false;
+	return runtime === declared || runtime.trim() === declared;
+}
+
+/** Drop a project-supplied Herdr executable before this command spawns anything. */
+export function dropProjectSuppliedHerdrBinPath(env: NodeJS.ProcessEnv): void {
+	const snapshot = startupProjectEnvSnapshot();
+	const key = canonicalEnvKey("HERDR_BIN_PATH");
+	if (!rejectProjectHerdrBinPath(env.HERDR_BIN_PATH, snapshot.values[key], snapshot.dynamic.has(key))) return;
+	delete env.HERDR_BIN_PATH;
+}
+
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
+	dropProjectSuppliedHerdrBinPath(process.env);
 	const parsedArgs = parsed;
 	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;
@@ -2229,19 +2230,12 @@ export async function runRootCommand(
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
-	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted).
-	// Precedence per role: CLI flag > documented GJC_*_MODEL > legacy PI_*_MODEL.
-	const roleOverrides = resolveModelRoleOverrides(parsedArgs);
-	if (roleOverrides.smol || roleOverrides.slow || roleOverrides.plan) {
-		settingsInstance.overrideModelRoles({
-			...(roleOverrides.smol ? { smol: roleOverrides.smol } : {}),
-			...(roleOverrides.slow ? { slow: roleOverrides.slow } : {}),
-			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
-		});
-	}
+	// Plan mode switches to the `plan` model role; --plan / GJC_PLAN_MODEL override it
+	// for this run only (ephemeral, not persisted).
+	const planModelOverride = resolvePlanModelOverride(parsedArgs);
+	if (planModelOverride) settingsInstance.overrideModelRoles({ plan: planModelOverride });
 	// Apply --clipboard-transport / --clipboard-ssh-host as ephemeral runtime
-	// overrides (CLI > persisted config > "auto" default). Not persisted —
-	// mirrors the role-override precedence above.
+	// overrides (CLI > persisted config > "auto" default). Not persisted.
 	if (parsedArgs.clipboardTransport) {
 		settingsInstance.override("clipboard.transport", parsedArgs.clipboardTransport);
 	}
@@ -2478,7 +2472,12 @@ export async function runRootCommand(
 	// defer; their connect evidence is published during session creation).
 	// ACP/print/SDK sessions connect eagerly and are not carved out here.
 	if (isInteractive) {
+		// Root TUI sessions may control conventional autoload declarations after first paint.
+		// The grant is minted here only; SDK callers of createAgentSession cannot mint one.
+		// Exact --mcp-config sessions retain their existing capability path.
 		sessionOptions.deferMcpConfigStartup = true;
+		if (sessionOptions.mcpConfigPath === undefined && sessionOptions.enableMcpAutoload !== false)
+			sessionOptions.sessionMcpControlGrant = issueSessionMcpControlGrant();
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup
@@ -2839,9 +2838,9 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(args);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {

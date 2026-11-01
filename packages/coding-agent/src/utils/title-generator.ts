@@ -1,5 +1,5 @@
 /**
- * Generate session titles using a smol, fast model.
+ * Generate session titles with the `default` model role.
  */
 import * as path from "node:path";
 
@@ -152,7 +152,7 @@ export async function titleInputObfuscator(
  *
  * @param firstMessage The first user message or bounded conversation digest
  * @param registry Model registry
- * @param settings Settings used to resolve the smol role
+ * @param settings Settings used to resolve the `default` model role
  * @param sessionId Optional session id for sticky API key selection
  * @param currentModel Current model (used to derive title model)
  * @param metadataResolver Optional resolver evaluated after credential selection
@@ -178,7 +178,7 @@ export async function generateSessionTitle(
 
 	const apiKey = await registry.getApiKey(model, sessionId);
 	if (!apiKey) {
-		logger.debug("title-generator: no API key for smol model", {
+		logger.debug("title-generator: no API key for title model", {
 			provider: model.provider,
 			id: model.id,
 		});
@@ -229,7 +229,10 @@ export async function generateSessionTitle(
 			logger.debug("title-generator: response error", {
 				model: request.model,
 				stopReason: response.stopReason,
-				errorMessage: response.errorMessage,
+				errorMessage:
+					typeof response.errorMessage === "string"
+						? redactCrashSecrets(response.errorMessage)
+						: response.errorMessage,
 			});
 			return null;
 		}
@@ -238,7 +241,7 @@ export async function generateSessionTitle(
 
 		logger.debug("title-generator: response", {
 			model: request.model,
-			title,
+			title: redactCrashSecrets(title),
 			usage: response.usage,
 			stopReason: response.stopReason,
 		});
@@ -251,7 +254,7 @@ export async function generateSessionTitle(
 	} catch (err) {
 		logger.debug("title-generator: error", {
 			model: request.model,
-			error: err instanceof Error ? err.message : String(err),
+			error: redactCrashSecrets(err instanceof Error ? err.message : String(err)),
 		});
 		return null;
 	}

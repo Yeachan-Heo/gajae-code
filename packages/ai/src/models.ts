@@ -9,7 +9,7 @@ import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinki
 // NOT emitted into the bunfs, and its cwd-fallback masks the failure whenever
 // the process runs inside a repo checkout — see PR body for the minimal repro.
 import modelsJsonPath from "./models.json" with { type: "file" };
-import type { Api, KnownProvider, Model, Usage } from "./types";
+import type { Api, KnownProvider, Model, ModelCost, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
 /**
@@ -103,9 +103,22 @@ export function getBundledModels(provider: GeneratedProvider): Model<Api>[] {
 	return models ? (Array.from(models.values()) as Model<Api>[]) : [];
 }
 
+/** OpenRouter's tier comes from its own discovery payload (pricing.overrides), not a canonical table. */
+function getDiscoveredLongContextCost<TApi extends Api>(
+	model: Model<TApi>,
+	inputTokens: number,
+): ModelCost | undefined {
+	if (model.provider !== "openrouter" || !model.longContextPricing) return undefined;
+	return inputTokens > model.longContextPricing.threshold ? model.longContextPricing.cost : undefined;
+}
+
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
 	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-	const pricing = getAnthropicModelCost(model, inputTokens) ?? getOpenAIModelCost(model, inputTokens) ?? model.cost;
+	const pricing =
+		getAnthropicModelCost(model, inputTokens) ??
+		getOpenAIModelCost(model, inputTokens) ??
+		getDiscoveredLongContextCost(model, inputTokens) ??
+		model.cost;
 	usage.cost.input = (pricing.input / 1000000) * usage.input;
 	usage.cost.output = (pricing.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (pricing.cacheRead / 1000000) * usage.cacheRead;

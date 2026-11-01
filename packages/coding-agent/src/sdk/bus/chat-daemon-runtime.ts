@@ -741,6 +741,7 @@ export class ChatDaemonRuntime {
 			!shouldPublishChatFrame(normalizedFrame, this.input.config.presentation?.verbosity)
 		)
 			return;
+		const keepLiteral = this.input.config.presentation?.redact === false;
 		const payload = this.#presentation?.fanout(notification)[0];
 		const body = payload?.body;
 		const content =
@@ -761,6 +762,7 @@ export class ChatDaemonRuntime {
 					...(notification.type === "action_needed"
 						? { actionId: notification.id, options: notification.options }
 						: {}),
+					...(keepLiteral ? { literal: true as const } : {}),
 				}),
 			);
 		if (this.#slack)
@@ -771,6 +773,7 @@ export class ChatDaemonRuntime {
 					notification.type === "action_needed" && notification.kind === "ask" ? notification.id : undefined,
 					attachment.generation,
 					publicationId,
+					keepLiteral,
 				),
 			);
 	}

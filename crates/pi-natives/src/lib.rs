@@ -68,6 +68,7 @@ pub mod task;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod text;
+pub mod tty_raw_mode;
 pub mod tty_writer;
 pub(crate) mod utils;
 pub mod workspace;
@@ -280,7 +281,7 @@ mod runtime_tests {
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_18_12")]
+#[napi(js_name = "__piNativesV0_19_2")]
 pub const fn pi_natives_version_sentinel() {}
 
 /// Publish-result wire-contract sentinel.

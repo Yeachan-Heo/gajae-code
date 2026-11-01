@@ -117,9 +117,9 @@ describe("Kiro OAuth reasoning", () => {
 		};
 
 		expect(conversationState.profileArn).toBe(PROFILE_ARN);
-		expect(conversationState.currentMessage.userInputMessage.content).toBe(
-			"<thinking_mode>enabled</thinking_mode><max_thinking_length>30000</max_thinking_length>\n\nSummarize this",
-		);
+		// When native reasoning is enabled (Claude 4.6+), the prompt prefix is not applied
+		// because additionalModelRequestFields handles the thinking configuration
+		expect(conversationState.currentMessage.userInputMessage.content).toBe("Summarize this");
 		expect(message.content).toEqual([
 			{ type: "text", text: "Answer " },
 			{ type: "thinking", thinking: "private thought" },

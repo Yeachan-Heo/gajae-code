@@ -142,6 +142,12 @@ function isAiCatalogModelPath(changedPath: string): boolean {
 }
 
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
+	"packages/coding-agent/src/prompts/agent-fragments/browser-aside.md": [
+		"packages/coding-agent/test/sdk-browser-aside-backend.test.ts",
+	],
+	"packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md": [
+		"packages/coding-agent/test/gjc-runtime/ralplan-worktree-root.test.ts",
+	],
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
 	"packages/agent/src/agent.ts": [
 		"packages/agent/test/agent-force-abort.test.ts",
@@ -1014,6 +1020,10 @@ export function planTasks(
 	// embedded index is generated from, so either side changing must run its gate.
 	// The gate loads the generated corpus through the package barrel, so it is a
 	// native consumer and must bring its own producer.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 		addNativeBuild(tasks);
@@ -1124,10 +1134,14 @@ export function planTargetedTasks(
 	validateTestPaths = false,
 ): Task[] {
 	const tasks = new Map<string, Task>();
-	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath) || isRuntimeMarkdownPath(changedPath));
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
 	// index is generated from, so shipping the edit without regenerating that index is
 	// the one drift class a docs-only PR can introduce. Select just its gate.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 	}
@@ -1214,16 +1228,19 @@ export function planTargetedTasks(
 			addCodingAgentSdkProductionHostTask(tasks);
 		}
 
-		if (mappedTests.length > 0) {
+		// Lint/typecheck is cheap and test mapping never covers it: every touched
+		// package gets its check, even when a mapped test replaces its suite.
+		const owner = owningPackage(changedPath, packages);
+		if (owner?.manifest.scripts?.check) {
+			add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+		}
+
+		if (mappedTests.length > 0 || (changedPath.endsWith(".md") && behavioralTestsFor(changedPath).length > 0)) {
 			continue;
 		}
 
-		const owner = owningPackage(changedPath, packages);
 		if (owner) {
-			if (owner.manifest.scripts?.check) {
-				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
-			}
-			if (isCodingAgentRuntimePath(changedPath)) {
+			if (isCodingAgentRuntimePath(changedPath) || isRuntimeMarkdownPath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
@@ -1376,7 +1393,11 @@ function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
 // collisions fall back to package-level checks instead of selecting arbitrary tests.
 function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
 	if (isTestFilePath(changedPath)) {
-		return testFiles.includes(changedPath) ? [changedPath] : [];
+		// Discovery can miss a test added in this diff. An existing package test is
+		// still its own focused task. A deleted path is in neither the index nor the
+		// checkout, so it stays off the plan.
+		if (testFiles.includes(changedPath) || packageTestExists(changedPath)) return [changedPath];
+		return [];
 	}
 	const base = path.posix.basename(changedPath).replace(/\.(tsx?|jsx?|mts|cts)$/, "");
 	if (base === "") {
@@ -1391,10 +1412,14 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 	return matches.length === 1 ? matches : [];
 }
 
-// Resolve explicit behavioral-owner tests. Unlike mappedTestsFor(), these tests
-// are additive because an entrypoint's package-level check and smoke coverage
-// remain necessary even when it owns a dedicated contract test.
+// Resolve explicit behavioral-owner tests. These supplement package checks and
+// smoke coverage for code entrypoints. Bundled Markdown uses its mapped consumer
+// tests instead of CLI smoke; its owning-package check is still required.
 function behavioralTestsFor(changedPath: string): readonly string[] {
+	if (changedPath.endsWith(".md") && (
+		changedPath.startsWith("packages/coding-agent/src/prompts/agents/") ||
+		changedPath.startsWith("packages/coding-agent/src/defaults/gjc/")
+	)) return ["packages/coding-agent/test/default-gjc-definitions.test.ts"];
 	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
 }
 
@@ -1418,6 +1443,12 @@ function ensureNativeBuild(tasks: Map<string, Task>): void {
 	}
 }
 
+// PR targeting must keep bundled source input. Push planning already discovers
+// its owning package and deliberately retains its broader validation policy.
+function isRuntimeMarkdownPath(changedPath: string): boolean {
+	return changedPath.endsWith(".md") && ["packages/coding-agent/src/", "packages/agent/src/", "packages/ai/src/"].some(prefix => changedPath.startsWith(prefix));
+}
+
 export function isDocOrChangelogPath(changedPath: string): boolean {
 	return changedPath.endsWith(".md") || changedPath.startsWith("docs/") || changedPath.startsWith(".gjc/");
 }
@@ -1432,6 +1463,26 @@ function isEmbeddedDocsSourcePath(changedPath: string): boolean {
 
 function isTestFilePath(changedPath: string): boolean {
 	return /\.test\.tsx?$/.test(changedPath);
+}
+
+export function isPackageTestPath(changedPath: string): boolean {
+	return changedPath.startsWith("packages/") && !changedPath.includes("node_modules/") && /\.test\.tsx?$/.test(changedPath);
+}
+
+function packageTestExists(changedPath: string): boolean {
+	if (!isPackageTestPath(changedPath)) return false;
+	if (changedPath.split("/").some(part => part === "" || part === "." || part === "..")) return false;
+	return fsSync.existsSync(path.join(repoRoot, changedPath));
+}
+
+/** Existing package tests with no `test:<path>` task. A path that is not on disk is not an omission. */
+export function omittedPackageTestPaths(
+	paths: readonly string[],
+	taskKeys: readonly string[],
+	fileExists: (changedPath: string) => boolean = packageTestExists,
+): string[] {
+	const keys = new Set(taskKeys);
+	return paths.filter(changedPath => isPackageTestPath(changedPath) && fileExists(changedPath) && !keys.has(`test:${changedPath}`));
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
@@ -2306,6 +2357,10 @@ async function loadCanonicalPlan(): Promise<Task[] | null> {
 		new Set(tasks.map(task => task.key)).size !== tasks.length ||
 		new Set(tasks.map(task => task.identity)).size !== tasks.length
 	) throw new Error("affected-plan-invalid: duplicate task key or identity");
+	if (decoded.mode === "pr") {
+		const omitted = omittedPackageTestPaths(paths, tasks.map(task => task.key));
+		if (omitted.length > 0) throw new Error(`affected-plan-invalid: changed package test omitted from canonical plan: ${omitted.join(", ")}`);
+	}
 	const matrixKey = Bun.env.CI_DEV_MATRIX_KEY?.trim();
 	if (matrixKey) {
 		const task = tasks.find(candidate => candidate.key === matrixKey);

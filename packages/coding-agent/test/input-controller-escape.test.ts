@@ -7,6 +7,7 @@ import {
 	AVAILABILITY_GATED_NAV_PALETTE_ACTIONS,
 	InputController,
 } from "@gajae-code/coding-agent/modes/controllers/input-controller";
+import { PromptSuggestionController } from "@gajae-code/coding-agent/modes/prompt-suggestion-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type {
 	ComposerSubmissionOptions,
@@ -1186,6 +1187,59 @@ describe("InputController escape behavior", () => {
 
 		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
 		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+	});
+	it("spends Esc on dismissing a prompt suggestion before arming the empty-editor double Esc", () => {
+		const { ctx, editor } = createContext();
+		let active = true;
+		const tryCancelOnEscape = vi.fn(() => {
+			const consumed = active;
+			active = false;
+			return consumed;
+		});
+		ctx.promptSuggestion = { tryCancelOnEscape } as unknown as InteractiveModeContext["promptSuggestion"];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		editor.onEscape?.();
+		expect(tryCancelOnEscape).toHaveBeenCalledTimes(2);
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+
+		editor.onEscape?.();
+		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
+	});
+	it("clears a draft on double Esc even while a hidden prompt suggestion is pending", () => {
+		const { ctx, editor, spies } = createContext();
+		const suggestionCtx = {
+			settings: { get: (key: string) => key === "promptSuggestions" },
+			shutdownRequested: false,
+			compactionQueuedMessages: [],
+			hasActiveBtw: () => false,
+			editor: ctx.editor,
+			ui: ctx.ui,
+			session: {
+				get isStreaming() {
+					return ctx.session.isStreaming;
+				},
+				getLastAssistantMessage: () => ({ role: "assistant", stopReason: "stop" }),
+				getQueuedMessageEntries: () => [],
+				runEphemeralTurn: () => new Promise(() => {}),
+			},
+		} as unknown as InteractiveModeContext;
+		const suggestion = new PromptSuggestionController(suggestionCtx);
+		ctx.promptSuggestion = suggestion;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		suggestion.onAgentEnd("completed");
+		expect(suggestion.active).toBe(true);
+		editor.setText("draft message");
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(suggestion.active).toBe(false);
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
 	});
 	it("interrupts a running bash command even when the composer contains a draft", () => {
 		const { ctx, editor, spies } = createContext();

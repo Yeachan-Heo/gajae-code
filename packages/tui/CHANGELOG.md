@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- File autocomplete labels and descriptions no longer send terminal control sequences from repository file or directory names. The inserted completion value stays the on-disk path.
+
+- Preserve text before a yanked combining character when cycling the kill ring in Input and SecretInput.
+
+- Markdown source is sanitized before parsing so code fences and inline text cannot emit terminal control sequences.
+
+- A mouse drag selection that starts after other text on a padded row now highlights only the selected cells. The copied text was already correct, but the drag-origin marker was spliced in by slicing the painted row twice, which pulled the reverse-video escape into the prefix and highlighted from the start of the row.
+
+- OSC 9 and OSC 99 notifications drop C0, DEL, and C1 characters before the message is placed in the parameter.
+
+- Settings list rows and text-field prefills no longer send terminal control sequences; an untouched confirm keeps the stored value, and an edit commits the submitted text.
+
+## [0.19.0] - 2026-10-22
+
+### Fixed
+
+- Kitty and iTerm2 image encoders now reject a payload that is not RFC 4648 base64 before writing the terminal escape, so an early APC or OSC terminator in the image data cannot inject further control sequences.
+
+- Normalize local Markdown links to absolute, percent-encoded `file://` OSC 8 destinations, resolving relative paths from the active working directory and `~/` paths from the home directory. Link destinations are read as URI references, so percent-escapes are decoded and `#fragment` / `?query` suffixes (for example `src/file.ts#L12`) stay URI components. Network-path references (`//host/path`) are left unchanged rather than read as local absolute paths. Targets containing control characters remain non-clickable.
+
+- The Gajae Pet sprite is uploaded as a single-escape lossless PNG instead of chunked kitty raw RGBA (`f=32`), and every kitty escape is bounded to the protocol's 4096-byte limit in both the pet and inline-image paths. A pet animation frame used to emit several ~4 KB raw-RGBA chunk continuations per tick; when the terminal dropped one mid-payload the remaining base64 was painted into the transcript as text and the frame desynchronized. A sprite frame now costs a few hundred payload characters inside one complete escape.
+
 ## [0.18.12] - 2026-10-16
 
 ### Added

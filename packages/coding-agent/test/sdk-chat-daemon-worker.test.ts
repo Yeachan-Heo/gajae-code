@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -23,6 +24,16 @@ import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/s
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
+
+/** Darwin and Windows broker startup shells out for a machine id. Linux reads a file. */
+function hardwareIdToolOnPath(): boolean {
+	const name = process.platform === "win32" ? "reg.exe" : process.platform === "darwin" ? "ioreg" : "";
+	if (!name) return true;
+	return (process.env.PATH ?? "")
+		.split(path.delimiter)
+		.filter(Boolean)
+		.some(dir => existsSync(path.join(dir, name)));
+}
 
 async function withStageTimeout<T>(label: string, promise: Promise<T>, timeoutMs = 15_000): Promise<T> {
 	const timeout = Promise.withResolvers<T>();
@@ -355,7 +366,7 @@ async function deliverLeanFinalThroughProductionHost(
 	return count();
 }
 
-describe("chat daemon worker", () => {
+describe.skipIf(!hardwareIdToolOnPath())("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
 		if (root) await fs.rm(root, { recursive: true, force: true });
@@ -485,6 +496,11 @@ describe("chat daemon worker", () => {
 			},
 		);
 
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			'notifications:\n  discord:\n    authorizedUserId: "human"\n',
+		);
 		const replayedThread = provider.waitForThreadCount(1);
 		await runtime.start();
 		await client.waitForRequest(frame => frame.type === "event_replay");
@@ -1615,6 +1631,11 @@ describe("chat daemon worker", () => {
 					},
 				},
 			);
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				'notifications:\n  discord:\n    authorizedUserId: "human"\n',
+			);
 			const replayedThread = provider.waitForThreadCount(1);
 			await runtime.start();
 			expect(provider.started).toBe(true);
@@ -1674,6 +1695,7 @@ describe("chat daemon worker", () => {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
+			const endpointGeneration = await host.readGeneration();
 			const endpointIdentity = await fs.stat(path.join(root, ".gjc", "state", "sdk", `${host.sessionId}.json`), {
 				bigint: true,
 			});
@@ -1725,7 +1747,7 @@ describe("chat daemon worker", () => {
 					type: "host_registered",
 					sessionId: host.sessionId,
 					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
-					endpointGeneration: 1,
+					endpointGeneration,
 					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
 				});
@@ -1738,12 +1760,12 @@ describe("chat daemon worker", () => {
 					channelId: "channel",
 					rootTs: "root",
 					sessionId: host.sessionId,
-					endpointGeneration: 1,
+					endpointGeneration,
 					// Derive through the Router's identity helper using the exact host
 					// process tuple; hand-rolled or test-runner pids create stale roots.
 					attachmentAuthorityId: sessionAttachmentAuthorityId({
 						sessionId: host.sessionId,
-						generation: 1,
+						generation: endpointGeneration,
 						pid: host.endpoint.pid,
 						endpointMtimeMs: host.endpointMtimeMs,
 						url: host.endpoint.url,

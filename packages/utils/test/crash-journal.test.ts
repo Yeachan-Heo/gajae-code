@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseCrashRecordMarker } from "../src/crash-fingerprint";
+import { CRASH_FINGERPRINT_VERSION, parseCrashRecordMarker } from "../src/crash-fingerprint";
 import {
 	appendCrashEvent,
 	CRASH_EVENT_MAX_BYTES,
@@ -162,12 +162,13 @@ describe("recordFatalCrash identity", () => {
 		const markerLine = contents.split("\n").find(line => line.startsWith("gjc-crash-record.v1 "));
 		const marker = parseCrashRecordMarker(markerLine ?? "");
 		expect(marker?.fingerprint).toMatch(/^[0-9a-f]{32}$/);
-		expect(marker?.version).toBe(1);
+		expect(marker?.version).toBe(CRASH_FINGERPRINT_VERSION);
 
 		const journal = fs.readFileSync(path.join(dir, "gjc-crash-events.jsonl"), "utf8");
 		const event = parseCrashEventLine(journal.split("\n")[0] ?? "");
 		expect(event?.kind).toBe("occurrence");
 		expect(event && "fingerprint" in event ? event.fingerprint : undefined).toBe(marker?.fingerprint ?? "");
+		expect(event && "fpv" in event ? event.fpv : undefined).toBe(marker?.version);
 	});
 
 	it("keeps the identity line even when the record body is truncated", () => {

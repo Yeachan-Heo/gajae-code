@@ -29,13 +29,24 @@ function createContainer() {
 	};
 }
 
-const agentDir = path.join(process.cwd(), "empty-agent");
+const agentDir = process.env.GJC_SHARE_AGENT_DIR ?? path.join(process.cwd(), "empty-agent");
 await fs.mkdir(agentDir, { recursive: true });
 setAgentDir(agentDir);
 
 const moveTo = process.env.GJC_SHARE_MOVE_TO;
 if (moveTo) setProjectDir(moveTo);
 
+const projectRoot = process.env.GJC_SHARE_PROJECT_ROOT;
+const bunfigPreloadMarker = process.env.GJC_SHARE_BUNFIG_MARKER;
+if (projectRoot && bunfigPreloadMarker) {
+	const preloadPath = path.join(projectRoot, "bunfig-share-preload.ts");
+	await fs.writeFile(
+		preloadPath,
+		`import * as fs from "node:fs/promises";\nawait fs.writeFile(${JSON.stringify(bunfigPreloadMarker)}, "executed");\n`,
+		"utf8",
+	);
+	await fs.writeFile(path.join(projectRoot, "bunfig.toml"), `preload = [${JSON.stringify(preloadPath)}]\n`, "utf8");
+}
 requireEnv("GH_HOST", process.env.GJC_SHARE_EXPECT_HOST);
 requireEnv("GH_CONFIG_DIR", process.env.GJC_SHARE_EXPECT_CONFIG);
 
@@ -56,7 +67,7 @@ const ctx = {
 	editorContainer,
 	ui: { setFocus() {}, requestRender() {} },
 	showError(message: string) {
-		console.error(`SHARE_ERROR ${message}`);
+		process.stderr.write(`SHARE_ERROR ${message}\n`);
 	},
 	showStatus() {},
 } as unknown as InteractiveModeContext;

@@ -331,6 +331,7 @@ describe("/provider preset CLI surface", () => {
 			"ionet",
 			"litellm",
 			"openai-compatible-proxy",
+			"runcrate",
 		]);
 	});
 });

@@ -816,7 +816,9 @@ test("retries native access-denied staging cleanup within the shared acquisition
 
 	try {
 		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
-		await expect(acquireFileLock(file, { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		await expect(
+			acquireFileLock(file, { retries: 2, retryDelayMs: 1, ownerHostId: "staging-owner-host" }),
+		).rejects.toMatchObject({
 			name: "FileLockAcquireError",
 			code: "acquire_timeout",
 			publicationFailureCode: "access_denied",
@@ -1255,7 +1257,9 @@ test("reaps an empty staging directory after info identity retries exhaust", asy
 
 	try {
 		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
-		await expect(acquireFileLock(file, { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		await expect(
+			acquireFileLock(file, { retries: 2, retryDelayMs: 1, ownerHostId: "staging-owner-host" }),
+		).rejects.toMatchObject({
 			message: "persistent staging info stat denial",
 			code: "EACCES",
 		});
@@ -1265,10 +1269,12 @@ test("reaps an empty staging directory after info identity retries exhaust", asy
 		if (!pendingName) throw new Error("expected the staging root to remain after transient cleanup denial");
 		const pendingPath = path.join(root, pendingName);
 		expect(await fs.readdir(pendingPath)).toEqual([]);
+		const expiredAt = new Date(Date.now() - 61_000);
+		await fs.utimes(pendingPath, expiredAt, expiredAt);
 
 		FileLockTestHooks.cleanupPendingStaging = undefined;
 		FileLockTestHooks.processIncarnation = () => "staging-owner-after-exit";
-		const reaped = await reapOrphanedLockStagingDirs(lock);
+		const reaped = await reapOrphanedLockStagingDirs(lock, { ownerHostId: "staging-owner-host" });
 		expect(reaped.removed).toContain(pendingPath);
 		await expect(fs.lstat(pendingPath)).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {

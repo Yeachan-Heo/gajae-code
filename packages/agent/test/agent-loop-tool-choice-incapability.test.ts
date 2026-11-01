@@ -30,7 +30,7 @@ describe("agent-loop toolChoiceIncapability handling", () => {
 
 		const received: Array<Extract<AssistantMessageEvent, { type: "toolChoiceIncapability" }>> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onToolChoiceIncapability: event => {
 				received.push(event);
@@ -84,7 +84,7 @@ describe("agent-loop toolChoiceIncapability handling", () => {
 	it("ignores the event silently when no callback is configured", async () => {
 		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
 		const mock = createMockModel({ responses: [{ content: ["fine"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const streamFn = (...args: Parameters<typeof mock.stream>) => {
 			const inner = mock.stream(...args);

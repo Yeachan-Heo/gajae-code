@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { ToolAbortError, ToolError } from "../tool-errors";
@@ -352,6 +353,8 @@ export async function openChromeProfileHandle(
 		const port = kind.cdpPort ?? (await findFreeCdpPort());
 		const launchArgs = buildChromeProfileLaunchArgs(kind, opts.appArgs, port);
 		const child = Bun.spawn([exe, ...launchArgs], {
+			// Bun otherwise hands the browser the autoloaded environment, project `.env` included.
+			env: projectSafeSpawnEnv(),
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -421,6 +424,8 @@ async function openSpawnedBrowserHandle(
 		const port = await findFreeCdpPort();
 		const launchArgs = [...(opts.appArgs ?? []), `--remote-debugging-port=${port}`];
 		const child = Bun.spawn([exe, ...launchArgs], {
+			// Bun otherwise hands the browser the autoloaded environment, project `.env` included.
+			env: projectSafeSpawnEnv(),
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",

@@ -971,6 +971,27 @@ export async function readBrokerSpawnLogTail(spawnLogPath: string): Promise<stri
 	}
 }
 
+/**
+ * A startup-failure marker can be published before the broker finishes writing
+ * its final stderr diagnostics. Wait for that exact process to exit before
+ * sampling the inherited log descriptor; cleanup reaps it if the bounded wait
+ * expires.
+ */
+async function waitForBrokerExitBeforeReadingSpawnLog(
+	pid: number | undefined,
+	incarnation: string | undefined,
+	timeoutMs: number,
+): Promise<void> {
+	if (pid === undefined || incarnation === undefined || timeoutMs <= 0) return;
+	try {
+		const brokerProcess = nativeProcessBindings().Process.fromPid(pid);
+		if (!brokerProcess || brokerProcess.incarnation !== incarnation) return;
+		await brokerProcess.waitForExit({ timeoutMs });
+	} catch {
+		// Diagnostic draining must not prevent the owned broker from being reaped.
+	}
+}
+
 async function removeBrokerSpawnLog(spawnLogPath: string): Promise<void> {
 	try {
 		await fs.unlink(spawnLogPath);
@@ -1813,6 +1834,21 @@ async function ensureBrokerOnce(
 				await ensureBrokerTiming.sleep(50);
 			}
 		}
+		if (exitedBeforeDiscovery) {
+			await waitForBrokerExitBeforeReadingSpawnLog(
+				realBrokerPid,
+				childIncarnation,
+				Math.max(0, Math.floor(deadline - ensureBrokerTiming.now())),
+			);
+		}
+		let cleanupFailed = false;
+		let cleanupError: unknown;
+		try {
+			await owner.stop();
+		} catch (error) {
+			cleanupFailed = true;
+			cleanupError = error;
+		}
 		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
 		// A marker only wins over the generic fallback when it was written by the
 		// exact child this call just spawned and reaped. The pre-spawn clear
@@ -1833,9 +1869,7 @@ async function ensureBrokerOnce(
 				: discoveryError
 					? discoveryError
 					: new Error("Timed out waiting for detached SDK broker discovery.");
-		try {
-			await owner.stop();
-		} catch (cleanupError) {
+		if (cleanupFailed) {
 			throw new AggregateError(
 				[failure, cleanupError],
 				"SDK broker discovery and spawned broker cleanup both failed.",

@@ -244,6 +244,87 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
 	});
 
+	async function retainedReplaceFixture(root: string) {
+		const source = path.join(root, "staged.exe");
+		const destination = path.join(root, "gjc.exe");
+		await fs.writeFile(source, "new-binary");
+		await fs.writeFile(destination, "old-binary");
+		const parent = await parentIdentity(source);
+		const identity = async (pathname: string, contents: string) => {
+			const stat = await fs.stat(pathname, { bigint: true });
+			return {
+				...parent,
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256(contents),
+			};
+		};
+		return {
+			source,
+			destination,
+			replace: async () =>
+				exactReplaceRetained(
+					source,
+					destination,
+					"gjc.exe.backup",
+					await identity(source, "new-binary"),
+					await identity(destination, "old-binary"),
+				),
+		};
+	}
+
+	// What a default %LOCALAPPDATA%\gjc install inherits (#6096, #6916).
+	async function applyDefaultProfileDacl(pathname: string, user: string): Promise<void> {
+		await runIcacls(pathname, "/inheritance:r", "/grant:r", `${user}:F`, "*S-1-5-18:F", "*S-1-5-32-544:F");
+	}
+
+	it("publishes over an executable carrying the default profile DACL and an Administrators owner", async () => {
+		// An elevated token's default owner is BUILTIN\Administrators, and the
+		// profile DACL grants SYSTEM and Administrators full control. Both are
+		// trusted principals, so a stock elevated install must update.
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const root = await temporaryDirectory();
+		const fixture = await retainedReplaceFixture(root);
+		for (const pathname of [fixture.source, fixture.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			await runIcacls(pathname, "/setowner", "*S-1-5-32-544");
+		}
+
+		const result = await fixture.replace();
+
+		expect(result.code).toBeUndefined();
+		expect(result.ok).toBe(true);
+		expect(await fs.readFile(fixture.destination, "utf8")).toBe("new-binary");
+		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
+	});
+
+	it("accepts a read/execute grant for another principal but refuses a shared write grant", async () => {
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const readOnlyRoot = await temporaryDirectory();
+		const readOnly = await retainedReplaceFixture(readOnlyRoot);
+		for (const pathname of [readOnly.source, readOnly.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			// (RX) carries SYNCHRONIZE; it must not count as a write grant (#6096).
+			await runIcacls(pathname, "/grant", "*S-1-5-32-545:RX");
+		}
+		expect(await readOnly.replace()).toMatchObject({ ok: true });
+
+		const sharedRoot = await temporaryDirectory();
+		const shared = await retainedReplaceFixture(sharedRoot);
+		for (const pathname of [shared.source, shared.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			await runIcacls(pathname, "/grant", "*S-1-5-32-545:M");
+		}
+		expect(await shared.replace()).toMatchObject({ ok: false, code: "acl_present" });
+		expect(await fs.readFile(shared.destination, "utf8")).toBe("old-binary");
+		expect(await fs.readFile(shared.source, "utf8")).toBe("new-binary");
+	});
+
 	it("retries a transient destination sharing violation and succeeds after the holder releases", async () => {
 		// Issue #4330: a concurrent holder that denies delete sharing on the
 		// destination makes the exact-replace destination open fail with

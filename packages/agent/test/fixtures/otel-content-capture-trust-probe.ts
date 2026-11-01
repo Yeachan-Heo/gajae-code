@@ -6,6 +6,7 @@ import { GenAIAttr, PiGenAIAttr } from "@gajae-code/agent-core/telemetry";
 import type { AgentContext, AgentLoopConfig, AgentMessage } from "@gajae-code/agent-core/types";
 import type { Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { setProjectDir } from "@gajae-code/utils";
 import { context, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
@@ -24,6 +25,8 @@ async function main(): Promise<void> {
 	// "delete" removes the key after import and before the first loop.
 	if (beforeLoop === "delete") delete process.env[ENV_NAME];
 	else if (beforeLoop !== undefined) process.env[ENV_NAME] = beforeLoop;
+	const moveTo = process.env.OTEL_CAPTURE_TRUST_MOVE_TO;
+	if (moveTo !== undefined) setProjectDir(moveTo);
 	trace.disable();
 	context.disable();
 	const contextManager = new AsyncLocalStorageContextManager().enable();

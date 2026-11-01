@@ -657,8 +657,7 @@ describe("Cursor raw transport watchdog", () => {
 
 	it("applies backpressure to a coalesced burst without dropping raw progress or partial usage", async () => {
 		const baseUrl = await createCursorServer(stream => {
-			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
-			setTimeout(() => {
+			stream.once("data", () => {
 				const frames: Buffer[] = [];
 				for (let index = 0; index < 300; index += 1) {
 					const message =
@@ -686,7 +685,8 @@ describe("Cursor raw transport watchdog", () => {
 					}),
 				);
 				stream.end(Buffer.concat(frames));
-			}, 10);
+			});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
 		});
 
 		const { events, result } = await collectTerminal(baseUrl, {

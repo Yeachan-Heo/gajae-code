@@ -23,7 +23,7 @@ A server is loaded at startup when all of the following hold:
 
 - the server is not marked `enabled: false`;
 - the server name is not in the `disabledServers` list of either native config scope (`<agent dir>/mcp.json` or `./.gjc/mcp.json`);
-- the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server stored but unloaded at startup — flip the flag and start a new session to load it);
+- the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server stored but unloaded at startup — flip the flag and start a new session, or use `/mcp connect <name>` from an eligible interactive session);
 - project-scope HTTP and SSE servers load by default. A project stdio server is spawned only when the user config sets `mcp.enableProjectConfig` to true. A project settings file cannot set that flag. Setting it to false in the user config disables every project-scope source.
 
 Conventional discovery logs a structured `Skipping MCP autoload registration`
@@ -67,20 +67,30 @@ mcp:
 
 ## Public slash-command boundary
 
-The ordinary interactive TUI and ACP slash-command surfaces intentionally do not
-register a top-level `/mcp` command. On those surfaces `/mcp test`, `/mcp reauth`,
-`/mcp reconnect`, and `/mcp reload` are not supported user-input entry points.
-Use `gjc mcp add`, `gjc mcp list`, or `gjc mcp remove` to manage stored
-registrations and start a new session.
+Ordinary interactive sessions without the MCP session-control capability, and all
+ACP sessions, do not register a top-level `/mcp` command. On those surfaces
+`/mcp test`, `/mcp reauth`, `/mcp reconnect`, and `/mcp reload` are not
+supported user-input entry points. Use `gjc mcp add`, `gjc mcp list`, or
+`gjc mcp remove` to manage stored registrations and start a new session.
+
+A conventional interactive root session with the capability exposes
+`/mcp status`, `/mcp list`, `/mcp connect <name>`, `/mcp disconnect <name>`,
+and `/mcp reconnect <name>`. It controls only servers declared in the native
+GJC user or project `.gjc` `mcp.json` files, subject to the same startup gates:
+`enabled: false`, `disabledServers`, and unapproved project stdio servers are
+refused. These controls are runtime-only and never write `mcp.json`; `/new` and
+session switches restore the startup policy. They are unavailable in ACP, print
+modes, SDK sessions, and subagents.
 
 An interactive session started with exact-file `--mcp-config` is the exception:
 it exposes the session-scoped `/mcp` status and control command for the servers
 in that exact config, including `/mcp suspend <name>`, `/mcp resume <name>`, and
-`/mcp reconnect <name>`. `--mcp-config` and the SDK's `mcpConfigPath` are
-explicit connection-consumer entry points for a trusted config; they do not
-initiate MCP OAuth authorization. Existing credentials bound through `auth` may
-be refreshed by the runtime, but there is no public MCP OAuth authorization or
-reauthorization entry path, and no `/mcp reload` contract.
+`/mcp reconnect <name>`; `--mcp-config` keeps that exact surface.
+`--mcp-config` and the SDK's `mcpConfigPath` are explicit connection-consumer
+entry points for a trusted config; they do not initiate MCP OAuth authorization.
+Existing credentials bound through `auth` may be refreshed by the runtime, but
+there is no public MCP OAuth authorization or reauthorization entry path, and no
+`/mcp reload` contract.
 
 ## Subagents and lifecycle
 

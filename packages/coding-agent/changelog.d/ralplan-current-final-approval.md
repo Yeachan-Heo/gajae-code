@@ -1,3 +1,0 @@
-### Fixed
-
-- The Ultragoal ask guard no longer deadlocks the one question that can unblock a blocked goal: an ask that selects the `ralplan` / `approval` workflow gate is now admitted when this session's current ralplan final validates. Validation re-hashes every persisted stage artifact against `index.jsonl`, requires an iteration opener before the final, requires architect and critic verdicts from the same iteration, requires the final to be the newest stage, and requires `autoHandoff` to be `off`; anything missing, stale, rewritten, or outside the session's run directory is refused with the reason. Ordinary asks and incomplete-goal guards are unchanged, and `AskTool` still authenticates the publication it records consent against.

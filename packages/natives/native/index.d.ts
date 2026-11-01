@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -687,7 +686,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_18_12(): void
+export declare function __piNativesV0_19_2(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -2303,6 +2302,23 @@ export interface NativeExactUnlinkResult {
    * namespace mutation.
    */
   windowsErrorCode?: string
+  /**
+   * ACL failure details: offending principal (account name or SID string).
+   * Present only when code is "acl_present" on Windows exact-replace
+   * pre-mutation failures.
+   */
+  aclFailurePrincipal?: string
+  /**
+   * ACL failure detail: whether the offending ACE is inherited from a parent
+   * directory. Present only when code is "acl_present" on Windows
+   * exact-replace pre-mutation failures.
+   */
+  aclFailureInherited?: boolean
+  /**
+   * ACL failure detail: identifies which path failed ACL validation ("source" or "destination").
+   * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+   */
+  aclFailureSide?: string
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */
@@ -2315,6 +2331,16 @@ export interface NativeNoReplaceResult {
   primitive: string
   phase: string
   diagnostic: NativePublishDiagnostic
+}
+
+/**
+ * Bounded, read-only owner-private file bytes. Failures never contain paths or
+ * bytes.
+ */
+export interface NativeOwnerOnlyFileReadResult {
+  ok: boolean
+  data?: Uint8Array
+  code?: string
 }
 
 /** Result of applying or checking owner-only path security. */
@@ -2671,6 +2697,27 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  * Returns an error if clipboard access fails or image encoding fails.
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
+
+/**
+ * Read a private regular file under a private lifecycle directory on
+ * macOS/Linux.
+ *
+ * `max_bytes` must be an integer in 1..=65536. Both
+ * same-descriptor reads are bounded; no path, digest, descriptor, or partial
+ * bytes are returned on failure.
+ */
+export declare function readOwnerOnlyFile(path: string, maxBytes: number): NativeOwnerOnlyFileReadResult
+
+/**
+ * Re-apply raw mode to `fd` when a direct termios change left it cooked.
+ *
+ * Applies the transform Bun's `setRawMode(true)` uses (libuv's
+ * `UV_TTY_MODE_RAW`) to the live termios with `TCSANOW`, so the tty never
+ * enters an echoing mode. Returns `true` when it had to restore raw mode.
+ * Returns `false` when the tty was already raw, and in that case issues no
+ * `tcsetattr`. Throws when `fd` is not a tty and on non-Unix hosts.
+ */
+export declare function reassertRawTty(fd: number): boolean
 
 export interface RecoveryFsIdentity {
   dev: string

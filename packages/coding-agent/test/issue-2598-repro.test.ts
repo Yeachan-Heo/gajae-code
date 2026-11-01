@@ -159,7 +159,7 @@ function expectGraphNotToContain(graph: Map<string, string[]>, file: string): vo
 
 /**
  * The runtime test is host evidence only: it exercises source-worker startup
- * on the current platform without launching Chrome. macos-14 hosted execution
+ * on the current platform without launching Chrome. macos-15 hosted execution
  * of `gjc --smoke-test` remains the Darwin compiled-binary contract.
  */
 describe("issue #2598 — tab worker source and compiled smoke contract", () => {
