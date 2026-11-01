@@ -431,50 +431,168 @@ export interface ResolvedSkillSlashCommand {
 	skill: Skill;
 }
 
-export interface ParsedSkillInvocation {
+export interface ParsedSkillInvocation<TSkill extends Pick<Skill, "name"> = Skill> {
 	commandName: string;
 	args: string;
-	skill: Skill;
+	skill: TSkill;
 }
 
-interface SkillTokenMatch {
+interface SkillTokenMatch<TSkill extends Pick<Skill, "name"> = Skill> {
 	index: number;
 	end: number;
 	commandName: string;
-	skill: Skill;
+	skill: TSkill;
 }
 
-function buildInlineSkillInvocationArgs(text: string, matches: readonly SkillTokenMatch[]): string {
+function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
+	text: string,
+	matches: readonly SkillTokenMatch<TSkill>[],
+): string {
 	const pieces: string[] = [];
 	let cursor = 0;
 	for (const match of matches) {
-		pieces.push(text.slice(cursor, match.index));
+		let prefix = text.slice(cursor, match.index);
+		// Removing the token joins the whitespace on each side. Drop only one
+		// adjacent ASCII space when that join would otherwise double a separator;
+		// preserve all other spacing, including indentation and repeated spaces.
+		if (prefix.endsWith(" ") && text[match.end] === " ") prefix = prefix.slice(0, -1);
+		pieces.push(prefix);
 		cursor = match.end;
 	}
 	pieces.push(text.slice(cursor));
-	return pieces
-		.join("")
-		.replace(/[ \t]{2,}/g, " ")
-		.replace(/[ \t]+\n/g, "\n")
-		.replace(/\n[ \t]+/g, "\n")
-		.trim();
+	return pieces.join("");
 }
 
-export function parseSkillInvocations(
+/**
+ * Build a single-pass span tracking for all code blocks and inline spans.
+ * Returns a function that checks if a position is inside a code span or fence.
+ * Per CommonMark:
+ * - An inline code span opens with a backtick run and closes with a backtick run of equal length
+ * - A fenced code block starts with a backtick run (3+) at the start of a line
+ * - A closing fence may be longer than the opener (counts as valid close)
+ * - Non-matching backtick runs inside a span are treated as literal text, not delimiters
+ */
+function buildCodeSpanChecker(text: string): (position: number) => boolean {
+	// Stack to track code spans/blocks: [openLength, isAtLineStart, startPosition]
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean, startPos: number]> = [];
+	// Set of all positions that are inside code spans/blocks
+	const insideCodePositions = new Set<number>();
+
+	for (let i = 0; i < text.length; ) {
+		if (text[i] !== "`") {
+			i += 1;
+			continue;
+		}
+
+		// Count the backtick run
+		let runEnd = i + 1;
+		while (text[runEnd] === "`") runEnd += 1;
+		const runLength = runEnd - i;
+
+		// Check if this backtick run is escaped
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		const isEscaped = backslashCount % 2 === 1;
+
+		if (isEscaped) {
+			i = runEnd;
+			continue;
+		}
+
+		// Check if this backtick run is at the start of a line
+		const isAtLineStart = i === 0 || text[i - 1] === "\n";
+
+		// Handle fenced code blocks (3+ backticks at line start)
+		if (isAtLineStart && runLength >= 3) {
+			const top = delimiterStack[delimiterStack.length - 1];
+			if (top && top[1] && runLength >= top[0]) {
+				// Closing fence: length must be >= opener (per CommonMark)
+				// and only whitespace may follow on the line
+				let closingFenceValid = true;
+				for (let j = runEnd; j < text.length && text[j] !== "\n"; j++) {
+					if (text[j] !== " " && text[j] !== "\t") {
+						closingFenceValid = false;
+						break;
+					}
+				}
+				if (closingFenceValid) {
+					const [, , openPos] = top;
+					// Mark all positions from opener to closer as inside code
+					for (let pos = openPos; pos < runEnd; pos++) {
+						insideCodePositions.add(pos);
+					}
+					delimiterStack.pop();
+				}
+			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
+				// Opening fence (only if not already inside another fence)
+				delimiterStack.push([runLength, true, i]);
+			}
+			i = runEnd;
+			continue;
+		}
+
+		// Handle inline code spans (all backticks except 3+ at line start)
+		// Don't open new inline spans inside fenced blocks
+		const insideFence = delimiterStack.length > 0 && delimiterStack[delimiterStack.length - 1]?.[1];
+		if (insideFence) {
+			// Inside a fenced block, skip non-fence backticks
+			i = runEnd;
+			continue;
+		}
+
+		// Check for closing inline code span with matching length
+		if (delimiterStack.length > 0) {
+			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+			if (!openIsAtLineStart && openLength === runLength) {
+				// Closing inline code span with matching length
+				const [, , openPos] = delimiterStack.pop()!;
+				// Mark all positions from opener to closer as inside code
+				for (let pos = openPos; pos < runEnd; pos++) {
+					insideCodePositions.add(pos);
+				}
+				i = runEnd;
+				continue;
+			}
+			// Non-matching run inside a span: treat as literal text, not a delimiter
+		} else {
+			// Opening inline code span (not a fence opener, not inside another span)
+			delimiterStack.push([runLength, false, i]);
+		}
+
+		i = runEnd;
+	}
+
+	// For any unclosed spans, mark them as code to preserve parity
+	while (delimiterStack.length > 0) {
+		const [, , openPos] = delimiterStack.pop()!;
+		for (let pos = openPos; pos < text.length; pos++) {
+			insideCodePositions.add(pos);
+		}
+	}
+
+	return (position: number) => insideCodePositions.has(position);
+}
+
+export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 	text: string,
-	skillsByCommandName: ReadonlyMap<string, Skill>,
-): ParsedSkillInvocation[] {
+	skillsByCommandName: ReadonlyMap<string, TSkill>,
+): ParsedSkillInvocation<TSkill>[] {
+	const leadingWhitespaceLength = text.length - text.trimStart().length;
 	const trimmedText = text.trim();
 	if (!trimmedText) return [];
-	const normalizedSkillsByCommandName = new Map<string, Skill>();
+	const normalizedSkillsByCommandName = new Map<string, TSkill>();
 	for (const [commandName, skill] of skillsByCommandName) {
 		const normalizedCommandName = commandName.toLowerCase();
 		if (!normalizedSkillsByCommandName.has(normalizedCommandName)) {
 			normalizedSkillsByCommandName.set(normalizedCommandName, skill);
 		}
 	}
+
+	// Build code-span checker in a single forward pass (O(N))
+	const isInsideCode = buildCodeSpanChecker(trimmedText);
+
 	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/gi;
-	const matches: SkillTokenMatch[] = [];
+	const matches: SkillTokenMatch<TSkill>[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
 		const commandName = match[2];
 		if (!commandName) continue;
@@ -482,6 +600,8 @@ export function parseSkillInvocations(
 		if (!skill) continue;
 		const leading = match[1] ?? "";
 		const index = (match.index ?? 0) + leading.length;
+		// Skip matches inside inline code spans (O(1) set lookup instead of O(N) scan)
+		if (isInsideCode(index)) continue;
 		matches.push({
 			index,
 			end: index + commandName.length + 1,
@@ -495,7 +615,12 @@ export function parseSkillInvocations(
 		// should remain plain text rather than silently skipping the unknown
 		// leading command and invoking the later known one.
 		if (trimmedText.startsWith("/")) return [];
-		const args = buildInlineSkillInvocationArgs(trimmedText, matches);
+		const rawMatches = matches.map(match => ({
+			...match,
+			index: match.index + leadingWhitespaceLength,
+			end: match.end + leadingWhitespaceLength,
+		}));
+		const args = buildInlineSkillInvocationArgs(text, rawMatches);
 		return matches.map(match => ({
 			commandName: match.commandName,
 			args,

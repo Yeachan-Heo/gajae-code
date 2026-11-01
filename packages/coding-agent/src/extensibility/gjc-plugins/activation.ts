@@ -53,21 +53,35 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		.split(/\s+/)
 		.filter(token => token.length > 0);
 	let activation: LoadedSubskillActivation | undefined;
-	const cleanedTokens: string[] = [];
 	let consumed = false;
-	for (const token of tokens) {
+	// Find the activation flag and its position to remove it while preserving
+	// other text (especially multiline structure when the flag is removed)
+	let flagTokenIndex = -1;
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
 		if (!consumed && token.startsWith("--") && !token.includes("=")) {
 			const candidate = activationsByArg.get(token.slice(2));
 			if (candidate) {
 				activation = candidate;
 				consumed = true;
-				continue;
+				flagTokenIndex = i;
+				break;
 			}
 		}
-		cleanedTokens.push(token);
+	}
+	let cleanedArgs = input.args;
+	if (consumed && flagTokenIndex >= 0) {
+		// Remove the flag from the original text by finding and deleting the exact token
+		// without normalizing other whitespace (review P2, issue #5951).
+		const flagToken = tokens[flagTokenIndex];
+		const flagPattern = new RegExp(`(^|\\s)${flagToken.replace(/[.*+?^${}()|[\\\\\]]/g, "\\$&")}(\\s|$)`);
+		cleanedArgs = input.args.replace(flagPattern, (_match, before, after) => {
+			// Preserve one whitespace boundary if present
+			return before || after ? before || after : "";
+		});
 	}
 	return {
-		cleanedArgs: consumed ? cleanedTokens.join(" ") : input.args,
+		cleanedArgs,
 		activation,
 		activeSubskillsToPersist: activation
 			? candidates.filter(

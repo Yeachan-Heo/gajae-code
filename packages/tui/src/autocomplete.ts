@@ -238,8 +238,17 @@ function normalizeSlashCommandText(value: string): string {
 		.trim()
 		.replace(/\s+/g, " ");
 }
+
+/**
+ * Find the start position of an open code span/fence that contains the end of the text.
+ * Matches the runtime parser logic from skills.ts:
+ * - Fenced code blocks start with 3+ backticks at line start
+ * - Inline code spans use matching backtick run lengths
+ * - Longer closing fences are valid
+ * - Non-matching backtick runs inside a span are literal text
+ */
 function findOpenInlineCodeSpanStart(text: string): number | null {
-	let openDelimiter: number | null = null;
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean, position: number]> = [];
 
 	for (let i = 0; i < text.length; ) {
 		if (text[i] !== "`") {
@@ -249,21 +258,155 @@ function findOpenInlineCodeSpanStart(text: string): number | null {
 
 		let runEnd = i + 1;
 		while (text[runEnd] === "`") runEnd += 1;
-		if (runEnd - i !== 1) {
+		const runLength = runEnd - i;
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		const isEscaped = backslashCount % 2 === 1;
+
+		if (isEscaped) {
 			i = runEnd;
 			continue;
 		}
 
-		let backslashCount = 0;
-		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
-		if (backslashCount % 2 === 0) openDelimiter = openDelimiter === null ? i : null;
+		const isAtLineStart = i === 0 || text[i - 1] === "\n";
+
+		// Handle fenced code blocks (3+ backticks at line start)
+		if (isAtLineStart && runLength >= 3) {
+			const top = delimiterStack[delimiterStack.length - 1];
+			if (top && top[1] && runLength >= top[0]) {
+				// Closing fence: length must be >= opener (per CommonMark)
+				// and only whitespace may follow on the line
+				let closingFenceValid = true;
+				for (let j = runEnd; j < text.length && text[j] !== "\n"; j++) {
+					if (text[j] !== " " && text[j] !== "\t") {
+						closingFenceValid = false;
+						break;
+					}
+				}
+				if (closingFenceValid) delimiterStack.pop();
+			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
+				// Opening fence (only if not already inside another fence)
+				delimiterStack.push([runLength, true, i]);
+			}
+			i = runEnd;
+			continue;
+		}
+
+		// Handle inline code spans (all backticks except 3+ at line start)
+		// Don't open new inline spans inside fenced blocks
+		const insideFence = delimiterStack.length > 0 && delimiterStack[delimiterStack.length - 1]?.[1];
+		if (insideFence) {
+			i = runEnd;
+			continue;
+		}
+
+		// Check for closing inline code span with matching length
+		if (delimiterStack.length > 0) {
+			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+			if (!openIsAtLineStart && openLength === runLength) {
+				delimiterStack.pop();
+				i = runEnd;
+				continue;
+			}
+			// Non-matching run inside a span: treat as literal text, not a delimiter
+		} else {
+			// Opening inline code span
+			delimiterStack.push([runLength, false, i]);
+		}
+
 		i = runEnd;
 	}
 
-	return openDelimiter;
+	// If there's an open delimiter at the end of the text, return its position
+	const top = delimiterStack[delimiterStack.length - 1];
+	return top ? top[2] : null;
 }
+
+/**
+ * Check if a position is inside a code span/fence.
+ * Matches the runtime parser logic from skills.ts:
+ * - Fenced code blocks start with 3+ backticks at line start
+ * - Inline code spans use matching backtick run lengths
+ * - Longer closing fences are valid
+ * - Non-matching backtick runs inside a span are literal text
+ */
+function isPositionInsideCodeSpan(text: string, position: number): boolean {
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean]> = [];
+
+	for (let i = 0; i < position && i < text.length; ) {
+		if (text[i] !== "`") {
+			i += 1;
+			continue;
+		}
+
+		let runEnd = i + 1;
+		while (text[runEnd] === "`") runEnd += 1;
+		const runLength = runEnd - i;
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		const isEscaped = backslashCount % 2 === 1;
+
+		if (isEscaped) {
+			i = runEnd;
+			continue;
+		}
+
+		const isAtLineStart = i === 0 || text[i - 1] === "\n";
+
+		// Handle fenced code blocks (3+ backticks at line start)
+		if (isAtLineStart && runLength >= 3) {
+			const top = delimiterStack[delimiterStack.length - 1];
+			if (top && top[1] && runLength >= top[0]) {
+				// Closing fence: length must be >= opener (per CommonMark)
+				// and only whitespace may follow on the line
+				let closingFenceValid = true;
+				for (let j = runEnd; j < text.length && text[j] !== "\n"; j++) {
+					if (text[j] !== " " && text[j] !== "\t") {
+						closingFenceValid = false;
+						break;
+					}
+				}
+				if (closingFenceValid) delimiterStack.pop();
+			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
+				// Opening fence (only if not already inside another fence)
+				delimiterStack.push([runLength, true]);
+			}
+			i = runEnd;
+			continue;
+		}
+
+		// Handle inline code spans (all backticks except 3+ at line start)
+		// Don't open new inline spans inside fenced blocks
+		const insideFence = delimiterStack.length > 0 && delimiterStack[delimiterStack.length - 1]?.[1];
+		if (insideFence) {
+			i = runEnd;
+			continue;
+		}
+
+		// Check for closing inline code span with matching length
+		if (delimiterStack.length > 0) {
+			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+			if (!openIsAtLineStart && openLength === runLength) {
+				delimiterStack.pop();
+				i = runEnd;
+				continue;
+			}
+			// Non-matching run inside a span: treat as literal text, not a delimiter
+		} else {
+			// Opening inline code span
+			delimiterStack.push([runLength, false]);
+		}
+
+		i = runEnd;
+	}
+
+	return delimiterStack.length > 0;
+}
+
 export function isInsideInlineCodeSpan(text: string): boolean {
-	return findOpenInlineCodeSpanStart(text) !== null;
+	return isPositionInsideCodeSpan(text, text.length);
 }
 
 export function hasInlineCodeDelimiter(text: string): boolean {
@@ -283,6 +426,12 @@ export function extractSlashCommandTokenPrefix(text: string): string | null {
 	if (isInsideInlineCodeSpan(text.slice(0, tokenStart))) return null;
 	return tokenStart === 0 || isSkillSlashCommandToken(token) ? token : null;
 }
+
+function getSkillSlashCommandPrefix(text: string): string | null {
+	const token = extractSlashCommandTokenPrefix(text);
+	return token?.toLowerCase().startsWith("/skill:") ? token : null;
+}
+
 export function isSlashCommandPromptStart(lines: string[], cursorLine: number, textBeforeCursor: string): boolean {
 	return lines.slice(0, cursorLine).every(line => line.trim() === "") && textBeforeCursor.trimStart().startsWith("/");
 }
@@ -372,12 +521,15 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return "name" in cmd ? cmd.name : cmd.value;
 	}
 
-	#getSlashCommandNameSuggestions(prefix: string): AutocompleteItem[] {
+	#getSlashCommandNameSuggestions(
+		prefix: string,
+		commands: (SlashCommand | AutocompleteItem)[] = this.#commands,
+	): AutocompleteItem[] {
 		const lowerPrefix = prefix.toLowerCase();
 		const normalizedPrefix = normalizeFuzzyText(prefix);
 		if (prefix.length > 0 && normalizedPrefix.length === 0) return [];
 
-		return this.#commands
+		return commands
 			.filter(cmd => {
 				const name = this.#getCommandName(cmd);
 				if (!name) return false;
@@ -481,6 +633,22 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			};
 		}
 
+		const promptBeforeCursor = [...lines.slice(0, cursorLine), textBeforeCursor].join("\n");
+		const skillPrefix = getSkillSlashCommandPrefix(promptBeforeCursor);
+		if (skillPrefix) {
+			const skillCommands = this.#commands.filter(command =>
+				this.#getCommandName(command).toLowerCase().startsWith("skill:"),
+			);
+			const matches = this.#getSlashCommandNameSuggestions(skillPrefix.slice(1), skillCommands);
+			if (matches.length === 0) return null;
+
+			return {
+				items: matches,
+				kind: "slash-command",
+				prefix: skillPrefix,
+			};
+		}
+
 		const pathMatch = this.#extractPathPrefix(textBeforeCursor, false);
 
 		// Check for file paths - triggered by Tab or if we detect a path pattern
@@ -522,9 +690,12 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 		const afterCursor = currentLine.slice(cursorCol);
 
-		// Slash commands are completed only at the start of the prompt.
+		// Plain slash commands and skill invocations are completed only at the start of the prompt.
 		const isSlashCommand = prefix.startsWith("/") && !prefix.slice(1).includes("/") && beforePrefix.trim() === "";
-		if (isSlashCommand) {
+		// Skill command completions should not match file path prefixes ending with "."/
+		// (review P3: distinguish file suggestions from skill-command suggestions).
+		const isSkillSlashCommand = /^\/skill:/i.test(prefix) && !prefix.endsWith("/");
+		if (isSlashCommand || isSkillSlashCommand) {
 			// This is a command name completion
 			const newLine = `${beforePrefix}/${item.value} ${afterCursor}`;
 			const newLines = [...lines];
@@ -1013,6 +1184,15 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return command.getInlineHint(argumentText);
 	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
+		const skillPrefix = getSkillSlashCommandPrefix(textBeforeCursor);
+		if (skillPrefix) {
+			const skillCommands = this.#commands.filter(command =>
+				this.#getCommandName(command).toLowerCase().startsWith("skill:"),
+			);
+			const matches = this.#getSlashCommandNameSuggestions(skillPrefix.slice(1), skillCommands);
+			return matches.length === 0 ? null : { items: matches, prefix: skillPrefix };
+		}
+
 		const commandText = textBeforeCursor.trimStart();
 		if (!commandText.startsWith("/")) return null;
 		if (commandText.length <= 1) return null; // Bare "/" alone, don't auto-complete
