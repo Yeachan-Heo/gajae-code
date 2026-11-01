@@ -17,6 +17,11 @@ export interface MasterPeerSnapshotContributorInput {
 	readonly ownerSessionId: string;
 	/** Current transcript/session identity; differs from ownerSessionId after a branch or switch. */
 	readonly getSessionId?: () => string;
+	/**
+	 * Endpoint generation of the owner session when this master process began.
+	 * Used to distinguish between stale index data and a different process incarnation.
+	 */
+	readonly ownerEndpointGeneration?: number;
 	readonly scope: MasterScope;
 	/** Live cwd accessor; resolved at injection time, not at registration. */
 	readonly getCwd: () => string;
@@ -48,6 +53,9 @@ export function createMasterPeerSnapshotContributor(
 				actor: { id: input.ownerSessionId, namespace: "sdk:master-snapshot" },
 				ownerSessionId: input.ownerSessionId,
 				...(input.getSessionId === undefined ? {} : { currentSessionId: input.getSessionId() }),
+				...(input.ownerEndpointGeneration === undefined
+					? {}
+					: { ownerEndpointGeneration: input.ownerEndpointGeneration }),
 				scope: input.scope,
 				requestAnchor: { cwd: anchorCwd, worktreeRoot: await sessionWorktreeRoot(anchorCwd) },
 			});

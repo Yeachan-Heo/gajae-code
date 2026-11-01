@@ -869,6 +869,7 @@ function scopedSearchRows(sessions: readonly SessionLifecycleListEntry[]): SdkSe
 				sessionId: session.sessionId,
 				locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
 				live: session.live === true,
+				...(session.endpointGeneration === undefined ? {} : { endpointGeneration: session.endpointGeneration }),
 				...(session.role === undefined ? {} : { role: session.role }),
 				...(session.spawnedBy === undefined ? {} : { spawnedBy: session.spawnedBy }),
 			}),

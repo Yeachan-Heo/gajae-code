@@ -32,6 +32,12 @@ export interface CollectMasterPeerSnapshotInput {
 	readonly actor: SessionLifecycleActor;
 	readonly ownerSessionId: string;
 	readonly currentSessionId?: string;
+	/**
+	 * Endpoint generation of the owner session when this master process last registered it.
+	 * If present and differs from the owner row's current generation after a switch, the owner
+	 * row belongs to a different process (a separate incarnation of the same session id).
+	 */
+	readonly ownerEndpointGeneration?: number;
 	readonly scope: ScopeNameV1;
 	readonly requestAnchor: ScopeRequestV1["requestAnchor"];
 	readonly timeoutMs?: number;
@@ -100,7 +106,7 @@ function boundSnapshotRows(
  * The current row is always this master. Before a switch the lineage owner row
  * is the current row. After a switch this master stopped the owner's host, so we
  * require evidence that the host registration was retired or that the row belongs
- * to a different process (different stateRoot) before treating it as a real peer.
+ * to a different process (different endpoint generation) before treating it as a real peer.
  * Liveness alone does not prove a separate process since host_unregistered is
  * best-effort and can be retried on agent_end (#7459).
  */
@@ -109,14 +115,18 @@ function isPeerRow(
 	ownerSessionId: string,
 	currentSessionId: string,
 	switched: boolean,
-	currentStateRoot?: string,
+	ownerEndpointGeneration?: number,
 ): boolean {
 	if (row.id === currentSessionId) return false;
 	if (row.id === ownerSessionId) {
 		if (!switched) return false; // Before switch, owner row is this master's lineage
-		// After switch, owner row is a peer only if it has a different stateRoot
-		if (currentStateRoot === undefined) return false; // Conservative: no evidence it's a peer
-		return row.locator.stateRoot !== currentStateRoot;
+		// After switch, owner row is a peer only if it has a different endpoint generation.
+		// Same generation means the same registration (stale index data from same process).
+		// Different generation means a new registration in a different process incarnation.
+		if (ownerEndpointGeneration === undefined || row.endpointGeneration === undefined) {
+			return false; // Conservative: no evidence it's a different process
+		}
+		return row.endpointGeneration !== ownerEndpointGeneration;
 	}
 	return true;
 }
@@ -148,11 +158,9 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 	};
 	const currentSessionId = input.currentSessionId ?? input.ownerSessionId;
 	const switched = currentSessionId !== input.ownerSessionId;
-	// Extract current session's stateRoot to validate owner row after a switch
-	const currentSessionRow = result.rows.find(row => row.id === currentSessionId);
-	const currentStateRoot = currentSessionRow?.locator.stateRoot;
+	// Validate owner row after a switch using endpoint generation to distinguish processes
 	const rows = result.rows
-		.filter(row => isPeerRow(row, input.ownerSessionId, currentSessionId, switched, currentStateRoot))
+		.filter(row => isPeerRow(row, input.ownerSessionId, currentSessionId, switched, input.ownerEndpointGeneration))
 		.map(row => withSpawnOwnerSelf(row, input.ownerSessionId))
 		.sort(compareRows);
 	const bounded = boundSnapshotRows(snapshot, rows);
