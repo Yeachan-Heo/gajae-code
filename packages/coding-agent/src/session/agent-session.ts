@@ -612,7 +612,7 @@ import {
 } from "./terminal-abort";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
-import { YieldQueue } from "./yield-queue";
+import { TerminalIdleAdmissionError, YieldQueue } from "./yield-queue";
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -5108,6 +5108,12 @@ export class AgentSession {
 				: this.#disposeAbortController.signal;
 			try {
 				await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
+			} catch (error) {
+				// An idle delivery cannot be retried once readiness itself rejected or the
+				// session was disposed: mark that terminal so the yield queue drops the
+				// entries instead of retaining work no later admission can deliver.
+				if (options?.idleDelivery === true) throw new TerminalIdleAdmissionError(error);
+				throw error;
 			} finally {
 				releaseStartupPromptWaiter?.();
 			}
@@ -6374,6 +6380,7 @@ export class AgentSession {
 			},
 			withIdleAdmission: (body, signal) =>
 				this.#withSessionAdmission("prompt", async () => body(), signal, undefined, { idleDelivery: true }),
+			onIdleEntriesDropped: (kind, entries) => this.#releaseDroppedYieldEntries(kind, entries),
 			injectIdle: async (messages, signal) => {
 				const sdkRunToken = this.#activeSdkRunToken;
 				// Mandated boundary comment (corrected turn semantics): same origin
@@ -17744,24 +17751,26 @@ export class AgentSession {
 	 * review P2 on #5088).
 	 */
 	#drainTerminalOwnedYieldEntries(): void {
-		this.yieldQueue.clear((kind, entries) => {
-			if (kind !== "async-result") return;
-			const ownedManager = this.#ownedAsyncJobManager;
-			for (const entry of entries) {
-				if (typeof entry !== "object" || entry === null) continue;
-				const record = entry as { generation?: unknown; ownedCompletion?: unknown };
-				if (typeof record.generation === "string" && record.generation !== "") {
-					const envelope = isOwnedCompletionEnvelope(record.ownedCompletion) ? record.ownedCompletion : undefined;
-					const endpointId = envelope?.registration.endpointId;
-					const manager =
-						(endpointId !== undefined ? AsyncJobManager.forEndpoint(endpointId) : undefined) ?? ownedManager;
-					manager?.releaseDeliveryClaim(record.generation);
-				}
-				if (isOwnedCompletionEnvelope(record.ownedCompletion)) {
-					this.#settleOwnedCompletionEnvelope(record.ownedCompletion);
-				}
+		this.yieldQueue.clear((kind, entries) => this.#releaseDroppedYieldEntries(kind, entries));
+	}
+
+	#releaseDroppedYieldEntries(kind: string, entries: readonly unknown[]): void {
+		if (kind !== "async-result") return;
+		const ownedManager = this.#ownedAsyncJobManager;
+		for (const entry of entries) {
+			if (typeof entry !== "object" || entry === null) continue;
+			const record = entry as { generation?: unknown; ownedCompletion?: unknown };
+			if (typeof record.generation === "string" && record.generation !== "") {
+				const envelope = isOwnedCompletionEnvelope(record.ownedCompletion) ? record.ownedCompletion : undefined;
+				const endpointId = envelope?.registration.endpointId;
+				const manager =
+					(endpointId !== undefined ? AsyncJobManager.forEndpoint(endpointId) : undefined) ?? ownedManager;
+				manager?.releaseDeliveryClaim(record.generation);
 			}
-		});
+			if (isOwnedCompletionEnvelope(record.ownedCompletion)) {
+				this.#settleOwnedCompletionEnvelope(record.ownedCompletion);
+			}
+		}
 	}
 
 	#getCustomMessageTextContent(message: Pick<CustomMessage, "content">): string {

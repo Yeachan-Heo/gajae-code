@@ -23,6 +23,28 @@ export interface YieldQueueOptions {
 	withIdleAdmission?(body: () => Promise<void>, signal?: AbortSignal): Promise<void>;
 	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
+	/**
+	 * Release per-entry delivery claims after idle entries are dropped without
+	 * delivery. Called once per kind while dropping a terminal admission failure.
+	 */
+	onIdleEntriesDropped?(kind: string, entries: readonly unknown[]): void;
+}
+
+/**
+ * Thrown when idle delivery admission failed in a way the session can never
+ * retry (startup readiness rejected or the session was disposed). Retaining
+ * entries past that point strands them forever, so the queue drops them.
+ */
+export class TerminalIdleAdmissionError extends Error {
+	readonly admissionError: unknown;
+
+	constructor(admissionError: unknown) {
+		super(admissionError instanceof Error ? admissionError.message : String(admissionError), {
+			cause: admissionError,
+		});
+		this.name = "TerminalIdleAdmissionError";
+		this.admissionError = admissionError;
+	}
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -100,8 +122,17 @@ export class YieldQueue {
 					await this.#flushEntries(mode, deliverySignal);
 				}
 			} catch (error) {
-				// Admission failed before draining: retain the original entries for a later owned retry.
-				logger.warn("Yield queue idle admission failed", { error: formatError(error) });
+				if (error instanceof TerminalIdleAdmissionError) {
+					// Readiness itself failed, so no later admission can deliver these
+					// entries: drop them instead of retaining work that never drains.
+					this.clear((kind, entries) => this.#options.onIdleEntriesDropped?.(kind, entries));
+					logger.warn("Yield queue idle delivery dropped after terminal admission failure", {
+						error: formatError(error.admissionError),
+					});
+				} else {
+					// Admission failed before draining: retain the original entries for a later owned retry.
+					logger.warn("Yield queue idle admission failed", { error: formatError(error) });
+				}
 			}
 			return;
 		}
