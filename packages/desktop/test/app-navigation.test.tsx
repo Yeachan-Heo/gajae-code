@@ -34,7 +34,241 @@ async function fixture(holdBootstrap = false): Promise<{ context: BrowserContext
 	} catch (error) { await context.close(); throw error; }
 }
 
+async function threeProjects(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		const snapshot = window.navigationFixture.snapshot();
+		window.navigationFixture.emit({ type: "snapshot", snapshot: { ...snapshot, projects: [...snapshot.projects, { id: "r", name: "Third workspace", path: "/work/third" }] } });
+	});
+	await page.waitForSelector('[data-project-id="r"]');
+}
+
+async function point(page: Page, selector: string, edge?: "before" | "after"): Promise<{ x: number; y: number }> {
+	return page.$eval(selector, (node, edge) => {
+		const box = node.getBoundingClientRect();
+		return { x: box.left + box.width / 2, y: edge === "before" ? box.top + 8 : edge === "after" ? box.bottom - 8 : box.top + box.height / 2 };
+	}, edge);
+}
+
+async function startProjectPointer(page: Page, from: string, to: string, edge: "before" | "after", scope = ".desktop-sidebar", handle = "h2"): Promise<void> {
+	const start = await point(page, `${scope} [data-project-id="${from}"] ${handle}`);
+	const target = await point(page, `${scope} [data-project-id="${to}"]`, edge);
+	await page.mouse.move(start.x, start.y);
+	await page.mouse.down();
+	await page.mouse.move(target.x, target.y, { steps: 12 });
+}
+
+async function projectOrder(page: Page): Promise<string[]> {
+	return page.$$eval('.desktop-sidebar .project-group', nodes => nodes.map(node => (node as HTMLElement).dataset.projectId!));
+}
+
+async function reorderRequests(page: Page): Promise<unknown[]> {
+	return page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "project.reorder").map(request => request.params));
+}
+
 describe("mounted desktop navigation", () => {
+	for (const { from, to, edge, ids } of [
+		{ from: "p", to: "r", edge: "before", ids: ["q", "p", "r"] },
+		{ from: "p", to: "r", edge: "after", ids: ["q", "r", "p"] },
+		{ from: "r", to: "p", edge: "before", ids: ["r", "p", "q"] },
+		{ from: "r", to: "p", edge: "after", ids: ["p", "r", "q"] },
+	] as const) {
+		test(`pointer inserts ${from} ${edge} ${to} at the painted boundary`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await threeProjects(page);
+				await startProjectPointer(page, from, to, edge);
+				const selector = `.desktop-sidebar [data-project-id="${to}"].drop-${edge}`;
+				await page.waitForSelector(selector);
+				expect(await projectOrder(page)).toEqual(["p", "q", "r"]);
+				expect(await reorderRequests(page)).toEqual([]);
+				const line = await page.$eval(selector, node => {
+					const style = getComputedStyle(node, "::after");
+					return { content: style.content, height: style.height, color: style.backgroundColor, top: style.top, bottom: style.bottom };
+				});
+				expect(line.content).toBe('""');
+				expect(line.height).toBe("3px");
+				expect(line.color).not.toBe("rgba(0, 0, 0, 0)");
+				expect(line[edge === "before" ? "top" : "bottom"]).toBe("-4px");
+				await page.mouse.up();
+				await page.waitForFunction(ids => [...document.querySelectorAll('.desktop-sidebar .project-group')].map(node => (node as HTMLElement).dataset.projectId).join() === ids.join(), {}, ids);
+				expect(await reorderRequests(page)).toEqual([{ ids: [...ids] }]);
+				expect(await page.$('.dragging, .drop-target')).toBeNull();
+			} finally { await context.close(); }
+		}, 30000);
+	}
+
+	test("compact initials drag without collapsing or creating a conversation; ordinary clicks retain focus", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			await startProjectPointer(page, "p", "q", "after", ".desktop-sidebar", ".project-toggle");
+			await page.waitForSelector('[data-project-id="q"].drop-after');
+			await page.mouse.up();
+			await page.waitForFunction(() => window.navigationFixture.requests().some(request => request.method === "project.reorder"));
+			expect(await page.$eval('[data-project-id="p"] .project-toggle', node => node.getAttribute("aria-expanded"))).toBe("true");
+			expect(await page.$eval('.desktop-sidebar', node => node.getBoundingClientRect().width)).toBe(64);
+			expect(await page.evaluate(() => window.navigationFixture.requests().some(request => request.method === "session.create"))).toBe(false);
+			const toggle = '.desktop-sidebar [data-project-id="p"] .project-toggle';
+			await page.click(toggle);
+			expect(await page.$eval(toggle, node => node === document.activeElement && node.getAttribute("aria-expanded") === "false")).toBe(true);
+			await page.keyboard.press("Enter");
+			expect(await page.$eval(toggle, node => node.getAttribute("aria-expanded"))).toBe("true");
+		} finally { await context.close(); }
+	}, 30000);
+
+	for (const cancel of ["Escape", "pointercancel", "lostcapture", "catalog"] as const) {
+		test(`${cancel} cancels a captured pointer without reordering or leaking a click`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await startProjectPointer(page, "p", "q", "after", ".desktop-sidebar", ".project-toggle");
+				await page.waitForSelector('.drop-after');
+				if (cancel === "Escape") await page.keyboard.press("Escape");
+				else await page.evaluate(cancel => {
+					const heading = document.querySelector<HTMLElement>('.desktop-sidebar [data-project-id="p"] .project-heading')!;
+					if (cancel === "pointercancel") heading.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 1 }));
+					if (cancel === "lostcapture") heading.releasePointerCapture(1);
+					if (cancel === "catalog") {
+						const snapshot = window.navigationFixture.snapshot();
+						window.navigationFixture.emit({ type: "snapshot", snapshot: { ...snapshot, projects: snapshot.projects.toReversed() } });
+					}
+				}, cancel);
+				if (cancel === "lostcapture") {
+					const target = await point(page, '.desktop-sidebar [data-project-id="q"]', "after");
+					await page.mouse.move(target.x, target.y + 1);
+				}
+				await page.waitForFunction(() => !document.querySelector('.dragging, .drop-target'));
+				await page.mouse.up();
+				expect(await reorderRequests(page)).toEqual([]);
+				expect(await page.$eval('[data-project-id="p"] .project-toggle', node => node.getAttribute("aria-expanded"))).toBe("true");
+			} finally { await context.close(); }
+		}, 30000);
+	}
+
+	test("the pointer can cross a target midpoint and leave the navigation without a stale drop", async () => {
+		const { context, page } = await fixture();
+		try {
+			await threeProjects(page);
+			await startProjectPointer(page, "p", "r", "before");
+			await page.waitForSelector('[data-project-id="r"].drop-before');
+			const after = await point(page, '.desktop-sidebar [data-project-id="r"]', "after");
+			await page.mouse.move(after.x, after.y);
+			await page.waitForSelector('[data-project-id="r"].drop-after');
+			await page.mouse.move(500, after.y);
+			await page.waitForFunction(() => !document.querySelector('.drop-target'));
+			await page.mouse.up();
+			expect(await reorderRequests(page)).toEqual([]);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("keyboard workspace moves and new-conversation clicks remain independent of dragging", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.focus('.desktop-sidebar [data-project-id="p"] .project-heading');
+			await page.keyboard.down("Shift");
+			await page.keyboard.press("F10");
+			await page.keyboard.up("Shift");
+			await page.waitForSelector('.context-menu');
+			expect(await page.$$eval('.context-menu [role="menuitem"]', nodes => nodes.slice(0, 2).map(node => (node as HTMLButtonElement).disabled))).toEqual([true, false]);
+			await page.keyboard.press("Tab");
+			await page.keyboard.press("Enter");
+			await page.waitForFunction(() => window.navigationFixture.requests().some(request => request.method === "project.reorder"));
+			expect(await reorderRequests(page)).toEqual([{ ids: ["q", "p"] }]);
+			const create = '.desktop-sidebar [data-project-id="p"] .project-heading > button:not(.project-toggle)';
+			const start = await point(page, create);
+			await page.mouse.move(start.x, start.y);
+			await page.mouse.down();
+			await page.mouse.move(start.x, start.y + 30, { steps: 5 });
+			await page.mouse.up();
+			expect(await page.$('.dragging, .drop-target')).toBeNull();
+			expect(await reorderRequests(page)).toHaveLength(1);
+			await page.click(create);
+			await page.waitForFunction(() => window.navigationFixture.requests().some(request => request.method === "session.create"));
+			expect(await page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "session.create").at(-1)?.params)).toEqual({ projectId: "p" });
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("pending and rejected reorders retain the catalog order and can be retried", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => window.navigationFixture.holdProjectReorder(true));
+			await startProjectPointer(page, "p", "q", "after");
+			await page.mouse.up();
+			await page.waitForSelector('.sidebar-open-project[disabled]');
+			expect(await projectOrder(page)).toEqual(["p", "q"]);
+			await startProjectPointer(page, "p", "q", "after");
+			await page.mouse.up();
+			expect(await reorderRequests(page)).toHaveLength(1);
+			expect(await page.$('.dragging, .drop-target')).toBeNull();
+			await page.evaluate(() => window.navigationFixture.resolveProjectReorder(false));
+			await page.waitForSelector('.sidebar-open-project:not([disabled])');
+			expect(await page.$eval('.main-pane .error-banner', node => node.textContent)).toContain("Reorder refused");
+			expect(await projectOrder(page)).toEqual(["p", "q"]);
+			await page.evaluate(() => window.navigationFixture.holdProjectReorder(false));
+			await startProjectPointer(page, "p", "q", "after");
+			await page.mouse.up();
+			await page.waitForFunction(() => window.navigationFixture.snapshot().projects[0]?.id === "q");
+			expect(await reorderRequests(page)).toHaveLength(2);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("disconnect cancels an active drag and blocks subsequent gestures", async () => {
+		const { context, page } = await fixture();
+		try {
+			await startProjectPointer(page, "p", "q", "after");
+			await page.waitForSelector('.drop-after');
+			await page.evaluate(() => window.navigationFixture.emit({ type: "fatal", error: "Host stopped" }));
+			await page.waitForFunction(() => !document.querySelector('.dragging, .drop-target'));
+			await page.mouse.up();
+			await startProjectPointer(page, "p", "q", "after");
+			await page.mouse.up();
+			expect(await reorderRequests(page)).toEqual([]);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("mobile drawer supports project insertion and cancels on drawer removal", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.setViewport({ width: 700, height: 800 });
+			await page.click('.toolbar .mobile-only');
+			await page.waitForSelector('dialog.sidebar-drawer');
+			await startProjectPointer(page, "p", "q", "after", "dialog.sidebar-drawer");
+			await page.waitForSelector('dialog.sidebar-drawer .drop-after');
+			await page.evaluate(() => document.querySelector<HTMLButtonElement>('dialog.sidebar-drawer .modal-close')!.click());
+			await page.waitForFunction(() => !document.querySelector('dialog.sidebar-drawer'));
+			await page.mouse.up();
+			expect(await reorderRequests(page)).toEqual([]);
+			await page.click('.toolbar .mobile-only');
+			await page.waitForSelector('dialog.sidebar-drawer');
+			await startProjectPointer(page, "p", "q", "after", "dialog.sidebar-drawer");
+			await page.mouse.up();
+			await page.waitForFunction(() => window.navigationFixture.requests().some(request => request.method === "project.reorder"));
+			expect(await reorderRequests(page)).toEqual([{ ids: ["q", "p"] }]);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("session drags, subthreshold presses and same-boundary gestures do not reorder", async () => {
+		const { context, page } = await fixture();
+		try {
+			const session = await point(page, '.desktop-sidebar .session-select');
+			await page.mouse.move(session.x, session.y);
+			await page.mouse.down();
+			await page.mouse.move(session.x, session.y + 60, { steps: 6 });
+			await page.mouse.up();
+			const heading = await point(page, '.desktop-sidebar .project-heading h2');
+			await page.mouse.move(heading.x, heading.y);
+			await page.mouse.down();
+			await page.mouse.move(heading.x + 3, heading.y);
+			await page.mouse.up();
+			await startProjectPointer(page, "p", "q", "before");
+			await page.waitForSelector('.drop-before');
+			await page.mouse.up();
+			expect(await reorderRequests(page)).toEqual([]);
+			expect(await page.evaluate(() => window.navigationFixture.requests().some(request => request.method === "session.reorder"))).toBe(false);
+			expect(await page.$('[draggable="true"]')).toBeNull();
+		} finally { await context.close(); }
+	}, 30000);
+
 	test("keeps projects and status-only conversations usable in a persistent compact rail", async () => {
 		const { context, page } = await fixture();
 		try {

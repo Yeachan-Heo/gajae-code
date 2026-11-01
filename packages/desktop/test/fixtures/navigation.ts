@@ -6,6 +6,8 @@ export interface NavigationFixture {
 	emit(frame: DesktopFrame): void;
 	requests(): DesktopRequest[];
 	snapshot(): DesktopSnapshot;
+	holdProjectReorder(hold: boolean): void;
+	resolveProjectReorder(ok: boolean): void;
 }
 
 declare global {
@@ -21,6 +23,8 @@ export function installNavigationFixture(holdBootstrap = false): void {
 	const requests: DesktopRequest[] = [];
 	let serial = 0;
 	let bootstrapId: string | undefined;
+	let holdReorder = false;
+	let heldReorder: DesktopRequest | undefined;
 	const session = (id: string, title: string, status: DesktopSession["status"]): DesktopSession => ({
 		id,
 		title,
@@ -34,7 +38,7 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		model: "fixture/astra",
 		thinking: { level: "medium", scope: "session", available: true, options: [{ value: "medium", label: "Medium" }] },
 	});
-	const snapshot: DesktopSnapshot = {
+	let snapshot: DesktopSnapshot = {
 		protocolVersion: 1,
 		projects: [
 			{ id: "p", name: "pandas", path: "/work/pandas" },
@@ -101,9 +105,22 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		sampling: [],
 	};
 	const emit = (frame: DesktopFrame) => {
+		if (frame.type === "snapshot") snapshot = frame.snapshot;
 		for (const [id, callback] of listeners) callbacks.get(callback)?.({ event: "engine-frame", id, payload: frame });
 	};
 	const respond = (id: string, result: unknown) => emit({ type: "response", id, ok: true, result });
+	const finishReorder = (request: DesktopRequest, ok: boolean) => {
+		if (!ok) {
+			emit({ type: "response", id: request.id, ok: false, error: "Reorder refused" });
+			return;
+		}
+		const ids = request.params.ids as string[];
+		emit({
+			type: "snapshot",
+			snapshot: { ...snapshot, projects: ids.map(id => snapshot.projects.find(project => project.id === id)!) },
+		});
+		respond(request.id, null);
+	};
 	window.navigationFixture = {
 		connect() {
 			if (bootstrapId) {
@@ -114,6 +131,15 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		emit,
 		requests: () => requests,
 		snapshot: () => snapshot,
+		holdProjectReorder(hold) {
+			holdReorder = hold;
+		},
+		resolveProjectReorder(ok) {
+			if (!heldReorder) throw new Error("No held project reorder");
+			const request = heldReorder;
+			heldReorder = undefined;
+			finishReorder(request, ok);
+		},
 	};
 	const scoped = window as unknown as {
 		isTauri: boolean;
@@ -146,6 +172,11 @@ export function installNavigationFixture(holdBootstrap = false): void {
 			requests.push(request);
 			if (request.method === "bootstrap" && holdBootstrap) {
 				bootstrapId = request.id;
+				return;
+			}
+			if (request.method === "project.reorder") {
+				if (holdReorder) heldReorder = request;
+				else queueMicrotask(() => finishReorder(request, true));
 				return;
 			}
 			let result: unknown = null;

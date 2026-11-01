@@ -17,7 +17,7 @@ import {
 	Trash2,
 	X,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import type {
 	DesktopActivityDetail,
 	DesktopActivityGateAnswer,
@@ -575,12 +575,32 @@ export default function App() {
 		| null
 	>(null);
 	const [dragProject, setDragProject] = useState<string | null>(null);
-	const dragProjectRef = useRef<string | null>(null);
+	const projectPointer = useRef<{
+		id: string;
+		pointerId: number;
+		x: number;
+		y: number;
+		heading: HTMLElement;
+		nav: HTMLElement;
+		projects: DesktopSnapshot["projects"];
+		active: boolean;
+	} | null>(null);
+	const suppressProjectClick = useRef<HTMLElement | null>(null);
 	/** The conversation whose open is still outstanding; its transcript is unknown. */
 	const [opening, setOpening] = useState<string | null>(null);
 	/** The row under the pointer and which of its edges the dragged item will land on. */
 	const [dropTarget, setDropTarget] = useState<{ key: string; after: boolean } | null>(null);
 	const dropTargetRef = useRef<{ key: string; after: boolean } | null>(null);
+	const clearProjectDrag = useCallback(() => {
+		const pointer = projectPointer.current;
+		projectPointer.current = null;
+		dropTargetRef.current = null;
+		setDropTarget(null);
+		setDragProject(null);
+		if (pointer?.heading.hasPointerCapture(pointer.pointerId))
+			pointer.heading.releasePointerCapture(pointer.pointerId);
+	}, []);
+	useEffect(() => () => clearProjectDrag(), [clearProjectDrag]);
 	const menuRef = useRef<HTMLDivElement | null>(null);
 	/**
 	 * One Escape must dismiss only the drawer's context menu. The menu clears first, then the
@@ -637,6 +657,14 @@ export default function App() {
 	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal && recoveryReady;
+	const projectReorderAvailable =
+		connected &&
+		!pending.global &&
+		!(snapshot?.projects ?? []).some(item => pending[`project:${item.id}`] || pending[`close-project:${item.id}`]);
+	// A new authoritative catalog or a changed navigation surface retires the gesture.
+	useEffect(() => {
+		clearProjectDrag();
+	}, [snapshot?.projects, projectReorderAvailable, sidebar, compactSidebar, clearProjectDrag]);
 	const modelGeneration = session?.controlGeneration ?? null;
 	const modelOwner = session ? `${session.id}:${modelGeneration}` : "";
 	const modelOwnerRef = useRef(modelOwner);
@@ -921,6 +949,12 @@ export default function App() {
 				else openCommands();
 			}
 			if (event.key === "Escape") {
+				if (projectPointer.current) {
+					event.preventDefault();
+					armDrawerSuppression();
+					clearProjectDrag();
+					return;
+				}
 				if (menuEscapeAt.current === event.timeStamp) return;
 				if (menu) {
 					armDrawerSuppression();
@@ -936,7 +970,7 @@ export default function App() {
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, menu, sidebar, setDialog]);
+	}, [dialog, closeDialog, menu, sidebar, setDialog, clearProjectDrag]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
@@ -1839,14 +1873,72 @@ export default function App() {
 		if (!menu) return;
 		menuRef.current?.focus();
 	}, [menu]);
-	const clearDrag = () => {
-		dropTargetRef.current = null;
-		setDropTarget(null);
-		dragProjectRef.current = null;
-		setDragProject(null);
+	const updateProjectDrag = (event: ReactPointerEvent<HTMLElement>) => {
+		const pointer = projectPointer.current;
+		if (!pointer || pointer.pointerId !== event.pointerId) return;
+		if (
+			!projectReorderAvailable ||
+			locks.current.has("global") ||
+			pointer.projects !== snapshot?.projects ||
+			!pointer.heading.isConnected
+		) {
+			clearProjectDrag();
+			return;
+		}
+		if (!pointer.active) {
+			if (Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) < 6) return;
+			pointer.active = true;
+			suppressProjectClick.current = pointer.nav;
+			pointer.heading.setPointerCapture(event.pointerId);
+			setDragProject(pointer.id);
+		}
+		event.preventDefault();
+		const navBox = pointer.nav.getBoundingClientRect();
+		let target: { key: string; after: boolean } | null = null;
+		if (
+			event.clientX >= navBox.left &&
+			event.clientX <= navBox.right &&
+			event.clientY >= navBox.top &&
+			event.clientY <= navBox.bottom
+		) {
+			const groups = [...pointer.nav.querySelectorAll<HTMLElement>(".project-group")];
+			// Choose a visible group's edge from the actual pointer position, not the source index.
+			const group = groups.find(node => event.clientY <= node.getBoundingClientRect().bottom) ?? groups.at(-1);
+			if (group && group.dataset.projectId !== pointer.id) {
+				const box = group.getBoundingClientRect();
+				target = { key: `project:${group.dataset.projectId}`, after: event.clientY >= (box.top + box.bottom) / 2 };
+			}
+		}
+		dropTargetRef.current = target;
+		setDropTarget(target);
+	};
+	const finishProjectDrag = (event: ReactPointerEvent<HTMLElement>) => {
+		const pointer = projectPointer.current;
+		if (!pointer || pointer.pointerId !== event.pointerId) return;
+		// Re-evaluate the release coordinate so the dispatched permutation matches its line.
+		if (pointer.active) updateProjectDrag(event);
+		const target = dropTargetRef.current;
+		const active = projectPointer.current?.active;
+		clearProjectDrag();
+		if (
+			!active ||
+			!target ||
+			!projectReorderAvailable ||
+			locks.current.has("global") ||
+			pointer.projects !== snapshot?.projects
+		)
+			return;
+		const ids = pointer.projects.map(project => project.id).filter(id => id !== pointer.id);
+		const index = ids.indexOf(target.key.slice("project:".length));
+		if (index < 0) return;
+		ids.splice(index + Number(target.after), 0, pointer.id);
+		if (ids.every((id, index) => id === pointer.projects[index]?.id)) return;
+		// Keep the catalog authoritative. Failure leaves the original order intact.
+		void call("project.reorder", { ids }, "global");
 	};
 	/** Move one item one slot up or down; the keyboard path for list reordering. */
 	const moveProject = (id: string, direction: -1 | 1) => {
+		if (!projectReorderAvailable || locks.current.has("global")) return;
 		const ids = (snapshot?.projects ?? []).map(project => project.id);
 		const from = ids.indexOf(id);
 		const to = from + direction;
@@ -1880,7 +1972,28 @@ export default function App() {
 			>
 				<FolderOpen size={16} aria-hidden="true" /> <span className="sidebar-label">{t("shell.openProject")}</span>
 			</Button>
-			<nav aria-label={t("shell.projectsAndConversations")} onDragEnd={clearDrag}>
+			<nav
+				aria-label={t("shell.projectsAndConversations")}
+				onPointerDownCapture={() => {
+					if (!projectPointer.current) suppressProjectClick.current = null;
+				}}
+				onPointerMove={updateProjectDrag}
+				onPointerUp={finishProjectDrag}
+				onPointerCancel={clearProjectDrag}
+				onLostPointerCapture={event => {
+					if (event.target === projectPointer.current?.heading) clearProjectDrag();
+				}}
+				onPointerLeave={() => {
+					if (!projectPointer.current?.active) clearProjectDrag();
+				}}
+				onClickCapture={event => {
+					if (event.detail && suppressProjectClick.current === event.currentTarget) {
+						event.preventDefault();
+						event.stopPropagation();
+						suppressProjectClick.current = null;
+					}
+				}}
+			>
 				{(snapshot?.projects ?? []).map(item => {
 					// The host catalog appends new conversations. Reverse that creation sequence for
 					// display only; message/status updates must not shuffle a running list.
@@ -1899,44 +2012,14 @@ export default function App() {
 									: ""
 							}`}
 							key={item.id}
+							data-project-id={item.id}
 							onContextMenu={event => {
 								event.preventDefault();
 								setMenu({ kind: "project", id: item.id, x: event.clientX, y: event.clientY });
 							}}
-							onDragOver={event => {
-								// The cue follows the drag state; the payload is read in the drop below, which
-								// is where a browser exposes it.
-								const dragged = dragProjectRef.current;
-								if (!dragged || dragged === item.id) return;
-								event.preventDefault();
-								const order = (snapshot?.projects ?? []).map(project => project.id);
-								// The cue marks the edge the drop inserts at, matching the splice below.
-								setDropTarget({
-									key: `project:${item.id}`,
-									after: order.indexOf(dragged) < order.indexOf(item.id),
-								});
-							}}
-							onDragLeave={() =>
-								setDropTarget(previous => (previous?.key === `project:${item.id}` ? null : previous))
-							}
-							onDrop={event => {
-								// The payload is authoritative: a fast drag can drop before React
-								// has re-rendered the handlers with the drag state.
-								const dragged = event.dataTransfer?.getData("text/plain") || dragProject;
-								if (!dragged || dragged === item.id) return;
-								event.preventDefault();
-								const ids = (snapshot?.projects ?? []).map(project => project.id);
-								const from = ids.indexOf(dragged);
-								const to = ids.indexOf(item.id);
-								if (from < 0 || to < 0) return;
-								ids.splice(to, 0, ...ids.splice(from, 1));
-								clearDrag();
-								if (connected) void call("project.reorder", { ids }, "global");
-							}}
 						>
 							<div
 								className="project-heading"
-								draggable
 								tabIndex={0}
 								aria-haspopup="menu"
 								onKeyDown={event => {
@@ -1945,13 +2028,30 @@ export default function App() {
 									const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
 									setMenu({ kind: "project", id: item.id, x: box.left, y: box.bottom });
 								}}
-								onDragStart={event => {
-									dragProjectRef.current = item.id;
-									setDragProject(item.id);
-									event.dataTransfer?.setData("text/plain", item.id);
-									if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+								onPointerDown={event => {
+									if (
+										!event.isPrimary ||
+										event.button !== 0 ||
+										!projectReorderAvailable ||
+										locks.current.has("global") ||
+										!snapshot
+									)
+										return;
+									const control = (event.target as Element).closest("button");
+									if (control && !control.classList.contains("project-toggle")) return;
+									const nav = event.currentTarget.closest("nav");
+									if (!nav) return;
+									projectPointer.current = {
+										id: item.id,
+										pointerId: event.pointerId,
+										x: event.clientX,
+										y: event.clientY,
+										heading: event.currentTarget,
+										nav,
+										projects: snapshot.projects,
+										active: false,
+									};
 								}}
-								onDragEnd={clearDrag}
 							>
 								<Button
 									className="project-toggle"
@@ -2220,12 +2320,18 @@ export default function App() {
 			>
 				{menu.kind === "project" ? (
 					<>
-						<Button role="menuitem" disabled={menuProjectIndex <= 0} onClick={() => moveProject(menu.id, -1)}>
+						<Button
+							role="menuitem"
+							disabled={!projectReorderAvailable || menuProjectIndex <= 0}
+							onClick={() => moveProject(menu.id, -1)}
+						>
 							{t("shell.moveWorkspace")}
 						</Button>
 						<Button
 							role="menuitem"
-							disabled={menuProjectIndex < 0 || menuProjectIndex >= menuProjectCount - 1}
+							disabled={
+								!projectReorderAvailable || menuProjectIndex < 0 || menuProjectIndex >= menuProjectCount - 1
+							}
 							onClick={() => moveProject(menu.id, 1)}
 						>
 							{t("shell.moveWorkspaceBack")}

@@ -2163,26 +2163,16 @@ describe("mounted composer delivery recovery", () => {
 				});
 			});
 			await page.waitForFunction(() => document.querySelectorAll(".project-group").length === 2);
-			// Dragging a workspace onto its sibling asks the host for the new order. The steps are
-			// separate tasks because a real drag also spans frames, letting React re-render between.
-			const startDrag = (selector: string, index: number) =>
-				page.evaluate(
-					({ selector, index }) => {
-						const target = [...document.querySelectorAll(selector)][index] as HTMLElement | undefined;
-						target?.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: new DataTransfer() }));
-					},
-					{ selector, index },
-				);
-			const dragOver = (selector: string, index: number) =>
-				page.evaluate(
-					({ selector, index }) => {
-						const target = [...document.querySelectorAll(selector)][index] as HTMLElement | undefined;
-						target?.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true }));
-					},
-					{ selector, index },
-				);
-			await startDrag(".project-group .project-heading", 0);
-			await dragOver(".project-group", 1);
+			// Use native pointer input: HTML5 drag events are not a project reorder API.
+			const points = await page.evaluate(() => {
+				const start = document.querySelector('.project-heading h2')!.getBoundingClientRect();
+				const target = document.querySelectorAll('.project-group')[1]!.getBoundingClientRect();
+				return { x: start.left + start.width / 2, y: start.top + start.height / 2, targetX: target.left + target.width / 2, targetY: target.bottom - 8 };
+			});
+			await page.mouse.move(points.x, points.y);
+			await page.mouse.down();
+			await page.mouse.move(points.targetX, points.targetY, { steps: 12 });
+			await page.waitForSelector('.project-group.drop-after');
 			// A downward drag inserts after the target, and the cue says so before the drop.
 			expect(
 				await page.evaluate(() =>
@@ -2196,31 +2186,9 @@ describe("mounted composer delivery recovery", () => {
 				{ dragging: true, after: false, before: false },
 				{ dragging: false, after: true, before: false },
 			]);
-			// The cue has to paint: the ring token is a box-shadow value and cannot be an outline.
-			expect(
-				await page.evaluate(() => {
-					const group = document.querySelector(".project-group.drop-after");
-					return group ? getComputedStyle(group).boxShadow : "none";
-				}),
-			).not.toBe("none");
-			await page.evaluate(() => {
-				const groups = [...document.querySelectorAll(".project-group")] as HTMLElement[];
-				groups[1]!.dispatchEvent(new DragEvent("drop", { bubbles: true }));
-			});
-			await page.waitForFunction(() =>
-				window.fixture.requests().some(request => request.method === "project.reorder"),
-			);
-			// A drop that carries only the payload is still applied: the browser exposes the drag
-			// data at drop time, and a fast drag can land before React re-renders the drag state.
-			await page.evaluate(() => {
-				const groups = [...document.querySelectorAll(".project-group")] as HTMLElement[];
-				const transfer = new DataTransfer();
-				transfer.setData("text/plain", "q");
-				groups[0]!.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
-			});
-			await page.waitForFunction(
-				() => window.fixture.requests().filter(request => request.method === "project.reorder").length === 2,
-			);
+			// The actual insertion line paints without changing the group's layout.
+			expect(await page.$eval('.project-group.drop-after', node => getComputedStyle(node, '::after').height)).toBe("3px");
+			await page.mouse.up();
 			await page.waitForFunction(() =>
 				window.fixture.requests().some(request => request.method === "project.reorder"),
 			);
@@ -2270,8 +2238,8 @@ describe("mounted composer delivery recovery", () => {
 			expect(closed).toEqual({ projectId: "p" });
 			expect(await page.$(".context-menu")).toBeNull();
 
-			// Conversations are reordered from their context menu only: a row carries no drag
-			// surface, so a pointer drag over one must never reach the host.
+			// Conversations have no reorder surface or move menu; pointer movement must not
+			// reach either project or session reorder.
 			const reorderBefore = await page.evaluate(
 				() => window.fixture.requests().filter(request => request.method === "session.reorder").length,
 			);

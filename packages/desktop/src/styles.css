@@ -163,16 +163,14 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .brand-mark { width: 26px; height: 26px; flex: none; border-radius: var(--radius-xs); }
 
-.project-group { margin: 10px 0 6px; border-radius: var(--radius-md); }
-/* Drag reorder: the dragged row dims, the whole workspace is a drop target. */
+.project-group { position: relative; margin: 10px 0 6px; border-radius: var(--radius-md); }
+/* Pointer reorder paints a boundary, never a whole-project selection outline. */
 .project-group.dragging { opacity: 0.45; }
-/* The insertion cue marks where the dragged item will land. */
-/* `--ring` is a box-shadow value, so the highlight joins the cue in one declaration per class:
-   an outline could not paint it, and a border would reflow the list under the pointer. */
-.project-group.drop-target { box-shadow: var(--ring); }
-.project-group.drop-before { box-shadow: var(--ring), inset 0 2px 0 var(--accent); }
-.project-group.drop-after { box-shadow: var(--ring), inset 0 -2px 0 var(--accent); }
-.project-heading { cursor: grab; border-radius: var(--radius-xs); }
+.project-group.drop-target::after { content: ""; position: absolute; left: 0; right: 0; height: 3px; border-radius: var(--radius-pill); background: var(--accent); pointer-events: none; z-index: 1; }
+.project-group.drop-before::after { top: -4px; }
+.project-group.drop-after::after { bottom: -4px; }
+.project-heading { cursor: grab; border-radius: var(--radius-xs); touch-action: none; user-select: none; -webkit-user-select: none; }
+.project-group.dragging .project-heading { cursor: grabbing; }
 .session-item { border-radius: var(--radius-sm); }
 .show-more { width: 100%; justify-content: center; min-height: 26px; margin-top: 2px; font-size: 0.75rem; }
 /* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
