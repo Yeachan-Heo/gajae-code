@@ -98,13 +98,26 @@ function boundSnapshotRows(
 
 /**
  * The current row is always this master. Before a switch the lineage owner row
- * is the current row. After a switch this master stopped the owner's host, so a
- * non-live owner row is still this master's own lineage, while a live one is a
- * process that resumed that session independently and is a real peer (#7459).
+ * is the current row. After a switch this master stopped the owner's host, so we
+ * require evidence that the host registration was retired or that the row belongs
+ * to a different process (different stateRoot) before treating it as a real peer.
+ * Liveness alone does not prove a separate process since host_unregistered is
+ * best-effort and can be retried on agent_end (#7459).
  */
-function isPeerRow(row: SdkSearchRowV1, ownerSessionId: string, currentSessionId: string, switched: boolean): boolean {
+function isPeerRow(
+	row: SdkSearchRowV1,
+	ownerSessionId: string,
+	currentSessionId: string,
+	switched: boolean,
+	currentStateRoot?: string,
+): boolean {
 	if (row.id === currentSessionId) return false;
-	if (row.id === ownerSessionId) return switched && row.live;
+	if (row.id === ownerSessionId) {
+		if (!switched) return false; // Before switch, owner row is this master's lineage
+		// After switch, owner row is a peer only if it has a different stateRoot
+		if (currentStateRoot === undefined) return false; // Conservative: no evidence it's a peer
+		return row.locator.stateRoot !== currentStateRoot;
+	}
 	return true;
 }
 
@@ -135,8 +148,11 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 	};
 	const currentSessionId = input.currentSessionId ?? input.ownerSessionId;
 	const switched = currentSessionId !== input.ownerSessionId;
+	// Extract current session's stateRoot to validate owner row after a switch
+	const currentSessionRow = result.rows.find(row => row.id === currentSessionId);
+	const currentStateRoot = currentSessionRow?.locator.stateRoot;
 	const rows = result.rows
-		.filter(row => isPeerRow(row, input.ownerSessionId, currentSessionId, switched))
+		.filter(row => isPeerRow(row, input.ownerSessionId, currentSessionId, switched, currentStateRoot))
 		.map(row => withSpawnOwnerSelf(row, input.ownerSessionId))
 		.sort(compareRows);
 	const bounded = boundSnapshotRows(snapshot, rows);
