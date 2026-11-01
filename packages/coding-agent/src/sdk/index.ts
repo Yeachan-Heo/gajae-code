@@ -19,6 +19,8 @@ export {
 	type ProjectProgressSnapshot,
 } from "../progress/progress-contract";
 export type {
+	AgentSessionLifecycleState,
+	AutoSessionTitleResult,
 	QueuedInputAdmission,
 	QueuedInputDelivery,
 	QueuedInputExecution,
@@ -27,14 +29,18 @@ export type {
 	QueuedInputSubmission,
 	QueuedInputTerminal,
 	SendUserMessageOptions,
+	SessionAgentModelRole,
 	TrackedSendUserMessageOptions,
 } from "../session/agent-session";
+export { getSessionMessageEntryId } from "../session/session-manager";
 export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";
+export * as btw from "./btw";
 export * as bus from "./bus";
 export * from "./diagnostics/observe-broker";
 export * from "./extension-interaction";
 export * as host from "./host";
+export * from "./image-input";
 export * from "./job-observation";
 export * as lifecycle from "./lifecycle";
 export * as mcp from "./mcp";

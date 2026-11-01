@@ -86,11 +86,15 @@ describe("model profile capability contract", () => {
 			id: "codex-eco",
 			displayName: "Overridden Eco",
 			source: "configured",
+			providerGroup: "CODEX",
+			providerGroupRank: 0,
 		});
 		expect(catalog.find(item => item.id === "custom/profile !")).toEqual({
 			id: "custom/profile !",
 			displayName: "Custom Display",
 			source: "configured",
+			// CUSTOM is not a preset group, so no rank is reported for it.
+			providerGroup: "CUSTOM",
 		});
 		expect(catalog.some(item => Object.hasOwn(item, "description"))).toBe(false);
 	});
@@ -115,6 +119,7 @@ describe("model profile capability contract", () => {
 			id: "registry-profile",
 			displayName: "Registry Profile",
 			source: "configured",
+			providerGroup: "CUSTOM",
 		});
 	});
 

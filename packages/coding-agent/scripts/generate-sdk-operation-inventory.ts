@@ -303,6 +303,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
 	"agent_session:withSdkControlMutation":
 		"internal session admission wrapper for the reviewed config.patch seam, not an independent public SDK operation",
+	"agent_session:withMcpControlAdmission":
+		"internal generation-fenced admission for session-owned MCP controls, not independent transport authority",
+	"agent_session:getThinkingLevelMutationRevision":
+		"internal thinking-intent revision fence for profile rollback, not an independent transport operation",
 	"agent_session:setThinkingLevelForControl":
 		"internal Telegram control wrapper over the reviewed thinking.set seam, not an independent public SDK operation",
 	"agent_session:getThinkingScopeForControl":
@@ -379,6 +383,20 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
 	"agent_session:submitUserMessage":
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
+	"agent_session:generateAutoSessionTitle":
+		"public in-process embedder title lifecycle API; no automatic title-generation transport operation is admitted",
+	"agent_session:setSessionAgentModelSelection":
+		"public in-process session-owned task-role control; no task-role transport mutation is admitted",
+	"agent_session:getAgentModelOverrides":
+		"in-process effective task-role projection used by owned dispatch, not an independent transport operation",
+	"agent_session:hasSessionAgentModelOverride":
+		"in-process task-role source projection used by owned dispatch, not an independent transport operation",
+	"agent_session:getSessionAgentModelOverrideState":
+		"internal profile transaction rollback snapshot, not caller-supplied SDK transport authority",
+	"agent_session:retireSessionAgentModelOverrides":
+		"internal session and profile lifecycle retirement, not an independent SDK transport operation",
+	"agent_session:restoreSessionAgentModelOverrides":
+		"internal revision-fenced profile rollback, not caller-supplied SDK transport authority",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {

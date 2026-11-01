@@ -292,6 +292,51 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(userTexts(session)).toEqual(["predecessor", "restored"]);
 	});
 
+	it("settles tracked receipts for a real no-model refusal without an observer", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let providerCalls = 0;
+		session = buildSession([
+			async () => {
+				providerCalls += 1;
+				entered.resolve();
+				await release.promise;
+				return { content: ["predecessor"] };
+			},
+		]);
+		const predecessor = session.prompt("predecessor");
+		await entered.promise;
+		const refused = await session.submitUserMessage("same text", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("refused-tracked-owner"),
+		});
+		const sibling = await session.submitUserMessage("same text", { deliverAs: "followUp", trackSubmission: true });
+		let executionSettlements = 0;
+		let terminalSettlements = 0;
+		void refused.execution.then(() => {
+			executionSettlements += 1;
+		});
+		void refused.terminal.then(() => {
+			terminalSettlements += 1;
+		});
+		expect(sibling.cancel()).toBe(true);
+		expect(await sibling.execution).toMatchObject({ disposition: "removed", reason: "cancelled" });
+		expect(await sibling.terminal).toMatchObject({ disposition: "removed", reason: "cancelled" });
+		session.agent.setModel(undefined);
+		release.resolve();
+		expect(await refused.execution).toMatchObject({ disposition: "removed", reason: "refused" });
+		expect(await refused.terminal).toMatchObject({ disposition: "removed", reason: "refused" });
+		await predecessor;
+		await session.waitForIdle();
+		expect(refused.cancel()).toBe(false);
+		expect(sibling.cancel()).toBe(false);
+		expect(executionSettlements).toBe(1);
+		expect(terminalSettlements).toBe(1);
+		expect(providerCalls).toBe(1);
+		expect(userTexts(session)).toEqual(["predecessor"]);
+	});
+
 	it("never downgrades a started queued run to not-started on a provider error", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -306,8 +351,9 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 		const predecessor = session.prompt("predecessor");
 		await entered.promise;
-		await session.sendUserMessage("queued", {
+		const submission = await session.submitUserMessage("queued", {
 			deliverAs: "followUp",
+			trackSubmission: true,
 			sdkRunCapability: createSdkRunCapability("started-queued-owner"),
 			onQueuedRunStartFailed: failure => failures.push(failure),
 		});
@@ -320,6 +366,9 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		await predecessor;
 		await session.waitForIdle();
 		expect(successorCalls).toBeGreaterThan(0);
+		expect(await submission.execution).toMatchObject({ disposition: "promoted-to-run" });
+		expect(await submission.terminal).toMatchObject({ disposition: "completed" });
+		expect(submission.cancel()).toBe(false);
 		expect(failures).toEqual([]);
 		expect(userTexts(session)).toEqual(["predecessor", "queued"]);
 	});

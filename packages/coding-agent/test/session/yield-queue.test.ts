@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { YieldQueue } from "@gajae-code/coding-agent/session/yield-queue";
+import { TerminalIdleAdmissionError, YieldQueue } from "@gajae-code/coding-agent/session/yield-queue";
 
 type Entry = {
 	id: string;
@@ -84,6 +84,158 @@ describe("YieldQueue", () => {
 
 		expect(harness.idleBatches).toHaveLength(1);
 		expect(harness.idleBatches[0]?.map(messageText)).toEqual(["a,b"]);
+	});
+
+	test("streaming ignores the idle signal provider and failed idle lookup retains entries", async () => {
+		let failSignal = true;
+		let lookups = 0;
+		const streaming: string[] = [];
+		const idle: string[] = [];
+		const controller = new AbortController();
+		const queue = new YieldQueue({
+			isStreaming: () => true,
+			injectStreaming: message => {
+				streaming.push(messageText(message));
+			},
+			injectIdle: async (messages, signal) => {
+				if (signal !== controller.signal) throw new Error("Wrong idle signal");
+				idle.push(...messages.map(messageText));
+			},
+			scheduleIdleFlush: () => {
+				throw new Error("Unexpected idle scheduling");
+			},
+			getIdleFlushSignal: () => {
+				lookups++;
+				if (failSignal) throw new Error("Idle signal unavailable");
+				return controller.signal;
+			},
+		});
+		queue.register<Entry>("items", { build: entries => userMessage(entries.map(entry => entry.id).join(",")) });
+		queue.enqueue("items", { id: "streaming" });
+		await queue.flush("streaming");
+		expect(lookups).toBe(0);
+		expect(streaming).toEqual(["streaming"]);
+		queue.enqueue("items", { id: "idle" });
+		await queue.flush("idle");
+		expect(lookups).toBe(1);
+		expect(queue.has("items")).toBe(true);
+		expect(idle).toEqual([]);
+		failSignal = false;
+		await queue.flush("idle");
+		expect(lookups).toBe(2);
+		expect(queue.has()).toBe(false);
+		expect(idle).toEqual(["idle"]);
+	});
+
+	test("retains entries on admission failure and holds the recovered lease through delivery", async () => {
+		let ready = false;
+		let leased = false;
+		let builds = 0;
+		const enteredAdmission = Promise.withResolvers<void>();
+		const drain = Promise.withResolvers<void>();
+		const enteredDelivery = Promise.withResolvers<void>();
+		const finishDelivery = Promise.withResolvers<void>();
+		const scheduled: Array<(signal?: AbortSignal) => Promise<void>> = [];
+		const batches: string[][] = [];
+		const ownership: boolean[] = [];
+		const signals: Array<AbortSignal | undefined> = [];
+		const controller = new AbortController();
+		const queue = new YieldQueue({
+			isStreaming: () => false,
+			injectStreaming: () => {
+				throw new Error("Unexpected streaming delivery");
+			},
+			withIdleAdmission: async (body, signal) => {
+				signals.push(signal);
+				if (!ready) throw new Error("Delegation not ready");
+				leased = true;
+				enteredAdmission.resolve();
+				try {
+					await drain.promise;
+					await body();
+				} finally {
+					leased = false;
+				}
+			},
+			injectIdle: async messages => {
+				ownership.push(leased);
+				batches.push(messages.map(messageText));
+				enteredDelivery.resolve();
+				await finishDelivery.promise;
+				ownership.push(leased);
+			},
+			scheduleIdleFlush: run => {
+				scheduled.push(run);
+			},
+		});
+		queue.register<Entry>("items", {
+			build: entries => {
+				builds++;
+				return userMessage(entries.map(entry => entry.id).join(","));
+			},
+		});
+		queue.enqueue("items", { id: "original" });
+		await scheduled.shift()!(controller.signal);
+		expect(queue.has("items")).toBe(true);
+		expect(builds).toBe(0);
+		expect(batches).toEqual([]);
+		expect(scheduled).toHaveLength(0);
+		ready = true;
+		queue.rearmIdle();
+		const delivery = scheduled.shift()!(controller.signal);
+		try {
+			await enteredAdmission.promise;
+			expect(queue.has("items")).toBe(true);
+			expect(builds).toBe(0);
+			queue.enqueue("items", { id: "later" });
+			drain.resolve();
+			await enteredDelivery.promise;
+			expect(queue.has()).toBe(false);
+			expect(builds).toBe(1);
+			expect(batches).toEqual([["original,later"]]);
+			expect(leased).toBe(true);
+		} finally {
+			drain.resolve();
+			finishDelivery.resolve();
+			await delivery;
+		}
+		expect(ownership).toEqual([true, true]);
+		expect(signals).toEqual([controller.signal, controller.signal]);
+		expect(leased).toBe(false);
+	});
+
+	test("drops idle entries and releases them when admission fails terminally", async () => {
+		const dropped: Array<{ kind: string; ids: string[] }> = [];
+		const batches: string[][] = [];
+		const queue = new YieldQueue({
+			isStreaming: () => false,
+			injectStreaming: () => {
+				throw new Error("Unexpected streaming delivery");
+			},
+			withIdleAdmission: async () => {
+				throw new TerminalIdleAdmissionError(new Error("startup readiness rejected"));
+			},
+			injectIdle: async messages => {
+				batches.push(messages.map(messageText));
+			},
+			scheduleIdleFlush: () => {},
+			onIdleEntriesDropped: (kind, entries) => {
+				dropped.push({ kind, ids: (entries as Entry[]).map(entry => entry.id) });
+			},
+		});
+		queue.register<Entry>("items", { build: entries => userMessage(entries.map(entry => entry.id).join(",")) });
+		queue.register<Entry>("notes", { build: () => null });
+		queue.enqueue("items", { id: "a" });
+		queue.enqueue("notes", { id: "b" });
+
+		await queue.flush("idle");
+
+		expect(dropped).toEqual([
+			{ kind: "items", ids: ["a"] },
+			{ kind: "notes", ids: ["b"] },
+		]);
+		expect(queue.has()).toBe(false);
+		expect(batches).toEqual([]);
 	});
 
 	test("a skipped idle callback releases the debounce latch", () => {

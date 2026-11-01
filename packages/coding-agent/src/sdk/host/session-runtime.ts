@@ -448,6 +448,8 @@ export interface SdkOnlyReconciliationStore {
 }
 
 export interface SdkOnlyTerminalAbortSeams {
+	/** Factory-owned identity for shared image budgets; never supplied by a client or extension context. */
+	getImageAdmissionSession?: () => object;
 	/** Definitive event-driven observation: never abort, seal or quarantine a run to reclaim images. */
 	waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
@@ -7380,7 +7382,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const imageUploads =
 			typeof transport.isConnectionOpen === "function" &&
 			typeof options.terminalAbortSeams?.waitForRunSettlement === "function"
-				? new PromptImageUploadStore(connectionId => transport.isConnectionOpen?.(connectionId) === true)
+				? new PromptImageUploadStore(
+						connectionId => transport.isConnectionOpen?.(connectionId) === true,
+						options.terminalAbortSeams?.getImageAdmissionSession?.(),
+					)
 				: undefined;
 		currentImageUploads = imageUploads;
 		const controlSurface = createControlSurface(

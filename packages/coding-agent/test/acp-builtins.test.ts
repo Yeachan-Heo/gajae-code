@@ -3,6 +3,7 @@ import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/sdk";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
@@ -31,6 +32,7 @@ interface FakeAcpBuiltinSession {
 	isFastForProvider(provider?: string): boolean;
 	isFastForSubagentProvider(provider?: string): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
+	getAgentModelOverrides(): Record<string, ModelSelectorValue>;
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
 	getSessionStats: () => {
@@ -169,6 +171,11 @@ function createRuntime() {
 			this._todoPhases = phases;
 		},
 		async refreshBaseSystemPrompt() {},
+		// Mirrors AgentSession: the effective selector map merges this session's
+		// `task.agentModelOverrides` with its live session-owned selections.
+		getAgentModelOverrides() {
+			return structuredClone(this.settings.get("task.agentModelOverrides") ?? {});
+		},
 		getAsyncJobSnapshot: () => null,
 		getSessionStats: () => ({
 			sessionFile: undefined,
@@ -668,7 +675,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("model: reports only default plus GJC role-agent assignment targets", async () => {
-		const { output, runtime } = createRuntime();
+		const { output, runtime, session } = createRuntime();
 		runtime.settings = Settings.isolated({
 			cycleOrder: ["smol", "task", "default"],
 			modelRoles: {
@@ -683,6 +690,8 @@ describe("ACP builtin slash commands", () => {
 				smol: { name: "Quick", color: "error" },
 			},
 		});
+		// The summary reads role overrides from the session's own settings.
+		session.settings = runtime.settings;
 
 		const result = await executeAcpBuiltinSlashCommand("/model", runtime);
 
