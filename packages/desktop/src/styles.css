@@ -399,7 +399,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-controls > * { min-width: 0; max-width: 100%; }
 .model-trigger { min-width: 0; max-width: 100%; text-align: left; }
 .model-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.reasoning-control { display: flex; flex: 0 1 220px; align-items: center; min-width: 0; max-width: 100%; margin: 0; }
+/* The level names are short and fixed, so the control takes the width of its own label instead
+   of a fixed column that leaves a long empty strip inside the trigger. */
+.reasoning-control { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; max-width: min(220px, 100%); margin: 0; }
+.reasoning-control .select-control, .reasoning-control .select-trigger { flex: 0 1 auto; }
 /* Reasoning listbox. It reuses only the base button metrics shared with .model-trigger. */
 .select-control { position: relative; display: flex; min-width: 0; max-width: 100%; flex: 1 1 auto; }
 .select-trigger { flex: 1 1 auto; justify-content: flex-start; gap: 8px; }
