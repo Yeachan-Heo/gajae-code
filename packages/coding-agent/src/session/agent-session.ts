@@ -5045,6 +5045,15 @@ export class AgentSession {
 			return;
 		}
 	}
+	/**
+	 * True when idle delivery cannot be retried by any later admission: the session
+	 * is being torn down, or the startup barrier itself rejected and therefore stays
+	 * rejected for every later prompt.
+	 */
+	#isTerminalIdleAdmissionFailure(error: unknown): boolean {
+		if (this.#isDisposed || this.#disposeAbortController.signal.aborted) return true;
+		return !isPromptPreflightCancelledError(error);
+	}
 	async #awaitStartupPromptWaiters(signal?: AbortSignal): Promise<void> {
 		while (this.#startupPromptWaiters.size > 0) {
 			await awaitPromptInvocationPreflight(Promise.all([...this.#startupPromptWaiters]), signal);
@@ -5111,10 +5120,12 @@ export class AgentSession {
 			try {
 				await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
 			} catch (error) {
-				// An idle delivery cannot be retried once readiness itself rejected or the
-				// session was disposed: mark that terminal so the yield queue drops the
-				// entries instead of retaining work no later admission can deliver.
-				if (options?.idleDelivery === true) throw new TerminalIdleAdmissionError(error);
+				// An idle delivery is unrecoverable in exactly two cases: the session is being
+				// torn down, or startup readiness itself rejected (the barrier stays rejected
+				// for every later prompt). A cancelled preflight, such as a new turn
+				// superseding post-prompt work, stays retryable and must retain the entries.
+				if (options?.idleDelivery === true && this.#isTerminalIdleAdmissionFailure(error))
+					throw new TerminalIdleAdmissionError(error);
 				throw error;
 			} finally {
 				releaseStartupPromptWaiter?.();

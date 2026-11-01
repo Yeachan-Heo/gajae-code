@@ -169,6 +169,11 @@ function createRuntime() {
 			this._todoPhases = phases;
 		},
 		async refreshBaseSystemPrompt() {},
+		// Mirrors AgentSession: the effective selector map merges this session's
+		// `task.agentModelOverrides` with its live session-owned selections.
+		getAgentModelOverrides() {
+			return structuredClone(this.settings.get("task.agentModelOverrides") ?? {});
+		},
 		getAsyncJobSnapshot: () => null,
 		getSessionStats: () => ({
 			sessionFile: undefined,
@@ -668,7 +673,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("model: reports only default plus GJC role-agent assignment targets", async () => {
-		const { output, runtime } = createRuntime();
+		const { output, runtime, session } = createRuntime();
 		runtime.settings = Settings.isolated({
 			cycleOrder: ["smol", "task", "default"],
 			modelRoles: {
@@ -683,6 +688,8 @@ describe("ACP builtin slash commands", () => {
 				smol: { name: "Quick", color: "error" },
 			},
 		});
+		// The summary reads role overrides from the session's own settings.
+		session.settings = runtime.settings;
 
 		const result = await executeAcpBuiltinSlashCommand("/model", runtime);
 

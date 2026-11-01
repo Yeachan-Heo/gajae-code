@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { YieldQueue } from "@gajae-code/coding-agent/session/yield-queue";
+import { TerminalIdleAdmissionError, YieldQueue } from "@gajae-code/coding-agent/session/yield-queue";
 
 type Entry = {
 	id: string;
@@ -202,6 +202,40 @@ describe("YieldQueue", () => {
 		expect(ownership).toEqual([true, true]);
 		expect(signals).toEqual([controller.signal, controller.signal]);
 		expect(leased).toBe(false);
+	});
+
+	test("drops idle entries and releases them when admission fails terminally", async () => {
+		const dropped: Array<{ kind: string; ids: string[] }> = [];
+		const batches: string[][] = [];
+		const queue = new YieldQueue({
+			isStreaming: () => false,
+			injectStreaming: () => {
+				throw new Error("Unexpected streaming delivery");
+			},
+			withIdleAdmission: async () => {
+				throw new TerminalIdleAdmissionError(new Error("startup readiness rejected"));
+			},
+			injectIdle: async messages => {
+				batches.push(messages.map(messageText));
+			},
+			scheduleIdleFlush: () => {},
+			onIdleEntriesDropped: (kind, entries) => {
+				dropped.push({ kind, ids: (entries as Entry[]).map(entry => entry.id) });
+			},
+		});
+		queue.register<Entry>("items", { build: entries => userMessage(entries.map(entry => entry.id).join(",")) });
+		queue.register<Entry>("notes", { build: () => null });
+		queue.enqueue("items", { id: "a" });
+		queue.enqueue("notes", { id: "b" });
+
+		await queue.flush("idle");
+
+		expect(dropped).toEqual([
+			{ kind: "items", ids: ["a"] },
+			{ kind: "notes", ids: ["b"] },
+		]);
+		expect(queue.has()).toBe(false);
+		expect(batches).toEqual([]);
 	});
 
 	test("a skipped idle callback releases the debounce latch", () => {
