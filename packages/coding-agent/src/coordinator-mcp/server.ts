@@ -7371,6 +7371,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (existing.request_digest !== requestDigest) throw new Error("idempotency_conflict");
 				if (existing.phase === "uncertain") throw new Error("terminal_uncertain");
 				if (retainDelegateResponse) existing.delegate_response_pending = true;
+				// If the request was converted to a steer and then deleted, the steer disposition
+				// is preserved for recovery: replay it instead of re-dispatching the prompt.
+				if ((existing as Record<string, unknown>).steer_disposition) {
+					// The request was discarded but steer disposition is durable recovery authority.
+					throw Object.assign(new Error("steer_converted"), { acknowledged: (existing as Record<string, unknown>).steer_disposition });
+				}
 				// An accepted receipt is durable authority. It is recovered below instead
 				// of sending the same remote idempotency key a second time.
 				if (existing.phase === "accepted" || existing.phase === "completed" || existing.phase === "claimed") return;
@@ -7447,6 +7453,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (initialAuthority) delete transaction.recovery.initial_delegate_request;
 		});
 		return keyDigest;
+	}
+
+	/** Persist the steer disposition before discarding the prompt reservation.
+	 * This ensures that if a crash occurs between the steer acceptance and
+	 * reservation cleanup, a retry can recover the durable steer outcome
+	 * instead of re-dispatching the prompt. */
+	async function persistSteerDispositioning(
+		sessionId: string,
+		promptKey: string,
+		acknowledgement: RuntimePromptAcknowledgement,
+	): Promise<void> {
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (!request) return;
+			// Record the durable steer outcome so retry can replay it without re-dispatching.
+			request.steer_disposition = {
+				accepted: acknowledgement.accepted,
+				command_id: acknowledgement.command_id,
+				turn_id: acknowledgement.turn_id,
+				status: acknowledgement.status,
+			};
+			request.updated_at = new Date().toISOString();
+		});
 	}
 
 	/** Remove a reservation when the remote endpoint returned a decided, malformed
@@ -7580,8 +7609,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// The runtime refused to replace a run this connection does not own and
 			// queued the text as a steer for that run instead. No prompt lifecycle
 			// exists for the reserved turn, so it must not be persisted as accepted.
-			// A crash before this discard leaves the reservation `remote_started`; the
-			// exact-key retry replays the same SDK request and lands here again.
+			// Persist the steer disposition durably BEFORE deletion: a crash between
+			// the deletion and return leaves recovery authority to replay the steer
+			// instead of re-dispatching the prompt.
+			await persistSteerDispositioning(sessionId, promptKey, acknowledgement);
 			await discardUnacceptedPromptReservation(sessionId, promptKey);
 			return acknowledgement;
 		}
@@ -10669,7 +10700,38 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									turn_id: previousActiveTurn.turn_id,
 								};
 							}
-							const promptKey = await claimCanonicalPrompt(sessionId, prompt, operation, idempotencyKey);
+							let promptKey: string;
+							let recoveredSteerDisposition: Record<string, unknown> | undefined;
+							try {
+								promptKey = await claimCanonicalPrompt(sessionId, prompt, operation, idempotencyKey);
+							} catch (error) {
+								// If this idempotency key was previously converted to a steer and then deleted,
+								// the steer disposition is durable recovery authority: replay it instead of
+								// re-dispatching the prompt.
+								if (error instanceof Error && (error as Record<string, unknown>).message === "steer_converted")
+									recoveredSteerDisposition = (error as Record<string, unknown>).acknowledged as Record<string, unknown>;
+								else throw error;
+							}
+							if (recoveredSteerDisposition) {
+								// Replay the durable steer disposition: the prompt was deleted but the steer
+								// outcome is recoverable.
+								const activeTurnId = previousActiveTurn?.turn_id ?? null;
+								const acknowledgement = recoveredSteerDisposition as RuntimePromptAcknowledgement;
+								return {
+									ok: true,
+									session_id: sessionId,
+									turn_id: activeTurnId,
+									active_turn_id: activeTurnId,
+									delivery: "steer",
+									queued: false,
+									aborted: false,
+									operation,
+									result: publicSdkAcknowledgement(acknowledgement),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+								};
+							}
 							const acknowledgement = await dispatchOrRecoverPrompt(
 								currentSession,
 								sessionId,
