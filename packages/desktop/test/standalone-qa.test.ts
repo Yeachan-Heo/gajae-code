@@ -5,7 +5,14 @@ import * as path from "node:path";
 
 // Verifier-only fixtures exercise failure handling and EOF-driven shutdown.
 // Packaged-runtime proof still runs the actual app binaries, never these fixtures.
-for (const fault of ["fatal_after_shutdown", "malformed_after_shutdown", "early_eof", "normal_eof"] as const) {
+for (const fault of [
+	"fatal_after_shutdown",
+	"malformed_after_shutdown",
+	"early_eof",
+	"cleanup_deadline",
+	"cleanup_rejected",
+	"normal_eof",
+] as const) {
 	test(fault === "normal_eof"
 		? "standalone verifier closes stdin after acknowledged shutdown"
 		: `standalone verifier rejects ${fault} even with an exit-zero host`, async () => {
@@ -27,12 +34,14 @@ for await (const chunk of Bun.stdin.stream()) {
     const request = JSON.parse(buffer.slice(0, newline)); buffer = buffer.slice(newline + 1); newline = buffer.indexOf("\\n");
     const result = request.method === "project.open" ? { id: "p" } : request.method === "session.create" ? { id: "s" } : request.method === "operator.execute" ? { operationId: "o", status: "completed", exitCode: 0, output: ${JSON.stringify(path.join(directory, "gjc"))} } : null;
     process.stdout.write(JSON.stringify({ type: "response", id: request.id, ok: true, result }) + "\\n");
-    if (request.method === "shutdown" && ${JSON.stringify(fault)} !== "normal_eof") {
+    if (request.method === "shutdown" && ["fatal_after_shutdown", "malformed_after_shutdown"].includes(${JSON.stringify(fault)})) {
       process.stdout.write(${JSON.stringify(fault)} === "fatal_after_shutdown" ? JSON.stringify({ type: "fatal", error: "late fixture fatal" }) + "\\n" : "not-json\\n");
       await Bun.sleep(20); process.exit(0);
     }
   }
 }
+if (${JSON.stringify(fault)} === "cleanup_deadline") process.stderr.write("[postmortem] cleanup deadline (1ms) expired for manual; exiting without waiting for remaining callbacks.\\n");
+if (${JSON.stringify(fault)} === "cleanup_rejected") process.stderr.write("Cleanup callback failed\\n");
 `;
 			for (const name of ["gjc", "gjc-desktop-host"]) {
 				const file = path.join(directory, name);
@@ -57,6 +66,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			if (fault === "normal_eof") {
 				expect(code).toBe(0);
 				expect(JSON.parse(output).hostExitCode).toBe(0);
+				expect(JSON.parse(output).hostDiagnostics).toBe("");
 				expect(error).toBe("");
 			} else {
 				expect(code).not.toBe(0);
@@ -66,7 +76,9 @@ for await (const chunk of Bun.stdin.stream()) {
 						? "late fixture fatal"
 						: fault === "malformed_after_shutdown"
 							? "JSON"
-							: "Host",
+							: fault.startsWith("cleanup_")
+								? "Host cleanup diagnostics"
+								: "Host",
 				);
 			}
 		} finally {

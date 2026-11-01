@@ -203,9 +203,12 @@ try {
 	const code = await bounded(child.exited, 10_000, "Host shutdown exit");
 	await bounded(readFrames, 5000, "Host final frame drain");
 	if (readerFailure) throw readerFailure;
-	if (code !== 0) throw new Error(`Host shutdown failed: ${await diagnostics.wait(1000)}`);
+	const hostDiagnostics = await diagnostics.wait(1000);
+	if (code !== 0) throw new Error(`Host shutdown failed: ${hostDiagnostics}`);
+	if (/\[postmortem\] cleanup deadline|Cleanup callback failed|Cleanup invoked recursively/.test(hostDiagnostics))
+		throw new Error(`Host cleanup diagnostics: ${hostDiagnostics}`);
 	process.stdout.write(
-		`${JSON.stringify({ app, globalPath: environment.PATH, version, smoke, sdkDispatch, shellStatus: operation.status, shellExitCode: operation.exitCode, shellOutput: operation.output, hostExitCode: code }, null, 2)}\n`,
+		`${JSON.stringify({ app, globalPath: environment.PATH, version, smoke, sdkDispatch, shellStatus: operation.status, shellExitCode: operation.exitCode, shellOutput: operation.output, hostExitCode: code, hostDiagnostics }, null, 2)}\n`,
 	);
 } finally {
 	await Promise.all([...children].map(stop));
