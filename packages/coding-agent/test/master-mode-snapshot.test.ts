@@ -134,16 +134,16 @@ test("collectMasterPeerSnapshot omits both the current row and the lineage owner
 	]);
 });
 
-test("collectMasterPeerSnapshot keeps a live lineage owner row after a switch as an independent peer", async () => {
-	// After master `master` switched to `switched`, it stopped the `master` host. A
-	// live `master` row is another process that resumed that session (#7459).
+test("collectMasterPeerSnapshot omits stale-live owner row when it has the same stateRoot as current", async () => {
+	// After master `master` switched to `switched` (both sharing stateRoot `/s`), the
+	// `master` row may still show live due to best-effort host_unregistered and Broker
+	// index staleness. Same stateRoot proves it is the same process, not a peer (#7459).
 	const { anchor } = await gitAnchor();
-	const owner = { id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true };
 	const lifecycle = new FakeLifecycle({
 		ok: true,
 		operation: "session.list",
 		result: result(anchor, [
-			owner,
+			{ id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true },
 			{ id: "switched", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
 		]),
 	});
@@ -155,7 +155,60 @@ test("collectMasterPeerSnapshot keeps a live lineage owner row after a switch as
 		scope: "repo",
 		requestAnchor: anchor,
 	});
+	expect(snapshot.rows).toEqual([]);
+});
+
+test("collectMasterPeerSnapshot keeps live owner row when it has different stateRoot than current", async () => {
+	// After master `master` switched to `switched` with different stateRoots, a live
+	// `master` row with a different stateRoot `/s-old` proves it is another process
+	// that independently resumed that session (#7459).
+	const { anchor } = await gitAnchor();
+	const owner = { id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s-old" }, live: true };
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			owner,
+			{
+				id: "switched",
+				locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s-new" },
+				live: true,
+				role: "master",
+			},
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
 	expect(snapshot.rows).toEqual([owner]);
+});
+
+test("collectMasterPeerSnapshot omits owner row after switch when current session is not in results", async () => {
+	// Conservative approach: if we cannot confirm the owner row has a different
+	// stateRoot, we do not treat it as a peer (it might be stale index data).
+	const { anchor } = await gitAnchor();
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			{ id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true },
+			// Current session `switched` is not in the results
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	expect(snapshot.rows).toEqual([]);
 });
 
 test("collectMasterPeerSnapshot omits the owner row before a switch even when it is live", async () => {
