@@ -2,8 +2,15 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import { oauthCredentialSchema, remoteOauthCredentialSchema } from "../src/auth-broker/wire-schemas";
-import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "../src/auth-storage";
+import {
+	AuthStorage,
+	REMOTE_REFRESH_SENTINEL,
+	resolveMCPOAuthResourceOrigin,
+	resolveMCPOAuthTokenEndpoint,
+	SqliteAuthCredentialStore,
+} from "../src/auth-storage";
 
 describe("MCP OAuth credential binding persistence", () => {
 	let tempDir = "";
@@ -333,5 +340,169 @@ describe("MCP OAuth credential binding persistence", () => {
 			await firstServer.stop(true);
 			await secondServer.stop(true);
 		}
+	});
+});
+
+describe("MCP OAuth token endpoint TLS", () => {
+	const cleartextRefused = [
+		"http://192.0.0.9/token",
+		"http://192.0.0.10/token",
+		"http://[::ffff:c000:9]/token",
+		"http://[::ffff:c000:a]/token",
+		"http://192.0.0.8/token",
+		"http://192.0.0.11/token",
+		"http://attacker.example/token",
+		"http://10.0.0.1/token",
+	];
+	const httpsStillAllowed = [
+		"https://192.0.0.9/token",
+		"https://192.0.0.10/token",
+		"https://[::ffff:c000:9]/token",
+		"https://[::ffff:c000:a]/token",
+		"https://192.0.0.8/token",
+		"https://192.0.0.11/token",
+		"https://attacker.example/token",
+		"https://10.0.0.1/token",
+	];
+	const loopbackStillAllowed = [
+		"http://127.0.0.1/token",
+		"http://localhost/token",
+		"http://localhost./token",
+		"http://[::1]/token",
+		"http://[::ffff:7f00:1]/token",
+	];
+
+	async function refreshTokenEndpoint(
+		tokenEndpoint: string,
+	): Promise<{ fetchedBody: string | null; error: string | null }> {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-oauth-tls-"));
+		let fetchedBody: string | null = null;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: string | URL | Request,
+			init?: RequestInit,
+		) => {
+			const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+			if (href !== tokenEndpoint) throw new Error(`unexpected token endpoint ${href}`);
+			fetchedBody = String(init?.body ?? "");
+			return Response.json({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 });
+		}) as unknown as typeof fetch);
+		const storage = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(dir, "agent.db")));
+		try {
+			await storage.reload();
+			await storage.set("mcp_oauth_tls", {
+				type: "oauth",
+				access: "old-access",
+				refresh: "refresh-secret",
+				expires: 0,
+				mcpBinding: { resourceOrigin: "https://mcp.example", tokenEndpoint },
+			});
+			const credential = storage.get("mcp_oauth_tls");
+			if (credential?.type !== "oauth") throw new Error("expected OAuth credential");
+			await storage.forceRefreshOAuthCredential("mcp_oauth_tls", credential, {
+				clientId: "bound-client",
+				clientSecret: "bound-secret",
+			});
+			return { fetchedBody, error: null };
+		} catch (error) {
+			return { fetchedBody, error: error instanceof Error ? error.message : String(error) };
+		} finally {
+			fetchSpy.mockRestore();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}
+
+	test("does not refresh globally reachable anycast addresses over HTTP, including mapped forms", async () => {
+		for (const tokenEndpoint of [
+			"http://192.0.0.9/token",
+			"http://192.0.0.10/token",
+			"http://[::ffff:c000:9]/token",
+			"http://[::ffff:c000:a]/token",
+		]) {
+			expect(resolveMCPOAuthTokenEndpoint(tokenEndpoint)).toBeUndefined();
+			expect(resolveMCPOAuthTokenEndpoint("http://[::ffff:192.0.0.9]/token")).toBeUndefined();
+			expect(resolveMCPOAuthTokenEndpoint("http://[0:0:0:0:0:ffff:192.0.0.10]/token")).toBeUndefined();
+			const outcome = await refreshTokenEndpoint(tokenEndpoint);
+			expect(outcome.fetchedBody).toBeNull();
+			expect(outcome.error).toContain("Invalid MCP OAuth credential binding");
+		}
+	});
+
+	test("still refreshes the https form of those addresses and adjacent hosts", async () => {
+		for (const tokenEndpoint of httpsStillAllowed) {
+			expect(resolveMCPOAuthTokenEndpoint(tokenEndpoint)).toBe(tokenEndpoint);
+			const outcome = await refreshTokenEndpoint(tokenEndpoint);
+			expect(outcome.error).toBeNull();
+			expect(outcome.fetchedBody).toContain("refresh_token=refresh-secret");
+			expect(outcome.fetchedBody).toContain("client_secret=bound-secret");
+		}
+	});
+
+	test("still refreshes a loopback http token endpoint, including the mapped form", async () => {
+		for (const tokenEndpoint of loopbackStillAllowed) {
+			expect(resolveMCPOAuthTokenEndpoint(tokenEndpoint)).toBe(new URL(tokenEndpoint).href);
+			const outcome = await refreshTokenEndpoint(new URL(tokenEndpoint).href);
+			expect(outcome.error).toBeNull();
+			expect(outcome.fetchedBody).toContain("refresh_token=refresh-secret");
+		}
+	});
+
+	test("refuses other cleartext token endpoints and leaves the resource origin on http", async () => {
+		for (const tokenEndpoint of cleartextRefused) {
+			expect(resolveMCPOAuthTokenEndpoint(tokenEndpoint)).toBeUndefined();
+		}
+		expect(resolveMCPOAuthResourceOrigin("http://192.0.0.9")).toBe("http://192.0.0.9");
+		expect(resolveMCPOAuthResourceOrigin("http://attacker.example")).toBe("http://attacker.example");
+		const credential = {
+			type: "oauth" as const,
+			access: "access",
+			refresh: "refresh",
+			expires: 0,
+			mcpBinding: { resourceOrigin: "https://mcp.example", tokenEndpoint: "http://192.0.0.9/token" },
+		};
+		expect(oauthCredentialSchema.safeParse(credential).success).toBe(false);
+	});
+
+	test("property: non-loopback token endpoints are https, fc.property seed 65827, numRuns 80", () => {
+		const letter = fc.integer({ min: 0, max: 25 }).map(value => String.fromCharCode(97 + value));
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 0, max: 255 }),
+				fc.integer({ min: 0, max: 255 }),
+				fc.integer({ min: 0, max: 255 }),
+				fc.integer({ min: 0, max: 255 }),
+				letter,
+				letter,
+				letter,
+				(a, b, c, d, x, y, z) => {
+					const host = `${a}.${b}.${c}.${d}`;
+					const loopback = a === 127;
+					const http = resolveMCPOAuthTokenEndpoint(`http://${host}/token`);
+					const https = resolveMCPOAuthTokenEndpoint(`https://${host}/token`);
+					const mappedHttp = resolveMCPOAuthTokenEndpoint(`http://[::ffff:${host}]/token`);
+					const mappedHttps = resolveMCPOAuthTokenEndpoint(`https://[::ffff:${host}]/token`);
+					const name = `${x}${y}${z}.example`;
+					const namedHttp = resolveMCPOAuthTokenEndpoint(`http://${name}/token`);
+					const namedHttps = resolveMCPOAuthTokenEndpoint(`https://${name}/token`);
+					const httpOk = loopback ? http === `http://${host}/token` : http === undefined;
+					const mappedHttpOk = loopback
+						? mappedHttp?.startsWith("http:") === true && resolveMCPOAuthTokenEndpoint(mappedHttp) === mappedHttp
+						: mappedHttp === undefined;
+					const mappedHttpsOk =
+						mappedHttps?.startsWith("https://") === true &&
+						resolveMCPOAuthTokenEndpoint(mappedHttps) === mappedHttps;
+					return (
+						httpOk &&
+						mappedHttpOk &&
+						https === `https://${host}/token` &&
+						resolveMCPOAuthTokenEndpoint(https) === https &&
+						mappedHttpsOk &&
+						namedHttp === undefined &&
+						namedHttps === `https://${name}/token`
+					);
+				},
+			),
+			{ seed: 65827, numRuns: 80 },
+		);
 	});
 });
