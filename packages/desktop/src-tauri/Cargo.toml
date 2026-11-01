@@ -1,0 +1,25 @@
+[package]
+name = "gjc-desktop"
+version = "0.19.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+# Non-blocking pipe creation for the frame-transport regression test.
+libc = "0.2"

@@ -1,0 +1,163 @@
+/**
+ * The SDK runs its isolated shell worker chain through `process.execPath`, which
+ * for the desktop app is the host binary itself. If the compiled entrypoint does
+ * not dispatch those internal modes, the worker lane starts a second desktop host
+ * and every bash call fails with "Isolated shell worker emitted an unauthenticated
+ * protocol record". These tests pin the dispatch and the build wiring.
+ */
+import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const root = path.resolve(import.meta.dir, "../../..");
+const entry = path.join(root, "packages/desktop-host/src/entry.ts");
+
+async function handshake(mode: string) {
+	const token = crypto.randomUUID();
+	const child = Bun.spawn([process.execPath, entry, mode], {
+		cwd: root,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const settled = Promise.withResolvers<Record<string, unknown>>();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	void (async () => {
+		for await (const chunk of child.stdout as ReadableStream<Uint8Array>) {
+			buffer += decoder.decode(chunk, { stream: true });
+			let newline = buffer.indexOf("\n");
+			while (newline >= 0) {
+				const line = buffer.slice(0, newline);
+				buffer = buffer.slice(newline + 1);
+				newline = buffer.indexOf("\n");
+				if (!line.trim()) continue;
+				try {
+					const record = JSON.parse(line) as Record<string, unknown>;
+					settled.resolve(record);
+					return;
+				} catch {
+					/* keep reading */
+				}
+			}
+		}
+		settled.reject(new Error("worker closed without a protocol record"));
+	})();
+	child.stdin.write(`${JSON.stringify({ type: "init", token, options: { cwd: root } })}\n`);
+	await child.stdin.flush();
+	const timeout = setTimeout(() => settled.reject(new Error("worker handshake timed out")), 60_000);
+	try {
+		const record = await settled.promise;
+		return { record, token };
+	} finally {
+		clearTimeout(timeout);
+		child.kill("SIGKILL");
+		await child.exited;
+	}
+}
+
+describe("desktop host internal worker modes", () => {
+	test("SDK child modes reach the real CLI before desktop environment setup", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-sdk-dispatch-"));
+		try {
+			const child = Bun.spawn([process.execPath, entry, "sdk", "--help"], {
+				cwd: root,
+				env: { HOME: home, PATH: "/usr/bin:/bin" },
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [code, output, errors] = await Promise.all([
+				child.exited,
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			expect({ code, errors }).toEqual({ code: 0, errors: "" });
+			expect(output).toContain('"id":"sdk/overview/summary"');
+			expect(output).not.toContain('"type":"fatal"');
+		} finally {
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	for (const source of [entry, path.join(root, "packages/desktop-host/src/index.ts")]) {
+		for (const exitCode of [0, 7]) {
+			test(`${path.basename(source)} joins process cleanup and preserves exit ${exitCode}`, async () => {
+				const home = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-process-cleanup-"));
+				const marker = path.join(home, "cleanup-completed");
+				const preload = path.join(home, "preload.ts");
+				let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+				let deadline: Timer | undefined;
+				try {
+					await Bun.write(
+						preload,
+						`import { postmortem } from ${JSON.stringify(path.join(root, "packages/utils/src/index.ts"))};
+process.exitCode = ${exitCode};
+const timer = setInterval(() => {}, 1000);
+postmortem.register("desktop-lifetime-fixture", async () => { clearInterval(timer); await Bun.write(${JSON.stringify(marker)}, "completed"); });
+`,
+					);
+					child = Bun.spawn([process.execPath, "--preload", preload, source], {
+						cwd: root,
+						env: {
+							HOME: home,
+							PATH: "/usr/bin:/bin",
+							GJC_DESKTOP_ISOLATED: "1",
+							GJC_DESKTOP_DATA_DIR: path.join(home, "data"),
+						},
+						stdin: "pipe",
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					const owned = child;
+					deadline = setTimeout(() => owned.kill("SIGKILL"), 15_000);
+					child.stdin.write(`${JSON.stringify({ id: "cleanup", method: "shutdown", params: {} })}\n`);
+					await child.stdin.flush();
+					child.stdin.end();
+					const [code, output, errors] = await Promise.all([
+						child.exited,
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+					]);
+					expect({ code, errors }).toEqual({ code: exitCode, errors: "" });
+					const frames = output
+						.trim()
+						.split("\n")
+						.map(line => JSON.parse(line) as Record<string, unknown>);
+					expect(frames.find(frame => frame.type === "response" && frame.id === "cleanup")).toMatchObject({
+						ok: true,
+					});
+					expect(await Bun.file(marker).text()).toBe("completed");
+				} finally {
+					if (deadline) clearTimeout(deadline);
+					if (child?.exitCode === null) {
+						child.kill("SIGKILL");
+						await child.exited;
+					}
+					await fs.rm(home, { recursive: true, force: true });
+				}
+			}, 25_000);
+		}
+	}
+
+	test("answers the guardian handshake with an authenticated record", async () => {
+		const { record, token } = await handshake("--internal-bash-shell-worker");
+		// The desktop protocol answers with a fatal frame and no token; the worker
+		// protocol echoes the token it was given.
+		expect(record.token).toBe(token);
+		expect(record.type === "ready" || record.type === "retiring").toBe(true);
+	}, 90_000);
+
+	test("answers the runtime handshake with an authenticated record", async () => {
+		const { record, token } = await handshake("--internal-bash-shell-runtime");
+		expect(record.token).toBe(token);
+		expect(record.type).toBe("ready");
+	}, 90_000);
+
+	test("the packaged entrypoint is the one that dispatches worker modes", async () => {
+		const script = await fs.readFile(path.join(root, "packages/desktop/scripts/build-host.ts"), "utf8");
+		expect(script).toContain("packages/desktop-host/src/entry.ts");
+		expect(script).not.toContain('"./packages/desktop-host/src/index.ts"');
+	});
+});
