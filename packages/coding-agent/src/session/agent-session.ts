@@ -1238,6 +1238,10 @@ export interface PromptOptions {
 	 * agent execution begins. SDK bus installs a closure that fsyncs acceptance.
 	 */
 	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Ordinary model prompt's core acceptance observer, initially before agent_start, then for replacement
+	 * handles of that exact logical run until prompt settles. Observer errors are contained.
+	 * Does not fire for locally handled commands or skill invocations. Not a persistence fence. */
+	onRunAccepted?: (handle: AttemptRunHandle) => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
@@ -4257,6 +4261,10 @@ export class AgentSession {
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
 	readonly #logicalRunIdByAttemptScope = new WeakMap<AttemptScope, AttemptRunHandle["logicalRunId"]>();
+	readonly #promptRunAcceptedObservers = new Map<
+		AttemptRunHandle["logicalRunId"],
+		Set<(handle: AttemptRunHandle) => void>
+	>();
 	#acceptRunHandle(handle: AttemptRunHandle | undefined): void {
 		// Integration doubles can accept a run without minting a handle; keep the
 		// previously recorded run id rather than throwing inside the callback.
@@ -4264,6 +4272,9 @@ export class AgentSession {
 		this.#activeLogicalRunId = handle.logicalRunId;
 		this.#activeAttemptScope = handle.scope;
 		this.#logicalRunIdByAttemptScope.set(handle.scope, handle.logicalRunId);
+		// Mid-run maintenance replaces the handle for the same logical run without
+		// re-entering #promptWithMessage, so continuation acceptances are published here.
+		for (const observer of this.#promptRunAcceptedObservers.get(handle.logicalRunId) ?? []) observer(handle);
 	}
 
 	#turnIndex = 0;
@@ -11526,6 +11537,7 @@ export class AgentSession {
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
+		this.#promptRunAcceptedObservers.clear();
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;
@@ -15336,14 +15348,50 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
+		const observer = options?.onRunAccepted;
+		let observedLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
+		const observedHandles = new WeakSet<AttemptRunHandle>();
+		const notifyRunAccepted = (handle: AttemptRunHandle): void => {
+			if (!handle) return;
+			if (observedLogicalRunId !== undefined && handle.logicalRunId !== observedLogicalRunId) return;
+			if (observedHandles.has(handle)) return;
+			observedHandles.add(handle);
+			if (observedLogicalRunId === undefined && !this.#isDisposed) {
+				// Bind only to this invocation's actual first acceptance. Continuations may
+				// replace its scope, but unrelated logical runs cannot inherit it.
+				observedLogicalRunId = handle.logicalRunId;
+				let observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+				if (!observers) {
+					observers = new Set();
+					this.#promptRunAcceptedObservers.set(observedLogicalRunId, observers);
+				}
+				observers.add(notifyRunAccepted);
+			}
+			try {
+				const result: unknown = observer?.(handle);
+				if (result !== undefined)
+					void Promise.resolve(result).catch(() => logger.warn("Prompt run acceptance observer failed"));
+			} catch {
+				logger.warn("Prompt run acceptance observer failed");
+			}
+		};
 		try {
-			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
+			await this.#promptInternal(
+				text,
+				observer ? { ...options, onRunAccepted: notifyRunAccepted } : options,
+				releaseStartupPromptWaiter,
+			);
 			// Agent-core converts listener failures into an aborted response. Keep a
 			// rejected persistence fence typed at the public prompt boundary instead
 			// of reporting the misleading provider-level "Request was aborted".
 			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
 			if (appendRejection) throw appendRejection;
 		} finally {
+			if (observedLogicalRunId !== undefined) {
+				const observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+				observers?.delete(notifyRunAccepted);
+				if (observers?.size === 0) this.#promptRunAcceptedObservers.delete(observedLogicalRunId);
+			}
 			releaseStartupPromptWaiter();
 		}
 	}
