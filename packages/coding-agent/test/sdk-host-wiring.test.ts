@@ -7295,7 +7295,11 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	if (abortResponse?.result?.turn === "no_active_turn") {
 		expect(abortResponse.result.terminal).toBe("terminal_no_effect");
 	} else {
-		expect(abortResponse?.result).toMatchObject({ ownedWork: "left_running", resumeOnOwnedCompletion: true });
+		expect(abortResponse?.result).toMatchObject({
+			turn: "stopped",
+			ownedWork: "left_running",
+			resumeOnOwnedCompletion: true,
+		});
 	}
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
