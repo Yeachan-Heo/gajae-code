@@ -149,7 +149,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .project-group.drop-before { box-shadow: var(--ring), inset 0 2px 0 var(--accent); }
 .project-group.drop-after { box-shadow: var(--ring), inset 0 -2px 0 var(--accent); }
 .project-heading { cursor: grab; border-radius: var(--radius-xs); }
-.session-drop { border-radius: var(--radius-sm); }
+.session-item { border-radius: var(--radius-sm); }
 .show-more { width: 100%; justify-content: center; min-height: 26px; margin-top: 2px; font-size: 0.75rem; }
 /* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
 .menu-scrim { position: fixed; inset: 0; z-index: 40; border: 0; padding: 0; background: transparent; }
@@ -189,7 +189,8 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 /* The chevron folds the workspace's conversation list away; it turns right when folded. */
 .project-toggle { color: var(--muted); padding: 2px 4px; }
 .project-toggle .disclosure-chevron[data-open] { transform: rotate(90deg); }
-.path { display: block; overflow-wrap: anywhere; word-break: break-all; font-family: var(--mono); font-size: 0.6875rem; margin: 1px 0 4px; color: var(--muted); }
+/* One line at any font size: a wrapped path doubles the height of every workspace header. */
+.path { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 0.6875rem; margin: 1px 0 4px; color: var(--muted); }
 .session-row { display: flex; align-items: center; border: 1px solid transparent; border-radius: var(--radius-sm); margin: 1px 0; min-width: 0; }
 .session-row:hover { background: var(--surface-2); }
 .session-row.selected { background: var(--card); border-color: var(--border-soft); box-shadow: var(--shadow-rest); }
@@ -515,8 +516,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .theme-option[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .font-size-control { display: flex; align-items: center; gap: 6px; }
 .font-size-control .button { width: 32px; height: 32px; min-height: 0; padding: 0; font-size: 1rem; }
-/* A field, not a button: it still carries no accent outline, only its own surface. */
-.font-size-input { width: 4.5em; height: 32px; padding: 0 6px; border: 1px solid transparent; border-radius: var(--radius-xs); background: var(--surface-2); color: var(--text); text-align: center; font: inherit; }
+/* A field, not a button: it still carries no accent outline, only its own surface.
+   `--surface-2` sits within a rounding error of the dialog card, so this uses `--surface`. */
+.font-size-input { width: 4.5em; height: 32px; padding: 0 6px; border: 1px solid transparent; border-radius: var(--radius-xs); background: var(--surface); color: var(--text); text-align: center; font: inherit; }
 .font-size-input:focus-visible { outline: var(--ring); outline-offset: 1px; }
 .font-size-unit { color: var(--muted); font-size: 0.75rem; }
 .theme-swatch { width: 16px; height: 16px; flex: none; border-radius: var(--radius-pill); border: 1px solid var(--border-soft); }
