@@ -5790,11 +5790,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// provider request; see createMasterPeerSnapshotContributor for the
 			// discard/reuse/no-duplicate semantics.
 			const capturedSession = session;
+			const ownerEndpointGeneration = lifecycleStartupCapability?.rollback?.result.endpointGeneration ?? undefined;
 			session.registerBeforeAgentStartContributor(
 				createMasterPeerSnapshotContributor({
 					lifecycle: createSessionLifecycleService(agentDir),
 					ownerSessionId: masterModeContext.ownerSessionId,
 					getSessionId: () => sessionManager.getSessionId(),
+					...(ownerEndpointGeneration === undefined ? {} : { ownerEndpointGeneration }),
 					scope: masterModeContext.scope,
 					getCwd: getLiveCwd,
 					hasPersistedInjection: () =>
