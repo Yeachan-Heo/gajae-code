@@ -291,6 +291,22 @@
 							"modelsDevProvider": {
 								"type": "string",
 								"minLength": 1
+							},
+							"outputModalities": {
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							},
+							"inputModalities": {
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
 							}
 						},
 						"required": [

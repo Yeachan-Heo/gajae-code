@@ -90,6 +90,7 @@ import {
 	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	SessionSdkHost,
+	TURN_STREAM_CAPABILITY,
 } from "../src/sdk/host";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
@@ -1406,24 +1407,45 @@ for (const confirmNative of [false, true]) {
 	}, 60_000);
 }
 
-test("a default ACP-shaped SessionRouter client remains demanding", async () => {
+test("an ACP-shaped turnStream SessionRouter negotiates turn_stream alone and remains demanding", async () => {
+	const negotiations: string[][] = [];
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		return negotiatedImpl.call(this, (error, connectionId, capabilities) => {
+			// The threadsafe callback delivers its tuple as the second argument at runtime.
+			const negotiated = Array.isArray(connectionId) ? (connectionId as unknown[])[1] : capabilities;
+			if (Array.isArray(negotiated)) negotiations.push(negotiated.map(String));
+			return callback(error, connectionId, capabilities);
+		});
+	});
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
 	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
-	const baseDemand = sessionHostAttachedClients() ?? 0;
-	// ACP constructs the default router without notification-daemon observer role.
-	const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent") });
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
 	try {
-		await router.start();
-		await waitFor(
-			() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
-			"default SessionRouter demand attachment",
-		);
-		await Bun.sleep(100);
-		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		const baseDemand = sessionHostAttachedClients() ?? 0;
+		// ACP constructs its router with turnStream (not the notification-daemon observer role).
+		const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent"), turnStream: true });
+		try {
+			await router.start();
+			await waitFor(
+				() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
+				"turnStream SessionRouter demand attachment",
+			);
+			await waitFor(() => negotiations.length === 1, "turnStream hello negotiation");
+			await Bun.sleep(100);
+			expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		} finally {
+			await router.stop();
+		}
+		expect(negotiations[0]).toContain(TURN_STREAM_CAPABILITY);
+		expect(negotiations[0]).not.toContain(SESSION_HOST_OBSERVER_CAPABILITY);
 	} finally {
-		await router.stop();
-		await host.stop();
+		await host?.stop();
+		negotiatedHook.mockRestore();
 	}
 }, 60_000);
 

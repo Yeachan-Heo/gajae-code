@@ -397,7 +397,7 @@ import {
 	type WorkflowRecoveryZeroProgressMemory,
 } from "../gjc-runtime/workflow-recovery-projection";
 import { GoalRuntime } from "../goals/runtime";
-import type { Goal, GoalModeState } from "../goals/state";
+import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import {
 	buildSkillStopOutput,
@@ -417,7 +417,7 @@ import {
 	type WorkflowGateEmitter,
 } from "../modes/shared/agent-wire/workflow-gate-broker";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
-import type { PlanModeState } from "../plan-mode/state";
+import { type PlanModeState, restoredPlanFilePath } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
@@ -1238,6 +1238,10 @@ export interface PromptOptions {
 	 * agent execution begins. SDK bus installs a closure that fsyncs acceptance.
 	 */
 	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Ordinary model prompt's core acceptance observer, initially before agent_start, then for replacement
+	 * handles of that exact logical run until prompt settles. Observer errors are contained.
+	 * Does not fire for locally handled commands or skill invocations. Not a persistence fence. */
+	onRunAccepted?: (handle: AttemptRunHandle) => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
@@ -3209,6 +3213,7 @@ export class AgentSession {
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
 	#sessionIdentityChangeListeners = new Set<() => void | Promise<void>>();
+	#committedSessionSwitchListeners = new Set<() => void | Promise<void>>();
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
@@ -4195,7 +4200,6 @@ export class AgentSession {
 	readonly #sessionMcpControlPort: SessionMcpControlPort | undefined;
 	#sessionMcpOverrides = new Map<string, "connected" | "disconnected">();
 	/** MCP tool names skipped because a non-MCP tool already holds them. */
-	#mcpToolNamesHeldByOtherTools = new Set<string>();
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
@@ -4259,6 +4263,10 @@ export class AgentSession {
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
 	readonly #logicalRunIdByAttemptScope = new WeakMap<AttemptScope, AttemptRunHandle["logicalRunId"]>();
+	readonly #promptRunAcceptedObservers = new Map<
+		AttemptRunHandle["logicalRunId"],
+		Set<(handle: AttemptRunHandle) => void>
+	>();
 	#acceptRunHandle(handle: AttemptRunHandle | undefined): void {
 		// Integration doubles can accept a run without minting a handle; keep the
 		// previously recorded run id rather than throwing inside the callback.
@@ -4266,6 +4274,9 @@ export class AgentSession {
 		this.#activeLogicalRunId = handle.logicalRunId;
 		this.#activeAttemptScope = handle.scope;
 		this.#logicalRunIdByAttemptScope.set(handle.scope, handle.logicalRunId);
+		// Mid-run maintenance replaces the handle for the same logical run without
+		// re-entering #promptWithMessage, so continuation acceptances are published here.
+		for (const observer of this.#promptRunAcceptedObservers.get(handle.logicalRunId) ?? []) observer(handle);
 	}
 
 	#turnIndex = 0;
@@ -6370,7 +6381,7 @@ export class AgentSession {
 		this.#mandatoryMCPToolNames = new Set(
 			(config.mandatoryMCPToolNames ?? [])
 				.map(name => name.toLowerCase())
-				.filter(name => this.#toolRegistry.has(name)),
+				.filter(name => this.#isRegisteredMcpTool(name)),
 		);
 		this.#constructorMCPToolSelection =
 			config.initialMCPToolSelectionIsExplicit === true
@@ -6787,16 +6798,29 @@ export class AgentSession {
 		await replacement;
 	}
 
+	/** A mandatory MCP name counts only while an MCP tool is the registered object for it. */
+	#isRegisteredMcpTool(name: string): boolean {
+		const tool = this.#toolRegistry.get(name);
+		return tool !== undefined && isMCPBridgeTool(tool);
+	}
+
+	/** True when a non-MCP tool owns `name`; a mandatory MCP name must never activate it. */
+	#isNameHeldByNonMcpTool(name: string): boolean {
+		const tool = this.#toolRegistry.get(name);
+		return tool !== undefined && !isMCPBridgeTool(tool);
+	}
+
 	/**
 	 * True when `tool` is an MCP tool whose name is already registered by a non-MCP tool
 	 * (for example an extension tool named `mcp__foo_bar`). The existing tool is kept so
 	 * later calls are never redirected to an MCP endpoint; the conflict is logged.
+	 * A registry object in `retiring` is being removed by its owner, so the MCP tool replaces it.
 	 */
-	#isMcpToolNameHeldByOtherTool(tool: CustomTool): boolean {
+	#isMcpToolNameHeldByOtherTool(tool: CustomTool, retiring?: ReadonlyMap<string, AgentTool>): boolean {
 		if (!isMCPBridgeTool(tool)) return false;
 		const existing = this.#toolRegistry.get(tool.name);
 		if (!existing || isMCPBridgeTool(existing)) return false;
-		this.#mcpToolNamesHeldByOtherTools.add(tool.name);
+		if (retiring?.get(tool.name) === existing) return false;
 		logger.warn("Skipping MCP tool whose name is already registered by another tool", {
 			tool: tool.name,
 			serverName: tool.mcpServerName,
@@ -6804,7 +6828,11 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Swap named custom tools and restore authoritative MCP selections as late tools arrive. */
+	/**
+	 * Swap named custom tools and restore authoritative MCP selections as late tools arrive.
+	 * A previous name whose registry entry is a non-MCP tool keeps that tool unless it is the
+	 * object the caller lists in `retiringTools`; another owner of the name is never removed.
+	 */
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
 		nextTools: readonly CustomTool[],
@@ -6814,6 +6842,7 @@ export class AgentSession {
 			activateNewTools?: boolean;
 			inactiveNewToolNames?: readonly string[];
 			persistMCPSelection?: boolean;
+			retiringTools?: ReadonlyMap<string, AgentTool>;
 		},
 	): Promise<void> {
 		while (this.#sessionTransitionKind !== undefined) {
@@ -6826,15 +6855,20 @@ export class AgentSession {
 		const previous = new Set(previousNames);
 		const inactiveNewToolNames = new Set(options?.inactiveNewToolNames ?? []);
 		const previousActive = this.getActiveToolNames();
+		const retiring = options?.retiringTools;
 		for (const name of previous) {
-			// The registry still holds the non-MCP tool that kept this name; do not remove it.
-			if (this.#mcpToolNamesHeldByOtherTools.delete(name)) continue;
+			const tool = this.#toolRegistry.get(name);
+			if (tool && !isMCPBridgeTool(tool) && retiring?.get(name) !== tool) {
+				// The kept tool is not replaced, so it also keeps its active state.
+				previous.delete(name);
+				continue;
+			}
 			this.#toolRegistry.delete(name);
 		}
 		const getCustomToolContext = () => this.#getCustomToolContext();
 		const added: string[] = [];
 		for (const customTool of omitPluginMcpNameShadows(nextTools)) {
-			if (this.#isMcpToolNameHeldByOtherTool(customTool)) continue;
+			if (this.#isMcpToolNameHeldByOtherTool(customTool, retiring)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
@@ -6848,8 +6882,8 @@ export class AgentSession {
 		);
 		this.#mandatoryMCPToolNames = new Set(
 			options?.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
-				: retainedMandatory,
+				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
+				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		if (options?.defaultSelectedConventionalMCPToolNames !== undefined) {
 			this.#defaultSelectedConventionalMCPToolNames = new Set(options.defaultSelectedConventionalMCPToolNames);
@@ -11185,6 +11219,12 @@ export class AgentSession {
 		return () => this.#sessionIdentityChangeListeners.delete(listener);
 	}
 
+	/** Fires after a different-file switch commits, including when later cleanup throws. */
+	subscribeCommittedSessionSwitch(listener: () => void | Promise<void>): () => void {
+		this.#committedSessionSwitchListeners.add(listener);
+		return () => this.#committedSessionSwitchListeners.delete(listener);
+	}
+
 	/**
 	 * Temporarily disconnect from agent events.
 	 * User listeners are preserved and will receive events again after resubscribe().
@@ -11505,6 +11545,7 @@ export class AgentSession {
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
+		this.#promptRunAcceptedObservers.clear();
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;
@@ -11848,6 +11889,22 @@ export class AgentSession {
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
 		return this.agent.state.isStreaming || this.#livePromptsInFlight() > 0;
+	}
+
+	/**
+	 * Whether `waitForIdle()` would block right now: a streaming turn, a retry or
+	 * TTSR resume, post-prompt work (idle-flush deliveries, auto-continuations), or
+	 * pending session settlement. Unlike `isStreaming`, this stays true in the gap
+	 * after a turn ends while a scheduled background delivery is still pending.
+	 */
+	get isAwaitingIdle(): boolean {
+		return (
+			this.isStreaming ||
+			this.#retryPromise !== undefined ||
+			this.#ttsrResumePromise !== undefined ||
+			this.#postPromptTasks.size > 0 ||
+			this.#isSessionSettlementPending()
+		);
 	}
 
 	/** Wait until streaming and session settlement work are fully settled. */
@@ -13888,9 +13945,15 @@ export class AgentSession {
 			activeMCPToolNames?: string[];
 			mandatoryMCPToolNames?: string[];
 			persistMCPSelection?: boolean;
+			/**
+			 * Registry objects, by name, that the caller installed and is retiring. An incoming MCP
+			 * tool replaces one only while it is still the registered object for that name.
+			 */
+			retiringTools?: ReadonlyMap<string, AgentTool>;
 		} = {},
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+		const retiring = options.retiringTools;
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		for (const name of existingNames) {
 			const tool = this.#toolRegistry.get(name);
@@ -13913,7 +13976,7 @@ export class AgentSession {
 		});
 
 		for (const customTool of omitPluginMcpNameShadows(mcpTools)) {
-			if (this.#isMcpToolNameHeldByOtherTool(customTool)) continue;
+			if (this.#isMcpToolNameHeldByOtherTool(customTool, retiring)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
@@ -13928,8 +13991,8 @@ export class AgentSession {
 		);
 		this.#mandatoryMCPToolNames = new Set(
 			options.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
-				: retainedMandatory,
+				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
+				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
@@ -14466,6 +14529,13 @@ export class AgentSession {
 		}
 	}
 
+	/** Drop plan mode and its reference when plan tool activation does not finish. */
+	clearPlanModeBinding(): void {
+		this.setPlanModeState(undefined);
+		this.#planReferenceSent = false;
+		this.#planReferencePath = "local://PLAN.md";
+	}
+
 	async invokeSkill(
 		name: string,
 		args = "",
@@ -14651,6 +14721,30 @@ export class AgentSession {
 
 	setGoalModeState(state: GoalModeState | undefined): void {
 		this.#applyGoalModeState(state);
+	}
+
+	/**
+	 * The loaded session file is the mode source after a switch to a different
+	 * file. A saved plan is installed only when plan mode is enabled and tools
+	 * are available, and only with a session-scoped plan path. A saved goal is
+	 * installed only when goal mode is enabled; otherwise the goal slot is cleared.
+	 */
+	#rebindSwitchedSessionMode(sessionContext: SessionContext): void {
+		const mode = sessionContext.mode;
+		const planEligible =
+			mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
+		if (planEligible) {
+			const planFilePath = restoredPlanFilePath(sessionContext.modeData?.planFilePath);
+			this.setPlanModeState({ enabled: true, planFilePath });
+		} else {
+			this.clearPlanModeBinding();
+		}
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		this.setGoalModeState(savedGoal ? { enabled: mode === "goal", mode: "active", goal: savedGoal } : undefined);
+		this.#resetInjectedContextSignatures();
 	}
 
 	getWorkflowGateEmitter(): WorkflowGateEmitter | undefined {
@@ -15316,14 +15410,50 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
+		const observer = options?.onRunAccepted;
+		let observedLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
+		const observedHandles = new WeakSet<AttemptRunHandle>();
+		const notifyRunAccepted = (handle: AttemptRunHandle): void => {
+			if (!handle) return;
+			if (observedLogicalRunId !== undefined && handle.logicalRunId !== observedLogicalRunId) return;
+			if (observedHandles.has(handle)) return;
+			observedHandles.add(handle);
+			if (observedLogicalRunId === undefined && !this.#isDisposed) {
+				// Bind only to this invocation's actual first acceptance. Continuations may
+				// replace its scope, but unrelated logical runs cannot inherit it.
+				observedLogicalRunId = handle.logicalRunId;
+				let observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+				if (!observers) {
+					observers = new Set();
+					this.#promptRunAcceptedObservers.set(observedLogicalRunId, observers);
+				}
+				observers.add(notifyRunAccepted);
+			}
+			try {
+				const result: unknown = observer?.(handle);
+				if (result !== undefined)
+					void Promise.resolve(result).catch(() => logger.warn("Prompt run acceptance observer failed"));
+			} catch {
+				logger.warn("Prompt run acceptance observer failed");
+			}
+		};
 		try {
-			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
+			await this.#promptInternal(
+				text,
+				observer ? { ...options, onRunAccepted: notifyRunAccepted } : options,
+				releaseStartupPromptWaiter,
+			);
 			// Agent-core converts listener failures into an aborted response. Keep a
 			// rejected persistence fence typed at the public prompt boundary instead
 			// of reporting the misleading provider-level "Request was aborted".
 			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
 			if (appendRejection) throw appendRejection;
 		} finally {
+			if (observedLogicalRunId !== undefined) {
+				const observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
+				observers?.delete(notifyRunAccepted);
+				if (observers?.size === 0) this.#promptRunAcceptedObservers.delete(observedLogicalRunId);
+			}
 			releaseStartupPromptWaiter();
 		}
 	}
@@ -25063,6 +25193,7 @@ export class AgentSession {
 				signal,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				rowId: failedRowId,
+				modelId: candidate.id,
 			});
 		}
 		const inventory = authStorage.listCredentialInventory(candidate.provider);
@@ -25075,7 +25206,7 @@ export class AgentSession {
 				peer.credentialKind !== credentialKind ||
 				failedRowIds.has(peer.id) ||
 				peer.disabled ||
-				!authStorage.isCredentialAvailable(candidate.provider, peer.id)
+				!authStorage.isCredentialAvailable(candidate.provider, peer.id, candidate.id)
 			) {
 				continue;
 			}
@@ -25101,10 +25232,11 @@ export class AgentSession {
 					signal,
 					owner: this.#modelRegistry.getAuthStorageOwner(),
 					rowId: peer.id,
+					modelId: candidate.id,
 				});
 				continue;
 			}
-			if (authStorage.isCredentialAvailable(candidate.provider, peer.id)) {
+			if (authStorage.isCredentialAvailable(candidate.provider, peer.id, candidate.id)) {
 				return { apiKey: resolved.apiKey, credentialRowId: peer.id };
 			}
 		}
@@ -25131,7 +25263,7 @@ export class AgentSession {
 		}
 		if (
 			resolved.credentialRowId !== undefined &&
-			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId, candidate.id)
 		) {
 			if (!this.#hasManagedFallbackCredentialPin(candidate.provider)) {
 				for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
@@ -25139,7 +25271,7 @@ export class AgentSession {
 						resolved = await resolveCurrentSelection();
 						break;
 					}
-					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
+					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)) continue;
 					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
 					try {
 						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
@@ -25170,7 +25302,7 @@ export class AgentSession {
 					if (
 						!alternative.apiKey ||
 						alternative.credentialRowId !== credential.id ||
-						!authStorage.isCredentialAvailable(candidate.provider, credential.id)
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)
 					) {
 						continue;
 					}
@@ -25180,7 +25312,7 @@ export class AgentSession {
 			}
 			if (
 				resolved.credentialRowId !== undefined &&
-				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId, candidate.id)
 			) {
 				return {
 					apiKey: undefined,
@@ -27171,7 +27303,7 @@ export class AgentSession {
 							credential.provider !== storageProvider ||
 							credential.credentialKind !== credentialKind ||
 							triedRows.has(credential.id) ||
-							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)
 						)
 							continue;
 						let credentialKeyResult: { kind: "resolved"; value: string | undefined } | { kind: "aborted" };
@@ -27182,7 +27314,7 @@ export class AgentSession {
 								}),
 							);
 						} catch (error) {
-							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)) {
+							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)) {
 								await rollbackCancelled();
 								throw error;
 							}
@@ -27207,7 +27339,7 @@ export class AgentSession {
 						if (
 							selectedRowId !== credential.id ||
 							selectedKind !== credentialKind ||
-							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)
 						)
 							continue;
 						selectedCredentialRowId = selectedRowId;
@@ -27493,6 +27625,7 @@ export class AgentSession {
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
+				modelId: model.id,
 			});
 			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
 			const trackedCredentialKind = credentialKind ?? beforeKind;
@@ -27507,14 +27640,14 @@ export class AgentSession {
 			if (credentialKind === undefined) return "unchanged";
 			for (const peerId of remainingCredentialIds) {
 				if (triedRows?.has(peerId)) continue;
-				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				if (!authStorage.isCredentialAvailable(provider, peerId, model.id)) continue;
 				let peerApiKey: string | undefined;
 				try {
 					peerApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(peerId) },
 					});
 				} catch (error) {
-					if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+					if (!authStorage.isCredentialAvailable(provider, peerId, model.id)) continue;
 					throw error;
 				}
 				if (!isAuthenticated(peerApiKey)) continue;
@@ -27523,7 +27656,7 @@ export class AgentSession {
 				if (
 					selectedRowId === peerId &&
 					selectedKind === credentialKind &&
-					authStorage.isCredentialAvailable(provider, peerId)
+					authStorage.isCredentialAvailable(provider, peerId, model.id)
 				) {
 					triedRows?.add(selectedRowId);
 					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before
@@ -29572,6 +29705,11 @@ export class AgentSession {
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
 		let sessionIdentityCommitted = false;
+		// Committed-switch listeners rebind controllers from the successor file. A
+		// same-file reload whose exact ownership changed still publishes a new
+		// identity, but #rebindSwitchedSessionMode does not run for it, so the
+		// listeners must not detach the live mode either.
+		let differentSessionCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -29966,6 +30104,10 @@ export class AgentSession {
 					);
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
+					differentSessionCommitted = true;
+					// Bind plan before post-commit cleanup. A cleanup failure leaves this
+					// successor active and must not keep the predecessor plan slot.
+					this.#rebindSwitchedSessionMode(sessionContext);
 					// A checkpoint count and entry id belong to the predecessor file.
 					// Leaving them armed lets a later rewind slice the successor and
 					// branch it from a missing entry, which falls back to the root.
@@ -30231,7 +30373,17 @@ export class AgentSession {
 				}
 			}
 			this.#endSessionTransition();
-			if (sessionIdentityCommitted) await this.notifySessionIdentityChanged();
+			if (sessionIdentityCommitted) {
+				const committedSwitchListeners = differentSessionCommitted ? [...this.#committedSessionSwitchListeners] : [];
+				for (const listener of committedSwitchListeners) {
+					try {
+						await listener();
+					} catch (error) {
+						logger.warn("Committed session switch listener failed", { error: String(error) });
+					}
+				}
+				await this.notifySessionIdentityChanged();
+			}
 		}
 	}
 

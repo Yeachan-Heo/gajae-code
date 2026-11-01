@@ -632,6 +632,8 @@ export interface EvictedContentMarker {
 	compactionEntryId: string;
 	firstKeptEntryId: string;
 	payloads: Record<string, ColdSpillRef>;
+	/** "v1": payload keys escape `\\` and `.` inside segments. Omitted: legacy raw dot-join (v0.19.2 and earlier). */
+	pathEncoding?: "v1";
 }
 
 export interface EvictCompactedContentResult {
@@ -5811,6 +5813,15 @@ function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: Reside
 const COLD_SPILL_NOTICE = "[Compacted history content evicted to durable cold storage]";
 const COLD_SPILL_ARGUMENTS_SENTINEL_KEY = "__gjcColdSpillArguments";
 const COLD_SPILL_MIN_CHARS = 1024;
+/**
+ * Append one segment to a cold-spill payload path. Segments are dot-joined so paths written by
+ * earlier releases (`message.content.0.text`) keep resolving; `\\` and `.` inside a key are
+ * backslash-escaped so `details["a.b"]` and `details.a.b` cannot collide.
+ */
+function coldSpillPathJoin(base: string, segment: string | number): string {
+	const escaped = typeof segment === "number" ? String(segment) : segment.replace(/[\\.]/g, "\\$&");
+	return `${base}.${escaped}`;
+}
 
 type ColdSpillWrite = {
 	path: string;
@@ -5830,32 +5841,37 @@ function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, u
 	return isRecord(value) && value[COLD_SPILL_ARGUMENTS_SENTINEL_KEY] === true;
 }
 
-function residentBlobBytesForColdSpill(value: ResidentBlobSentinel, promotion: ColdSpillResidentPromotion): Buffer {
+function residentBlobBytesForColdSpill(
+	value: ResidentBlobSentinel,
+	promotion: ColdSpillResidentPromotion,
+): Buffer | null {
 	const hash = parseBlobRef(value.ref);
-	if (!hash)
-		throw reportResidentBlobMissing(
-			new ResidentBlobMissingError(value.ref, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
-			"cold-spill",
-		);
+	if (!hash) return null;
 	const store = value.kind === "text" ? promotion.stores.textStore : promotion.stores.imageStore;
 	const data = store.getSync(hash);
-	if (!data)
-		throw reportResidentBlobMissing(
-			new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
-			"cold-spill",
-		);
+	if (!data) return null;
 	promotion.stores.onResidentBlobRead?.(value.kind);
 	if (value.kind === "imageData") return Buffer.from(data.toString("base64"), "utf8");
 	return Buffer.from(data);
 }
 
+/**
+ * Attempt to cold-spill a resident blob sentinel.
+ * If the sentinel is malicious or refers to missing blob storage, treat it as
+ * untrusted content and return the original value instead of aborting compaction.
+ */
 function coldSpillResidentValue(
 	value: ResidentBlobSentinel,
 	basePath: string,
 	writes: ColdSpillWrite[],
 	promotion: ColdSpillResidentPromotion,
-): string {
+): string | ResidentBlobSentinel {
 	const data = residentBlobBytesForColdSpill(value, promotion);
+	if (data === null) {
+		// The sentinel is malicious or refers to missing storage.
+		// Return the original value unchanged; it will be serialized as-is.
+		return value;
+	}
 	writes.push({ path: basePath, encoding: "utf8", data, originalChars: data.byteLength });
 	return COLD_SPILL_NOTICE;
 }
@@ -5893,7 +5909,7 @@ function coldSpillSubtreeValue(
 		}
 		let changed = false;
 		const next = value.map((child, index) => {
-			const replaced = coldSpillSubtreeValue(child, `${basePath}.${index}`, writes, promotion);
+			const replaced = coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, index), writes, promotion);
 			if (replaced !== child) changed = true;
 			return replaced;
 		});
@@ -5906,7 +5922,7 @@ function coldSpillSubtreeValue(
 	}
 	let changed = false;
 	const entries = Object.entries(value).map(([key, child]) => {
-		const replaced = coldSpillSubtreeValue(child, `${basePath}.${key}`, writes, promotion);
+		const replaced = coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, key), writes, promotion);
 		if (replaced !== child) changed = true;
 		return [key, replaced] as const;
 	});
@@ -5934,31 +5950,50 @@ function coldSpillContentBlock(
 	if (block.type === "text") {
 		const text = block.text;
 		if (isResidentBlobSentinel(text))
-			return { ...block, text: coldSpillResidentValue(text, `${basePath}.text`, writes, promotion) };
+			return {
+				...block,
+				text: coldSpillResidentValue(text, coldSpillPathJoin(basePath, "text"), writes, promotion),
+			};
 		if (typeof text !== "string" || text.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, text: coldSpillTextValue(text, `${basePath}.text`, writes) };
+		return { ...block, text: coldSpillTextValue(text, coldSpillPathJoin(basePath, "text"), writes) };
 	}
 	if (block.type === "thinking") {
-		const thinking = block.thinking;
-		if (typeof thinking !== "string" || thinking.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, thinking: coldSpillTextValue(thinking, `${basePath}.thinking`, writes) };
+		// Encrypted signatures are often far larger than the visible thinking (empty
+		// thinking with a multi-KB signature is common); spill both fields
+		// independently, including resident-blob sentinels, so compacted history does
+		// not keep them in the transcript forever.
+		const thinking = coldSpillSubtreeValue(
+			block.thinking,
+			coldSpillPathJoin(basePath, "thinking"),
+			writes,
+			promotion,
+		);
+		const thinkingSignature = coldSpillSubtreeValue(
+			block.thinkingSignature,
+			coldSpillPathJoin(basePath, "thinkingSignature"),
+			writes,
+			promotion,
+		);
+		if (thinking === block.thinking && thinkingSignature === block.thinkingSignature) return block;
+		return { ...block, thinking, thinkingSignature };
 	}
 	if (block.type === "redactedThinking") {
 		const data = block.data;
 		if (typeof data !== "string" || data.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, data: coldSpillTextValue(data, `${basePath}.data`, writes) };
+		return { ...block, data: coldSpillTextValue(data, coldSpillPathJoin(basePath, "data"), writes) };
 	}
 	if (block.type === "toolCall") {
 		const args = block.arguments;
 		if (isColdSpillArgumentsSentinel(args)) return block;
 		const json = JSON.stringify(args);
 		if (json.length < COLD_SPILL_MIN_CHARS && !containsResidentSentinel(args)) return block;
-		const nextArgs = coldSpillArgumentsValue(args, `${basePath}.arguments`, writes, promotion);
+		const nextArgs = coldSpillArgumentsValue(args, coldSpillPathJoin(basePath, "arguments"), writes, promotion);
 		return nextArgs === args ? block : { ...block, arguments: nextArgs };
 	}
 	let changed = false;
 	const entries = Object.entries(block).map(([key, child]) => {
-		const replaced = key === "type" ? child : coldSpillSubtreeValue(child, `${basePath}.${key}`, writes, promotion);
+		const replaced =
+			key === "type" ? child : coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, key), writes, promotion);
 		if (replaced !== child) changed = true;
 		return [key, replaced] as const;
 	});
@@ -5989,13 +6024,16 @@ function coldSpillContentBlocks(
 				const text = texts.join("");
 				if (text.length >= COLD_SPILL_MIN_CHARS) {
 					changedRuns = true;
-					merged.push({ ...block, text: coldSpillTextValue(text, `${basePath}.${start}.text`, writes) });
+					merged.push({
+						...block,
+						text: coldSpillTextValue(text, coldSpillPathJoin(coldSpillPathJoin(basePath, start), "text"), writes),
+					});
 				} else {
 					merged.push(...value.slice(start, index + 1));
 				}
 				continue;
 			}
-			const replaced = coldSpillContentBlock(block, `${basePath}.${index}`, writes, promotion);
+			const replaced = coldSpillContentBlock(block, coldSpillPathJoin(basePath, index), writes, promotion);
 			if (replaced !== block) changedRuns = true;
 			merged.push(replaced);
 		}
@@ -6003,7 +6041,7 @@ function coldSpillContentBlocks(
 	}
 	let changed = false;
 	const next = value.map((block, index) => {
-		const replaced = coldSpillContentBlock(block, `${basePath}.${index}`, writes, promotion);
+		const replaced = coldSpillContentBlock(block, coldSpillPathJoin(basePath, index), writes, promotion);
 		if (replaced !== block) changed = true;
 		return replaced;
 	});
@@ -6015,19 +6053,68 @@ function coldSpillCustomMessageContent(
 	writes: ColdSpillWrite[],
 	promotion: ColdSpillResidentPromotion,
 ): CustomMessageEntry["content"] {
+	const basePath = coldSpillPathJoin("custom_message", "content");
 	if (typeof content === "string") {
-		return content.length >= COLD_SPILL_MIN_CHARS
-			? coldSpillTextValue(content, "custom_message.content", writes)
-			: content;
+		return content.length >= COLD_SPILL_MIN_CHARS ? coldSpillTextValue(content, basePath, writes) : content;
 	}
 	if (Array.isArray(content))
-		return coldSpillContentBlocks(
-			content,
-			"custom_message.content",
-			writes,
-			promotion,
-		) as CustomMessageEntry["content"];
+		return coldSpillContentBlocks(content, basePath, writes, promotion) as CustomMessageEntry["content"];
 	return content;
+}
+
+/**
+ * Cold-spill details while preserving the `usage` field, which is read during
+ * session reopen for task tool results. Never cold-spill task tool usage.
+ */
+function preserveTaskUsageWhenColdSpilling(
+	details: unknown,
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): unknown {
+	if (!isRecord(details)) return coldSpillSubtreeValue(details, basePath, writes, promotion);
+
+	// Extract usage before cold-spilling to preserve it inline
+	const usage = details.usage;
+	const hasUsage = usage !== undefined;
+
+	// Cold-spill all fields recursively
+	let changed = false;
+	const entries = Object.entries(details).map(([key, child]) => {
+		if (key === "usage") {
+			// Never cold-spill usage; keep it inline
+			return [key, child] as const;
+		}
+		const replaced = coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, key), writes, promotion);
+		if (replaced !== child) changed = true;
+		return [key, replaced] as const;
+	});
+
+	return changed || hasUsage ? Object.fromEntries(entries) : details;
+}
+
+function isColdSpillRef(value: unknown): value is ColdSpillRef {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const obj = value as Record<string, unknown>;
+	return (
+		obj.kind === "cold_spill" &&
+		typeof obj.ref === "string" &&
+		(obj.encoding === "utf8" || obj.encoding === "json") &&
+		typeof obj.originalChars === "number" &&
+		typeof obj.sha256 === "string" &&
+		typeof obj.bytes === "number"
+	);
+}
+
+function coldSpillLegacyPathJoin(base: string, segment: string | number): string {
+	return `${base}.${segment}`;
+}
+
+/** Own-property, shape-checked payload lookup: refPaths come from persisted, possibly hostile data. */
+function coldSpillMarkerRef(marker: EvictedContentMarker | undefined, path: string): ColdSpillRef | undefined {
+	if (!marker || !Object.hasOwn(marker.payloads, path)) return undefined;
+	const ref = marker.payloads[path];
+	return isColdSpillRef(ref) ? ref : undefined;
 }
 
 function coldSpillUnavailable(ref: ColdSpillRef): string {
@@ -6057,20 +6144,23 @@ function rehydrateColdSpillValue(
 	basePath: string,
 	residentStores?: ResidentBlobStores,
 ): unknown {
-	const directRef = marker?.payloads[basePath];
+	const directRef = coldSpillMarkerRef(marker, basePath);
 	if (directRef) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
 	if (isColdSpillArgumentsSentinel(value) && typeof value.refPath === "string") {
-		const ref = marker?.payloads[value.refPath];
+		const ref = coldSpillMarkerRef(marker, value.refPath);
 		return ref ? rehydrateColdSpillRef(ref, blobStore, residentStores) : value;
 	}
+	// Markers written before path escaping (v0.19.2 and earlier) carry no pathEncoding and
+	// were keyed by a raw dot-join, so walk them with the same join they were written with.
+	const join = marker?.pathEncoding === "v1" ? coldSpillPathJoin : coldSpillLegacyPathJoin;
 	if (Array.isArray(value))
 		return value.map((item, index) =>
-			rehydrateColdSpillValue(item, marker, blobStore, `${basePath}.${index}`, residentStores),
+			rehydrateColdSpillValue(item, marker, blobStore, join(basePath, index), residentStores),
 		);
 	if (!isRecord(value)) return value;
 	const entries = Object.entries(value).map(([key, child]) => {
 		if (key === "evictedContent") return [key, child] as const;
-		return [key, rehydrateColdSpillValue(child, marker, blobStore, `${basePath}.${key}`, residentStores)] as const;
+		return [key, rehydrateColdSpillValue(child, marker, blobStore, join(basePath, key), residentStores)] as const;
 	});
 	return Object.fromEntries(entries);
 }
@@ -19920,6 +20010,7 @@ export class SessionManager {
 					compactionEntryId,
 					firstKeptEntryId,
 					payloads,
+					pathEncoding: "v1",
 				};
 				// Store the marker at the ENTRY level (session metadata), not on the
 				// strict message type, so message shapes stay type-clean.
@@ -19957,14 +20048,40 @@ export class SessionManager {
 
 	#coldSpillClone(entry: SessionEntry, writes: ColdSpillWrite[]): SessionEntry {
 		if (entry.type === "message") {
-			const content = "content" in entry.message ? entry.message.content : undefined;
-			if (!Array.isArray(content)) return entry;
-			const nextContent = coldSpillContentBlocks(content, "message.content", writes, {
-				stores: this.#residentBlobStoresForColdRehydrate(),
-			});
-			return nextContent === content
-				? entry
-				: { ...entry, message: { ...entry.message, content: nextContent } as AgentMessage };
+			const message = entry.message;
+			const content = "content" in message ? message.content : undefined;
+			const promotion = { stores: this.#residentBlobStoresForColdRehydrate() };
+			const nextContent = Array.isArray(content)
+				? coldSpillContentBlocks(content, coldSpillPathJoin("message", "content"), writes, promotion)
+				: content;
+			// Tool-result `details` carry renderer-only payloads (e.g. an MCP tool's full
+			// raw response, base64 screenshots included) that are never replayed to the
+			// model. Left resident, they make compacted history the bulk of the file and
+			// long-lived sessions hit the managed per-file cap.
+			// HOWEVER: preserve details.usage (task tool only) which is read during session
+			// reopen to reconstruct usage statistics. Never cold-spill task tool usage.
+			const details = "details" in message ? message.details : undefined;
+			const isTaskTool = message.role === "toolResult" && message.toolName === "task";
+			const nextDetails =
+				details === undefined
+					? details
+					: isTaskTool
+						? preserveTaskUsageWhenColdSpilling(
+								details,
+								coldSpillPathJoin("message", "details"),
+								writes,
+								promotion,
+							)
+						: coldSpillSubtreeValue(details, coldSpillPathJoin("message", "details"), writes, promotion);
+			if (nextContent === content && nextDetails === details) return entry;
+			return {
+				...entry,
+				message: {
+					...message,
+					...(nextContent === content ? {} : { content: nextContent }),
+					...(nextDetails === details ? {} : { details: nextDetails }),
+				} as AgentMessage,
+			};
 		}
 		if (entry.type === "custom_message") {
 			const content = coldSpillCustomMessageContent(entry.content, writes, {

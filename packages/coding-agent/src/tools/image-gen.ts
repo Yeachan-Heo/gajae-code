@@ -1,10 +1,8 @@
 import * as fs from "node:fs";
-import * as http from "node:http";
-import * as https from "node:https";
-import * as net from "node:net";
+import type * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getEnvApiKey, type Model } from "@gajae-code/ai/core";
+import { getBundledModel, getEnvApiKey, type Model } from "@gajae-code/ai/core";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -29,7 +27,8 @@ import { type ModelRoleSettings, resolveModelRoleValue } from "../config/model-r
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
-import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
+import { openPinnedResponse, readResponseBody, validateResponseFraming, withAbortSignal } from "../web/hardened-http";
+import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import { resolveReadPath } from "./path-utils";
 
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
@@ -396,6 +395,14 @@ interface OpenAIHostedImageRequest {
 	store: false;
 	stream?: boolean;
 }
+interface CodexImagesRequest {
+	model: string;
+	prompt: string;
+	n: 1;
+	quality: "auto";
+	size?: string;
+	output_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;
+}
 
 interface OpenAIImageGenerationCall {
 	id?: string;
@@ -403,6 +410,9 @@ interface OpenAIImageGenerationCall {
 	result?: string;
 	revised_prompt?: string;
 	status?: string;
+}
+interface CodexImagesResponse {
+	data?: Array<{ b64_json?: string; revised_prompt?: string }>;
 }
 
 interface OpenAIOutputText {
@@ -633,25 +643,6 @@ function toDataUrl(image: InlineImageData): string {
 	return `data:${image.mimeType};base64,${image.data}`;
 }
 
-function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-	if (!signal) return operation;
-	if (signal.aborted) return Promise.reject(signal.reason);
-	const deferred = Promise.withResolvers<T>();
-	const abort = () => deferred.reject(signal.reason);
-	signal.addEventListener("abort", abort, { once: true });
-	operation.then(deferred.resolve, deferred.reject).finally(() => signal.removeEventListener("abort", abort));
-	return deferred.promise;
-}
-
-function normalizePeerAddress(address: string): string {
-	const normalized = address.toLowerCase();
-	return normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
-}
-
-function normalizeUrlHostname(hostname: string): string {
-	return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-}
-
 function responseHeaderByteLength(response: http.IncomingMessage): number {
 	let bytes = Buffer.byteLength(
 		`HTTP/${response.httpVersion} ${response.statusCode ?? ""}${response.statusMessage ? ` ${response.statusMessage}` : ""}\r\n`,
@@ -671,87 +662,28 @@ function openImageResponse(
 	addresses: string[],
 	signal: AbortSignal | undefined,
 ): Promise<http.IncomingMessage> {
-	const hostname = normalizeUrlHostname(url.hostname);
-	const approved = addresses.map(address => ({ address, family: net.isIP(address) }));
-	const approvedPeers = new Set(approved.map(record => normalizePeerAddress(record.address)));
-	const lookup: net.LookupFunction = (requestedHostname, options, callback) => {
-		const requestedFamily = options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : (options.family ?? 0);
-		const matching = approved.filter(record => requestedFamily === 0 || record.family === requestedFamily);
-		if (normalizeUrlHostname(requestedHostname) !== hostname || matching.length === 0) {
-			const error = Object.assign(new Error("No approved address for image host"), { code: "ENOTFOUND" });
-			callback(error, options.all ? [] : "", 0);
-			return;
-		}
-		if (options.all) callback(null, matching);
-		else callback(null, matching[0].address, matching[0].family);
-	};
-	const deferred = Promise.withResolvers<http.IncomingMessage>();
-	const options: https.RequestOptions = {
-		protocol: url.protocol,
-		hostname,
-		port: url.port || undefined,
-		path: `${url.pathname}${url.search}`,
-		method: "GET",
-		headers: { Accept: "image/*", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
-		agent: false,
-		insecureHTTPParser: false,
-		lookup,
-		maxHeaderSize: MAX_IMAGE_HEADER_SIZE,
+	return openPinnedResponse({
+		url,
+		addresses,
 		signal,
-		...(url.protocol === "https:"
-			? { rejectUnauthorized: true, servername: net.isIP(hostname) === 0 ? hostname : undefined }
-			: {}),
-	};
-	const requestFn = url.protocol === "https:" ? https.request : http.request;
-	const request = requestFn(options, response => {
-		if (responseHeaderByteLength(response) > MAX_IMAGE_HEADER_SIZE) {
-			response.destroy();
-			deferred.reject(new Error("Image response headers exceed the maximum size of 16 KiB"));
-			return;
-		}
-		const peer = response.socket.remoteAddress;
-		if (peer && (isPrivateOrSpecialAddress(peer) || !approvedPeers.has(normalizePeerAddress(peer)))) {
-			response.destroy();
-			deferred.reject(new Error("Refusing image response from an unapproved connected peer"));
-			return;
-		}
-		deferred.resolve(response);
+		headers: { Accept: "image/*", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
+		maxHeaderBytes: MAX_IMAGE_HEADER_SIZE,
+		rejectMissingPeer: false,
+		lookupErrorMessage: "No approved address for image host",
+		unapprovedPeerMessage: () => "Refusing image response from an unapproved connected peer",
+		maxResponseHeaderBytes: MAX_IMAGE_HEADER_SIZE,
+		responseHeaderBytes: responseHeaderByteLength,
+		responseHeaderTooLargeMessage: "Image response headers exceed the maximum size of 16 KiB",
 	});
-	request.once("error", deferred.reject);
-	const abort = () => {
-		request.destroy(signal?.reason);
-		deferred.reject(signal?.reason);
-	};
-	if (signal?.aborted) abort();
-	else signal?.addEventListener("abort", abort, { once: true });
-	request.once("close", () => signal?.removeEventListener("abort", abort));
-	request.end();
-	return deferred.promise;
 }
 
 function validateImageResponseFraming(response: http.IncomingMessage): void {
-	const rawContentLengths: string[] = [];
-	let hasTransferEncoding = false;
-	for (let index = 0; index < response.rawHeaders.length; index += 2) {
-		const name = response.rawHeaders[index]?.toLowerCase();
-		if (name === "content-length") rawContentLengths.push(response.rawHeaders[index + 1] ?? "");
-		if (name === "transfer-encoding") hasTransferEncoding = true;
-	}
-	if (rawContentLengths.length > 1 || (rawContentLengths.length > 0 && hasTransferEncoding)) {
-		response.destroy();
-		throw new Error("Image response has ambiguous framing");
-	}
-	const contentLength = response.headers["content-length"];
-	if (contentLength === undefined) return;
-	const declaredBytes = typeof contentLength === "string" && /^\d+$/.test(contentLength) ? Number(contentLength) : NaN;
-	if (!Number.isSafeInteger(declaredBytes)) {
-		response.destroy();
-		throw new Error("Image response has an invalid Content-Length");
-	}
-	if (declaredBytes > MAX_IMAGE_SIZE) {
-		response.destroy();
-		throw new Error("Image response exceeds the maximum size of 35 MiB");
-	}
+	validateResponseFraming(response, {
+		ambiguousMessage: "Image response has ambiguous framing",
+		invalidContentLengthMessage: "Image response has an invalid Content-Length",
+		maxBytes: MAX_IMAGE_SIZE,
+		oversizeMessage: "Image response exceeds the maximum size of 35 MiB",
+	});
 }
 
 async function readImageResponse(
@@ -759,32 +691,14 @@ async function readImageResponse(
 	maxBytes: number,
 	signal: AbortSignal | undefined,
 ): Promise<Buffer> {
-	const abort = () => response.destroy(signal?.reason);
-	if (signal?.aborted) {
-		abort();
-		throw signal.reason;
-	}
-	signal?.addEventListener("abort", abort, { once: true });
-	const chunks: Buffer[] = [];
-	let receivedBytes = 0;
-	try {
-		for await (const chunk of response) {
-			const bytes = Buffer.from(chunk);
-			receivedBytes += bytes.byteLength;
-			if (receivedBytes > maxBytes) {
-				response.destroy();
-				throw new Error(
-					maxBytes === MAX_IMAGE_SIZE
-						? "Image response exceeds the maximum size of 35 MiB"
-						: "Image download error response exceeded the preview limit",
-				);
-			}
-			chunks.push(bytes);
-		}
-		return Buffer.concat(chunks, receivedBytes);
-	} finally {
-		signal?.removeEventListener("abort", abort);
-	}
+	return await readResponseBody(response, {
+		maxBytes,
+		signal,
+		oversizeMessage:
+			maxBytes === MAX_IMAGE_SIZE
+				? "Image response exceeds the maximum size of 35 MiB"
+				: "Image download error response exceeded the preview limit",
+	});
 }
 
 async function loadImageFromUrl(
@@ -1237,6 +1151,38 @@ function createOpenAIInlineImage(data: string): InlineImageData {
 	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
 	return { data, mimeType };
 }
+/** Bundled openai-codex gpt-image-* models on the bundled Codex endpoint. A custom model keeps /codex/responses. */
+function getCodexImagesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string | undefined {
+	const bundled = getBundledModel("openai-codex", model.id);
+	if (!bundled?.id.startsWith("gpt-image-")) return undefined;
+	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
+	const url = getCodexRouteUrl(getOpenAIBaseUrl(model, authCredentialType), URL_PATHS.CODEX_IMAGES_GENERATIONS);
+	const bundledUrl = getCodexRouteUrl(
+		getOpenAIBaseUrl(bundled, authCredentialType),
+		URL_PATHS.CODEX_IMAGES_GENERATIONS,
+	);
+	return url === bundledUrl ? url : undefined;
+}
+function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	return {
+		model: model.id,
+		prompt: promptText,
+		n: 1,
+		quality: "auto",
+		output_format: OPENAI_IMAGE_OUTPUT_FORMAT,
+		...(size ? { size } : {}),
+	};
+}
+function collectCodexImagesResult(response: CodexImagesResponse): OpenAIHostedImageResult {
+	const images: InlineImageData[] = [];
+	let revisedPrompt: string | undefined;
+	for (const item of response.data ?? []) {
+		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json));
+		if (item.revised_prompt) revisedPrompt = item.revised_prompt;
+	}
+	return { images, revisedPrompt };
+}
 
 function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): OpenAIHostedImageResult {
 	const images: InlineImageData[] = [];
@@ -1297,15 +1243,31 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 	return getOpenAIBaseUrl(model, authCredentialType);
 }
 
+/** Normalizes on the parsed pathname so the route appears once; the fragment is never sent, so it is dropped. */
+function getCodexRouteUrl(baseUrl: string, route: string): string {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		throw new Error(`Invalid OpenAI Codex base URL: ${baseUrl}`);
+	}
+	let pathname = url.pathname.replace(/\/+$/, "");
+	if (pathname.endsWith(URL_PATHS.CODEX_RESPONSES)) {
+		pathname = pathname.slice(0, -URL_PATHS.CODEX_RESPONSES.length);
+	} else if (pathname.endsWith("/codex")) {
+		pathname = pathname.slice(0, -"/codex".length);
+	}
+	url.pathname = `${pathname}${route}`;
+	url.hash = "";
+	return url.toString();
+}
+
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
 	const baseUrl = getOpenAIBaseUrl(model, authCredentialType);
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
 		return `${baseUrl}/responses`;
 	}
-	const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-	return new URL(URL_PATHS.RESPONSES.slice(1), baseWithSlash)
-		.toString()
-		.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
+	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_RESPONSES);
 }
 
 function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
@@ -1393,10 +1355,17 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const stream = model.api === "openai-codex-responses" || model.provider === "openai-codex";
-	const requestBody = buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
+	const imagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
+	const useImagesApi = imagesUrl !== undefined;
+	if (useImagesApi && inputImages.length > 0) {
+		throw new Error("Codex image edits are not supported on this route.");
+	}
+	const stream = !useImagesApi && (model.api === "openai-codex-responses" || model.provider === "openai-codex");
+	const requestBody = useImagesApi
+		? buildCodexImagesRequest(model, promptText, params)
+		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
 	const response = await fetchImageProvider(
-		getOpenAIResponsesUrl(model, options?.authCredentialType),
+		imagesUrl ?? getOpenAIResponsesUrl(model, options?.authCredentialType),
 		{
 			method: "POST",
 			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
@@ -1413,6 +1382,11 @@ async function generateOpenAIHostedImage(
 		);
 	}
 
+	if (useImagesApi) {
+		const rawText = await readProviderResponseText(response, apiKey, signal);
+		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
+		return redactOpenAIHostedImageResult(collectCodexImagesResult(data), apiKey);
+	}
 	const contentType = response.headers.get("content-type") ?? "";
 	if (stream || contentType.includes("text/event-stream")) {
 		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);

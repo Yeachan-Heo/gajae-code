@@ -78,30 +78,27 @@ function stripInlineDotenvComment(value: string): string {
  */
 export function parseShellEnvFile(filePath: string): Record<string, string> {
 	const result: Record<string, string> = {};
-	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) continue;
+	const content = readEnvFile(filePath).content;
+	if (content === undefined) return result;
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
 
-			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
-			if (!match) continue;
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
+		if (!match) continue;
 
-			const key = match[1];
-			if (!isValidEnvName(key)) continue;
+		const key = match[1];
+		if (!isValidEnvName(key)) continue;
 
-			let value = stripInlineShellComment(match[2] ?? "").trim();
-			if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-			if (/[$`]/.test(value)) continue;
-
-			result[key] = value;
+		let value = stripInlineShellComment(match[2] ?? "").trim();
+		if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
+		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+			value = value.slice(1, -1);
 		}
-	} catch {
-		// File doesn't exist or can't be read - return empty result
+		if (!isSafeEnvValue(value)) continue;
+		if (/[$`]/.test(value)) continue;
+
+		result[key] = value;
 	}
 
 	return result;
@@ -126,12 +123,9 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * conservative.
  */
 export function parseEnvFile(filePath: string): Record<string, string> {
-	try {
-		return parseEnvFileContent(fs.readFileSync(filePath, "utf-8"));
-	} catch {
-		// File doesn't exist or can't be read - return empty result
-		return {};
-	}
+	// A missing, unreadable, or non-regular file yields an empty result.
+	const content = readEnvFile(filePath).content;
+	return content === undefined ? {} : parseEnvFileContent(content);
 }
 
 /** Parse dotenv content that has already been read from a trusted file. */
@@ -307,13 +301,21 @@ export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	];
 }
 
-function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?: string; incomplete: boolean } {
+/**
+ * Read an env file only if it is a regular file. A FIFO or device file would block
+ * `readFileSync` until a writer appears (Bun's own dotenv autoload skips them), so
+ * the open is non-blocking and fstat rejects anything else before a read. A
+ * missing file is complete and empty; any other failure is `incomplete`.
+ * `maxFileBytes` additionally bounds the read.
+ */
+function readEnvFile(filePath: string, maxFileBytes?: number): { content?: string; incomplete: boolean } {
 	let fileDescriptor: number | undefined;
 	try {
-		// Non-blocking open lets fstat reject FIFOs and device files before any read.
 		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
 		const initialStat = fs.fstatSync(fileDescriptor);
-		if (!initialStat.isFile() || initialStat.size > maxFileBytes) return { incomplete: true };
+		if (!initialStat.isFile()) return { incomplete: true };
+		if (maxFileBytes === undefined) return { content: fs.readFileSync(fileDescriptor, "utf-8"), incomplete: false };
+		if (initialStat.size > maxFileBytes) return { incomplete: true };
 
 		const buffer = Buffer.allocUnsafe(maxFileBytes + 1);
 		let bytesRead = 0;
@@ -380,22 +382,13 @@ export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnaps
 	let incomplete = false;
 	for (const file of files) {
 		const filePath = path.join(cwd, file);
-		let content: string;
-		if (options.maxFileBytes === undefined) {
-			try {
-				content = fs.readFileSync(filePath, "utf-8");
-			} catch {
-				continue;
-			}
-		} else {
-			const boundedRead = readBoundedEnvFile(filePath, options.maxFileBytes);
-			if (boundedRead.incomplete) {
-				incomplete = true;
-				continue;
-			}
-			if (boundedRead.content === undefined) continue;
-			content = boundedRead.content;
+		const read = readEnvFile(filePath, options.maxFileBytes);
+		if (read.incomplete) {
+			incomplete = true;
+			continue;
 		}
+		if (read.content === undefined) continue;
+		const content = read.content;
 		const quoted = quotedDeclarationKeys(content);
 		const seen = new Set<string>();
 		for (const [rawKey, value] of Object.entries(parseEnvFileContent(content))) {

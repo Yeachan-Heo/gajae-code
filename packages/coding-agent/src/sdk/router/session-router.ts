@@ -297,6 +297,11 @@ export interface SessionRouterOptions {
 	/** Marks default SDK clients as notification-only observers; demanding by default. */
 	observer?: boolean;
 	/**
+	 * Negotiates `turn_stream` on default SDK clients, so they receive turns owned by
+	 * other invocations while still counting as demand. `observer` implies it.
+	 */
+	turnStream?: boolean;
+	/**
 	 * Negotiates positioned-only notification effects on default SDK clients, so the
 	 * host stops sending them the raw native copy of frames whose positioned
 	 * envelope already reached them. Only notification-effect publishers opt in;
@@ -631,6 +636,7 @@ export class SessionRouter {
 	readonly #sessionIds: ReadonlySet<string> | undefined;
 	readonly #attachFilter: ((sessionId: string) => boolean) | undefined;
 	readonly #observer: boolean;
+	readonly #turnStream: boolean;
 	readonly #positionedNotificationEffects: boolean;
 	readonly #deps: SessionRouterDeps;
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
@@ -675,6 +681,7 @@ export class SessionRouter {
 		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
 		this.#attachFilter = options.attachFilter;
 		this.#observer = options.observer === true;
+		this.#turnStream = options.turnStream === true;
 		this.#positionedNotificationEffects = options.positionedNotificationEffects === true;
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
@@ -1608,7 +1615,11 @@ export class SessionRouter {
 			});
 		} else {
 			const capabilities = [
-				...(this.#observer ? [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY] : []),
+				...(this.#observer
+					? [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]
+					: this.#turnStream
+						? [TURN_STREAM_CAPABILITY]
+						: []),
 				...(this.#positionedNotificationEffects ? [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY] : []),
 			];
 			const defaultClient = new SdkClient(endpoint.url, endpoint.token, {

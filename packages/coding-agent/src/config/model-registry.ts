@@ -489,6 +489,30 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 	)?.api as Api | undefined;
 }
 
+/**
+ * A catalog that mixes chat rows with image, audio, video, embedding, or
+ * transcription rows can opt into `discovery.outputModalities` and
+ * `discovery.inputModalities`. Each set list admits only rows whose advertised
+ * modalities all fall inside it, so a non-chat entry never becomes a
+ * chat-completion model. Rows that omit the filtered field are skipped,
+ * because they cannot be classified. An unset list does not filter.
+ */
+function admitsAdvertisedModalities(allowed: readonly string[] | undefined, advertised: unknown): boolean {
+	if (allowed === undefined) return true;
+	return (
+		Array.isArray(advertised) &&
+		advertised.length > 0 &&
+		advertised.every(modality => typeof modality === "string" && allowed.includes(modality))
+	);
+}
+
+function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: Record<string, unknown>): boolean {
+	return (
+		admitsAdvertisedModalities(discovery.outputModalities, item.output_modalities) &&
+		admitsAdvertisedModalities(discovery.inputModalities, item.input_modalities)
+	);
+}
+
 function resolveModelApiOverrideFromDiscovery(
 	providerApi: Api,
 	discovery: ProviderDiscovery,
@@ -1296,6 +1320,12 @@ function fingerprintConfiguredDiscoveryRequestShape(
 		api: providerConfig.api,
 		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
 		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+		...(providerConfig.discovery.outputModalities
+			? { outputModalities: [...providerConfig.discovery.outputModalities].sort() }
+			: {}),
+		...(providerConfig.discovery.inputModalities
+			? { inputModalities: [...providerConfig.discovery.inputModalities].sort() }
+			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
@@ -5969,6 +5999,7 @@ export class ModelRegistry {
 			// check, so IDs that appear only between requests cannot enter
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			if (!admitsDiscoveredCatalogModalities(providerConfig.discovery, item)) continue;
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same

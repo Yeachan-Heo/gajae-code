@@ -104,6 +104,12 @@ export class ManagedReplaceError extends Error {
 	/** Path-free Windows NTSTATUS of the underlying pre-mutation failure, when
 	 * the native layer preserved one (e.g. `0xC0000043` for a sharing violation). */
 	readonly windowsErrorCode: string | undefined;
+	/** ACL failure detail: offending principal (account name or SID string).
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailurePrincipal: string | undefined;
+	/** ACL failure detail: whether the offending ACE is inherited from a parent directory.
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailureInherited: boolean | undefined;
 	readonly replacementCause: unknown;
 
 	constructor(result: NativeExactUnlinkResult, cleanupReceiptPath: string, replacementCause?: unknown) {
@@ -117,6 +123,8 @@ export class ManagedReplaceError extends Error {
 		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
 		this.retainedUnknownPath = result.retainedUnknownPath;
 		this.windowsErrorCode = result.windowsErrorCode;
+		this.aclFailurePrincipal = result.aclFailurePrincipal;
+		this.aclFailureInherited = result.aclFailureInherited;
 		this.replacementCause = replacementCause;
 	}
 }

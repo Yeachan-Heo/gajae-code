@@ -85,6 +85,30 @@ export class GoalModeController {
 		this.#paused = paused;
 	}
 
+	/**
+	 * Drop the predecessor goal binding after a committed switch to a different
+	 * session file. No mode entry is written: the predecessor file keeps its goal.
+	 */
+	async detachForSessionSwitch(): Promise<void> {
+		const previousTools = this.#previousTools;
+		this.#enabled = false;
+		this.#paused = false;
+		this.#previousTools = undefined;
+		this.#previousMCPToolNames = undefined;
+		this.#continuationTurnInFlight = false;
+		this.#resetContinuationSuppression();
+		this.cancelContinuation();
+		this.ctx.modeGate.exit("goal");
+		this.#updateStatus();
+		if (previousTools === undefined || previousTools.includes("goal")) return;
+		const activeTools = this.ctx.session.getActiveToolNames();
+		if (!activeTools.includes("goal")) return;
+		await this.ctx.session.setActiveToolsByName(
+			activeTools.filter(name => name !== "goal"),
+			{ explicit: false, persistMCPSelection: false, retryOnMcpCatalogChange: true },
+		);
+	}
+
 	async beforeGetUserInput(): Promise<void> {
 		if (this.ctx.session.getGoalModeState()?.mode === "exiting") {
 			await this.exit({ reason: "completed", silent: true });

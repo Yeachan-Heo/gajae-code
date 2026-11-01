@@ -283,7 +283,7 @@ function sharedAskGate(
 				clarification_action: "clarify",
 			},
 		},
-		options: labels.map(label => ({ value: label, label })),
+		options: labels.map(label => ({ value: { selected: [label] }, label })),
 	};
 }
 
@@ -4275,22 +4275,28 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			allow_mutation: true,
 		});
 		expect(second).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
-		if (process.platform !== "win32") {
-			await Bun.write(
-				persistedSessionPath,
-				JSON.stringify({ ...persistedSession, broker_workspace: worktree.toUpperCase() }),
-			);
-			await expect(
-				server.callTool("gjc_delegate_plan", {
-					cwd: root,
-					session_id: "created-session-1",
-					task: "case-mismatched worktree must not bind",
-					queue: true,
-					idempotency_key: "managed-worktree-delegate-case-mismatch",
-					allow_mutation: true,
-				}),
-			).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
-		}
+		const differentlyCased = worktree.toUpperCase();
+		// macOS volumes can be case-insensitive despite process.platform !== win32.
+		// Just like the symlink above, an alias authorizes only the SAME real worktree.
+		const aliasTarget = await fs.realpath(differentlyCased).catch(() => undefined);
+		const sameWorktree = aliasTarget === (await fs.realpath(worktree));
+		await Bun.write(
+			persistedSessionPath,
+			JSON.stringify({ ...persistedSession, broker_workspace: differentlyCased }),
+		);
+		const cased = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "case-altered path must honor canonical worktree identity",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-case-mismatch",
+			allow_mutation: true,
+		});
+		expect(cased).toMatchObject(
+			sameWorktree
+				? { ok: true, session: { session_id: "created-session-1" } }
+				: { ok: false, error: { code: "endpoint_stale" } },
+		);
 	}, 20_000);
 	it("does not seal transient managed-worktree canonicalization failures", async () => {
 		const root = await tempRoot();

@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import type { MarketplacePluginEntry } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
 import { resolvePluginSource } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
+import { GitCommandError } from "@gajae-code/coding-agent/utils/git";
 
 // Fixture: a cloned marketplace with a single plugin at ./plugins/hello-plugin
 const FIXTURE_DIR = path.resolve(import.meta.dir, "fixtures/valid-marketplace");
@@ -66,7 +67,7 @@ describe("resolvePluginSource", () => {
 		expect(resolved.tempCloneRoot).toBeUndefined();
 	});
 
-	// Network-dependent: object sources attempt real git clones
+	// This GitHub object source attempts a real remote clone.
 	it.skip("resolves github object source via git clone", async () => {
 		const entry = makeEntry({ source: "github", repo: "nonexistent-owner/nonexistent-repo" });
 		await expect(resolvePluginSource(entry, { marketplaceClonePath: FIXTURE_DIR, tmpDir })).rejects.toThrow(
@@ -74,11 +75,17 @@ describe("resolvePluginSource", () => {
 		);
 	});
 
-	it.skip("resolves url object source via git clone", async () => {
-		const entry = makeEntry({ source: "url", url: "https://example.com/nonexistent.git" });
-		await expect(resolvePluginSource(entry, { marketplaceClonePath: FIXTURE_DIR, tmpDir })).rejects.toThrow(
-			/git clone failed/,
-		);
+	it("rejects a url object source whose local repository is missing", async () => {
+		const missingRepository = path.join(tmpDir, "missing-repository");
+		const entry = makeEntry({ source: "url", url: missingRepository });
+		const resolution = resolvePluginSource(entry, { marketplaceClonePath: FIXTURE_DIR, tmpDir });
+		await expect(resolution).rejects.toBeInstanceOf(GitCommandError);
+		await resolution.catch((error: unknown) => {
+			if (!(error instanceof GitCommandError)) throw error;
+			expect(error.args[0]).toBe("clone");
+			expect(error.args).toContain(missingRepository);
+			expect(error.result.exitCode).toBeGreaterThan(0);
+		});
 	});
 
 	it("rejects a relative source whose directory is a symlink out of the marketplace root", async () => {

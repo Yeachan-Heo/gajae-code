@@ -328,9 +328,11 @@ describe("/provider preset CLI surface", () => {
 			"alibaba-token-plan",
 			"minimax",
 			"minimax-cn",
+			"cloudgpu",
 			"ionet",
 			"litellm",
 			"openai-compatible-proxy",
+			"runcrate",
 		]);
 	});
 });

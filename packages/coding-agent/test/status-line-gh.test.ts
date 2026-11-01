@@ -36,6 +36,7 @@ describe("status-line GitHub PR lookup", () => {
 			url: "https://github.com/Yeachan-Heo/gajae-code/pull/3354",
 		});
 		expect(spawnSpy).toHaveBeenCalledWith([ghPath, "pr", "view", "--json", "number,url"], {
+			env: expect.objectContaining({ GH_PAGER: "cat" }),
 			stdout: "pipe",
 			stderr: "pipe",
 			stdin: "ignore",
