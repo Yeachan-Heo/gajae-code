@@ -804,6 +804,10 @@ export default class Harness extends Command {
 			const timer = setInterval(() => {
 				void resolveOwner(root, sessionId).then(resolved => {
 					if (!resolved.live) stop();
+				}).catch(() => {
+					// If resolveOwner fails (e.g., file system error), assume owner is not responding
+					// and stop gracefully rather than crashing with an uncaught rejection.
+					stop();
 				});
 			}, 500);
 			timer.unref?.();
