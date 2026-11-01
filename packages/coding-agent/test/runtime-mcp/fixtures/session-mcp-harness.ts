@@ -6,8 +6,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Settings } from "../../../src/config/settings";
+import { invalidate } from "../../../src/discovery";
 import { issueSessionMcpControlGrant } from "../../../src/runtime-mcp/session-controls-grant";
-import { type CreateAgentSessionOptions, createAgentSession } from "../../../src/sdk/session";
+import {
+	type CreateAgentSessionOptions,
+	type CreateAgentSessionResult,
+	createAgentSession,
+} from "../../../src/sdk/session";
+import type { AgentSession } from "../../../src/session/agent-session";
 
 const fakeServer = join(import.meta.dir, "session-mcp-fake-server.ts");
 
@@ -21,19 +27,25 @@ export type Case = {
 	projectMcp: string;
 	flag: (name: string) => string;
 };
-export type SessionHarness = Awaited<ReturnType<typeof openSession>>;
+export interface SessionHarness {
+	result: CreateAgentSessionResult;
+	session: AgentSession;
+}
 
-const cleanups: Array<() => Promise<void> | void> = [];
+const cleanups: Array<{ run: () => Promise<void> | void; deletesEvidence: boolean }> = [];
 
-/** Call from `afterEach`: disposes sessions and removes temporary directories. */
+/** Join actual session teardown; retain diagnostic directories if any cleanup fails. */
 export async function runCleanups(): Promise<void> {
+	const failures: unknown[] = [];
 	for (const cleanup of cleanups.splice(0).reverse()) {
+		if (cleanup.deletesEvidence && failures.length > 0) continue;
 		try {
-			await cleanup();
-		} catch {
-			/* best effort */
+			await cleanup.run();
+		} catch (error) {
+			failures.push(error);
 		}
 	}
+	if (failures.length > 0) throw new AggregateError(failures, "Session MCP fixture cleanup failed; evidence retained");
 }
 
 export function makeCase(): Case {
@@ -44,7 +56,7 @@ export function makeCase(): Case {
 	mkdirSync(join(cwd, ".gjc"), { recursive: true });
 	const log = join(base, "spawn.log");
 	writeFileSync(log, "");
-	cleanups.push(() => rmSync(base, { recursive: true, force: true }));
+	cleanups.push({ run: () => rmSync(base, { recursive: true, force: true }), deletesEvidence: true });
 	return {
 		base,
 		agentDir,
@@ -81,6 +93,7 @@ export function writeMcp(
 		Object.entries(servers).map(([name, spec]) => [name, serverConfig(c, name, spec)]),
 	);
 	writeFileSync(file, `${JSON.stringify({ mcpServers, ...extra }, null, 2)}\n`);
+	invalidate(file);
 }
 
 /**
@@ -123,7 +136,7 @@ export function mcpToolsOf(names: readonly string[], server: string): string[] {
 	return names.filter(name => name.startsWith("mcp_") && name.includes(server));
 }
 
-export const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+export const sleep = (ms: number): Promise<void> => Bun.sleep(ms);
 
 /** Let background disconnects and tool refreshes land. */
 export async function settle(): Promise<void> {
@@ -165,9 +178,14 @@ export async function openSession(
 		...(options.session ?? {}),
 	});
 	const session = result.session;
-	cleanups.push(async () => {
-		await session.dispose();
-		await sleep(150);
+	cleanups.push({
+		run: async () => {
+			const results = await Promise.allSettled([session.dispose(), session.awaitDisposeCompletion()]);
+			const failures = results.filter(result => result.status === "rejected").map(result => result.reason);
+			if (failures.length > 0) throw new AggregateError(failures, "Session MCP fixture teardown failed");
+			await sleep(150);
+		},
+		deletesEvidence: false,
 	});
 	if (options.start !== false) await result.startDeferredMcpConfig?.();
 	return { result, session };
