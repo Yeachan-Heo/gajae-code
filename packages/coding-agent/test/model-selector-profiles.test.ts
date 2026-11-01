@@ -10,6 +10,7 @@ import {
 } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { PreparedProfileModelSelection } from "@gajae-code/coding-agent/session/agent-session";
 import type { TUI } from "@gajae-code/tui";
 
 const model = (provider: string, id: string): Model =>
@@ -77,7 +78,7 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 		getModelProfile: (name: string) => profiles.get(name),
 		getAvailableModelProfileNames: () => [...profiles.keys()],
 		getApiKeyForProvider: async () => (options.missingCredentials ? undefined : "key"),
-		getApiKey: async () => "key",
+		getApiKey: async (_model: Model, _credentialSessionId?: string) => "key",
 	};
 }
 
@@ -127,6 +128,22 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		setCalls.push({ path: path as string, value });
 		return originalSet(path, value);
 	}) as typeof settings.set;
+	// "Set as default" writes through one atomic durable batch (ownership CAS plus the
+	// default/thinking patches) instead of settings.set + flushOrThrow, so the durable
+	// write has to be observed at the batch commit, not at the synchronous setter.
+	const committedWrites: Array<{ path: string; value: unknown }> = [];
+	const durableCommits = vi.fn();
+	const originalCommitAtomicBatchWithCurrent = settings.commitAtomicBatchWithCurrent.bind(settings);
+	settings.commitAtomicBatchWithCurrent = (async buildPatches => {
+		return originalCommitAtomicBatchWithCurrent(async current => {
+			const patches = await buildPatches(current);
+			for (const patch of patches) {
+				if (patch.op === "set") committedWrites.push({ path: patch.path, value: patch.value });
+			}
+			if (patches.length > 0) durableCommits();
+			return patches;
+		});
+	}) as typeof settings.commitAtomicBatchWithCurrent;
 	const session = {
 		settings,
 		model: alternateModel as Model | undefined,
@@ -144,6 +161,61 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		},
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			this.configuredChains[role] = entries;
+		},
+		disposed: false,
+		get sessionLifecycle() {
+			return Object.freeze({ generation: 0, transitioning: false, disposed: this.disposed });
+		},
+		async dispose() {
+			this.disposed = true;
+		},
+		activeModelProfile: undefined as string | undefined,
+		activatedModelProfile: undefined as string | undefined,
+		setActiveModelProfile(name: string | undefined, activatedByThisProcess = false) {
+			this.activeModelProfile = name;
+			this.activatedModelProfile = activatedByThisProcess ? name : undefined;
+		},
+		getActiveModelProfile(): string | undefined {
+			return this.activeModelProfile;
+		},
+		getActivatedModelProfile(): string | undefined {
+			return this.activatedModelProfile === this.activeModelProfile ? this.activeModelProfile : undefined;
+		},
+		resumeDefaultSelectors: [] as Array<string | undefined>,
+		recordResumeDefaultModel(selector: string | undefined) {
+			this.resumeDefaultSelectors.push(selector);
+		},
+		setThinkingLevel(level: ThinkingLevel | undefined) {
+			this.thinkingLevel = level;
+		},
+		commitCalls: [] as PreparedProfileModelSelection[],
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			signal?.throwIfAborted();
+			const apiKey = await this.modelRegistry.getApiKey(next, this.sessionId);
+			if (!apiKey) throw new Error(`No API key for ${next.provider}/${next.id}`);
+			return {
+				sessionId: this.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: this.model,
+				previousThinkingLevel: this.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection) {
+			selection.signal?.throwIfAborted();
+			if (this.model !== selection.previousModel || this.thinkingLevel !== selection.previousThinkingLevel)
+				throw new Error("Session changed while publishing profile");
+			this.commitCalls.push(selection);
+			this.model = selection.model;
+			this.thinkingLevel = selection.committedThinkingLevel;
 		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
@@ -164,7 +236,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		showError: vi.fn(),
 		restoreComposer: vi.fn(),
 	};
-	return { ctx, settings, session, flush, setCalls };
+	return { ctx, settings, session, flush, setCalls, committedWrites, durableCommits };
 }
 
 async function selectFirstProfile(controller: SelectorController, setDefault = false): Promise<void> {
@@ -879,15 +951,21 @@ describe("model selector profiles", () => {
 		expect(rendered).not.toContain("DEFAULT: provider-a/default");
 	});
 
-	test("Apply for this session activates profile through setModelTemporary", async () => {
-		const { ctx, settings, session } = createControllerContext();
+	test("Apply for this session commits the profile selection without persisting the default", async () => {
+		const { ctx, settings, session, committedWrites, durableCommits } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller);
 
 		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
-		expect(session.setModelTemporaryCalls).toHaveLength(1);
+		// The session-only path publishes the prepared selection; it must not fall back
+		// to the temporary-model escape hatch or write anything durable.
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls.map(call => call.model)).toEqual([defaultModel]);
+		expect(session.commitCalls[0]?.committedThinkingLevel).toBe(ThinkingLevel.High);
 		expect(session.model).toBe(defaultModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(committedWrites).toEqual([]);
+		expect(durableCommits).not.toHaveBeenCalled();
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
@@ -1086,21 +1164,23 @@ describe("model selector profiles", () => {
 
 		idle.resolve();
 		await Promise.all([firstSelection, secondSelection]);
-		expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([defaultModel, providerBDefault]);
+		expect(session.commitCalls.map(call => call.model)).toEqual([defaultModel, providerBDefault]);
 		expect(session.model).toBe(providerBDefault);
 		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
-	test("Set as default persists and flushes modelProfile.default", async () => {
-		const { ctx, flush, setCalls } = createControllerContext();
+	test("Set as default persists modelProfile.default through one atomic commit", async () => {
+		const { ctx, flush, setCalls, committedWrites, durableCommits } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller, true);
 
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
-		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
-		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(flush).toHaveBeenCalledTimes(1);
-		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+		// The durable write is a single atomic batch, never a setter plus a separate flush.
+		expect(setCalls).not.toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(committedWrites).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(committedWrites).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
+		expect(durableCommits).toHaveBeenCalledTimes(1);
+		expect(flush).not.toHaveBeenCalled();
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
@@ -1120,17 +1200,20 @@ describe("model selector profiles", () => {
 	});
 
 	test("settings Default Model Profile applies the profile live and persists it", async () => {
-		const { ctx, session, flush, setCalls } = createControllerContext();
+		const { ctx, session, flush, setCalls, committedWrites, durableCommits } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 
 		controller.handleSettingChange("modelProfile.default", "profile-a");
 		await Bun.sleep(10);
 
-		expect(session.setModelTemporaryCalls).toHaveLength(1);
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls.map(call => call.model)).toEqual([defaultModel]);
 		expect(session.model?.id).toBe("default");
-		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
-		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(flush).toHaveBeenCalledTimes(1);
+		expect(setCalls).not.toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(committedWrites).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(committedWrites).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
+		expect(durableCommits).toHaveBeenCalledTimes(1);
+		expect(flush).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
