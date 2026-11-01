@@ -4279,6 +4279,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										masterCapability: masterModeContext.getCapability(),
 										masterAttestationEpoch: masterModeContext.attestationEpoch,
 										masterOwnerSessionId: masterModeContext.ownerSessionId,
+										onBrokerRegistered: (generation: number) => {
+											latestRegisteredEndpointGeneration = generation;
+										},
 									}
 								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
@@ -5796,8 +5799,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					lifecycle: createSessionLifecycleService(agentDir),
 					ownerSessionId: masterModeContext.ownerSessionId,
 					getSessionId: () => sessionManager.getSessionId(),
-					getOwnerEndpointGeneration: () =>
-						lifecycleStartupCapability?.rollback?.result.endpointGeneration ?? latestRegisteredEndpointGeneration,
+					getOwnerEndpointGeneration: () => {
+						const startup = lifecycleStartupCapability?.rollback?.result.endpointGeneration;
+						return latestRegisteredEndpointGeneration ?? startup ?? undefined;
+					},
 					scope: masterModeContext.scope,
 					getCwd: getLiveCwd,
 					hasPersistedInjection: () =>
