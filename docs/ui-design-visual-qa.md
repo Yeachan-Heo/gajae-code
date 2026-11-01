@@ -55,7 +55,7 @@ Required evidence:
 
 ## Desktop session-control evidence
 
-Extend the existing Desktop design system in `packages/desktop/DESIGN.md`; model, reasoning, activity, fork, and side-conversation controls are not separate redesigns.
+Extend the existing Desktop design system recorded in the desktop app package's `DESIGN.md`; model, reasoning, activity, fork, and side-conversation controls are not separate redesigns.
 
 - Exercise the mounted App as well as the component showcase. Replace a session with the same catalog ID but a different control generation while catalog loads and mutations are pending. Late successes and failures must not revive a picker, expose stale errors, or unlock the replacement owner's request. Null-generation controls must remain unavailable.
 - Model search must distinguish provider/model IDs even when labels collide. Reasoning choices must come from the SDK's declared options, without optimistic selection or invented levels. Check keyboard selection, focus return, loading, unavailable, empty, error, and retry states in both themes, narrow layouts, and enlarged text.

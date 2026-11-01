@@ -3,6 +3,7 @@ import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/sdk";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
@@ -31,6 +32,7 @@ interface FakeAcpBuiltinSession {
 	isFastForProvider(provider?: string): boolean;
 	isFastForSubagentProvider(provider?: string): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
+	getAgentModelOverrides(): Record<string, ModelSelectorValue>;
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
 	getSessionStats: () => {
