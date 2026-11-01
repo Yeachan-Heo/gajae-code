@@ -5,7 +5,7 @@
  * Handles tool loading and lifecycle.
  */
 
-import { realpathSync } from "node:fs";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai/core";
@@ -233,7 +233,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 function canonicalMCPWorkingDirectory(candidate: string): string {
 	const absolute = path.resolve(candidate);
 	try {
-		return realpathSync.native(absolute);
+		return fs.realpathSync.native(absolute);
 	} catch {
 		return absolute;
 	}
@@ -386,6 +386,46 @@ export interface MCPManagerOptions {
 	afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
 }
 
+/** Manager-issued CAS identity. Binding is SDK authority, not browser data. */
+export interface MCPServerControlTarget {
+	readonly name: string;
+	readonly generation: number;
+	readonly binding: string;
+}
+
+export type MCPServerControlAction = "suspend" | "resume" | "reconnect";
+export type MCPServerControlErrorCode =
+	| "invalid_target"
+	| "stale_target"
+	| "busy"
+	| "unsupported"
+	| "unavailable"
+	| "unknown_effect";
+
+export class MCPServerControlError extends Error {
+	constructor(readonly code: MCPServerControlErrorCode) {
+		super(`MCP server control: ${code}`);
+		this.name = "MCPServerControlError";
+	}
+}
+
+export interface MCPServerControlSnapshot {
+	readonly target: MCPServerControlTarget;
+	readonly state: "connected" | "connecting" | "disconnected" | "suspended" | "unknown";
+	readonly transport: "stdio" | "http" | "sse" | "unknown";
+	readonly scope: "manager";
+	readonly sharing: "shared" | "per-session" | "unknown";
+	readonly toolCount: number;
+	readonly controls: readonly MCPServerControlAction[];
+}
+
+export interface MCPServerControlResult {
+	/** Completion of the manager's connection/catalog operation, not remote termination or session-registry publication. */
+	readonly status: "suspended" | "resumed" | "reconnected";
+	readonly cleanup: "not_certified";
+	readonly target: MCPServerControlTarget;
+}
+
 export type ExactMcpServerControlStatus =
 	| "suspended"
 	| "already-suspended"
@@ -485,6 +525,14 @@ export class MCPManager {
 	#reconnectBackoffs = new Map<string, AbortController>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
+	readonly #serverControlBinding = crypto.randomUUID();
+	#serverControlGeneration = 0;
+	readonly #serverControlTargets = new Map<string, MCPServerControlTarget>();
+	/** Known release failures are not erased by a later successful open. No rollback proof is inferred. */
+	readonly #serverControlUnknown = new Set<string>();
+	readonly #pendingServerControls = new Map<string, { signal: AbortSignal | undefined }>();
+	readonly #serverControlListeners = new Set<() => void>();
+	#serverControlWakePending = false;
 	// Exact MCP replacements retain cleanup ownership and cancel in-flight candidates.
 	/** Session-local operator suppression; never persisted to MCP config. */
 	#suppressedServers = new Set<string>();
@@ -516,7 +564,10 @@ export class MCPManager {
 	#removePendingAcquireCleanup(name: string, error: MCPPoolAcquireAbortError): void {
 		const pending = this.#pendingAcquireCleanups.get(name);
 		pending?.delete(error);
-		if (pending?.size === 0) this.#pendingAcquireCleanups.delete(name);
+		if (pending?.size === 0) {
+			this.#pendingAcquireCleanups.delete(name);
+			this.#notifyServerControlsChanged();
+		}
 	}
 	#pruneSettledPendingAcquireCleanups(name: string): void {
 		for (const error of this.#pendingAcquireCleanups.get(name) ?? []) {
@@ -598,6 +649,7 @@ export class MCPManager {
 		if (this.#toolsOnly) throw new Error("Tools-only MCP manager does not allow raw MCP access");
 	}
 	#beginScopedLifecycle(phase: "disconnecting" | "reconnecting"): number {
+		for (const name of this.#serverControlTargets.keys()) this.#advanceServerControlTarget(name);
 		this.#scopedLifecycle = phase;
 		this.#scopedLifecycleEpoch += 1;
 		return this.#scopedLifecycleEpoch;
@@ -606,6 +658,7 @@ export class MCPManager {
 	#finishScopedLifecycle(epoch: number): void {
 		if (this.#scopedLifecycleEpoch !== epoch) return;
 		this.#scopedLifecycle = "open";
+		this.#notifyServerControlsChanged();
 		this.#drainDeferredSharedRebinds();
 	}
 
@@ -689,7 +742,11 @@ export class MCPManager {
 	}
 
 	#scheduleSharedRebind(name: string, lease: MCPPoolLease): void {
-		if (this.#pendingExactSuspensions.has(name) || this.#pendingExactControlServers.has(name)) {
+		if (
+			this.#pendingServerControls.has(name) ||
+			this.#pendingExactSuspensions.has(name) ||
+			this.#pendingExactControlServers.has(name)
+		) {
 			this.#queueDeferredSharedRebind(name, lease, this.#epoch);
 			return;
 		}
@@ -721,6 +778,7 @@ export class MCPManager {
 			// of staying bound to a retired pool generation.
 			if (
 				this.#suppressedServers.has(name) ||
+				this.#pendingServerControls.has(name) ||
 				this.#pendingExactSuspensions.has(name) ||
 				this.#pendingExactControlServers.has(name)
 			)
@@ -765,6 +823,7 @@ export class MCPManager {
 			});
 		});
 		this.#leases.set(name, lease);
+		this.#advanceServerControlTarget(name);
 		if (!this.#toolsOnly) lease.updateRoots(this.#getRoots().roots);
 		this.#leaseEventUnsubscribers.set(
 			name,
@@ -790,10 +849,12 @@ export class MCPManager {
 		);
 	}
 
-	async #rebindAfterSharedRestart(name: string, lease: MCPPoolLease): Promise<void> {
+	async #rebindAfterSharedRestart(name: string, lease: MCPPoolLease, assertControl?: () => void): Promise<void> {
+		assertControl?.();
 		const managerEpoch = this.#epoch;
 		if (
 			this.#scopedLifecycle === "disconnecting" ||
+			(!assertControl && this.#pendingServerControls.has(name)) ||
 			this.#pendingExactSuspensions.has(name) ||
 			this.#pendingExactControlServers.has(name)
 		)
@@ -810,8 +871,9 @@ export class MCPManager {
 		const source = this.#sources.get(name) ?? oldConnection._source;
 		if (currentLease === lease) {
 			await this.#releaseLease(name, oldConnection);
-			this.#connections.delete(name);
+			if (this.#connections.get(name) === oldConnection) this.#connections.delete(name);
 		}
+		assertControl?.();
 		const lifecycleAfterRelease = this.#scopedLifecycle as "open" | "disconnecting" | "reconnecting";
 		if (lifecycleAfterRelease === "disconnecting" || this.#epoch !== managerEpoch) return;
 		if (lifecycleAfterRelease === "reconnecting") {
@@ -945,6 +1007,9 @@ export class MCPManager {
 		poolKey?: string,
 	): MCPPoolLeaseReleaseError {
 		const diagnostic = this.#leaseReleaseDiagnostic(name, connection, error, poolKey);
+		this.#serverControlUnknown.add(name);
+		this.#advanceServerControlTarget(name);
+		this.#notifyServerControlsChanged();
 		logger.error("MCP lease release failed", {
 			path: `mcp:${name}`,
 			serverName: name,
@@ -966,6 +1031,7 @@ export class MCPManager {
 		void promise.then(
 			() => {
 				this.#retiredLeaseReleases.delete(retired);
+				this.#notifyServerControlsChanged();
 			},
 			() => {
 				// Keep rejected retired releases for disconnectAll aggregation.
@@ -1256,17 +1322,19 @@ export class MCPManager {
 		sources: Record<string, SourceMeta>,
 		onConnecting?: (serverNames: string[]) => void,
 	): Promise<MCPLoadResult> {
+		if (this.#pendingServerControls.size) throw new MCPServerControlError("busy");
 		const errors = new Map<string, string>();
 		const connectedServers = new Set<string>();
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
 		const reportedErrors = new Set<string>();
 		let allowBackgroundLogging = false;
-		let shouldPublishToolSnapshot = true;
 
 		// Prepare connection tasks
 		const connectionTasks: ConnectionTask[] = [];
+		const existingConnections = new Map<string, { connection: MCPServerConnection; epoch: number }>();
 
 		for (const [name, config] of Object.entries(configs)) {
+			if (this.#suppressedServers.has(name)) continue;
 			// Another manager sharing the pool may have retried and completed an
 			// abandoned-acquire cleanup. Retire this manager's observation before
 			// applying its reconnect fence; pool ownership remains authoritative.
@@ -1304,14 +1372,10 @@ export class MCPManager {
 			// Skip if already connected.
 			if (this.#connections.has(name)) {
 				connectedServers.add(name);
-				if (this.#isExactToolPublicationAllowed(name)) {
-					allTools.push(
-						...this.#tools.filter(
-							tool =>
-								(tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
-						),
-					);
-				}
+				existingConnections.set(name, {
+					connection: this.#connections.get(name)!,
+					epoch: this.#disconnectEpochs.get(name) ?? 0,
+				});
 				continue;
 			}
 
@@ -1348,6 +1412,7 @@ export class MCPManager {
 
 			// Save config early so reconnection works even if the initial connect times out
 			// and falls back to cached/deferred tools.
+			this.#advanceServerControlTarget(name);
 			this.#serverConfigs.set(name, config);
 
 			const connectionEpoch = this.#epoch;
@@ -1554,6 +1619,7 @@ export class MCPManager {
 			}
 
 			const cachedTools = new Map<string, MCPToolDefinition[]>();
+			const startupCleanupEpochs = new Map<string, number>();
 			const pendingTasks = connectionTasks.filter(task => task.tracked.status === "pending");
 
 			if (pendingTasks.length > 0) {
@@ -1585,6 +1651,13 @@ export class MCPManager {
 				const startupElapsedMs = Date.now() - startupStartedAt;
 				for (const task of pendingTasks) {
 					if (task.tracked.status !== "pending") continue;
+					if (
+						this.#epoch !== task.connectionEpoch ||
+						(this.#disconnectEpochs.get(task.name) ?? 0) !== task.disconnectEpoch ||
+						this.#serverConfigs.get(task.name) !== task.config
+					) {
+						continue;
+					}
 					if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
 						logger.warn("MCP server still connecting after the startup wait", {
 							path: `mcp:${task.name}`,
@@ -1611,11 +1684,15 @@ export class MCPManager {
 					if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
 						this.#pendingToolLoads.delete(task.name);
 					this.#pendingConnectionControllers.delete(task.name);
-					void this.#disconnectServer(task.name, {
+					const cleanup = this.#disconnectServer(task.name, {
 						preserveConfig: this.#toolsOnly || cachedTools.has(task.name),
 						preserveSource: cachedTools.has(task.name),
 						preserveTools: cachedTools.has(task.name),
-					}).catch(error => {
+					});
+					// This synchronous epoch advance belongs to startup cleanup, not an
+					// external disconnect invalidating the preserved cache fallback.
+					startupCleanupEpochs.set(task.name, this.#disconnectEpochs.get(task.name)!);
+					void cleanup.catch(error => {
 						this.#logLeaseReleaseFailure(task.name, undefined, error);
 					});
 				}
@@ -1627,11 +1704,12 @@ export class MCPManager {
 					const value = task.tracked.value;
 					if (!value) continue;
 					const { connection, serverTools } = value;
-					if (this.#pendingToolLoads.has(name) && this.#pendingToolLoads.get(name) !== task.toolsPromise) continue;
+					if (this.#pendingToolLoads.has(name) && this.#pendingToolLoads.get(name) !== task.toolsPromise) {
+						continue;
+					}
 					if (
 						!this.#isCurrentConnection(name, task.config, task.connectionEpoch, task.disconnectEpoch, connection)
 					) {
-						shouldPublishToolSnapshot = false;
 						continue;
 					}
 					connectedServers.add(name);
@@ -1671,10 +1749,13 @@ export class MCPManager {
 							this.#logLeaseReleaseFailure(name, this.#connections.get(name), error);
 						});
 					}
-					if ((this.#disconnectEpochs.get(name) ?? 0) !== task.disconnectEpoch) {
-						shouldPublishToolSnapshot = false;
-					}
 				} else {
+					if (
+						this.#epoch !== task.connectionEpoch ||
+						(this.#disconnectEpochs.get(name) ?? 0) !== (startupCleanupEpochs.get(name) ?? task.disconnectEpoch)
+					) {
+						continue;
+					}
 					const cached = cachedTools.get(name);
 					if (cached && this.#isExactToolPublicationAllowed(name)) {
 						const source = this.#sources.get(name);
@@ -1699,6 +1780,22 @@ export class MCPManager {
 			}
 		}
 
+		for (const [name, existing] of existingConnections) {
+			if (
+				this.#connections.get(name) !== existing.connection ||
+				(this.#disconnectEpochs.get(name) ?? 0) !== existing.epoch
+			) {
+				continue;
+			}
+			if (!this.#isExactToolPublicationAllowed(name)) continue;
+			allTools.push(
+				...this.#tools.filter(
+					tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+				),
+			);
+			allTools.push(...(this.#shadowedServerTools.get(name) ?? []));
+		}
+
 		// Stable sort by name so the order is independent of connection completion.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(allTools);
@@ -1707,12 +1804,49 @@ export class MCPManager {
 			throw new Error("MCP tool catalog contains duplicate tool names");
 		}
 
-		// Update cached tools
-		if (shouldPublishToolSnapshot) {
-			this.#publishToolCatalog(allTools);
-			this.#notifyToolsChanged();
+		// Preserve owners already published by connection completions, then retain
+		// colliding candidates for promotion when their owner disconnects.
+		if (this.#toolsOnly || allTools.length > 0) {
+			if (!this.#toolsOnly) {
+				const owners = new Map(this.#tools.map(tool => [tool.name, tool]));
+				const addressed = new Set(allTools.map(tool => (tool as MCPTool | DeferredMCPTool).mcpServerName));
+				const candidates = [
+					...allTools,
+					...this.#tools.filter(
+						tool =>
+							!(
+								(tool instanceof MCPTool || tool instanceof DeferredMCPTool) &&
+								addressed.has(tool.mcpServerName)
+							),
+					),
+				].sort((a, b) => {
+					if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+					const owner = owners.get(a.name);
+					const isOwner = (tool: typeof a) =>
+						owner instanceof MCPTool || owner instanceof DeferredMCPTool
+							? (tool instanceof MCPTool || tool instanceof DeferredMCPTool) &&
+								tool.mcpServerName === owner.mcpServerName
+							: false;
+					return Number(isOwner(b)) - Number(isOwner(a));
+				});
+				for (const name of addressed) this.#shadowedServerTools.delete(name);
+				allTools.length = 0;
+				const names = new Set<string>();
+				for (const tool of candidates) {
+					const server = (tool as MCPTool | DeferredMCPTool).mcpServerName;
+					this.#addServerTool(server, tool, allTools, names);
+				}
+				sortMCPToolsByName(allTools);
+			}
+		} else {
+			allTools.splice(0, allTools.length, ...this.#tools);
 		}
+		// Even an empty startup establishes an authoritative current catalog.
+		// Stale candidates above are excluded; unrelated current owners remain.
+		this.#publishToolCatalog(allTools);
+		this.#notifyToolsChanged();
 		allowBackgroundLogging = true;
+		this.#notifyServerControlsChanged();
 
 		return {
 			tools: [...allTools],
@@ -1734,20 +1868,7 @@ export class MCPManager {
 			// replace another server's tool under the same name: keep the existing tool and
 			// hold the incoming one until the name is free.
 			const publishedNames = new Set(publishedTools.map(tool => tool.name));
-			const shadowed: CustomTool<TSchema, MCPToolDetails>[] = [];
-			for (const tool of tools) {
-				if (publishedNames.has(tool.name)) {
-					logger.warn("Skipping MCP tool whose name is already published by another server", {
-						path: `mcp:${name}`,
-						tool: tool.name,
-					});
-					shadowed.push(tool);
-					continue;
-				}
-				publishedNames.add(tool.name);
-				publishedTools.push(tool);
-			}
-			if (shadowed.length > 0) this.#shadowedServerTools.set(name, shadowed);
+			for (const tool of tools) this.#addServerTool(name, tool, publishedTools, publishedNames);
 		}
 		// This server may have dropped a name another connected server is waiting for.
 		this.#promoteShadowedTools(publishedTools);
@@ -1755,6 +1876,26 @@ export class MCPManager {
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(publishedTools);
 		this.#publishToolCatalog(publishedTools);
+	}
+
+	#addServerTool(
+		name: string,
+		tool: CustomTool<TSchema, MCPToolDetails>,
+		publishedTools: CustomTool<TSchema, MCPToolDetails>[],
+		publishedNames: Set<string>,
+	): void {
+		if (publishedNames.has(tool.name)) {
+			logger.warn("Skipping MCP tool whose name is already published by another server", {
+				path: `mcp:${name}`,
+				tool: tool.name,
+			});
+			const shadowed = this.#shadowedServerTools.get(name) ?? [];
+			shadowed.push(tool);
+			this.#shadowedServerTools.set(name, shadowed);
+			return;
+		}
+		publishedNames.add(tool.name);
+		publishedTools.push(tool);
 	}
 
 	/**
@@ -1788,9 +1929,7 @@ export class MCPManager {
 		noReplay: boolean,
 	): { noReplay: boolean; isAvailable?: () => boolean; inputHandler: () => MCPInputRequestHandler | undefined } {
 		const inputHandler = () => this.#inputRequestHandler ?? undefined;
-		return this.#toolsOnly
-			? { noReplay, isAvailable: () => !this.#suppressedServers.has(name), inputHandler }
-			: { noReplay, inputHandler };
+		return { noReplay, isAvailable: () => !this.#suppressedServers.has(name), inputHandler };
 	}
 
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): void {
@@ -1897,10 +2036,8 @@ export class MCPManager {
 
 	#isExactToolPublicationAllowed(name: string): boolean {
 		return (
-			!this.#toolsOnly ||
-			(!this.#suppressedServers.has(name) &&
-				!this.#pendingExactSuspensions.has(name) &&
-				!this.#pendingExactControlServers.has(name))
+			!this.#suppressedServers.has(name) &&
+			(!this.#toolsOnly || (!this.#pendingExactSuspensions.has(name) && !this.#pendingExactControlServers.has(name)))
 		);
 	}
 
@@ -1945,6 +2082,7 @@ export class MCPManager {
 				tools,
 				canCommit: () => true,
 				commit: async () => {
+					this.#advanceServerControlTarget(name);
 					this.#suppressedServers.add(name);
 					this.#pendingExactSuspensions.delete(name);
 					this.#reconnectBackoffs.get(name)?.abort(new Error(`MCP server suspended: ${name}`));
@@ -2164,6 +2302,7 @@ export class MCPManager {
 		const publish = (): void => {
 			if (settled) return;
 			candidate?.publish();
+			this.#advanceServerControlTarget(name);
 			settled = true;
 			if (candidate) {
 				this.#leaseByConnection.set(candidate.connection, candidate.lease);
@@ -2329,6 +2468,203 @@ export class MCPManager {
 		}
 	}
 
+	#advanceServerControlTarget(name: string): MCPServerControlTarget {
+		if (this.#serverControlGeneration >= Number.MAX_SAFE_INTEGER) throw new MCPServerControlError("unavailable");
+		const target = Object.freeze({
+			name,
+			generation: ++this.#serverControlGeneration,
+			binding: this.#serverControlBinding,
+		});
+		this.#serverControlTargets.set(name, target);
+		return target;
+	}
+
+	#hasUnknownServerControlState(name: string): boolean {
+		return (
+			this.#serverControlUnknown.has(name) ||
+			this.#pendingConnectionCleanups.has(name) ||
+			[...(this.#pendingAcquireCleanups.get(name) ?? [])].some(error =>
+				this.#pool.hasPendingAcquireCleanup(error),
+			) ||
+			[...this.#retiredLeaseReleases].some(release => release.name === name)
+		);
+	}
+
+	#notifyServerControlsChanged(): void {
+		if (this.#serverControlWakePending) return;
+		this.#serverControlWakePending = true;
+		// Observers cannot re-enter a synchronous mutation fence.
+		queueMicrotask(() => {
+			this.#serverControlWakePending = false;
+			for (const listener of [...this.#serverControlListeners]) {
+				try {
+					listener();
+				} catch {
+					/* Wakeups are not mutation authority. */
+				}
+			}
+		});
+	}
+
+	/** Payload-free wakeups. Consumers must read a fresh snapshot. */
+	subscribeToServerControlsChanged(listener: () => void): () => void {
+		this.#serverControlListeners.add(listener);
+		return () => {
+			this.#serverControlListeners.delete(listener);
+		};
+	}
+
+	/** Read-only, including while session prompt admission is occupied. No resolved config is returned. */
+	getServerControlSnapshot(): readonly MCPServerControlSnapshot[] {
+		const names = new Set([
+			...this.#serverConfigs.keys(),
+			...this.#connections.keys(),
+			...this.#pendingConnectionCleanups.keys(),
+			...this.#pendingAcquireCleanups.keys(),
+			...this.#serverControlUnknown,
+		]);
+		return [...names].map<MCPServerControlSnapshot>(name => {
+			const config = this.#serverConfigs.get(name) ?? this.#connections.get(name)?.config;
+			const target = this.#serverControlTargets.get(name);
+			if (!target) throw new MCPServerControlError("unavailable");
+			const unknown = this.#hasUnknownServerControlState(name);
+			const pending =
+				this.#pendingConnections.has(name) ||
+				this.#pendingToolLoads.has(name) ||
+				this.#pendingReconnections.has(name) ||
+				this.#activeSharedRebinds.has(name) ||
+				this.#pendingServerControls.has(name);
+			const state = unknown
+				? "unknown"
+				: pending
+					? "connecting"
+					: this.#suppressedServers.has(name)
+						? "suspended"
+						: this.#connections.get(name)?.transport.connected
+							? "connected"
+							: "disconnected";
+			const supported =
+				!this.#toolsOnly &&
+				!this.#connectionSetSealed &&
+				this.#scopedLifecycle === "open" &&
+				this.#pendingServerControls.size === 0 &&
+				!pending &&
+				!unknown &&
+				config !== undefined;
+			const controls: MCPServerControlAction[] = !supported
+				? []
+				: state === "suspended"
+					? ["resume"]
+					: ["suspend", "reconnect"];
+			return {
+				target: { ...target },
+				state,
+				transport: config?.type ?? "unknown",
+				scope: "manager",
+				sharing: this.#leases.get(name)?.sharingMode ?? "unknown",
+				toolCount: state === "suspended" ? 0 : this.#exactServerToolCount(name),
+				controls,
+			};
+		});
+	}
+
+	/**
+	 * Atomic target validation and reservation, before the first await. Existing
+	 * disconnect/reconnect/pool machinery remains the only physical mutation path.
+	 * Failure is not rollback proof; read the resulting state before retrying.
+	 */
+	async controlServer(
+		expected: MCPServerControlTarget,
+		action: MCPServerControlAction,
+		options: { signal?: AbortSignal } = {},
+	): Promise<MCPServerControlResult> {
+		if (!expected || typeof expected !== "object") throw new MCPServerControlError("invalid_target");
+		const descriptors = Object.getOwnPropertyDescriptors(expected);
+		if (["name", "generation", "binding"].some(key => !descriptors[key] || !("value" in descriptors[key]!)))
+			throw new MCPServerControlError("invalid_target");
+		const name: unknown = descriptors.name!.value;
+		const generation: unknown = descriptors.generation!.value;
+		const binding: unknown = descriptors.binding!.value;
+		if (
+			typeof name !== "string" ||
+			typeof generation !== "number" ||
+			!Number.isSafeInteger(generation) ||
+			typeof binding !== "string" ||
+			(action !== "suspend" && action !== "resume" && action !== "reconnect")
+		)
+			throw new MCPServerControlError("invalid_target");
+		const target = this.#serverControlTargets.get(name);
+		if (!target || binding !== this.#serverControlBinding || target.generation !== generation)
+			throw new MCPServerControlError("stale_target");
+		if (this.#toolsOnly || this.#connectionSetSealed) throw new MCPServerControlError("unsupported");
+		if (
+			this.#pendingServerControls.size ||
+			this.#pendingConnections.has(name) ||
+			this.#pendingToolLoads.has(name) ||
+			this.#pendingReconnections.has(name) ||
+			this.#activeSharedRebinds.has(name)
+		)
+			throw new MCPServerControlError("busy");
+		this.#assertScopedAdmission();
+		const config = this.#serverConfigs.get(name);
+		if (!config || this.#hasUnknownServerControlState(name)) throw new MCPServerControlError("unavailable");
+		if ((action === "resume") !== this.#suppressedServers.has(name)) throw new MCPServerControlError("unavailable");
+		if (options.signal?.aborted) throw new MCPServerControlError("unavailable");
+		const ticket = { signal: options.signal };
+		const epoch = this.#epoch;
+		this.#pendingServerControls.set(name, ticket);
+		this.#advanceServerControlTarget(name);
+		const assertCurrent = (): void => {
+			if (
+				options.signal?.aborted ||
+				this.#epoch !== epoch ||
+				this.#pendingServerControls.get(name) !== ticket ||
+				this.#serverConfigs.get(name) !== config ||
+				this.#hasUnknownServerControlState(name)
+			)
+				throw new MCPServerControlError("unknown_effect");
+		};
+		const onAbort = (): void => {
+			this.#disconnectEpochs.set(name, (this.#disconnectEpochs.get(name) ?? 0) + 1);
+			this.#pendingConnectionControllers.get(name)?.abort(new MCPServerControlError("unknown_effect"));
+			this.#reconnectBackoffs.get(name)?.abort(new MCPServerControlError("unknown_effect"));
+		};
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			if (action === "suspend") {
+				this.#suppressedServers.add(name);
+				for (const tool of this.#tools) {
+					if (tool.mcpServerName === name && (tool instanceof MCPTool || tool instanceof DeferredMCPTool))
+						tool.invalidateForSessionControl();
+				}
+				await this.#retireScopedOperations(name, new MCPServerControlError("unavailable"));
+				assertCurrent();
+				await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true });
+			} else {
+				if (action === "resume") this.#suppressedServers.delete(name);
+				const connection = await this.#reconnectServer(name, assertCurrent);
+				if (!connection?.transport.connected || this.#connections.get(name) !== connection)
+					throw new MCPServerControlError("unknown_effect");
+			}
+			assertCurrent();
+			return {
+				status: action === "suspend" ? "suspended" : action === "resume" ? "resumed" : "reconnected",
+				cleanup: "not_certified",
+				target: { ...this.#serverControlTargets.get(name)! },
+			};
+		} catch (error) {
+			if (error instanceof MCPServerControlError) throw error;
+			this.#serverControlUnknown.add(name);
+			this.#advanceServerControlTarget(name);
+			throw new MCPServerControlError("unknown_effect");
+		} finally {
+			options.signal?.removeEventListener("abort", onAbort);
+			if (this.#pendingServerControls.get(name) === ticket) this.#pendingServerControls.delete(name);
+			this.#notifyServerControlsChanged();
+			this.#drainDeferredSharedRebinds();
+		}
+	}
+
 	/**
 	 * Get a specific connection.
 	 */
@@ -2388,6 +2724,8 @@ export class MCPManager {
 	}
 
 	async #waitForConnection(name: string): Promise<MCPServerConnection> {
+		if (this.#pendingServerControls.has(name) || this.#suppressedServers.has(name))
+			throw new MCPServerControlError("unavailable");
 		const connection = this.#connections.get(name);
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
@@ -2417,6 +2755,8 @@ export class MCPManager {
 		options: { signal?: AbortSignal; source?: SourceMeta } = {},
 	): Promise<T> {
 		this.#assertRawMCPAccessAllowed();
+		if (this.#pendingServerControls.has(name) || this.#suppressedServers.has(name))
+			throw new MCPServerControlError("unavailable");
 		const lifecycleEpoch = this.#assertScopedAdmission();
 		const leaseReady = Promise.withResolvers<MCPPoolLease | undefined>();
 		const operation: ScopedOperation = {
@@ -2576,6 +2916,7 @@ export class MCPManager {
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
+		if (this.#pendingServerControls.size) throw new MCPServerControlError("busy");
 		this.#assertRawMCPAccessAllowed();
 		this.#assertConnectionSetMutable();
 		await this.#disconnectServer(name);
@@ -2585,6 +2926,7 @@ export class MCPManager {
 		name: string,
 		options: { preserveConfig?: boolean; preserveSource?: boolean; preserveTools?: boolean } = {},
 	): Promise<void> {
+		this.#advanceServerControlTarget(name);
 		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
 		this.#disconnectEpochs.set(name, nextEpoch);
 		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
@@ -2595,7 +2937,10 @@ export class MCPManager {
 		this.#pendingToolLoads.delete(name);
 		this.#pendingReconnections.delete(name);
 		if (!options.preserveSource) this.#sources.delete(name);
-		if (!options.preserveConfig) this.#serverConfigs.delete(name);
+		if (!options.preserveConfig) {
+			this.#serverConfigs.delete(name);
+			this.#suppressedServers.delete(name);
+		}
 		this.#pendingResourceRefresh.delete(name);
 		const connection = this.#connections.get(name);
 
@@ -2645,6 +2990,7 @@ export class MCPManager {
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
+		this.#notifyServerControlsChanged();
 		if (closeError !== undefined) throw closeError;
 	}
 
@@ -2699,6 +3045,7 @@ export class MCPManager {
 	async disconnectAll(): Promise<void> {
 		const lifecycleEpoch = this.#beginScopedLifecycle("disconnecting");
 		this.#deferredSharedRebinds.clear();
+		this.#pendingServerControls.clear();
 		try {
 			const cleanupNames = new Set([
 				...this.#pendingConnectionCleanups.keys(),
@@ -2788,6 +3135,11 @@ export class MCPManager {
 	 * Throws a retryable cleanup failure while the previous transport owner remains incomplete.
 	 */
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
+		if (this.#pendingServerControls.size) return null;
+		return this.#reconnectServer(name);
+	}
+
+	async #reconnectServer(name: string, assertControl?: () => void): Promise<MCPServerConnection | null> {
 		if (this.#connectionSetSealed) return null;
 		if (this.#scopedLifecycle === "disconnecting") return null;
 		if (this.#pendingExactControlServers.has(name)) return this.#connections.get(name) ?? null;
@@ -2795,7 +3147,11 @@ export class MCPManager {
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
-		const attempt = this.#closePendingConnectionCleanup(name).then(() => this.#startReconnect(name));
+		this.#advanceServerControlTarget(name);
+		const attempt = this.#closePendingConnectionCleanup(name).then(() => {
+			assertControl?.();
+			return this.#startReconnect(name, assertControl);
+		});
 		this.#pendingReconnections.set(name, attempt);
 		return attempt.finally(() => {
 			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
@@ -2811,11 +3167,10 @@ export class MCPManager {
 	): Promise<MCPServerConnection> {
 		this.#assertRawMCPAccessAllowed();
 		this.#assertConnectionSetMutable();
-		if (options?.restart && this.#connections.has(name)) {
-			await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true, preserveTools: true });
-		}
+		if (this.#pendingServerControls.size) throw new MCPServerControlError("busy");
+		this.#assertScopedAdmission();
 		const existing = this.#connections.get(name);
-		if (existing) return existing;
+		if (existing && !options?.restart) return existing;
 		if (
 			this.#pendingConnections.has(name) ||
 			this.#pendingToolLoads.has(name) ||
@@ -2825,49 +3180,92 @@ export class MCPManager {
 		}
 		const validationErrors = validateServerConfig(name, config);
 		if (validationErrors.length > 0) throw new Error(validationErrors.join("; "));
-		this.#pruneSettledPendingAcquireCleanups(name);
-		await this.#closePendingConnectionCleanup(name);
-		const hadState = this.#serverConfigs.has(name) || this.#tools.some(tool => tool.mcpServerName === name);
-		this.#serverConfigs.set(name, config);
-		this.#sources.set(name, source);
-		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
-		const flight = this.#connectAndWireServer(name, config, source, this.#epoch, disconnectEpoch);
-		this.#pendingConnections.set(name, flight);
-		let timer: Timer | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() => reject(new Error(`MCP connection timed out: ${name}`)),
+		const ticket = { signal: undefined };
+		const managerEpoch = this.#epoch;
+		this.#advanceServerControlTarget(name);
+		this.#pendingServerControls.set(name, ticket);
+		const lifecycleEpoch = options?.restart ? this.#beginScopedLifecycle("reconnecting") : undefined;
+		const assertCurrent = (): void => {
+			if (
+				this.#epoch !== managerEpoch ||
+				this.#pendingServerControls.get(name) !== ticket ||
+				(lifecycleEpoch !== undefined && this.#scopedLifecycleEpoch !== lifecycleEpoch)
+			) {
+				throw new MCPServerControlError("unknown_effect");
+			}
+		};
+		try {
+			if (options?.restart) {
+				await this.#retireScopedOperations(name, new Error(`MCP server reconnecting: ${name}`));
+				assertCurrent();
+				if (this.#hasUnknownServerControlState(name)) throw new MCPServerControlError("unknown_effect");
+				const oldLease = this.#leases.get(name);
+				if (oldLease) this.#pool.retireLease(oldLease);
+				if (existing) {
+					await this.#disconnectServer(name, { preserveConfig: true, preserveSource: true, preserveTools: true });
+					assertCurrent();
+				}
+			}
+			this.#pruneSettledPendingAcquireCleanups(name);
+			await this.#closePendingConnectionCleanup(name);
+			assertCurrent();
+			if (this.#hasUnknownServerControlState(name)) throw new MCPServerControlError("unknown_effect");
+			const hadState = this.#serverConfigs.has(name) || this.#tools.some(tool => tool.mcpServerName === name);
+			this.#serverConfigs.set(name, config);
+			this.#sources.set(name, source);
+			const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+			const flight = this.#connectAndWireServer(name, config, source, managerEpoch, disconnectEpoch);
+			this.#pendingConnections.set(name, flight);
+			const timeout = Promise.withResolvers<never>();
+			const timer = setTimeout(
+				() => timeout.reject(new Error(`MCP connection timed out: ${name}`)),
 				resolveExactConfigStartupTimeoutMs([config]),
 			);
-		});
-		try {
-			return await Promise.race([flight, timeout]);
-		} catch (error) {
-			void flight.catch(() => {});
-			if ((this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch) {
-				await this.#disconnectServer(
-					name,
-					hadState ? { preserveConfig: true, preserveSource: true, preserveTools: true } : undefined,
-				).catch(cleanupError => this.#logLeaseReleaseFailure(name, this.#connections.get(name), cleanupError));
+			try {
+				const connection = await Promise.race([flight, timeout.promise]);
+				assertCurrent();
+				return connection;
+			} catch (error) {
+				void flight.catch(() => {});
+				if (
+					this.#epoch === managerEpoch &&
+					this.#pendingServerControls.get(name) === ticket &&
+					(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch
+				) {
+					await this.#disconnectServer(
+						name,
+						hadState ? { preserveConfig: true, preserveSource: true, preserveTools: true } : undefined,
+					).catch(cleanupError => this.#logLeaseReleaseFailure(name, this.#connections.get(name), cleanupError));
+				}
+				throw error;
+			} finally {
+				clearTimeout(timer);
+				if (this.#pendingConnections.get(name) === flight) this.#pendingConnections.delete(name);
 			}
-			throw error;
 		} finally {
-			if (timer) clearTimeout(timer);
-			if (this.#pendingConnections.get(name) === flight) this.#pendingConnections.delete(name);
+			if (this.#pendingServerControls.get(name) === ticket) this.#pendingServerControls.delete(name);
+			if (lifecycleEpoch !== undefined) this.#finishScopedLifecycle(lifecycleEpoch);
+			else {
+				this.#notifyServerControlsChanged();
+				this.#drainDeferredSharedRebinds();
+			}
 		}
 	}
 
-	#startReconnect(name: string): Promise<MCPServerConnection | null> {
+	#startReconnect(name: string, assertControl?: () => void): Promise<MCPServerConnection | null> {
+		assertControl?.();
+		if (this.#pendingServerControls.get(name)?.signal?.aborted) return Promise.resolve(null);
 		const lease = this.#leases.get(name);
 		const sharedKey = lease?.sharingMode === "shared" ? lease.key : undefined;
 		let attempt: Promise<MCPServerConnection | null>;
 		if (sharedKey && !this.#pool.claimRestart(sharedKey)) {
 			attempt = this.#pool.awaitRestart(sharedKey).then(async success => {
-				if (success) await this.#rebindAfterSharedRestart(name, lease!);
+				assertControl?.();
+				if (success) await this.#rebindAfterSharedRestart(name, lease!, assertControl);
 				return this.#connections.get(name) ?? null;
 			});
 		} else {
-			attempt = this.#doReconnect(name);
+			attempt = this.#doReconnect(name, assertControl);
 			if (sharedKey) {
 				attempt = attempt
 					.then(
@@ -2891,14 +3289,15 @@ export class MCPManager {
 		return attempt;
 	}
 
-	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
+	async #doReconnect(name: string, assertControl?: () => void): Promise<MCPServerConnection | null> {
+		assertControl?.();
 		const oldConnection = this.#connections.get(name);
 		const config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
 		const lifecycleEpoch = this.#beginScopedLifecycle("reconnecting");
 		try {
-			return await this.#performReconnect(name, oldConnection, config, source);
+			return await this.#performReconnect(name, oldConnection, config, source, assertControl);
 		} finally {
 			this.#finishScopedLifecycle(lifecycleEpoch);
 		}
@@ -2909,24 +3308,29 @@ export class MCPManager {
 		oldConnection: MCPServerConnection | undefined,
 		config: MCPServerConfig,
 		source: SourceMeta | undefined,
+		assertControl?: () => void,
 	): Promise<MCPServerConnection | null> {
+		assertControl?.();
 		logger.debug("MCP reconnecting", { path: `mcp:${name}` });
 
 		// Close the old transport without removing tools or notifying consumers.
 		// Tools stay available (stale) while we establish the new connection.
 		const reconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 		await this.#retireScopedOperations(name, new Error(`MCP server reconnecting: ${name}`));
+		assertControl?.();
+		if (this.#pendingServerControls.has(name) && this.#hasUnknownServerControlState(name))
+			throw new MCPServerControlError("unknown_effect");
 		const oldLease = this.#leases.get(name);
 		if (oldLease) this.#pool.retireLease(oldLease);
 		if (oldConnection) {
 			const releasePromise = this.#releaseLease(name, oldConnection).catch(error => {
 				throw this.#logLeaseReleaseFailure(name, oldConnection, error);
 			});
-			if (oldConnection.transport.closeBeforeReconnect !== false) {
+			if (oldConnection.transport.closeBeforeReconnect !== false || this.#pendingServerControls.has(name)) {
 				try {
 					await releasePromise;
 				} finally {
-					this.#connections.delete(name);
+					if (this.#connections.get(name) === oldConnection) this.#connections.delete(name);
 				}
 			} else {
 				// Fire-and-forget HTTP/SSE close so a slow DELETE does not delay retries.
@@ -2937,6 +3341,7 @@ export class MCPManager {
 				this.#connections.delete(name);
 			}
 		}
+		assertControl?.();
 		this.#pendingConnections.delete(name);
 		const backoffAbort = new AbortController();
 		this.#reconnectBackoffs.set(name, backoffAbort);
@@ -2946,7 +3351,12 @@ export class MCPManager {
 			// Retry with backoff — the server may still be starting up.
 			const delays = [500, 1000, 2000, 4000];
 			for (let attempt = 0; attempt <= delays.length; attempt++) {
-				if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
+				assertControl?.();
+				if (
+					(this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch ||
+					backoffAbort.signal.aborted ||
+					this.#pendingServerControls.get(name)?.signal?.aborted
+				) {
 					logger.debug("MCP reconnect aborted before attempt after server disconnected", {
 						path: `mcp:${name}`,
 						storedEpoch: reconnectEpoch,
@@ -2960,7 +3370,11 @@ export class MCPManager {
 					return connection;
 				} catch (error) {
 					const cleanupFailure = this.#retainConnectionCleanupFailure(name, error);
-					if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
+					if (
+						(this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch ||
+						backoffAbort.signal.aborted ||
+						this.#pendingServerControls.get(name)?.signal?.aborted
+					) {
 						logger.debug("MCP reconnect aborted after server disconnected", {
 							path: `mcp:${name}`,
 							storedEpoch: reconnectEpoch,
@@ -3008,6 +3422,7 @@ export class MCPManager {
 		lifecycleEpoch?: number,
 	): Promise<MCPServerConnection> {
 		const assertLifecycle = (): void => {
+			if (this.#pendingServerControls.get(name)?.signal?.aborted) throw new MCPServerControlError("unknown_effect");
 			if (
 				lifecycleEpoch === undefined ||
 				(this.#scopedLifecycle === "open" && this.#scopedLifecycleEpoch === lifecycleEpoch)

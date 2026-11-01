@@ -2,6 +2,7 @@ import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AsyncJobManager, FoldReason } from "../async";
+import type { ModelSelectorValue } from "../config/model-selector-value";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
@@ -182,6 +183,10 @@ export interface AskAnswerSource {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	/** Effective session-owned and inherited task role selectors. */
+	getAgentModelOverrides?: () => Record<string, ModelSelectorValue>;
+	/** Whether a role selector is explicitly owned by this session. */
+	hasSessionAgentModelOverride?: (role: string) => boolean;
 	/** Current working directory */
 	cwd: string;
 	/** Whether UI is available */

@@ -77,6 +77,30 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
+	it("rebinds future UI contexts without redirecting captured contexts or duplicating errors", () => {
+		const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+		const firstNotify = vi.fn();
+		const nextNotify = vi.fn();
+		const onError = vi.fn();
+		runner.onError(onError);
+		const first = { ...runner.getUIContext(), notify: firstNotify };
+		const next = { ...runner.getUIContext(), notify: nextNotify };
+		runner.setUIContext(first);
+		const captured = runner.createContext();
+		runner.setUIContext(next);
+		const current = runner.createContext();
+		captured.ui.notify("captured context");
+		current.ui.notify("fresh context");
+		runner.emitError({ extensionPath: "owned-fixture", event: "input", error: "one failure" });
+		expect(firstNotify).toHaveBeenCalledTimes(1);
+		expect(firstNotify).toHaveBeenCalledWith("captured context");
+		expect(nextNotify).toHaveBeenCalledTimes(1);
+		expect(nextNotify).toHaveBeenCalledWith("fresh context");
+		expect(onError).toHaveBeenCalledTimes(1);
+		expect(captured.ui).toBe(first);
+		expect(current.ui).toBe(next);
+	});
+
 	describe("safe tool resolver", () => {
 		it("exposes the authoritative session settings to extension contexts", () => {
 			const settings = {

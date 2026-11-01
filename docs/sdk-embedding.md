@@ -301,6 +301,14 @@ const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
 
 `createAgentSession()` uses `ModelRegistry` + `AuthStorage` for model selection and API key resolution.
 
+### Live session task-role selections
+
+`session.setSessionAgentModelSelection(role, model)` selects a concrete available model for `executor`, `planner`, `critic` or `architect` without changing the main model, thinking level or shared `Settings`. These choices last only for the live session: passing `null` removes the session choice and reveals the current inherited profile/configuration. `getAgentModelOverrides()` returns a cloned effective selector map; `hasSessionAgentModelOverride(role)` distinguishes the session-owned source. Real task dispatch, detached task snapshots and eager-delegation prompts consume the same map. Successful explicit profile or session-identity replacement retires choices; failed activation/transition and ordinary configuration refresh preserve them. Default model selection remains the separate durable `setDefaultModelSelection` operation. These are in-process APIs, not new transport mutation authority.
+
+### Automatic session titles
+
+Call `session.generateAutoSessionTitle(text, { signal })` independently at first accepted input, before its first user message is recorded. It reuses SDK model/credential/obfuscation logic and returns `applied`, `skipped` (with a reason), or `failed`; it never changes prompt delivery. Do not seed a display placeholder using a user-sourced name. Existing/manual names win, duplicate generation is coalesced, and session identity/lifecycle changes fence late completion. Hosts must abort their signal synchronously before retiring/replacing the live owner and must recheck ownership before publishing derived metadata. A successful result has committed the SDK title; a redundant application catalog cache can be reconciled from it on reopening. No generation transport operation is implicitly admitted.
+
 ### Explicit wiring
 
 ```ts
@@ -336,7 +344,9 @@ When no explicit `model`/`modelPattern` is provided:
 2. settings default model role (`default`)
 3. first available model with valid auth
 
-If restore fails, `modelFallbackMessage` explains fallback.
+If restore fails, `modelFallbackMessage` explains the outcome. Without a usable
+explicit key, an unavailable saved credential pin leaves the model unselected
+with an actionable diagnostic rather than silently switching model or provider.
 
 ### Auth priority
 
@@ -346,6 +356,12 @@ If restore fails, `modelFallbackMessage` explains fallback.
 2. stored credentials in `agent.db`
 3. provider environment variables
 4. custom-provider resolver fallback (if configured)
+
+An unavailable saved credential pin blocks implicit fallback to another stored
+account. An explicit runtime key or literal provider key registered by the
+current model registry can override that availability failure without clearing
+the unavailable-pin marker. Another registry's key or an `apiKeyEnv` indirection
+must not authorize selection of a different stored account.
 
 ## Event subscription model
 
@@ -469,6 +485,34 @@ Related APIs:
 - `followUp(text, images?)`
 - `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`
 - `abort()`
+
+### Bounded image input and durable acceptance
+
+`createSessionImageInput(session)` returns a generation-owned controller for
+canonical user-selected image bytes. Its `prompt(text, images, options)` and
+`submitUserMessage(text, images, options)` share the session's image admission
+budget; creating another controller does not reset that budget. The queued
+method returns the same tracked submission receipt described above. For direct
+`prompt` local dispatch, image-bearing extension/custom/MCP slash commands are
+rejected before their handler can run or discard the attached bytes. Queued
+`submitUserMessage` retains the slash text as queued message input; it does not
+execute a local command handler.
+
+Both methods accept `onPreflightAcceptCommit?: () => void | Promise<void>`.
+The SDK awaits this callback before admitting the input. A rejected callback
+prevents admission and releases only that invocation's image reservation.
+Cancellation and controller ownership are rechecked after an awaited callback.
+Use this fence to persist an embedder-owned delivery record before execution
+can begin, not as proof that execution or transcript persistence has happened:
+subsequent cancellation or ingress checks can still prevent a run.
+
+Retain the original text and attachment payload independently of redacted
+presentation DTOs until a correlated outcome is known. `removed` and its
+`reason` are meaningful terminal outcomes, not successful delivery. In particular,
+`reason: "refused"` records a positive core decision not to start the queued run;
+a provider failure after run acceptance is not a refusal. After a
+crash without a conclusive receipt, preserve an unknown outcome and require an
+explicit user decision; do not automatically replay potentially executed input.
 
 ## Tools integration
 
