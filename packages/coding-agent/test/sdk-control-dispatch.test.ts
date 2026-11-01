@@ -30,6 +30,8 @@ const methodByOperation: Record<string, string> = {
 	"thinking.set": "setThinking",
 	"thinking.cycle": "cycleThinking",
 	"permission_mode.set": "setPermissionMode",
+	"permission.channel.set": "configurePermissionChannel",
+	"permission.respond": "respondPermission",
 	"queue.steering_mode.set": "setQueueMode",
 	"queue.follow_up_mode.set": "setQueueMode",
 	"queue.tool_interrupt_policy.set": "setQueueMode",

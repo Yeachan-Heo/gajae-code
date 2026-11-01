@@ -27,6 +27,18 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 core and emits credential-free JSON on success. Add `--json` explicitly for
 machine failures; default ordinary failures are text on stderr, not JSON stdout.
 
+### External permission approvals
+
+Machine integrations can explicitly enable a session-owned approval channel with
+`permission.channel.set`, poll `permission.requests.list`, and submit an offered
+option through `permission.respond`, including a rejection comment. The channel
+reuses the existing permission gate and exposes tool input/path evidence without
+requiring a persistent reverse-RPC client. See the [approval contract and CLI
+examples](./sdk-session-cli.md#external-tool-permission-approvals) for bounds,
+policy precedence, lifecycle cancellation and security requirements. This does
+not change which tools require approval or expose these operations to model-facing
+adapters.
+
 ### Public CLI discovery and recovery
 
 Use `gjc sdk --help` or deepest local help such as

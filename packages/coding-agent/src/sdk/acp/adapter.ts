@@ -21,7 +21,7 @@ import {
 	validateAdapterSecretFields,
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
-import { OPERATIONS } from "../protocol/operation-registry";
+import { findOperation, OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
 import { ACP_SESSION_RECONNECT, SESSION_ABORT_TIMEOUT_MS } from "../session-reconnect";
 import type { SessionLifecycleMcpServer } from "./mcp";
@@ -514,6 +514,7 @@ export class AcpSdkAdapter {
 		);
 	}
 	async query(query: string, input: JsonObject = {}, cursor?: string): Promise<unknown> {
+		this.#assertGenericDisposition("query", query);
 		return await this.#requestSession({
 			type: "query_request",
 			query,
@@ -855,8 +856,18 @@ export class AcpSdkAdapter {
 		);
 	}
 
-	#assertGenericDisposition(kind: "control" | "global", sdkId: string): void {
-		const operation = OPERATIONS.find(candidate => candidate.kind === kind && candidate.sdkId === sdkId);
+	#assertGenericDisposition(kind: "control" | "global" | "query", sdkId: string): void {
+		const operation =
+			findOperation(kind, sdkId) ??
+			(kind === "query"
+				? OPERATIONS.find(
+						candidate =>
+							candidate.kind === "query" &&
+							(candidate.id === sdkId ||
+								(candidate.sdkId === "models.list/current" &&
+									["models.list", "models.current"].includes(sdkId))),
+					)
+				: undefined);
 		if (!operation) throw new AcpSdkAdapterError("unknown_operation", `Unknown SDK ${kind}: ${sdkId}`);
 		const disposition = operation.adapterDispositions.acp;
 		if (disposition === "prohibited")

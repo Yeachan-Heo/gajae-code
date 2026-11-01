@@ -326,8 +326,9 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 							throw Object.assign(new Error("permission_mode.set requires prompt, allow, or deny."), {
 								code: "invalid_input",
 							});
+						const changed = session.sdkPermissionMode !== mode;
 						session.setSdkPermissionMode(mode);
-						return { changed: true, mode: session.sdkPermissionMode };
+						return { changed, mode: session.sdkPermissionMode };
 					}
 					case "bash.execute": {
 						if (typeof input.cmd !== "string" || input.cmd.trim() === "")

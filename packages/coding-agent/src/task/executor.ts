@@ -394,6 +394,8 @@ export interface ExecutorOptions {
 	 * default (`allow`) before the first prompt. `allow` is that default.
 	 */
 	sdkPermissionMode?: "prompt" | "allow" | "deny";
+	/** Parent SDK approval provider, without terminal or filesystem capabilities. */
+	sdkPermissionProvider?: ClientBridge["requestPermission"];
 	/**
 	 * Parent plan-mode state. Copied onto the child before the first prompt so
 	 * `enforcePlanModeWrite` still refuses product-file writes.
@@ -2259,6 +2261,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			}
 			const approvalBridge = permissionOnlyBridge(options.clientBridge);
 			if (approvalBridge) session.setClientBridge(approvalBridge);
+			if (options.sdkPermissionProvider) session.setSdkPermissionProvider(options.sdkPermissionProvider);
 			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
 			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
 			if (!parentFallbackSelector) {

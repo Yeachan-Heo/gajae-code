@@ -35,6 +35,11 @@ export * as bus from "./bus";
 export * from "./diagnostics/observe-broker";
 export * from "./extension-interaction";
 export * as host from "./host";
+export type {
+	ExternalPermissionChannelInput,
+	ExternalPermissionRequest,
+	ExternalPermissionResponseInput,
+} from "./host/external-permissions";
 export * from "./job-observation";
 export * as lifecycle from "./lifecycle";
 export * as mcp from "./mcp";

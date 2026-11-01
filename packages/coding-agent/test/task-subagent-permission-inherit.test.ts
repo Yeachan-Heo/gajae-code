@@ -15,6 +15,7 @@ import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import type { CreateAgentSessionResult } from "../src/sdk";
 import * as sdkModule from "../src/sdk";
+import { ExternalPermissionRuntime } from "../src/sdk/host/external-permissions";
 import { AgentSession, type AgentSessionEvent, type PromptOptions } from "../src/session/agent-session";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "../src/session/client-bridge";
 import { convertToLlm } from "../src/session/messages";
@@ -119,6 +120,9 @@ function createChildSession(
 		setSdkPermissionMode: (mode: "prompt" | "allow" | "deny") => {
 			gate.setSdkPermissionMode(mode);
 		},
+		setSdkPermissionProvider: (provider: ClientBridge["requestPermission"]) => {
+			gate.setSdkPermissionProvider(provider);
+		},
 		setClientBridge: (bridge: ClientBridge) => {
 			onBridge(bridge);
 			gate.setClientBridge(bridge);
@@ -160,7 +164,12 @@ function createChildSession(
 	} as unknown as AgentSession;
 }
 
-function createParentSession(root: string, mode: "prompt" | "allow" | "deny", bridge: ClientBridge): ToolSession {
+function createParentSession(
+	root: string,
+	mode: "prompt" | "allow" | "deny",
+	bridge: ClientBridge,
+	parent?: AgentSession,
+): ToolSession {
 	return {
 		cwd: root,
 		hasUI: false,
@@ -169,6 +178,7 @@ function createParentSession(root: string, mode: "prompt" | "allow" | "deny", br
 		getSessionId: () => "parent-session",
 		getSessionSpawns: () => "*",
 		getSdkPermissionMode: () => mode,
+		getSdkPermissionProvider: () => parent?.getSdkPermissionProvider(),
 		getClientBridge: () => bridge,
 		modelRegistry: {
 			refresh: async () => {},
@@ -196,11 +206,27 @@ async function runDelegated(
 	mode: "prompt" | "allow" | "deny",
 	outcome: ClientBridgePermissionOutcome,
 	withPermission = true,
+	external?: (
+		runtime: ExternalPermissionRuntime,
+		parent: AgentSession,
+		bash: AgentTool & { executeCalls: number },
+	) => void,
 ) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "task-approval-"));
 	roots.push(root);
 	const bash = makeBashTool();
 	const gate = await createGateSession(root, bash);
+	const parent = await createGateSession(root, makeBashTool());
+	const runtime = new ExternalPermissionRuntime("parent-session");
+	if (external) {
+		runtime.configure({ enabled: true });
+		parent.setSdkPermissionMode(mode);
+		parent.setSdkPermissionProvider((toolCall, options, signal) => {
+			const response = runtime.request(toolCall, options, signal);
+			external(runtime, parent, bash);
+			return response;
+		});
+	}
 	let permissionCalls = 0;
 	let installed: ClientBridge | undefined;
 	let toolError: unknown;
@@ -236,7 +262,7 @@ async function runDelegated(
 			eventBus: new EventBus(),
 		} satisfies CreateAgentSessionResult;
 	});
-	const tool = await TaskTool.create(createParentSession(root, mode, parentBridge));
+	const tool = await TaskTool.create(createParentSession(root, mode, parentBridge, parent));
 	await executeDetached(tool, {
 		agent: "executor",
 		tasks: [{ id: "Child", description: "approval", assignment: "Run the command." }],
@@ -245,6 +271,41 @@ async function runDelegated(
 }
 
 describe("task subagent approval inheritance", () => {
+	test.each(["allow_once", "reject_once"] as const)("external queue routes child approval: %s", async optionId => {
+		const { bash, installed, toolError } = await runDelegated(
+			"prompt",
+			{ outcome: "cancelled" },
+			false,
+			(runtime, _parent, childBash) => {
+				const requests = runtime.list().requests;
+				expect(requests).toHaveLength(1);
+				expect(requests[0]!.sessionId).toBe("parent-session");
+				expect(requests[0]!.toolCall.rawInput).toMatchObject({ command: "echo hi" });
+				expect(childBash.executeCalls).toBe(0);
+				runtime.respond({ sessionId: "parent-session", id: requests[0]!.id, optionId });
+				expect(runtime.list().requests).toHaveLength(0);
+			},
+		);
+		expect(installed).toBeUndefined();
+		expect(bash.executeCalls).toBe(optionId === "allow_once" ? 1 : 0);
+		if (optionId === "allow_once") expect(toolError).toBeUndefined();
+		else expect(toolError).toBeInstanceOf(Error);
+	});
+
+	test.each(["mode", "provider"] as const)("parent %s change cancels pending child approval", async change => {
+		const { bash, toolError } = await runDelegated("prompt", { outcome: "cancelled" }, false, (runtime, parent) => {
+			const request = runtime.list().requests[0]!;
+			if (change === "mode") parent.setSdkPermissionMode("deny");
+			else parent.setSdkPermissionProvider(undefined);
+			expect(runtime.list().requests).toHaveLength(0);
+			expect(() =>
+				runtime.respond({ sessionId: "parent-session", id: request.id, optionId: "allow_once" }),
+			).toThrow();
+		});
+		expect(bash.executeCalls).toBe(0);
+		expect(toolError).toBeInstanceOf(Error);
+	});
+
 	test("deny on the parent still rejects the child bash call", async () => {
 		const { bash, permissionCalls, installed, toolError, gate } = await runDelegated("deny", {
 			outcome: "selected",
