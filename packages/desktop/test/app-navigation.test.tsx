@@ -71,6 +71,76 @@ describe("mounted desktop navigation", () => {
 		} finally { await context.close(); }
 	}, 30000);
 
+	test("puts new conversations first without shuffling the list on status updates", async () => {
+		const { context, page } = await fixture();
+		try {
+			const titles = () => page.$$eval('.project-group:first-child .session-title', nodes => nodes.map(node => node.textContent));
+			expect(await titles()).toEqual(["Newest conversation", "Middle conversation", "Oldest conversation"]);
+			await page.evaluate(() => {
+				const old = window.navigationFixture.snapshot().sessions[0]!;
+				window.navigationFixture.emit({ type: "session", session: { ...old, status: "running" } });
+			});
+			expect(await titles()).toEqual(["Newest conversation", "Middle conversation", "Oldest conversation"]);
+			await page.evaluate(() => {
+				const old = window.navigationFixture.snapshot().sessions[0]!;
+				window.navigationFixture.emit({ type: "session", session: { ...old, id: "latest", title: "Just created" } });
+			});
+			await page.waitForFunction(() => document.querySelector('.project-group:first-child .session-title')?.textContent === "Just created");
+			expect(await titles()).toEqual(["Just created", "Newest conversation", "Middle conversation", "Oldest conversation"]);
+			await page.click('.project-group:first-child .session-select', { button: "right" });
+			await page.waitForSelector('.context-menu');
+			expect(await page.$eval('.context-menu', node => node.textContent)).not.toContain("Move conversation");
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("paginates newest first and retains a selected older conversation", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => {
+				const snapshot = window.navigationFixture.snapshot();
+				const template = snapshot.sessions[0]!;
+				const sessions = Array.from({ length: 12 }, (_, i) => ({ ...template, id: `s${i}`, title: `Conversation ${i}` }));
+				window.navigationFixture.emit({ type: "snapshot", snapshot: { ...snapshot, sessions } });
+			});
+			await page.waitForFunction(() => document.querySelector('.session-title')?.textContent === "Conversation 11");
+			const titles = () => page.$$eval('.project-group:first-child .session-title', nodes => nodes.map(node => node.textContent));
+			expect(await titles()).toEqual([11, 10, 9, 8, 7].map(i => `Conversation ${i}`));
+			await page.click('.show-more');
+			expect(await titles()).toHaveLength(10);
+			await page.click('.show-more');
+			expect(await titles()).toHaveLength(12);
+			await page.click('.session-select[title="Conversation 0 · Idle"]');
+			await page.evaluate(() => {
+				const snapshot = window.navigationFixture.snapshot();
+				window.navigationFixture.emit({ type: "session", session: { ...snapshot.sessions[0]!, id: "s12", title: "Conversation 12" } });
+			});
+			await page.waitForFunction(() => document.querySelector('.session-title')?.textContent === "Conversation 12");
+			expect(await titles()).toHaveLength(13);
+			expect(await page.$('.session-select[title="Conversation 0 · Idle"][aria-current="page"]')).not.toBeNull();
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("show more advances past the effective page expanded by a selected older row", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => {
+				const snapshot = window.navigationFixture.snapshot();
+				const sessions = Array.from({ length: 12 }, (_, i) => ({ ...snapshot.sessions[0]!, id: `s${i}`, title: `Conversation ${i}` }));
+				window.navigationFixture.emit({ type: "snapshot", snapshot: { ...snapshot, sessions } });
+			});
+			await page.waitForFunction(() => document.querySelector('.session-title')?.textContent === "Conversation 11");
+			await page.click('.session-select[title="Conversation 7 · Idle"]');
+			await page.evaluate(() => {
+				const template = window.navigationFixture.snapshot().sessions[0]!;
+				for (let i = 12; i < 17; i++) window.navigationFixture.emit({ type: "session", session: { ...template, id: `s${i}`, title: `Conversation ${i}` } });
+			});
+			await page.waitForFunction(() => document.querySelectorAll('.session-row').length === 10);
+			await page.click('.show-more');
+			await page.waitForFunction(() => document.querySelectorAll('.session-row').length === 15);
+			expect(await page.$('.session-select[title="Conversation 7 · Idle"][aria-current="page"]')).not.toBeNull();
+		} finally { await context.close(); }
+	}, 30000);
+
 	test("centers the connection state instead of flashing the conversation empty state", async () => {
 		const { context, page } = await fixture(true);
 		try {

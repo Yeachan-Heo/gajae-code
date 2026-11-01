@@ -1855,15 +1855,6 @@ export default function App() {
 		setMenu(null);
 		if (connected) void call("project.reorder", { ids }, "global");
 	};
-	const moveSession = (projectId: string, id: string, direction: -1 | 1) => {
-		const ids = (snapshot?.sessions ?? []).filter(session => session.projectId === projectId).map(s => s.id);
-		const from = ids.indexOf(id);
-		const to = from + direction;
-		if (from < 0 || to < 0 || to >= ids.length) return;
-		ids.splice(to, 0, ...ids.splice(from, 1));
-		setMenu(null);
-		if (connected) void call("session.reorder", { projectId, ids }, "global");
-	};
 	const closeProject = (projectId: string) => {
 		setMenu(null);
 		if (!connected) return;
@@ -1891,7 +1882,9 @@ export default function App() {
 			</Button>
 			<nav aria-label={t("shell.projectsAndConversations")} onDragEnd={clearDrag}>
 				{(snapshot?.projects ?? []).map(item => {
-					const all = snapshot?.sessions.filter(chat => chat.projectId === item.id) ?? [];
+					// The host catalog appends new conversations. Reverse that creation sequence for
+					// display only; message/status updates must not shuffle a running list.
+					const all = snapshot?.sessions.filter(chat => chat.projectId === item.id).toReversed() ?? [];
 					const limit = sessionLimits[item.id] ?? SESSION_PAGE;
 					// Selecting or creating a conversation beyond the page must not hide its own row.
 					const selectedIndex = all.findIndex(chat => chat.id === selected);
@@ -1955,7 +1948,6 @@ export default function App() {
 								onDragStart={event => {
 									dragProjectRef.current = item.id;
 									setDragProject(item.id);
-									title={item.name}
 									event.dataTransfer?.setData("text/plain", item.id);
 									if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
 								}}
@@ -1963,6 +1955,7 @@ export default function App() {
 							>
 								<Button
 									className="project-toggle"
+									title={item.name}
 									aria-expanded={!collapsedProjects.includes(item.id)}
 									aria-label={
 										collapsedProjects.includes(item.id)
@@ -1975,9 +1968,6 @@ export default function App() {
 												? previous.filter(id => id !== item.id)
 												: [...previous, item.id],
 										)
-									<span className="project-initials" aria-hidden="true">
-										{Array.from(item.name).slice(0, 2).join("")}
-									</span>
 									}
 								>
 									<ChevronRight
@@ -1985,6 +1975,9 @@ export default function App() {
 										aria-hidden="true"
 										data-open={collapsedProjects.includes(item.id) ? undefined : true}
 									/>
+									<span className="project-initials" aria-hidden="true">
+										{Array.from(item.name).slice(0, 2).join("")}
+									</span>
 								</Button>
 								<h2 title={item.path}>{item.name}</h2>
 								<Button
@@ -2031,10 +2024,6 @@ export default function App() {
 												onSelect={() => select(chat)}
 												onMenu={(x, y) =>
 													setMenu({ kind: "session", id: chat.id, projectId: item.id, x, y })
-											aria-label={t("shell.showMoreConversations", {
-												count: Math.min(SESSION_PAGE, remaining),
-											})}
-											title={t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
 												}
 											/>
 										</div>
@@ -2042,10 +2031,14 @@ export default function App() {
 									{remaining > 0 && (
 										<Button
 											className="show-more"
+											aria-label={t("shell.showMoreConversations", {
+												count: Math.min(SESSION_PAGE, remaining),
+											})}
+											title={t("shell.showMoreConversations", { count: Math.min(SESSION_PAGE, remaining) })}
 											onClick={() =>
 												setSessionLimits(previous => ({
 													...previous,
-													[item.id]: (previous[item.id] ?? SESSION_PAGE) + SESSION_PAGE,
+													[item.id]: pageSize + SESSION_PAGE,
 												}))
 											}
 										>
@@ -2194,15 +2187,6 @@ export default function App() {
 	const menuSession =
 		menu?.kind === "session" ? (snapshot?.sessions ?? []).find(session => session.id === menu.id) : undefined;
 	const menuProjectIndex = menu?.kind === "project" ? (snapshot?.projects ?? []).findIndex(p => p.id === menu.id) : -1;
-	const menuSessionIndex =
-		menu?.kind === "session"
-			? (snapshot?.sessions ?? [])
-					.filter(session => session.projectId === menu.projectId)
-					.map(session => session.id)
-					.indexOf(menu.id)
-			: -1;
-	const menuSessionCount =
-		menu?.kind === "session" ? (snapshot?.sessions ?? []).filter(s => s.projectId === menu.projectId).length : 0;
 	const menuProjectCount = (snapshot?.projects ?? []).length;
 	/** True when the workspace being closed has a turn running, so the label can say it stops. */
 	const menuProjectBusy =
@@ -2255,33 +2239,17 @@ export default function App() {
 						</Button>
 					</>
 				) : (
-					<>
+					menuSession && (
 						<Button
 							role="menuitem"
-							disabled={menuSessionIndex <= 0}
-							onClick={() => moveSession(menu.projectId, menu.id, -1)}
+							onClick={() => {
+								setMenu(null);
+								select(menuSession);
+							}}
 						>
-							{t("shell.moveConversationUp")}
+							{t("shell.openConversation")}
 						</Button>
-						<Button
-							role="menuitem"
-							disabled={menuSessionIndex < 0 || menuSessionIndex >= menuSessionCount - 1}
-							onClick={() => moveSession(menu.projectId, menu.id, 1)}
-						>
-							{t("shell.moveConversationDown")}
-						</Button>
-						{menuSession && (
-							<Button
-								role="menuitem"
-								onClick={() => {
-									setMenu(null);
-									select(menuSession);
-								}}
-							>
-								{t("shell.openConversation")}
-							</Button>
-						)}
-					</>
+					)
 				)}
 			</div>
 		</>
@@ -2545,6 +2513,11 @@ export default function App() {
 							/>
 						</div>
 					</>
+				) : connection && !fatal ? (
+					<div className="empty connection-state" role="status">
+						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+						<p>{connection}</p>
+					</div>
 				) : (
 					<div className="empty">
 						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
@@ -2563,11 +2536,6 @@ export default function App() {
 					</Modal>
 				</div>
 			)}
-				) : connection && !fatal ? (
-					<div className="empty connection-state" role="status">
-						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
-						<p>{connection}</p>
-					</div>
 			{dialog === "btw" && dialogOwner === selected && btwOwner?.sessionId === selected && (
 				<BtwDialog
 					key={dialogGeneration.current}

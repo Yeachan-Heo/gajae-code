@@ -232,8 +232,12 @@ async function select(page: Page, index = 0) {
 	return step(page, `select session ${index}`, async () => {
 	await page.waitForSelector(".desktop-sidebar .session-select");
 	for (let attempt = 0; attempt < 100; attempt++) {
-		const buttons = await page.$$(".desktop-sidebar .session-select");
-		await buttons[index]!.click();
+		const title = index === 0 ? "Session A" : "Session B";
+		await page.evaluate(title => {
+			const button = [...document.querySelectorAll<HTMLButtonElement>(".desktop-sidebar .session-select")]
+				.find(node => node.querySelector(".session-title")?.textContent === title);
+			button?.click();
+		}, title);
 		const current = await page.$eval(".desktop-sidebar .session-select[aria-current='page']", el => el.textContent).catch(() => "");
 		if (current?.includes(index === 0 ? "Session A" : "Session B") && await page.$(".composer textarea:not([disabled])")) return;
 		await Bun.sleep(50);
@@ -417,10 +421,6 @@ describe("mounted preference ownership", () => {
 });
 
 
-describe("mounted model selection deferral", () => {
-	test("applies a model chosen during a run once the session settles, without a second request", async () => {
-		const { context, page } = await fixture();
-		try {
 async function selectionFixture(preferences: DesktopPreferences = deferralPreferences): Promise<{ context: BrowserContext; page: Page }> {
 	const { context, page } = await fixture();
 	try {
@@ -644,6 +644,10 @@ describe("mounted model and preset scope confirmation", () => {
 	}, 30000);
 });
 
+describe("mounted model selection deferral", () => {
+	test("applies a model chosen during a run once the session settles, without a second request", async () => {
+		const { context, page } = await fixture();
+		try {
 			await page.evaluate(() =>
 				window.fixture.setModels([
 					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
@@ -680,12 +684,12 @@ describe("mounted model and preset scope confirmation", () => {
 				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
 			);
 			await page.click(".model-role-option");
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 			// The chosen model shows immediately; nothing is sent and no prose explains the wait.
 			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
 			await page.evaluate(() =>
-			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
-			await page.click('.model-scope-option[data-scope="session"]');
 				window.fixture.emit({
 					type: "session",
 					session: {
@@ -761,12 +765,12 @@ describe("mounted deferred selection intent", () => {
 				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
 			);
 			await page.click(".model-role-option");
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 			// A reasoning choice made while busy must merge, not replace, the model choice.
 			await page.click(".reasoning-control .select-trigger");
 			await page.waitForSelector(".select-menu .select-option:not([disabled])");
-			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
-			await page.click('.model-scope-option[data-scope="session"]');
 			await page.evaluate(() => {
 				const option = [...document.querySelectorAll<HTMLButtonElement>(".select-menu .select-option")].find(
 					item => item.textContent?.includes("High"),
@@ -888,12 +892,12 @@ describe("mounted deferred selection intent", () => {
 				[...document.querySelectorAll<HTMLButtonElement>(".model-role-option")].some(button => !button.disabled),
 			);
 			await page.click(".model-role-option");
+			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
+			await page.click('.model-scope-option[data-scope="session"]');
 			// The chosen model stays visible while the session is still running.
 			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model Two"));
 			await page.evaluate(() =>
 				window.fixture.emit({
-			await page.waitForSelector('.model-scope-option[data-scope="session"]:not([disabled])');
-			await page.click('.model-scope-option[data-scope="session"]');
 					type: "session",
 					session: {
 						id: "a", title: "Session A", projectId: "p", status: "done", starred: false,
@@ -2021,8 +2025,9 @@ describe("mounted composer delivery recovery", () => {
 			await page.click(".project-group .show-more");
 			await page.waitForFunction(() => document.querySelectorAll(".project-group .session-row").length === 10);
 			await page.evaluate(() => {
-				const seven = document.querySelectorAll(".project-group .session-row .session-select")[6];
-				(seven as HTMLElement | null)?.click();
+				const seven = [...document.querySelectorAll<HTMLButtonElement>(".project-group .session-select")]
+					.find(node => node.querySelector(".session-title")?.textContent === "Conversation 7");
+				seven?.click();
 			});
 			await page.waitForFunction(
 				() =>

@@ -58,8 +58,6 @@ export const shell = {
 	"shell.openConversation": "Open conversation",
 	"shell.moveWorkspace": "Move workspace up",
 	"shell.moveWorkspaceBack": "Move workspace down",
-	"shell.moveConversationUp": "Move conversation up",
-	"shell.moveConversationDown": "Move conversation down",
 	"shell.dismissMenu": "Dismiss menu",
 	"shell.newConversationIn": "New conversation in {project}",
 	"shell.settings": "Settings",
