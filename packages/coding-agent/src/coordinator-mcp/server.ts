@@ -7373,10 +7373,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (retainDelegateResponse) existing.delegate_response_pending = true;
 				// If the request was converted to a steer and then deleted, the steer disposition
 				// is preserved for recovery: replay it instead of re-dispatching the prompt.
-				if ((existing as Record<string, unknown>).steer_disposition) {
+				if ((existing as unknown as Record<string, unknown>).steer_disposition) {
 					// The request was discarded but steer disposition is durable recovery authority.
 					throw Object.assign(new Error("steer_converted"), {
-						acknowledged: (existing as Record<string, unknown>).steer_disposition,
+						acknowledged: (existing as unknown as Record<string, unknown>).steer_disposition,
 					});
 				}
 				// An accepted receipt is durable authority. It is recovered below instead
@@ -7474,7 +7474,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				accepted: acknowledgement.accepted,
 				command_id: acknowledgement.command_id,
 				turn_id: acknowledgement.turn_id,
-				status: acknowledgement.status,
+				...(acknowledgement.queued_as ? { queued_as: acknowledgement.queued_as } : {}),
 			};
 			request.updated_at = new Date().toISOString();
 		});
@@ -10702,26 +10702,47 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									turn_id: previousActiveTurn.turn_id,
 								};
 							}
-							let promptKey: string;
-							let recoveredSteerDisposition: Record<string, unknown> | undefined;
+							let promptKey: string | undefined;
+							let recoveredSteerDisposition:
+								| { accepted: boolean; command_id: string; turn_id: string; queued_as?: string }
+								| undefined;
 							try {
 								promptKey = await claimCanonicalPrompt(sessionId, prompt, operation, idempotencyKey);
 							} catch (error) {
 								// If this idempotency key was previously converted to a steer and then deleted,
 								// the steer disposition is durable recovery authority: replay it instead of
 								// re-dispatching the prompt.
-								if (error instanceof Error && (error as Record<string, unknown>).message === "steer_converted")
-									recoveredSteerDisposition = (error as Record<string, unknown>).acknowledged as Record<
+								if (
+									error instanceof Error &&
+									(error as unknown as Record<string, unknown>).message === "steer_converted"
+								) {
+									const disposition = (error as unknown as Record<string, unknown>).acknowledged as Record<
 										string,
 										unknown
 									>;
-								else throw error;
+									if (
+										typeof disposition.accepted === "boolean" &&
+										typeof disposition.command_id === "string" &&
+										typeof disposition.turn_id === "string"
+									)
+										recoveredSteerDisposition = disposition as {
+											accepted: boolean;
+											command_id: string;
+											turn_id: string;
+											queued_as?: string;
+										};
+								} else throw error;
 							}
 							if (recoveredSteerDisposition) {
 								// Replay the durable steer disposition: the prompt was deleted but the steer
 								// outcome is recoverable.
 								const activeTurnId = previousActiveTurn?.turn_id ?? null;
-								const acknowledgement = recoveredSteerDisposition as RuntimePromptAcknowledgement;
+								const acknowledgement: RuntimePromptAcknowledgement = {
+									accepted: true,
+									command_id: recoveredSteerDisposition.command_id,
+									turn_id: recoveredSteerDisposition.turn_id,
+									...(recoveredSteerDisposition.queued_as === "steer" ? { queued_as: "steer" as const } : {}),
+								};
 								return {
 									ok: true,
 									session_id: sessionId,
@@ -10737,6 +10758,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									),
 								};
 							}
+							if (!promptKey) throw new Error("prompt_key_missing");
 							const acknowledgement = await dispatchOrRecoverPrompt(
 								currentSession,
 								sessionId,

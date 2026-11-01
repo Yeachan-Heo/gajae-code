@@ -166,6 +166,8 @@ export interface PromptRequestV1 {
 	coordinator_turn_id?: string;
 	/** Retain prompt and source turn until the delegate's outer response is durable. */
 	delegate_response_pending?: boolean;
+	/** Preserve steer disposition durably for recovery when a prompt is converted to a steer. */
+	steer_disposition?: { accepted: boolean; command_id: string; turn_id: string; queued_as?: string };
 	safe_response?: Record<string, unknown>;
 	error_code?: PublicReason | "idempotency_conflict";
 	created_at: string;
