@@ -20,6 +20,7 @@ import {
 	snapshotDirectory,
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
+import * as updateCli from "../src/cli/update-cli";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -337,6 +338,78 @@ describe("doctor standalone install repair: refusals", () => {
 		} finally {
 			warnSpy.mockRestore();
 			replaceSpy.mockRestore();
+		}
+	});
+
+	it("preserves the rollback diagnostic when releasing the update lock fails", async () => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const acquire = updateCli.acquireBinaryUpdateLock;
+		const lockSpy = vi.spyOn(updateCli, "acquireBinaryUpdateLock").mockImplementation(async target => {
+			const release = await acquire(target);
+			return async () => {
+				await release();
+				throw new Error("lock-release-secret");
+			};
+		});
+		const replaceNative = native.exactReplaceRetained;
+		let calls = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (calls++ === 0) return replaceNative(...args);
+			return { ok: false, code: "acl_present", aclFailurePrincipal: "S-1-5-32-545", aclFailureInherited: true };
+		});
+		const deps = fakeDeps(f);
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				{
+					...deps,
+					smokeCandidate: async file => {
+						if (file === f.target) throw new Error("verification failed");
+						await deps.smokeCandidate(file, candidateFor(f));
+					},
+				},
+			);
+			expect(result).toMatchObject({
+				state: "failed",
+				reason: "installation_rollback_unverified",
+				sideEffectStarted: true,
+			});
+			expect(result.diagnostic).toContain("S-1-5-32-545");
+			expect(result.diagnostic).toContain("Lock release could not be verified");
+			expect(result.diagnostic).not.toContain("lock-release-secret");
+		} finally {
+			replaceSpy.mockRestore();
+			lockSpy.mockRestore();
+		}
+	});
+
+	it("does not report a successful repair when releasing the update lock fails", async () => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const acquire = updateCli.acquireBinaryUpdateLock;
+		const lockSpy = vi.spyOn(updateCli, "acquireBinaryUpdateLock").mockImplementation(async target => {
+			const release = await acquire(target);
+			return async () => {
+				await release();
+				throw new Error("lock_release_unverified");
+			};
+		});
+		try {
+			await expect(
+				repairStandaloneBinary(
+					f.target,
+					descriptor,
+					candidateFor(f),
+					["install-replace", "network", "external-execution"],
+					fakeDeps(f),
+				),
+			).rejects.toThrow("lock_release_unverified");
+		} finally {
+			lockSpy.mockRestore();
 		}
 	});
 });

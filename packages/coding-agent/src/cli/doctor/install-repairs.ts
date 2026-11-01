@@ -279,6 +279,7 @@ export async function repairStandaloneBinary(
 		return blocked("candidate_provenance_mismatch");
 	const release = await acquireBinaryUpdateLock(targetPath);
 	let started = false;
+	let releaseAttempted = false;
 	try {
 		const rechecked = await snapshotRegularFile(targetPath);
 		const parentNow = await snapshotDirectory(path.dirname(path.resolve(targetPath)));
@@ -341,9 +342,17 @@ export async function repairStandaloneBinary(
 		const inherited = rollbackAcl?.detail.aclFailureInherited;
 		const artifact =
 			side === "source" ? "retained backup" : side === "destination" ? "installed binary" : "unknown artifact";
-		const rollbackDiagnostic = rollbackAcl
+		let rollbackDiagnostic = rollbackAcl
 			? `Installation failed; binary rollback was blocked by an ${inherited === true ? "inherited" : inherited === false ? "explicit" : "unknown"} ACL on the ${artifact}${principal ? ` for SID ${principal}` : "; principal omitted"}. Inspect the selected binary's installation directory and activation record locally before retrying.`
 			: undefined;
+		if (rollbackDiagnostic) {
+			releaseAttempted = true;
+			try {
+				await release();
+			} catch {
+				rollbackDiagnostic += " Lock release could not be verified.";
+			}
+		}
 		const repointError = error instanceof ActivationRetryCandidateRepointError ? error : undefined;
 		const reason = pendingActivation
 			? "sharing_violation"
@@ -385,6 +394,6 @@ export async function repairStandaloneBinary(
 			...(accessDeniedError?.retainedPaths ? { retainedPaths: accessDeniedError.retainedPaths } : {}),
 		};
 	} finally {
-		await release();
+		if (!releaseAttempted) await release();
 	}
 }
