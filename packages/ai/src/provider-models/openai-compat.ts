@@ -1035,7 +1035,7 @@ export function openrouterModelManagerOptions(
 
 					const supportsToolChoice = params.includes("tool_choice");
 
-					return {
+					const model: Model<"openai-completions"> = {
 						...defaults,
 						reasoning: params.includes("reasoning"),
 						input: modality.includes("image") ? ["text", "image"] : ["text"],
@@ -1055,6 +1055,28 @@ export function openrouterModelManagerOptions(
 							compat: { supportsToolChoice: false },
 						}),
 					};
+
+					// OpenRouter publishes long-context rates as pricing.overrides[{ min_prompt_tokens, ...rates }].
+					const tier = Array.isArray(pricing?.overrides)
+						? (pricing.overrides as Array<Record<string, unknown>>).find(
+								override => typeof override?.min_prompt_tokens === "number" && override.min_prompt_tokens > 0,
+							)
+						: undefined;
+					if (tier) {
+						const rate = (key: string, fallback: number) =>
+							tier[key] === undefined ? fallback : parseFloat(String(tier[key])) * 1_000_000;
+						model.longContextPricing = {
+							threshold: tier.min_prompt_tokens as number,
+							cost: {
+								input: rate("prompt", model.cost.input),
+								output: rate("completion", model.cost.output),
+								cacheRead: rate("input_cache_read", model.cost.cacheRead),
+								cacheWrite: rate("input_cache_write", model.cost.cacheWrite),
+							},
+						};
+					}
+
+					return model;
 				},
 			}),
 	};
