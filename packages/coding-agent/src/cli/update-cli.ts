@@ -1279,7 +1279,9 @@ export function formatInstallationRollbackAclError(error: unknown): string | und
 			? describeAclFailure(primary)
 			: primary instanceof InstallationVerificationError
 				? primary.rollbackMessage
-				: "installation verification or activation record update failed";
+				: primary instanceof Error && primary.message === "installation_postcheck_identity_changed"
+					? "installed target identity changed after verification"
+					: "unclassified installation failure";
 	const rollbackStage =
 		rollback instanceof InstallationRollbackAclPresentError ? "binary restore" : "activation record update";
 	return `${error}: Inspect the uncertain activation before retrying. Primary failure: ${primaryMessage}; rollback ${rollbackStage} failed: ${describeAclFailure(rollback)}`;

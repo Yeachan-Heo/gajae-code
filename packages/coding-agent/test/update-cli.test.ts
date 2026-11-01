@@ -1946,6 +1946,26 @@ describe("update-cli binary replacement", () => {
 		expect(message).not.toContain("icacls");
 	});
 
+	it("reports a postcheck identity conflict without disclosing unknown primary errors", () => {
+		const rollback = new InstallationAclPresentError("record", "record-stage", {
+			aclFailurePrincipal: "S-1-5-32-545",
+			aclFailureInherited: false,
+		});
+		const conflict = new AggregateError(
+			[new Error("installation_postcheck_identity_changed"), rollback],
+			"installation_rollback_unverified",
+		);
+		const unknown = new AggregateError(
+			[new Error("private-primary-sentinel"), rollback],
+			"installation_rollback_unverified",
+		);
+		expect(formatInstallationRollbackAclError(conflict)).toContain(
+			"installed target identity changed after verification",
+		);
+		expect(formatInstallationRollbackAclError(unknown)).toContain("unclassified installation failure");
+		expect(formatInstallationRollbackAclError(unknown)).not.toContain("private-primary-sentinel");
+	});
+
 	it("reports a rolled-back record ACL failure after removing a newly installed target", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
