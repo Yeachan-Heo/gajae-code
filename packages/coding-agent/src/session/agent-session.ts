@@ -1535,10 +1535,19 @@ function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boole
 		(facts.headers !== undefined && Object.keys(facts.headers).length > 0)
 	);
 }
+/**
+ * Trailing diagnostics appended by provider first-event watchdogs, e.g.
+ * " (elapsed=100001ms request_bytes=1234 endpoint=custom configured_timeout=100000ms; override with ...)".
+ * Exact-identity matchers strip it so diagnostics never change retry policy.
+ */
+const FIRST_EVENT_TIMEOUT_DIAGNOSTIC_SUFFIX =
+	/ \(elapsed=\d+ms request_bytes=\d+ endpoint=(?:canonical|custom) configured_timeout=(?:\d+ms|disabled); override with [^()]*\)$/;
+function stripFirstEventTimeoutDiagnostics(errorMessage: string): string {
+	return errorMessage.replace(FIRST_EVENT_TIMEOUT_DIAGNOSTIC_SUFFIX, "");
+}
 function terminalProviderFirstEventTimeoutIdentity(errorMessage: string): string {
-	return errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
-		? PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
-		: errorMessage;
+	const identity = stripFirstEventTimeoutDiagnostics(errorMessage);
+	return identity === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR ? PROVIDER_FIRST_EVENT_TIMEOUT_ERROR : identity;
 }
 function attachRetryableAtHint(errorMessage: string | undefined, retryableAt: number): string {
 	if (!Number.isFinite(retryableAt)) return errorMessage?.trim() || "";
@@ -1574,7 +1583,7 @@ function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): b
 	return (
 		!hasBareDefaultRetryDisqualifyingFacts(message) &&
 		(message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR ||
-			BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))
+			BARE_DEFAULT_WATCHDOG_ERROR.test(stripFirstEventTimeoutDiagnostics(message.errorMessage ?? "")))
 	);
 }
 /**
@@ -26181,7 +26190,7 @@ export class AgentSession {
 	#isKimiCodeCompactionTimeout(candidate: Model, errorMessage: string): boolean {
 		if (candidate.provider !== "kimi-code") return false;
 		return /^(?:Summarization failed|Turn prefix summarization failed): (?:Provider|Anthropic|OpenAI completions) stream timed out while waiting for the first event$/.test(
-			errorMessage,
+			stripFirstEventTimeoutDiagnostics(errorMessage),
 		);
 	}
 
@@ -26203,10 +26212,11 @@ export class AgentSession {
 		if (candidate.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
 		const timeoutMessages = this.#alibabaTokenPlanTimeoutMessagesForApi(candidate.api);
 		if (!timeoutMessages) return false;
+		const identity = stripFirstEventTimeoutDiagnostics(errorMessage);
 		for (const timeoutMessage of timeoutMessages) {
 			if (
-				errorMessage === `Summarization failed: ${timeoutMessage}` ||
-				errorMessage === `Turn prefix summarization failed: ${timeoutMessage}`
+				identity === `Summarization failed: ${timeoutMessage}` ||
+				identity === `Turn prefix summarization failed: ${timeoutMessage}`
 			) {
 				return true;
 			}
@@ -27882,7 +27892,7 @@ export class AgentSession {
 					!messageOnlyWatchdogTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
-						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
+						!BARE_DEFAULT_WATCHDOG_ERROR.test(stripFirstEventTimeoutDiagnostics(message.errorMessage ?? "")))) ||
 				(!firstEventTimeout &&
 					!messageOnlyWatchdogTimeout &&
 					!canReplayUnexpectedSocketClose &&
