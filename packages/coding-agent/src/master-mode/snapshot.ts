@@ -97,6 +97,18 @@ function boundSnapshotRows(
 }
 
 /**
+ * The current row is always this master. Before a switch the lineage owner row
+ * is the current row. After a switch this master stopped the owner's host, so a
+ * non-live owner row is still this master's own lineage, while a live one is a
+ * process that resumed that session independently and is a real peer (#7459).
+ */
+function isPeerRow(row: SdkSearchRowV1, ownerSessionId: string, currentSessionId: string, switched: boolean): boolean {
+	if (row.id === currentSessionId) return false;
+	if (row.id === ownerSessionId) return switched && row.live;
+	return true;
+}
+
+/**
  * Collects the first-request peer snapshot through scoped Broker session.list.
  * It deliberately has no Router or endpoint-probe dependency.
  */
@@ -121,9 +133,10 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 		observedAt: result.observedAt,
 		...(result.indexSeq === undefined ? {} : { indexSeq: result.indexSeq }),
 	};
+	const currentSessionId = input.currentSessionId ?? input.ownerSessionId;
+	const switched = currentSessionId !== input.ownerSessionId;
 	const rows = result.rows
-		// Both the current row and the lineage owner row are this master (they differ after a switch).
-		.filter(row => row.id !== input.ownerSessionId && row.id !== input.currentSessionId)
+		.filter(row => isPeerRow(row, input.ownerSessionId, currentSessionId, switched))
 		.map(row => withSpawnOwnerSelf(row, input.ownerSessionId))
 		.sort(compareRows);
 	const bounded = boundSnapshotRows(snapshot, rows);

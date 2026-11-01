@@ -134,6 +134,53 @@ test("collectMasterPeerSnapshot omits both the current row and the lineage owner
 	]);
 });
 
+test("collectMasterPeerSnapshot keeps a live lineage owner row after a switch as an independent peer", async () => {
+	// After master `master` switched to `switched`, it stopped the `master` host. A
+	// live `master` row is another process that resumed that session (#7459).
+	const { anchor } = await gitAnchor();
+	const owner = { id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true };
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			owner,
+			{ id: "switched", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	expect(snapshot.rows).toEqual([owner]);
+});
+
+test("collectMasterPeerSnapshot omits the owner row before a switch even when it is live", async () => {
+	const { anchor } = await gitAnchor();
+	for (const currentSessionId of [undefined, "master"]) {
+		const lifecycle = new FakeLifecycle({
+			ok: true,
+			operation: "session.list",
+			result: result(anchor, [
+				{ id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
+				{ id: "peer", locator: { cwd: "/p", worktreeRoot: null, stateRoot: "/s" }, live: true },
+			]),
+		});
+		const snapshot = await collectMasterPeerSnapshot({
+			lifecycle,
+			actor,
+			ownerSessionId: "master",
+			...(currentSessionId === undefined ? {} : { currentSessionId }),
+			scope: "repo",
+			requestAnchor: anchor,
+		});
+		expect(snapshot.rows.map(row => row.id)).toEqual(["peer"]);
+	}
+});
+
 test("collectMasterPeerSnapshot preserves explicit empty and not-in-git-worktree results", async () => {
 	const { anchor } = await gitAnchor();
 	const emptyLifecycle = new FakeLifecycle({
