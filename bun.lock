@@ -17,7 +17,6 @@
       "version": "0.19.2",
       "dependencies": {
         "@gajae-code/ai": "catalog:",
-        "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
         "@opentelemetry/api": "catalog:",
       },

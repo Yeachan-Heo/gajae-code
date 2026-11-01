@@ -170,6 +170,11 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
 	return true; // not a recognizable IP -> treat as unsafe
 }
 
+/** URL.hostname retains IPv6 brackets in Node/Bun; net APIs expect the bare literal. */
+export function normalizeUrlHostname(hostname: string): string {
+	return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+}
+
 /**
  * Validate that `rawUrl` is a public http/https target. Resolves DNS names and
  * rejects any that map to a private/special address. Never throws; returns a
@@ -197,7 +202,7 @@ export async function validatePublicHttpUrl(
 		return { ok: false, reason: "localhost or internal host" };
 	}
 
-	const hostname = url.hostname.replace(/^\[|\]$/g, "");
+	const hostname = normalizeUrlHostname(url.hostname);
 	const literalFamily = net.isIP(hostname);
 	if (literalFamily !== 0) {
 		if (isPrivateOrSpecialAddress(hostname)) {
@@ -240,7 +245,7 @@ export async function guardedPublicFetch(
 	const headers = new Headers(init.headers);
 	headers.delete("host");
 	headers.set("Host", logicalUrl.host);
-	const hostname = logicalUrl.hostname.replace(/^\[|\]$/g, "");
+	const hostname = normalizeUrlHostname(logicalUrl.hostname);
 	const tls =
 		logicalUrl.protocol === "https:"
 			? { rejectUnauthorized: true, ...(net.isIP(hostname) === 0 ? { serverName: hostname } : {}) }
