@@ -2711,7 +2711,8 @@
 						"parallel",
 						"kagi",
 						"synthetic",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"default": "auto"
 				},
@@ -2736,7 +2737,8 @@
 							"parallel",
 							"kagi",
 							"synthetic",
-							"searxng"
+							"searxng",
+							"keenable"
 						]
 					},
 					"description": "Ordered fallback web search providers after the active model native provider",
@@ -3203,7 +3205,8 @@
 						"kagi",
 						"synthetic",
 						"parallel",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"

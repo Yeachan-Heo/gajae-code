@@ -441,6 +441,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `KAGI_API_KEY`                                      | Kagi search provider                                          |
 | `JINA_API_KEY`                                      | Jina search provider                                          |
 | `PARALLEL_API_KEY`                                  | Parallel search provider                                      |
+| `KEENABLE_API_KEY`                                  | Keenable search provider (optional; keyless without it)       |
 | `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`                 | SearXNG endpoint and optional bearer token                    |
 | `SEARXNG_BASIC_USERNAME`, `SEARXNG_BASIC_PASSWORD`  | SearXNG HTTP Basic Auth credentials                           |
 
