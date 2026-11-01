@@ -779,6 +779,41 @@
         "mode": "anthropic-adaptive"
       }
     },
+    "anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.05,
+          "cacheWrite": 0.625,
+          "input": 0.5,
+          "output": 2.5
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
+      }
+    },
     "anthropic.claude-opus-4-6-v1": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1096,6 +1131,41 @@
         "maxLevel": "high",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "au.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "au.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.055,
+          "cacheWrite": 0.6875,
+          "input": 0.55,
+          "output": 2.75
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (AU)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
       }
     },
     "au.anthropic.claude-opus-4-6-v1": {
@@ -1787,6 +1857,41 @@
         "mode": "budget"
       }
     },
+    "eu.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "eu.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.055,
+          "cacheWrite": 0.6875,
+          "input": 0.55,
+          "output": 2.75
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (EU)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
+      }
+    },
     "eu.anthropic.claude-opus-4-1-20250805-v1:0": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2265,6 +2370,41 @@
         "maxLevel": "high",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "global.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "global.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.05,
+          "cacheWrite": 0.625,
+          "input": 0.5,
+          "output": 2.5
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (Global)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
       }
     },
     "global.anthropic.claude-opus-4-5-20251101-v1:0": {
@@ -3122,6 +3262,41 @@
         "maxLevel": "high",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "jp.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "jp.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.055,
+          "cacheWrite": 0.6875,
+          "input": 0.55,
+          "output": 2.75
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (JP)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
       }
     },
     "jp.anthropic.claude-opus-4-7": {
@@ -4573,6 +4748,41 @@
         "mode": "budget"
       }
     },
+    "us.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "us.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.055,
+          "cacheWrite": 0.6875,
+          "input": 0.55,
+          "output": 2.75
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (US)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
+      }
+    },
     "us.anthropic.claude-opus-4-1-20250805-v1:0": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -5780,6 +5990,41 @@
         "maxLevel": "xhigh",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "claude-haiku-5-5": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.05,
+          "cacheWrite": 0.625,
+          "input": 0.5,
+          "output": 2.5
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5",
+      "provider": "anthropic",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
       }
     },
     "claude-opus-4-0": {
@@ -16842,6 +17087,34 @@
       ],
       "maxTokens": 128000,
       "name": "GPT-6.1 Sol",
+      "provider": "github-copilot",
+      "reasoning": true
+    },
+    "gpt-6.1-terra": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.githubcopilot.com",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsStore": false
+      },
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.05,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "headers": {
+        "User-Agent": "opencode/1.3.15"
+      },
+      "id": "gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "GPT-6.1 Terra",
       "provider": "github-copilot",
       "reasoning": true
     },
@@ -28516,6 +28789,56 @@
       ],
       "maxTokens": 128000,
       "name": "OpenAI: GPT-6.1 Sol Pro",
+      "provider": "kilo",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "xhigh",
+        "minLevel": "minimal",
+        "mode": "effort"
+      }
+    },
+    "openai/gpt-6.1-terra": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.049999999999999996,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "openai/gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "OpenAI: GPT-6.1 Terra",
+      "provider": "kilo",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "effort"
+      }
+    },
+    "openai/gpt-6.1-terra-pro": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.049999999999999996,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "openai/gpt-6.1-terra-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "OpenAI: GPT-6.1 Terra Pro",
       "provider": "kilo",
       "reasoning": true,
       "thinking": {
@@ -69526,6 +69849,40 @@
         "supportsUltrafastTier": true
       }
     },
+    "gpt-6.1-terra": {
+      "api": "openai-responses",
+      "baseUrl": "",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.05,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.1,
+          "cacheWrite": 2.5,
+          "input": 2,
+          "output": 7.5
+        },
+        "threshold": 272000
+      },
+      "maxTokens": 128000,
+      "name": "GPT-6.1 Terra",
+      "provider": "openai",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "effort"
+      }
+    },
     "gpt-daybreak-blue-latest": {
       "api": "openai-responses",
       "baseUrl": "",
@@ -70576,6 +70933,41 @@
       },
       "compat": {
         "supportsUltrafastTier": true
+      }
+    },
+    "gpt-6.1-terra": {
+      "api": "openai-codex-responses",
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.05,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.1,
+          "cacheWrite": 2.5,
+          "input": 2,
+          "output": 7.5
+        },
+        "threshold": 272000
+      },
+      "maxTokens": 128000,
+      "name": "GPT-6.1 Terra",
+      "preferWebsockets": true,
+      "provider": "openai-codex",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "effort"
       }
     },
     "gpt-daybreak-blue-latest": {
@@ -82444,6 +82836,106 @@
       ],
       "maxTokens": 128000,
       "name": "OpenAI: GPT-6.1 Sol Pro",
+      "provider": "openrouter",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "effort"
+      }
+    },
+    "openai/gpt-6.1-terra": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.049999999999999996,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "openai/gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "OpenAI: GPT-6.1 Terra",
+      "provider": "openrouter",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "effort"
+      }
+    },
+    "openai/gpt-6.1-terra-pro": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.049999999999999996,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "openai/gpt-6.1-terra-pro",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "OpenAI: GPT-6.1 Terra Pro",
+      "provider": "openrouter",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "effort"
+      }
+    },
+    "openai/gpt-6.1-terra-pro:batch": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.024999999999999998,
+        "cacheWrite": 0.625,
+        "input": 0.5,
+        "output": 2.5
+      },
+      "id": "openai/gpt-6.1-terra-pro:batch",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "OpenAI: GPT-6.1 Terra Pro (batch)",
+      "provider": "openrouter",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "effort"
+      }
+    },
+    "openai/gpt-6.1-terra:batch": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.024999999999999998,
+        "cacheWrite": 0.625,
+        "input": 0.5,
+        "output": 2.5
+      },
+      "id": "openai/gpt-6.1-terra:batch",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "OpenAI: GPT-6.1 Terra (batch)",
       "provider": "openrouter",
       "reasoning": true,
       "thinking": {
@@ -97366,6 +97858,56 @@
       ],
       "maxTokens": 128000,
       "name": "GPT-6.1 Sol (Fast)",
+      "provider": "vercel-ai-gateway",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "xhigh",
+        "minLevel": "minimal",
+        "mode": "budget"
+      }
+    },
+    "openai/gpt-6.1-terra": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://ai-gateway.vercel.sh",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.049999999999999996,
+        "cacheWrite": 1.25,
+        "input": 1,
+        "output": 5
+      },
+      "id": "openai/gpt-6.1-terra",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "GPT-6.1 Terra",
+      "provider": "vercel-ai-gateway",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "budget"
+      }
+    },
+    "openai/gpt-6.1-terra-fast": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://ai-gateway.vercel.sh",
+      "contextWindow": 1050000,
+      "cost": {
+        "cacheRead": 0.09999999999999999,
+        "cacheWrite": 2.5,
+        "input": 2,
+        "output": 10
+      },
+      "id": "openai/gpt-6.1-terra-fast",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "GPT-6.1 Terra (Fast)",
       "provider": "vercel-ai-gateway",
       "reasoning": true,
       "thinking": {

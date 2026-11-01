@@ -1,4 +1,17 @@
-import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fchmodSync,
+	fstatSync,
+	ftruncateSync,
+	lstatSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
 import * as path from "node:path";
 import {
 	type Keybinding,
@@ -469,22 +482,156 @@ function loadRawConfig(filePath: string): unknown {
 	}
 }
 
+const KEYBINDINGS_MARKER_MODE = 0o600;
+
+type KeybindingsLeaf = "absent" | "file" | "symlink" | "other";
+
+function keybindingsLeaf(filePath: string): KeybindingsLeaf {
+	try {
+		const stat = lstatSync(filePath);
+		if (stat.isSymbolicLink()) return "symlink";
+		if (stat.isFile()) return "file";
+		return "other";
+	} catch (error) {
+		if (isEnoent(error)) return "absent";
+		throw error;
+	}
+}
+
+function writeAllSync(fd: number, content: string | Buffer): void {
+	const buffer = typeof content === "string" ? Buffer.from(content) : content;
+	let offset = 0;
+	while (offset < buffer.length) {
+		const wrote = writeSync(fd, buffer, offset, buffer.length - offset);
+		if (wrote <= 0) throw new Error("keybindings migration write was incomplete");
+		offset += wrote;
+	}
+}
+
+/** Create a new file. O_NOFOLLOW refuses a final symlink. A set mode is fchmod'd. */
+function writeExclusiveNoFollow(filePath: string, content: string | Buffer, mode: number | undefined): void {
+	const noFollow = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
+	const fd = openSync(filePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, mode ?? 0o666);
+	try {
+		writeAllSync(fd, content);
+		if (mode !== undefined && process.platform !== "win32") fchmodSync(fd, mode);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Copy bytes to the backup. A final symlink at either path is not opened for write. */
+function copyKeybindingsBackup(
+	source: string,
+	dest: string,
+	sourceKind: KeybindingsLeaf,
+	destKind: KeybindingsLeaf,
+): void {
+	const noFollow = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
+	// A symlinked config is still backed up from its target. The backup path itself stays no-follow.
+	const sourceFlags = constants.O_RDONLY | (sourceKind === "file" ? noFollow : 0);
+	const srcFd = openSync(source, sourceFlags);
+	try {
+		const stat = fstatSync(srcFd);
+		if (!stat.isFile()) throw new Error("keybindings migration target is not a regular file");
+		const bytes = readFileSync(srcFd);
+		const mode = stat.mode & 0o777;
+		if (destKind === "absent") {
+			writeExclusiveNoFollow(dest, bytes, mode);
+			return;
+		}
+		const fd = openSync(dest, constants.O_WRONLY | noFollow);
+		try {
+			const destStat = fstatSync(fd);
+			if (!destStat.isFile()) throw new Error("keybindings migration target is not a regular file");
+			if (destStat.dev === stat.dev && destStat.ino === stat.ino) return;
+			ftruncateSync(fd, 0);
+			writeAllSync(fd, bytes);
+			if (process.platform !== "win32") fchmodSync(fd, mode);
+		} finally {
+			closeSync(fd);
+		}
+	} finally {
+		closeSync(srcFd);
+	}
+}
+
+function migrationMarkerState(markerPath: string): { present: boolean; kind: KeybindingsLeaf } {
+	const kind = keybindingsLeaf(markerPath);
+	// A symlink is not a completed marker. existsSync only preserves the historical
+	// skip when that link already names a real target. The write path never opens it.
+	const present = kind === "file" || kind === "other" || (kind === "symlink" && existsSync(markerPath));
+	return { present, kind };
+}
+
+function writeMigratedKeybindings(
+	filePath: string,
+	markerPath: string,
+	markerKind: KeybindingsLeaf,
+	body: string,
+): void {
+	const tempPath = `${filePath}.${process.pid}.tmp`;
+	const bakPath = `${filePath}.bak`;
+	const bakKind = keybindingsLeaf(bakPath);
+	const tempKind = keybindingsLeaf(tempPath);
+	const sourceKind = keybindingsLeaf(filePath);
+	if (
+		bakKind === "symlink" ||
+		bakKind === "other" ||
+		tempKind === "symlink" ||
+		tempKind === "other" ||
+		(sourceKind !== "file" && sourceKind !== "symlink")
+	) {
+		throw new Error("keybindings migration target is not a regular file");
+	}
+	if (tempKind === "file") unlinkSync(tempPath);
+	if (keybindingsLeaf(filePath) !== sourceKind) {
+		throw new Error("keybindings migration target is not a regular file");
+	}
+	const mode = sourceKind === "file" ? lstatSync(filePath).mode & 0o777 : undefined;
+	try {
+		copyKeybindingsBackup(filePath, bakPath, sourceKind, bakKind);
+		writeExclusiveNoFollow(tempPath, body, mode);
+		const current = lstatSync(filePath);
+		if (sourceKind === "file" && (current.isSymbolicLink() || !current.isFile())) {
+			throw new Error("keybindings migration target is not a regular file");
+		}
+		renameSync(tempPath, filePath);
+		if (markerKind === "absent") writeExclusiveNoFollow(markerPath, "v1\n", KEYBINDINGS_MARKER_MODE);
+	} catch (error) {
+		if (keybindingsLeaf(tempPath) === "file") {
+			try {
+				unlinkSync(tempPath);
+			} catch {
+				// Best-effort removal of the unreplaced temp file.
+			}
+		}
+		throw error;
+	}
+}
+
 /** Migrate legacy keybindings once, preserving the original file as .bak. */
 function loadKeybindingsConfig(filePath: string, writeBack: boolean): KeybindingsConfig {
 	const rawConfig = loadRawConfig(filePath);
 	if (rawConfig === null) return {};
 	const markerPath = `${filePath}.migration-v1`;
-	const { config: migratedConfig, migrated } = existsSync(markerPath)
+	let markerKind: KeybindingsLeaf = "absent";
+	let markerPresent = false;
+	try {
+		const marker = migrationMarkerState(markerPath);
+		markerKind = marker.kind;
+		markerPresent = marker.present;
+	} catch (error) {
+		logger.warn("Failed to read keybindings migration marker", { path: markerPath, error: String(error) });
+		return toKeybindingsConfig(rawConfig);
+	}
+	const { config: migratedConfig, migrated } = markerPresent
 		? { config: toKeybindingsConfig(rawConfig), migrated: false }
 		: migrateKeybindingNames(rawConfig);
 	if (writeBack && migrated) {
 		const ordered = orderKeybindingsConfig(migratedConfig);
-		const tempPath = `${filePath}.${process.pid}.tmp`;
 		try {
-			copyFileSync(filePath, `${filePath}.bak`);
-			writeFileSync(tempPath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
-			renameSync(tempPath, filePath);
-			writeFileSync(markerPath, "v1\n", "utf-8");
+			writeMigratedKeybindings(filePath, markerPath, markerKind, `${JSON.stringify(ordered, null, 2)}\n`);
 			logger.debug("Migrated keybindings config", { path: filePath });
 		} catch (error) {
 			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });

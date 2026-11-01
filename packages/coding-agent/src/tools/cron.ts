@@ -443,7 +443,16 @@ function toCronListJobDetails(snapshot: CronJobSnapshot): CronListJobDetails {
 }
 
 function formatCronFireContent(snapshot: CronJobSnapshot): string {
-	return `<task-notification>\nScheduled task ${snapshot.id} fired (${snapshot.humanSchedule}).\n\n${snapshot.prompt}\n</task-notification>`;
+	// A fired cron prompt is an instruction to execute, not a notification to
+	// acknowledge. Wrapping it in a notification-only envelope made models
+	// restate the prompt and end the turn without calling a tool.
+	return [
+		"<system-reminder>",
+		`Scheduled task ${snapshot.id} fired (${snapshot.humanSchedule}). The text below is this turn's task instruction: execute it now, using tools as needed. Do not merely restate, summarize, or acknowledge it.`,
+		"</system-reminder>",
+		"",
+		snapshot.prompt,
+	].join("\n");
 }
 
 function deliverCronFire(record: CronScheduleRecord): Promise<void> | undefined {

@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	type CustomizeDoctorReport,
 	type CustomizeDoctorSurface,
@@ -74,7 +75,7 @@ function withoutTimestamp(report: CustomizeDoctorReport): Omit<CustomizeDoctorRe
 	return rest;
 }
 
-describe("customize doctor (#4288)", () => {
+describe.serial("customize doctor (#4288)", () => {
 	it("reports deterministic provenance and precedence across native, Claude, and Codex fixtures", async () => {
 		const cwd = await makeTempProject();
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-native", "Native project skill");
@@ -131,6 +132,33 @@ describe("customize doctor (#4288)", () => {
 		// Determinism: two runs over the same fixture produce identical reports
 		// (modulo the generation timestamp).
 		expect(withoutTimestamp(second)).toEqual(withoutTimestamp(first));
+	});
+
+	it("reports project hooks as stored-only without shadowing user hooks", async () => {
+		const cwd = await makeTempProject();
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(cwd, "user-agent");
+		const projectHook = path.join(cwd, ".gjc", "hooks", "pre", "bash.ts");
+		const userHook = path.join(agentDir, "hooks", "pre", "bash.ts");
+		await fs.mkdir(path.dirname(projectHook), { recursive: true });
+		await fs.mkdir(path.dirname(userHook), { recursive: true });
+		await Bun.write(projectHook, "export {}\n");
+		await Bun.write(userHook, "export {}\n");
+		setAgentDir(agentDir);
+		try {
+			const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+			const hooks = surface(report, "hook").items.filter(item => item.name === "bash.ts");
+			expect(hooks.find(item => item.scope === "project")).toMatchObject({
+				status: "stored-only",
+				reason: "storage-only",
+				detail: expect.stringContaining("do not load repository hook modules"),
+			});
+			expect(hooks.find(item => item.scope === "project")?.precedence.shadowedBy).toBeUndefined();
+			expect(hooks.find(item => item.scope === "user")?.status).toBe("stored-only");
+			expect(hooks.find(item => item.scope === "user")?.precedence.shadowedBy).toBeUndefined();
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
 	});
 
 	it("redacts secret-bearing MCP fields in both JSON and text output", async () => {

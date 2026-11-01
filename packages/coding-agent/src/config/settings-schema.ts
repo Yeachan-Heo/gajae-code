@@ -1,5 +1,6 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
 import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
+import { type CredentialPreferenceEntryValue, parseCredentialPreferenceList } from "../session/startup-auth-config";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
@@ -178,33 +179,43 @@ export type JsonSchemaObject = {
 	const?: unknown;
 };
 
-interface BooleanDef {
+export interface SettingApplication {
+	kind: "next-run" | "host-presentation" | "reload" | "restart";
+	reason: string;
+}
+
+interface SettingApplicationMetadata {
+	/** Absent means application behavior has not been classified for the portable catalog. */
+	application?: SettingApplication;
+}
+
+interface BooleanDef extends SettingApplicationMetadata {
 	type: "boolean";
 	default?: boolean;
 	ui?: UiBoolean;
 }
 
-interface StringDef {
+interface StringDef extends SettingApplicationMetadata {
 	type: "string";
 	default: string | undefined;
 	ui?: UiString;
 }
 
-interface NumberDef {
+interface NumberDef extends SettingApplicationMetadata {
 	type: "number";
 	default: number;
 	validate?: (value: number) => boolean;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> {
+interface EnumDef<T extends readonly string[]> extends SettingApplicationMetadata {
 	type: "enum";
 	values: T;
 	default: T[number];
 	ui?: UiEnum<T>;
 }
 
-interface ArrayDef<T> {
+interface ArrayDef<T> extends SettingApplicationMetadata {
 	type: "array";
 	default: T[];
 	items?: { enum: readonly string[] };
@@ -215,7 +226,10 @@ type RecordValueDef =
 	| { type: "model-selector-value" }
 	| { type: "string-enum"; values: readonly string[] }
 	| { type: "credential-selector" }
-	| { type: "portable-credential-selector" };
+	| { type: "credential-preference-list" };
+
+/** A provider's `auth.credentialPreferences` value: one account or a non-empty ordered list of entries. */
+export type CredentialPreferenceSettingValue = string | CredentialPreferenceEntryValue[];
 
 interface ConstrainedRecordValueDef {
 	type: "autorouting-selector-value";
@@ -223,7 +237,7 @@ interface ConstrainedRecordValueDef {
 	description: string;
 }
 
-interface ConstrainedRecordDef<T> {
+interface ConstrainedRecordDef<T> extends SettingApplicationMetadata {
 	type: "constrained-record";
 	default: T;
 	keys: readonly string[];
@@ -232,14 +246,14 @@ interface ConstrainedRecordDef<T> {
 	ui?: UiBase;
 }
 
-interface RecordDef<T> {
+interface RecordDef<T> extends SettingApplicationMetadata {
 	type: "record";
 	default: Record<string, T>;
 	valueSchema?: RecordValueDef;
 	ui?: UiBase;
 }
 
-export interface OptionalObjectDef<T> {
+export interface OptionalObjectDef<T> extends SettingApplicationMetadata {
 	type: "optional-object";
 	default: undefined;
 	jsonSchema: JsonSchemaObject;
@@ -453,17 +467,12 @@ export const SETTINGS_SCHEMA = {
 		valueSchema: { type: "credential-selector" } as const,
 	},
 	"auth.credentialPinStoreIdentity": { type: "string", default: undefined },
-	// Soft per-provider OAuth account preference. Global-only, like pins; read at startup.
+	// Ordered soft per-provider OAuth account preferences with optional per-entry usage caps. Global-only, like pins;
+	// read at startup.
 	"auth.credentialPreferences": {
 		type: "record",
-		default: {} as Record<string, string>,
-		valueSchema: { type: "portable-credential-selector" } as const,
-	},
-	// Usage percent at which a preferred account yields to the normal ranking; 100 yields only once it is blocked.
-	"auth.credentialPreferenceMaxUsedPercent": {
-		type: "number",
-		default: 100,
-		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 100,
+		default: {} as Record<string, CredentialPreferenceSettingValue>,
+		valueSchema: { type: "credential-preference-list" } as const,
 	},
 	"session.directoryMigration": {
 		type: "enum",
@@ -504,6 +513,13 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 120_000,
 		description: "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
+	},
+	"sdk.brokerAbandonedGraceMs": {
+		type: "number",
+		default: 120_000,
+		description:
+			"Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
 	},
 
@@ -1378,6 +1394,10 @@ export const SETTINGS_SCHEMA = {
 
 	// Sampling
 	temperature: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1396,6 +1416,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1414,6 +1438,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topK: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1431,6 +1459,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	minP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1447,6 +1479,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	presencePenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1464,6 +1500,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	repetitionPenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1804,7 +1844,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Prompt Suggestions",
 			description:
-				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+				"Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 		},
 	},
 
@@ -2847,6 +2887,12 @@ export const SETTINGS_SCHEMA = {
 		type: "string",
 		default: undefined,
 	},
+	// xxHash64 hex pin for settingsPath. Only the user/global value is a pin;
+	// a project file cannot authorize the TOML path it names.
+	"shellMinimizer.settingsHash": {
+		type: "string",
+		default: undefined,
+	},
 	"shellMinimizer.only": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.except": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.maxCaptureBytes": {
@@ -3591,6 +3637,11 @@ export const SETTINGS_SCHEMA = {
 		default: [] as string[],
 	},
 
+	"mcp.discoveryDeferAutoload": {
+		type: "boolean",
+		default: false,
+	},
+
 	"mcp.notifications": {
 		type: "boolean",
 		default: false,
@@ -3814,6 +3865,17 @@ export const SETTINGS_SCHEMA = {
 				{ value: "32", label: "32 tasks" },
 				{ value: "64", label: "64 tasks" },
 			],
+		},
+	},
+
+	"task.compactSubagentPanel": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Compact Subagent Panel",
+			description:
+				"Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
 		},
 	},
 
@@ -4395,8 +4457,8 @@ function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean 
 				/^account:\S+$/.test(value))
 		);
 	}
-	if (valueSchema.type === "portable-credential-selector") {
-		return typeof value === "string" && (/^email:[^@\s]+@[^@\s]+$/.test(value) || /^account:\S+$/.test(value));
+	if (valueSchema.type === "credential-preference-list") {
+		return parseCredentialPreferenceList(value) !== undefined;
 	}
 	return typeof value === "string" && valueSchema.values.includes(value);
 }
@@ -4427,6 +4489,20 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 }
 
 /**
+ * Identity and destination fields adopted from the notification config file.
+ * `config.patch` must not rewrite them; local provider commands still do.
+ */
+const NOTIFICATION_BINDING_PATCH_PATHS = new Set<SettingPath>([
+	"notifications.telegram.chatId",
+	"notifications.discord.applicationId",
+	"notifications.discord.guildId",
+	"notifications.discord.parentChannelId",
+	"notifications.slack.workspaceId",
+	"notifications.slack.channelId",
+	"notifications.slack.authorizedUserId",
+]);
+
+/**
  * Validate an external (SDK `config.patch`) path/value set against the
  * settings schema before any durable write. Dotted sub-paths of record
  * settings (e.g. `modelRoles.default`) are validated against the record's
@@ -4442,6 +4518,13 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 			issues.push({
 				path,
 				detail: "The versioned model-profile ownership record is internal and cannot be patched generically.",
+			});
+			continue;
+		}
+		if (NOTIFICATION_BINDING_PATCH_PATHS.has(path as SettingPath)) {
+			issues.push({
+				path,
+				detail: "Notification binding fields cannot be changed through config.patch.",
 			});
 			continue;
 		}
@@ -4740,6 +4823,7 @@ export interface BashInterceptorRule {
 export interface ShellMinimizerSettings {
 	enabled: boolean;
 	settingsPath: string | undefined;
+	settingsHash: string | undefined;
 	only: string[];
 	except: string[];
 	maxCaptureBytes: number;

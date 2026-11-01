@@ -1,13 +1,19 @@
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../src/sdk/host/websocket-transport";
-import { ManagedSessionScopeTestHooks } from "../src/session/internal/managed-session-scope";
+import { SessionLifecycleService } from "../src/sdk/lifecycle";
+import {
+	ManagedSessionScopeTestHooks,
+	prepareManagedSessionScopeForWriteSync,
+	resolveManagedScope,
+} from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 
 const event = (
@@ -163,6 +169,63 @@ test("broker session.list keeps cursor warnings snapshot-stable", async () => {
 	} finally {
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker-to-lifecycle preserves permission_denied for an invalid saved-session candidate", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lifecycle-denied-candidate-"));
+	const cwd = path.join(root, "workspace");
+	const deniedCwd = path.join(root, "denied-workspace");
+	const agentDir = path.join(root, "agent");
+	await fs.mkdir(cwd, { recursive: true });
+	await fs.mkdir(deniedCwd, { recursive: true });
+	const scopeResolution = resolveManagedScope({ cwd, agentDir, sessionsRoot: path.join(agentDir, "sessions") });
+	if (scopeResolution.kind !== "resolved") throw new Error(`Could not resolve fixture scope: ${scopeResolution.code}`);
+	const preparedScope = prepareManagedSessionScopeForWriteSync(scopeResolution.scope);
+	if (preparedScope.kind !== "resolved") throw new Error(`Could not prepare fixture scope: ${preparedScope.code}`);
+	const sessionId = "denied-candidate";
+	await fs.writeFile(
+		path.join(scopeResolution.scope.directoryPath, `${sessionId}.jsonl`),
+		`${JSON.stringify({ type: "session", id: sessionId, cwd: deniedCwd })}\n`,
+	);
+
+	const broker = new Broker({ agentDir });
+	let brokerStarted = false;
+	let restoreIdentity: (() => void) | undefined;
+	try {
+		await broker.start();
+		brokerStarted = true;
+		const canonicalIdentity = native.canonicalExistingDirectoryIdentity;
+		const identitySpy = spyOn(native, "canonicalExistingDirectoryIdentity").mockImplementation(candidateCwd =>
+			candidateCwd === deniedCwd ? { ok: false, code: "access_denied" } : canonicalIdentity(candidateCwd),
+		);
+		restoreIdentity = () => identitySpy.mockRestore();
+		const service = new SessionLifecycleService({
+			global: (operation, input) => broker.handleRequest(operation, input),
+		});
+		expect(
+			await service.list({
+				actor: { id: "operator-1", namespace: "test" },
+				capability: "session.list",
+				target: { cwd, resolveSessionId: sessionId },
+			}),
+		).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: {
+					sessionId,
+					reason: "candidate_invalid",
+					detailCode: "permission_denied",
+				},
+			},
+		});
+	} finally {
+		restoreIdentity?.();
+		try {
+			if (brokerStarted) await broker.stop();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	}
 });
 
@@ -508,14 +571,15 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		if (!start) throw new Error("SDK-only session_start handler was not registered.");
 		await start({}, context);
 		await broker.index.refresh();
-		expect(broker.index.listSessions().sessions.find(session => session.sessionId === sessionId)).toMatchObject({
-			lifecycleRequestId,
-		});
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		const indexed = broker.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(indexed).toMatchObject({ lifecycleRequestId });
+		const endpointGeneration = indexed?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("SDK-only endpoint was not indexed.");
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: true,
 			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
 		});
-		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 		if (!endpoint.ok) throw new Error(endpoint.error.message);
 		const socket = new WebSocket(
 			`${(endpoint.result as { url: string; token: string }).url}?token=${encodeURIComponent((endpoint.result as { token: string }).token)}`,
@@ -576,12 +640,12 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		if (!shutdown) throw new Error("SDK-only session_shutdown handler was not registered.");
 		const stopping = Promise.resolve(shutdown({}, context));
 		await Bun.sleep(10);
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: true,
 		});
 		drainGateResolution();
 		await stopping;
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone", message: "session endpoint record is gone" },
 		});

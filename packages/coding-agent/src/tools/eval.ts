@@ -139,6 +139,18 @@ export interface EvalToolOptions {
 	proxyExecutor?: EvalProxyExecutor;
 }
 
+/**
+ * In-process eval is not a shell command, so a bash allowlist cannot authorize it.
+ * The same flags that turn the bash tool's allowlist on refuse eval outright.
+ * Blank prefixes match `checkBashAllowedPrefixes`: they do not restrict.
+ */
+function bashRestrictionBlocksEval(
+	session: Pick<ToolSession, "bashAllowedPrefixes" | "bashRestrictionProfile">,
+): boolean {
+	if (session.bashRestrictionProfile === "read-only") return true;
+	return (session.bashAllowedPrefixes ?? []).some(prefix => prefix.trim().length > 0);
+}
+
 interface ResolvedBackend {
 	backend: ExecutorBackend;
 	notice?: string;
@@ -225,6 +237,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		onUpdate?: AgentToolUpdateCallback,
 		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
+		if (this.session && bashRestrictionBlocksEval(this.session)) {
+			throw new ToolError("Eval is unavailable while this session's bash allowlist or read-only profile is active.");
+		}
 		if (this.#proxyExecutor) {
 			return this.#proxyExecutor(params, signal);
 		}

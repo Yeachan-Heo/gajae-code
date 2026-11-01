@@ -732,6 +732,54 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
+	it.skipIf(posixOnly)("adopts a managed root another initializer recreated with a settled marker", async () => {
+		const sessionId = `recreated-${crypto.randomUUID()}`;
+		const noteUrl = ["local", "//note.txt"].join(":");
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			// The temp sweeper removes the root; a sibling gjc process for the same
+			// session recreates it and settles the migration marker.
+			await fs.rm(localRoot, { recursive: true, force: true });
+			await fs.mkdir(localRoot, { mode: 0o700 });
+			await fs.writeFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "absent\n", { mode: 0o600 });
+			expect(resolveLocalUrlToPath(noteUrl, options)).toBe(path.join(localRoot, "note.txt"));
+			expect(await initializeLocalRoot(options)).toBe(await fs.realpath(localRoot));
+		});
+	});
+
+	it("refuses a recreated managed root on Windows without ACL validation", async () => {
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!originalPlatform?.configurable) throw new Error("process.platform descriptor is not configurable");
+		const sessionId = `recreated-windows-${crypto.randomUUID()}`;
+		const noteUrl = ["local", "//note.txt"].join(":");
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.chmod(localRoot, 0o700);
+			const options = localOptions(sessionId, path.join(os.tmpdir(), `unused-artifacts-${sessionId}`));
+			await initializeLocalRoot(options);
+			const parked = `${localRoot}-parked`;
+			const originalIdentity = await fs.lstat(localRoot);
+			await fs.rename(localRoot, parked);
+			try {
+				await fs.mkdir(localRoot, { mode: 0o700 });
+				expect((await fs.lstat(localRoot)).ino).not.toBe(originalIdentity.ino);
+				const marker = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+				await fs.writeFile(marker, "absent\n", { mode: 0o600 });
+				Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+				try {
+					expect(() => resolveLocalUrlToPath(noteUrl, options)).toThrow("Unsafe local:// root");
+					await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe local:// root");
+					expect(await fs.readFile(marker, "utf8")).toBe("absent\n");
+				} finally {
+					Object.defineProperty(process, "platform", originalPlatform);
+				}
+			} finally {
+				await fs.rm(parked, { recursive: true, force: true });
+			}
+		});
+	});
+
 	it.skipIf(posixOnly)("still allows a managed root after its marker-only directory is removed", async () => {
 		const sessionId = `marker-pruned-${crypto.randomUUID()}`;
 		await withLocalRoot(sessionId, async localRoot => {

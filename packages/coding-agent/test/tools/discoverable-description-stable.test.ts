@@ -43,7 +43,7 @@ async function descriptionBeforeAndAfterLoad(name: string, toolSession: ToolSess
 	const before = facade.description;
 	const parametersBefore = name === "task" ? JSON.stringify(facade.parameters) : undefined;
 	beforeLoad?.();
-	await facade.materializeForTests();
+	await facade.materialize();
 	return {
 		before,
 		after: facade.description,

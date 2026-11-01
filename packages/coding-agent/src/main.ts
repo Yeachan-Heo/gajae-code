@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,15 +21,19 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@gajae-code/utils";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import chalk from "chalk";
-import type { Args } from "./cli/args";
+import { selectAppendSystemPromptFile } from "./cli/append-system-prompt";
+import { type Args, resolvePlanModelOverride } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { fetchGithubChannelRelease } from "./cli/github-release";
 import { buildInitialMessage } from "./cli/initial-message";
 import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
-import { findConfigFile } from "./config";
+import { getConfigDirs } from "./config";
+import { FileLockAcquireError, FileLockStagingCleanupError } from "./config/file-lock";
 import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
@@ -67,6 +72,7 @@ import type { MCPManager } from "./runtime-mcp";
 // Leaf path, not the barrel: the capability registry must stay out of the
 // runtime-mcp import graph that every root command would otherwise load.
 import { attachExactMcpControls } from "./runtime-mcp/redaction";
+import { issueSessionMcpControlGrant } from "./runtime-mcp/session-controls-grant";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -74,7 +80,12 @@ import {
 	discoverAuthStorage,
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
-import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
+import {
+	newMasterAttestationEpoch,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionLocatorV2,
+} from "./sdk/broker/session-index";
 import type { AgentSession } from "./session/agent-session";
 import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
@@ -249,8 +260,6 @@ export function resolveAcpStartupOptions(
 		| "resume"
 		| "sessionDir"
 		| "skills"
-		| "slow"
-		| "smol"
 		| "plan"
 		| "systemPrompt"
 		| "thinking"
@@ -291,8 +300,6 @@ export function resolveAcpStartupOptions(
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
 		...(parsed.skills !== undefined ? ["--skills"] : []),
-		...(parsed.slow ? ["--slow"] : []),
-		...(parsed.smol ? ["--smol"] : []),
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
 		...(parsed.tmux ? ["--tmux"] : []),
@@ -1446,17 +1453,13 @@ async function maybeAutoChdir(parsed: Args): Promise<void> {
 	}
 }
 
-/** Discover APPEND_SYSTEM.md file if no CLI append system prompt was provided */
+/** User APPEND_SYSTEM.md only. Repository copies are not appended. */
 function discoverAppendSystemPromptFile(): string | undefined {
-	const projectPath = findConfigFile("APPEND_SYSTEM.md", { user: false });
-	if (projectPath) {
-		return projectPath;
-	}
-	const globalPath = findConfigFile("APPEND_SYSTEM.md", { user: true });
-	if (globalPath) {
-		return globalPath;
-	}
-	return undefined;
+	const candidates = getConfigDirs("", { existingOnly: false }).flatMap(entry => {
+		const filePath = path.join(entry.path, "APPEND_SYSTEM.md");
+		return existsSync(filePath) ? [{ level: entry.level, path: filePath }] : [];
+	});
+	return selectAppendSystemPromptFile(candidates);
 }
 
 async function buildSessionOptions(
@@ -1617,6 +1620,7 @@ type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promis
 export interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	createSessionManager?: typeof createSessionManager;
+	registerDirectSession?: typeof registerDirectSession;
 	discoverAuthStorage?: typeof discoverAuthStorage;
 	resolveStartupAuthConfig?: typeof resolveStartupAuthConfig;
 	runAcpMode?: (options?: { agentDir?: string }) => Promise<void>;
@@ -1663,84 +1667,278 @@ interface DirectSessionRegistrationDependencies {
 	masterRole?: { ownerSessionId: string; attestationEpoch: string };
 }
 
+/**
+ * Handle for a direct CLI session's broker-index registration.
+ *
+ * A direct session registers once at startup, but `/new`, `/resume` and forks
+ * replace the manager's session id inside the same process. The index row is
+ * keyed on that id, so without a follow-up the successor is never indexed and the
+ * predecessor stays live for as long as this pid is alive (the broker keeps
+ * heartbeating a live pid). `syncIdentity` moves the registration to whichever
+ * id the manager the session has adopted currently reports.
+ */
+export interface DirectSessionRegistration {
+	/**
+	 * Register the current manager's session id and release the one it replaced.
+	 *
+	 * `adoptedManager` rebinds the registration to the manager the session now
+	 * owns: a bounded cold-sidecar fork adopts its own forked manager before it
+	 * emits `session_switch`, so the wired handler must hand that manager over or
+	 * the sync keeps reading the startup manager's predecessor id.
+	 */
+	syncIdentity(adoptedManager?: DirectSessionManager): Promise<void>;
+}
+
+const NOOP_DIRECT_SESSION_REGISTRATION: DirectSessionRegistration = { syncIdentity: async () => {} };
+
+/**
+ * Appends allowed for one successor registration before the switch gives up and
+ * keeps the predecessor registered. `SessionIndex.append` takes the shared index
+ * lock independently per append, so a peer holding it is a transient failure.
+ */
+const DIRECT_SESSION_REGISTRATION_ATTEMPTS = 3;
+
 /** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
 export async function registerDirectSession(
 	sessionManager: DirectSessionManager | undefined,
 	agentDir: string,
 	lifecycleRequestId: string | undefined,
 	dependencies: DirectSessionRegistrationDependencies = {},
-): Promise<void> {
-	const directSessionId = directSessionRegistrationId(sessionManager, lifecycleRequestId);
-	if (!directSessionId || !sessionManager) return;
+): Promise<DirectSessionRegistration> {
+	const initialSessionId = directSessionRegistrationId(sessionManager, lifecycleRequestId);
+	if (!initialSessionId || !sessionManager) return NOOP_DIRECT_SESSION_REGISTRATION;
 	const sessionIndex = dependencies.createIndex?.(agentDir) ?? new SessionIndex(agentDir);
-	const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
 	const directSessionIncarnation = (dependencies.processIncarnation ?? processIncarnation)(process.pid);
-	await sessionIndex.append({
-		type: "host_registered",
-		sessionId: directSessionId,
-		locator,
-		endpointGeneration: 0,
-		pid: process.pid,
-		...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
-		...(dependencies.masterRole && directSessionIncarnation
-			? {
-					masterRole: {
-						version: 2 as const,
-						ownerSessionId: dependencies.masterRole.ownerSessionId,
-						launchPid: process.pid,
-						launchProcessIncarnation: directSessionIncarnation,
-						role: "master" as const,
-						attestationEpoch: dependencies.masterRole.attestationEpoch,
-					},
-				}
-			: {}),
-	});
-	if (locator.worktreeRoot !== null) {
+	// The session can adopt a different manager mid-process (bounded cold-sidecar
+	// fork), so every read goes through the manager that is current now.
+	let activeManager = sessionManager;
+	let registeredLocator: SessionLocatorV2 | undefined;
+	let registeredSessionId: string | undefined;
+	// Predecessors whose `host_unregistered` append has not succeeded yet. Once the
+	// successor is registered the old id is no longer `registeredSessionId`, so a
+	// release that failed here would otherwise be lost and keep the predecessor live
+	// in the index for the rest of the process. An entry is dropped as soon as its id
+	// is current again: replaying it would retire a session this process reactivated.
+	const pendingPredecessorReleases: Array<{ sessionId: string; locator: SessionLocatorV2 | undefined }> = [];
+	const forgetPendingRelease = (sessionId: string): void => {
+		for (let index = pendingPredecessorReleases.length - 1; index >= 0; index--) {
+			if (pendingPredecessorReleases[index]?.sessionId === sessionId) pendingPredecessorReleases.splice(index, 1);
+		}
+	};
+
+	const register = async (sessionId: string): Promise<void> => {
+		const locator = await resolveSessionLocator(activeManager.getCwd(), agentDir);
 		try {
-			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, locator.worktreeRoot);
+			await sessionIndex.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 0,
+				pid: process.pid,
+				...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+				...(dependencies.masterRole && directSessionIncarnation
+					? {
+							masterRole: {
+								version: 2 as const,
+								ownerSessionId: dependencies.masterRole.ownerSessionId,
+								launchPid: process.pid,
+								launchProcessIncarnation: directSessionIncarnation,
+								role: "master" as const,
+								attestationEpoch: dependencies.masterRole.attestationEpoch,
+							},
+						}
+					: {}),
+			});
+		} catch (error) {
+			// A lock-release refusal after the row is durable is a real startup failure:
+			// the next process would observe a registered session whose lock generation
+			// this process can no longer prove. Surface it instead of adopting the row.
+			if (error instanceof Error && /^Failed to release file lock:/u.test(error.message)) throw error;
+			// `SessionIndex.append` can reject after its row is already durable (awaited
+			// post-append maintenance), so a rejection does not prove the registration is
+			// missing. Adopt the id when this process already owns a live row for it, so a
+			// later switch still releases it; otherwise the switch keeps failing and the
+			// previous identity stays registered.
+			if (!isRegisteredLive(sessionId)) throw error;
+			logger.warn("Direct session registration append failed after its row was durable", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		// This id is current again: any queued release for it is stale.
+		forgetPendingRelease(sessionId);
+		registeredLocator = locator;
+		registeredSessionId = sessionId;
+	};
+	const isRegisteredLive = (sessionId: string): boolean => {
+		try {
+			return sessionIndex
+				.listSessions()
+				.sessions.some(row => row.sessionId === sessionId && row.pid === process.pid && row.live === true);
+		} catch {
+			return false;
+		}
+	};
+	const unregister = async (sessionId: string, locator: SessionLocatorV2 | undefined): Promise<void> => {
+		if (!locator) return;
+		await sessionIndex.append({
+			type: "host_unregistered",
+			sessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+	};
+
+	/**
+	 * Release queued predecessors in order. A failed append keeps its entry, so the
+	 * next sync or the teardown handler retries it; the failure itself is a warning
+	 * rather than a failed identity switch, matching the best-effort release of the
+	 * launch worktree reservation below.
+	 */
+	const releasePendingPredecessors = async (): Promise<void> => {
+		while (pendingPredecessorReleases.length > 0) {
+			const predecessor = pendingPredecessorReleases[0]!;
+			// Defence in depth for the reactivation order: never retire the id this
+			// process currently publishes as its own.
+			if (predecessor.sessionId === registeredSessionId) {
+				pendingPredecessorReleases.shift();
+				continue;
+			}
+			try {
+				await unregister(predecessor.sessionId, predecessor.locator);
+			} catch (error) {
+				logger.warn("Failed to release a superseded session registration", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return;
+			}
+			pendingPredecessorReleases.shift();
+		}
+	};
+
+	/**
+	 * Register `sessionId`, retrying a bounded number of times so a transient
+	 * index-lock loss self-heals instead of leaving the successor unregistered
+	 * until the next identity change.
+	 */
+	const registerWithRetry = async (sessionId: string): Promise<void> => {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await register(sessionId);
+				return;
+			} catch (error) {
+				// Only lock contention self-heals. A refused release is an identity
+				// verdict; retrying it would mask a committed registration whose lock
+				// generation no longer matches.
+				const code = (error as NodeJS.ErrnoException | undefined)?.code;
+				const transient =
+					code === "sharing_violation" ||
+					code === "access_denied" ||
+					code === "EBUSY" ||
+					code === "EPERM" ||
+					code === "EACCES" ||
+					code === "ENOTEMPTY" ||
+					code === "removal_record_busy";
+				if (!transient || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
+				await Bun.sleep(50 * attempt);
+			}
+		}
+	};
+
+	/**
+	 * Move the registration to the id `activeManager` currently reports.
+	 *
+	 * A successor append that cannot land after its bounded retries keeps the
+	 * predecessor registered and the successor unregistered, so every later call
+	 * (any session event, or teardown) retries the successor instead of leaving it
+	 * unindexed for the life of the process.
+	 */
+	const syncToActiveManager = async (): Promise<void> => {
+		const currentId = activeManager.getSessionFile() === undefined ? undefined : activeManager.getSessionId();
+		// A predecessor left over from a failed release is retried here even when
+		// the identity itself did not change.
+		if (!currentId || currentId === registeredSessionId) {
+			await releasePendingPredecessors();
+			return;
+		}
+		// The predecessor is released under the locator it was registered with, and
+		// only after the successor's own append succeeded.
+		const predecessorId = registeredSessionId;
+		const predecessorLocator = registeredLocator;
+		await registerWithRetry(currentId);
+		if (predecessorId) {
+			pendingPredecessorReleases.push({ sessionId: predecessorId, locator: predecessorLocator });
+			await releasePendingPredecessors();
+		}
+	};
+
+	await register(initialSessionId);
+	if (registeredLocator?.worktreeRoot != null) {
+		try {
+			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, registeredLocator.worktreeRoot);
 		} catch (error) {
 			logger.warn("Failed to release launch worktree reservation after host registration", {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
 	}
+	// Teardown registers the id the session is on now — a post-switch append that
+	// failed would otherwise leave the active transcript unindexed — then releases
+	// everything this process still holds.
 	(dependencies.registerPostmortem ?? postmortem.register)("direct-session-index", async _reason => {
-		await sessionIndex.append({
-			type: "host_unregistered",
-			sessionId: directSessionId,
-			locator,
-			endpointGeneration: 0,
-			pid: process.pid,
-		});
+		try {
+			await syncToActiveManager();
+		} catch (error) {
+			logger.warn("Failed to register the active direct session during teardown", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		if (registeredSessionId) await unregister(registeredSessionId, registeredLocator);
+		await releasePendingPredecessors();
 	});
+
+	let syncing: Promise<void> = Promise.resolve();
+	return {
+		syncIdentity: adoptedManager => {
+			// Serialized: a rapid /new /new must register in order and never interleave.
+			const run = syncing.then(async () => {
+				// An ephemeral manager owns nothing the index could fence, so the tracked
+				// manager survives an adoption that has no durable transcript.
+				if (adoptedManager?.getSessionFile() !== undefined) activeManager = adoptedManager;
+				await syncToActiveManager();
+			});
+			syncing = run.catch(() => {});
+			return run;
+		},
+	};
 }
 
-export interface ModelRoleOverrides {
-	smol?: string;
-	slow?: string;
-	plan?: string;
-}
-
-/**
- * Resolve the ephemeral `smol`/`slow`/`plan` model-role overrides.
- *
- * Precedence per role is CLI flag > documented `GJC_*_MODEL` > legacy
- * `PI_*_MODEL`, matching the repo-wide GJC-first/PI-fallback convention.
- * Resolution reads the process environment via `$pickenv`, which trims values
- * and treats empty/whitespace as unset; it is deliberately kept separate from
- * credential env resolution (`$credentialEnv`/`$pickCredentialEnv`). The
- * function is pure and stateless, so it reads fresh each call and a later
- * invocation never inherits an earlier one's values.
- */
-export function resolveModelRoleOverrides(parsed: Pick<Args, "smol" | "slow" | "plan">): ModelRoleOverrides {
-	const overrides: ModelRoleOverrides = {};
-	const smol = parsed.smol ?? $pickenv("GJC_SMOL_MODEL", "PI_SMOL_MODEL");
-	const slow = parsed.slow ?? $pickenv("GJC_SLOW_MODEL", "PI_SLOW_MODEL");
-	const plan = parsed.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
-	if (smol) overrides.smol = smol;
-	if (slow) overrides.slow = slow;
-	if (plan) overrides.plan = plan;
-	return overrides;
+function directSessionIndexLockFailureMessage(error: unknown, agentDir: string): string | undefined {
+	if (error instanceof FileLockStagingCleanupError) {
+		return (
+			"Session index lock staging cleanup failed; acquisition stopped instead of retrying with another staging directory.\n" +
+			`Lock: ${error.lockPath}\nStaging: ${error.stagingPath}\nCode: ${error.code ?? "unknown"}\n${error.message}`
+		);
+	}
+	if (error instanceof FileLockAcquireError) {
+		const code = error.publicationFailureCode ?? error.code;
+		if (error.publicationFailureCode === "sharing_violation" || error.holderIsLive)
+			return (
+				"Session index is busy (validated lock-publication contention). Retry in a few seconds.\n" +
+				`Lock: ${error.lockPath}\nCode: ${code}\n${error.message}`
+			);
+		return (
+			"Session index lock acquisition failed; no session was registered.\n" +
+			`Lock: ${error.lockPath}\nCode: ${code}\nHolder: ${error.holder}`
+		);
+	}
+	if (!(error instanceof Error) || !/^Failed to publish file lock:/u.test(error.message)) return undefined;
+	const code =
+		(error as NodeJS.ErrnoException).code ??
+		error.message.match(/^Failed to publish file lock: ([a-z0-9_]+)/u)?.[1] ??
+		"unknown";
+	const lockPath = path.join(agentDir, "sdk", "sessions", "index.jsonl.lock");
+	return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
 }
 
 /**
@@ -1763,11 +1961,41 @@ export function applyTerminalControlFlagsToEnv(
 		env.PI_NO_TITLE = "1";
 	}
 }
+
+/**
+ * Whether the live `HERDR_BIN_PATH` must not be used as Herdr's executable.
+ *
+ * A static project declaration is rejected when the live value is that
+ * declaration, including surrounding whitespace. A dynamic declaration is
+ * ambiguous with Bun's preload, so any live value is rejected and Herdr falls
+ * back to `PATH`. A shell export is kept when the project declaration is
+ * absent or is a different static string.
+ */
+export function rejectProjectHerdrBinPath(
+	runtime: string | undefined,
+	declared: string | undefined,
+	dynamic: boolean,
+): boolean {
+	if (runtime === undefined) return false;
+	if (dynamic) return true;
+	if (declared === undefined) return false;
+	return runtime === declared || runtime.trim() === declared;
+}
+
+/** Drop a project-supplied Herdr executable before this command spawns anything. */
+export function dropProjectSuppliedHerdrBinPath(env: NodeJS.ProcessEnv): void {
+	const snapshot = startupProjectEnvSnapshot();
+	const key = canonicalEnvKey("HERDR_BIN_PATH");
+	if (!rejectProjectHerdrBinPath(env.HERDR_BIN_PATH, snapshot.values[key], snapshot.dynamic.has(key))) return;
+	delete env.HERDR_BIN_PATH;
+}
+
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
+	dropProjectSuppliedHerdrBinPath(process.env);
 	const parsedArgs = parsed;
 	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;
@@ -2002,19 +2230,12 @@ export async function runRootCommand(
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
-	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted).
-	// Precedence per role: CLI flag > documented GJC_*_MODEL > legacy PI_*_MODEL.
-	const roleOverrides = resolveModelRoleOverrides(parsedArgs);
-	if (roleOverrides.smol || roleOverrides.slow || roleOverrides.plan) {
-		settingsInstance.overrideModelRoles({
-			...(roleOverrides.smol ? { smol: roleOverrides.smol } : {}),
-			...(roleOverrides.slow ? { slow: roleOverrides.slow } : {}),
-			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
-		});
-	}
+	// Plan mode switches to the `plan` model role; --plan / GJC_PLAN_MODEL override it
+	// for this run only (ephemeral, not persisted).
+	const planModelOverride = resolvePlanModelOverride(parsedArgs);
+	if (planModelOverride) settingsInstance.overrideModelRoles({ plan: planModelOverride });
 	// Apply --clipboard-transport / --clipboard-ssh-host as ephemeral runtime
-	// overrides (CLI > persisted config > "auto" default). Not persisted —
-	// mirrors the role-override precedence above.
+	// overrides (CLI > persisted config > "auto" default). Not persisted.
 	if (parsedArgs.clipboardTransport) {
 		settingsInstance.override("clipboard.transport", parsedArgs.clipboardTransport);
 	}
@@ -2251,7 +2472,12 @@ export async function runRootCommand(
 	// defer; their connect evidence is published during session creation).
 	// ACP/print/SDK sessions connect eagerly and are not carved out here.
 	if (isInteractive) {
+		// Root TUI sessions may control conventional autoload declarations after first paint.
+		// The grant is minted here only; SDK callers of createAgentSession cannot mint one.
+		// Exact --mcp-config sessions retain their existing capability path.
 		sessionOptions.deferMcpConfigStartup = true;
+		if (sessionOptions.mcpConfigPath === undefined && sessionOptions.enableMcpAutoload !== false)
+			sessionOptions.sessionMcpControlGrant = issueSessionMcpControlGrant();
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup
@@ -2302,15 +2528,64 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
-	await registerDirectSession(sessionManager, settingsInstance.getAgentDir(), process.env.GJC_LIFECYCLE_REQUEST_ID, {
-		masterRole: masterModeContext
-			? {
-					ownerSessionId: masterModeContext.ownerSessionId,
-					attestationEpoch: masterModeContext.attestationEpoch,
+	const sessionAgentDir = settingsInstance.getAgentDir();
+	let directSessionRegistration: DirectSessionRegistration;
+	try {
+		directSessionRegistration = await (deps.registerDirectSession ?? registerDirectSession)(
+			sessionManager,
+			sessionAgentDir,
+			process.env.GJC_LIFECYCLE_REQUEST_ID,
+			{
+				masterRole: masterModeContext
+					? {
+							ownerSessionId: masterModeContext.ownerSessionId,
+							attestationEpoch: masterModeContext.attestationEpoch,
+						}
+					: undefined,
+			},
+		);
+	} catch (error) {
+		const message = directSessionIndexLockFailureMessage(error, sessionAgentDir);
+		if (message === undefined) throw error;
+		process.stderr.write(`${message}\n`);
+		if (!deps.suppressProcessExit) process.exitCode = 1;
+		await sessionManager?.close().catch(closeError => {
+			logger.warn("Failed to close session manager after session-index registration failure", {
+				error: closeError instanceof Error ? closeError.message : String(closeError),
+			});
+		});
+		authStorage.close();
+		stopThemeWatcher();
+		await postmortem.cleanup();
+		return;
+	}
+	// /new, /resume and forks replace the manager's session id in this same process.
+	// Follow it, or the broker index keeps listing the predecessor as live forever.
+	//
+	// The extension context is not a usable source here: `ExtensionRunner` is
+	// constructed with the startup manager and `createContext()` keeps handing that
+	// facade back, while a bounded cold-sidecar fork replaces only the session's own
+	// manager. Read the live session at dispatch time instead.
+	let liveSession: AgentSession | undefined;
+	sessionOptions.extensions = [
+		...(sessionOptions.extensions ?? []),
+		pi => {
+			const sync = async (): Promise<void> => {
+				try {
+					await directSessionRegistration.syncIdentity(liveSession?.sessionManager);
+				} catch (error) {
+					logger.warn("Failed to move direct session registration to the new session id", {
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
-			: undefined,
-	});
-
+			};
+			pi.on("session_switch", sync);
+			pi.on("session_branch", sync);
+			// A transition whose append failed is retried at the next turn boundary, not
+			// only on another identity change.
+			pi.on("agent_end", sync);
+		},
+	];
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
@@ -2346,6 +2621,7 @@ export async function runRootCommand(
 			startDeferredMemoryBackend,
 			eventBus,
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
+		liveSession = session;
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
 		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
 		installHerdrReporter(listener => session.subscribe(listener));
@@ -2562,9 +2838,9 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(args);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {

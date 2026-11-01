@@ -1,3 +1,0 @@
-### Added
-
-- Custom `openai-responses` relays whose base URL has a loopback hostname (`127.0.0.0/8`, `localhost`, `::1`) now send `session_id`/`x-client-request-id` affinity headers without an explicit opt-in. The ChatGPT codex backend only reuses a warmed prompt prefix for requests that carry a session identity, so such a relay previously reported zero cached tokens and replayed the entire context on every turn. Remote relays stay opt-in, known non-OpenAI provider IDs stay excluded, retention `none` still suppresses the headers, and `compat.supportsResponsesSessionAffinity: false` opts a loopback relay back out.

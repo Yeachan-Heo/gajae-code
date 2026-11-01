@@ -88,6 +88,7 @@ const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number 
 	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
 	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
 	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+	{ id: "gpt-6.1-terra", name: "GPT-6.1 Terra" },
 	{ id: "gpt-6-luna", name: "GPT-6 Luna" },
 ];
 
@@ -770,8 +771,8 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
  * Fetch available Antigravity models from the API using the discovery module.
  * Returns empty array if no auth is available (previous models used as fallback).
  */
-async function fetchAntigravityModels(): Promise<Model<"google-gemini-cli">[]> {
-	const access = await getOAuthAccessFromStorage("google-antigravity");
+export async function fetchAntigravityModels(accessOverride?: OAuthAccess): Promise<Model<"google-gemini-cli">[]> {
+	const access = accessOverride ?? (await getOAuthAccessFromStorage("google-antigravity"));
 	if (!access) {
 		console.log("No Antigravity credentials found, will use previous models");
 		return [];
@@ -781,6 +782,7 @@ async function fetchAntigravityModels(): Promise<Model<"google-gemini-cli">[]> {
 		const discovered = await fetchAntigravityDiscoveryModels({
 			token: access.accessToken,
 			endpoint: ANTIGRAVITY_ENDPOINT,
+			project: access.projectId,
 		});
 		if (discovered === null) {
 			console.warn("Antigravity API fetch failed, will use previous models");

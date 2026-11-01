@@ -4,8 +4,9 @@
  * Replicates how the ZCode desktop app turns a Z.AI login into usable GLM model
  * access. This is NOT an official Z.AI OAuth client: it reuses ZCode's authorize
  * page, broker, and a custom-protocol redirect. It may break at any time and may
- * violate ZCode/Z.AI Terms of Service. Endpoints/client id are overridable via
- * `ZCODE_OAUTH_*` environment variables.
+ * violate ZCode/Z.AI Terms of Service. Endpoints and the client id are
+ * overridable via `ZCODE_OAUTH_*` from the launching shell or user-owned env
+ * files. A project `.env` is not a trusted source for those values.
  *
  * Verified end-to-end against the ZCode host bundle (`resolveZaiApiKey` /
  * `resolveBizApiKey`) and live traffic:
@@ -28,6 +29,7 @@
  * This provider must NEVER force `isOAuth=true`: the key is a plain Z.AI API key, and
  * api.z.ai is not api.anthropic.com, so the Anthropic path already emits a plain bearer.
  */
+import { $credentialEnv } from "@gajae-code/utils";
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions, parseCallbackInput } from "./callback-server";
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -52,9 +54,18 @@ export const GLM_ZCODE_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
 
 type FetchImpl = typeof globalThis.fetch;
 
+/**
+ * Trusted override for one `ZCODE_OAUTH_*` name.
+ *
+ * These values choose where the authorization code and upstream token are sent.
+ * `$credentialEnv` keeps the launching shell and user-owned env files and skips
+ * a project `.env`. A shell value is also skipped when it repeats that file
+ * or the project declaration is dynamic, and when no other trusted source
+ * sets the name an empty value still uses the built-in endpoint.
+ */
 function envOr(name: string, fallback: string): string {
-	const value = process.env[name];
-	return value && value.trim().length > 0 ? value.trim() : fallback;
+	const value = $credentialEnv(name)?.trim();
+	return value ? value : fallback;
 }
 
 function resolveAuthorizeUrl(): string {

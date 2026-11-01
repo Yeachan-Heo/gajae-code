@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
 import * as tls from "node:tls";
+import { gzipSync } from "node:zlib";
 import Anthropic, { type ClientOptions as AnthropicSdkClientOptions } from "@anthropic-ai/sdk";
 import type {
 	ContentBlockParam,
@@ -34,8 +35,9 @@ import {
 } from "../adapter-internals/provider-safety-stop";
 import {
 	getMiniMaxThinkingMode,
-	hasOpus47ApiRestrictions,
+	hasAnthropicModelSamplingRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
+	requiresAnthropicThinkingDisableWhenOff,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -389,6 +391,14 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	thinkingReplayRepairAttempts: number;
 	thinkingReplayRejectedPayload?: AnthropicPayloadFingerprint;
 	/**
+	 * sha256 digests of base64 image payloads Anthropic rejected with
+	 * "Could not process image". The image stays in session history, so every
+	 * later build must keep replacing it or each turn draws the same 400.
+	 */
+	omittedImageDigests: Set<string>;
+	/** Image omissions spent since the last completed stream; bounds escalation. */
+	imageOmissionRepairs: number;
+	/**
 	 * Managed-mode escalation for the CPA alias-restore failure (issue #4338):
 	 * corrective steering recorded against one exact turn, applied by the next
 	 * managed attempt that rebuilds the same turn and released on success.
@@ -416,6 +426,8 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 		warnedUnknownLongCacheRetention: new Set(),
 		thinkingReplayRepairScope: "none",
 		thinkingReplayRepairAttempts: 0,
+		omittedImageDigests: new Set(),
+		imageOmissionRepairs: 0,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
@@ -424,6 +436,8 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 			state.thinkingReplayRepairScope = "none";
 			state.thinkingReplayRepairAttempts = 0;
 			state.thinkingReplayRejectedPayload = undefined;
+			state.omittedImageDigests.clear();
+			state.imageOmissionRepairs = 0;
 			state.cpaToolAliasSteering = undefined;
 		},
 	};
@@ -530,6 +544,86 @@ export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolea
 		/thinking|redacted_thinking/i.test(message) &&
 		/invalid\s+`?signature`?/i.test(message)
 	);
+}
+
+/**
+ * 400 shape where Anthropic cannot decode one of the request's images:
+ * `{"type":"invalid_request_error","message":"Could not process image"}`.
+ * Observed for a truncated JPEG (no end-of-image marker) that local resizing
+ * also failed to decode and therefore forwarded unchanged. The body names no
+ * image, and the image stays in history, so without omission every later
+ * request of the session draws the same rejection.
+ */
+export function isAnthropicImageUnprocessableError(error: unknown): boolean {
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	return /invalid_request_error/i.test(message) && /could not process image/i.test(message);
+}
+
+/**
+ * Bounds image omission per stream: the first rejection omits the images of the
+ * newest message that carries any (the request before it was accepted, so the
+ * rejected image is almost always new), the second omits every remaining image.
+ */
+const ANTHROPIC_MAX_IMAGE_OMISSION_REPAIRS = 2;
+
+export const ANTHROPIC_OMITTED_IMAGE_PLACEHOLDER =
+	"[Image omitted: Anthropic could not process this image. The file may be corrupt or truncated; re-export or convert it before attaching it again.]";
+
+type AnthropicImageSite = {
+	digest: string;
+	messageIndex: number;
+	container: unknown[];
+	index: number;
+};
+
+function collectAnthropicImageSites(params: MessageCreateParamsStreaming): AnthropicImageSite[] {
+	const sites: AnthropicImageSite[] = [];
+	const visit = (container: unknown[], messageIndex: number): void => {
+		for (let index = 0; index < container.length; index++) {
+			const block = container[index];
+			if (!isRecord(block)) continue;
+			if (block.type === "tool_result" && Array.isArray(block.content)) {
+				visit(block.content, messageIndex);
+				continue;
+			}
+			if (block.type !== "image" || !isRecord(block.source)) continue;
+			const data = block.source.data;
+			if (typeof data !== "string") continue;
+			const digest = nodeCrypto.createHash("sha256").update(data).digest("hex");
+			sites.push({ digest, messageIndex, container, index });
+		}
+	};
+	params.messages.forEach((message, messageIndex) => {
+		if (Array.isArray(message.content)) visit(message.content as unknown[], messageIndex);
+	});
+	return sites;
+}
+
+/** Replace every image whose payload digest is listed, keeping its cache breakpoint. */
+function omitAnthropicImages(params: MessageCreateParamsStreaming, digests: ReadonlySet<string>): void {
+	for (const site of collectAnthropicImageSites(params)) {
+		if (!digests.has(site.digest)) continue;
+		const image = site.container[site.index] as Record<string, unknown>;
+		site.container[site.index] = {
+			type: "text",
+			text: ANTHROPIC_OMITTED_IMAGE_PLACEHOLDER,
+			...(image.cache_control === undefined ? {} : { cache_control: image.cache_control }),
+		};
+	}
+}
+
+/** Digests to omit after a rejection: the newest image-bearing message first, then everything. */
+function selectAnthropicImagesToOmit(
+	params: MessageCreateParamsStreaming,
+	omitted: ReadonlySet<string>,
+	scope: "latest" | "all",
+): string[] {
+	const remaining = collectAnthropicImageSites(params).filter(site => !omitted.has(site.digest));
+	if (remaining.length === 0) return [];
+	const newest = Math.max(...remaining.map(site => site.messageIndex));
+	const selected = scope === "latest" ? remaining.filter(site => site.messageIndex === newest) : remaining;
+	return [...new Set(selected.map(site => site.digest))];
 }
 
 /**
@@ -1494,6 +1588,51 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 	);
 }
 
+/** Body bytes for a request `BodyInit`, or `undefined` when the body cannot be inspected. */
+function requestBodyBuffer(body: RequestInit["body"]): Buffer | undefined {
+	if (typeof body === "string") return Buffer.from(body, "utf-8");
+	if (body instanceof ArrayBuffer) return Buffer.from(body);
+	if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+	return undefined;
+}
+
+/** Compresses request bodies with gzip for first-party Anthropic endpoints only. */
+export function wrapAnthropicFetchForGzip(baseFetch: FetchImpl): FetchImpl {
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : String(input), "https://api.anthropic.com");
+			const isFirstPartyAnthropicApi =
+				url.protocol.toLowerCase() === "https:" &&
+				url.hostname.toLowerCase() === "api.anthropic.com" &&
+				(url.port === "" || url.port === "443");
+			const bodyBuffer = init?.body ? requestBodyBuffer(init.body) : undefined;
+			if (!isFirstPartyAnthropicApi || !bodyBuffer) return baseFetch(input, init);
+
+			let compressedBody: Buffer;
+			try {
+				compressedBody = gzipSync(bodyBuffer);
+			} catch (error) {
+				logger.debug("anthropic: gzip compression failed, falling back to uncompressed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return baseFetch(input, init);
+			}
+
+			// The caller's Content-Length describes the uncompressed body; drop it so
+			// fetch recomputes the length for the compressed payload.
+			const headers = new Headers(init?.headers ?? {});
+			headers.set("Content-Encoding", "gzip");
+			headers.delete("Content-Length");
+			logger.debug("anthropic: gzip compression", {
+				uncompressed: bodyBuffer.length,
+				compressed: compressedBody.length,
+			});
+			return baseFetch(input, { ...init, body: compressedBody, headers });
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+}
+
 // The Anthropic SDK logs malformed SSE frames directly before rethrowing them.
 // We surface the resulting provider error ourselves, so keep the SDK quiet.
 const ANTHROPIC_SDK_LOG_LEVEL = "off" as const;
@@ -2158,6 +2297,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let thinkingReplayRepairPersistent = thinkingReplayRepairScope !== "none";
 			let generatedCacheBudget: GeneratedCacheBudget = providerSessionState?.generatedCacheBudget ?? 2;
 			let warnedUnknownLongCacheRetention = false;
+			// Shared with the session so later turns keep omitting a rejected image
+			// that is still in history; per-stream when no session state is shared.
+			const omittedImageDigests = providerSessionState?.omittedImageDigests ?? new Set<string>();
+			let imageOmissionRepairs = providerSessionState?.imageOmissionRepairs ?? 0;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
 				// repairs activated so far. Rebuilding from only the immediate call lets
@@ -2193,12 +2336,18 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				}
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
+					if (options?.thinkingEnabled === false && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+						nextParams.thinking = { type: "disabled" };
+					}
 				}
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
 				}
 				if (dropFastMode) {
 					dropAnthropicFastMode(nextParams);
+				}
+				if (omittedImageDigests.size > 0) {
+					omitAnthropicImages(nextParams, omittedImageDigests);
 				}
 				const replacementPayload = await options?.onPayload?.(
 					nextParams,
@@ -2787,6 +2936,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						providerSessionState.thinkingReplayRepairScope = "none";
 						providerSessionState.thinkingReplayRepairAttempts = 0;
 					}
+					// Omitted digests stay recorded (the images are still in history); only
+					// the escalation budget re-arms for a different image rejected later.
+					if (providerSessionState && imageOmissionRepairs > 0) {
+						providerSessionState.imageOmissionRepairs = 0;
+					}
 					// Release a recorded CPA steering once any stream completes: a
 					// successful stream consumed it, and a failed one ends the turn (a
 					// later turn's different user prompt would expire it anyway).
@@ -2889,6 +3043,36 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
+					}
+					// An image Anthropic cannot decode fails the whole request and stays in
+					// history, so the session never recovers on its own. Record the omission
+					// before deciding who retries: unmanaged streams resend here, managed
+					// attempts leave the retry to the fallback controller, whose next attempt
+					// rebuilds from the shared session state without the rejected image.
+					if (
+						firstTokenTime === undefined &&
+						imageOmissionRepairs < ANTHROPIC_MAX_IMAGE_OMISSION_REPAIRS &&
+						isAnthropicImageUnprocessableError(streamFailure)
+					) {
+						const scope = imageOmissionRepairs === 0 ? "latest" : "all";
+						const digests = selectAnthropicImagesToOmit(params, omittedImageDigests, scope);
+						if (digests.length > 0) {
+							for (const digest of digests) omittedImageDigests.add(digest);
+							imageOmissionRepairs++;
+							if (providerSessionState) providerSessionState.imageOmissionRepairs = imageOmissionRepairs;
+							logger.warn("anthropic: provider could not process an image; omitting it from the request", {
+								model: model.id,
+								scope,
+								omittedImages: digests.length,
+								managed: options?.fallbackManaged === true,
+							});
+							if (!options?.fallbackManaged && !options?.disableProviderRetries) {
+								params = await prepareParams();
+								providerUploadCount++;
+								resetOutputForRetry();
+								continue;
+							}
+						}
 					}
 					const thinkingSignatureInvalid = isAnthropicThinkingSignatureInvalidError(streamFailure);
 					const thinkingBlocksImmutable = isAnthropicThinkingBlockMutationError(streamFailure);
@@ -3343,8 +3527,9 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	const baseFetch = args.fetch ?? fetch;
 	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	const gzipFetch = wrapAnthropicFetchForGzip(boundedFetch);
 	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, args.providerSessionId, "anthropic");
-	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(gzipFetch, openCodeGoSessionId);
 	const debugFetch = onSseEvent
 		? wrapFetchForSseDebug(providerScopedFetch, event => onSseEvent(event, model))
 		: providerScopedFetch;
@@ -3480,11 +3665,22 @@ function createClient(
  * request drops `thinking`/`output_config`. Reports whether the forced-choice branch
  * applied so the caller can keep the replayed history consistent with it.
  */
-function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming): boolean {
+function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming, modelId: string): boolean {
 	const toolChoice = params.tool_choice;
 	if (!toolChoice) return false;
 	if (toolChoice.type !== "any" && toolChoice.type !== "tool") return false;
-	delete params.thinking;
+	if (requiresAnthropicThinkingDisableWhenOff(modelId)) {
+		// Haiku 5+ enables adaptive thinking when `thinking` is omitted, which a forced tool
+		// choice rejects, and applies `output_config.effort` to all response tokens including
+		// tool-call arguments. Send an explicit `disabled` and keep the selected effort;
+		// effort is capped at `high` while thinking is disabled.
+		params.thinking = { type: "disabled" };
+		const effort = params.output_config?.effort;
+		if (effort === "xhigh" || effort === "max") params.output_config = { ...params.output_config, effort: "high" };
+		return true;
+	}
+	// An explicit `disabled` is compatible with forced tool use and is kept.
+	if (params.thinking?.type !== "disabled") delete params.thinking;
 	delete params.output_config;
 	return true;
 }
@@ -3728,7 +3924,7 @@ function applyExplicitPromptCaching(
 	}
 }
 
-function applyPromptCaching(
+export function applyPromptCaching(
 	params: AnthropicCacheParams,
 	cacheMode: AnthropicCacheMode,
 	cacheControl?: AnthropicCacheControl,
@@ -3737,9 +3933,22 @@ function applyPromptCaching(
 	if (!cacheControl || cacheMode === "none" || budget === 0) return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
-		// Automatic mode only ever emits one marker, so any non-zero budget
-		// covers it; the zero case already returned above.
-		params.cache_control = { ...cacheControl };
+		// A caller layout that already holds four block markers leaves no room for a new root marker;
+		// adding one anyway made validateCacheControls reject the request. An existing root is still replaced.
+		if (params.cache_control || countCacheControlBreakpoints(params) < 4) {
+			params.cache_control = { ...cacheControl };
+		}
+		// #2383's moving breakpoint reasoning holds within a session, not across
+		// sessions: anchor tools + system so new messages can reuse that prefix.
+		if (
+			budget > 1 &&
+			Array.isArray(params.system) &&
+			!params.system.some(block => block.cache_control) &&
+			countCacheControlBreakpoints(params) < 4
+		) {
+			const lastBlock = params.system.at(-1);
+			if (lastBlock) lastBlock.cache_control = { ...cacheControl };
+		}
 		return;
 	}
 	applyExplicitPromptCaching(params, cacheControl, budget);
@@ -3813,8 +4022,8 @@ function buildParams(
 			seqs.length > ANTHROPIC_STOP_SEQUENCES_MAX ? seqs.slice(0, ANTHROPIC_STOP_SEQUENCES_MAX) : seqs;
 	}
 
-	// Opus 4.7+ rejects non-default sampling parameters with 400 error.
-	if (hasOpus47ApiRestrictions(model.id)) {
+	// Opus 4.7+ and Haiku 5+ reject non-default sampling parameters.
+	if (hasAnthropicModelSamplingRestrictions(model.id)) {
 		delete params.top_p;
 		delete params.top_k;
 		delete params.temperature;
@@ -3834,7 +4043,9 @@ function buildParams(
 	}
 
 	const miniMaxMode = getMiniMaxThinkingMode(model, baseUrl);
-	if (model.reasoning && miniMaxMode === "toggle") {
+	if (options?.thinkingEnabled === false && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+		params.thinking = { type: "disabled" };
+	} else if (model.reasoning && miniMaxMode === "toggle") {
 		// MiniMax's Messages endpoint defaults to off and only supports a
 		// switch. Claude budget_tokens/output_config.effort do not apply.
 		if (options?.thinkingEnabled !== undefined) {
@@ -3850,8 +4061,8 @@ function buildParams(
 
 			const compat = getAnthropicCompat(model);
 			if (mode === "anthropic-adaptive" && !compat.disableAdaptiveThinking) {
-				// Starting with Anthropic model Opus 4.7, adaptive thinking content is omitted from the
-				// response by default. Opt into summarized reasoning so thinking deltas keep
+				// Opus 4.7+, Fable, and Haiku 5+ omit adaptive thinking content by
+				// default. Opt into summarized reasoning so thinking deltas keep
 				// streaming with human-readable content for callers that rely on it.
 				const adaptive: { type: "adaptive"; display?: AnthropicThinkingDisplay } = { type: "adaptive" };
 				if (supportsAdaptiveThinkingDisplay(model.id)) {
@@ -3909,7 +4120,7 @@ function buildParams(
 	// that pair with `thinking`/`redacted_thinking` blocks "cannot be modified", so the
 	// replay has to degrade in the same rebuild. Runs before the billing/system payload
 	// snapshot so the attribution hash covers the messages actually sent.
-	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+	if (disableThinkingIfToolChoiceForced(params, model.id) && hasNativeThinkingBlocks(params.messages)) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,

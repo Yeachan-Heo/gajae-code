@@ -5,14 +5,19 @@
  */
 
 import * as fs from "node:fs/promises";
-import * as http from "node:http";
-import * as https from "node:https";
+import type * as http from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent, logger, redactCrashSecrets } from "@gajae-code/utils";
 import * as git from "../../../utils/git";
-import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../../../web/insane/url-guard";
+import {
+	openPinnedResponse,
+	readResponseBody,
+	validateResponseFraming,
+	withAbortSignal,
+} from "../../../web/hardened-http";
+import { isPrivateOrSpecialAddress, normalizeUrlHostname, validatePublicHttpUrl } from "../../../web/insane/url-guard";
 
 import type { MarketplaceCatalog, MarketplaceSourceType } from "./types";
 import { isValidNameSegment } from "./types";
@@ -205,24 +210,6 @@ const URL_FETCH_MAX_HEADER_BYTES = 16 * 1024;
 const URL_FETCH_MAX_BYTES = 2 * 1024 * 1024;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-	if (signal.aborted) return Promise.reject(signal.reason);
-	const deferred = Promise.withResolvers<T>();
-	const abort = () => deferred.reject(signal.reason);
-	signal.addEventListener("abort", abort, { once: true });
-	operation.then(deferred.resolve, deferred.reject).finally(() => signal.removeEventListener("abort", abort));
-	return deferred.promise;
-}
-
-function normalizePeerAddress(address: string): string {
-	const normalized = address.toLowerCase();
-	return normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
-}
-
-function normalizeUrlHostname(hostname: string): string {
-	return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-}
-
 async function validateCatalogUrl(rawUrl: string, signal: AbortSignal) {
 	const url = new URL(rawUrl);
 	const hostname = normalizeUrlHostname(url.hostname);
@@ -239,59 +226,16 @@ async function validateCatalogUrl(rawUrl: string, signal: AbortSignal) {
 }
 
 function openCatalogResponse(url: URL, addresses: string[], signal: AbortSignal): Promise<http.IncomingMessage> {
-	const hostname = normalizeUrlHostname(url.hostname);
-	const approved = addresses.map(address => ({ address, family: net.isIP(address) }));
-	const approvedPeers = new Set(approved.map(record => normalizePeerAddress(record.address)));
-	const lookup: net.LookupFunction = (requestedHostname, options, callback) => {
-		const requestedFamily = options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : (options.family ?? 0);
-		const matching = approved.filter(record => requestedFamily === 0 || record.family === requestedFamily);
-		if (normalizeUrlHostname(requestedHostname) !== hostname || matching.length === 0) {
-			const error = Object.assign(new Error("No approved address for marketplace host"), { code: "ENOTFOUND" });
-			callback(error, options.all ? [] : "", 0);
-			return;
-		}
-		if (options.all) callback(null, matching);
-		else callback(null, matching[0].address, matching[0].family);
-	};
-	const deferred = Promise.withResolvers<http.IncomingMessage>();
-	const options: https.RequestOptions = {
-		protocol: url.protocol,
-		hostname,
-		port: url.port || undefined,
-		path: `${url.pathname}${url.search}`,
-		method: "GET",
-		headers: { Accept: "application/json", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
-		agent: false,
-		insecureHTTPParser: false,
-		lookup,
-		maxHeaderSize: URL_FETCH_MAX_HEADER_BYTES,
+	return openPinnedResponse({
+		url,
+		addresses,
 		signal,
-		...(url.protocol === "https:"
-			? { rejectUnauthorized: true, servername: net.isIP(hostname) === 0 ? hostname : undefined }
-			: {}),
-	};
-	const requestFn = url.protocol === "https:" ? https.request : http.request;
-	const request = requestFn(options, response => {
-		const peer = response.socket.remoteAddress;
-		if (!peer || isPrivateOrSpecialAddress(peer) || !approvedPeers.has(normalizePeerAddress(peer))) {
-			response.destroy();
-			deferred.reject(
-				new Error(`Refusing marketplace catalog response from unapproved connected peer ${peer ?? "unknown"}`),
-			);
-			return;
-		}
-		deferred.resolve(response);
+		headers: { Accept: "application/json", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
+		maxHeaderBytes: URL_FETCH_MAX_HEADER_BYTES,
+		lookupErrorMessage: "No approved address for marketplace host",
+		unapprovedPeerMessage: peer =>
+			`Refusing marketplace catalog response from unapproved connected peer ${peer ?? "unknown"}`,
 	});
-	request.once("error", deferred.reject);
-	const abort = () => {
-		request.destroy(signal.reason);
-		deferred.reject(signal.reason);
-	};
-	if (signal.aborted) abort();
-	else signal.addEventListener("abort", abort, { once: true });
-	request.once("close", () => signal.removeEventListener("abort", abort));
-	request.end();
-	return deferred.promise;
 }
 
 async function readCatalogResponse(
@@ -299,53 +243,18 @@ async function readCatalogResponse(
 	source: string,
 	signal: AbortSignal,
 ): Promise<string> {
-	const rawContentLengths: string[] = [];
-	let hasTransferEncoding = false;
-	for (let index = 0; index < response.rawHeaders.length; index += 2) {
-		const name = response.rawHeaders[index]?.toLowerCase();
-		if (name === "content-length") rawContentLengths.push(response.rawHeaders[index + 1] ?? "");
-		if (name === "transfer-encoding") hasTransferEncoding = true;
-	}
-	if (rawContentLengths.length > 1 || (rawContentLengths.length > 0 && hasTransferEncoding)) {
-		response.destroy();
-		throw new Error(`Marketplace catalog from ${source} has ambiguous response framing`);
-	}
-	const contentLength = response.headers["content-length"];
-	if (contentLength !== undefined) {
-		const declaredBytes =
-			typeof contentLength === "string" && /^\d+$/.test(contentLength) ? Number(contentLength) : NaN;
-		if (!Number.isSafeInteger(declaredBytes)) {
-			response.destroy();
-			throw new Error(`Marketplace catalog from ${source} has an invalid Content-Length`);
-		}
-		if (declaredBytes > URL_FETCH_MAX_BYTES) {
-			response.destroy();
-			throw new Error(`Marketplace catalog from ${source} exceeds the maximum size of 2 MiB`);
-		}
-	}
-
-	const abort = () => response.destroy(signal.reason);
-	if (signal.aborted) {
-		abort();
-		throw signal.reason;
-	}
-	signal.addEventListener("abort", abort, { once: true });
-	const chunks: Buffer[] = [];
-	let receivedBytes = 0;
-	try {
-		for await (const chunk of response) {
-			const bytes = Buffer.from(chunk);
-			receivedBytes += bytes.byteLength;
-			if (receivedBytes > URL_FETCH_MAX_BYTES) {
-				response.destroy();
-				throw new Error(`Marketplace catalog from ${source} exceeds the maximum size of 2 MiB`);
-			}
-			chunks.push(bytes);
-		}
-		return Buffer.concat(chunks, receivedBytes).toString("utf8");
-	} finally {
-		signal.removeEventListener("abort", abort);
-	}
+	validateResponseFraming(response, {
+		ambiguousMessage: `Marketplace catalog from ${source} has ambiguous response framing`,
+		invalidContentLengthMessage: `Marketplace catalog from ${source} has an invalid Content-Length`,
+		maxBytes: URL_FETCH_MAX_BYTES,
+		oversizeMessage: `Marketplace catalog from ${source} exceeds the maximum size of 2 MiB`,
+	});
+	const body = await readResponseBody(response, {
+		maxBytes: URL_FETCH_MAX_BYTES,
+		signal,
+		oversizeMessage: `Marketplace catalog from ${source} exceeds the maximum size of 2 MiB`,
+	});
+	return body.toString("utf8");
 }
 
 async function fetchMarketplaceCatalogUrl(source: string): Promise<string> {

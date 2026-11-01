@@ -84,6 +84,7 @@ export function finalizeReport(input: FinalizeInput): DoctorReport {
 	const checks = input.checks.map(check => ({ ...check, evidence: sanitizeEvidence(check.evidence) }));
 	const repairs = (input.repairs ?? []).map(repair => ({
 		...repair,
+		...(repair.diagnostic ? { diagnostic: sanitize(repair.diagnostic) as string } : {}),
 		candidates: repair.candidates.map(candidate => ({
 			...candidate,
 			evidence: sanitizeEvidence(candidate.evidence),
@@ -171,6 +172,7 @@ export function renderDoctorText(report: DoctorReport): string {
 		lines.push(`- repair ${repair.id}: ${repair.state}`);
 		lines.push(`  target: ${repair.targetId}`);
 		if (repair.readiness.length) lines.push(`  readiness: ${repair.readiness.join(", ")}`);
+		if (repair.diagnostic) lines.push(`  diagnostic: ${repair.diagnostic}`);
 	}
 	return `${lines.join("\n")}\n`;
 }

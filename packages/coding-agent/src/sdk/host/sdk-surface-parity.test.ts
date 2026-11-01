@@ -133,6 +133,21 @@ describe("SDK surface parity", () => {
 		expect(policy.installedQueries.has("skill.list/state")).toBe(false);
 	});
 
+	test("private image operations are advertised only when the host installs staging", () => {
+		for (const available of [false, true]) {
+			const policy = createSdkSurfacePolicy({
+				bindings: [],
+				workflowGateAvailable: false,
+				imageUploadsAvailable: available,
+			});
+			const capabilities = createSdkCapabilities(policy);
+			expect(capabilities.operations.filter(operation => operation.startsWith("turn.image."))).toEqual(
+				available ? ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"] : [],
+			);
+			expect(capabilities.operations).toContain("turn.prompt");
+		}
+	});
+
 	test("request results, replay order, and typed protocol errors match across transports", async () => {
 		const nativeTransport = memoryTransport();
 		const loopbackTransport = memoryTransport();

@@ -31,8 +31,8 @@ export interface StartupAuthConfigSnapshot {
 	credentialPinStoreIdentity?: string;
 	credentialRankingMode: CredentialRankingMode;
 	credentialPins: Readonly<Record<string, string>>;
-	/** Soft per-provider preferences; only portable `email:`/`account:` selectors are accepted. */
-	credentialPreferences: Readonly<Record<string, ConfiguredCredentialPreference>>;
+	/** Ordered soft per-provider preferences; only portable email/`account:` selectors are accepted. */
+	credentialPreferences: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 }
 
 export type StartupAuthConfigErrorKind =
@@ -72,7 +72,6 @@ const LEGACY_LITERAL_AUTH_KEYS = new Set([
 	"auth.credentialRankingMode",
 	"auth.credentialPins",
 	"auth.credentialPreferences",
-	"auth.credentialPreferenceMaxUsedPercent",
 ]);
 
 function configPathForAgentDir(agentDir: string): string {
@@ -87,7 +86,7 @@ function shortenConfigPath(configPath: string): string {
 	return absolutePath.startsWith(homePrefix) ? `~${absolutePath.slice(homePath.length)}` : absolutePath;
 }
 
-function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
+export function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
 	return new StartupAuthConfigError(kind, configPathForAgentDir(agentDir));
 }
 
@@ -109,18 +108,67 @@ export function isValidPersistedCredentialSelector(value: string): boolean {
 	return parsePersistedCredentialSelector(value) !== undefined;
 }
 
+/** JSON-schema pattern for a preference account; shared with {@link parsePreferenceAccount}. */
+export const PREFERENCE_ACCOUNT_PATTERN = "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$";
+
 /**
- * Validate the selector grammar used by `auth.credentialPreferences`. Numeric row ids are excluded: they are bound
- * to one credential store, and a preference has no store-identity binding to detect a retargeted row.
+ * Parse one `auth.credentialPreferences` account: a bare email, `email:<address>`, or `account:<id>`. Numeric row ids
+ * are excluded: they are bound to one credential store, and a preference has no store-identity binding to detect a
+ * retargeted row.
  */
-export function parsePortableCredentialSelector(value: string): AuthCredentialSelector | undefined {
-	const selector = parsePersistedCredentialSelector(value);
-	return selector?.kind === "id" ? undefined : selector;
+export function parsePreferenceAccount(value: string): AuthCredentialSelector | undefined {
+	const trimmed = value.trim();
+	const selector = parsePersistedCredentialSelector(trimmed);
+	if (selector) return selector.kind === "id" ? undefined : selector;
+	return /^[^@\s:]+@[^@\s]+$/.test(trimmed) ? { kind: "email", value: trimmed } : undefined;
 }
 
-/** `auth.credentialPreferenceMaxUsedPercent` accepts (0, 100]; 100 rotates away only once the account is blocked. */
-export function isValidCredentialPreferenceMaxUsedPercent(value: unknown): value is number {
+/** A preference cap accepts (0, 100]; 100 moves past the account only once it is blocked. */
+export function isValidCredentialPreferenceCap(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 100;
+}
+
+/** Canonical config text for one preference entry: the account, or a one-key `{ account: cap }` mapping. */
+export type CredentialPreferenceEntryValue = string | Readonly<Record<string, number>>;
+
+function parseCredentialPreferenceEntry(value: unknown): ConfiguredCredentialPreference | undefined {
+	if (typeof value === "string") {
+		const selector = parsePreferenceAccount(value);
+		return selector ? { selector } : undefined;
+	}
+	const entry = asRecord(value);
+	const fields = entry ? Object.entries(entry) : [];
+	if (fields.length !== 1) return undefined;
+	const [account, cap] = fields[0]!;
+	const selector = parsePreferenceAccount(account);
+	if (!selector || !isValidCredentialPreferenceCap(cap)) return undefined;
+	return cap === 100 ? { selector } : { selector, maxUsedFraction: cap / 100 };
+}
+
+function preferenceSelectorKey(selector: AuthCredentialSelector): string {
+	return `${selector.kind}:${selector.kind === "email" ? selector.value.toLowerCase() : selector.value}`;
+}
+
+/**
+ * Parse one provider's `auth.credentialPreferences` value: a single account, or a non-empty ordered list whose
+ * entries are an account (`me@example.com`) or an account with a usage cap in percent (`me@example.com: 75`).
+ * Returns undefined for any invalid value, including an account listed twice, so a typo fails closed instead of
+ * silently changing the order.
+ */
+export function parseCredentialPreferenceList(value: unknown): ConfiguredCredentialPreference[] | undefined {
+	const rawEntries = Array.isArray(value) ? value : [value];
+	if (rawEntries.length === 0) return undefined;
+	const entries: ConfiguredCredentialPreference[] = [];
+	const seen = new Set<string>();
+	for (const rawEntry of rawEntries) {
+		const entry = parseCredentialPreferenceEntry(rawEntry);
+		if (!entry) return undefined;
+		const key = preferenceSelectorKey(entry.selector);
+		if (seen.has(key)) return undefined;
+		seen.add(key);
+		entries.push(entry);
+	}
+	return entries;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -169,8 +217,9 @@ function throwLegacyLiteralKeyError(keys: string[]): never {
 			"  credentialPins:\n" +
 			"    <provider>: id:<positive-id>\n" +
 			"  credentialPreferences:\n" +
-			"    <provider>: email:<address>\n" +
-			"  credentialPreferenceMaxUsedPercent: <0-100, exclusive of 0>\n" +
+			"    <provider>:\n" +
+			"      - <email>\n" +
+			"      - <email>: <max used percent, above 0 and at most 100>\n" +
 			"Do not copy secret values into command output; rewrite the file by hand.",
 	);
 }
@@ -201,27 +250,21 @@ function readCredentialPins(
 function readCredentialPreferences(
 	auth: Record<string, unknown> | undefined,
 	configPath: string,
-): Readonly<Record<string, ConfiguredCredentialPreference>> {
-	const rawMaxUsedPercent = auth?.credentialPreferenceMaxUsedPercent;
-	if (rawMaxUsedPercent !== undefined && !isValidCredentialPreferenceMaxUsedPercent(rawMaxUsedPercent)) {
-		throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
-	}
+): Readonly<Record<string, readonly ConfiguredCredentialPreference[]>> {
 	const rawPreferences = auth?.credentialPreferences;
 	if (rawPreferences === undefined) return {};
 	const preferences = asRecord(rawPreferences);
 	if (!preferences) throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
 
-	const maxUsedFraction =
-		rawMaxUsedPercent === undefined || rawMaxUsedPercent === 100 ? undefined : rawMaxUsedPercent / 100;
-	const result: Record<string, ConfiguredCredentialPreference> = {};
-	for (const [provider, rawSelector] of Object.entries(preferences)) {
+	const result: Record<string, readonly ConfiguredCredentialPreference[]> = {};
+	for (const [provider, rawList] of Object.entries(preferences)) {
 		const normalizedProvider = provider.trim();
 		if (normalizedProvider.length === 0 || /[\u0000-\u001f\u007f]/u.test(normalizedProvider)) {
 			throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
 		}
-		const selector = typeof rawSelector === "string" ? parsePortableCredentialSelector(rawSelector) : undefined;
-		if (!selector) throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
-		result[normalizedProvider] = maxUsedFraction === undefined ? { selector } : { selector, maxUsedFraction };
+		const entries = parseCredentialPreferenceList(rawList);
+		if (!entries) throw new StartupAuthConfigError("invalid-credential-preferences", configPath);
+		result[normalizedProvider] = entries;
 	}
 	return result;
 }
@@ -230,7 +273,7 @@ interface GlobalStartupAuthYaml {
 	auth: Record<string, unknown> | undefined;
 	credentialPinStoreIdentity: string | undefined;
 	credentialPins: Readonly<Record<string, string>>;
-	credentialPreferences: Readonly<Record<string, ConfiguredCredentialPreference>>;
+	credentialPreferences: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 }
 
 const EMPTY_GLOBAL_STARTUP_AUTH: GlobalStartupAuthYaml = {

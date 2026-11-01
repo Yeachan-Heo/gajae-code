@@ -15,6 +15,7 @@ import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { ty
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
 import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
+import { wrapUntrustedContent } from "../../tools/fetch";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import {
@@ -157,7 +158,7 @@ export function formatSearchResponseForLlm(response: SearchResponse): string {
 		}
 	}
 
-	return `<untrusted-content>\n${parts.join("\n").replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n</untrusted-content>`;
+	return wrapUntrustedContent(parts.join("\n"));
 }
 
 interface ExecuteSearchOptions {

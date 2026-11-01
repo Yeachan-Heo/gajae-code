@@ -40,17 +40,23 @@ function stripInlineShellComment(value: string): string {
 }
 
 /**
- * Strips an unquoted trailing `# comment` from a dotenv value the way Bun's
- * dotenv loader does: an unescaped `#` starts a comment regardless of the
- * preceding character (`a#b` loads as `a`), while `#` inside quotes or after a
- * backslash escape survives. Used only by `parseEnvFile`; shell files use
+ * Strips an unquoted trailing `# comment` the way Bun's dotenv loader does.
+ * Outside quotes, `#` starts a comment even after a backslash (`a\#b` loads
+ * as `a\`). A backslash before a quote does not open a quoted span
+ * (`a\"b#c` loads as `a\"b`). Inside quotes, a backslash skips the next byte,
+ * so `#` and the closer stay in the value. Shell files use
  * `stripInlineShellComment`, whose POSIX rule requires whitespace before `#`.
  */
 function stripInlineDotenvComment(value: string): string {
 	let quote: '"' | "'" | undefined;
 	for (let i = 0; i < value.length; i++) {
 		const char = value[i];
-		if (char === "\\") {
+		const next = value[i + 1];
+		if (!quote && char === "\\" && (next === '"' || next === "'")) {
+			i++;
+			continue;
+		}
+		if (quote && char === "\\") {
 			i++;
 			continue;
 		}
@@ -72,30 +78,27 @@ function stripInlineDotenvComment(value: string): string {
  */
 export function parseShellEnvFile(filePath: string): Record<string, string> {
 	const result: Record<string, string> = {};
-	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) continue;
+	const content = readEnvFile(filePath).content;
+	if (content === undefined) return result;
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
 
-			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
-			if (!match) continue;
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
+		if (!match) continue;
 
-			const key = match[1];
-			if (!isValidEnvName(key)) continue;
+		const key = match[1];
+		if (!isValidEnvName(key)) continue;
 
-			let value = stripInlineShellComment(match[2] ?? "").trim();
-			if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-			if (/[$`]/.test(value)) continue;
-
-			result[key] = value;
+		let value = stripInlineShellComment(match[2] ?? "").trim();
+		if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
+		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+			value = value.slice(1, -1);
 		}
-	} catch {
-		// File doesn't exist or can't be read - return empty result
+		if (!isSafeEnvValue(value)) continue;
+		if (/[$`]/.test(value)) continue;
+
+		result[key] = value;
 	}
 
 	return result;
@@ -111,20 +114,18 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * `filterCredentialInheritedEnv`) decide provenance by comparing
  * `process.env` against this parse, so the accepted syntax must be a superset
  * of what Bun's own dotenv loader honors in `cwd/.env`: `export KEY=value`,
- * whitespace around `=` or `:`, and `#` comments after unquoted values (quotes keep
- * their `#`). Values that Bun would expand (`$VAR`, `${VAR}`, backticks,
+ * whitespace around `=` or `:`, and `#` comments after unquoted values, including
+ * a backslash before `#` (quotes keep their `#`). Values that Bun would expand
+ * (`$VAR`, `${VAR}`, backticks,
  * command substitution) are kept as their literal text: the trust rule only
  * needs the parser to see the key at all, and an operator environment value
  * cannot equal attacker-written expansion text, so a literal parse stays
  * conservative.
  */
 export function parseEnvFile(filePath: string): Record<string, string> {
-	try {
-		return parseEnvFileContent(fs.readFileSync(filePath, "utf-8"));
-	} catch {
-		// File doesn't exist or can't be read - return empty result
-		return {};
-	}
+	// A missing, unreadable, or non-regular file yields an empty result.
+	const content = readEnvFile(filePath).content;
+	return content === undefined ? {} : parseEnvFileContent(content);
 }
 
 /** Parse dotenv content that has already been read from a trusted file. */
@@ -189,10 +190,28 @@ export function canonicalEnvKey(name: string): string {
  * Keys whose last declaration is not safe to value-compare.
  *
  * The line parser drops the suffix after the first unescaped closing quote,
- * matching Bun, and strips an unquoted `#` comment. Classification refuses a
- * value that parser would not store the way Bun loaded it. Other backslashes
- * stay in the compared text. The bytes inside the quotes are not decoded.
+ * matching Bun, and strips an unquoted `#` comment even when a backslash
+ * precedes the hash. Classification refuses a value that parser would not
+ * store the way Bun loaded it. Other backslashes stay in the compared text.
+ * The bytes inside the quotes are not decoded.
  */
+/**
+ * Keys Bun's dotenv loader accepts that are not shell identifiers. Bun loads
+ * names containing `-` or `.` (e.g. `npm_config_node-options`, which npm reads as
+ * `node-options`), but the line parser keeps only identifiers, so provenance
+ * would never see them. They are refused as dynamic, like a dropped quoted key.
+ */
+function nonIdentifierDeclarationKeys(content: string): Set<string> {
+	const keys = new Set<string>();
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const key = /^(?:export\s+)?([A-Za-z0-9_.-]+)\s*(?:=|:)/.exec(trimmed)?.[1];
+		if (key && !isValidEnvName(key)) keys.add(canonicalEnvKey(key));
+	}
+	return keys;
+}
+
 function quotedDeclarationKeys(content: string): Set<string> {
 	const quoted = new Set<string>();
 	for (const line of content.split("\n")) {
@@ -282,13 +301,21 @@ export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	];
 }
 
-function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?: string; incomplete: boolean } {
+/**
+ * Read an env file only if it is a regular file. A FIFO or device file would block
+ * `readFileSync` until a writer appears (Bun's own dotenv autoload skips them), so
+ * the open is non-blocking and fstat rejects anything else before a read. A
+ * missing file is complete and empty; any other failure is `incomplete`.
+ * `maxFileBytes` additionally bounds the read.
+ */
+function readEnvFile(filePath: string, maxFileBytes?: number): { content?: string; incomplete: boolean } {
 	let fileDescriptor: number | undefined;
 	try {
-		// Non-blocking open lets fstat reject FIFOs and device files before any read.
 		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
 		const initialStat = fs.fstatSync(fileDescriptor);
-		if (!initialStat.isFile() || initialStat.size > maxFileBytes) return { incomplete: true };
+		if (!initialStat.isFile()) return { incomplete: true };
+		if (maxFileBytes === undefined) return { content: fs.readFileSync(fileDescriptor, "utf-8"), incomplete: false };
+		if (initialStat.size > maxFileBytes) return { incomplete: true };
 
 		const buffer = Buffer.allocUnsafe(maxFileBytes + 1);
 		let bytesRead = 0;
@@ -311,6 +338,37 @@ function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?:
 	}
 }
 
+/**
+ * True when Bun expands the declaration at load time.
+ * A backslash before `$` is a literal dollar, the same rule as project-value
+ * expansion. Any other `$`, and any backtick, is still an expansion.
+ */
+export function projectDeclarationIsDynamic(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const char = value[index];
+		if (char === "\\" && value[index + 1] === "$") {
+			index++;
+			continue;
+		}
+		if (char === "$" || char === "`") return true;
+	}
+	return false;
+}
+
+/** Bun drops a backslash before `$`. Equality uses that decoded literal. */
+export function decodeEscapedProjectLiteral(value: string): string {
+	let result = "";
+	for (let index = 0; index < value.length; index++) {
+		if (value[index] === "\\" && value[index + 1] === "$") {
+			result += "$";
+			index++;
+			continue;
+		}
+		result += value[index] ?? "";
+	}
+	return result;
+}
+
 export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnapshotOptions = {}): ProjectEnvSnapshot {
 	if (
 		options.maxFileBytes !== undefined &&
@@ -324,36 +382,31 @@ export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnaps
 	let incomplete = false;
 	for (const file of files) {
 		const filePath = path.join(cwd, file);
-		let content: string;
-		if (options.maxFileBytes === undefined) {
-			try {
-				content = fs.readFileSync(filePath, "utf-8");
-			} catch {
-				continue;
-			}
-		} else {
-			const boundedRead = readBoundedEnvFile(filePath, options.maxFileBytes);
-			if (boundedRead.incomplete) {
-				incomplete = true;
-				continue;
-			}
-			if (boundedRead.content === undefined) continue;
-			content = boundedRead.content;
+		const read = readEnvFile(filePath, options.maxFileBytes);
+		if (read.incomplete) {
+			incomplete = true;
+			continue;
 		}
+		if (read.content === undefined) continue;
+		const content = read.content;
 		const quoted = quotedDeclarationKeys(content);
 		const seen = new Set<string>();
 		for (const [rawKey, value] of Object.entries(parseEnvFileContent(content))) {
 			const key = canonicalEnvKey(rawKey);
 			seen.add(key);
-			values[key] = value;
 			// A quoted declaration Bun may decode differently is refused, same as `$`.
 			// Unquoted values, and one plain pair of quotes, still compare by text.
-			if (quoted.has(key) || /[$`]/.test(value)) dynamic.add(key);
+			// An escaped dollar is a literal. Store Bun's decoded text so equality
+			// still sees the project value. A real `$` or backtick stays dynamic.
+			const expands = projectDeclarationIsDynamic(value);
+			values[key] = expands || quoted.has(key) ? value : decodeEscapedProjectLiteral(value);
+			if (quoted.has(key) || expands) dynamic.add(key);
 			else dynamic.delete(key);
 		}
-		// The line parser drops a key when `.` cannot cross a carriage return.
-		// Keep that key in the snapshot so the value Bun loaded is not an override.
-		for (const key of quoted) {
+		// The line parser drops a key when `.` cannot cross a carriage return, or
+		// when Bun accepts a non-identifier name. Keep that key in the snapshot so
+		// the value Bun loaded is not an override.
+		for (const key of [...quoted, ...nonIdentifierDeclarationKeys(content)]) {
 			if (seen.has(key)) continue;
 			values[key] = "";
 			dynamic.add(key);

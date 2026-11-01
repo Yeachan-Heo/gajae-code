@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import { streamOpenAICompletions } from "../src/providers/openai-completions";
+import type { Context, Model, ServiceTier } from "../src/types";
 import {
 	getPriorityPremiumRequests,
 	isFastModeEffectiveForProvider,
@@ -174,5 +176,73 @@ describe("shouldSendServiceTier", () => {
 	it("returns false for undefined/null tier", () => {
 		expect(shouldSendServiceTier(undefined, "openai")).toBe(false);
 		expect(shouldSendServiceTier(null, "openai")).toBe(false);
+	});
+});
+
+const originalFetch = global.fetch;
+
+const context: Context = {
+	systemPrompt: [],
+	messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
+};
+
+function completionsSseResponse(): Response {
+	const payload = [
+		{ choices: [{ delta: { content: "ok" }, index: 0 }] },
+		{ choices: [{ delta: {}, finish_reason: "stop", index: 0 }] },
+		"[DONE]",
+	]
+		.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`)
+		.join("\n\n");
+	return new Response(`${payload}\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+describe("DeepInfra service-tier wire behavior", () => {
+	afterEach(() => {
+		global.fetch = originalFetch;
+		vi.restoreAllMocks();
+	});
+
+	async function captureDeepInfraBody(serviceTier: ServiceTier): Promise<Record<string, unknown>> {
+		const model: Model<"openai-completions"> = {
+			id: "deepseek-ai/DeepSeek-V3.2",
+			name: "DeepSeek-V3.2",
+			api: "openai-completions",
+			provider: "deepinfra",
+			baseUrl: "https://api.deepinfra.com/v1/openai",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0.26, output: 0.38, cacheRead: 0.13, cacheWrite: 0 },
+			contextWindow: 163840,
+			maxTokens: 64000,
+		};
+		let capturedBody: Record<string, unknown> = {};
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			capturedBody = JSON.parse(
+				String(init?.body ?? (input instanceof Request ? await input.clone().text() : "{}")),
+			) as Record<string, unknown>;
+			return completionsSseResponse();
+		});
+		global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
+
+		const stream = streamOpenAICompletions(model, context, { apiKey: "test-key", serviceTier });
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+		return capturedBody;
+	}
+
+	it("forwards priority service_tier to DeepInfra chat completions", async () => {
+		const capturedBody = await captureDeepInfraBody("priority");
+
+		expect(capturedBody.model).toBe("deepseek-ai/DeepSeek-V3.2");
+		expect(capturedBody.service_tier).toBe("priority");
+	});
+
+	it.each(["flex", "scale"] as const)("does not forward %s service_tier to DeepInfra", async serviceTier => {
+		const capturedBody = await captureDeepInfraBody(serviceTier);
+
+		expect(capturedBody.model).toBe("deepseek-ai/DeepSeek-V3.2");
+		expect(capturedBody).not.toHaveProperty("service_tier");
 	});
 });

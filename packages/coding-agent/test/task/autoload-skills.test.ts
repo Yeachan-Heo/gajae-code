@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import fc from "fast-check";
 import { kNoAuth } from "../../src/config/model-registry";
 
 import { Settings } from "../../src/config/settings";
@@ -270,5 +271,128 @@ describe("autoloadSkills in executor", () => {
 		});
 
 		expect(callOrder).toEqual(["sendCustomMessage", "prompt"]);
+	});
+
+	function skillNamed(name: string): Skill {
+		return {
+			name,
+			description: name,
+			filePath: `/skills/${name}/SKILL.md`,
+			baseDir: `/skills/${name}`,
+			source: "user",
+		};
+	}
+
+	function yieldingSession(): AgentSession {
+		return createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-1",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+	}
+
+	async function preload(
+		agentSource: "project" | "user" | "bundled",
+		skills: Skill[],
+	): Promise<ReturnType<typeof vi.fn>> {
+		const session = yieldingSession();
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		vi.spyOn(skillsModule, "buildSkillPromptMessage").mockImplementation(async skill => ({
+			message: `Content of ${skill.name}`,
+			details: { name: skill.name, path: skill.filePath, lineCount: 1 },
+		}));
+		await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, source: agentSource },
+			autoloadSkills: skills,
+		});
+		return session.sendCustomMessage as ReturnType<typeof vi.fn>;
+	}
+
+	it("refuses bundled workflow skill preload from a project agent", async () => {
+		const send = await preload("project", ["ralplan", "ultragoal", "deep-interview", "autoresearch"].map(skillNamed));
+		expect(send).not.toHaveBeenCalled();
+	});
+
+	it("refuses a bundled workflow skill while delivering an ordinary skill for a project agent", async () => {
+		const send = await preload("project", [skillNamed("ralplan"), skillNamed("user-created-skill-a")]);
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send).toHaveBeenCalledWith(
+			expect.objectContaining({
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				details: { name: "user-created-skill-a", path: "/skills/user-created-skill-a/SKILL.md" },
+			}),
+			{ triggerTurn: false },
+		);
+	});
+
+	it("allows a user agent to preload a bundled workflow skill", async () => {
+		const send = await preload("user", [skillNamed("ralplan")]);
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]?.[0]).toMatchObject({ details: { name: "ralplan" } });
+	});
+
+	it("allows a bundled agent to preload a bundled workflow skill", async () => {
+		const send = await preload("bundled", [skillNamed("ultragoal")]);
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]?.[0]).toMatchObject({ details: { name: "ultragoal" } });
+	});
+
+	it("allows a project agent to preload an ordinary skill", async () => {
+		const send = await preload("project", [skillNamed("user-created-skill-a")]);
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]?.[0]).toMatchObject({ details: { name: "user-created-skill-a" } });
+	});
+
+	it("property refuses project preload of bundled workflow names", async () => {
+		const { projectAgentMayPreloadSkill } = await import("../../src/task/executor");
+		expect(typeof projectAgentMayPreloadSkill).toBe("function");
+		fc.assert(
+			fc.property(
+				fc.constantFrom("deep-interview", "ralplan", "ultragoal", "autoresearch"),
+				fc.constantFrom("", ".", " ", ". "),
+				fc.boolean(),
+				(name, suffix, upper) => {
+					const skillName = `${upper ? name.toUpperCase() : name}${suffix}`;
+					const decision = projectAgentMayPreloadSkill("project", skillName);
+					return decision === false && projectAgentMayPreloadSkill("project", skillName) === decision;
+				},
+			),
+			{ seed: 42611, numRuns: 64 },
+		);
+	});
+
+	it("property accepts ordinary names and non-project sources for workflow preload", async () => {
+		const { projectAgentMayPreloadSkill } = await import("../../src/task/executor");
+		const { isCanonicalGjcWorkflowSkillFilesystemAlias } = await import("../../src/skill-state/canonical-skills");
+		expect(typeof projectAgentMayPreloadSkill).toBe("function");
+		fc.assert(
+			fc.property(
+				fc
+					.string({ minLength: 1, maxLength: 32 })
+					.filter(name => !isCanonicalGjcWorkflowSkillFilesystemAlias(name)),
+				fc.constantFrom("project" as const, "user" as const, "bundled" as const),
+				(name, source) => {
+					const decision = projectAgentMayPreloadSkill(source, name);
+					return decision === true && projectAgentMayPreloadSkill(source, name) === decision;
+				},
+			),
+			{ seed: 42612, numRuns: 64 },
+		);
+		fc.assert(
+			fc.property(
+				fc.constantFrom("ralplan", "ultragoal", "deep-interview", "autoresearch"),
+				fc.constantFrom("user" as const, "bundled" as const),
+				(name, source) => projectAgentMayPreloadSkill(source, name) === true,
+			),
+			{ seed: 42613, numRuns: 64 },
+		);
 	});
 });

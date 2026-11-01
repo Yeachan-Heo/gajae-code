@@ -364,6 +364,8 @@ export interface ToolSession {
 	 * directory, or escapes the current scope.
 	 */
 	rescopeSessionCwd?: (path: string) => Promise<{ from: string; to: string }>;
+	/** Live ACP/SDK approval mode. Task children copy this at spawn; absent means `allow`. */
+	getSdkPermissionMode?: () => "prompt" | "allow" | "deny";
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */

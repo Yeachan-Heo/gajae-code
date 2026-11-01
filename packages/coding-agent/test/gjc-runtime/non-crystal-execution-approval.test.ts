@@ -250,6 +250,45 @@ describe("non-Crystal user-gated execution approval", () => {
 			});
 		});
 
+		// SessionManager full rewrites replace the transcript inode (atomic rename); consent binds content.
+		it(`${stage}: a SessionManager full rewrite after approval keeps consent valid at handoff`, async () => {
+			await withSession(async (cwd, manager, sessionId) => {
+				await publish(cwd, sessionId, stage);
+				await ask(cwd, manager, stage, "approve-report", false);
+				if (stage === "deep-interview") expect((await consume(cwd, sessionId)).status).toBe(0);
+				const transcriptPath = manager.getSessionFile()!;
+				const inodeBefore = (await fs.stat(transcriptPath)).ino;
+				await manager.rewriteEntries();
+				expect((await fs.stat(transcriptPath)).ino).not.toBe(inodeBefore);
+				const result = await handoff(cwd, sessionId, stage);
+				expect(result.status, result.stderr).toBe(0);
+				expect(JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8")).active).toBe(true);
+			});
+		});
+
+		// Records written before this change carry device/inode in transcript_boundary; they stay readable.
+		if (stage === "ralplan")
+			it("ralplan: a legacy record with device/inode boundary keys is accepted after a rewrite", async () => {
+				await withSession(async (cwd, manager, sessionId) => {
+					await publish(cwd, sessionId, stage);
+					await ask(cwd, manager, stage, "approve-report", false);
+					const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage);
+					const original = await fs.readFile(recordPath, "utf8");
+					const record = JSON.parse(original);
+					record.transcript_boundary = { ...record.transcript_boundary, device: "1", inode: "1" };
+					const legacy = JSON.stringify(record);
+					await fs.writeFile(recordPath, legacy);
+					// Re-seal the audit digest as the unpatched binary would have written it for this record.
+					const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+					const audit = await fs.readFile(auditPath(cwd, sessionId), "utf8");
+					expect(audit).toContain(sha(original));
+					await fs.writeFile(auditPath(cwd, sessionId), audit.replaceAll(sha(original), sha(legacy)));
+					await manager.rewriteEntries();
+					const result = await handoff(cwd, sessionId, stage);
+					expect(result.status, result.stderr).toBe(0);
+				});
+			});
+
 		it(`${stage}: a new persisted user message invalidates consent`, async () => {
 			await withSession(async (cwd, manager, sessionId) => {
 				await publish(cwd, sessionId, stage);

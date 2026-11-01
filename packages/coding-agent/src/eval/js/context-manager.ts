@@ -523,15 +523,41 @@ async function spawnJsWorker(): Promise<WorkerHandle> {
 }
 
 function wrapBunWorker(worker: Worker): WorkerHandle {
+	// Cells share parentPort, so worker→host frames use a port transferred before
+	// the first cell. worker "message" events are accepted only until ready.
+	const channel = new MessageChannel();
+	const hostPort = channel.port2;
+	const queued: WorkerOutbound[] = [];
+	let onFrame: ((msg: WorkerOutbound) => void) | undefined;
+	let acceptWorkerEvent = true;
+	const deliver = (msg: WorkerOutbound): void => {
+		if (msg?.type === "ready" || msg?.type === "init-failed") acceptWorkerEvent = false;
+		if (onFrame) onFrame(msg);
+		else queued.push(msg);
+	};
+	const onPort = (event: Event): void => {
+		deliver((event as MessageEvent).data as WorkerOutbound);
+	};
+	const onWorker = (event: Event): void => {
+		if (!acceptWorkerEvent) return;
+		deliver((event as MessageEvent).data as WorkerOutbound);
+	};
+	hostPort.addEventListener("message", onPort);
+	worker.addEventListener("message", onWorker);
+	worker.postMessage({ type: "gjc-bind", port: channel.port1 }, { transfer: [channel.port1] });
 	return {
 		mode: "worker",
 		send(msg) {
 			worker.postMessage(msg);
 		},
 		onMessage(handler) {
-			const wrap = (event: MessageEvent): void => handler(event.data as WorkerOutbound);
-			worker.addEventListener("message", wrap);
-			return () => worker.removeEventListener("message", wrap);
+			onFrame = handler;
+			for (const msg of queued.splice(0)) handler(msg);
+			return () => {
+				if (onFrame === handler) onFrame = undefined;
+				hostPort.removeEventListener("message", onPort);
+				worker.removeEventListener("message", onWorker);
+			};
 		},
 		async terminate() {
 			worker.terminate();

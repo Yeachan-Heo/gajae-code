@@ -2,7 +2,8 @@
  * Protocol handler for artifact:// URLs.
  *
  * Resolves artifact IDs only against artifacts directories explicitly authorized
- * by the caller's ResolveContext. Unlike agent://, artifacts are raw text.
+ * by the caller's ResolveContext. SSH output artifacts are marked untrusted so
+ * ReadTool wraps the selected text after applying selectors and truncation.
  *
  * URL form:
  * - artifact://<id> - Full artifact content
@@ -97,6 +98,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			contentType: "text/plain",
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: foundPath,
+			untrusted: path.basename(foundPath).endsWith(".ssh.log"),
 		};
 	}
 }

@@ -4,7 +4,7 @@ import type { AgentSideConnection, PromptRequest, SessionNotification } from "@a
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
 import { logger, TempDir } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpPromptPayload } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
@@ -12,6 +12,7 @@ import {
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
 } from "../src/sdk/prompt-watchdog";
+import { REQUEST_FRAME_BYTES } from "../src/sdk/transport/relay";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -529,6 +530,38 @@ async function startTurnAfterFence(fixture: Fixture): Promise<{ pending: Promise
 		throw outcome.kind === "rejected" ? outcome.error : new Error("Successor settled before delivery barrier");
 	}
 }
+
+test("oversize ACP images are rejected before dispatch without losing the session", async () => {
+	const fixture = await createFixture();
+	const control = vi.spyOn(AcpSdkAdapter.prototype, "control");
+	try {
+		for (const dataLength of [REQUEST_FRAME_BYTES - 100, REQUEST_FRAME_BYTES + 1_000]) {
+			const request: PromptRequest = {
+				sessionId: fixture.sessionId,
+				prompt: [{ type: "image", mimeType: "image/png", data: "A".repeat(dataLength) }],
+			};
+			// The first payload fits; its real SDK envelope must still be refused.
+			if (dataLength < REQUEST_FRAME_BYTES)
+				expect(Buffer.byteLength(JSON.stringify(acpPromptPayload(request.prompt)))).toBeLessThan(
+					REQUEST_FRAME_BYTES,
+				);
+			await expect(fixture.agent.prompt(request)).rejects.toMatchObject({
+				code: "invalid_input",
+				message: expect.stringContaining("over the 256 KiB transport limit"),
+			});
+		}
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(control).not.toHaveBeenCalled();
+		expect(fixture.clock.pending).toBe(0);
+		const { pending } = await startTurn(fixture);
+		fixture.sendStopped("end_turn");
+		await expect(pending).resolves.toEqual({ stopReason: "end_turn" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		control.mockRestore();
+		fixture.dispose();
+	}
+});
 
 test("a prompt awaiting the model past the inference bound is rejected instead of hanging", async () => {
 	const fixture = await createFixture();

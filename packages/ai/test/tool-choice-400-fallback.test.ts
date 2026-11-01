@@ -20,6 +20,12 @@ const model: Model<"anthropic-messages"> = {
 	maxTokens: 8_192,
 };
 
+const haiku55Model: Model<"anthropic-messages"> = {
+	...model,
+	id: "claude-haiku-5-5",
+	name: "Claude Haiku 5.5",
+};
+
 const context: Context = {
 	messages: [{ role: "user", content: "Use the tool", timestamp: Date.now() }],
 	tools: [
@@ -129,6 +135,33 @@ beforeEach(() => {
 });
 
 describe("anthropic", () => {
+	it("keeps explicit Haiku thinking Off on the forced-tool request and its fallback", async () => {
+		const requestBodies: Array<{ tool_choice?: unknown; thinking?: unknown }> = [];
+		let attempt = 0;
+		const client = mockClient((params: unknown) => {
+			attempt += 1;
+			requestBodies.push(params as { tool_choice?: unknown; thinking?: unknown });
+			return attempt === 1
+				? createRejectedMockRequest(unsupportedForcedChoiceError())
+				: createMockRequest(successEvents());
+		});
+
+		const stream = streamAnthropic(haiku55Model, context, {
+			client,
+			thinkingEnabled: false,
+			toolChoice: { type: "tool", name: "resolve" },
+		});
+		for await (const _ of stream) {
+		}
+		await stream.result();
+
+		expect(attempt).toBe(2);
+		expect(requestBodies[0]?.tool_choice).toEqual({ type: "tool", name: "resolve" });
+		expect(requestBodies[0]?.thinking).toEqual({ type: "disabled" });
+		expect(requestBodies[1]?.tool_choice).toBeUndefined();
+		expect(requestBodies[1]?.thinking).toEqual({ type: "disabled" });
+	});
+
 	it("retries forced tool_choice 400s once without the forced field and emits a single terminal event", async () => {
 		const requestBodies: Array<{ tool_choice?: unknown }> = [];
 		let attempt = 0;

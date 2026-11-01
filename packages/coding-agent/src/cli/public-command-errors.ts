@@ -105,12 +105,20 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 		"The --op value is not a known SDK operation id for this command. Per-session control ids include turn.prompt, turn.steer, turn.follow_up, turn.abort and turn.abort_and_prompt.",
 	sdk_scope_requires_repository:
 		"The selected session-list scope requires a Git repository. Run inside a checkout, pass --repo <path>, or use --scope cwd or --scope all.",
+	sdk_operator_control_unsupported:
+		"The session's host does not publish operator control authority, so the broker did not send the operator abort and nothing was stopped. The host likely runs a gjc release that predates operator control; restart that session with a current gjc. Retrying the same request will not succeed.",
 	router_cleanup_failed: "SDK session Router cleanup failed.",
 	broker_cleanup_failed: "SDK broker client cleanup failed.",
 	// The broker reports this code from several distinct causes, so the text names none
 	// of them and never implies that another key would be safe.
 	lifecycle_idempotency_conflict:
 		"The broker reported an idempotency conflict. Reconcile existing lifecycle state before deciding whether another request is safe.",
+	lifecycle_legacy_history_ambiguous:
+		"The broker refused admission because legacy lifecycle history cannot prove this target is unrelated. This request was not dispatched; this refusal does not settle earlier effects. Preserve the ledger and original operation, request key, and target. For a prior session.create, use read-only session.lookup with its original key and create target; not_found is not proof of no effect. An empty transcript, stopped host, or fresh key does not resolve this fence. Do not edit the ledger, force deletion, or retry with another key; missing identity or terminal effect evidence requires operator investigation.",
+	// Refusals of the request payload itself: the broker's own text names the missing field
+	// (a required `sessionPath`, for one), and it is never rendered, so the class is named here.
+	lifecycle_input_refused:
+		"The broker refused the request as invalid input. Correct the request payload and reconcile existing lifecycle state before deciding whether another request is safe.",
 	usage_transport_exclusive: "Specify exactly one of --stdio or --socket <path>.",
 	usage_duplicate_option: "Each option on this command may occur at most once.",
 	usage_unknown_argument: "An unrecognized argument was supplied; re-read the command help for its accepted grammar.",

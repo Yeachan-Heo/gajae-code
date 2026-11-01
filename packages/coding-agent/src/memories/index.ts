@@ -197,7 +197,13 @@ export async function buildMemoryToolDeveloperInstructions(
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Delete every memory row and memory job in the shared local database, then remove
+ * only the current project's memory directory.
+ *
+ * Database deletion is not scoped to `cwd`. Filesystem cleanup removes the
+ * directory that `getMemoryRoot(agentDir, cwd)` returns. Project paths that
+ * differ only in `/`, `\`, or `:` versus `-` map to the same directory, so that
+ * shared directory is removed too.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -206,6 +212,7 @@ export async function clearMemoryData(agentDir: string, cwd: string): Promise<vo
 	} finally {
 		closeMemoryDb(db);
 	}
+	// Filesystem cleanup is the current project directory only.
 	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
 }
 
@@ -681,23 +688,27 @@ async function runStage1Job(options: {
 async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[]): Promise<void> {
 	const summariesDir = path.join(memoryRoot, "rollout_summaries");
 	await fs.mkdir(summariesDir, { recursive: true });
+	const summariesRoot = path.resolve(summariesDir);
 
 	const keepFiles = new Set<string>();
 	for (const row of outputs) {
-		const stem = formatRolloutFilename(row.threadId, row.rolloutSlug);
-		const filename = `${stem}.md`;
+		const target = rolloutSummaryDestination(summariesRoot, row.threadId, row.rolloutSlug);
+		if (!target) continue;
+		const filename = path.basename(target);
 		keepFiles.add(filename);
 		const body = [`thread_id: ${row.threadId}`, `updated_at: ${row.sourceUpdatedAt}`, "", row.rolloutSummary].join(
 			"\n",
 		);
-		await Bun.write(path.join(summariesDir, filename), `${body.trim()}\n`);
+		await Bun.write(target, `${body.trim()}\n`);
 	}
 
 	const currentFiles = await fs.readdir(summariesDir).catch(() => [] as string[]);
 	for (const file of currentFiles) {
 		if (!file.endsWith(".md")) continue;
 		if (keepFiles.has(file)) continue;
-		await fs.rm(path.join(summariesDir, file), { force: true });
+		const target = containedExistingSummary(summariesRoot, file);
+		if (!target) continue;
+		await fs.rm(target, { force: true });
 	}
 
 	const rawBody = buildRawMemoriesMarkdown(outputs);
@@ -925,6 +936,55 @@ function formatRolloutFilename(threadId: string, rolloutSlug: string | null): st
 	return `${threadId}-${normalized}`;
 }
 
+/** Lexical containment for one summary file name. A backslash is a separator only when the platform says so. */
+function lexicalSummaryTarget(summariesRoot: string, filename: string): string | undefined {
+	if (filename.length === 0 || filename.includes("\0") || filename.includes("/")) return undefined;
+	if (filename === "." || filename === "..") return undefined;
+	if (path.basename(filename) !== filename) return undefined;
+	const target = path.resolve(summariesRoot, filename);
+	const relative = path.relative(summariesRoot, target);
+	if (
+		relative.length === 0 ||
+		relative === ".." ||
+		relative.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relative) ||
+		relative !== filename
+	) {
+		return undefined;
+	}
+	return target;
+}
+
+/** New summary names stay portable: reject separators, including backslash. */
+function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
+	if (filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+/** Existing directory entries may contain a backslash on POSIX. Still refuse a name that leaves the directory. */
+function containedExistingSummary(summariesRoot: string, filename: string): string | undefined {
+	if (!filename.endsWith(".md")) return undefined;
+	if (path.sep === "\\" && filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+function rolloutSummaryDestination(
+	summariesRoot: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return containedSummaryFilename(summariesRoot, `${formatRolloutFilename(threadId, rolloutSlug)}.md`);
+}
+
+/** Test seam for the rollout summary path gate. */
+export function rolloutSummaryDestinationForTesting(
+	summariesDir: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return rolloutSummaryDestination(path.resolve(summariesDir), threadId, rolloutSlug);
+}
+
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
 	if (!text) return undefined;
 	try {
@@ -1041,6 +1101,29 @@ function redactSecrets(input: string): string {
 	for (const pattern of patterns) {
 		out = out.replace(pattern, "[REDACTED]");
 	}
+	return redactBearerAndBasicAssignments(out);
+}
+
+/**
+ * Bearer and Basic assignments have no vendor prefix, so the rules above miss
+ * them. A following word with no digit, "+", "/", or "=" stays, which keeps
+ * phrases such as "Basic authentication" and "the bearer of".
+ */
+function bearerOrBasicValueIsCredential(value: string): boolean {
+	if (value.length < 8) return false;
+	if (value.includes("+") || value.includes("/") || value.includes("=")) return true;
+	return value.length >= 12 && /[0-9]/.test(value);
+}
+
+function redactBearerAndBasicAssignments(input: string): string {
+	const labeled = /(["']?authorization["']?\s*[:=]\s*["']?)((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	const bare = /\b((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	let out = input.replace(labeled, (match, label: string, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${label}${scheme}[REDACTED]` : match,
+	);
+	out = out.replace(bare, (match, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${scheme}[REDACTED]` : match,
+	);
 	return out;
 }
 
@@ -1196,7 +1279,7 @@ async function resolveMemoryModel(options: {
 	const { modelRegistry, session, fallbackRole } = options;
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
+		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(session.credentialSessionId), {
 			settings: session.settings,
 			matchPreferences: { usageOrder: session.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry,
@@ -1210,7 +1293,7 @@ async function resolveMemoryModel(options: {
 	// before lazy model resolution): prefer the most recently used model over
 	// raw registry order. `getAll()[0]` can be a retired model the provider
 	// now rejects with 404, which permanently fails consolidation jobs.
-	const allModels = modelRegistry.getAll();
+	const allModels = modelRegistry.getAll(session.credentialSessionId);
 	const usageOrder = session.settings.getStorage()?.getModelUsageOrder() ?? [];
 	for (const usedKey of usageOrder) {
 		const match = allModels.find(model => `${model.provider}/${model.id}` === usedKey);

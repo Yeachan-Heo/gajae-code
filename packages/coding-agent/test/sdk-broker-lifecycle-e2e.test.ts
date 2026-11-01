@@ -20,7 +20,7 @@ import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
-import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, ensureBroker, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -6358,13 +6358,18 @@ test("broker distinguishes an absent ledger from a damaged ledger during create 
 			.filter(Boolean)
 			.map(line => JSON.parse(line) as Record<string, unknown>);
 		const damagedOperationRows = damagedRows.filter(row => row.identity === damagedIdentity);
-		expect(damagedOperationRows.findLast(row => row.operationKey === `session.create\0${damagedKey}`)).toMatchObject({
-			state: "terminal_uncertain",
-		});
-		const effectIntent = damagedOperationRows.findLast(row => row.state === "terminal_uncertain")?.effectIntent as
-			| { sessionId?: unknown }
-			| undefined;
-		if (typeof effectIntent?.sessionId === "string") damagedSessionId = effectIntent.sessionId;
+		// The broker writes its terminal row before verifying persistence. A damaged
+		// read-back makes the caller's answer conservative (`terminal_uncertain`), but
+		// the ledger keeps the proven terminal row: proven terminal records admit no
+		// successor, so the identity still replays the real create result on reopen.
+		const damagedTerminal = damagedOperationRows.findLast(
+			row => row.operationKey === `session.create\0${damagedKey}`,
+		);
+		expect(damagedTerminal).toMatchObject({ state: "terminal_ok" });
+		expect(damagedOperationRows.some(row => row.state === "terminal_uncertain")).toBe(false);
+		const damagedSessionIdFromLedger = (damagedTerminal?.response as { result?: { sessionId?: unknown } } | undefined)
+			?.result?.sessionId;
+		if (typeof damagedSessionIdFromLedger === "string") damagedSessionId = damagedSessionIdFromLedger;
 	} finally {
 		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
 		for (const [sessionId, key] of [
@@ -9417,10 +9422,17 @@ test("delayed lifecycle host cleanup does not unregister a file-only same-genera
 		child.kill("SIGTERM");
 		expect(await child.exited).toBe(0);
 		const reopened = await new SessionIndex(agentDir).open();
-		expect(reopened.indexSeq).toBe(successor.indexSeq);
+		const appendedRows = (
+			Bun.JSONL.parse(
+				await Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl")).text(),
+			) as SessionIndexEvent[]
+		).filter(event => event.indexSeq > successor.indexSeq);
 		const current = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
 		expect(current).toMatchObject({ terminal: false, endpointFileId: successor.endpointFileId });
 		expect(endpointIncarnation(current, sessionId)).toBe(endpointIncarnation(successor, sessionId));
+		// A host heartbeat already in flight can append after this registration; only
+		// retirement of either registration would violate this cleanup contract.
+		expect(appendedRows.every(event => event.type === "host_heartbeat")).toBe(true);
 		expect(reopened.hostUnregisteredAfter(registered)).toBeUndefined();
 		expect(reopened.hostUnregisteredAfter(successor)).toBeUndefined();
 	} finally {
@@ -9489,6 +9501,7 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);
 		expect(await readSdkBrokerDiscovery(agentDirs[2])).not.toBeNull();
 	} finally {
+		for (const agentDir of agentDirs) await brokerOwnerForTest(agentDir)?.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
@@ -9788,6 +9801,25 @@ test("session/list does not grant a second ACP connection destructive lifecycle 
 			]),
 		).resolves.toEqual([{}, {}]);
 	} finally {
+		await brokerOwnerForTest(agentDir)?.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);
+
+test("broker owner shuts down through its retained endpoint after agent directory removal", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-owner-dir-removed-"));
+	const agentDir = path.join(root, "agent");
+	const discovery = await ensureBroker({ agentDir });
+	const owner = brokerOwnerForTest(agentDir);
+	if (!owner) throw new Error("expected a locally owned SDK broker");
+	try {
+		expect(discovery.pid).not.toBe(process.pid);
+		await fs.rm(root, { recursive: true, force: true });
+		const stoppedAt = Date.now();
+		await owner.stop();
+		expect(Date.now() - stoppedAt).toBeLessThan(5_000);
+	} finally {
+		await owner.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

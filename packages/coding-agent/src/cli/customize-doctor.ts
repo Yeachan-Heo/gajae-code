@@ -22,6 +22,7 @@ import {
 	getPluginsNodeModules,
 	getPluginsPackageJson,
 	getProjectDir,
+	sanitizeDisplayLine,
 } from "@gajae-code/utils";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { findRepoRoot } from "../capability/fs";
@@ -54,6 +55,7 @@ import {
 	isCanonicalGjcWorkflowSkillFilesystemAlias,
 } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
+import { resolveDiscoveryPrecedence } from "./customize-doctor-precedence";
 
 // =============================================================================
 // Public types (stable JSON contract)
@@ -67,9 +69,10 @@ export type CustomizeSurfaceKind = "mcp" | "skill" | "hook" | "tool" | "extensio
  *
  * - `canonical`: project/global `.gjc` entries and GJC bundled defaults — the
  *   primary load path and the persisted authority for sessions.
- * - `convention`: items from registered non-native conventions that are part of
- *   the discovery load path (claude-plugins, claude/codex hooks, agents,
- *   cursor, gemini, opencode, windsurf, cline, github, mcp-json, ssh).
+ * - `convention`: items exposed by registered non-native discovery providers
+ *   (claude-plugins, claude/codex hooks, agents, cursor, gemini, opencode,
+ *   windsurf, cline, github, mcp-json, ssh). The item status identifies whether
+ *   a discovered item is active, stored-only, or otherwise excluded at runtime.
  * - `import-candidate`: Claude Code / Codex project (+ global) files on
  *   surfaces GJC deliberately never loads. Reported for provenance only; never
  *   active runtime authority. Candidates for a future import flow (#4291).
@@ -267,7 +270,7 @@ const SOURCE_CLASS_DESCRIPTIONS: Array<{ sourceClass: CustomizeSourceClass; desc
 	{
 		sourceClass: "convention",
 		description:
-			"Items from other registered conventions (claude-plugins, claude/codex hooks, agents, cursor, gemini, opencode, windsurf, cline, github, mcp-json, ssh) that are part of the discovery load path.",
+			"Items exposed by registered convention providers (claude-plugins, claude/codex hooks, agents, cursor, gemini, opencode, windsurf, cline, github, mcp-json, ssh); item status identifies runtime eligibility.",
 	},
 	{
 		sourceClass: "import-candidate",
@@ -394,6 +397,7 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 		nameOf: (item: T) => string;
 		pathOf: (item: T) => string;
 		extensionIdOf?: (item: T) => string | undefined;
+		precedenceEligible?: (item: T) => boolean;
 	},
 ): Promise<DiscoveredSet<T>> {
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
@@ -405,41 +409,34 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 		includeDisabledProviders: true,
 	});
 
-	// First item per dedup key wins (highest priority provider first in `all`).
-	const winners = new Map<string, { provider: string; scope: "user" | "project" | "native" }>();
-	const entries: DiscoveredEntry<T>[] = [];
-	for (const item of result.all) {
-		const key = capability.key(item);
-		const scope = scopeOf(item._source);
-		let shadowed = (item as { _shadowed?: boolean })._shadowed === true;
-		let shadowedBy: { provider: string; scope: string } | undefined;
-		if (key !== undefined) {
-			const winner = winners.get(key);
-			if (winner) {
-				shadowed = true;
-				shadowedBy = winner;
-			} else if (!disabledProviders.has(item._source.provider)) {
-				// Only enabled providers can own a dedup key; a disabled
-				// higher-priority provider must never shadow an enabled
-				// lower-priority source (includeDisabledProviders reports it
-				// as a listed item without giving it effective precedence).
-				winners.set(key, { provider: item._source.provider, scope });
-			}
-		}
-		entries.push({
+	// Resolve provider-order winners only after applying surface eligibility and
+	// the configured provider-disabled policy.
+	const resolvedPrecedence = resolveDiscoveryPrecedence(
+		result.all.map(item => ({
+			key: capability.key(item),
+			provider: item._source.provider,
+			scope: scopeOf(item._source),
+			eligible: options.precedenceEligible?.(item) ?? true,
+			enabled: !disabledProviders.has(item._source.provider),
+		})),
+	);
+	const entries: DiscoveredEntry<T>[] = result.all.map((item, index) => {
+		const precedence = resolvedPrecedence[index];
+		if (!precedence) throw new Error("discovery precedence result is missing an item");
+		return {
 			item,
 			name: options.nameOf(item),
 			path: options.pathOf(item),
 			provider: item._source.provider,
 			providerName: item._source.providerName,
-			scope,
+			scope: scopeOf(item._source),
 			priority: capability.providers.find(p => p.id === item._source.provider)?.priority ?? 0,
-			shadowed,
-			shadowedBy,
+			shadowed: precedence.shadowed,
+			shadowedBy: precedence.shadowedBy,
 			invalidReason: capability.validate?.(item),
 			extensionId: options.extensionIdOf?.(item),
-		});
-	}
+		};
+	});
 
 	entries.sort((a, b) => a.name.localeCompare(b.name) || a.provider.localeCompare(b.provider));
 
@@ -954,6 +951,7 @@ async function collectHooks(cwd: string, activeSettings: SettingsInstance): Prom
 	return collectNotExecutedAtStartup("hook", hookCapability, cwd, activeSettings, {
 		nameOf: hook => hook.name,
 		pathOf: hook => hook.path,
+		precedenceEligible: hook => hook.level !== "project",
 		notExecutedDetail:
 			"Trusted filesystem hook module discovered for session-start activation. Doctor does not execute the module, so dynamic Function Hook registrations and effective runtime order remain opaque until a session loads it.",
 		notExecutedRemediation: [
@@ -989,6 +987,7 @@ async function collectExtensions(cwd: string, activeSettings: SettingsInstance):
 interface NotExecutedOptions<T extends { _source: SourceMeta }> {
 	nameOf: (item: T) => string;
 	pathOf: (item: T) => string;
+	precedenceEligible?: (item: T) => boolean;
 	notExecutedDetail: string;
 	notExecutedRemediation: string[];
 }
@@ -1004,6 +1003,7 @@ async function collectNotExecutedAtStartup<T extends { _source: SourceMeta }>(
 		nameOf: options.nameOf,
 		pathOf: options.pathOf,
 		extensionIdOf: item => capability.toExtensionId?.(item),
+		precedenceEligible: options.precedenceEligible,
 	});
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
@@ -1017,6 +1017,18 @@ async function collectNotExecutedAtStartup<T extends { _source: SourceMeta }>(
 				"invalid-config",
 				`Invalid ${kind} definition: ${entry.invalidReason}.`,
 				[`Fix ${entry.path}`],
+			);
+		}
+		if (kind === "hook" && entry.scope === "project") {
+			return finalizeItem(
+				base,
+				"stored-only",
+				"storage-only",
+				"Project-scoped hooks are stored for inspection, but ordinary sessions do not load repository hook modules.",
+				[
+					"Import the hook into Global .gjc to load it for future sessions",
+					"or configure an explicit hook path if repository-local activation is intentional",
+				],
 			);
 		}
 		if (entry.extensionId !== undefined && disabledExts.has(entry.extensionId)) {
@@ -1360,13 +1372,12 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 // Foreign conventions (Claude project / Codex project)
 //
 // Claude Code / Codex project hooks are discovered by the registered
-// claude-hooks/codex-hooks providers (see discovery/index.ts) and appear in the
-// Hooks surface above; sessions surface them in the extension dashboard but do
-// not execute hook files. Every OTHER `.claude`/`.codex` surface (MCP, skills,
-// tools, extensions, commands, prompts, settings) is deliberately not part of
-// the load path: the doctor reports those files by invoking the canonical
-// provider load functions directly (without registering the providers) and
-// marks every such item as `ignored`.
+// claude-hooks/codex-hooks providers (see discovery/index.ts), but like native
+// project hooks are stored-only and are not imported by ordinary sessions.
+// Every OTHER `.claude`/`.codex` surface (MCP, skills, tools, extensions,
+// commands, prompts, settings) is deliberately not part of the load path: the
+// doctor reports those files by invoking canonical provider load functions
+// directly (without registering the providers) and marks them `ignored`.
 // =============================================================================
 
 interface ForeignConventionDescriptor {
@@ -1468,7 +1479,7 @@ function foreignItem(
 async function collectForeignConventions(cwd: string): Promise<ForeignConventionCollection> {
 	const ctx: LoadContext = { cwd, home: os.homedir(), repoRoot: await findRepoRoot(cwd) };
 	const itemsByKind: Map<CustomizeSurfaceKind, CustomizeDoctorItem[]> = new Map();
-	const policyNote = `${FOREIGN_CONVENTIONS.map(d => d.dirName).join(" and ")} project hooks are discovered by GJC (see the Hooks surface); all other ${FOREIGN_CONVENTIONS.map(d => d.providerName).join(" / ")} project config surfaces (MCP servers, skills, tools, extensions, commands, prompts, settings) are not part of the GJC load path. Those files are reported below as import candidates for provenance but are never discovered by sessions.`;
+	const policyNote = `${FOREIGN_CONVENTIONS.map(d => d.dirName).join(" and ")} project hooks are shown as stored-only (see the Hooks surface); ordinary sessions do not load repository hook modules. All other ${FOREIGN_CONVENTIONS.map(d => d.providerName).join(" / ")} project config surfaces (MCP servers, skills, tools, extensions, commands, prompts, settings) are not part of the GJC load path and are reported below as import candidates for provenance.`;
 
 	for (const desc of FOREIGN_CONVENTIONS) {
 		const inspection = await desc.inspect(ctx);
@@ -1658,14 +1669,22 @@ function formatShadowedBy(item: CustomizeDoctorItem): string {
 	return ` (shadowed by ${provider}/${scope})`;
 }
 
+// Discovery text is untrusted. Strip terminal controls at this boundary, with
+// no preview cut before it. Surface titles and summary labels use the same
+// helper. The structured report keeps the original name so session load
+// matching still compares that discovery name.
+function doctorDisplay(text: string): string {
+	return sanitizeDisplayLine(text);
+}
+
 function formatMcpSummary(item: CustomizeDoctorItem): string {
 	const mcp = item.mcp;
 	if (!mcp) return "";
-	const parts: string[] = [`transport: ${mcp.transport ?? "unknown"}`];
-	if (mcp.command) parts.push(`command: ${mcp.command}`);
-	if (mcp.args && mcp.args.length > 0) parts.push(`args: ${mcp.args.join(" ")}`);
-	if (mcp.url) parts.push(`url: ${mcp.url}`);
-	if (mcp.envKeys && mcp.envKeys.length > 0) parts.push(`env: ${mcp.envKeys.join(",")}`);
+	const parts: string[] = [`transport: ${doctorDisplay(mcp.transport ?? "unknown")}`];
+	if (mcp.command) parts.push(`command: ${doctorDisplay(mcp.command)}`);
+	if (mcp.args && mcp.args.length > 0) parts.push(`args: ${mcp.args.map(doctorDisplay).join(" ")}`);
+	if (mcp.url) parts.push(`url: ${doctorDisplay(mcp.url)}`);
+	if (mcp.envKeys && mcp.envKeys.length > 0) parts.push(`env: ${mcp.envKeys.map(doctorDisplay).join(",")}`);
 	if (mcp.hasHeaders) parts.push("headers: present (values redacted)");
 	if (mcp.hasAuth) parts.push("auth: present (values redacted)");
 	if (mcp.hasOauth) parts.push("oauth: present (values redacted)");
@@ -1676,7 +1695,7 @@ function formatMcpSummary(item: CustomizeDoctorItem): string {
 export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string {
 	const lines: string[] = [];
 	lines.push(`${report.command} — provenance and status for discovered customizations`);
-	lines.push(`cwd: ${report.cwd}`);
+	lines.push(`cwd: ${doctorDisplay(report.cwd)}`);
 	lines.push("");
 
 	const policyHints: string[] = [];
@@ -1695,16 +1714,16 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 	policyHints.push(report.policy.mcpNote);
 	if (policyHints.length > 0) {
 		lines.push("Policy");
-		for (const hint of policyHints) lines.push(`  - ${hint}`);
+		for (const hint of policyHints) lines.push(`  - ${doctorDisplay(hint)}`);
 		lines.push("");
 	}
 
 	for (const surface of report.surfaces) {
-		lines.push(`${surface.displayName} (${surface.kind}) — ${surface.items.length} discovered`);
-		for (const warning of surface.warnings ?? []) lines.push(`  warning: ${warning}`);
+		lines.push(`${doctorDisplay(surface.displayName)} (${surface.kind}) — ${surface.items.length} discovered`);
+		for (const warning of surface.warnings ?? []) lines.push(`  warning: ${doctorDisplay(warning)}`);
 		for (const p of surface.precedence) {
 			lines.push(
-				`  precedence: ${p.displayName} (${p.provider}) priority ${p.priority} ${p.enabled ? "enabled" : "disabled"}`,
+				`  precedence: ${doctorDisplay(p.displayName)} (${doctorDisplay(p.provider)}) priority ${p.priority} ${p.enabled ? "enabled" : "disabled"}`,
 			);
 		}
 		if (surface.items.length === 0) {
@@ -1714,30 +1733,34 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 		}
 		for (const item of surface.items) {
 			lines.push(
-				`  ${item.name}  [${item.status}]  ${item.convention}/${item.scope}  (${item.sourceClass})${formatShadowedBy(item)}`,
+				`  ${doctorDisplay(item.name)}  [${item.status}]  ${doctorDisplay(item.convention)}/${item.scope}  (${item.sourceClass})${doctorDisplay(formatShadowedBy(item))}`,
 			);
-			lines.push(`    reason: ${item.reason} — ${item.detail}`);
-			lines.push(`    source: ${item.path}`);
-			if (item.quarantineCode) lines.push(`    quarantine code: ${item.quarantineCode}`);
+			lines.push(`    reason: ${item.reason} — ${doctorDisplay(item.detail)}`);
+			lines.push(`    source: ${doctorDisplay(item.path)}`);
+			if (item.quarantineCode) lines.push(`    quarantine code: ${doctorDisplay(item.quarantineCode)}`);
 			for (const hook of item.functionHooks ?? []) {
+				const target = hook.target ? ` target=${doctorDisplay(hook.target)}` : "";
 				lines.push(
-					`    function hook[${hook.order}]: ${hook.extensionId} event=${hook.event}${hook.target ? ` target=${hook.target}` : ""} status=${hook.status}`,
+					`    function hook[${hook.order}]: ${doctorDisplay(hook.extensionId)} event=${doctorDisplay(hook.event)}${target} status=${hook.status}`,
 				);
-				lines.push(`      provenance: scope=${hook.scope} plugin=${hook.plugin} path=${hook.relativePath}`);
 				lines.push(
-					`      grants: requested=${hook.requestedCapabilities.join(",") || "none"} effective=${hook.effectiveCapabilities.join(",") || "none"} attenuate=${hook.attenuateDownstream.join(",") || "none"}`,
+					`      provenance: scope=${hook.scope} plugin=${doctorDisplay(hook.plugin)} path=${doctorDisplay(hook.relativePath)}`,
+				);
+				lines.push(
+					`      grants: requested=${hook.requestedCapabilities.map(doctorDisplay).join(",") || "none"} effective=${hook.effectiveCapabilities.map(doctorDisplay).join(",") || "none"} attenuate=${hook.attenuateDownstream.map(doctorDisplay).join(",") || "none"}`,
 				);
 				if (hook.networkDestinations.length > 0)
-					lines.push(`      network destinations: ${hook.networkDestinations.join(",")}`);
+					lines.push(`      network destinations: ${hook.networkDestinations.map(doctorDisplay).join(",")}`);
 				if (hook.filesystemRoots.length > 0)
-					lines.push(`      filesystem roots: ${hook.filesystemRoots.join(",")}`);
-				if (hook.capabilityHash) lines.push(`      capability hash: ${hook.capabilityHash}`);
-				if (hook.implementationHash) lines.push(`      implementation hash: ${hook.implementationHash}`);
-				if (hook.quarantineCode) lines.push(`      quarantine code: ${hook.quarantineCode}`);
-				lines.push(`      remediation: ${hook.remediation}`);
+					lines.push(`      filesystem roots: ${hook.filesystemRoots.map(doctorDisplay).join(",")}`);
+				if (hook.capabilityHash) lines.push(`      capability hash: ${doctorDisplay(hook.capabilityHash)}`);
+				if (hook.implementationHash)
+					lines.push(`      implementation hash: ${doctorDisplay(hook.implementationHash)}`);
+				if (hook.quarantineCode) lines.push(`      quarantine code: ${doctorDisplay(hook.quarantineCode)}`);
+				lines.push(`      remediation: ${doctorDisplay(hook.remediation)}`);
 			}
-			for (const fix of item.remediation) lines.push(`    fix: ${fix}`);
-			lines.push(`    trust: ${item.trust}`);
+			for (const fix of item.remediation) lines.push(`    fix: ${doctorDisplay(fix)}`);
+			lines.push(`    trust: ${doctorDisplay(item.trust)}`);
 			lines.push(`    restart required: ${item.restartRequired ? "yes (new session)" : "no"}`);
 			if (item.mcp) lines.push(formatMcpSummary(item));
 		}
@@ -1745,13 +1768,13 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 	}
 
 	const summaryLine = Object.entries(report.summary)
-		.map(([status, count]) => `${status}: ${count}`)
+		.map(([status, count]) => `${doctorDisplay(status)}: ${count}`)
 		.join(", ");
 	lines.push(`Summary — ${summaryLine || "nothing discovered"}`);
 	if (report.warnings.length > 0) {
 		lines.push("");
 		lines.push("Warnings");
-		for (const warning of report.warnings) lines.push(`  - ${warning}`);
+		for (const warning of report.warnings) lines.push(`  - ${doctorDisplay(warning)}`);
 	}
 	return `${lines.join("\n")}\n`;
 }

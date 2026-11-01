@@ -1,5 +1,12 @@
 import { createHmac, randomBytes } from "node:crypto";
-import type { Message, TextContent } from "@gajae-code/ai/core";
+import type {
+	ImageContent,
+	Message,
+	RedactedThinkingContent,
+	TextContent,
+	ThinkingContent,
+	ToolCall,
+} from "@gajae-code/ai/core";
 import { type SessionContext, transferSessionMessageIdentity } from "../session/session-manager";
 import { compileSecretRegex } from "./regex";
 
@@ -373,25 +380,67 @@ export function deobfuscateSessionContext(
 // Message obfuscation (outbound to LLM)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Obfuscate all text content in LLM messages (for outbound interception). */
+type OutboundBlock = TextContent | ImageContent | ThinkingContent | RedactedThinkingContent | ToolCall;
+
+/** Obfuscate outbound string content and thinking prose before they reach the provider. */
 export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
-	return messages.map(msg => {
-		if (!Array.isArray(msg.content)) return msg;
+	return messages.map(msg => obfuscateOutboundMessage(obfuscator, msg));
+}
 
-		let changed = false;
-		const content = msg.content.map(block => {
-			if (block.type === "text") {
-				const obfuscated = obfuscator.obfuscate(block.text);
-				if (obfuscated !== block.text) {
-					changed = true;
-					return { ...block, text: obfuscated } as TextContent;
-				}
-			}
+function obfuscateOutboundMessage(obfuscator: SecretObfuscator, msg: Message): Message {
+	const content = obfuscateMessageContent(obfuscator, msg);
+	return content === msg.content ? msg : ({ ...msg, content } as typeof msg);
+}
+
+function obfuscateMessageContent(obfuscator: SecretObfuscator, msg: Message): Message["content"] {
+	if (typeof msg.content === "string") {
+		const obfuscated = obfuscator.obfuscate(msg.content);
+		return obfuscated === msg.content ? msg.content : obfuscated;
+	}
+	let changed = false;
+	const next: OutboundBlock[] = [];
+	for (const block of msg.content as OutboundBlock[]) {
+		const updated = obfuscateOutboundBlock(obfuscator, block);
+		if (updated === undefined) {
+			changed = true;
+			continue;
+		}
+		if (updated !== block) changed = true;
+		next.push(updated);
+	}
+	return (changed ? next : msg.content) as Message["content"];
+}
+
+function obfuscateOutboundBlock(obfuscator: SecretObfuscator, block: OutboundBlock): OutboundBlock | undefined {
+	switch (block.type) {
+		case "text": {
+			const text = obfuscator.obfuscate(block.text);
+			return text === block.text ? block : { ...block, text };
+		}
+		case "thinking":
+			return obfuscateThinkingBlock(obfuscator, block);
+		default:
 			return block;
-		});
+	}
+}
 
-		return changed ? ({ ...msg, content } as typeof msg) : msg;
-	});
+/**
+ * Unsigned thinking prose is masked in place. A block whose prose would change
+ * while a provider signature is still attached is omitted: the signature has to
+ * stay paired with the original bytes, and the secret must not be sent.
+ */
+function obfuscateThinkingBlock(obfuscator: SecretObfuscator, block: ThinkingContent): ThinkingContent | undefined {
+	const thinking = obfuscator.obfuscate(block.thinking);
+	const summaryText = block.summaryText === undefined ? undefined : obfuscator.obfuscate(block.summaryText);
+	const rawText = block.rawText === undefined ? undefined : obfuscator.obfuscate(block.rawText);
+	if (thinking === block.thinking && summaryText === block.summaryText && rawText === block.rawText) return block;
+	if (block.thinkingSignature) return undefined;
+	return {
+		...block,
+		thinking,
+		...(summaryText !== undefined ? { summaryText } : {}),
+		...(rawText !== undefined ? { rawText } : {}),
+	};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

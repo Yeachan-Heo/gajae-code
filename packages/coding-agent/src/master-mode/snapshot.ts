@@ -6,6 +6,7 @@ import {
 	type SdkSearchResultV1,
 	type SdkSearchRowV1,
 	sdkSearchResultV1,
+	withSpawnOwnerSelf,
 } from "../sdk/broker/session-scope";
 import type { SessionLifecycleActor, SessionListOutcome, SessionListRequest } from "../sdk/lifecycle/service";
 
@@ -121,7 +122,9 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 		...(result.indexSeq === undefined ? {} : { indexSeq: result.indexSeq }),
 	};
 	const rows = result.rows
-		.filter(row => row.id !== (input.currentSessionId ?? input.ownerSessionId))
+		// Both the current row and the lineage owner row are this master (they differ after a switch).
+		.filter(row => row.id !== input.ownerSessionId && row.id !== input.currentSessionId)
+		.map(row => withSpawnOwnerSelf(row, input.ownerSessionId))
 		.sort(compareRows);
 	const bounded = boundSnapshotRows(snapshot, rows);
 	return {
@@ -189,6 +192,15 @@ function renderedRows(rows: readonly SdkSearchRowV1[]): readonly SdkSearchRowV1[
 			stateRoot: escapeMasterPeerSnapshotText(row.locator.stateRoot),
 		},
 		live: row.live,
+		...(row.role === undefined ? {} : { role: row.role }),
+		...(row.spawnedBy === undefined
+			? {}
+			: {
+					spawnedBy: {
+						masterSessionId: escapeMasterPeerSnapshotText(row.spawnedBy.masterSessionId),
+						...(row.spawnedBy.self === undefined ? {} : { self: row.spawnedBy.self }),
+					},
+				}),
 	}));
 }
 

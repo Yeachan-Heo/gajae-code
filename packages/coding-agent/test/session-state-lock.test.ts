@@ -2086,6 +2086,44 @@ describe("coordinator session state lock", () => {
 		expect(await fs.readFile(lockFile, "utf8")).toContain("foreign-malformed-owner");
 	});
 
+	it("admits a released tombstone whose tail reads back as NUL padding", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-nul-padded-tombstone");
+		const lockFile = `${stateFile}.lock`;
+		// The exact on-disk shape a Windows session left behind: a complete released
+		// tombstone followed by a zero-filled tail the file system never wrote.
+		const record = JSON.stringify({
+			pid: 1,
+			start_time: "unknown",
+			token: "nul-padded-tombstone",
+			owner_host_id: "local-host",
+			released: true,
+		});
+		await fs.writeFile(lockFile, Buffer.concat([Buffer.from(record, "utf8"), Buffer.alloc(38, 0)]));
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		await expectReleasedOwner(lockFile);
+	});
+
+	it("still fails closed when a NUL sits inside the owner document", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-interior-nul");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(
+			lockFile,
+			'{"pid":1,"start_time":"unknown",\0"token":"interior-nul","owner_host_id":"local-host","released":true}',
+		);
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		const failure = await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z").catch(error => error);
+
+		expect((failure as Error).message).toContain("lock_owner_record_unprovenanced");
+		expect(await fs.readFile(lockFile, "utf8")).toContain("interior-nul");
+	});
+
 	it("fails closed for an unqualified transition claim on a shared volume", async () => {
 		const { stateFile } = await seededRunningSession("lock-unqualified-transition");
 		const transitionFile = `${stateFile}.lock.transition`;

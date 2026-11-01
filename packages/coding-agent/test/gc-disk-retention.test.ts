@@ -3,6 +3,7 @@ import type { Dirent, PathLike, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { getDefault } from "../src/config/settings-schema";
 import { collectEmptyDeleteReceipts, runEmptyDeleteGc } from "../src/gjc-runtime/empty-delete-gc";
 import {
@@ -1027,6 +1028,32 @@ describe("gjc gc --disk (natives retention)", () => {
 
 			expect((await fsp.readdir(fixture.nativesDir)).sort()).toEqual(["0.2.0", "0.3.0"]);
 		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+	test("withholds a version when exact removal is denied before detach", async () => {
+		const fixture = await makeTestRoot();
+		const removal = spyOn(native, "exactRemoveDirectoryTree").mockReturnValue({ ok: false, code: "access_denied" });
+		try {
+			for (const version of ["0.1.0", "0.2.0", "0.3.0"]) await writeNativesVersion(fixture, version);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy({ natives_keep_versions: 1 }),
+				prune: true,
+				runningVersion: "0.3.0",
+			});
+
+			const record = disk.surfaces.natives.records.find(item => item.id === "0.1.0");
+			expect(reasonById(disk, "natives").get("0.1.0")).toBe("keep:withheld_evidence_incomplete: tree_unreadable");
+			expect(record?.withheld).toBe(true);
+			expect(record?.error).toBeUndefined();
+			expect(disk.surfaces.natives.failed).toBe(0);
+			expect(await Bun.file(path.join(fixture.nativesDir, "0.1.0", "pi-natives.node")).exists()).toBe(true);
+			expect((await fsp.readdir(fixture.nativesDir)).sort()).toEqual(["0.1.0", "0.2.0", "0.3.0"]);
+		} finally {
+			removal.mockRestore();
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
 	});

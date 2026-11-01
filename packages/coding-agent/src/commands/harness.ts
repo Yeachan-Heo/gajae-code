@@ -15,12 +15,19 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { $credentialEnv } from "@gajae-code/utils/env";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
+import { ensureOwnerLifecycleDirectorySync } from "../gjc-runtime/owner-lifecycle-path";
 import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "../gjc-runtime/session-state-sidecar";
-import { resolveGjcTmuxBinary, resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
+import {
+	canonicalManagedStateFile,
+	resolveGjcTmuxBinary,
+	resolveGjcTmuxCommand,
+	sanitizeTmuxToken,
+} from "../gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
 	classifyCgroup,
@@ -47,7 +54,11 @@ import {
 } from "../harness-control-plane/lifecycle-reconciliation";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
-import { RECEIPT_SPOOL_DIR_ENV } from "../harness-control-plane/receipt-spool";
+import {
+	RECEIPT_SPOOL_DIR_ENV,
+	resolveReceiptSpoolDir,
+	trustedReceiptSpoolDir,
+} from "../harness-control-plane/receipt-spool";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { createSdkSessionTransport, spawnNormalHarnessSession } from "../harness-control-plane/sdk-transport";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
@@ -149,6 +160,7 @@ function gitDeltaFor(workspace: string): { gitDelta: GitDelta; branch: string | 
 	let branch: string | null = null;
 	try {
 		branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
@@ -158,6 +170,7 @@ function gitDeltaFor(workspace: string): { gitDelta: GitDelta; branch: string | 
 	}
 	try {
 		const porcelain = execFileSync("git", ["status", "--porcelain"], {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
@@ -201,6 +214,7 @@ function normalizeIssueOrPr(value: unknown): string | null {
 function gitOutput(workspace: string, args: string[]): string | null {
 	try {
 		return execFileSync("git", args, {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
@@ -605,7 +619,7 @@ function portableProcessStartTime(pid: number): string | null {
 	const result = Bun.spawnSync([...command, String(pid)], {
 		stdout: "pipe",
 		stderr: "ignore",
-		env: { ...process.env, LC_ALL: "C", LANG: "C" },
+		env: { ...projectSafeSpawnEnv(), LC_ALL: "C", LANG: "C" },
 	});
 	if (result.exitCode !== 0) return null;
 	const value = result.stdout.toString();
@@ -986,7 +1000,10 @@ export default class Harness extends Command {
 				reason: "tmux-owner-native_session_identity_unavailable",
 			};
 		const socketKey = `gjc-owner-${randomBytes(24).toString("hex")}`;
-		const ownerStateDir = root;
+		// The default root lives under this process's `.gjc`. Resolve a workspace or
+		// `.gjc` reached through a link once, as the launchers do; the private tail
+		// below it stays lexical and must not contain links.
+		const ownerStateDir = canonicalManagedStateFile(process.cwd(), root);
 		let baseline: OwnerGenerationBaseline;
 		try {
 			baseline = captureOwnerGenerationBaselineSync(ownerStateDir, sessionId);
@@ -996,7 +1013,8 @@ export default class Harness extends Command {
 		const platform = ownerIsolationPlatform();
 		if (platform !== "linux" && !portableProcessStartTime(process.pid))
 			return { started: false, sessionName, socketKey, reason: "tmux-owner-generation_unverifiable" };
-		await fs.mkdir(path.join(ownerStateDir, sessionId, "owner-lifecycle"), { recursive: true, mode: 0o700 });
+		if (!ensureOwnerLifecycleDirectorySync(path.join(ownerStateDir, sessionId, "owner-lifecycle")))
+			return { started: false, sessionName, socketKey, reason: "tmux-owner-lifecycle_root_unsafe" };
 		const ownerGeneration = randomUUID();
 		const envAssignments = [
 			`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`,
@@ -1004,8 +1022,9 @@ export default class Harness extends Command {
 			`${GJC_TMUX_OWNER_STATE_DIR_ENV}=${shellQuote(ownerStateDir)}`,
 			`${GJC_TMUX_OWNER_SERVER_KEY_ENV}=${shellQuote(socketKey)}`,
 		];
-		if (process.env[RECEIPT_SPOOL_DIR_ENV])
-			envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(process.env[RECEIPT_SPOOL_DIR_ENV])}`);
+		const trustedSpoolDir = resolveReceiptSpoolDir();
+		if (trustedSpoolDir) envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(trustedSpoolDir)}`);
+		else envAssignments.unshift(`-u ${RECEIPT_SPOOL_DIR_ENV}`);
 		if (process.env.GJC_HARNESS_TEST_NODE_MODULES)
 			envAssignments.push(`GJC_HARNESS_TEST_NODE_MODULES=${shellQuote(process.env.GJC_HARNESS_TEST_NODE_MODULES)}`);
 		if (process.env.GJC_SDK_DISABLE)
@@ -1203,19 +1222,20 @@ export default class Harness extends Command {
 		}
 		const fallbackReason = tmux.reason;
 		const cmd = this.#buildOwnerCommand(sessionId);
+		const trustedSpoolDir = resolveReceiptSpoolDir();
+		const childEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			GJC_HARNESS_STATE_ROOT: root,
+			...(process.env.GJC_HARNESS_TEST_NODE_MODULES
+				? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
+				: {}),
+			...(process.env.GJC_SDK_DISABLE ? { GJC_SDK_DISABLE: process.env.GJC_SDK_DISABLE } : {}),
+		};
+		if (trustedSpoolDir) childEnv[RECEIPT_SPOOL_DIR_ENV] = trustedSpoolDir;
+		else delete childEnv[RECEIPT_SPOOL_DIR_ENV];
 		const child = Bun.spawn(cmd, {
 			cwd,
-			env: {
-				...process.env,
-				GJC_HARNESS_STATE_ROOT: root,
-				...(process.env[RECEIPT_SPOOL_DIR_ENV]
-					? { [RECEIPT_SPOOL_DIR_ENV]: process.env[RECEIPT_SPOOL_DIR_ENV] }
-					: {}),
-				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
-					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
-					: {}),
-				...(process.env.GJC_SDK_DISABLE ? { GJC_SDK_DISABLE: process.env.GJC_SDK_DISABLE } : {}),
-			},
+			env: childEnv,
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -1374,7 +1394,11 @@ export default class Harness extends Command {
 		if (!owner.live || !owner.socketPath) return false;
 		const priorSpoolDir = input[RECEIPT_SPOOL_DIR_ENV];
 		try {
-			if (process.env[RECEIPT_SPOOL_DIR_ENV]) input[RECEIPT_SPOOL_DIR_ENV] = process.env[RECEIPT_SPOOL_DIR_ENV];
+			const fromEnv = resolveReceiptSpoolDir();
+			const fromInput = trustedReceiptSpoolDir(typeof priorSpoolDir === "string" ? priorSpoolDir : undefined);
+			const trustedSpoolDir = fromEnv ?? fromInput;
+			if (trustedSpoolDir) input[RECEIPT_SPOOL_DIR_ENV] = trustedSpoolDir;
+			else delete input[RECEIPT_SPOOL_DIR_ENV];
 			const res = (await callEndpoint(owner.socketPath, { verb, input })) as { ok?: boolean };
 			writeJson(res);
 			if (res?.ok === false) process.exitCode = 1;

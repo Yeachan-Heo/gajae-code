@@ -8,7 +8,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state
   ${APP_NAME} auth-broker         - Manage the auth-broker (credential vault)
-  ${APP_NAME} accounts             - List, check, pin, and remove stored OAuth accounts
+  ${APP_NAME} accounts             - List, check, pin, prefer, and remove stored OAuth accounts
   ${APP_NAME} models presets       - Inspect, refresh, pin, rollback, or disable the signed model preset registry
   ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands
@@ -81,8 +81,6 @@ Environment Variables:
   GJC_CODING_AGENT_DIR       - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
   GJC_UI_LANGUAGE            - Explicit first-use onboarding language (en, ko, zh, or ja); invalid values use English without prompting
   GJC_PACKAGE_DIR            - Override package directory (for Nix/Guix store paths)
-  GJC_SMOL_MODEL              - Override smol/fast model (see --smol)
-  GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   GJC_PLAN_MODEL              - Override planning model (see --plan)
   GJC_MODEL_PRESET_REGISTRY_URL - HTTPS latest.json override for the signed preset registry
   GJC_MODEL_PRESET_REGISTRY_DISABLED - Disable registry fetch/use (1/true/yes/on)

@@ -22,6 +22,7 @@ import {
 	resolveDaemonAction,
 } from "../daemon/operator-contract";
 import { runChatDaemonInternal } from "../sdk/bus/chat-daemon-cli";
+import { requireDaemonInternalOwnerId } from "../sdk/bus/daemon-internal-cli-args";
 import { PublicCommandFailure, type PublicDaemonTargetOutcome } from "./public-command-errors";
 
 export type DaemonCliAction = "list" | "status" | "stop" | "restart";
@@ -124,9 +125,11 @@ export function parseDaemonArgs(argv: string[]): DaemonCommandArgs | undefined {
 }
 export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonCommandDeps = {}): Promise<void> {
 	if (isDaemonInternalAction(cmd.action)) {
+		const ownerId = requireDaemonInternalOwnerId(cmd.ownerId ? ["--owner-id", cmd.ownerId] : []);
 		const args = [
 			...(cmd.smoke ? ["--smoke"] : []),
-			...(cmd.ownerId ? ["--owner-id", cmd.ownerId] : []),
+			"--owner-id",
+			ownerId,
 			...(cmd.agentDir ? ["--agent-dir", cmd.agentDir] : []),
 		];
 		await runChatDaemonInternal(cmd.action === "discord-internal" ? "discord" : "slack", args);

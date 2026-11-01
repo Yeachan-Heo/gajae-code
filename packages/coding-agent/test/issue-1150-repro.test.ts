@@ -39,6 +39,7 @@ describe("issue #1150 — release-build script must list all worker --compile en
 		"./packages/stats/src/sync-worker.ts",
 		"./packages/coding-agent/src/tools/browser/tab-worker-entry.ts",
 		"./packages/coding-agent/src/eval/js/worker-entry.ts",
+		"./packages/coding-agent/src/sdk/broker/publication-liveness-watchdog-worker.ts",
 	];
 
 	it("shared compile-args builder lists every worker as an explicit release --compile entrypoint", async () => {
@@ -67,6 +68,7 @@ describe("issue #1150 — release-build script must list all worker --compile en
 			"../stats/src/sync-worker.ts",
 			"./src/tools/browser/tab-worker-entry.ts",
 			"./src/eval/js/worker-entry.ts",
+			"./src/sdk/broker/publication-liveness-watchdog-worker.ts",
 		];
 		const source = await Bun.file(compileArgsPath).text();
 		for (const entry of devWorkerEntrypoints) {

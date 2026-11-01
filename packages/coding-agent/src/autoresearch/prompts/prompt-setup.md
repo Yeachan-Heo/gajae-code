@@ -32,7 +32,7 @@ Do not edit product source, manifests, or dependencies. The harness must use exi
 ### Steps
 
 1. Inspect the target. Read source, identify what to measure, decide on the workload.
-2. Write `autoresearch.sh` only when it is an explicitly approved research artifact; otherwise use an existing benchmark command.
+2. Write or edit `autoresearch.sh` with a direct file tool only when it is an explicitly approved research artifact; do not use Bash, Python, or eval to change the harness. Otherwise use an existing benchmark command.
 3. Validate it: invoke `bash autoresearch.sh` through the regular `bash` tool. Confirm it exits 0 and emits at least one `METRIC` line. Iterate on the harness until it does.
 4. Start the mission with `gjc autoresearch` (cold intake: goal, constraints, deliverables, and an explicit mode) or `gjc autoresearch --spec <spec>` (handoff intake). Record the primary metric name and its direction (lower/higher is better) with the mission. The harness baseline is snapshotted at mission start and Phase 2 (the iteration loop) begins.
 

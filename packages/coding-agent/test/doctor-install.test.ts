@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	describeInstallRestore,
 	type InstallDispatchAuthority,
@@ -14,9 +16,11 @@ import {
 	activationRecordPath,
 	buildActivationRecord,
 	createActivationRecordFile,
+	readActivationRecord,
 	snapshotDirectory,
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
+import * as updateCli from "../src/cli/update-cli";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -233,6 +237,180 @@ describe("doctor standalone install repair: refusals", () => {
 		expect(result.state).toBe("conflict");
 		expect(result.reason).toBe("target_or_parent_changed");
 		expect(await fs.readFile(f.target)).toEqual(Buffer.concat([ELF_HEADER, Buffer.from("raced-runtime")]));
+	});
+
+	it("preserves access_denied recovery paths when a Windows publication failure reaches doctor", async () => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const detachedPath = path.join(f.root, "gjc.detached");
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockReturnValue({
+			ok: false,
+			code: "access_denied",
+			windowsErrorCode: "0xC0000022",
+			detachedPath,
+			retainedUnknownPath: f.target,
+		});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				fakeDeps(f),
+			);
+			expect(result).toMatchObject({
+				state: "failed",
+				reason: "access_denied",
+				sideEffectStarted: true,
+				windowsErrorCode: "0xC0000022",
+				retainedPaths: { detachedPath, retainedUnknownPath: f.target },
+			});
+			expect(warnSpy).toHaveBeenCalledWith("Doctor standalone binary restore failed with access denied", {
+				targetPath: f.target,
+				code: "access_denied",
+				windowsErrorCode: "0xC0000022",
+				retainedPaths: { detachedPath, retainedUnknownPath: f.target },
+			});
+			expect(await fs.readFile(f.target)).toEqual(Buffer.concat([ELF_HEADER, Buffer.from("old-runtime")]));
+			const pending = await readActivationRecord(f.target);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") expect(pending.record.phase).toBe("staged");
+		} finally {
+			warnSpy.mockRestore();
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		["source", "retained backup", "S-1-5-32-545"],
+		["destination", "installed binary", "S-1-5-32-545"],
+		[undefined, "unknown artifact", "S-1-5-32-545"],
+		["source", "retained backup", "secret-principal"],
+	] as const)("reports the binary rollback ACL role %s", async (side, artifact, principal) => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const replaceNative = native.exactReplaceRetained;
+		let calls = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (calls++ === 0) return replaceNative(...args);
+			return {
+				ok: false,
+				code: "acl_present",
+				aclFailurePrincipal: principal,
+				aclFailureInherited: false,
+				aclFailureSide: side,
+			};
+		});
+		const warnSpy = vi.spyOn(logger, "warn");
+		const deps = fakeDeps(f);
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				{
+					...deps,
+					smokeCandidate: async file => {
+						if (file === f.target) throw new Error(`${"x".repeat(1000)} secret-sentinel\u001b[31m`);
+						await deps.smokeCandidate(file, candidateFor(f));
+					},
+				},
+			);
+			expect(calls).toBe(2);
+			expect(result).toMatchObject({
+				state: "failed",
+				reason: "installation_rollback_unverified",
+				sideEffectStarted: true,
+			});
+			if (principal === "secret-principal") {
+				expect(result.diagnostic).toContain("principal omitted");
+				expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(principal);
+			} else {
+				expect(result.diagnostic).toContain(principal);
+				expect(warnSpy.mock.calls.map(call => String(call[0])).join("\n")).toContain(principal);
+			}
+			expect(result.diagnostic).toContain(artifact);
+			expect(result.diagnostic).toContain("Installation failed; binary rollback was blocked");
+			expect(result.diagnostic).not.toContain("secret-sentinel");
+			expect(warnSpy.mock.calls.map(call => String(call[0])).join("\n")).not.toContain("secret-sentinel");
+		} finally {
+			warnSpy.mockRestore();
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it("preserves the rollback diagnostic when releasing the update lock fails", async () => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const acquire = updateCli.acquireBinaryUpdateLock;
+		const lockSpy = vi.spyOn(updateCli, "acquireBinaryUpdateLock").mockImplementation(async target => {
+			const release = await acquire(target);
+			return async () => {
+				await release();
+				throw new Error("lock-release-secret");
+			};
+		});
+		const replaceNative = native.exactReplaceRetained;
+		let calls = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (calls++ === 0) return replaceNative(...args);
+			return { ok: false, code: "acl_present", aclFailurePrincipal: "S-1-5-32-545", aclFailureInherited: true };
+		});
+		const deps = fakeDeps(f);
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				{
+					...deps,
+					smokeCandidate: async file => {
+						if (file === f.target) throw new Error("verification failed");
+						await deps.smokeCandidate(file, candidateFor(f));
+					},
+				},
+			);
+			expect(result).toMatchObject({
+				state: "failed",
+				reason: "installation_rollback_unverified",
+				sideEffectStarted: true,
+			});
+			expect(result.diagnostic).toContain("S-1-5-32-545");
+			expect(result.diagnostic).toContain("Lock release could not be verified");
+			expect(result.diagnostic).not.toContain("lock-release-secret");
+		} finally {
+			replaceSpy.mockRestore();
+			lockSpy.mockRestore();
+		}
+	});
+
+	it("does not report a successful repair when releasing the update lock fails", async () => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const acquire = updateCli.acquireBinaryUpdateLock;
+		const lockSpy = vi.spyOn(updateCli, "acquireBinaryUpdateLock").mockImplementation(async target => {
+			const release = await acquire(target);
+			return async () => {
+				await release();
+				throw new Error("lock_release_unverified");
+			};
+		});
+		try {
+			await expect(
+				repairStandaloneBinary(
+					f.target,
+					descriptor,
+					candidateFor(f),
+					["install-replace", "network", "external-execution"],
+					fakeDeps(f),
+				),
+			).rejects.toThrow("lock_release_unverified");
+		} finally {
+			lockSpy.mockRestore();
+		}
 	});
 });
 

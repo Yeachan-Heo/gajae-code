@@ -8,6 +8,7 @@ import {
 	earliestMergedPullRequest,
 	isExplicitEmptyGhResult,
 	isRateLimitedGhResult,
+	isTransientGhResult,
 	isUnknownCommitGhResult,
 	rateLimitWaitMs,
 	normalizeSubject,
@@ -56,6 +57,46 @@ function notes(input: {
 		firstMergedPullRequestByAuthor: input.firstMergedPullRequestByAuthor ?? new Map(),
 	});
 }
+
+function createSeededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function generatedStderr(random: () => number, maxLength = 96): string {
+	const characters = " abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.,_-/\n\t[](){}";
+	const length = Math.floor(random() * (maxLength + 1));
+	let text = "";
+	for (let index = 0; index < length; index++) {
+		text += characters[Math.floor(random() * characters.length)];
+	}
+	return text;
+}
+
+function generatedRefusalContext(random: () => number): string {
+	const words = ["request", "authorization", "repository", "lookup", "permission", "scope", "resource", "denied"];
+	const count = 1 + Math.floor(random() * 5);
+	const context: string[] = [];
+	for (let index = 0; index < count; index++) {
+		context.push(words[Math.floor(random() * words.length)]!);
+	}
+	return context.join(" ");
+}
+
+const SUPPORTED_TRANSIENT_GH_ERRORS = [
+	"unexpected end of JSON input",
+	"HTTP 500: Internal Server Error",
+	"HTTP 502: Bad Gateway",
+	"HTTP 503: Service Unavailable",
+	"HTTP 504: Gateway Timeout",
+	"connection reset by peer",
+	"unexpected EOF",
+	"i/o timeout",
+	"TLS handshake timeout",
+] as const;
 
 describe("subject parsing", () => {
 	test("reads and strips a trailing pull request reference", () => {
@@ -395,5 +436,78 @@ describe("search quota pacing", () => {
 		// A far-future stamp cannot park the release indefinitely.
 		expect(rateLimitWaitMs(now / 1000 + 86_400, now)).toBe(90_000);
 		expect(rateLimitWaitMs(Number.NaN, now)).toBe(15_000);
+	});
+});
+
+describe("transient gh failures", () => {
+	test("retries only dropped responses, never refusals or explicit answers", () => {
+		expect(
+			isTransientGhResult(
+				1,
+				"gh api --paginate repos/Yeachan-Heo/gajae-code/commits/2ce24e0d/pulls?per_page=100 --jq ... failed (exit 1): unexpected end of JSON input",
+			),
+		).toBe(true);
+		expect(isTransientGhResult(1, "HTTP 502: Bad Gateway")).toBe(true);
+		expect(isTransientGhResult(1, "HTTP 500: Internal Server Error")).toBe(true);
+		expect(isTransientGhResult(1, "read tcp 10.0.0.1:443: connection reset by peer")).toBe(true);
+		// A success, a permission refusal, an unknown OID, and "no PR" are answers, not drops.
+		expect(isTransientGhResult(0, "unexpected end of JSON input")).toBe(false);
+		expect(isTransientGhResult(1, "HTTP 403: Resource not accessible by integration")).toBe(false);
+		expect(isTransientGhResult(1, "HTTP 501: Not Implemented")).toBe(false);
+		expect(isTransientGhResult(1, "HTTP 422: No commit found for SHA: abc")).toBe(false);
+		expect(isTransientGhResult(1, "could not resolve to a PullRequest")).toBe(false);
+	});
+
+	test("keeps successful exits non-transient for seeded arbitrary stderr", () => {
+		const random = createSeededRandom(0x6821_cafe);
+
+		for (let sample = 0; sample < 256; sample++) {
+			expect(isTransientGhResult(0, generatedStderr(random))).toBe(false);
+		}
+		for (const error of SUPPORTED_TRANSIENT_GH_ERRORS) {
+			const stderr = `${generatedStderr(random)} ${error} ${generatedStderr(random)}`;
+			expect(isTransientGhResult(0, stderr)).toBe(false);
+		}
+	});
+
+	test("keeps generated supported transport errors transient for nonzero exits", () => {
+		const random = createSeededRandom(0x6821_cafe);
+
+		for (const error of SUPPORTED_TRANSIENT_GH_ERRORS) {
+			for (let sample = 0; sample < 16; sample++) {
+				const exitCode = 1 + Math.floor(random() * 255);
+				const stderr = `${generatedStderr(random)} ${error} ${generatedStderr(random)}`;
+				expect(isTransientGhResult(exitCode, stderr)).toBe(true);
+			}
+		}
+	});
+
+	test("keeps generated explicit refusals non-transient for nonzero exits", () => {
+		const random = createSeededRandom(0x6821_cafe);
+		const refusalCodes = [400, 401, 403, 404, 409, 422, 429, 501];
+		const refusalDetails = [
+			"Bad credentials",
+			"Resource not accessible by integration",
+			"Not Found",
+			"Validation Failed",
+			"API rate limit exceeded",
+			"No commit found for SHA: abcdef0123456789",
+			"Not Implemented",
+		];
+
+		for (const status of refusalCodes) {
+			for (let sample = 0; sample < 16; sample++) {
+				const exitCode = 1 + Math.floor(random() * 255);
+				const detail = refusalDetails[Math.floor(random() * refusalDetails.length)]!;
+				const context = generatedRefusalContext(random);
+				expect(isTransientGhResult(exitCode, `${context}: HTTP ${status}: ${detail}`)).toBe(false);
+			}
+		}
+
+		for (let sample = 0; sample < 16; sample++) {
+			const exitCode = 1 + Math.floor(random() * 255);
+			const context = generatedRefusalContext(random);
+			expect(isTransientGhResult(exitCode, `${context}: could not resolve to a PullRequest`)).toBe(false);
+		}
 	});
 });

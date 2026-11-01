@@ -37,7 +37,7 @@ describe("agentLoop invalid_prompt circuit breaker (issue #2282)", () => {
 		const mock = createMockModel({
 			responses: [{ throw: INVALID_PROMPT }, { content: ["recovered"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([poisoned], context, config, undefined, mock.stream));
 
@@ -65,7 +65,7 @@ describe("agentLoop invalid_prompt circuit breaker (issue #2282)", () => {
 		const mock = createMockModel({
 			responses: [{ throw: INVALID_PROMPT }, { content: ["recovered"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(agentLoop([poisoned], context, config, undefined, mock.stream));
 
@@ -77,7 +77,7 @@ describe("agentLoop invalid_prompt circuit breaker (issue #2282)", () => {
 		const clean = createUserMessage("clean history with no leaked markers");
 		const context: AgentContext = { systemPrompt: ["sys"], messages: [], tools: [] };
 		const mock = createMockModel({ responses: [{ throw: INVALID_PROMPT }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([clean], context, config, undefined, mock.stream));
 
@@ -96,7 +96,7 @@ describe("agentLoop invalid_prompt circuit breaker (issue #2282)", () => {
 		const mock = createMockModel({
 			responses: [{ throw: INVALID_PROMPT }, { throw: INVALID_PROMPT }, { content: ["never reached"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([poisoned], context, config, undefined, mock.stream));
 
@@ -112,7 +112,7 @@ describe("agentLoop invalid_prompt circuit breaker (issue #2282)", () => {
 		const poisoned = createUserMessage(poisonedText());
 		const context: AgentContext = { systemPrompt: ["sys"], messages: [], tools: [] };
 		const mock = createMockModel({ responses: [{ throw: "The server had an error (code=server_error)" }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const messages = await drain(agentLoop([poisoned], context, config, undefined, mock.stream));
 

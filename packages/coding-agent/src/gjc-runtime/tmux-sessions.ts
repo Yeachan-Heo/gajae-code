@@ -3,17 +3,32 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Process } from "@gajae-code/natives";
+import { type Process, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
+import { hasMacOSMallocEnv, macOSMallocEnvUnsetArgs } from "../cli/malloc-env-guard";
+import { observeProcessIncarnation, type ProcessIncarnationObservation } from "../sdk/broker/process-incarnation";
+import {
+	managedDirectoryRoot,
+	managedSecurityFailureClassification,
+	publishManagedFileNoReplace,
+} from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import {
-	MANAGED_OWNER_COMMAND_ENV,
+	isManagedOwnerBinding,
+	isManagedOwnerSupervisorIndex,
+	type ManagedOwnerBinding,
+} from "./managed-owner-binding";
+import {
 	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_LAUNCH_BASELINE_ENV,
 	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_SUPERVISOR_ARG,
+	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
+import { ensureOwnerLifecycleDirectorySync } from "./owner-lifecycle-path";
+import { prepareOwnerLifecycleRootSync } from "./owner-lifecycle-root";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -23,6 +38,7 @@ import {
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "./session-state-sidecar";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
 	assertGjcTmuxMutationAuthoritySync,
 	bindGjcTmuxProviderAuthority,
@@ -33,6 +49,7 @@ import {
 	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionError,
 	buildTmuxProviderCommand,
+	canonicalManagedStateFile,
 	GJC_TMUX_BRANCH_OPTION,
 	GJC_TMUX_BRANCH_SLUG_OPTION,
 	GJC_TMUX_COMMAND_ENV,
@@ -59,12 +76,14 @@ import {
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
 	isValidOwnerVerdict,
+	launchBaselineToken,
 	lifecyclePaths,
 	type OwnerIsolationProbeSync,
 	type OwnerVerdict,
 	observeOwnerTerminal,
 	type PlanResponse,
 	planTmuxOwnerIsolationSync,
+	readSecureOwnerJson,
 	replaceOwnerGenerationSync,
 	type TmuxOwnerIsolationExecutionDependencies,
 	type TmuxOwnerIsolationExecutionResult,
@@ -103,11 +122,13 @@ function providerIdentity(
 	return JSON.stringify([provider.kind, provider.command, provider.namespace, provider.executableIdentity]);
 }
 
-function managedOwnerSupervisorArgv(): string[] {
+function managedOwnerSupervisorArgv(platform: NodeJS.Platform): string[] {
 	const entry = process.argv[1];
-	if (!entry || !/\.(?:[cm]?[jt]s)$/.test(entry) || /\.test\.[^.]+$/.test(entry))
-		return [process.execPath, MANAGED_OWNER_SUPERVISOR_ARG];
-	return [process.execPath, entry, MANAGED_OWNER_SUPERVISOR_ARG];
+	if (!entry || !/\.(?:[cm]?[jt]s)$/.test(entry) || /\.test\.[^.]+$/.test(entry)) return [process.execPath];
+	// The macOS pane process must stay the pinned supervisor PID. Bun's cwd `.env`
+	// autoload could reintroduce the malloc variables the pane scrubs and make the
+	// CLI malloc guard re-exec below the pane PID; a compiled binary never loads it.
+	return platform === "darwin" ? [process.execPath, "--no-env-file", entry] : [process.execPath, entry];
 }
 
 function validManagedLaunchSpec(spec: ManagedTmuxLaunchSpec, platform: NodeJS.Platform): boolean {
@@ -214,6 +235,10 @@ export interface ForceCloseOwnerDependencies {
 	waitForOwnerExitVerdict?(): Promise<OwnerVerdict>;
 	/** Broker close pin; production callers use this to reject reused session identity. */
 	expectedManagedProof?: ManagedTmuxLaunchProof;
+	/** @internal Exercise the kernel delivery branch with synthetic test dependencies. */
+	shutdownModeForTest?: "kernel_signal";
+	/** @internal Process-table observation of the pinned cooperative supervisor. */
+	observeProcess?(pid: number): ProcessIncarnationObservation;
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 const effectiveSessionEnvironments = new WeakMap<GjcTmuxSessionStatus, NodeJS.ProcessEnv>();
@@ -222,9 +247,40 @@ const fallbackSessionEnvironments = new WeakSet<GjcTmuxSessionStatus>();
 const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 15_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
 
+/**
+ * Waits for positive evidence that one pinned process incarnation is gone: the
+ * OS reports the PID absent, or the PID now names a different incarnation.
+ * `unknown` observations (for example a transient Darwin sysctl failure, which
+ * `Process.status` would report as exited) are never treated as exit.
+ */
+export async function waitForPinnedProcessExit(
+	pid: number,
+	incarnation: string,
+	deadline: number,
+	deps: {
+		observe(pid: number): ProcessIncarnationObservation;
+		now(): Date;
+		sleep(ms: number): Promise<void>;
+	},
+): Promise<boolean> {
+	for (;;) {
+		const observed = deps.observe(pid);
+		if (observed.status === "absent") return true;
+		if (observed.status === "present" && observed.incarnation !== incarnation) return true;
+		const remaining = deadline - deps.now().getTime();
+		if (remaining <= 0) return false;
+		await deps.sleep(Math.min(FORCE_CLOSE_VERDICT_POLL_MS, remaining));
+	}
+}
+
 export interface CreateGjcTmuxSessionOptions {
 	platform?: NodeJS.Platform;
 	launch?: ManagedTmuxLaunchSpec;
+	/**
+	 * @internal Program prefix (executable and entrypoint) of the supervisor in isolated
+	 * managed-launch tests; the supervisor flag is appended as in production.
+	 */
+	supervisorArgvForTest?: readonly string[];
 }
 
 export type CreateOwnerIsolationTestDependencies = {
@@ -245,6 +301,81 @@ export function __setMutationServerProofForTests(
 	dependency: ((tmuxCommand: string, env: NodeJS.ProcessEnv) => unknown) | null,
 ): void {
 	mutationServerProofTestDependency = dependency;
+}
+
+const TMUX_LAUNCH_IDENTITY_ENV_NAMES = [
+	"GJC_SESSION_ID",
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	"GJC_TMUX_SESSION",
+] as const;
+
+/**
+ * Drop project-dotenv copies of the tmux session name, coordinator id, and
+ * state-file path. A pin is kept only when every snapshot accepts it, so a
+ * declaration Bun loaded before `chdir` is refused even if the launch cwd no
+ * longer contains that file. Acceptance uses the shared helper, but the
+ * original string stays: callers trim at use, and a later check must see the
+ * same value that was accepted.
+ */
+export function trustedTmuxLaunchIdentityEnv(
+	env: NodeJS.ProcessEnv,
+	snapshots: readonly ProjectEnvSnapshot[],
+): NodeJS.ProcessEnv {
+	const denied: string[] = [];
+	for (const name of TMUX_LAUNCH_IDENTITY_ENV_NAMES) {
+		if (!env[name]) continue;
+		for (const snapshot of snapshots) {
+			if (trustedCoordinatorEnv(name, env, snapshot) === undefined) {
+				denied.push(name);
+				break;
+			}
+		}
+	}
+	if (denied.length === 0) return env;
+	const next: NodeJS.ProcessEnv = { ...env };
+	for (const name of denied) delete next[name];
+	return next;
+}
+
+export function tmuxLaunchIdentityEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv {
+	return trustedTmuxLaunchIdentityEnv(env, [projectEnvSnapshot(cwd), startupProjectEnvSnapshot()]);
+}
+
+/**
+ * Session id the launched child must see. A trusted pin is passed through.
+ * A rejected project pin is replaced by the same fallback the launch plan uses
+ * for the session root, which also stops Bun from reloading that dotenv value
+ * (`GJC_TMUX_LAUNCHED=1` skips the planner filter). An omitted id stays omitted.
+ */
+export function resolvedChildGjcSessionId(input: {
+	trusted: string | undefined;
+	inherited: string | undefined;
+	projectDeclared: boolean;
+	fallback: string;
+}): string | undefined {
+	const trusted = input.trusted?.trim();
+	if (trusted) return trusted;
+	if (!input.inherited?.trim() && !input.projectDeclared) return undefined;
+	const fallback = input.fallback.trim();
+	return fallback.length > 0 ? fallback : undefined;
+}
+
+export function childGjcSessionIdAssignment(
+	env: NodeJS.ProcessEnv,
+	identityEnv: NodeJS.ProcessEnv,
+	cwd: string,
+	fallbackSessionId: string,
+): Record<string, string> {
+	const snapshot = projectEnvSnapshot(cwd);
+	const key = canonicalEnvKey("GJC_SESSION_ID");
+	const value = resolvedChildGjcSessionId({
+		trusted: identityEnv.GJC_SESSION_ID,
+		inherited: env.GJC_SESSION_ID,
+		projectDeclared: snapshot.values[key] !== undefined || snapshot.dynamic.has(key),
+		fallback: fallbackSessionId,
+	});
+	return value === undefined ? {} : { GJC_SESSION_ID: value };
 }
 
 function psmuxAuthorityFromEnv(env: NodeJS.ProcessEnv): ProviderAuthority | null {
@@ -269,6 +400,24 @@ function environmentForProviderAuthority(
 	};
 }
 
+/**
+ * tmux lets a client write UTF-8 only when it was started with `-u`, runs inside tmux
+ * (`$TMUX`), or the first set of LC_ALL/LC_CTYPE/LANG names UTF-8. Any other client gets
+ * every byte outside printable ASCII replaced with `_`, including the tab separators and
+ * non-ASCII names and paths parsed here. A detached Broker inherits its launcher's locale,
+ * and launchd or a service manager provides none, so every native tmux client this module
+ * runs for managed-session creation, inspection, and mutation requests UTF-8 output instead
+ * of depending on the caller's environment. The flag precedes the subcommand, so the Linux
+ * owner-isolation server proof inherits it from the new-session control prefix. psmux has
+ * its own client flags and never receives it. Interactive attach is deliberately excluded:
+ * its output goes to the user's terminal, whose locale is authoritative.
+ */
+const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
+
+function tmuxClientFlags(isPsmux: boolean): string[] {
+	return isPsmux ? [] : [NATIVE_TMUX_UTF8_CLIENT_FLAG];
+}
+
 function runTmux(
 	args: string[],
 	env: NodeJS.ProcessEnv = process.env,
@@ -283,7 +432,11 @@ function runTmux(
 	let result: Bun.SyncSubprocess<"pipe", "pipe">;
 	try {
 		result = Bun.spawnSync(
-			[tmuxCommand, ...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args)],
+			[
+				tmuxCommand,
+				...tmuxClientFlags(authority ? authority.kind !== "native-tmux" : binary.isPsmux),
+				...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args),
+			],
 			{
 				stdout: "pipe",
 				stderr: "pipe",
@@ -515,11 +668,14 @@ function canonicalProviderStateDirs(cwd: string): string[] {
 }
 
 function psmuxAuthorityEnvironments(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv[] {
-	const explicitAuthority = psmuxAuthorityFromEnv(env);
+	const identityEnv = tmuxLaunchIdentityEnv(env, process.cwd());
+	const explicitAuthority = psmuxAuthorityFromEnv(identityEnv);
 	if (explicitAuthority) return [environmentForProviderAuthority(env, explicitAuthority)];
 	const explicitStateDir =
-		env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
-		(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ? path.dirname(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]) : "");
+		identityEnv[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
+		(identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]
+			? path.dirname(identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV])
+			: "");
 	const ambient = resolveGjcTmuxBinary({ env });
 	if (gjcTmuxAuthorityPlatform() === "win32") {
 		const ambientAvailable = path.isAbsolute(ambient.command)
@@ -666,22 +822,40 @@ export function createGjcTmuxSession(
 ): GjcTmuxSessionStatus {
 	const launch = options.launch;
 	const platform = options.platform ?? process.platform;
+	// Managed admission requires the retained owner-only reader, unavailable on Windows.
+	// Reject before provider probes, lifecycle storage, or supervisor allocation.
+	if (launch && platform === "win32") throw new Error("gjc_tmux_managed_launch_platform_unsupported:win32");
 	if (launch && !validManagedLaunchSpec(launch, platform)) throw new Error("gjc_tmux_managed_launch_spec_invalid");
 	const provider = resolveGjcTmuxProviderContext({ env, platform });
 	const tmuxCommand = provider.command;
-	const launchEnvironment = launch ? { ...env, GJC_TMUX_SESSION: launch.childSessionId } : env;
-	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
 	const cwd = launch?.cwd ?? process.cwd();
-	const sessionId = launch?.childSessionId ?? (env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
+	const identityEnv = tmuxLaunchIdentityEnv(env, cwd);
+	const launchEnvironment = launch ? { ...identityEnv, GJC_TMUX_SESSION: launch.childSessionId } : identityEnv;
+	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
+	const sessionId = launch?.childSessionId ?? (identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
+	const filteredGjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
+	const derivedStateFile = tmuxRuntimeSessionPath(
+		cwd,
+		launch?.childSessionId ?? filteredGjcSessionId,
+		buildGjcTmuxSessionSlug(sessionName),
+	);
 	const stateFile =
-		(!launch ? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
-		tmuxRuntimeSessionPath(
-			cwd,
-			launch?.childSessionId ?? (env.GJC_SESSION_ID?.trim() || sessionId),
-			buildGjcTmuxSessionSlug(sessionName),
-		);
+		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
+		// Lifecycle writers refuse a link in the state path, so a workspace reached
+		// through a symlink must be named by its canonical path.
+		(platform !== "win32" ? canonicalManagedStateFile(cwd, derivedStateFile) : derivedStateFile);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
+	if (launch) {
+		try {
+			prepareOwnerLifecycleRootSync(lifecyclePaths(stateDir, sessionId, generation).root);
+		} catch {
+			// Preparation refuses a linked or unsafe component without naming it.
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+		}
+	}
+	// Captured before the session exists: its child is admitted only while this stays current.
+	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
 	const managedEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",
@@ -690,35 +864,40 @@ export function createGjcTmuxSession(
 		[GJC_TMUX_OWNER_SERVER_KEY_ENV]: tmuxCommand,
 		[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 		[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+		...childGjcSessionIdAssignment(env, identityEnv, cwd, filteredGjcSessionId),
 		...(launch
 			? {
 					[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),
 					[MANAGED_OWNER_INCARNATION_ENV]: crypto.randomUUID(),
+					[MANAGED_OWNER_LAUNCH_BASELINE_ENV]: launchBaselineToken(baseline),
 					[MANAGED_OWNER_REDACT_COMMAND_ENV]: "1",
 				}
 			: {}),
 	};
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
-	const executionEnv = { ...env, ...managedEnvironment };
+	const executionEnv = { ...identityEnv, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+	const supervisorArgv = options.supervisorArgvForTest ?? managedOwnerSupervisorArgv(platform);
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({
-					command: launch ? managedOwnerSupervisorArgv() : ["gjc"],
-					environment: {
-						...childEnvironment,
-						...(launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {}),
-					},
+					command: launch ? managedOwnerSupervisorInvocation(supervisorArgv, launch.argv) : ["gjc"],
+					environment: childEnvironment,
 				})
 			: (() => {
-					const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
-					const invocation = launch ? managedOwnerSupervisorArgv() : ["gjc"];
-					return `exec env ${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
+					const invocation = launch ? managedOwnerSupervisorInvocation(supervisorArgv, launch.argv) : ["gjc"];
+					// The pane process must stay the exact supervisor; never let the CLI malloc
+					// guard re-exec it below the pane PID.
+					const unsetArgs = launch && platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
+					return `exec env ${unsetArgs}${Object.entries(childEnvironment)
+						// An explicit spawn override must not re-add what the scrub removed.
+						.filter(([name]) => !unsetArgs || !hasMacOSMallocEnv({ [name]: "" }))
 						.map(([name, value]) => `${name}=${shellQuote(value)}`)
 						.join(" ")} ${invocation.map(shellQuote).join(" ")}`;
 				})();
 	const tmuxArgv = [
 		tmuxCommand,
+		...tmuxClientFlags(provider.kind !== "native-tmux"),
 		...buildTmuxProviderCommand(provider, "new-session", [
 			"-d",
 			"-s",
@@ -738,11 +917,14 @@ export function createGjcTmuxSession(
 				pidProven: false,
 			};
 		}
-		const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
-			stdout: "pipe",
-			stderr: "pipe",
-			env,
-		});
+		const result = Bun.spawnSync(
+			[tmuxCommand, ...tmuxClientFlags(provider.kind !== "native-tmux"), "display-message", "-p", "#{pid}"],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
 		if (result.exitCode !== 0) {
 			const diagnostic = result.stderr.toString();
 			return /no server running|failed to connect|error connecting/.test(diagnostic)
@@ -793,7 +975,7 @@ export function createGjcTmuxSession(
 			(({ attempt }) => {
 				const root = lifecyclePaths(stateDir, sessionId, generation).root;
 				const attemptFile = path.join(root, `attempt-${attempt.token}.json`);
-				fsSync.mkdirSync(root, { recursive: true, mode: 0o700 });
+				if (!ensureOwnerLifecycleDirectorySync(root)) throw new Error("owner_lifecycle_root_unsafe");
 				const descriptor = fsSync.openSync(attemptFile, "wx", 0o600);
 				try {
 					fsSync.writeFileSync(
@@ -819,7 +1001,6 @@ export function createGjcTmuxSession(
 			}),
 	};
 
-	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const ownerPlan = planTmuxOwnerIsolationSync(
 		{
 			schema_version: 1,
@@ -1245,11 +1426,14 @@ function requireSafeTmuxServerForMutation(
 		return { pid: 1, startTime: "test" };
 	}
 	if (process.platform !== "linux") return { pid: 1, startTime: "not-applicable", pidProven: false };
-	const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
-		stdout: "pipe",
-		stderr: "pipe",
-		env,
-	});
+	const result = Bun.spawnSync(
+		[tmuxCommand, ...tmuxClientFlags(resolveGjcTmuxBinary({ env }).isPsmux), "display-message", "-p", "#{pid}"],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+			env,
+		},
+	);
 	if (result.exitCode !== 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");
 	const pid = Number(result.stdout.toString().trim());
 	if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");
@@ -1708,20 +1892,22 @@ async function waitForExpectedVerdict(
 	sleep: (ms: number) => Promise<void>,
 	now: () => Date,
 	deadline: number,
+	intentId?: string,
 ): Promise<OwnerVerdict | null> {
 	const paths = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation);
 	const verdictFile = paths.verdictFile;
 	const verdictAliasFile = paths.verdictAliasFile;
 	while (now().getTime() <= deadline) {
 		try {
-			const [verdictBody, aliasBody] = await Promise.all([
-				fs.readFile(verdictFile, "utf8"),
-				fs.readFile(verdictAliasFile, "utf8"),
-			]);
-			const verdict: unknown = JSON.parse(verdictBody);
-			const alias: unknown = JSON.parse(aliasBody);
+			const verdict: unknown = intentId
+				? readSecureOwnerJson(verdictFile)
+				: JSON.parse(await fs.readFile(verdictFile, "utf8"));
+			const alias: unknown = intentId
+				? readSecureOwnerJson(verdictAliasFile)
+				: JSON.parse(await fs.readFile(verdictAliasFile, "utf8"));
 			if (
 				isValidOwnerVerdict(verdict) &&
+				(!intentId || verdict.intent_id === intentId) &&
 				typeof alias === "object" &&
 				alias !== null &&
 				Object.keys(alias).length === Object.keys(verdict).length + 1 &&
@@ -1744,10 +1930,98 @@ async function waitForExpectedVerdict(
 	return null;
 }
 
+function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): ManagedOwnerBinding {
+	// The generation's own index names its one binding, so retained history of
+	// earlier generations in the shared lifecycle root never bounds discovery.
+	const paths = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation);
+	if (!verifyOwnerOnlyPathSecurity(paths.root, "directory").ok) throw new Error("managed_owner_binding_untrusted");
+	try {
+		fsSync.lstatSync(paths.supervisorIndexFile);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("managed_owner_binding_unavailable");
+		throw error;
+	}
+	const index = readSecureOwnerJson(paths.supervisorIndexFile);
+	if (
+		!isManagedOwnerSupervisorIndex(index) ||
+		index.generation !== identity.generation ||
+		index.session_id !== identity.sessionId ||
+		!/^[A-Za-z0-9._-]+$/.test(index.child_token)
+	)
+		throw new Error("managed_owner_binding_untrusted");
+	// One supervisor per generation: an index naming another process is not ours.
+	if (index.supervisor_pid !== identity.pid || index.supervisor_start_time !== identity.startTime)
+		throw new Error("managed_owner_binding_untrusted");
+	const binding = readSecureOwnerJson(path.join(paths.root, `child-${index.child_token}.binding.json`));
+	if (
+		!isManagedOwnerBinding(binding) ||
+		binding.child_token !== index.child_token ||
+		binding.supervisor_pid !== identity.pid ||
+		binding.supervisor_start_time !== identity.startTime ||
+		binding.session_id !== identity.sessionId ||
+		binding.generation !== identity.generation
+	)
+		throw new Error("managed_owner_binding_untrusted");
+	return binding;
+}
+
+/**
+ * @internal Bounded discovery of the exact supervisor's binding.
+ *
+ * The launch proof can return before the supervisor durably publishes its binding.
+ * Only an absent binding is retried, and only while the same exact supervisor stays
+ * live; untrusted, ambiguous, or changed evidence still fails closed immediately. The
+ * binding's wall-clock `created_at` is not a gate, so a clock rollback after launch
+ * never blocks closing a live owner.
+ */
+export async function awaitCooperativeSupervisorBinding(
+	identity: ExactOwnerIdentity,
+	deps: {
+		assertSameSupervisor: () => void;
+		sleep: (ms: number) => Promise<void>;
+		now: () => Date;
+		deadline: number;
+	},
+): Promise<ManagedOwnerBinding> {
+	for (;;) {
+		try {
+			return proveCooperativeSupervisorBinding(identity);
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "managed_owner_binding_unavailable") throw error;
+			if (deps.now().getTime() >= deps.deadline) throw error;
+		}
+		deps.assertSameSupervisor();
+		await deps.sleep(FORCE_CLOSE_VERDICT_POLL_MS);
+		deps.assertSameSupervisor();
+	}
+}
+
 /**
  * Requests an exact tagged owner shutdown. Session cleanup is compatibility-only
  * and follows a validated SIGTERM verdict; it never authorizes the close.
  */
+/** No-replace owner-intent publication under the exact private lifecycle root. */
+export function publishOwnerIntentNoReplace(
+	root: string,
+	file: string,
+	bytes: Uint8Array,
+	assertOwned: () => void,
+): Promise<void> {
+	return publishManagedFileNoReplace(file, bytes, assertOwned, managedDirectoryRoot(root));
+}
+
+/**
+ * @internal The force-close clock: one wall-clock anchor advanced by monotonic elapsed
+ * time, so a wall-clock step during a close neither extends nor shortens its deadline.
+ * After a backward step the published intent reads as created in the future and the
+ * supervisor refuses it until the closer has given up and retired it.
+ */
+export function monotonicCloseClock(): () => Date {
+	const anchor = Date.now();
+	const started = performance.now();
+	return () => new Date(anchor + (performance.now() - started));
+}
+
 export async function forceCloseGjcTmuxSession(
 	sessionName: string,
 	env: NodeJS.ProcessEnv = process.env,
@@ -1800,11 +2074,28 @@ export async function forceCloseGjcTmuxSession(
 
 	const currentStartTime = await (deps.readProcessStartTime ?? readProcessStartTime)(identity.pid);
 	if (currentStartTime !== identity.startTime) throw new Error("owner_pid_identity_mismatch");
-	const now = deps.now ?? (() => new Date());
+	const now = deps.now ?? monotonicCloseClock();
 	const sleep = deps.sleep ?? (ms => Bun.sleep(ms));
 	const dispatchId = crypto.randomUUID();
 	const verdictDeadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
-	let operatorVerdict: Promise<OwnerVerdict> | null = deps.waitForOwnerExitVerdict?.() ?? null;
+	const cooperativeSupervisor =
+		process.platform === "darwin" && deps.shutdownModeForTest !== "kernel_signal"
+			? exactManagedOwnerSupervisor(identity.pid, identity.startTime)
+			: null;
+	const cooperativeBinding = cooperativeSupervisor
+		? await awaitCooperativeSupervisorBinding(identity, {
+				assertSameSupervisor: () => {
+					if (exactManagedOwnerSupervisor(identity.pid, identity.startTime).pid !== cooperativeSupervisor.pid)
+						throw new Error("managed_owner_supervisor_changed");
+				},
+				sleep,
+				now,
+				deadline: verdictDeadline,
+			})
+		: null;
+	let operatorVerdict: Promise<OwnerVerdict> | null = cooperativeSupervisor
+		? null
+		: (deps.waitForOwnerExitVerdict?.() ?? null);
 	await closeExactTmuxOwner(
 		{
 			stateDir: identity.stateDir,
@@ -1819,38 +2110,91 @@ export async function forceCloseGjcTmuxSession(
 		},
 		{
 			readStartTime: deps.readProcessStartTime ?? readProcessStartTime,
-			sendSigterm: async pid => {
-				if ((await (deps.readProcessStartTime ?? readProcessStartTime)(pid)) !== identity.startTime)
-					throw new Error("owner_pid_identity_mismatch");
-				if (deps.signalTerm) {
-					deps.signalTerm(pid);
-				} else {
-					const supervisor = exactManagedOwnerSupervisor(pid, identity.startTime);
-					if (!signalManagedOwnerTerm(supervisor, pid)) throw new Error("managed_owner_supervisor_signal_failed");
-					operatorVerdict = supervisor
-						.waitForExit({ timeoutMs: FORCE_CLOSE_VERDICT_TIMEOUT_MS - 500 })
-						.then(async exited => {
-							if (!exited) throw new Error("managed_owner_supervisor_exit_timeout");
-							return await observeOwnerTerminal({
-								schema_version: 1,
-								op: "observe_terminal",
-								session_id: identity.sessionId,
-								owner_generation: identity.generation,
-								state_dir: identity.stateDir,
-								socket_key: identity.socketKey,
-								observer: "raw_monitor",
-								observed_at: now().toISOString(),
-								signal: "SIGTERM",
-								exit_code: null,
-								exit_kind: "exact_owner_exit_observed",
-								reason: "operator_observed_owner_exit",
-								operator_dispatch_id: dispatchId,
-							});
-						});
-				}
-			},
+			shutdown:
+				cooperativeSupervisor && cooperativeBinding
+					? {
+							kind: "cooperative_intent",
+							publishNoReplace: publishOwnerIntentNoReplace,
+							assertCooperativeOwner: () => {
+								if (
+									cooperativeSupervisor.pid !== identity.pid ||
+									cooperativeSupervisor.incarnation !== identity.startTime ||
+									JSON.stringify(proveCooperativeSupervisorBinding(identity)) !==
+										JSON.stringify(cooperativeBinding)
+								)
+									throw new Error("managed_owner_supervisor_changed");
+								const live = exactManagedOwnerSupervisor(identity.pid, identity.startTime);
+								if (
+									live.pid !== cooperativeSupervisor.pid ||
+									readNativeTmuxSessionId(session.name, sessionEnv) !== nativeSessionId ||
+									readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, sessionEnv) !==
+										identity.generation ||
+									readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, sessionEnv) !==
+										identity.sessionId ||
+									readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, sessionEnv) !==
+										actualStateFile ||
+									readExactOptionForGc(session.name, GJC_TMUX_OWNER_SERVER_KEY_OPTION, sessionEnv) !==
+										identity.socketKey ||
+									JSON.stringify((deps.listPanePids ?? readExactSessionPanePids)(session.name, sessionEnv)) !==
+										JSON.stringify([identity.pid])
+								)
+									throw new Error("managed_owner_supervisor_changed");
+								const server = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(sessionEnv), sessionEnv);
+								if (server.pid !== initialServer.pid || server.startTime !== initialServer.startTime)
+									throw new Error("managed_owner_server_changed");
+							},
+						}
+					: {
+							kind: "kernel_signal",
+							sendSigterm: async pid => {
+								if ((await (deps.readProcessStartTime ?? readProcessStartTime)(pid)) !== identity.startTime)
+									throw new Error("owner_pid_identity_mismatch");
+								if (deps.signalTerm) {
+									deps.signalTerm(pid);
+								} else {
+									const supervisor = exactManagedOwnerSupervisor(pid, identity.startTime);
+									if (!signalManagedOwnerTerm(supervisor, pid))
+										throw new Error("managed_owner_supervisor_signal_failed");
+									operatorVerdict = supervisor
+										.waitForExit({ timeoutMs: FORCE_CLOSE_VERDICT_TIMEOUT_MS - 500 })
+										.then(async exited => {
+											if (!exited) throw new Error("managed_owner_supervisor_exit_timeout");
+											return await observeOwnerTerminal({
+												schema_version: 1,
+												op: "observe_terminal",
+												session_id: identity.sessionId,
+												owner_generation: identity.generation,
+												state_dir: identity.stateDir,
+												socket_key: identity.socketKey,
+												observer: "raw_monitor",
+												observed_at: now().toISOString(),
+												signal: "SIGTERM",
+												exit_code: null,
+												exit_kind: "exact_owner_exit_observed",
+												reason: "operator_observed_owner_exit",
+												operator_dispatch_id: dispatchId,
+											});
+										});
+								}
+							},
+						},
 
-			waitForVerdict: async () => {
+			waitForVerdict: async intent => {
+				if (cooperativeSupervisor) {
+					const remaining = verdictDeadline - now().getTime();
+					if (remaining <= 0) return null;
+					const exited = await waitForPinnedProcessExit(
+						cooperativeSupervisor.pid,
+						cooperativeSupervisor.incarnation,
+						verdictDeadline,
+						{ observe: deps.observeProcess ?? observeProcessIncarnation, now, sleep },
+					);
+					if (!exited || now().getTime() >= verdictDeadline) return null;
+					const verdict = await waitForExpectedVerdict(identity, sleep, now, verdictDeadline, intent.intent_id);
+					// The close deadline is this monotonic clock, not the intent's wall-clock
+					// expiry: evidence whose reads ran past it never completes the close.
+					return verdict && now().getTime() < verdictDeadline ? verdict : null;
+				}
 				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
 				try {
 					return await waitForOwnerVerdictUntil(operatorVerdict, now, verdictDeadline);

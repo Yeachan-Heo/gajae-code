@@ -182,6 +182,7 @@ describe("SDK broker WebSocket transport", () => {
 			expect(discovery).not.toBeNull();
 			expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(true);
 			expect(broker.ownsDiscovery).toBe(false);
+			expect(broker.hasPublishedDiscovery).toBe(false);
 			ws = await connect(`${discovery!.url}/?token=${discovery!.token}`);
 			expect(await nextFrame(ws)).toEqual({ type: "broker_hello", protocolVersion: 3 });
 			const beforeReady = nextFrame(ws);
@@ -204,6 +205,7 @@ describe("SDK broker WebSocket transport", () => {
 			allowRetention.resolve();
 			await starting;
 			expect(broker.ownsDiscovery).toBe(true);
+			expect(broker.hasPublishedDiscovery).toBe(true);
 			const afterReady = nextFrame(ws);
 			ws.send(
 				JSON.stringify({ type: "broker_request", id: "status-after-ready", operation: "broker.status", input: {} }),

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import { rmSync } from "node:fs";
+import { renameSync, rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
@@ -52,7 +52,13 @@ function pinWindowsLockRemoval(): void {
 	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: native.snapshotDirectoryTree,
-		exactRemoveDirectoryTree: target => {
+		exactRemoveDirectoryTree: (target, _snapshot, _parentIdentity, detachOnly) => {
+			// The Windows protocol detaches first, then removes the parked tree.
+			if (detachOnly && !target.endsWith(".removing")) {
+				const detachedPath = `${target}.removing`;
+				renameSync(target, detachedPath);
+				return { ok: true, detachedPath };
+			}
 			rmSync(target, { recursive: true, force: true });
 			return { ok: true };
 		},
@@ -376,6 +382,7 @@ describe("SDK session index", () => {
 	});
 	it("uses the native Windows process handle when signal-zero misreports a detached host", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-windows-live-"));
+		const index = new SessionIndex(dir);
 		const originalPlatform = process.platform;
 		const originalKill = process.kill;
 		const processRef = {
@@ -383,13 +390,15 @@ describe("SDK session index", () => {
 			status: () => "running" as const,
 		};
 		const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(processRef as never);
-		process.kill = (() => {
-			throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
-		}) as typeof process.kill;
-		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
-		pinWindowsLockRemoval();
 		try {
-			const index = await new SessionIndex(dir).open();
+			// Resolve the machine-specific lock identity before faking the platform;
+			// only the process-liveness branch below should see Windows here.
+			await index.open();
+			process.kill = (() => {
+				throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
+			}) as typeof process.kill;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			pinWindowsLockRemoval();
 			await index.append({
 				...event("windows-detached"),
 				hostIncarnation: processRef.incarnation,

@@ -2,6 +2,988 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Added
+
+- GPT-6.1 Terra autorouting tier assignments (fast/medium rank 1, balanced/high rank 1). Prioritizes Terra over the legacy GPT-5.6 Terra (now rank 2).
+
+### Changed
+
+- Prompt suggestions (`promptSuggestions`) now follow the Codex TUI logic. After a turn that completes normally, an ephemeral turn on the session's own model, thinking level, system prompt, and full history sends Codex's prompt verbatim to predict the user's likely next message. Only a strict `{"suggestion": string | null}` reply that is one line of at most 240 characters is shown. Ghost text is hidden while you type, while a turn runs, or while an autocomplete popup is open. Tab on an empty composer accepts it and Esc dismisses it. A submission, a new turn, a session switch, or a 30-second deadline cancels the request. No suggestion is requested while messages are queued or a side chat is open. The previous `default`-role transcript summary, word-count heuristics, and system prompt are removed.
+- Unlike Codex's hidden thread fork, the suggestion turn runs with tools disabled and in a fresh provider session. It is marked as a maintenance call, so agent-level providers such as Devin refuse it.
+
+### Fixed
+
+- SDK broker spawn-claim mirror rows in the lifecycle ledger now carry `spawnAnchor: true`, so a mirror no longer turns into a fenced legacy row once its claim leaves the spawn-authority journal and stops blocking `session.create` and `session.close` with `legacy_lifecycle_ambiguous`. Mirrors written by older brokers stay fenced because nothing durable proves their origin; an operator can release them through `sdk/lifecycle-ledger.spawn-anchor-attestation.json` (see `docs/sdk-session-cli.md`). Genuine pre-index legacy rows stay fenced (#7143).
+
+- Collapsed Google Antigravity `/usage` rows by shared quota pool and preserved account email labels across live and cached usage views (#7267).
+- Kept accounts that report only one horizon of a quota pool in the sibling `/usage` row as `not reported` cells (unknown bar, `N% free · M not reported` aggregate, warning instead of a false `exhausted`) instead of dropping the column (#7267).
+
+- ACP session updates strip terminal control sequences from tool titles, raw tool arguments, and command text before they are sent to the client.
+
+- Preserve explicit TAR directory entries in the archive index, including empty directories, and keep the existing first duplicate file record's metadata consistent with its bytes.
+
+- `gjc auth-broker serve` re-reads the bearer token file on each request, so `token --regenerate` revokes the previous bearer while the broker is running.
+
+- `gjc auth-gateway serve` re-reads `auth-gateway.token` on each request, so `token --regenerate` retires the previous bearer without a restart.
+
+- Autoresearch setup and iterate prompts frame the active branch name so repository branch markup cannot close that slot.
+
+- The bisect tool now uses the same ACP and SDK permission gate as eval. Prompt mode asks before its shell predicate runs, and deny mode rejects it. Allow mode is unchanged.
+
+- Bisect tool results are framed as untrusted content when they enter the model, so a commit subject or diffstat cannot close that frame early.
+
+- The bisect predicate now refuses a tmux input verb aimed at this agent pane before each shell starts, including a script that changes at a checked-out commit. The same check refuses a shell runner whose PATH override is still an unresolved expansion; a static PATH is unchanged.
+
+- A broker discovery record is ignored when its url is not the owned loopback endpoint for that record's port.
+
+- A stalled discovery publication fsync/rename no longer keeps an SDK broker alive past its liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat TTL × 4)`). When that write blocks the JS thread, `gjc sdk broker run` is SIGKILLed (signal status 137, not exit 1), including when stderr cannot accept the diagnostic. While the event loop still runs, it still exits 1.
+
+- SDK broker startup fails when the publication-liveness watchdog cannot be armed, instead of staying up without that protection. The failed attempt releases its discovery file and lock. If the watchdog worker dies after startup, the broker exits with `publication-liveness-timeout` rather than keeping the publication unprotected.
+
+- Foreground `gjc sdk broker run` loads the publication-liveness watchdog from the bundled module. A `PI_COMPILED` value from the environment or a project `.env` cannot redirect that worker to a file in the repository. The project-root worker path is used only when the running module is inside a compiled binary.
+
+- A repository `.gjc/config.yml` or `.gjc/settings.json` can no longer set `clipboard.transport` or `clipboard.sshHost`, and a non-object `clipboard` value there cannot replace the user clipboard settings. User config and the clipboard CLI flags still can.
+
+- Code cells strip terminal control sequences from source bytes before rendering, so a file read cannot write OSC, CSI, or DCS to the operator terminal.
+
+- `gjc crash report` flattens a duplicate issue title and author to one display row before writing the candidate line.
+
+- The custom model preset wizard strips terminal control characters from the snapshot preview before drawing role selectors and providers.
+
+- Correct custom-provider setup recipes so both local and hosted examples pass configuration validation.
+
+- `debug` tool results are framed as untrusted content when they enter the model, so debugger and program text cannot close that frame early.
+
+- A repository `.gjc` config file can no longer clear or replace the operator `disabledExtensions` list, so an operator-disabled extension module stays unloaded. User config and runtime overrides still apply.
+
+- Discord inbound commands and component actions, including claims recovered at startup, are delivered only for actors listed in the global Discord notification config, and are ignored when the author is missing or not listed.
+
+- Discord nonce reconciliation binds a thread only when this bot authored the starter, the thread parent and owner are that bot's thread, and a history fallback matches the starter message rather than a later copy.
+
+- A repository `.gjc/config.yml` or `.gjc/settings.json` can no longer set `edit.blockAutoGenerated`, and a runtime override cannot flip it. The user config keeps that switch, so a project file cannot turn off the auto-generated file edit guard.
+
+- Hashline edit previews and ast-edit before/after lines are framed as untrusted content, so a repository line cannot close that frame early.
+
+- Coordinator event webhook delivery checks https destinations with the public HTTP guard before the POST.
+
+- File-lock acquisition now reaps same-host staging directories whose recorded process generation is dead, and removes empty or missing-info staging directories only when their names prove the local host and they exceed a 60-second grace period. Foreign-host and live-owner staging directories remain protected, while a rotating bounded scan prevents retained entries from starving later candidates.
+
+- Restore parenthesized two-argument literal read-only Perl `open` calls during planning, including escaped literal backslashes, while rejecting unscanned startup modules and imports that can override `open`, custom `open` suffix calls, unsupported handles, and unsafe or unparsed modes.
+
+- The GitHub tool view strips terminal control sequences from repository text before drawing it.
+
+- The Herdr sequence watermark is stored in the trusted agent directory, so a planted file in the shared temp directory is not adopted at startup.
+
+- A `<lock>.removing` left by a lock owner that stamped no host id, such as a broker killed mid-release just before an upgrade, no longer blocks a host-qualified lock like the SDK session index forever. Its remover record stays foreign while the transition could still be in progress. Once the record and every captured entry have been unchanged for the orphan adoption age, the recorded pid is checked locally and a dead remover's transition is adopted. Records from another host, and records naming a live process, are still never reclaimed.
+
+- Point the install guide's retry configuration example at the global settings file actually read by GJC.
+
+- The helpers GJC runs on its own while starting a session -- the `ps` process-identity probe behind file locks, launch-worktree reservations, the resident blob cache and `gjc harness`, the `tmux -V` multiplexer detection, the tmux window rename and its `git symbolic-ref` branch lookup, and the `lspci`/`wmic` GPU probe -- now start from the same filtered environment as the bash tool. Previously a repository `.env` declaring `LD_PRELOAD` (or another loader hook such as `LD_AUDIT` or `DYLD_INSERT_LIBRARIES`) made those helpers load a repository library as soon as `gjc` was launched in the checkout, before any prompt, including in the compiled binary.
+
+- Record a model in the recent-model (usage) order only after its selection succeeds: a model profile switch, TUI default model selection, or configuration reload that fails and rolls back (for example, to a CLI `--model` startup override) no longer records the failed pick or the restored model as a recent choice (follow-up to #6768).
+- Within a session, a model choice that a newer default model or profile selection overtook while its transaction was still finishing (for example, a configuration reload waiting on another session's model-catalog publication, or a profile switch still flushing settings) no longer records itself over the newer choice in the recent-model order. An automatic fallback switch, or a newer selection that fails and rolls back, does not suppress the completed choice.
+
+- SDK broker session heartbeat checkpoints now emit a rate-limited warning when all retries fail because observations are stale.
+
+- Missing or invalid `--owner-id` arguments to private notification-daemon entrypoints now report a usage error and exit 2 instead of recording a crash.
+
+- Lean notifications keep the final answer of a tool-using request when a queued background result settles a short follow-up in the same run; the idle message no longer pins the request's first tool-loop narration in its place (#4458). A completed turn whose tool calls the provider already resolved (Devin ACP display-only calls) still counts as a settled answer.
+
+- Lifecycle MCP server env and headers no longer run `!` shell commands or copy sensitive host values, including a sensitive header placeholder, when the lifecycle host loads that tools-only file. A caller-selected exact config stays trusted.
+
+- Lifecycle read-back no longer rejects its own settled terminal row because an unrelated identity's ledger row exceeds the JSON bounds. A cleanup receipt carrying an artifact snapshot larger than the 1024-element limit no longer makes every later lifecycle result unverifiable on that agent directory; rows for the requested identity, undecodable rows, and unsupported state versions still withhold proof.
+
+- Local `!` and `$` command output that enters model context is framed as untrusted content after the stored excerpt is already truncated.
+
+- The Windows machine-identity probe (`reg query ... MachineGuid`) now runs with `windowsHide`, so the console-less detached broker no longer flashes a visible terminal window each time it derives the ownership-lock host identity.
+
+- Markdown cells strip terminal control sequences from repository content before rendering, and keep a carriage return as a markdown line break.
+
+- Marketplace registry writes no longer follow a symlink or hard link at the predictable temporary path next to `installed_plugins.json` or `marketplaces.json`.
+
+- Exa and Websets tools/call failures no longer write tool arguments or echoed credential text into the rotating log.
+
+- MCP server initialize instructions are framed as untrusted content after the per-server length cut, so a server-supplied closer cannot end that frame early.
+
+- `/mcp resources`, prompts, notifications, reload errors, and the reconnect, enable, disable, unauth, and reauth status lines sanitize the server name before drawing it.
+
+- MCP resource update notifications frame the server-provided URI as untrusted content before the user turn.
+
+- Shared MCP pool keys include an API-key Authorization value, so one binding label cannot send another caller's token.
+
+- Mid-run context maintenance no longer ends the turn with `Context maintenance could not commit a compaction before the next model request.` on models whose window is below 300k (for example a 272k window) when compaction has nothing to summarize but the unchanged context still fits the window. The fit check now uses the configured reserve instead of the window-scaled reserve, which below the 300k ceiling equalled the threshold margin and made the #6813 fallback unreachable.
+
+- `gjc migrate` no longer follows a symlinked Claude Code instruction, settings, or skill file outside the home or project root being imported. A rootless Codex or OpenCode config whose final component is a symlink is still read.
+
+- `/model roles` and the `/model` status summary strip control characters from stored model selectors before they reach the terminal.
+
+- Native hook error logs are created as owner-only files and are not written through a symlink.
+
+- `config.patch` rejects notification binding paths before any settings write, so a generic patch cannot replace a Slack actor, a Slack or Discord destination, or a Telegram chat id.
+
+- Discord and Slack notification frames publish only their own string fields, and a replayed frame body is scrubbed again before the provider post, so prototype text is not sent. Ask choices and an explicit redact opt-out stay readable, including a Slack ask root posted after a lease wait.
+
+- Outbound secret obfuscation now covers string message content and unsigned thinking prose.
+
+- Pasted image paths trim trailing terminal newlines in one pass, so a paste that does not end in a newline cannot stall path parsing.
+
+- The agent settings pending-retirement marker is rewritten on its own descriptor at mode 0600 and is not created through a final-component symlink. A refused marker write leaves settings.json active.
+
+- ACP and SDK tool-approval titles and command text show control bytes visibly and keep the shell text that still executes, including inside an OSC sequence, before the 80-character title preview.
+
+- External editor saves of a non-local plan path stay inside the session directory, including absolute paths, `..`, and symlinks.
+
+- Inspect every imported Python `os.system` alias during planning, including repeated and continued import lists, so an unused alias cannot hide a later shell invocation. Keep inert comments and strings read-only while failing closed on unresolved alias calls.
+
+- Preserve the original CLI argument list while parsing inline option values so tmux relaunches do not add those values to the user's prompt.
+
+- Preserve the terminal startup fallback-model notice when the SDK session stream subscribes before the TUI, without replaying the notice to live extension observers.
+
+- Project-layer task.agentModelOverrides is ignored when the task tool starts a subagent. User config and runtime overrides still apply.
+
+- A project plugin registry entry whose install path resolves inside the directory that owns that registry is no longer loaded. Entries outside that directory, including the user plugin cache, still load. On a case-sensitive Windows directory, a path that differs only by case stays outside that directory.
+
+- A project agent no longer preloads bundled workflow skills into a task subagent.
+
+- Quick-lane file paths are scanned once, so a long slash-separated task that names no file cannot stall classification.
+
+- The read tool description normalizes truncation to schema members and receipt budgets to finite numbers before interpolation and KiB conversion, so a project settings file cannot place arbitrary text in the tool definition.
+
+- Memory phase 2 writes a rollout summary only when its file name stays lexically inside rollout_summaries, and still prunes existing summaries in that directory.
+
+- SDK broker startup failures now wait for the spawned broker to exit before reading its stderr log, preserving the final diagnostic alongside the typed startup error.
+
+- A session resumed in a new process (`--resume`/`--continue`) no longer has its first Telegram notifications silently suppressed. Every SDK host start now takes its event generation from a per-session authority in the agent directory instead of restarting at `1`: generations are strictly increasing and unique across host processes, with wall-clock time only as a floor, so the new process's `(generation, seq)` coordinates and notification publication ids can no longer collide with delivery receipts recorded for the previous process, and a host resumed after the system clock stepped backward still outranks the previous host in the session index and stays visible to Router consumers. The Telegram daemon resumes a stored replay cursor only within the host generation that produced it.
+
+- A repository `.gjc/config.yml` or `.gjc/settings.json` can no longer set `searxng.endpoint` or replace the user SearXNG settings with a non-object value, and a runtime override cannot replace the user endpoint. Web search keeps the user config endpoint, or `SEARXNG_ENDPOINT` when that value is unset.
+
+- Stop a session's coordinator state persistence from failing permanently with `terminal_persistence ... lock_owner_record_unprovenanced` when its `runtime-state.json.lock` owner record ends in zero-filled bytes. File-system filters such as cloud-sync placeholders, or crash recovery, can leave such a tail after an otherwise complete record. Owner records now ignore trailing NUL padding the same way they already ignore the writer's space padding. A NUL inside the record still fails closed.
+
+- The `/session` panel strips terminal control sequences from project append-only settings, LSP server labels, and MCP server names before drawing them.
+
+- An untouched settings or plugin text confirm keeps the stored string, an edit commits the submitted text, and plugin enum confirmation keeps the stored option.
+
+- `skill_discovery` frames the paged skill catalog as untrusted content, so a repository skill description or use condition cannot close that frame early.
+
+- The skill HUD drops ESC, BEL, and C1 bytes from skill, phase, summary, and chip text so a control sequence cannot be reassembled on the status row.
+
+- A repository skill body is fenced as untrusted content in the model prompt, an end tag inside that body stays escaped, and the body and host suffix are shortened before that fence so the saved prompt keeps its closing fence within the session text cap.
+
+- Skills chained with the `skill` tool now reach the model in the same turn. The tool sent the callee prompt as a plain custom message, which a busy session queues as a follow-up; follow-ups are only delivered once the agent stops, so the prompt arrived after the final answer and started an extra turn that re-ran the chained workflow. For example, an autoresearch mission that had already reached a verdict and been cleared was re-activated at `intake`, and its research-only guard then blocked every write for the rest of the session. The prompt is now steered in right after the tool result, and a prompt whose preparation finishes after the run was aborted is dropped instead of restarting the stopped run.
+
+- `gjc skills discover` text output strips terminal control characters from repository skill names, descriptions, paths, and use conditions before writing the row.
+
+- SSH tool descriptions encode host names and destinations from repository `ssh.json` and frame that host list, so a host name cannot insert a newline or sit in the trusted prompt.
+
+- `/ssh list` strips terminal control sequences from host name, host, username, and port before drawing them.
+
+- Streaming artifact output is published as mode 0600 without following a destination symlink, and an existing regular file is still updated when its parent directory is not writable.
+
+- Task subagents inherit the parent session's bash restriction profile and allowlist, and a child allowlist cannot widen that posture.
+
+- A tail-only tool-result cut keeps the opening untrusted-content tag on the retained tail when both the line budget and the byte budget have room for the tags, the trusted suffix, and one body line. A shortfall leaves the unfenced plain tail.
+
+- Task setup-failure summaries escape "<" before they enter the task synopsis, so a repository agent file cannot close that element.
+
+- Resuming a closed session (`--resume`/`--continue`) while the Telegram notification daemon keeps running opens a fresh forum topic and delivers notifications again. The `session_closed` tombstone now fences only the attachment that closed, not every later attachment for the same session id, and refused attachment recovery leaves a daemon warning instead of silently dropping the subscription.
+
+- Managed tmux sessions start from a Broker launched without a UTF-8 locale (launchd, cron, a service manager). The native tmux clients that managed-session creation, inspection, and mutation run and parse now pass `-u`. Before this, tmux replaced the tab separators in their replies with `_`, so creation failed with `gjc_tmux_owner_changed_after_create`, and non-ASCII workspace paths did not round-trip through the session state-file tag. psmux and interactive `attach-session` are unchanged.
+
+- `/todo` strips terminal control sequences from phase, task, and note text before drawing the list and the status lines that echo that text.
+
+- The /tools panel strips terminal control sequences from tool names and descriptions before placing them in the markdown table.
+
+- TTSR rule notifications strip terminal control sequences from the rule name, description, and body before drawing them.
+
+- TTSR interrupt and tool-reminder text encodes rule name, path, and reserved prompt tags before they are rendered into the model message.
+
+- Fixed ACP and SDK clients receiving no message or tool content for a turn they submitted to a session hosted by an interactive terminal; the turn ran and settled, but the client only saw its start and the prompt watchdog later expired. Folded background bash jobs are now published to those clients as well.
+
+- The confirmed operator terminal abort (`gjc sdk session raw control <id> --op turn.abort --json-input '{"mode":"terminal","operator":true}' --confirm --idempotency-key <key>`) now reaches TUI and direct CLI sessions, not only sessions the SDK broker launched. Such a host publishes a process-local random marker in its own endpoint registration in the broker-owned session index; the broker echoes exactly that marker and the runtime accepts only its own. The marker is stripped from `session list` and never appears in endpoint discovery or SDK responses. The stopped session's terminal now shows `Turn stopped by a remote operator.` (#7272).
+- An operator abort to a session whose host publishes no operator authority (a gjc that predates the operator route) now fails with `authorization_denied`, outcome `not-applied`, and diagnostic `sdk_operator_control_unsupported`, instead of `endpoint_stale` — which told callers to retry a request that cannot succeed (#7272).
+
+- Resolve Ultragoal's default integration bases using explicit local and remote branch refs so same-named tags cannot hide committed changes or provide a false baseline.
+
+- Let `gjc update` supersede a pre-promotion activation record left by a failed attempt at an older release instead of failing every later update with `activation_transaction_requires_reconciliation`. The record is superseded only while the installed binary is still the exact recorded baseline (issue #6096).
+
+- v1 session migration records each assigned entry id before choosing the next one, so two entries cannot share an id.
+
+- Vim edit results frame viewport and diff text as untrusted content, so a repository line cannot close that frame early.
+
+- The welcome screen strips terminal controls from LSP server names and file types before drawing them.
+
+- Workflow intent tracking is persisted only after the final prompt acceptance check and immediately before execution, so a prompt cancelled during admission, including at the durable-accept fence, no longer leaves a `workflow-intent-diff` entry for work that never started (#7138).
+
+- Worktree dependency install refuses a non-exact `packageManager` version before `bun x` can resolve it as a package alias.
+
+- Write tool previews strip terminal escapes before syntax highlighting, including when highlighting is off.
+
+- The yield tool frames repository output-schema text in its parameter schema after truncation, so that text is not tool-definition instructions.
+
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- `session.create`, `session.fork`, and `session.resume` accept an optional per-session `env` map and `unsetEnv` list. The broker applies them to that session host's environment, so its Bash executor sees them, without touching the broker's own environment. Two sessions hosted by the same broker can therefore run with different `PATH` or tenant variables. Names must be valid variable names outside the broker-reserved `GJC_*` namespace, and a name may not be both set and unset. Values of credential-named variables are redacted from startup diagnostics (#6735).
+
+- TTSR rules accept an `astCondition` frontmatter field (string or list of ast-grep patterns), matched before a `write` or `edit` executes against an in-memory digest of introduced source. Write supplies full content; replace, patch, hashline, and apply_patch edits supply only added text per file. Vim edits are not evaluated. Language comes from each file's extension, and only the 18 languages built into the default native build are supported (no grammar downloads); `scope`, `globs`, and repeat gating apply. `interruptMode: "always"` blocks the call and retries with the reminder, leaving the file unchanged; `"never"` folds the reminder into the executed tool's result. AST-only rules are registered as TTSR rules.
+
+- Telegram notifications now announce when a foreground `bash` command prints a browser sign-in URL or device code and then waits (for example `tailscale up`, `az login --use-device-code`, `aws sso login`). The notice is sent once per command after 3 s without new output and carries only the prompt kind, never the URL or code, so it is also delivered under `notifications.redact` (#6852).
+
+- `mcp.discoveryDeferAutoload` keeps conventionally autoloaded MCP tools (`gjc mcp add`, `.gjc/mcp.json`, `~/.gjc/agent/mcp.json`) out of the default tool selection when MCP discovery is on. The tools stay registered and become active through `search_tool_bm25`; servers listed in `mcp.discoveryDefaultServers` are still selected, so large MCP catalogs no longer occupy the context window up front.
+
+- `gjc migrate --from claude-code` now imports Claude Code subagents from `.claude/agents` into the selected scope's `agents/` directory. Tool lists are translated to GJC tools, unsupported tools are dropped and reported, and a name that collides with a bundled role (`executor`, `architect`, `planner`, `critic`) is imported as `<source>-<name>` so the bundled role stays authoritative.
+
+- `gjc migrate` imports Claude Code Markdown commands and namespaced Codex prompts as scoped GJC slash commands, preserving nested names, namespacing every imported command under its source so built-in, extension, and MCP command registrations cannot shadow it, and reporting effective command names, case-insensitive/effective-name/structural/unsafe-destination collisions, and late creates.
+
+- `gjc migrate` imports Claude Code hooks as a generated `.gjc/hooks/migrated-claude-code.ts` module. `PreToolUse` maps to `tool_call` and keeps the origin contract (a command that exits 2 blocks the tool and its stderr becomes the reason); `PostToolUse` maps to `tool_result`, `SessionStart` to `session_start`, and `Stop` to `turn_end`. Tool matchers are preserved, the payload keeps the origin's field names, and fields this runtime cannot supply are omitted rather than invented. Events with no faithful equivalent (`Notification`, `SubagentStop`, `PreCompact`, `UserPromptSubmit`) are reported as `skipped_unmappable` for manual porting instead of being silently dropped.
+
+- `gjc migrate` now reports the source settings it cannot import instead of leaving them silent: Claude Code hook events (with their shell-command counts), `model`, `permissions` allow/deny/ask counts, and `env` variable names, plus Codex `config.toml` `model`, `approval_policy`, `sandbox_mode`, and `shell_environment_policy` names. They appear under `Manual actions:` and in `manualActions` with `--json`; environment values are never read.
+
+- Stage lossless prompt images through bounded, authenticated GJC-private SDK uploads on both session hosts without increasing transport frame limits. Staging accepts static PNG, JPEG, WebP, and GIF images and rejects animated PNG, WebP, and GIF; accepted bytes and MIME are preserved without transcoding or byte loss. Uploads expire and remain connection-owned; unadopted submissions retain image capacity until their producer settles, and adopted executions require exact execution-settlement proof even after cancellation or transport teardown. Quarantined or unidentifiable executions remain charged rather than freeing capacity for still-unfenced work. Standard ACP image schemas and oversized-prompt handling are unchanged.
+- Export staged image references in `TurnPromptInput`, with mutually exclusive direct and staged image inputs.
+- Reclaim accepted image capacity through exact ledger settlement events without polling or a release cutoff, including after host teardown. Expose internal process-budget accounting and isolate decode admission per session. Preserve specific image validation errors and retained `clientRef` conflict precedence before consuming staged images.
+- Retire positively refused queued starts without stranding image quota, while preserving producer-settlement fences and exact-run ownership for started or ambiguous executions. Report pre-start refusal as prompt failure rather than queue cancellation.
+
+- Document optional local Sem MCP navigation and a separate Weave merge-preview workflow, including the global `mcp.enableProjectConfig` opt-in a project stdio server requires and resetting it after the example.
+
+### Changed
+
+- Show `/mcp` command metadata only in interactive sessions with exact-file MCP controls; ordinary TUI sessions no longer advertise it.
+- Refresh slash-command visibility after a committed branch even when post-commit cleanup fails.
+
+- Raise daemon generations for incarnation-verified process-tree authority and Linux PTY cleanup that reaps adopted descendants.
+
+### Removed
+
+- Removed the `--smol` and `--slow` CLI flags and the `GJC_SMOL_MODEL`/`GJC_SLOW_MODEL` (and legacy `PI_SMOL_MODEL`/`PI_SLOW_MODEL`) environment variables. Since model roles were reduced to `default` (#449), no built-in feature resolves the `smol` or `slow` roles; passing the flags now fails with `Unknown option`. A custom `cycleOrder` entry named `smol`/`slow` still resolves from persisted `modelRoles`, just without a CLI/env override. The `resolveModelRoleOverrides` export is removed from the package root. `--plan`/`GJC_PLAN_MODEL` are kept because plan mode still switches to the `plan` role.
+
+### Fixed
+
+- `bash --rcfile FILE -c 'payload'` and other long-option forms of bash/sh no longer confuse script arguments with shell command payloads in the tmux self-injection guard.
+- The guard now properly handles bash long options (`--rcfile`, `--init-file`, `--norc`, `--noprofile`) before `-c` and correctly identifies quoted payloads.
+- Quoted `bash -c` arguments that begin with `-` but contain shell syntax are inspected conservatively to avoid false negatives across shell versions.
+
+- A managed session directory that comes back with the same inode on a different volume (after a remount, drive-letter change or volume-serial change) is still refused, but now reports `volume_identity_changed` instead of the generic `Managed write protocol setup failed.` ([#6750](https://github.com/Yeachan-Heo/gajae-code/issues/6750))
+
+- Stop Ultragoal try-harder nudges from targeting goals handed off to a successor run. When a retained source-owned goal remains, nudges target that work instead, keeping aggregate drop guarded until its nudge budget is exhausted; when no retained target remains, the guard falls through to its normal gate without spending budget (#6807).
+
+- Report a refused replacement-cleanup receipt as `managed_replace_cleanup_receipt_invalid` in the managed-scope startup error instead of a generic `binding_invalid`, so operators are pointed at the receipt rather than a healthy binding (#6820).
+
+- Revalidate configuration snapshots after overlapping session transitions that have started but have not committed yet, avoiding a spurious `MODEL_UNAVAILABLE` rejection.
+
+- ACP cancellation now preserves pre-admission intent when the host reports an uncertain abort and retries once the prompt is admitted, so a follow-up turn cannot misclassify the cancelled prompt as `end_turn`.
+
+- A repository APPEND_SYSTEM.md is no longer appended to the system prompt. An explicit append string and a user-level file still are.
+
+- Archive readers enforce per-entry, total member, count, and depth caps while accounting for TAR framing, bounding cumulative gzip output, streaming ZIP deflate input, and truncating long archive-controlled paths.
+- Empty global PAX values clear inherited path and size overrides.
+
+- Browser-backend guidance now continues Aside work through `aside session resume` instead of the unsupported `aside exec --session` option, and declares Aside session follow-ups as `exec` activity so continuations do not fail CLI argument parsing.
+
+- Owner shutdown now proves a cancelled queued subagent resume against the queue generation captured by its lease, instead of the stale job identity from before it was queued.
+
+- Browser open, run, and act results frame page URL, title, extract text, and script return values as untrusted content before they reach the model.
+
+- Browser screenshots that fall back to the shared temp directory are written to an exclusive private file so a preexisting symlink is not followed.
+
+- Codex web search now selects GPT-6.1 Sol, then GPT-6 Luna, only when advertised by current Codex subscription discovery. Removed legacy GPT-5 defaults and unadvertised fallbacks; unavailable or unmatched discovery fails closed. Explicit model overrides bypass discovery and preserve single-attempt behavior; unsupported-model retries stay limited to advertised defaults.
+
+- Strip terminal control characters from commit-agent previews, provider errors, assistant text, and tool labels before writing them to stdout.
+
+- Escape repository context file paths and bodies before they are inserted into the commit analysis prompt.
+
+- Encode the commit analysis diff, stat, scope candidates, and recent subjects before they are inserted into the analysis prompt.
+
+- A project settings file can no longer choose `compaction.remoteEndpoint`. Session compaction keeps the user config endpoint, so a repository cannot redirect the transcript POST or replace the summary.
+
+- Auto-compaction now moves to another stored credential row when its summarization request hits a provider usage limit, the way a normal turn already does. It used to retry the exhausted row until its retries ran out, and because compaction runs before the next request, a session whose context was full stayed stuck on that row while other rows still had quota. The credential-rotation phase marks every stored row that resolves to a failed key, so duplicate aliases cannot bypass its backoff or cause unbounded same-key rotation; once rotation is exhausted, the existing retry policy applies. A `--credential` pin is still never rotated, and only rows of the session model's provider are marked.
+- A stored API-key row selected under an `apiKeyEnv` override can rotate to another stored row; literal config keys, runtime API keys, and explicit credential pins remain fixed. Resolver failures and expired backoffs no longer prevent trying a later healthy row.
+
+- Serialize concurrent discovered-tool activations per session and fence queued or in-flight commits at committed session and MCP catalog boundaries. Revalidate delayed activations against the current MCP catalog, registry identities, prompt generation, and active-tool selection after prompt rebuilds; rebase after prompt refreshes and yield to newer explicit selections. Canceled transitions, manual and automatic compaction, and read-only MCP status snapshots preserve pending activations. Fence branch adoption before fallible MCP retirement, and publish execution-context tool names from active tools, including exact-MCP rollback restoration, so stale rebuilds or failed controls cannot leave mismatched context.
+
+- Crash diagnostics no longer follow a symlink on the diagnostics directory or change that target's mode.
+
+- Crash sanitization now preserves diagnostic text after URLs while stripping credentials, queries, and fragments from each URL.
+
+- Debug launch and attach now require approval and honor the planning mutation guard, and a debug adapter runInTerminal request stays inside the workspace.
+
+- Debug transcripts are written to an exclusive private temp file so a preexisting symlink is not followed.
+
+- Fixed the flaky "a stale deadline callback cannot terminalize after its submission was cleared" test: its `setTimeout` capture matched the bus deadline by delay window alone, so the SDK broker discovery timer the bus arms concurrently during startup (~35s, inside the 30–60s lease window) was intermittently captured as a second deadline. The capture now attributes timers to the `armPromptDeadline` arming site.
+
+- Move the direct CLI session broker-index registration to the successor session id after `/new`, `/resume` and forks, and release the predecessor, so the new session is listed and the old one no longer stays live under the same pid. A predecessor release that fails is retained and retried on the next identity sync and during teardown instead of being forgotten when the successor is already registered. A retained release is dropped when its id becomes current again (`/resume` of that session), so a stale release can never retire the session this process just reactivated, and a registration append that fails after its row was already durable is adopted instead of leaving an unowned live row behind.
+- Follow the manager the session adopted when it replaced its own (a bounded cold-sidecar fork), and retry a successor registration whose append never landed — bounded within the switch, again at the next turn boundary, and once more during teardown — while keeping the predecessor registered until the successor succeeds. The sync reads the live session's manager at dispatch time: the extension context keeps returning the manager the runner was constructed with, so a fork that adopted its own manager would otherwise be read through the stale facade.
+- Publish the committed branch identity even when the fallible post-commit integrations fail. `branch()` commits the successor's identity and then restores tool sessions and MCP selections before emitting `session_branch`; a failure there used to skip the event, leaving the broker index advertising the parent session until a later turn or teardown.
+
+- Session event replay now drops content frames that were stored before notification redaction was turned on, while other replay events stay available.
+
+- GitHub run logs and truncated read-url pages stored at an explicit artifact path are published as mode 0600 via a temporary file opened with O_NOFOLLOW, and a pre-existing mode 0644 file is replaced.
+
+- External editor drafts are written to an exclusive private temp file so a preexisting symlink is not followed.
+
+- Auto-read `@path` mentions now include a file only when its canonical path stays inside the session directory, so `..`, `~`, an outside absolute path, or a symlink cannot insert that file into the prompt.
+
+- Keep replay-only observer capability claims in host demand until native negotiation confirms them, while preserving replay-based stream routing.
+
+- Planning mutation guard now blocks Node preload options (`-r`/`--require`) when stdout writes are exempted, as preload code cannot be scanned.
+- Aliased stdout stream mutations are now detected: commands that pass `process.stdout` through function parameters or arrow functions are blocked during planning, as the method may be rebound.
+- Perl `open` mode operand is now correctly parsed by position instead of gathering unrelated quoted strings; variable modes and unparsed opens fail closed.
+- Python `from os import system as X` import aliases are now detected and calls to the imported alias are marked as unclassifiable during planning.
+
+- The default `/share` GitHub CLI child environment now omits project-declared shell, Node, Python, Ruby, Perl, Java, PHP, and .NET startup hooks and module paths (`BASH_ENV`, `ENV`, `ZDOTDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONHOME`, `PYTHONPATH`, `PYTHONUSERBASE`, `PYTHONSTARTUP`, `RUBYOPT`, `RUBYLIB`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `CLASSPATH`, `PHPRC`, `PHP_INI_SCAN_DIR`, and `DOTNET_STARTUP_HOOKS`), preventing checkout-controlled code from running with operator GitHub credentials.
+- Trusted GitHub CLI children run from the filesystem root rather than the checkout, preventing Bun wrappers from loading project `bunfig.toml` preloads.
+
+- `/share` strips project-declared `BUN_OPTIONS` so Bun-based GitHub CLI wrappers cannot replay checkout-controlled preloads.
+
+- `/share` strips project-declared `BUNDLE_GEMFILE` so Bundler cannot evaluate the checkout's Gemfile in GitHub CLI children.
+
+- `/share` GitHub CLI children now filter project-declared .NET profiler injection variables, including architecture-specific profiler paths.
+
+- `/share` strips project-declared `DOTNET_ROOT` variants so GitHub CLI apphosts cannot load a checkout-controlled .NET runtime.
+
+- `/share` strips project-declared `ELIXIR_ERL_OPTIONS` from its GitHub CLI children.
+
+- `/share` children now omit project-declared Erlang startup flags while retaining operator-provided values.
+
+- The default `/share` gist upload no longer forwards project `.env` routing, config, proxy, CA, executable-search, or native-loader values to `gh`; it resolves the CLI and child search path only through absolute operator PATH directories and executables whose resolved paths stay outside actual Git checkout roots discovered from the launch and active working directories, while keeping undeclared operator values. PATH entries beneath a non-checkout launch directory remain usable, and launching from the filesystem root does not mark every PATH entry as checkout-owned.
+
+- `/share` strips project-declared `JAVA_HOME` so GitHub CLI wrappers cannot launch a checkout-controlled Java runtime.
+
+- `/share` strips project-declared `JULIA_LOAD_PATH` and `JULIA_PROJECT` values while preserving operator-owned Julia settings.
+
+- `/share` now omits project-declared Julia depot paths from GitHub CLI child environments.
+
+- `/share` strips project-declared Lua module search paths, including versioned `LUA_PATH` and `LUA_CPATH` variants.
+
+- `/share` now omits project-declared Lua startup hooks from GitHub CLI child environments while preserving operator-provided values.
+
+- `/share` now removes project-declared `OPENSSL_CONF` from GitHub CLI child environments while preserving operator-owned configuration.
+
+- `/share` no longer inherits project-declared OpenSSL engine search paths in GitHub CLI child processes.
+
+- `/share` now removes project-declared OpenSSL provider and configuration-include paths from GitHub CLI child environments while preserving operator-owned values.
+
+- `/share` GitHub CLI children now omit project-declared R profile and environment startup files while preserving operator-provided values.
+
+- `/share` now resolves relative operator certificate file and directory paths against the launch directory before starting GitHub CLI from the filesystem root.
+
+- `/share` now resolves a preserved relative `GH_CONFIG_DIR` against the launch directory before starting `gh` from a safe working directory.
+
+- `/share` now resolves a relative `XDG_CONFIG_HOME` against the launch directory before starting GitHub CLI from the filesystem root.
+
+- `/share` no longer forwards a project-declared `BUNDLER_SETUP` Ruby startup hook to GitHub CLI children.
+
+- `/share` strips project-declared `RUBYGEMS_GEMDEPS` so RubyGems cannot activate a project dependency file in GitHub CLI children.
+
+- `/share` strips project-declared RubyGems search paths from its `gh` children.
+
+- `/share` now removes project-declared `TCL_LIBRARY` from GitHub CLI child environments while preserving operator-owned settings.
+
+- `/share` strips project-declared `TCLLIBPATH` so GitHub CLI wrappers cannot load project-controlled Tcl packages.
+
+- `/share` GitHub CLI children now filter version-specific Lua startup hooks for supported Lua runtimes.
+
+- Git patch text is written to an exclusive private temp file so a preexisting symlink is not followed.
+
+- GJC's own `git` and `gh` invocations (`/commit`, the github tool's `pr_checkout`/`pr_push`/`pr_create`, autoresearch commits, task worktree trees) now drop project-dotenv hook variables such as `GIT_CONFIG_*` (`core.hooksPath`), `GIT_SSH_COMMAND`, and `GIT_ASKPASS`, matching the bash tool. Previously a repository `.env` could make GJC run repository code, e.g. a pre-commit hook on `/commit` or an ssh helper on push. `gh` output is captured, so `GH_PAGER` is pinned to `cat` and `GH_FORCE_TTY` is removed.
+
+- GitHub issue and pull request text returned by the github tool, and by `read` of `issue://` and `pr://`, is fenced as untrusted content, with a forged closing tag escaped.
+
+- Isolate Antigravity and Gemini CLI discovered models by the selected OAuth credential and project so one live session cannot see another session’s project-only models.
+
+- Search and AST grep results stay inside an untrusted-content fence after tail-only truncation, and a closing tag inside a match stays escaped.
+
+- Hindsight recall text can no longer end a memories block early, and retention drops orphan or case-variant memory tags instead of storing that breakout.
+
+- Escape Hindsight mental-model names, content, and refresh stamps so a stored closer cannot end the mental-model frame early.
+
+- Hindsight session retain and the queued retain upload now scrub secrets with the same pass the local memory backend uses before it stores consolidation text.
+
+- Session history database files and WAL sidecars are owner-only on POSIX and Windows, are not opened through a symlink, and a failed first open leaves the database in place.
+
+- Interactive turn status markers are opt-in. The emitted `ESC ] 777 ; notify;Terax;...` sequence is the rxvt notification extension, so Ghostty and cmux raised a desktop notification titled `Terax` on every turn start and finish. A host now sets `GJC_HOST_STATUS=terax` to receive them, and unmarked terminals get no bytes at all.
+
+- Turn status is no longer announced to terminals that are not Terax. The OSC 777 `notify;` marker is now emitted only when the hosting terminal identifies itself with `TERAX_TERMINAL`, which stopped Ghostty (and other rxvt-compatible terminals) from raising a desktop notification titled "Terax" on every turn.
+
+- HTML session exports now preserve later diagnostic lines after unterminated quoted credential values.
+
+- HTML session exports now redact Azure Storage account-key fields in structured tool data.
+
+- HTML session exports now redact secrets when credential keys are wrapped in raw or escaped backticks.
+
+- HTML session exports now redact credential values in key/value header records regardless of property-name casing.
+
+- HTML session exports now redact plural `cookies` arrays instead of exposing cookie-jar values.
+
+- HTML exports redact shell-concatenated credential values while retaining following colon-delimited diagnostic context.
+
+- Session HTML export now masks opaque values under dotted credential keys such as `client.secret`, `db.password`, and `api.key`.
+
+- Session HTML export now fully masks backslash-escaped backtick credential values, including nested serialized containers, without dropping following diagnostics.
+
+- HTML session exports now redact credential values in flat alternating header arrays, including Node `rawHeaders`.
+
+- HTML session exports now redact credential values in HAR-style name/value header records.
+
+- HTML session exports now redact credential values in serialized header tuples.
+
+- HTML session exports now redact database URL credentials with long schemes such as `postgresql+asyncpg`.
+
+- HTML session export redaction preserves diagnostic lines after an unterminated credential container.
+
+- HTML session exports now redact password confirmation fields in text and structured tool-call arguments.
+
+- HTML session exports now redact plural values in credential header records.
+
+- HTML session exports now redact comma- and semicolon-bearing unquoted credential values completely.
+
+- Session HTML export redacts values under Rails-style `SECRET_KEY_BASE` fields.
+
+- HTML session exports now redact Azure `SharedAccessKey` values in connection strings and structured data.
+
+- HTML session exports now redact Azure `SharedAccessSignature` values in connection strings and structured data.
+
+- HTML session exports now redact unquoted multiword credential values without dropping later diagnostic fields.
+
+- HTML export coverage now protects credential-valued YAML block-scalar bodies in tool arguments while retaining following diagnostic context.
+
+- HTML exports now redact credential block scalars with YAML anchors or tags while preserving the node header.
+
+- HTML exports now redact credential block scalars inside YAML sequence mappings while preserving sibling fields.
+
+- Session HTML export masks credential-shaped object keys, complete bracketed credential containers, Cookie/Set-Cookie header values, and sensitive JSON-key values, including camelCase fields such as `authToken`, `githubToken`, and `dbPassword`, plus `auth`, `bearer`, `session_key`, `credentials`, `secrets`, and delimiter-separated labels such as `OPENAI_API_KEY` and `api_token`, before base64 encoding while preserving distinct values on key collisions with incremental suffix assignment for large maps and ordinary identifiers such as `session_id`, `source_session_id`, and `native_session_id` as well as `tokensBefore`, `maxTokens`, and `token_budget`.
+- String values are scrubbed without an intermediate JSON re-encoding, preserving diagnostic context after quoted credential values.
+- Structured HTML exports also mask passphrase fields such as `passphrase`, `sshPassphrase`, and `key_passphrase`.
+- Structured HTML exports also recognize multi-segment camelCase credential keys such as `gitHubAccessToken` and `myDatabasePassword`.
+
+- Generated images are written to an exclusive private temp file so a preexisting symlink is not followed.
+
+- On POSIX, skill and hook import publication now creates and writes destination files through no-follow directory descriptors, so replacing the destination directory with a symlink after validation cannot publish the file outside that directory. Windows retains lexical path validation. On POSIX, imports spanning more than 128 distinct destination directories fail before publication rather than risking a partial batch.
+
+- Deliver a background IRC exchange to a busy session at the live run's next tool boundary instead of at the end of the turn, and keep the incoming question and the reply already sent on the model's behalf in one steering cohort (`Agent.steerCohort`) so a later model step cannot see the question without its reply. A goal-mode turn keeps the session streaming from its first prompt to its last message, so a subagent's message could sit outside the model's history for many minutes while the transcript already showed it.
+- Keep that cohort together when a user interrupt re-arms the exchange as a follow-up of the next turn: the cohort metadata now follows the records into the follow-up batch, so the next turn cannot open on the question alone.
+- Keep an accepted exchange when the run it was admitted into ends before its next tool boundary: admission is not persistence, so the batch stays queued until its records are committed, and a session switch — which aborts the outgoing turn and drops unconsumed steering — still appends the exchange to the outgoing session's history instead of losing it.
+
+- IRC peer text is framed as untrusted data before the model sees it, and the incoming message placeholder is escaped.
+
+- Record and reap interrupted Windows retirements before successor publication, reserve `.removing` before scrubbing owner metadata, bound derived sibling components, and retry transient retirement and receipt cleanup failures. Completed same-host receipts no longer block acquisition while their publisher PID is still live, and pending rollback releases are drained before a same-process reacquisition can replace their cleanup authority. Ownerless canonical legacy locks remain fail-closed because age cannot prove a paused writer is dead (issue #6008).
+- Preserve the exact-removal detach contract for marketplace restores so the existing plugin tree remains available as a rollback backup on Windows; classify a failed post-detach restoration as an uncertain mutation, retain its verified path, and bound backup components independently of the canonical cache name.
+
+- Retry validated pre-mutation Windows access-denied lock publications within a three-call publish budget and a separate two-attempt acquisition budget; report exhaustion with the lock path and failure code without labeling it proven live contention (issue #6618).
+- Keep GC candidates withheld when Windows access denial prevents exact removal before detachment, rather than reporting the refused deletion as a GC failure.
+- Stop retrying pre-mutation publication after bounded transient staging-cleanup retries fail, preventing repeated attempts from multiplying same-process residue; keep generic failures distinct from proven contention.
+- Accept the distinct Windows `access_denied` code in managed-session security validation so ACL access refusals remain classified security errors.
+- Map Windows canonical workspace-identity `access_denied` results to `permission_denied` for scope resolution and candidate diagnostics.
+- Preserve candidate-invalid `permission_denied` diagnostics through lifecycle session-list validation.
+- Remove staged info entries after identity-stat retries exhaust only through a handle-derived identity, and refuse recursive cleanup when that identity is unavailable.
+- Defer transient Windows `access_denied` while detaching replacement receipts so a later managed-session mutation can retry cleanup.
+
+- Keep CLI startup model overrides run-scoped: one-shot model selections no longer rewrite the global model profile configuration or model-usage order (fixes #6768).
+- Keep a durable default model profile whose activation failed (for example, missing provider credentials), including when its identity was restored from session history: role-only selections save only the selected role and never persist the startup override as `modelRoles.default` (fixes #6768).
+
+- SDK broker owners can now shut down a detached broker through its retained authenticated endpoint after the agent directory is removed, preventing orphaned brokers on macOS (issue #6816).
+
+- Reclaim orphaned standalone-update staging files and exact-replace placeholders after updates, keep at most the active journal's rollback backup, and preserve stages owned by pending recovery (#6862).
+
+- Headless session resume refreshes the saved model's provider catalog before restoration, so slash-namespaced catalog IDs remain resumable without an explicit `--model` override (#7099).
+
+- Keybindings migration keeps an existing mode 0600 file and writes its marker as mode 0600 without following a symlink.
+
+- On POSIX, `local://` no longer fails with `Unsafe local:// root` for the rest of a session after the temp sweeper removes the session's scratch directory and another gjc process for the same session recreates it; a recreated root owned by you, private to you, and carrying a settled migration marker is adopted. Windows continues to reject changed-inode roots until their ownership and ACLs can be validated.
+
+- Session title debug logs scrub both credential-bearing request text and generated titles, and marketplace clone debug logs scrub URL credentials including token-as-username forms. Shared redaction covers full bracketed credential containers and generic/compound sensitive labels, including `auth`, `bearer`, `credentials`, `secrets`, `session_key`, `private_token`, `OPENAI_API_KEY`, `api_token`, and `AWS_SECRET_ACCESS_KEY`, before they are written.
+
+- Managed session startup now quarantines a valid v3 replacement-cleanup receipt when its publisher is verified dead and its inode still matches after the encoded device number changes. Receipt bytes are preserved, and live, remote, or unknown owners still fail closed.
+
+- Explicit tool selections persist MCP authority even when the selectable catalog is empty or unchanged, so deselections survive resume instead of re-enabling configured defaults.
+- Additive discovery activation retains unavailable names from persisted MCP selection, allowing temporarily missing tools to return when their catalog republishes.
+- Committed MCP activations are merged into live selection authority before catalog-generation retries can discard their result.
+- MCP selection authority now rolls back after failed tool updates and survives non-persisting catalog pruning; failed session-switch rollback restores matching tool signatures, prompts, and permission guards.
+- Reactive custom-tool replacements are fenced against session transitions, so a predecessor catalog update cannot reactivate non-default MCP tools after `/new`.
+- Deferred default-server activation is recomputed after catalog replacement waits for a session transition, preserving successor defaults after `/new`.
+- Plan mode retries its internal tool swap after an MCP catalog change, keeping `resolve` available alongside newly published tools.
+- Plan-mode retries preserve registered local tools whose names begin with `mcp__`.
+- Plan approval preserves late default-server tools and transferred MCP selections without overriding successor-owned selections.
+- Pending goal activation drops its new goal when a concurrent explicit tool selection supersedes the goal-tool swap, releasing the mode gate.
+- Catalog refreshes use committed MCP selection authority so an in-flight tool request cannot leak into a replacement catalog.
+- Discovery activation commits only the prior selection plus activated tools, keeping a concurrent failed explicit request out of MCP authority.
+- Owned and inherited deferred-default callbacks consult committed authority so a pending request cannot suppress a default after catalog publication.
+- Plan-mode exit retries its tool swap after catalog changes, preventing `resolve` from staying active after approval is disabled.
+
+- MCP prompt text and embedded resource text are framed as untrusted content before they replace the user prompt.
+
+- `/mcp test` and `/mcp list` draw server and tool names as plain terminal text, so a connected server cannot set the window title, spoof a hyperlink, or write the clipboard through those labels.
+
+- MCP tool descriptions and schema prose now use the same untrusted-content boundary as MCP tool results, while argument names, enums, defaults, patterns, and example payloads stay unchanged.
+
+- Memory consolidation redacts Bearer and Basic authorization assignments before it writes MEMORY.md and memory_summary.md.
+
+- Model selector search now ranks multi-token queries by aggregated token match quality and keeps the configured default model ahead of equally scoring MRU entries.
+
+- JSON-to-YAML config migration creates the new file as mode 0600, does not follow a dangling symlink, publishes that file only after its contents are fully written, and still publishes it when the volume does not support hard links.
+
+- The Codex native hook no longer appends hook error logs under a session id that the repository dotenv planted in `GJC_SESSION_ID`. An operator id the project does not declare is still used.
+
+- The non-interactive shell environment no longer sets `CI=1`. It made every child tool (including test runners and `node-llama-cpp`) believe it was running in CI, and a per-call `env` cannot unset it. The prompt-suppression intent is already covered by `GIT_TERMINAL_PROMPT`, `SSH_ASKPASS`, `GH_PROMPT_DISABLED`, `DEBIAN_FRONTEND`, and `PIP_NO_INPUT`.
+
+- The `ooo` bridge no longer adopts a project `.env` `OUROBOROS_CLI` as the executable. Only a trusted operator setting replaces the default `ouroboros` command, and a rejected project value is removed before the bridge spawns a child.
+
+- The OS opener launches only http(s) URLs and unchanged local paths, and skips other schemes, control characters, and flag-shaped arguments.
+
+- Imported-text OSC stripping walks each character once and stops at the first terminator, so unterminated ESC prefixes stay cheap and text between terminated OSC sequences is kept.
+
+- Strip terminal control sequences from AST grep, AST edit, and find result lines, and from tool error lines, before they are drawn.
+
+- A patch rename checks generated destinations before writing, again under the mutation lock immediately before a move commits, after an earlier edit marks one generated, and for a Windows path whose file name is generated.
+
+- Planning-phase Bash now refuses sed `w` destinations with spaces and compound scripts, awk quoted redirections, command pipes and opaque program files, alternate awk executables, `ln`, and writes from inline interpreters. Dynamic execution and reflective loading fail closed across supported interpreter one-liners, including Ruby, PHP, Lua, and shell `-c` forms. Read-only planning commands, including GNU awk `-W lint`, stay allowed.
+
+- Reject multiply linked files in planning-writable artifact, scratch, and research harness paths.
+
+- Project discovery no longer follows a symlink to a file outside the repository when loading rules.
+
+- A repository `.gjc/hooks` pre or post module is no longer imported at session startup. Project-scope hook imports and inventories now identify those files as stored-only; user-agent hooks and explicit hook paths still load.
+
+- Project-level MCP config from any provider now drops `!` shell values, keeps sensitive host names literal, and does not pass the host environment into that stdio process.
+
+- An approved project MCP stdio server, including a `/mcp test` entry whose type is omitted or null, spawns with the minimal OS environment plus its own `env` entries, so the repository file cannot read host credentials.
+
+- Python eval ignores a workspace `.venv` or `venv` unless `pyvenv.cfg` exists and the interpreter resolves outside that workspace, including a file named `..payload`.
+
+- `gjc ralplan --write` scrubs credential shapes from stage artifacts and pending-approval copies before it records their digest, and refuses a disposition when distinct target ids collapse to one scrubbed id.
+
+- The Ultragoal ask guard no longer deadlocks the one question that can unblock a blocked goal: an ask that selects the `ralplan` / `approval` workflow gate is now admitted when this session's current ralplan final validates. Validation re-hashes every persisted stage artifact against `index.jsonl`, requires an iteration opener before the final, requires architect and critic verdicts from the same iteration, requires the final to be the newest stage, and requires `autoHandoff` to be `off`; anything missing, stale, rewritten, or outside the session's run directory is refused with the reason. Ordinary asks and incomplete-goal guards are unchanged, and `AskTool` still authenticates the publication it records consent against.
+
+- A project dotenv entry can no longer choose the harness receipt spool directory, including when a command forwards that value to an owner started elsewhere. `spool.jsonl` is opened without following a final-component symlink, and an existing spool file is tightened to owner-only mode before a receipt is appended.
+
+- Encode task names, docs, paths, and runner fields in the recipe tool description so repository metadata cannot close its instruction or runner tags.
+
+- Debug report bundles are created as mode 0600 files, and a symlink at the archive path is refused instead of followed.
+
+- Resident text blobs for long assistant and tool output stay in memory when the resident cache root is inside a Git worktree, so a later git add cannot stage that plaintext.
+
+- Eval refuses to run when the session has a bash allowlist or a read-only bash profile, so in-process Python or JavaScript cannot bypass that restriction. Sessions without those restrictions still run eval.
+
+- `--resume` and `--fork` open the session whose id equals the argument when a newer case-insensitive prefix or filename match would otherwise be chosen.
+
+- SDK sessions now publish deferred `agent_end` events after continuation decisions are resolved and the originating prompt finalizer and earlier event handlers have completed, so terminal updates are not lost and do not race successor turns. Batched terminals publish in order, and settlement waits for the entire batch. Disposing during an in-flight extension delivery rejects the outstanding SDK terminal instead of leaving its submitter pending.
+
+- A detached SDK broker left with no client connection, no live session host, and no open spawn authority now exits on its own after `sdk.brokerAbandonedGraceMs` (default 120s) instead of holding its port, its publication, and its lock until the machine reboots, and it removes the registration it still owns.
+
+- Report a retained heartbeat-renewal block as a broker exit instead of silently dropping the checkpoint cycle. A heartbeat pass whose budget aborted before the lock layer exhausted reported nothing, so a broker blocked by a stale removal transition lingered until shutdown; it now surfaces the block and exits with `heartbeat-renewal-blocked` and the blocking lock path (#6738).
+- Keep the retained broker trampoline's decision backstop longer than the parent's discovery deadline so a broker that never publishes is reported as a discovery timeout rather than an "exited before discovery" startup failure (#6738).
+
+- The broker startup signal directory is taken only from the operator environment, including a value loaded before a worktree changes the working directory, so a project dotenv line cannot create that directory or pass it to the broker child. An operator directory the project does not declare is still used.
+
+- Session-host cwd-equality test seams (`GJC_SDK_TEST_HANG_MODEL_PROFILE`, `GJC_SDK_TEST_FAIL_AFTER_REGISTRATION`, `GJC_SDK_TEST_EXIT_AFTER_READY`, and `GJC_SDK_TEST_REJECT_AFTER_READY`) arm only from a trusted operator value, and a project dotenv copy is removed before a later child inherits it. An operator value the project does not declare is still honored.
+
+- Preserve proven lifecycle terminal results when a late transition attempts to overwrite them, avoiding contradictory ledger history on restart. Broker retries of proven errors return the recorded response even when it contains cleanup metadata. Existing uncertain or quarantined history is not repaired automatically.
+
+- SDK observer streams now deliver live tool activity only to authenticated clients that negotiated the required capabilities, without replaying it as durable history or exposing the prompt owner's identity.
+- Legacy broker admission refusals now retain a fixed public diagnostic while keeping outcome certainty and retryability unknown.
+
+- Event-replay capability claims no longer reduce SDK host demand until native negotiated-capability snapshots confirm the observer role.
+
+- SDK terminal events no longer wait for unrelated event handlers admitted afterward.
+
+- Keep the exact-config `/mcp` exception in the public slash-command boundary: sessions started with `--mcp-config` still expose `/mcp status|list|suspend|resume|reconnect` even though ordinary TUI and ACP surfaces do not.
+
+- SDK broker startup reclaims a same-host `sessions/index.jsonl.lock` whose owner process is provably dead, including a leftover `.lock.removing` directory. A live same-host owner and a lock attributed to another host stay in place.
+
+- Switching to a different session clears the active checkpoint so a later rewind cannot truncate that session or move its branch to the root.
+
+- Switching to a different session drops deferred bash and python results so the next prompt cannot write them into that session.
+
+- Switching to a different session drops the previous session's pending resolve action so apply cannot run after the switch.
+
+- Shell snapshot creation quotes the rc file path before sourcing it, so metacharacters in that path are not executed as shell commands.
+
+- Bash expansion of `skill://` paths now rejects a symlink that leaves the skill directory, and still expands a missing file whose real ancestors stay inside that directory.
+
+- Concurrent Slack root requests now wait through the active durable publication lease and retry only after its state changes or expires, avoiding false timeouts while a valid publisher is still working.
+
+- Slack root publication now stops renewing retired leases and cannot reactivate a mapping after attachment retirement.
+
+- Slack root publication waiters now stop with daemon shutdown instead of lingering through lease renewals or taking over after shutdown.
+
+- The ssh tool now uses the same ACP and SDK permission gate as bash. Prompt mode asks before a remote command runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+- The SSH tool frames remote command output in its direct result and error text, and a shorter inline window keeps that frame. Reading an SSH output artifact wraps the selected text after selection and truncation; stored artifact bytes remain unchanged.
+- A rejected artifact reservation after the remote command has finished still returns that command's framed output and exit status.
+
+- Workflow JSONL and text appends create mode 0600 files, refuse a final-component symlink, and tighten an existing group- or world-accessible file to 0600.
+
+- The Windows speech-to-text recorder script is written to an exclusive private temp file so a preexisting symlink is not followed.
+
+- Neutralize host framing tags inside a subagent role body so that text cannot close the role block early.
+
+- Subagent tool results frame preview, assignment, steer text, and setup diagnostics as untrusted content so a backtick fence cannot close early.
+
+- A repository SYSTEM.md no longer replaces the user file or is inserted raw into the system-prompt customization block; the user file is encoded before insertion.
+
+- Session title generation replaces configured secrets in automatic titles and /rename regeneration text before those prompts are truncated and sent to the model.
+
+- tmux launch and `gjc session create` ignore project dotenv pins for the tmux session name, coordinator session id, GJC session id, and coordinator state-file path, and pass that filtered GJC session id into the child so the project file cannot reload it. An operator value the project does not declare is still used, and an omitted id stays unset.
+
+- Task token logs and harness session state and event files are created mode 0600 in mode 0700 directories, refuse a final-component symlink, and tighten an existing group- or world-accessible file to 0600.
+
+- Background ephemeral turns apply the same host trust notice beside tool-result images as the main provider request, and leave user-attached images unchanged.
+
+- Encode tool names, labels, and descriptions in the system prompt inventory so metadata cannot close that wrapper, while repeated MCP descriptions keep their host untrusted-content fence and escape only the enclosed body.
+
+- Stdio MCP servers, LSP servers, the Biome and SwiftLint linters, and DAP adapters no longer inherit hook variables a project `.env` declares (e.g. `NODE_OPTIONS=--require ./x.js`, `LD_PRELOAD`, `GIT_CONFIG_*`). They now start from the same filtered environment as the bash tool, so opening a repository and writing a file can no longer run repository code through a server GJC starts on its own. Values the launching shell exported are still honored.
+
+- TTSR now records and logs non-fatal `astCondition` parse errors once per rule and language instead of silently treating invalid patterns as non-matches.
+
+- Recognize `develop` and `origin/develop` as authoritative Ultragoal integration bases while retaining nearest-merge-base selection. Exclude the checked-out local branch from default candidates so committed changes remain visible, and reject repositories without a distinct recognized base; explicit overrides and remote-tracking refs remain eligible.
+
+- Fail closed when Ultragoal cannot resolve an integration baseline independent of the checked-out branch, preventing committed goal changes from being authenticated as an empty checkpoint.
+
+- Ultragoal change-set capture no longer fails with "unable to resolve an authoritative integration base" when the repository's only integration ref is the checked-out branch (for example a trunk-only checkout or a single-branch clone). The checked-out branch is used as the fallback base, so the change set is exactly the working-tree diff.
+
+- Fetched pages, MCP tool text, and web search summaries escape an untrusted-content end tag when whitespace sits before its closing bracket.
+
+- `gjc update` recognizes a project dependency install at `<project>/node_modules/.bin/gjc` — including the real `.exe` that Windows dependency installs place there — and refuses with package-manager instructions instead of downloading a replacement. Replacing that file broke the project's lockfile contract and failed on Windows with `acl_present`.
+
+- Fixed the welcome screen model and provider pills staying stale after model switches, including resume choices, extension controls, profile changes, and fallback switches; sanitize discovered model metadata before rendering.
+
+- Restricted workflow bash runs an allowlisted command at its resolved path and disables git external diff and textconv helpers.
+
+### Security
+
+- fix(tmux-self-injection-guard): Fix multiple command-parsing vulnerabilities in the tmux injection guard
+  - Restrict `command -v`/`-V` lookup suppression to the same command invocation; previously suppressed across command boundaries (`;`, `|`)
+  - Preserve environment variable assignments like `env FOO=bar` in wrapper context; previously treated them as wrapped commands
+  - Separate flag-only options (`setsid -c/-w`, `sudo -s/-i`, `xargs -0/-t/-x`) from argument-taking options to prevent adjacent words from being consumed as option arguments
+  - Recognize shell option operands (`bash -O extglob`, `bash -o pipefail`) and skip over them when scanning for script payloads; previously halted at option operands
+  - Removed unreachable dead code in wrapper mode state machine
+- Preserve argv boundaries when recursively inspecting `env -S` payloads, including nested `bash -c` commands, and avoid treating `builtin` or non-executing `sudo` modes as external command executions.
+- Inspect executable here-document input and unquoted command substitutions, follow shell stdin through wrappers, pipelines, and identity descriptor redirects, while leaving literal data-only consumers unblocked.
+- Honor bundled `env` split-string options, environment unsets, and BSD `env -P` operands; keep trailing words as arguments to the split command, ignore lookup-only `env -S` operands, and stop shell command scanning at a pre-command `--`.
+- Resolve `env -C` from the tmux command's simple-command segment and respect bundled `xargs` option operands when detecting socket overrides.
+- Propagate `env -C` working directories into nested shell and here-document payloads; preserve pipeline identity across subshell grouping.
+- Inspect only the final repeated `tmux -c` command and stop command discovery after invalid shell-builtin wrapper options or GNU `env --null`/`-0` modes.
+- Pass the effective environment, including `env -u` changes, to named-target resolution.
+- Resolve wrapper working directories from the effective Bash environment and apply tmux's `/tmp` fallback when `TMUX_TMPDIR` is empty.
+- Inspect assignment-prefixed `eval` strings and shell scripts in their effective working directory, while respecting non-executing wrapper and Bash modes.
+- Respect unambiguous GNU wrapper-option abbreviations and bundled options inside `env -S` payloads.
+- Treat `sudo -e`/`--edit` as file editing rather than command execution when checking wrapper arguments.
+- Preserve Bash option order across mixed bundles and `noexec` toggles, distinguish shell-builtin `eval` from an external command under wrappers, inspect shell-runner scripts resolved through the effective `PATH`, and fail closed on unresolved `PATH` overrides.
+- Resolve statically known environment references in `env -C`, suppress command discovery for non-executing GNU `env` help/version/null modes and sudo modes.
+- Inspect command substitutions in ordinary shell arguments and here-documents, skip literal here-document bodies when matching substitution boundaries, and decode ANSI-C-quoted Bash `-c` payloads.
+- Stop timeout option parsing after its required duration, and recognize terminal help/version modes and unambiguous long-option abbreviations for common wrappers.
+- Document the guard's BashTool preflight scope, its direct `AgentSession.executeBash()`/SDK bypass, and its limitations around interpreter one-liners, shell variable indirection, and Python/eval tools.
+
+- Rulebook names, descriptions, and globs are encoded before the system prompt is rendered, so repository rule frontmatter cannot close the rules block.
+
+- Validation commands that would inject input into the current tmux pane are refused before a shell starts.
+
+### Fixes
+
+- Preserve canonical workflow identity across assistant continuations and helper prompts, including the Deep Interview ask contract, while clearing the identity when its durable workflow ends (#7049).
+
+- **ultragoal change-set**: Support SHA-256 unborn repository baselines. The empty tree object ID was hard-coded to the SHA-1 value, which caused git diff commands to fail (exit code 128) when applied to repositories initialized with `git init --object-format=sha256`. The empty tree ID is now derived dynamically from the repository format using `git hash-object -t tree`, ensuring compatibility with both SHA-1 and SHA-256 object formats.
+
+- **bash tool**: Complete removal of default CI=true injection. PR #6937 removed CI from the non-interactive constant but the underlying buildSpawnEnv() function in shell-config.ts still injected CI by default. This prevented tools like node-llama-cpp and test runners from running correctly, as they change behavior when CI=true is present. The injection is now completely removed; CI is only present in the spawned bash environment if inherited from the parent process.
+
+## [0.18.12] - 2026-10-16
+
+### Added
+
+- Added the `task.compactSubagentPanel` setting. When it is on, live subagent await progress collapses into one summary line such as `12 subagents running · 3 idle >30s`, plus any provider-degradation warning and an expand hint, until tool output is expanded. Await progress then refreshes only when that summary changes, so redraw cost and frequency no longer grow with the number of live subagents. Final results, including timeout guidance and failure receipts, still render in full (#6774).
+
+- `--credential`, `--prefer-credential`, `/credential`, `gjc accounts pin`, and `gjc accounts logout --account` accept `org:<organization id or name>` to choose one organization of an Anthropic account that belongs to several. Account lists show the organization name next to the email, and `gjc accounts logout --account <email>` refuses when that email matches more than one organization instead of guessing.
+
+- Reload user settings and model configuration in open Linux interactive sessions with verified private configuration directories at safe request boundaries, with validated changes, preserved session overrides, and refreshed model/status displays. macOS and Windows require a session restart after configuration edits until equivalent permission verification is available.
+
+- Added global `auth.credentialPreferences`: an ordered list of preferred OAuth accounts per provider, each optionally capped by a usage percent (`- low-cost@example.com` then `- shared@example.com: 75`). The first listed account that is usable and under its cap is used; once every listed account is rate-limited or at its cap, the remaining accounts are ranked normally. Unlike `auth.credentialPins`, a preference never blocks the provider. The key is global-only and ignored in project settings. Startup fails closed when two entries name the same stored account, including through different selectors such as an email and `account:<id>`.
+- Added `gjc accounts prefer <provider> <account>[=<percent>]...` to write that list without editing YAML. It checks every account against the stored OAuth rows, stores portable email/account selectors in a form startup reads back (`email:<address>` when the bare text would not read back as the same address), and writes nothing when any account is missing, ambiguous, duplicated, or has an invalid cap. `gjc accounts prefer <provider> --clear` removes the list.
+
+- `gjc migrate` now imports Claude Code `CLAUDE.md` and Codex `AGENTS.md` into the selected GJC scope's `AGENTS.md`, with collision-aware dry-run reporting and symlink-safe destination writes.
+
+- `models.yml` accepts provider-level and per-model `streamIdleTimeoutMs` settings for OpenAI-compatible Completions and Responses models, with environment overrides retaining precedence. Provider defaults also apply to registry models without conflating per-model timeout differences with transport identity. Values above the platform timer limit and model-configured timeouts on `pi-native` transports are rejected explicitly.
+
+- Document project-scoped Parallel Search MCP setup for free, keyless web search and page fetching through the native HTTP MCP loader.
+
+- Add `/provider status` to show each configured provider's active credential source and non-active sources that are shadowed, without displaying credential values (issue #6530).
+
+- `report_issue` tool (opt-in via `reportIssue.enabled`): the model records tool behavior that contradicts the tool's description into the local `~/.gjc/tool-issues.db`. Reports are never uploaded; read them with `gjc read '~/.gjc/tool-issues.db:tool_issues'`.
+
+- Added `ultrafast` as a valid service tier value in user settings (`serviceTier` enum)
+- Added `ultrafast` to SDK protocol validation for service tier operations
+
+### Changed
+
+- Settings schema now recognizes and validates `ultrafast` alongside existing tiers (auto, default, flex, scale, priority, openai-only, claude-only)
+- Trusted local SDK controls may set `ultrafast`; model-facing and chat adapter inputs remain restricted
+
+### Fixed
+
+- Keep SDK deadline recovery leased while owned tools are pending; bounded retries wait for exact tool-settlement evidence before publishing the prompt's terminal outcome (#6508).
+
+- The Bash tool's `read` builtin now decodes valid UTF-8 as text and preserves Windows ANSI-code-page text from native pipelines instead of replacing it, so `while IFS= read -r line` loops pass non-ASCII text through intact, `read -n`/`-N` count UTF-8 characters rather than bytes, and timed-out reads retain consumed partial input (#6543).
+- `mapfile` into a readonly array now fails before reading, leaving piped input for the next reader as bash does.
+- Terminal-backed custom shell streams are now recognized by `read` and `mapfile`, preserving terminal mode and control-key handling.
+
+- Allow dead retained Python sessions to recover after unconfirmed shutdown while retaining the old kernel for explicit cleanup retries.
+
+- The embedded shell reads its own standard input without buffering, so input that a builtin such as `read -n1` did not consume is still available to the next command that inherits stdin, and `read -t` no longer times out on input that was already read into the buffer.
+
+- Session listing, including `/resume`, reads a project's retired-session tombstones once per listing instead of once per session candidate. It used to open and parse every tombstone again for each candidate, so listing slowed down as sessions were deleted. With 116 sessions and 252 tombstone files that was 29,232 file reads and 8–10 s. It is now 252 reads and 1–3 s, and the same sessions are hidden (#6757).
+
+- Report a denied Windows open of the staged update or the live `gjc.exe` during `gjc update` as `access_denied` with its NTSTATUS code instead of a misleading `owner_mismatch`, so the activation is kept pending for a safe retry (#6760).
+
+- Preserve lifecycle input refusals in public JSON and text errors with a fixed `lifecycle_input_refused` diagnostic for invalid request payloads, without exposing broker-supplied error text.
+
+- Load the multisession characterization harness's bench-mock extension from its isolated user agent directory without enabling automatic project extension imports.
+
+- Mid-run context maintenance no longer ends the turn with `Context maintenance could not commit a compaction before the next model request.` when compaction has nothing to summarize but the unchanged context still fits the model window with its reserve. It sends the request, as the end-of-turn threshold check already does. This was common on 1M-window models when a session started with one very large message (#6813).
+
+- A project `.env` declaration of `GJC_ACP_PERMISSION_MODE` no longer switches ACP gated tools to allow; a launching-shell value that does not repeat that declaration is still honored.
+
+- The python tool now uses the same ACP and SDK permission gate as eval. Prompt mode asks before it runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+- `gjc accounts logout --account org:<value>` and `gjc accounts pin <provider> org:<value>` prefer the organization whose id matches exactly over display-name matches, and refuse a display name shared by several organizations while listing the candidate row ids.
+
+- Execution handoff no longer treats a pre-append approval index as sanctioned while the approval transaction journal is still pending.
+
+- Ralplan and deep-interview execution approval no longer fails at the ultragoal handoff with `execution approval transcript identity changed` after the session transcript is rewritten. Session persistence replaces the transcript file by atomic rename on full rewrites, which changes its inode, so the approval boundary now binds the approved transcript content (prefix length and SHA-256, leaf, and Ask tool call) instead of the file's device and inode. Edited, rewound, or newly user-bearing transcripts are still rejected, and approval records written before this change remain readable.
+
+- Assistant SVG fences now respect `terminal.showImages`, including changes made while a message is already rendered.
+
+- `ast_edit` refuses a single-file path whose real path leaves its reference root, so a symlink cannot rewrite a file outside that root.
+
+- Preserve ordinary SDK and folded ACP completion delivery when secured output storage is unavailable, with truthful bounded previews and artifact completeness notices.
+
+- The auto-generated edit guard now blocks `*.generated.ts` names and leading `Generated by scripts/` or `Auto-generated by` stamps.
+
+- Require direct file tools to write the root `autoresearch.sh` during active research missions, rejecting symlinks and preventing compound commands from retargeting the harness; new and regular harnesses remain writable.
+
+- Keep the autorouting tier-map gate passing for new Gemini 4 Argon and India-region Bedrock catalog entries without assigning unreviewed Gemini tier ordering.
+
+- Restore fast capture of large multi-line command output with bounded column-cap batches, while preserving secret-aware clipping.
+
+- `--continue` no longer resumes a terminal breadcrumb whose session file is absent from the selected continuation inventory. A project-local session already in that inventory is still resumed ahead of a newer sibling. A breadcrumb that names a session the managed listing owns is unchanged, and an explicit session directory still prefers its own terminal breadcrumb when that file stays inside the directory.
+
+- Recover SDK broker startup when a stale lock's PID has been reused by a different process incarnation, serialize concurrent reclamation, and reap aged PID-reuse tombstones without weakening fail-closed behavior when incarnation evidence is unavailable. Lock reclamation now requires host qualification: only same-host owners are reclaimed using PID/incarnation evidence; foreign-host and host-unqualified (legacy) owners are never reclaimed from local PID evidence alone (#6719).
+
+- The Codex native hook no longer reads a session transcript from a `GJC_SESSION_FILE` value that the repository dotenv planted. An operator path the project does not declare is still used.
+
+- Codex MCP import no longer writes a resolved secret into `.gjc/mcp.json`. An import into the project config omits `bearer_token_env_var`, `env_vars`, and `env_http_headers` references, including a user config imported into the project, so a later load cannot expand a host value. An import into the global config keeps a local name as `${NAME}`. An entry whose source is not local is skipped.
+
+- Column caps in streamed tool output and file reads no longer return partial configured plain secrets across a cut, including shorter overlapping prefixes and secrets that continue across newline boundaries. Raw reads and hashline output remain unchanged.
+
+- Redact credentials in the formatted commit header and detail lines before they are passed to git commit.
+
+- Redact changelog-shaped credentials and npm tokens in generated task commit messages before the provider request and before the message is returned.
+
+- Stopped showing "Configuration watching could not start because directory ownership and privacy could not be verified" on every interactive launch on macOS and other non-Linux platforms, where configuration hot reload is unsupported; the warning now appears only when a supported platform finds untrusted configuration directories.
+
+- Prevent watcher startup and configuration application after interactive stop or shutdown, including when a directory trust check is still pending.
+- Preserve successive manual model selections, completed provider discovery, and unchanged credential discovery restrictions during configuration reload. Validate reload credentials without rejecting refreshable OAuth accounts or registering API keys that conflict with a credential pin in any live session.
+- Preserve live model, thinking-level, and newer profile-owned selection state across asynchronous reload preparation and rollback after publication failures.
+- Re-stage an immutable reload snapshot after a catalog refresh invalidates preflight, and re-arm failed directory watches so ordinary later saves are still observed.
+
+- Coordinator managed-worktree roots no longer grow from a repository `.env` `GJC_WORKTREE_DIR`. An operator value the project does not declare is unchanged.
+
+- Crash egress now refuses a leftover 40-character AWS secret or percent-encoded `sessionid` cookie that the scrubber did not mask.
+
+- Custom and MCP tools that declare `strict` or `concurrency` no longer crash MCP tool refresh with "Attempted to assign to readonly property". The adapter now sets those fields before proxying the rest of the tool.
+
+- The debug tool refuses an adapter binary controlled by the session workspace when `cwd` points at a different directory, matching the check already applied to the command cwd.
+
+- The debugpy adapter starts with `python -I`, so a repository `debugpy` package in the working directory is not imported in place of the installed adapter.
+
+- The debug tool prompt names `python -I -m debugpy.adapter`, matching the adapter command that already starts with `-I`.
+
+- A JavaScript eval cell can no longer forge a tool call or a successful result by posting on the worker `parentPort`. A tool reply from the host still returns that tool's value.
+
+- Atomic writes inside an explicit artifacts local root now use that root as the trust boundary. A symlink there whose target was moved outside is refused, and a normal file inside the root is still written.
+
+- A live session no longer leaves `sessions/index.jsonl.lock` behind when its release collides with the previous lock generation's `.removing.owner` record, which that remover clears only after its tree is gone. The collision was reported as `owner_changed`, which release treats as final, so the lock stayed on disk under a live owner until the same process acquired it again; idle sessions never did, and every other session failed with `FileLockAcquireError ... after 600 attempts ... a live owner is never displaced`. The collision is now reported as the retryable `removal_record_busy`, and a release that still fails is retried in the background (250 ms to 60 s, five attempts) with the same owner and identity checks, so it can only remove its own generation.
+- Pending release retries preserve the original root and owner-file identity instead of authorizing whatever occupies the lock path later. A replacement directory cannot inherit removal authority by copying the original owner metadata; retries also refuse removal if the initial identity capture failed.
+- A foreign host's remover record is also retryable contention when its transition directory is already gone. Successors wait for the foreign remover to clear its own record without probing its PID or deleting its metadata; an existing foreign transition remains protected.
+
+- Stop `@word` mentions that name no file (chat handles such as `(@handle)` in gateway speaker headers, email addresses) from auto-attaching an unrelated workspace file: the fuzzy fallback now requires the query to spell prefixes of path segments in order instead of any scattered subsequence.
+
+- Preserve mandatory MCP ownership for validated plugin-bundle tools across startup and late catalog updates; caller-owned source metadata cannot grant mandatory status. Keep colliding user tools selectable.
+
+- A project `.gjc` file can no longer satisfy the explicit `sdk.flushWorktreeOnDeadline` opt-in that autosaves a primary checkout when a prompt deadline fires.
+
+- `gjc gc` ignores a project `.env` value for `GJC_CODING_AGENT_DIR` and `PI_CODING_AGENT_DIR`, and still uses an operator value the project does not declare. For the process environment that decision uses the dotenv provenance captured when the environment was loaded, so deleting or rewriting the declaration afterward cannot make the loaded value trusted.
+
+- The default `/share` gist upload no longer forwards a project `.env` `GH_HOST` or `GH_CONFIG_DIR` to `gh`; an operator value the project does not declare is kept.
+
+- Grok Build ignores a project dotenv declaration of its credential base URL and unsafe opt-in, including a quoted value whose suffix follows the closing quote and a quoted value that keeps spaces inside the quotes. Other repository `.env` entries are unchanged.
+
+- A project settings file can no longer choose `hindsight.apiUrl`. The Hindsight client keeps the user config endpoint, so a repository cannot redirect the operator API token or retained conversation text.
+
+- Session HTML export scrubs credential-shaped text inside embedded session values before base64 encoding, including any value stored under a credential JSON key.
+
+- Insane public-route fetches re-validate each redirect and refuse private or loopback targets instead of following them.
+
+- Keep accepted SDK prompt terminal outcomes private until exact run/tool settlement evidence is available.
+- Preserve queued subagent owner and generation identity, plus fail-closed saturation evidence across endpoint rekeys, shutdown cancellation, and queue draining.
+
+- Keep SDK broker heartbeat checkpoint work within its monotonic budget by avoiding redundant process probes during structural projection and stopping further synchronous identity probes after the deadline expires (issue #6624).
+
+- Allow new SDK session creation past unrelated legacy `terminal_uncertain` lifecycle rows while preserving exact-key handling and session-scoped uncertainty fences (issue #6665).
+
+- Allow SDK `session.close`, `session.resume`, `session.delete`, and `session.reconcile_uncertain` requests past unrelated final legacy lifecycle rows recorded for other sessions, while keeping live, same-session, unrecorded-session, and reused-key legacy rows fenced (issue #6708).
+
+- Retry transient Windows replacement failures only while the installed binary remains published; after a retained-publication denial, restore the predecessor before returning. Preserve and reuse verified candidates, surface retained cleanup paths even during rollback, and preserve the structured error code through `doctor install.restore-binary`.
+
+- Honor broker-authorized operator terminal aborts across SDK connections so they can stop another connection's active turn without weakening terminal-settlement checks (issue #6772).
+
+- Launch worktree cleanup no longer deletes through a symlinked worktree path, or through an in-repo bucket path that resolves outside the repository.
+
+- A gitignored `.worktrees` symlink that points outside the repository is refused before launch, so `git worktree add` cannot materialize the worktree through that link.
+
+- Redact known secrets in generated changelog entries before they are written to CHANGELOG.md.
+
+- On POSIX, a managed local:// root and its temp parent are adopted only when this user owns them and they are not group- or world-writable, and a later resolve refuses that root when the directory has been replaced. A root this process recreated can finish initialization after a failed marker write. Windows does not apply the owner and mode checks.
+
+- Session title debug logs and marketplace clone debug logs scrub credential text with the existing crash redactor before they are written.
+
+- Resuming managed sessions now ignores legacy directory names that exceed the filesystem filename limit.
+
+- A project dotenv declaration no longer chooses the managed-owner recovery transcript; an operator value the project does not declare is still forwarded.
+
+- Forward MCP tool-result images and embedded image resources to image-capable models on providers that support tool-result images, using bounded built-in image resizing and source-dimension limits while preserving untrusted text markers and text-only error results. Attached images carry an explicit untrusted-content notice.
+- Honor cancellation during MCP image processing and use the detected image MIME type for mislabeled images.
+
+- MCP server tool text is marked with the same untrusted-content boundary already used for remote URL output, while the original server content stays on `rawContent` and the tool view still shows the body.
+
+- Migration refuses to write project MCP config through a symlinked `.gjc` directory.
+
+- Saving a custom model profile refuses a symlink at `models.yml`, creates the file as owner-only (`0600`), and creates a missing parent directory as mode `0700`.
+
+- Planning and autoresearch mutation checks now cover recognized eval and python writes, including the destination of a qualified `os`/`shutil` copy or rename and `renameSync`/`copyFileSync`, even when whitespace or a line continuation precedes the attribute. Dynamic path expressions and non-literal `open` modes fail closed. A `Path` write inspects every constructor argument before `write_text` or `write_bytes`. Non-mutating code and the autoresearch.sh research artifact stay allowed. Alias imports and `Path.open` are not scanned.
+
+- MCP OAuth token exchange, dynamic client registration, and authorization-server metadata requests are pinned to the validated public address and no longer follow redirects. Those fetches are refused when a proxy environment variable is set.
+
+- Patch delete checks the real parent directory before unlinking, so a directory symlink cannot remove a file outside the workspace or the session local root.
+
+- Patch create and move check the real parent directory before mkdir, so a directory symlink cannot create a directory outside the workspace or the session local root.
+
+- Planning-phase bash now allows `.gjc/_session-*` specs and plans only for the current session's encoded directory. Another session's specs and plans are refused. The current session's own specs and plans, and unscoped `.gjc/specs` and `.gjc/plans`, stay writable.
+
+- The plan review external editor now refuses to save through a symlink that leaves the session local root, while a normal plan file inside that root is still updated.
+
+- Kept a user MCP tool registered when a GJC plugin bundle server normalizes to the same name, without leaving that user tool or an omitted plugin tool on the required-name list.
+
+- Configuration reload preserves the role mappings of an active model profile, and successor profiles rebase configured agent-role bindings from the current configuration instead of stale values captured before reload. Removed configured bindings are no longer revived from an active profile's baseline.
+
+- Subagent shutdown proofs preserve queued records while their owners are fenced and restart that work after live failures reconnect the predecessor and release the fence. Queued restarts wait for prior backing executions to settle; committed purges publish terminal evidence for queued waiters, and proofs validate captured record identity and generation.
+
+- A repository `.gjc/extensions` module and a project `extensions` setting are no longer imported at session startup. An extension in the user agent directory, a user `extensions` setting, and an explicit extension path still load.
+
+- A project `.gjc/mcp.json` stdio server is no longer spawned unless the user config sets `mcp.enableProjectConfig` to true. A project settings file cannot turn that opt-out back on. A stdio server in the user `mcp.json` still starts.
+
+- A persistent Python kernel cell can no longer forge a control frame by writing a raw NDJSON line to stdout. Those bytes are cell output, and a normal runner frame still completes the cell.
+
+- Let departing Python owners finish their own cleanup without waiting for another owner's shared startup or inheriting its later cleanup errors, while retaining actual owned shutdown obligations.
+
+- Read-only bash rejects `rg --hostname-bin`, which runs an arbitrary program to supply a hostname.
+
+- Read-only bash blocks `file -C` / `--compile` and its long-option abbreviations while preserving inspection option arguments.
+
+- Avoid one redundant inventory count during read-only GC receipt verification while retaining fresh evidence checks, existing work limits and unchanged writer/deletion behavior.
+
+- The recipe tool now uses the same ACP and SDK permission gate as bash. Prompt mode asks before it runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+- `lsp` `rename_file` checks the source, destination, and every `willRenameFiles` edit path with the existing workspace check before it writes any of them. A Windows drive root still allows that volume and rejects another drive or share. POSIX `/` stays unchecked.
+
+- Replace-mode edits refuse auto-generated files when that guard is enabled, and a multi-entry replace is published only after every entry passes.
+
+- Debug report bundles remove credential shapes from the session, log, artifact, and subagent copies, and from environment values whose names are not already replaced.
+
+- Restricted role-agent bash binds `gjc` session selectors to the tool session or its credential session, and binds `--worktree-root` to that session's repository.
+
+- Continue file-lock acquisition after a refused orphan-transition adoption and preserve paths for every retained transition state. Keep startup-fence acquisition open through the orphan-adoption age, and retry session-index lock timeouts up to twice within the fence, releasing the spawn lock before retrying. Refuse ordinary or mismatched starts during an unexpired committed restart; authorize successors only against its matching expiry across child-fence acquisition, startup, and parent acceptance.
+- Preserve a verified successor publication when trampoline handoff release crosses its lease deadline, and return a typed startup-lock-unavailable refusal when contention outlasts that deadline.
+- Retry successor validation when its short operation deadline expires but the committed lease remains live; bound post-spawn discovery reads by lease expiry and clean up unpublished children on timeout; and consume one-shot restart credentials before the broker launches session hosts.
+
+- Wait for same-process SDK broker discovery retirement after shutdown RPC failure; keep startup blocked while the incumbent owner remains published.
+
+- SDK lifecycle sessions ignore a project dotenv `GJC_SDK_TEST_IN_MEMORY_SESSION` line, so a repository `.env` cannot disable transcript persistence; an operator value the project does not declare is still honored.
+
+- SearXNG no longer attaches an operator environment credential (`SEARXNG_TOKEN` or basic-auth username and password) to an endpoint that came from the project settings layer. A complete credential set in that project layer is still sent. An incomplete project basic-auth pair is not filled from the environment and does not fail the search. An endpoint and credential that both come from the operator environment are still sent.
+
+- Latest-session auto-detect skips an activity timestamp more than two minutes ahead, so a planted future `updated_at` cannot replace a real session.
+
+- Latest-session auto-detect skips a session directory whose name decodes to a separator or `..`, so one such directory no longer stops discovery of the other sessions.
+
+- Coordinator session state persistence no longer wedges permanently when a process is killed while an owner record is being rewritten in place. The rewrite used to `truncate(0)` before writing, so every rewrite passed through a zero-length record — and an empty record carries no `owner_host_id`, which made the leftover transition claim unattributable, unreclaimable, and fatal: every later contender timed out after 60s with `transition_claim_timeout (reclaim refused: claim_or_owner_unreadable)` and the session's runtime-state snapshot stopped advancing for good. The replacement bytes are now written over the head of the record and its previous length is preserved with trailing whitespace, which JSON ignores, so the bytes on disk always carry the full ownership preamble a later contender needs to prove the dead owner and reclaim the claim (#5159, #5216).
+- An owner record's bytes now land on the descriptor before `chmod` in the create path. `chmod` is a metadata round-trip that a File Provider, NFS, or CIFS mount can hold for seconds, and every syscall in front of the write is a window in which a freshly created record is empty and its claim unattributable; the create's own mode argument already excludes anything more permissive than `0o600`.
+
+- A repository `.gjc/settings.json` `shellMinimizer.settingsPath` no longer rewrites command output. The minimizer loads that TOML file only when a user/global `shellMinimizer.settingsHash` matches it. A settings path in the user settings file, and a runtime override of that path, are still used.
+
+- A repository `.gjc/settings.json` `shellPath` no longer selects the shell. A `shellPath` in the user settings file is still used. Bash runs that shell. The Python executor uses the shell environment from the same resolver and runs its own Python path.
+
+- A project settings file can no longer set `skills.trustProjectSkills` or the legacy `skills.enablePiProject` alias. The user config keeps that consent, so a repository cannot turn a disabled project-skill gate back on.
+
+- Pre-admission artifact spill redacts configured secrets on the full tool result before the head/tail cut, so a secret that straddles the cut is not sent to the provider as plaintext.
+
+- SQLite row updates refuse a database whose real path is outside the workspace, so a symlink inside the project cannot change an outside file.
+
+- Flatten control characters in `gjc stats --summary` labels so a session model or folder cannot forge a row or emit a terminal escape.
+
+- Crash reports scrub stderr with the existing crash redactor before the preview is trimmed to 4096 bytes, so a token that sits in that window is not stored.
+
+- Subagent receipt guidance, such as the await-timeout instruction to inspect progress before cancelling, now wraps to the terminal width instead of being cut to one 80-column preview line. At 60 or 80 columns the instruction used to end mid-sentence before `Inspect progress` or `never cancel`.
+
+- Compaction, handoff, and branch-summary requests obfuscate registered secrets in text blocks, including a stored summary copied into the next summary prompt.
+
+- Refresh built-in Task authority after committed session moves without weakening repository checks, and retain admitted execution inputs for queued and resumed work.
+
+- Keep queued and live resident Task transcripts and outputs on verified same-owner managed storage after session moves, without changing admitted child cwd, identity, or conversation.
+- Refresh derived artifact authority after physical move rollback and re-prepare pending metadata writes across verified storage-only relocation.
+
+- Task subagents now copy an enabled parent plan mode before the first prompt, so a product-file write on the child is refused the same way as on the parent. Writes outside plan mode, and writes of the plan file, stay allowed.
+
+- Resumed task runs recompute the current tier map, disabled-provider policy, and credentials, and fail closed when a matched tier has no authenticated candidate.
+
+- Task subagents now copy the parent ACP/SDK approval mode. Deny still rejects a child tool call, and prompt still asks through the parent permission callback. Allow is unchanged, and terminal or filesystem routing is not copied onto the child.
+
+- Planning-phase mutation checks ignore a project dotenv `TMPDIR` and still allow writes under the real OS temp directories.
+
+- `todo_write` returns a tool result instead of a raw `TypeError` when a task holds a non-string note (for example from a persisted session or a bridged caller), and a note body that is not a string is rejected with a message naming the `text` field instead of crashing the call.
+
+- Ultragoal no longer appends goal-mode state to a session transcript whose path a repository `.env` planted in `GJC_SESSION_FILE`. An operator-supplied path the project does not declare is still used.
+
+- Ultragoal no longer writes a goal-mode request into a session whose id a repository `.env` planted in `GJC_SESSION_ID`. An operator-supplied id the project does not declare is still used.
+
+- File identity comparisons for user-agent and containment-root isolation now use exact bigint precision end-to-end: stat calls capture full 64-bit device and inode IDs, and comparisons are direct bigint equality without rounding. This prevents a security regression on Windows where replaced directories in the same double-rounding bucket could pass isolation checks.
+
+- Windows SDK broker now uses an intermediate 'hop' process to spawn with `detached:true`, allowing the broker to survive parent tree termination (taskkill /T /F). The hop exits immediately after spawning the real broker with detached mode and windowsHide, breaking the process tree chain. This avoids cmd.exe wrapping complexity (quoting, variable expansion, discovery matching) while ensuring broker survival across force-termination scenarios (issue #6007).
+- On macOS, SDK broker startup retains its acknowledged trampoline until discovery is published, then hands the broker to launchd and uses authenticated shutdown for cleanup instead of detached-PID signaling.
+
+- Prevent Windows file-lock staging cleanup from opening live publishers' metadata, use liveness-probed legacy names when process identity is unavailable, retry sharing violations as contention, preserve permanent access-denied publication errors in file locks and managed sessions, and show a manual cleanup command for ambiguous empty locks (issue #6603).
+
+- Detect project-declared `TMPDIR` from the workflow guard caller's cwd while retaining startup dotenv declarations after `.env` is removed or the process changes directories.
+- Bound workflow-guard dotenv provenance reads to regular files no larger than 64 KiB; unsafe layers fail closed for non-system temp roots.
+
+- The YouTube scraper reads `providers.parallelFetch` from the settings of the caller that dispatched it instead of the process-global settings singleton. A runtime that never calls `Settings.init()` — the SDK/ACP host path and workflow lanes that drive `read`/`fetch` — threw `Settings not initialized. Call Settings.init() first.` on every YouTube URL before any fetch was attempted. Special handlers now receive `settings` alongside `storage`, and the registry exposes the real `handleYouTube` instead of a wrapper that dropped both trailing arguments, so Parallel extract is reachable and no scraper needs the global singleton.
+
+### Security
+
+- The computer tool now uses the same ACP and SDK permission gate as other side-effect tools. Prompt mode asks before it runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+### Notes
+
+The ultrafast tier works like flex/scale/priority — it's a cost and processing priority tier, not an Anthropic fast-mode tier. Fast-mode predicates (`isFastModeEnabled`, `isFastForProvider`) correctly exclude ultrafast, maintaining the semantic distinction that ultrafast is a pure cost/priority layer.
+
+Users can configure ultrafast via:
+- Settings: `serviceTier: "ultrafast"`
+- SDK: `service_tier.set` with tier value `"ultrafast"` on trusted local control routes
+- Command line: future `/fast ultrafast` or UI tier selector additions
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12

@@ -104,6 +104,12 @@ export class ManagedReplaceError extends Error {
 	/** Path-free Windows NTSTATUS of the underlying pre-mutation failure, when
 	 * the native layer preserved one (e.g. `0xC0000043` for a sharing violation). */
 	readonly windowsErrorCode: string | undefined;
+	/** ACL failure detail: offending principal (account name or SID string).
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailurePrincipal: string | undefined;
+	/** ACL failure detail: whether the offending ACE is inherited from a parent directory.
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailureInherited: boolean | undefined;
 	readonly replacementCause: unknown;
 
 	constructor(result: NativeExactUnlinkResult, cleanupReceiptPath: string, replacementCause?: unknown) {
@@ -117,6 +123,8 @@ export class ManagedReplaceError extends Error {
 		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
 		this.retainedUnknownPath = result.retainedUnknownPath;
 		this.windowsErrorCode = result.windowsErrorCode;
+		this.aclFailurePrincipal = result.aclFailurePrincipal;
+		this.aclFailureInherited = result.aclFailureInherited;
 		this.replacementCause = replacementCause;
 	}
 }
@@ -170,7 +178,11 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 }
 
 function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
-	return error instanceof Error && error.message === "managed_replace_receipt_cleanup_pending:io_error";
+	return (
+		error instanceof Error &&
+		(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
+			error.message === "managed_replace_receipt_cleanup_pending:access_denied")
+	);
 }
 
 /**
@@ -448,6 +460,17 @@ function replacementReceiptIsOwned(bytes: Uint8Array): boolean {
 	const observed = observeProcessIncarnation(publisher.pid);
 	if (observed.status === "absent") return false;
 	return observed.status !== "present" || observed.incarnation === publisher.incarnation;
+}
+
+/** Only positive local process-incarnation evidence proves a mismatched receipt's publisher is stale. */
+function replacementReceiptPublisherIsVerifiedDead(bytes: Uint8Array): boolean {
+	const publisher = replacementReceiptPublisher(bytes);
+	if (!publisher || publisher.host !== os.hostname()) return false;
+	if (publisher.pid === process.pid && publisher.ownerId === replacementPublisherOwnerId) return false;
+	const observed = observeProcessIncarnation(publisher.pid);
+	return (
+		observed.status === "absent" || (observed.status === "present" && observed.incarnation !== publisher.incarnation)
+	);
 }
 
 type LegacyReplacementCleanupIdentity = {
@@ -1100,6 +1123,7 @@ const GENERAL_FAILURE_CODES = new Set([
 	"identity_unavailable",
 	"identity_mismatch",
 	"owner_mismatch",
+	"access_denied",
 	"mode_mismatch",
 	"io_error",
 ]);
@@ -1964,6 +1988,59 @@ export class ManagedSessionDescendantStore {
 		return true;
 	}
 
+	#recoverRenumberedReplacementCleanupReceipt(
+		receiptPath: string,
+		binding: { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } },
+		receipt: ManagedFileSnapshot,
+	): boolean {
+		const parsed = parseReplacementCleanupReceipt(receipt.bytes);
+		const predecessor = parsed ? parseReplacementIdentity(parsed.predecessor) : undefined;
+		if (
+			receipt.identity.dev === binding.receipt.dev ||
+			receipt.identity.ino !== binding.receipt.ino ||
+			!parsed ||
+			!predecessor ||
+			predecessor.dev !== binding.predecessor.dev ||
+			predecessor.ino !== binding.predecessor.ino ||
+			!replacementReceiptPublisherIsVerifiedDead(receipt.bytes)
+		)
+			return false;
+
+		// The filename's device is the only identity component allowed to drift.
+		// The no-follow snapshot supplies the exact current size and digest, and
+		// detachOnly preserves those bytes under a non-canonical quarantine name.
+		const quarantineName = replacementReceiptRetirementName(receipt.identity, binding.predecessor);
+		const detached = nativeSessionStorage().exactUnlink(receiptPath, {
+			dev: receipt.identity.dev,
+			ino: receipt.identity.ino,
+			nlink: receipt.identity.nlink,
+			parentDev: this.#subtreeRoot.dev,
+			parentIno: this.#subtreeRoot.ino,
+			size: BigInt(receipt.identity.size),
+			mtimeNs: receipt.identity.mtimeNs,
+			sha256: receipt.identity.sha256,
+			detachOnly: true,
+			quarantineName,
+		});
+		if (isPeerOwnedReceiptRetirement(detached)) return true;
+		if (
+			!detached.ok &&
+			detached.code === "not_found" &&
+			detached.retainedSuccessorPath === undefined &&
+			detached.retainedUnknownPath === undefined
+		)
+			return true;
+		if (
+			(!detached.ok && detached.code !== "cleanup_pending") ||
+			detached.detachedPath !== path.join(this.#baseDir, quarantineName) ||
+			detached.retainedSuccessorPath ||
+			detached.retainedUnknownPath
+		)
+			throw new Error(`managed_replace_receipt_cleanup_pending:${detached.code ?? "unknown"}`);
+		fsyncDirectory(this.#baseDir);
+		return true;
+	}
+
 	#detachReplacementCleanupReceipt(receiptPath: string): void {
 		const binding = replacementCleanupReceiptBinding(path.basename(receiptPath));
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
@@ -1975,6 +2052,7 @@ export class ManagedSessionDescendantStore {
 			throw error;
 		}
 		if (receipt.identity.dev !== binding.receipt.dev || receipt.identity.ino !== binding.receipt.ino) {
+			if (this.#recoverRenumberedReplacementCleanupReceipt(receiptPath, binding, receipt)) return;
 			if (this.#recoverReplacementCleanupPlaceholder(receiptPath, binding, receipt)) return;
 			throw new Error("managed_replace_cleanup_receipt_invalid");
 		}
@@ -4037,9 +4115,13 @@ export async function publishManagedFileNoReplace(
 		if (stagingIdentity && (linkPublished || !renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp
 				.lstat(staging, { bigint: true })
-				.then(stat => {
-					if (stat.dev === stagingIdentity?.dev && stat.ino === stagingIdentity.ino) return fsp.unlink(staging);
-					throw new Error("staging_identity_changed");
+				.then(async stat => {
+					if (stat.dev !== stagingIdentity?.dev || stat.ino !== stagingIdentity.ino)
+						throw new Error("staging_identity_changed");
+					await fsp.unlink(staging);
+					// A link-fallback publication is complete only once the staging name is
+					// durably gone; otherwise a crash can restore it and leave nlink=2.
+					if (linkPublished && failure === undefined) await fsyncDirectoryAsync(parent);
 				})
 				.catch(error => {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
@@ -4110,6 +4192,8 @@ export function publishManagedFileNoReplaceSync(
 				throw new Error("staging_identity_changed");
 			}
 			fs.unlinkSync(staging);
+			// See publishManagedFileNoReplace: the fallback is durable only after this.
+			if (linkPublished && failure === undefined) fsyncDirectory(parent);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
 		}

@@ -1,6 +1,6 @@
 import * as zlib from "node:zlib";
 
-import { encodeITerm2Multipart, wrapITerm2RecordsForTmux } from "../terminal-capabilities";
+import { encodeITerm2Multipart, encodeKittyTransmission, wrapITerm2RecordsForTmux } from "../terminal-capabilities";
 import {
 	OUROBOROS_HEART_STEPS,
 	OUROBOROS_IDLE_STEPS,
@@ -110,8 +110,9 @@ const OUROBOROS_PALETTE: Palette = {
 
 // ------------------------------------------------------------------------
 // Real-pixel frames (codex-pets style): the same grids encoded as terminal
-// image escapes, for absolute-positioned overlay rendering. No PNG round
-// trip — sixel and kitty raw-RGBA are generated straight from the grids.
+// image escapes, for absolute-positioned overlay rendering. Sixel is encoded
+// straight from the grids; kitty and iTerm2 both ship a losslessly rasterized
+// PNG so the upload stays a single, small escape.
 // ------------------------------------------------------------------------
 
 // 16x16 full-body grids used by the pixel pet -----------------------------
@@ -737,7 +738,7 @@ function pngChunk(type: string, data: Uint8Array): Uint8Array {
 	return out;
 }
 
-function validatePngGrid(
+function validatePixelGrid(
 	grid: string[],
 	scale: number,
 	topPaddingPx: number,
@@ -755,17 +756,16 @@ function validatePngGrid(
 	const gridHeight = grid.length;
 	const gridWidth = grid[0]?.length ?? 0;
 	if (gridHeight === 0 || gridWidth === 0 || grid.some(row => row.length !== gridWidth)) {
-		throw new Error("iTerm2 pet grid must be non-empty and rectangular");
+		throw new Error("pet grid must be non-empty and rectangular");
 	}
-	if (!Number.isFinite(scale) || scale <= 0) throw new Error("iTerm2 pet scale must be finite and positive");
+	if (!Number.isFinite(scale) || scale <= 0) throw new Error("pet scale must be finite and positive");
 	for (const [name, value] of [
 		["top padding", topPaddingPx],
 		["bottom padding", bottomPaddingPx],
 		["left padding", leftPaddingPx],
 		["right padding", rightPaddingPx],
 	] as const) {
-		if (!Number.isSafeInteger(value) || value < 0)
-			throw new Error(`iTerm2 pet ${name} must be a non-negative integer`);
+		if (!Number.isSafeInteger(value) || value < 0) throw new Error(`pet ${name} must be a non-negative integer`);
 	}
 	const spriteWidth = Math.round(gridWidth * scale);
 	const spriteHeight = Math.round(gridHeight * scale);
@@ -783,46 +783,35 @@ function validatePngGrid(
 		width > MAX_PET_PNG_DIMENSION ||
 		height > MAX_PET_PNG_DIMENSION
 	) {
-		throw new Error("iTerm2 pet PNG dimensions are out of bounds");
+		throw new Error("pet PNG dimensions are out of bounds");
 	}
 	const stride = width * 4 + 1;
 	const rawBytes = stride * height;
 	if (!Number.isSafeInteger(rawBytes) || rawBytes > MAX_PET_PNG_RAW_BYTES) {
-		throw new Error("iTerm2 pet PNG allocation is out of bounds");
+		throw new Error("pet PNG allocation is out of bounds");
 	}
 	return { gridWidth, gridHeight, spriteWidth, spriteHeight, width, height };
 }
 
 /**
- * Encode a grid as an iTerm2 inline PNG spanning a terminal cell block.
+ * Rasterize a pet grid into a lossless PNG canvas.
  *
- * The escape's `width`/`height` are the reserved cell-block footprint in
- * character cells (unitless numbers per the iTerm2 inline-images protocol).
- * iTerm2 resolves cells against its own live font metrics, so the sprite
- * scales with the real terminal geometry — including Retina, where iTerm2
- * divides `Npx` values by the backing-scale factor and would render a fixed
- * pixel box at half size.
+ * Both terminal pixel protocols consume PNG: iTerm2 inline images require it,
+ * and kitty's PNG transmission keeps a 36x36 sprite under ~300 base64
+ * characters — a single APC escape. Kitty raw-RGBA (`f=32`) instead needs
+ * multi-chunk transmissions of ~7 KB per frame, and a terminal that abandons a
+ * chunk mid-payload prints the remaining base64 into the transcript.
  */
-export function encodeGridIterm2(
+function encodePixelPng(
 	grid: string[],
 	scale: number,
-	columns: number,
-	rows: number,
-	topPaddingPx = 0,
-	bottomPaddingPx = 0,
-	leftPaddingPx = 0,
-	rightPaddingPx = 0,
-	palette: Palette = RED_PALETTE,
-): string {
-	for (const [name, value] of [
-		["column count", columns],
-		["row count", rows],
-	] as const) {
-		if (!Number.isSafeInteger(value) || value <= 0) {
-			throw new Error(`iTerm2 pet ${name} must be a positive integer`);
-		}
-	}
-	const { gridWidth, gridHeight, spriteWidth, spriteHeight, width, height } = validatePngGrid(
+	topPaddingPx: number,
+	bottomPaddingPx: number,
+	leftPaddingPx: number,
+	rightPaddingPx: number,
+	palette: Palette,
+): Buffer {
+	const { gridWidth, gridHeight, spriteWidth, spriteHeight, width, height } = validatePixelGrid(
 		grid,
 		scale,
 		topPaddingPx,
@@ -863,6 +852,39 @@ export function encodeGridIterm2(
 		pngChunk("IDAT", compressed),
 		pngChunk("IEND", new Uint8Array()),
 	]);
+	return png;
+}
+
+/**
+ * Encode a grid as an iTerm2 inline PNG spanning a terminal cell block.
+ *
+ * The escape's `width`/`height` are the reserved cell-block footprint in
+ * character cells (unitless numbers per the iTerm2 inline-images protocol).
+ * iTerm2 resolves cells against its own live font metrics, so the sprite
+ * scales with the real terminal geometry — including Retina, where iTerm2
+ * divides `Npx` values by the backing-scale factor and would render a fixed
+ * pixel box at half size.
+ */
+export function encodeGridIterm2(
+	grid: string[],
+	scale: number,
+	columns: number,
+	rows: number,
+	topPaddingPx = 0,
+	bottomPaddingPx = 0,
+	leftPaddingPx = 0,
+	rightPaddingPx = 0,
+	palette: Palette = RED_PALETTE,
+): string {
+	for (const [name, value] of [
+		["column count", columns],
+		["row count", rows],
+	] as const) {
+		if (!Number.isSafeInteger(value) || value <= 0) {
+			throw new Error(`iTerm2 pet ${name} must be a positive integer`);
+		}
+	}
+	const png = encodePixelPng(grid, scale, topPaddingPx, bottomPaddingPx, leftPaddingPx, rightPaddingPx, palette);
 	// Size in character cells, not pixels: iTerm2 applies its own cell metrics
 	// (and divides px values by the Retina backing scale), so cells keep the
 	// padded canvas 1:1 with the reserved block at every geometry.
@@ -872,7 +894,16 @@ export function encodeGridIterm2(
 	return `\x1b]1337;File=${params}:${png.toString("base64")}\x1b\\`;
 }
 
-/** Encode a bottom-aligned grid as kitty raw RGBA at `scale`. */
+/**
+ * Encode a bottom-aligned grid as a kitty PNG transmission at `scale`.
+ *
+ * The canvas is padded to the full cell block (`cols * cellWidthPx`) so the
+ * square sprite renders 1:1 inside it. A PNG-encoded sprite is a few hundred
+ * base64 characters, so the upload stays inside one APC escape; raw RGBA
+ * (`f=32`) would need several ~4 KB chunk continuations per animation frame,
+ * and a terminal that drops one prints the remaining base64 into the
+ * transcript.
+ */
 export function encodeGridKitty(
 	grid: string[],
 	scale: number,
@@ -885,47 +916,13 @@ export function encodeGridKitty(
 	rightPaddingPx = 0,
 	palette: Palette = RED_PALETTE,
 ): string {
-	const gw = grid[0].length;
-	const gh = grid.length;
-	const spriteW = Math.round(gw * scale);
-	// Pad the canvas to the full cell block (cols*cellWidth) so the square sprite
-	// renders 1:1 within it.
-	const w = spriteW + leftPaddingPx + rightPaddingPx;
-	const h = Math.round(gh * scale) + topPaddingPx;
-	const rgba = new Uint8Array(w * h * 4);
-	for (let y = 0; y < h; y++) {
-		for (let x = 0; x < w; x++) {
-			const sourceX = x - leftPaddingPx;
-			const sourceY = y - topPaddingPx;
-			const rgb =
-				sourceX < 0 || sourceX >= spriteW || sourceY < 0
-					? null
-					: palette[
-							grid[Math.min(gh - 1, Math.floor(sourceY / scale))][Math.min(gw - 1, Math.floor(sourceX / scale))]
-						];
-			if (!rgb) continue;
-			const o = (y * w + x) * 4;
-			rgba[o] = rgb[0];
-			rgba[o + 1] = rgb[1];
-			rgba[o + 2] = rgb[2];
-			rgba[o + 3] = 255;
-		}
-	}
-	const data = Buffer.from(rgba).toString("base64");
-	const CHUNK = 4000;
+	const png = encodePixelPng(grid, scale, topPaddingPx, 0, leftPaddingPx, rightPaddingPx, palette);
 	// `Y=` offsets the sprite down by sub-cell pixels within the first cell — the
 	// kitty analogue of the sixel top-padding drop. `C=1` keeps the placement
 	// cursor-neutral so the overlay never nudges the composer's real cursor.
 	const yParam = cellYOffsetPx > 0 ? `,Y=${Math.round(cellYOffsetPx)}` : "";
-	let out = `\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\`;
-	for (let off = 0, first = true; off < data.length; off += CHUNK, first = false) {
-		const chunk = data.slice(off, off + CHUNK);
-		const more = off + CHUNK < data.length ? 1 : 0;
-		out += first
-			? `\x1b_Ga=T,f=32,s=${w},v=${h},c=${cols},r=${rows},i=${imageId},q=2,C=1${yParam},m=${more};${chunk}\x1b\\`
-			: `\x1b_Gm=${more};${chunk}\x1b\\`;
-	}
-	return out;
+	const control = `a=T,f=100,c=${cols},r=${rows},i=${imageId},q=2,C=1${yParam}`;
+	return `\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\${encodeKittyTransmission(control, png.toString("base64"))}`;
 }
 
 export interface GajaePixelFrames {
@@ -957,7 +954,8 @@ export interface GajaePixelFrames {
  * iTerm2 receives unitless `width=columns;height=rasterRows`, so it resolves the
  * padded block with its live cell metrics. The PNG has that block's pixel aspect
  * ratio, allowing `preserveAspectRatio=0` without stretching the authored square
- * sprite. Kitty and Sixel retain their protocol-specific paths.
+ * sprite. Kitty transmits the same PNG through a single kitty escape; Sixel
+ * keeps its own encoder.
  */
 export function buildGajaePixelFrames(options: {
 	protocol: "sixel" | "kitty" | "iterm2";

@@ -1989,6 +1989,47 @@ describe("AuthStorage OAuth refresh race", () => {
 		expect(store.listAuthCredentials(provider)).toHaveLength(1);
 	});
 
+	test("retains the dispatched row ID after a peer refresh changes its OAuth access token", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const provider = "unit-oauth-row-id-preservation";
+		oauthUtils.registerOAuthProvider({
+			id: provider,
+			name: "Unit OAuth Row ID Preservation",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				return credentials;
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+		await authStorage.set(provider, {
+			type: "oauth",
+			access: "dispatch-access",
+			refresh: "dispatch-refresh",
+			expires: Date.now() + 60 * 60_000,
+		});
+		const credentialRowId = store.listAuthCredentials(provider)[0]?.id;
+		if (credentialRowId === undefined) throw new Error("test setup did not persist the OAuth row");
+
+		const resolved = await authStorage.getApiKeyWithCredentialRowId(provider, "compaction-session");
+		expect(resolved).toEqual({ apiKey: "dispatch-access", credentialRowId });
+
+		store.updateAuthCredential(credentialRowId, {
+			type: "oauth",
+			access: "peer-refreshed-access",
+			refresh: "peer-refreshed-token",
+			expires: Date.now() + 60 * 60_000,
+		});
+		await authStorage.reload();
+
+		expect(await authStorage.getCredentialRowIdsMatchingApiKey(provider, "dispatch-access")).toEqual([]);
+		expect(resolved.credentialRowId).toBe(credentialRowId);
+	});
+
 	test("releases a lease when the replay guard rethrows a memoized refresh failure", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 		const provider = "unit-oauth-replay-guard-lease-release";

@@ -73,6 +73,8 @@ bun scripts/clean.ts --dry-run  # list targets without deleting
 
 `artifacts/` policy (issue #4420): The root `artifacts/` directory is untracked test working space. Red-team and QA tests write evidence there and read it back within the same run (`g011`/`g014`/`g015`/`vb001-gen5`). The directory is gitignored at root and is not committed. Deterministic test fixtures that must be tracked belong in `packages/*/test/fixtures/`. The `clean` command deliberately does not touch `artifacts/`.
 
+The generated `g003`, `g011`, `g014`, and `g015` QA-report JSON files are also ignored under `packages/tui/artifacts/` because package-local test runs write there. This exception does not apply to the intentionally tracked `issue-3798` validation/capture evidence pair. `scripts/artifacts-tracked-policy.test.ts` checks both output locations from the repository root, independent of the test runner's working directory.
+
 Verification (never run `tsc`/`npx tsc` directly at repo root; use these):
 
 ```sh

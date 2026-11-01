@@ -8,11 +8,13 @@ import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
-import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
+import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
+import { renderGroupedFileTree } from "./grouped-file-tree";
 import { formatMatchLine } from "./match-line-format";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope } from "./path-utils";
@@ -221,7 +223,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				const parseMessage = cappedParseErrors.length
 					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`${noMatchMessage}${parseMessage}`).done();
+				return toolResult(baseDetails)
+					.text(wrapUntrustedContent(`${noMatchMessage}${parseMessage}`))
+					.done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -291,7 +295,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
 
-			return toolResult(details).text(outputLines.join("\n")).done();
+			return toolResult(details)
+				.text(wrapUntrustedContent(outputLines.join("\n")))
+				.done();
 		});
 	}
 }
@@ -382,51 +388,15 @@ export const astGrepToolRenderer = {
 		return createCachedComponent(
 			() => options.expanded,
 			width => {
-				const searchBase = details?.searchPath;
-				const matchLines = renderTreeList(
-					{
-						items: matchGroups,
-						expanded: options.expanded,
-						maxCollapsed: matchGroups.length,
-						maxCollapsedLines: COLLAPSED_MATCH_LIMIT,
-						itemType: "match",
-						renderItem: group => {
-							let contextDir = searchBase ?? "";
-							return group.map(line => {
-								if (line.startsWith("## ")) {
-									const fileName = line
-										.slice(3)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const absPath = contextDir && fileName ? path.join(contextDir, fileName) : undefined;
-									const styled = uiTheme.fg("dim", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								if (line.startsWith("# ")) {
-									const raw = line
-										.slice(2)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const isDirectory = raw.endsWith("/");
-									const name = raw.replace(/\/$/, "");
-									if (isDirectory) {
-										if (searchBase) {
-											contextDir = name === "." ? searchBase : path.join(searchBase, name);
-										}
-										return uiTheme.fg("accent", line);
-									}
-									// Root-level file (single # without trailing slash) from formatGroupedFiles.
-									const absPath = searchBase && name ? path.join(searchBase, name) : undefined;
-									const styled = uiTheme.fg("accent", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								if (line.startsWith("  meta:")) return uiTheme.fg("dim", line);
-								return uiTheme.fg("toolOutput", line);
-							});
-						},
-					},
+				const matchLines = renderGroupedFileTree({
+					groups: matchGroups,
+					expanded: options.expanded,
+					maxCollapsedLines: COLLAPSED_MATCH_LIMIT,
+					itemType: "match",
 					uiTheme,
-				);
+					searchPath: details?.searchPath,
+					dimMeta: true,
+				});
 				return [header, ...matchLines, ...extraLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
 			},
 		);

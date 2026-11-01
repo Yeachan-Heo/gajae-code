@@ -7,7 +7,9 @@ import {
 	type Api,
 	type Context,
 	Effort,
+	getAntigravityUserAgent,
 	getBundledModels,
+	getGeminiCliUserAgent,
 	getSupportedEfforts,
 	type Model,
 	type OpenAICompat,
@@ -924,10 +926,14 @@ describe("ModelRegistry", () => {
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const opusVariants = registry.getCanonicalVariants("claude-opus-5-5");
-			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
+			const haikuVariants = registry.getCanonicalVariants("claude-haiku-5-5");
+			const legacyHaikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);
 			expect(haikuVariants.some(variant => variant.selector === "demo/anthropic/claude-haiku-latest")).toBe(true);
+			expect(legacyHaikuVariants.some(variant => variant.selector === "demo/anthropic/claude-haiku-latest")).toBe(
+				false,
+			);
 			expect(
 				registry
 					.getCanonicalVariants("claude-haiku-4-5-20251001-thinking")
@@ -3651,6 +3657,420 @@ describe("ModelRegistry", () => {
 				.map(model => model.id)
 				.sort();
 			expect(afterOfflineIds).toEqual(discoveredIds);
+		});
+
+		test("sends the stored Google OAuth project during discovery refresh", async () => {
+			const requests: Array<{ accessToken: string | undefined; body: unknown }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					body: JSON.parse(String(init?.body ?? "{}")) as unknown,
+				});
+				return new Response(
+					JSON.stringify({ models: { "gemini-project-probe": { displayName: "Project Probe" } } }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			try {
+				for (const [provider, projectId] of [
+					["google-antigravity", "antigravity-project"],
+					["google-gemini-cli", "gemini-cli-project"],
+				] as const) {
+					const otherAccessToken = `${provider}-other-access`;
+					const selectedAccessToken = `${provider}-selected-access`;
+					const otherProjectId = `${projectId}-other`;
+					await authStorage.set(provider, [
+						{
+							type: "oauth",
+							access: otherAccessToken,
+							refresh: `${provider}-other-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId: otherProjectId,
+						},
+						{
+							type: "oauth",
+							access: selectedAccessToken,
+							refresh: `${provider}-selected-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId,
+						},
+					]);
+					await registry.refreshProvider(provider, "online");
+					const automaticRequest = requests.at(-1);
+					const automaticProject = new Map([
+						[otherAccessToken, otherProjectId],
+						[selectedAccessToken, projectId],
+					]).get(automaticRequest?.accessToken ?? "");
+					expect(automaticRequest?.body).toEqual({ project: automaticProject });
+
+					const sessionId = `${provider}-project-selection`;
+					authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectId });
+					await registry.refreshProvider(provider, "online", sessionId);
+					expect(requests.at(-1)).toMatchObject({
+						accessToken: selectedAccessToken,
+						body: { project: projectId },
+					});
+				}
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("scopes Google discovery cache reuse to the session-selected project", async () => {
+			const requests: Array<{ accessToken: string | undefined; project: string | undefined }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				const body = JSON.parse(String(init?.body ?? "{}")) as { project?: string };
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					project: body.project,
+				});
+				const modelId = `${body.project}-model`;
+				return new Response(JSON.stringify({ models: { [modelId]: { displayName: modelId } } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			try {
+				for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+					const accessToken = `${provider}-shared-access`;
+					const projectA = `${provider}-project-a`;
+					const projectB = `${provider}-project-b`;
+					await authStorage.set(provider, [
+						{
+							type: "oauth",
+							access: accessToken,
+							refresh: `${provider}-project-a-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId: projectA,
+						},
+						{
+							type: "oauth",
+							access: accessToken,
+							refresh: `${provider}-project-b-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId: projectB,
+						},
+					]);
+					const sessionA = `${provider}-project-a-session`;
+					const sessionB = `${provider}-project-b-session`;
+					authStorage.setSessionCredentialSelector(sessionA, provider, {
+						kind: "project",
+						value: projectA,
+					});
+					authStorage.setSessionCredentialSelector(sessionB, provider, {
+						kind: "project",
+						value: projectB,
+					});
+
+					const requestStart = requests.length;
+					await registry.refreshProvider(provider, "online", sessionA);
+					const projectAIdsBeforeB = new Set(
+						registry
+							.getAvailable(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					expect(projectAIdsBeforeB.has(`${projectA}-model`)).toBe(true);
+					await registry.refreshProvider(provider, "online-if-uncached", sessionB);
+
+					expect(requests.slice(requestStart)).toEqual([
+						{ accessToken, project: projectA },
+						{ accessToken, project: projectB },
+					]);
+					const projectAAvailableIds = new Set(
+						registry
+							.getAvailable(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const projectBAvailableIds = new Set(
+						registry
+							.getAvailable(sessionB)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const unscopedAvailableIds = new Set(
+						registry
+							.getAvailable()
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const projectAAllIds = new Set(
+						registry
+							.getAll(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const staticModelId = provider === "google-antigravity" ? "gemini-2.5-flash" : "gemini-2.0-flash";
+					expect(projectAAvailableIds.has(staticModelId)).toBe(true);
+					expect(projectBAvailableIds.has(staticModelId)).toBe(true);
+					expect(projectAAllIds.has(`${projectA}-model`)).toBe(true);
+					expect(projectAAllIds.has(`${projectB}-model`)).toBe(false);
+					expect(registry.find(provider, `${projectA}-model`, sessionA)).toBeDefined();
+					expect(registry.find(provider, `${projectB}-model`, sessionA)).toBeUndefined();
+					expect(projectAAvailableIds.has(`${projectA}-model`)).toBe(true);
+					expect(projectAAvailableIds.has(`${projectB}-model`)).toBe(false);
+					expect(projectBAvailableIds.has(`${projectA}-model`)).toBe(false);
+					expect(projectBAvailableIds.has(`${projectB}-model`)).toBe(true);
+					// Unscoped command callers (for example `--list-models`) resolve the
+					// effective default credential, which is the first stored OAuth entry
+					// (project A), so their own discovery must remain visible.
+					expect(unscopedAvailableIds.has(`${projectA}-model`)).toBe(true);
+					expect(unscopedAvailableIds.has(`${projectB}-model`)).toBe(false);
+
+					await registry.refreshProvider(provider, "offline", sessionA);
+					const offlineAvailableIds = new Set(
+						registry
+							.getAvailable(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					expect(offlineAvailableIds.has(`${projectA}-model`)).toBe(true);
+					expect(offlineAvailableIds.has(`${projectB}-model`)).toBe(false);
+				}
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("invalidates Google discovery caches when the effective user agent changes", async () => {
+			const restoreUserAgent = unsetEnvForTest("PI_AI_ANTIGRAVITY_USER_AGENT");
+			let registry: ModelRegistry | undefined;
+			try {
+				registry = new ModelRegistry(authStorage, modelsJsonPath);
+				let currentProvider = "";
+				const requests: Array<{ provider: string; userAgent: string | null; body: unknown }> = [];
+				using _hook = hookFetch((input, init) => {
+					if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+						throw new Error(`Unexpected URL: ${String(input)}`);
+					}
+					requests.push({
+						provider: currentProvider,
+						userAgent: new Headers(init?.headers).get("user-agent"),
+						body: JSON.parse(String(init?.body ?? "{}")) as unknown,
+					});
+					return new Response(
+						JSON.stringify({
+							models: {
+								"gemini-4-argon": {
+									displayName: "Gemini 4 Argon",
+									supportsImages: true,
+									supportsThinking: true,
+								},
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				});
+
+				for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+					const accessToken = `${provider}-projectless-access`;
+					await authStorage.set(provider, [
+						{
+							type: "oauth",
+							access: accessToken,
+							refresh: `${provider}-projectless-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							email: `${provider}@example.test`,
+						},
+					]);
+					const endpoint = registry.getProviderBaseUrl(provider);
+					if (!endpoint) throw new Error(`Expected a bundled endpoint for ${provider}`);
+					const authEvidence = authStorage.getProviderEvidenceGeneration(provider, accessToken);
+					const legacyProvenance = crypto
+						.createHash("sha256")
+						.update("gajae:model-discovery-provenance\0")
+						.update(JSON.stringify({ authEvidence, endpoint }))
+						.digest("hex");
+					writeModelCache(
+						provider,
+						Date.now(),
+						getBundledModels(provider),
+						true,
+						"",
+						cacheDbPath,
+						[],
+						legacyProvenance,
+					);
+					currentProvider = provider;
+					const requestStart = requests.length;
+					await registry.refreshProvider(provider, "online-if-uncached");
+
+					expect(requests.slice(requestStart)).toEqual([
+						{ provider, userAgent: getAntigravityUserAgent(), body: {} },
+					]);
+					expect(registry.find(provider, "gemini-4-argon")).toBeDefined();
+				}
+
+				const provider = "google-antigravity";
+				const accessToken = `${provider}-projectless-access`;
+				const endpoint = registry.getProviderBaseUrl(provider);
+				if (!endpoint) throw new Error("Expected a bundled Antigravity endpoint");
+				const authEvidence = authStorage.getProviderEvidenceGeneration(provider, accessToken);
+				const defaultIdentityProvenance = crypto
+					.createHash("sha256")
+					.update("gajae:model-discovery-provenance\0")
+					.update(JSON.stringify({ authEvidence, endpoint, discoveryIdentity: getGeminiCliUserAgent() }))
+					.digest("hex");
+				writeModelCache(
+					provider,
+					Date.now(),
+					getBundledModels(provider),
+					true,
+					"",
+					cacheDbPath,
+					[],
+					defaultIdentityProvenance,
+				);
+
+				const overrideUserAgent = "antigravity-test-cache-identity";
+				const restoreOverride = setEnvForTest("PI_AI_ANTIGRAVITY_USER_AGENT", overrideUserAgent);
+				try {
+					currentProvider = provider;
+					const requestStart = requests.length;
+					await registry.refreshProvider(provider, "online-if-uncached");
+					expect(requests.slice(requestStart)).toEqual([{ provider, userAgent: overrideUserAgent, body: {} }]);
+				} finally {
+					restoreOverride();
+				}
+			} finally {
+				await registry?.dispose();
+				restoreUserAgent();
+			}
+		});
+
+		test("does not publish Google discovery after its selected project changes in flight", async () => {
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			const requests: Array<{ accessToken: string | undefined; project: string | undefined }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				const body = JSON.parse(String(init?.body ?? "{}")) as { project?: string };
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					project: body.project,
+				});
+				if (requests.length === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				const modelId = `${body.project}-model`;
+				return new Response(JSON.stringify({ models: { [modelId]: { displayName: modelId } } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const provider = "google-antigravity";
+			const accessToken = "antigravity-shared-access";
+			const projectA = "antigravity-project-a";
+			const projectB = "antigravity-project-b";
+			const sessionId = "antigravity-project-change-session";
+			try {
+				await authStorage.set(provider, [
+					{
+						type: "oauth",
+						access: accessToken,
+						refresh: "antigravity-project-a-refresh",
+						expires: Date.now() + 60 * 60 * 1000,
+						projectId: projectA,
+					},
+					{
+						type: "oauth",
+						access: accessToken,
+						refresh: "antigravity-project-b-refresh",
+						expires: Date.now() + 60 * 60 * 1000,
+						projectId: projectB,
+					},
+				]);
+				authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectA });
+
+				const firstRefresh = registry.refreshProvider(provider, "online", sessionId);
+				await firstRequest.promise;
+				authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectB });
+				const modelA = `${projectA}-model`;
+				firstResponse.resolve(
+					new Response(JSON.stringify({ models: { [modelA]: { displayName: modelA } } }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+				await firstRefresh;
+				expect(readModelCache(provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+
+				await registry.refreshProvider(provider, "online-if-uncached", sessionId);
+				expect(requests).toEqual([
+					{ accessToken, project: projectA },
+					{ accessToken, project: projectB },
+				]);
+				expect(
+					registry
+						.getAvailable(sessionId)
+						.some(model => model.provider === provider && model.id === `${projectB}-model`),
+				).toBe(true);
+				expect(
+					registry
+						.getAvailable(sessionId)
+						.some(model => model.provider === provider && model.id === `${projectA}-model`),
+				).toBe(false);
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("sends project IDs from structured Google keys during discovery refresh", async () => {
+			const requests: Array<{ accessToken: string | undefined; body: unknown }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					body: JSON.parse(String(init?.body ?? "{}")) as unknown,
+				});
+				return new Response(
+					JSON.stringify({ models: { "gemini-project-probe": { displayName: "Project Probe" } } }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			});
+
+			for (const projectField of ["projectId", "project_id"] as const) {
+				for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+					for (const source of ["models-config", "runtime-override"] as const) {
+						const accessToken = `${provider}-${source}-${projectField}-access`;
+						const projectId = `${provider}-${source}-${projectField}-project`;
+						const structuredKey = JSON.stringify({ token: accessToken, [projectField]: projectId });
+						if (source === "models-config") {
+							writeRawModelsJson({ [provider]: { apiKey: structuredKey } });
+						} else {
+							writeRawModelsJson({});
+							authStorage.setRuntimeApiKey(provider, structuredKey);
+						}
+
+						const registry = new ModelRegistry(authStorage, modelsJsonPath);
+						try {
+							await registry.refreshProvider(provider, "online");
+							expect(requests.at(-1)).toMatchObject({
+								accessToken,
+								body: { project: projectId },
+							});
+						} finally {
+							await registry.dispose();
+							if (source === "runtime-override") authStorage.removeRuntimeApiKey(provider);
+						}
+					}
+				}
+			}
 		});
 
 		test("dynamically discovered Antigravity model survives token rotation followed by a models config change", async () => {

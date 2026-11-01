@@ -39,7 +39,11 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
-import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	getBuiltinSlashCommandsForSession,
+	loadSlashCommands,
+} from "../extensibility/slash-commands";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import {
 	createStarReminderBeforeAgentStartContributor,
@@ -473,6 +477,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#baseSlashCommands: SlashCommand[] = [];
 	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
+	#sessionBuiltinMcpVisible = false;
+	#sessionBuiltinSessionMcpVisible = false;
+	#slashCommandRefreshVersion = 0;
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
 
@@ -767,10 +774,22 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 		});
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribeCommittedSessionSwitch(() => {
+				if (this.#stopped) return;
+				return this.#applySwitchedSessionMode();
+			}),
+		);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
+		this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;
+		this.#sessionBuiltinSessionMcpVisible = this.session.hasSessionMcpControls;
+		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(
+			this.#sessionBuiltinMcpVisible,
+			this.#sessionBuiltinSessionMcpVisible ? this.session : undefined,
+		);
 		const activeProvider = this.session.model?.provider;
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
@@ -788,8 +807,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			description: `${loaded.command.description} (${loaded.source})`,
 		}));
 
-		this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];
-		this.#baseReservedSlashCommandNames = new Set(this.#baseSlashCommands.map(command => command.name));
+		this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];
+		// Hidden builtin metadata must still reserve its name from extensions and skills.
+		this.#baseReservedSlashCommandNames = new Set([
+			...builtinCommandNames,
+			...hookCommands.map(command => command.name),
+			...customCommands.map(command => command.name),
+		]);
 		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...this.#rebuildSkillSlashCommands()];
 
 		this.#uiHelpers = new UiHelpers(this);
@@ -1156,6 +1180,20 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Subscribe to agent events
 		this.#subscribeToAgent();
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribeSessionIdentityChanges(async () => {
+				// Any committed identity change (extension tree navigation, reload, ...) stales the suggestion.
+				this.promptSuggestion.clear();
+				try {
+					await this.refreshSlashCommandState();
+				} catch (error) {
+					if (this.#stopped) return;
+					logger.warn("Failed to refresh slash-command state after extension session transition", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}),
+		);
 
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribe(event => {
@@ -1220,9 +1258,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		if (this.#stopped) return;
+		const refreshVersion = ++this.#slashCommandRefreshVersion;
 		const basePath = cwd ?? this.sessionManager.getCwd();
+		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
-		if (this.#stopped) return;
+		if (this.#stopped || refreshVersion !== this.#slashCommandRefreshVersion) return;
+		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
@@ -1237,6 +1278,29 @@ export class InteractiveMode implements InteractiveModeContext {
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
 		this.session.setSlashCommands(fileCommands);
+	}
+
+	#refreshSessionBuiltinSlashCommandVisibility(cwd: string): void {
+		const hasExactMcpControls = this.session.hasExactMcpControls;
+		const hasSessionMcpControls = this.session.hasSessionMcpControls;
+		if (
+			hasExactMcpControls === this.#sessionBuiltinMcpVisible &&
+			hasSessionMcpControls === this.#sessionBuiltinSessionMcpVisible
+		)
+			return;
+
+		const previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);
+		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(command => command.name));
+		this.#baseSlashCommands = [
+			...getBuiltinSlashCommandsForSession(hasExactMcpControls, hasSessionMcpControls ? this.session : undefined),
+			...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),
+		];
+		this.#sessionBuiltinMcpVisible = hasExactMcpControls;
+		this.#sessionBuiltinSessionMcpVisible = hasSessionMcpControls;
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...previousSlashCommandTail];
+		this.editor.setAutocompleteProvider(
+			this.#inputController.createAutocompleteProvider(this.#resolvedSlashCommands, cwd),
+		);
 	}
 
 	#rebuildSkillSlashCommands(fileCommandNames: ReadonlySet<string> = new Set()): SlashCommand[] {
@@ -1480,6 +1544,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.editor.setPlaceholder(this.#getComposerPlaceholder());
 		this.#setComposerTopBorder();
+		// Every live model switch (/model, profiles, cycling, fallback) refreshes the
+		// editor chrome; keep the welcome model/provider pills on the same signal.
+		this.#welcomeComponent?.setModel(
+			this.session.model?.name ?? "Unknown",
+			this.session.model?.provider ?? "Unknown",
+		);
 		this.ui.requestRender();
 	}
 
@@ -1685,6 +1755,30 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#goalModeController.handleSessionEvent(event);
 	}
 
+	/** Match the plan and goal controllers and the mode gate to the session a switch just committed. */
+	async #applySwitchedSessionMode(): Promise<void> {
+		const sessionContext = this.sessionManager.buildSessionContext();
+		const mode = sessionContext.mode;
+		this.#modeGate.exit("plan");
+		this.#planModeController.setEnabledForCompatibility(false);
+		this.#planModeController.setPausedForCompatibility(false);
+		this.#planModeController.setPlanFilePathForCompatibility(undefined);
+		try {
+			await this.#goalModeController.detachForSessionSwitch();
+			if (mode === "goal" || mode === "goal_paused")
+				await this.#goalModeController.restoreFromSession(sessionContext);
+			else if (mode === "plan" || mode === "plan_paused")
+				await this.#planModeController.restoreFromSession(sessionContext);
+		} finally {
+			const planActive = this.#planModeController.enabled || this.#planModeController.paused;
+			this.#updatePlanModeStatus(
+				planActive
+					? { enabled: this.#planModeController.enabled, paused: this.#planModeController.paused }
+					: undefined,
+			);
+		}
+	}
+
 	/** Restore mode state from session entries on resume. */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -1860,6 +1954,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const draftText = selectShutdownDraft(this.editor.getText(), hadActiveBtw);
 		if (hadActiveBtw) this.pendingImages = [];
+		this.promptSuggestion.clear();
 		this.#btwController.dispose();
 
 		// Flush pending session writes before shutdown.
@@ -2344,6 +2439,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#prepareSessionSwitch(cleanupPreviousSessionUi?: () => void): void {
 		const errors: unknown[] = [];
+		this.promptSuggestion.clear();
 		try {
 			this.#btwController.dispose();
 		} catch (error) {

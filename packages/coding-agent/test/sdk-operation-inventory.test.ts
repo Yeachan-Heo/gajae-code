@@ -40,7 +40,7 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(54);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(58);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
@@ -137,12 +137,24 @@ describe("SDK operation inventory", () => {
 				"test-only estimator seam, not a user-facing SDK control seam",
 			],
 			[
+				"agent_session:getActivatedModelProfile",
+				"internal model-profile activation provenance used to gate role-only materialization, not a user-facing SDK control seam",
+			],
+			[
+				"agent_session:refreshEffectiveActiveWorkflowSkillState",
+				"internal durable workflow identity refresh before session safety checks, not an independent public SDK operation",
+			],
+			[
 				"agent_session:awaitPendingContextTransformations",
 				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 			],
 			[
 				"agent_session:awaitSessionSettlement",
 				"internal agent-event settlement barrier, not a user-facing SDK control seam",
+			],
+			[
+				"agent_session:waitForAgentEndHandlingForTests",
+				"test-only SDK terminal-event handler completion barrier, not a user-facing SDK control seam",
 			],
 			[
 				"agent_session:abortPromptAndWait",

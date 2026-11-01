@@ -18,6 +18,8 @@ export interface RuleFrontmatter {
 	alwaysApply?: boolean;
 	/** New key for TTSR match conditions. */
 	condition?: string | string[];
+	/** AST-grep pattern(s) for TTSR AST matching (evaluated on completed tool args). */
+	astCondition?: string | string[];
 	/** New key for TTSR stream scope. */
 	scope?: string | string[];
 	/** Per-rule TTSR interrupt mode override. */
@@ -48,6 +50,8 @@ export interface Rule {
 	description?: string;
 	/** Regex condition(s) that can trigger TTSR interruption. */
 	condition?: string[];
+	/** AST-grep pattern(s) for TTSR AST matching (evaluated on completed tool args). */
+	astCondition?: string[];
 	/** Optional stream scope tokens (for example: text, thinking, tool:edit(*.ts)). */
 	scope?: string[];
 	/** Per-rule TTSR interrupt mode override (falls back to global ttsr.interruptMode). */
@@ -182,17 +186,21 @@ function isLikelyFileGlob(value: string): boolean {
 }
 
 /**
- * Parse `condition` + `scope` from rule frontmatter.
+ * Parse `condition`, `astCondition`, and `scope` from rule frontmatter.
  *
  * - `condition` accepts string or string[]
+ * - `astCondition` accepts string or string[] (ast-grep patterns)
  * - `scope` accepts string or string[]
  * - legacy `ttsr_trigger` / `ttsrTrigger` are accepted as a `condition` fallback
  * - condition tokens that look like file globs become scope shorthands:
  *   `*.rs` => `tool:edit(*.rs)`, `tool:write(*.rs)` and a catch-all condition `.*`
  */
-export function parseRuleConditionAndScope(frontmatter: RuleFrontmatter): Pick<Rule, "condition" | "scope"> {
+export function parseRuleConditionAndScope(
+	frontmatter: RuleFrontmatter,
+): Pick<Rule, "condition" | "astCondition" | "scope"> {
 	const rawCondition = frontmatter.condition ?? frontmatter.ttsr_trigger ?? frontmatter.ttsrTrigger;
 	const parsedCondition = normalizeRuleField(rawCondition);
+	const parsedAstCondition = normalizeRuleField(frontmatter.astCondition);
 	const parsedScope = normalizeScopeField(frontmatter.scope);
 
 	const inferredScope: string[] = [];
@@ -214,6 +222,7 @@ export function parseRuleConditionAndScope(frontmatter: RuleFrontmatter): Pick<R
 	const scope = [...(parsedScope ?? []), ...inferredScope];
 	return {
 		condition: condition.length > 0 ? Array.from(new Set(condition)) : undefined,
+		astCondition: parsedAstCondition ? Array.from(new Set(parsedAstCondition)) : undefined,
 		scope: scope.length > 0 ? Array.from(new Set(scope)) : undefined,
 	};
 }

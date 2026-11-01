@@ -59,6 +59,7 @@ function safe(text: string): string {
 
 const STATUS_COLORS: Record<InventoryRow["status"], (text: string) => string> = {
 	enabled: text => theme.fg("success", text),
+	"stored-only": text => theme.fg("warning", text),
 	disabled: text => theme.fg("muted", text),
 	invalid: text => theme.fg("error", text),
 	shadowed: text => theme.fg("warning", text),
@@ -281,6 +282,12 @@ export class CustomizationDashboard extends Container {
 	async #toggleSelected(): Promise<void> {
 		const row = this.#selectedRow();
 		if (!row || !this.#guardScope(row)) return;
+		if (row.status === "stored-only") {
+			this.#flashStatus(
+				"project hooks are stored-only; import into Global .gjc or configure an explicit hook path to load them",
+			);
+			return;
+		}
 		if (row.status === "invalid" || row.status === "shadowed" || row.status === "quarantined") {
 			this.#flashStatus(`cannot toggle a ${row.status} entry; resolve its diagnostics first`);
 			return;

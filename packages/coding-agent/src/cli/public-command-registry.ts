@@ -260,7 +260,9 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 		constraints: [
 			"Stays in the foreground until SIGTERM or SIGINT, stops gracefully, then exits with the signal status (143 or 130).",
 			"Exits 1 without serving when another live broker owns the agent directory (it never retires it) or startup fails.",
+			"Startup fails (exit 1) when the publication-liveness watchdog cannot be armed, and that attempt does not leave its discovery file or lock behind.",
 			"Exits 1 if it loses its discovery root or cannot renew its heartbeat while serving; a broker.shutdown request exits 0.",
+			"A discovery write that blocks the process ends in SIGKILL (status 137, not exit 1) at publication-liveness-timeout; a full stderr pipe does not postpone that signal.",
 		],
 		example: "gjc sdk broker run --agent-dir ~/.gjc/agent",
 	}),

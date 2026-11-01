@@ -54,7 +54,7 @@ async function collectToolResults(
 			{ content: ["recovered"] },
 		],
 	});
-	const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+	const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 	const results: Array<{ toolName: string; isError?: boolean; text: string }> = [];
 	for await (const event of agentLoop([createUserMessage("go")], context, config, undefined, mock.stream)) {
 		if (event.type === "tool_execution_end") {

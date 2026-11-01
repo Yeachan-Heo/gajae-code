@@ -356,7 +356,6 @@
     "resolveLarkLidPlaceholders",
     "resolveManagedAgentDirForScope",
     "resolveManagedSessionScope",
-    "resolveModelRoleOverrides",
     "resolveResumableSession",
     "resolveSessionContextBudgetBytes",
     "resolveSkillSlashCommands",

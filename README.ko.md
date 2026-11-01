@@ -39,9 +39,9 @@
   <a href="#문서">문서</a>
 </p>
 
-**이미 구독 중인 플랜으로 로그인하고, 파일 하나 바뀌기 전에 계획하고, 증거와 함께 실행하고 — 에이전트의 질문에는 터미널·휴대폰·자체 봇 어디서든 답하세요.**
+**지원되는 구독 플랜을 연결하고, 필요하면 계획 워크플로로 범위를 정한 뒤 증거와 함께 실행하고 — 알림을 설정하면 터미널·휴대폰·자체 봇에서도 에이전트 질문에 답할 수 있습니다.**
 
-Gajae-Code(`gjc`)는 외부 코딩 에이전트 하네스입니다. 아무 저장소나 워크트리에 넣고 돌리세요. 별도 API 과금 없음. 토큰 단가 불안 없음. 터미널 앞 대기 없음.
+Gajae-Code(`gjc`)는 외부 코딩 에이전트 하네스입니다. 지원되는 구독 로그인은 이미 결제 중인 플랜을 활용할 수 있습니다. API 키나 자체 엔드포인트를 쓰면 요금은 해당 제공자의 정책을 따릅니다. 알림을 설정하면 터미널을 떠나서도 질문에 답할 수 있습니다.
 
 > Gajae-Code는 실험적인 베타 단계 프로젝트입니다. 거친 부분이 있을 수 있으니 중요한 작업에는 출력을 검증한 뒤 사용하세요.
 >
@@ -55,16 +55,16 @@ Gajae-Code(`gjc`)는 외부 코딩 에이전트 하네스입니다. 아무 저�
 
 | 문제 | 어떻게 되나 | Gajae-Code의 해법 |
 | :--- | :--- | :--- |
-| 별도 API 과금 | 플랜 요금 *플러스* 토큰당 API 비용 | 이미 결제 중인 코딩 플랜으로 `/login` — Claude, Codex, Cursor, Copilot, OpenCode Go, GOAT, ClinePass 등 |
-| 코드부터 고치는 에이전트 | 이해 전에 수정 → 재작업 | 계획 게이트 워크플로: 인터뷰 → 계획 → 비평 → *그 다음에* 변경, 승인 게이트 포함 |
-| 터미널 종속 세션 | 새벽 2시에 질문이 오면 아침까지 정지 | 질문이 텔레그램/Discord/Slack으로 라우팅 — 어디서든 답변 |
-| 컨텍스트 폭발 | 전체 파일 읽기와 로그 홍수가 윈도를 태움 | 구조 요약, artifact 스필, 캐시 인지 라우팅, 컴팩션 |
+| 별도 API 과금 | 직접 API를 쓰면 플랜 요금과 토큰 비용이 함께 들 수 있음 | 지원되는 구독은 `/login`으로 기존 플랜 이용 가능 — API 키·게이트웨이는 해당 제공자 요금 적용 |
+| 코드부터 고치는 에이전트 | 이해 전에 수정 → 재작업 | 선택형 계획 워크플로: 인터뷰 → 계획·비평 → 승인 또는 유효한 Ultragoal handoff 뒤 실행 |
+| 터미널 종속 세션 | 터미널을 떠나면 질문에 답하기 어려움 | 알림을 설정하면 질문을 Telegram/Discord/Slack으로 라우팅해 응답 가능 |
+| 컨텍스트 폭발 | 긴 파일·출력이 컨텍스트를 채울 수 있음 | 코드 구조 요약, 출력 제한·조건부 artifact 저장, 캐시 설정, 요약 기반 컴팩션 |
 
 ---
 
 ## 빠른 시작
 
-**설치** — Linux(x64/arm64), macOS(arm64/x64), Windows(x64) 프리빌드 바이너리. Bun은 필요 없습니다:
+**설치** — Linux(glibc, x64/arm64), macOS(arm64/x64), Windows(x64) 프리빌드 바이너리. Linux musl/Alpine은 지원하지 않습니다. Bun은 필요 없습니다:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.sh -o gjc-install.sh
@@ -78,19 +78,26 @@ gjc
 curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
 ```
 
-Windows (PowerShell, 태그 고정):
+Windows (PowerShell; 설치기 스크립트 태그 고정):
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.ps1 -OutFile gjc-install.ps1
 powershell -File gjc-install.ps1
 ```
 
-**첫 실행** — 플랜 고르고 바로 시작:
+`v0.15.3` URL은 설치기 스크립트 버전을 고정합니다. 설치할 바이너리 릴리스까지 고정하려면 Unix 설치기에는 `--ref v0.15.3`, PowerShell 설치기에는 `-Ref v0.15.3`을 전달하세요. Windows 설정과 셸 요구사항은 [docs/install.md](docs/install.md)를 참고하세요.
+
+**첫 실행** — 아래 슬래시 명령은 실행 중인 GJC 대화형 세션에서 입력합니다:
 
 ```text
 /login                       프로바이더 / 코딩 플랜 선택
 /skill:deep-interview        모호한 요구사항 명확화
 /skill:ralplan               계획 수립 및 비평
+```
+
+최종 계획을 승인한 뒤, GJC 세션의 셸에서 다음 명령으로 목표 계획을 만들 수 있습니다. 이 명령은 목표를 만들 뿐 코드를 실행하지 않습니다:
+
+```sh
 gjc ultragoal create-goals --brief-file <승인된-계획>
 ```
 
@@ -99,9 +106,13 @@ gjc ultragoal create-goals --brief-file <승인된-계획>
 ```sh
 gjc                                # 현재 체크아웃에서 실행
 gjc --tmux                         # tmux 기반 리더 세션
-gjc --tmux --worktree my-task      # 위험한 작업을 위한 격리 워크트리
+gjc --tmux --worktree my-task      # my-task라는 별도 격리 워크트리에서 실행
 gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
 ```
+
+관리형 워크트리는 기본적으로 저장소의 `.worktrees/` 아래에 생성되므로 해당 디렉터리를 Git에서 무시하도록 설정하세요. 다른 위치는 `GJC_WORKTREE_DIR`로 지정할 수 있습니다.
+
+Windows에서는 셸 도구에 bash 호환 셸이 필요하며, `--tmux`에는 PATH에서 찾을 수 있는 tmux 호환 실행 파일이 필요합니다. 세부 사항은 [docs/install.md](docs/install.md)를 참고하세요.
 
 나이틀리 채널: `sh gjc-install.sh --channel nightly` (위에서 받은 태그 설치기). 전체 설치 매트릭스, Windows 설정, 업데이트 채널, 셸 자동완성: [docs/install.md](docs/install.md). Bun은 소스 빌드에만 필요합니다.
 
@@ -119,34 +130,36 @@ gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
   <img src="assets/coding-plans-banner.png" alt="GJC가 지원하는 코딩 플랜과 프로바이더: Claude, ChatGPT/Codex, Cursor, GitHub Copilot, OpenCode Go, Kimi, GLM/Z.AI, MiniMax, Grok, Qwen, Command Code GOAT, ClinePass" width="100%" />
 </p>
 
-한 번 로그인하면 이미 결제 중인 구독으로 GJC가 돌아갑니다. 세션 안에서 `/login`을 실행하고 플랜을 고르세요:
+세션에서 `/login`을 실행해 프로바이더를 선택하세요. 프로바이더별 로그인 방식과 저장되는 자격 증명 유형은 서로 다릅니다:
 
-| 플랜 / 구독 | OAuth 로그인 |
-| :--- | :--- |
-| Claude Pro / Max | `anthropic` |
-| ChatGPT Plus / Pro (Codex) | `openai-codex` (브라우저) · `openai-codex-device` (헤드리스) |
-| Cursor | `cursor` |
-| GitHub Copilot | `github-copilot` |
-| OpenCode Zen / OpenCode Go | `opencode-zen` · `opencode-go` |
-| Kimi Code / Coding Plan / Moonshot | `kimi-code` · `moonshot` |
-| Z.AI GLM Coding Plan | `zai` |
-| MiniMax Coding Plan (해외 / 중국) | `minimax-code` · `minimax-code-cn` |
-| xAI (Grok) | `xai` |
-| Alibaba Token Plan / Qwen Portal | `alibaba-token-plan` · `qwen-portal` |
+| 플랜 / 구독 | GJC 로그인 ID | 인증 방식 |
+| :--- | :--- | :--- |
+| Claude Pro / Max | `anthropic` | OAuth |
+| ChatGPT Plus / Pro (Codex) | `openai-codex` (브라우저) · `openai-codex-device` (기기 코드; `openai-codex`에 자격 증명 저장) | OAuth |
+| Cursor | `cursor` | OAuth |
+| GitHub Copilot | `github-copilot` | OAuth |
+| Kimi Code / Coding Plan | `kimi-code` | OAuth |
+| xAI (Grok) | `xai` | OAuth |
+| OpenCode Zen / OpenCode Go | `opencode-zen` · `opencode-go` | API 키 자격 증명 |
+| Moonshot | `moonshot` | API 키 자격 증명 |
+| Z.AI GLM Coding Plan | `zai` | API 키 자격 증명 |
+| MiniMax Coding Plan (해외 / 중국) | `minimax-code` · `minimax-code-cn` | API 키 자격 증명 |
+| Alibaba Token Plan | `alibaba-token-plan` | API 키 자격 증명 |
+| Qwen Portal | `qwen-portal` | API 키 자격 증명 |
 
-그 외 OAuth 플랜 — Google Gemini CLI, GitLab Duo, Perplexity Pro/Max, Fire Pass, Xiaomi Token Plan — 은 [docs/models.md](docs/models.md)에서 다룹니다.
+그 외 OAuth 로그인은 Google Gemini CLI, GitLab Duo, Perplexity Pro/Max입니다. Fire Pass와 Xiaomi Token Plan은 API 키 자격 증명을 사용합니다. 지원 프로바이더와 인증 세부 정보는 [docs/models.md](docs/models.md)를 참고하세요.
 
 ### 신규: 코딩 플랜 프리셋
 
-키 기반 코딩 플랜은 명령 하나로 온보딩됩니다 — 프리셋이 API 타입, base URL, 환경 변수, 호환 플래그, **라이브 모델 카탈로그**를 한 번에 기록하므로 새 모델이 GJC 업데이트 없이 바로 나타납니다:
+키 기반 코딩 플랜은 프리셋으로 API 유형, 기본 URL, 환경 변수, 호환 옵션 등 프로바이더 설정을 기록해 온보딩할 수 있습니다. 아래 GOAT와 ClinePass 프리셋은 실행 중 라이브 모델 카탈로그를 검색합니다. 아래 열거한 `minimax`, `minimax-cn`, `glm`, `alibaba-token-plan` 프리셋은 정적 모델 목록을 사용하며, 다른 프리셋의 동작은 설정에 따라 다릅니다. 설정 명령은 자격 증명을 검증하지 않습니다:
 
 ```sh
 gjc setup provider --preset commandcode-goat   # Command Code GOAT 플랜 (CMD_API_KEY)
 gjc setup provider --preset cline-pass         # ClinePass (CLINE_API_KEY)
 ```
 
-- **Command Code GOAT** — 프로바이더의 라이브 `/models` 카탈로그를 가져오고, `claude-*` 모델은 네이티브 Anthropic Messages로, 나머지는 Chat Completions로 라우팅합니다. 별칭: `commandcode`, `goat`.
-- **ClinePass** — 하드코딩된 모델이 없습니다. GJC가 Cline이 자체 카탈로그를 생성하는 방식 그대로 라이브 카탈로그를 가져옵니다. 별칭: `clinepass`, `cline`.
+- **Command Code GOAT** — 실행 중 프로바이더의 라이브 `/models` 카탈로그를 검색하고, Claude 계열 ID는 Anthropic Messages로, 나머지는 OpenAI Chat Completions로 라우팅합니다. `/login`의 자격 증명 확인은 `max_tokens=1` 추론 요청을 보낼 수 있어 제공자 사용량을 소비할 수 있습니다. 별칭: `commandcode`, `goat`.
+- **ClinePass** — 모델 ID를 하드코딩하지 않고 실행 중 프로바이더 카탈로그를 검색합니다. 별칭: `clinepass`, `cline`.
 - 그 외 프리셋: `minimax`, `minimax-cn`, `glm`, `alibaba-token-plan` — TUI 안에서는 `/provider add --preset <name>`.
 
 <details>
@@ -169,11 +182,11 @@ API 키 프로바이더, 로컬 런타임(Ollama, LM Studio, vLLM), 게이트웨
   <img src="assets/telegram-mobile-hero.png" alt="Gajae Code 모바일 응답 히어로 일러스트" width="100%" />
 </p>
 
-에이전트가 결정을 요청하면 텔레그램으로 알림이 오고, 어디서든 답할 수 있습니다:
+알림은 기본적으로 꺼져 있습니다. 텔레그램 알림을 설정하고 활성화하면 에이전트 질문을 받을 수 있습니다. Coordinator/lifecycle 세션은 Threaded Mode를 사용할 수 있고 토픽 생성에 성공하면 포럼 토픽을 사용합니다. 런타임이 토픽 생성 거절이나 토픽 사용 불가로 판별한 경우에만 페어링된 비공개 채팅으로 알림과 질문 카드가 대체 전달되며, 인라인 버튼이나 질문 카드에 대한 직접 답장으로 응답할 수 있습니다. 토픽 생성 성공 응답에 유효한 `message_thread_id`가 없으면 오류로 처리하고 대체 전달하지 않습니다(fail closed). 일반 자유 텍스트와 세션 명령 라우팅에는 토픽이 필요합니다. 일반 세션은 기본 채팅으로 전달됩니다:
 
 - **Coordinator/lifecycle 세션용 포럼 토픽** — 실시간/최종 출력, 컨텍스트 업데이트, 이미지 첨부, 인라인 버튼, 자유 텍스트 답장, 타이핑 표시.
 - **한 번만 설정** — 실행 중인 세션의 `/settings` → Notifications에서, 또는 헤드리스로 `gjc notify setup|status|health|test|recovery`. 토큰은 입력 시 마스킹되고 이후 절대 표시되지 않습니다.
-- **`gjc daemon`** — 봇 토큰당 하나의 안전한 long-poll 소유자를 유지해 새 세션이 텔레그램 409 충돌 없이 깔끔하게 붙습니다.
+- **`gjc daemon`** — 같은 로컬 agent 디렉터리와 봇/채팅 설정을 공유하는 세션은 기존 long-poll 소유자를 재사용합니다. 같은 토큰을 쓰는 다른 GJC 프로필·호스트나 외부 폴러와는 Telegram 409 충돌이 여전히 발생할 수 있습니다.
 - Discord와 Slack 전달도 함께 제공됩니다. 범용 `action_needed`/`reply` 프로토콜로 어떤 봇/모바일 앱이든 터미널 스크래핑 없이 답을 되돌릴 수 있습니다.
 
 [텔레그램 온보딩](docs/telegram-onboarding.md) · [Discord](docs/discord-onboarding.md) · [Slack](docs/slack-onboarding.md)
@@ -182,7 +195,7 @@ API 키 프로바이더, 로컬 런타임(Ollama, LM Studio, vLLM), 게이트웨
 
 ## 변경 전에 계획
 
-의도적으로 작은 워크플로 표면 — 스킬 4개, 역할 에이전트 4개, 그 이상은 없습니다:
+기본 번들 워크플로는 스킬 4개와 역할 에이전트 4개입니다. 아래 워크플로는 사용자가 명시적으로 선택해 실행합니다:
 
 ```text
 deep-interview -> ralplan -> ultragoal
@@ -195,9 +208,11 @@ deep-interview -> ralplan -> ultragoal
 | `ralplan` | 코드 변경 전에 구현 계획을 세우고 비평합니다. |
 | `ultragoal` | 실행·수정·검증·증거까지 목표를 추적합니다. |
 | `autoresearch` | 목표 지향 리서치 미션을 수행하고 구조화된 판정으로 마무리합니다. |
-| `executor` / `architect` / `planner` / `critic` | 구현 및 읽기 전용 리뷰 레인을 위한 번들 역할 에이전트. |
+| `executor` / `architect` / `planner` / `critic` | 구현, 계획 및 읽기 전용 리뷰를 위한 번들 역할 에이전트. |
 
-옵트인 기능: **`computer-use`** (실험적 데스크톱 제어). [Python REPL](docs/python-repl.md), [docs/tools/computer.md](docs/tools/computer.md) 참고.
+`deep-interview`와 `ralplan`은 계획만 작성하며, 최종 계획에 대한 명시적 승인이 있거나 런타임이 유효한 Ultragoal handoff를 인정하기 전에는 구현을 시작하지 않습니다. `autoresearch`는 코드 구현이 아닌 리서치와 판정을 수행합니다.
+
+컴퓨터 도구는 지원되는 Apple Silicon macOS에서 기본으로 사용할 수 있으며, supervisor와 macOS 접근성·화면 기록 권한이 필요합니다. `computer.enabled=false`로 비활성화할 수 있습니다. [Python REPL](docs/python-repl.md), [컴퓨터 도구](docs/tools/computer.md) 참고.
 
 ## 사용자 스킬
 
@@ -223,14 +238,14 @@ Claude Code와 Codex 스킬 디렉터리는 가져오기 소스일 뿐입니다.
 
 GJC는 토큰 비용의 양쪽을 모두 최적화합니다:
 
-- **캐시 히트** — 프로바이더별 `cacheRetention` 제어. Anthropic은 짧은 캐시가 긴 에이전트 실행에 취약하므로 기본이 장기(1시간) 캐시 유지입니다. 프로바이더 랭킹은 저렴한 `cacheRead` 경로를 우선하고, 옵트인 session-affinity 헤더로 OpenAI 호환 릴레이가 서버측 프롬프트 캐시를 재사용할 수 있습니다.
-- **컨텍스트 절약** — 파일 읽기는 전체 파일 대신 구조 요약을 반환하고, 과대한 셸 출력은 컨텍스트를 채우는 대신 최소화되어 회수 가능한 `artifact://` 참조로 넘어갑니다. 컴팩션과 브랜치 요약이 긴 세션을 윈도 안에 유지하면서 이전 작업 맥락을 잃지 않게 합니다.
+- **캐시 히트** — 프로바이더별 `cacheRetention`을 제어합니다. Anthropic은 기본 보존 설정이 `long`이지만, 1시간 TTL은 정식 Anthropic API 등 이를 지원하는 엔드포인트에서만 전송됩니다. 호환 엔드포인트는 별도 지원 설정이 없으면 1시간 TTL을 생략할 수 있습니다. 모델 선택은 입력 비용과 `cacheRead` 비용 등을 고려하며, 옵트인 session-affinity 헤더는 OpenAI 호환 릴레이가 서버 측 프롬프트 캐시를 재사용하도록 도울 수 있습니다.
+- **컨텍스트 절약** — 코드 파일 읽기는 구조 요약을 제공할 수 있고, 전체 내용은 필요할 때 명시적으로 요청할 수 있습니다. 과대한 셸 출력은 제한·축약되며, 저장이 가능할 때 `artifact://` 참조가 함께 제공됩니다. 컴팩션과 브랜치 요약은 긴 세션을 이어 가도록 돕지만 원문을 그대로 보존하지 않는 요약이므로, 중요한 세부 사항은 확인하세요.
 
 [캐시 유지 & 프로바이더 호환](docs/models.md) · [컴팩션 & 브랜치 요약](docs/compaction.md)
 
 ---
 
-기본 다크 TUI 아이덴티티는 GJC red-claw 테마이며, 라이트 외관 터미널은 번들된 blue-crab 테마가 기본입니다. 전체 카탈로그와 `theme.dark` / `theme.light` 설정은 [docs/theme.md](docs/theme.md)를 참고하세요.
+기본 다크 TUI 아이덴티티는 GJC red-claw 테마이며, 라이트 외관 터미널은 번들된 blue-crab 테마가 기본입니다. 테마 선택과 `theme.dark` / `theme.light` 설정은 [docs/theme.md](docs/theme.md)를 참고하세요.
 
 ## OpenClaw / Hermes / Grokbot / 내가 만든 봇이 GJC를 부리게 하기
 
@@ -260,36 +275,40 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
 
 2. Prove the surface works (read-only). Run from inside the target repository:
      gjc --version
-     gjc sdk session list
+     gjc sdk session list --json
    `list` returns a credential-free JSON DTO of indexed sessions. Fail closed on missing,
    unavailable, stale, dead, unknown, or ambiguous rows. Exit 2 = usage error, exit 1 =
    operational failure (broker unavailable, session unavailable, retention gap, wait timeout).
+   On failure, preserve the structured error, outcome certainty, and references; a nonzero
+   exit does not prove a mutation was not applied. Reconcile with the original operation's
+   status or lookup instead of blindly replaying it (`session.lookup` `not_found` is not proof
+   that a create did not execute).
 
 3. Understand a session before touching it:
-     gjc sdk session inspect <sessionId>
-     gjc sdk session raw query <sessionId> --query session.metadata
-     ... then context.get, goal.list, todo.list, workflow.gates.list, session.stats
+     gjc sdk session inspect <sessionId> --json
+     gjc sdk session raw query <sessionId> --query session.metadata --json
+     ... then context.get, goal.list/get, todo.list, workflow.gates.list, session.stats
    These reads are not an atomic snapshot: label every reported field confirmed / inferred /
    stale / unavailable / unknown. Never invent a missing value.
 
 4. Start work in an isolated session:
      gjc sdk session raw global --op session.create \
-       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}'
-   Lifecycle ops allowed: session.create, session.fork, session.resume, session.close.
+       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}' --json
+   Mutating lifecycle ops allowed: session.create, session.fork, session.resume, session.close.
+   For a lost create response, reconcile with the read-only session.lookup using the same key and target.
    session.delete is NOT allowed. session.get_endpoint is refused unconditionally.
 
 5. Drive a turn and reconcile it:
-     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid>
-     gjc sdk session status <sessionId> <opRef>        # lossless turn.result lookup
-     gjc sdk session tail <sessionId> --until-idle     # replay + live follow
-   Use `send --wait --timeout-ms <ms>` for a bounded wait; a wait window that elapses reports
+     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid> --json
+     gjc sdk session status <sessionId> <opRef> --json # lossless turn.result lookup
+     gjc sdk session tail <sessionId> --until-idle --json # replay + live follow
+   Use `send --wait --timeout-ms <ms> --json` for a bounded wait; a wait window that elapses reports
    wait_timeout and never cancels the running turn. One fresh op-ref per logical prompt --
    `unknown` means uncertainty, never proof of non-execution, so reconcile with `status`
    instead of replaying a prompt.
 
-6. Answer what the agent asks you:
-     gjc sdk session raw control <sessionId> --op ask.answer --json-input '{...}'
-     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}'
+6. Answer durable workflow-gate questions from the agent:
+     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}' --json
    For gate answers use the durable workflow gate ID plus expectedSessionId; a transient
    action_needed.id is never durable authority. Other allowed per-session controls:
    turn.prompt, turn.steer, turn.follow_up, todo.replace, session.switch, session.rename.
@@ -305,8 +324,8 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
 귀속되는 툴 실행만으로 이루어지고, 하트비트나 스트리밍 텍스트로는 갱신되지 않는다.
 
 세션 하나가 아니라 여러 워크트리에 이벤트 기반으로 펼쳐야 한다면, 네이티브
-[Coordinator MCP 브리지](docs/hermes-mcp-bridge.md)(`gjc mcp-serve coordinator`, `gjc setup hermes`로 설치)가
-그 형태의 위임 도구를 제공한다.
+[Coordinator MCP 브리지](docs/hermes-mcp-bridge.md)(`gjc mcp-serve coordinator`)가
+그 형태의 위임 도구를 제공한다. `gjc setup hermes`는 기본적으로 설정 미리보기만 출력하며, 실제 프로필에 설치하려면 `--install`과 함께 `--target` 또는 `--profile-dir`을 지정해야 한다.
 
 - [외부 컨트롤러 / 봇 통합 가이드](docs/bot-integration.md) — 프로바이더 독립 스모크; [`docs/aside-integration.md`](docs/aside-integration.md)는 옵트인 검색/컨텍스트 사이드카와 `/aside` 컴포저 명령을 다룬다
 - [SDK 세션 CLI](docs/sdk-session-cli.md) · [SDK & 와이어 프로토콜](docs/sdk.md) · [SDK 앱 가이드](docs/sdk-app-guide.md) · [외부 제어 준비도](docs/external-control-readiness.md)
@@ -327,7 +346,7 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
   <sub><a href="https://github.com/getpaseo/paseo">저장소</a></sub>
 </td>
 <td align="center">★★★★★<br/><sub>1급 지원</sub></td>
-<td>GJC가 스스로 설치하는 네이티브 ACP 프로바이더. 모델 카탈로그, Default/Plan 모드, thinking 레벨, 실제 권한 승인 프롬프트, 소유 서브에이전트까지 끊는 취소, 모바일 제어.</td>
+<td>GJC가 스스로 설치하는 네이티브 ACP 프로바이더. 모델 카탈로그, Default/Plan 모드, thinking 레벨, 실제 권한 승인 프롬프트, 모바일 제어. 기본 취소는 현재 턴만 중단하며, 소유 백그라운드 작업까지 종료하려면 Paseo 프로바이더의 <code>env</code>에 <code>GJC_ACP_ABORT_SCOPE=owned</code>를 설정해야 합니다.</td>
 <td><code>gjc setup paseo</code><br/><sub>이후 <code>paseo daemon restart</code></sub></td>
 </tr>
 <tr>
@@ -390,7 +409,7 @@ Orca는 필드 하나다: GJC를 설치([docs/install.md](docs/install.md))하�
 
 ### 로컬 커스터마이징: `/extensions`
 
-대화형 세션에서 `/extensions`는 기본 커스터마이징 설정 화면입니다. 프로젝트(`<project>/.gjc/`)와 사용자 전역(`~/.gjc/agent/`) 범위의 스킬·훅·MCP를 구성하고, 상태·출처 진단, 활성화·비활성화·제거, Claude Code/Codex에서 가져오는 안내형 흐름(정규화된 미리보기, 명시적 확인, 충돌 시 건너뛰기·이름 변경·덮어쓰기 정책, 롤백 가능한 원자적 쓰기)을 제공합니다. 비대화형 설정에서는 MCP 서버에 `gjc mcp`, Claude Code/Codex 가져오기에 `gjc migrate`를 사용하세요.
+대화형 세션에서 `/extensions`는 기본 커스터마이징 설정 화면입니다. 프로젝트(`<project>/.gjc/`)와 사용자 전역(`~/.gjc/agent/`) 범위의 스킬·훅·MCP를 구성하고, 상태·출처 진단, 활성화·비활성화·제거, Claude Code/Codex에서 가져오는 안내형 흐름(정규화된 미리보기, 명시적 확인, 충돌 시 건너뛰기·이름 변경·덮어쓰기 정책, 롤백 가능한 원자적 쓰기)을 제공합니다. 비대화형 설정에서는 MCP 서버 관리에 `gjc mcp`, Claude Code/Codex에서 지원되는 MCP·스킬·지침 가져오기에 `gjc migrate`를 사용하세요.
 
 ### 스킬 마이그레이션 및 번들 스킬 검사
 
@@ -408,7 +427,7 @@ gjc setup defaults --check
 
 | 도구 또는 봇 | 권장 GJC 명령 | 경계 |
 | --- | --- | --- |
-| Codex CLI | `gjc --tmux --worktree <name>` 또는 `gjc` | `--worktree`는 GJC가 관리하는 인접 워크트리에 이름을 붙입니다. 기존 경로에서는 먼저 그곳으로 `cd`하세요. |
+| Codex CLI | `gjc --tmux --worktree <name>` 또는 `gjc` | 기본 워크트리 버킷은 저장소의 `.worktrees/`이며 Git에서 무시되어야 합니다. 기존 경로에서 실행하려면 먼저 해당 경로로 `cd`하세요. |
 | Claude Code | `gjc --tmux` 또는 `gjc --tmux --worktree <name>` | GJC는 Claude Code 확장이 되지 않습니다. |
 | OpenCode | `gjc` 또는 `gjc --tmux` | 현재는 외부 러너 워크플로만 지원합니다. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC는 Claw Code에 설치되거나 이를 대체하지 않습니다. |
@@ -428,21 +447,21 @@ gjc setup defaults --check
 
 ## 설정
 
-프로바이더 재시도 예산은 `~/.gjc/config.yml`에 있습니다:
+프로바이더 재시도 예산은 기본 전역 에이전트 디렉터리의 `config.yml`(기본 경로: `~/.gjc/agent/config.yml`)에 설정합니다. 사용자 지정 에이전트 디렉터리를 쓰면 해당 경로를 기준으로 합니다:
 
 ```yaml
 retry:
-  requestMaxRetries: 4
-  streamMaxRetries: 100
+  requestMaxRetries: 5
+  streamMaxRetries: 5
   maxRetries: 3
   maxDelayMs: 300000
 ```
 
-`requestMaxRetries`는 스트림이 수립되기 전에 적용됩니다. `streamMaxRetries`는 재생 안전한 일시적 스트림 실패에만 적용됩니다. 잘못된 인증, 지원하지 않는 모델/프로바이더, 잘못된 요청, 컨텍스트 초과, 사용자 중단, 영구적인 할당량 실패는 계속 즉시 실패합니다.
+이는 현재 기본값입니다. `requestMaxRetries`와 `streamMaxRetries`는 최초 시도가 아닌 재시도 횟수입니다. 전자는 스트림이 수립되기 전에 적용되고, 후자는 재생 안전한 일시적 스트림 실패에만 적용됩니다. 잘못된 인증, 지원하지 않는 모델/프로바이더, 잘못된 요청, 컨텍스트 초과, 사용자 중단, 영구적인 할당량 실패는 계속 즉시 실패합니다.
 
 ### 시작 시 업데이트
 
-대화형 시작은 기본적으로 백그라운드에서 더 새 GJC 버전이 있는지 GitHub 릴리스를 확인합니다. 이 검사는 알림 전용이며 변경하지 않습니다. GJC는 시작 중 스스로를 설치하거나 교체하지 않습니다. 지원 플랫폼에서는 `gjc update`가 일치하는 GitHub 릴리스 바이너리를 내려받아 원자적으로 교체합니다(패키지 매니저 shim은 덮어쓰지 않습니다). 소스 체크아웃과 `dev:link` 실행 파일은 해당 체크아웃을 통해 업데이트해야 하며, `gjc update`는 이를 스스로 덮어쓰지 않습니다. 지원하지 않는 플랫폼에서는 문서화된 설치기를 다시 실행하세요.
+대화형 시작은 기본적으로 백그라운드에서 더 새 GJC 버전이 있는지 GitHub 릴리스를 확인합니다. 이 검사는 알림 전용이며 변경하지 않습니다. GJC는 시작 중 스스로를 설치하거나 교체하지 않습니다. 지원 플랫폼에서 `gjc update`는 독립 바이너리를 원자적으로 교체하고, 패키지 매니저 설치는 shim을 덮어쓰거나 제거하지 않고 별도 사용자 바이너리 경로로 이전합니다. 소스 체크아웃과 `dev:link` 실행 파일은 해당 체크아웃을 통해 업데이트해야 하며, `gjc update`는 이를 스스로 덮어쓰지 않습니다. 지원하지 않는 플랫폼에서는 문서화된 설치기를 다시 실행하세요.
 
 시작 시 확인을 끄려면 `gjc config set startup.checkUpdate false`를 실행하세요. 네트워크 실패는 시작을 막지 않도록 무시됩니다.
 
@@ -465,6 +484,8 @@ Settings(`Appearance -> Dark theme` / `Light theme`) 또는 `/theme`에서 고�
 | `claude-code` | 테라코타·핑크 하이라이트를 갖춘 Claude Code 풍 다크 팔레트. | GJC 안에서 유지하는 Claude Code의 익숙함. |
 | `codex` | 코딩 세션 대비를 또렷하게 한 선명한 다크 블루그레이 팔레트. | Codex 같은 다크 작업 공간. |
 | `opencode` | 더 강한 터미널 포인트를 갖춘 OpenCode 풍 다크 팔레트. | 번들 피커에서 쓰는 OpenCode의 익숙함. |
+| `gruvbox-dark` | Gruvbox 계열의 따뜻한 황토·주황 포인트를 쓰는 다크 팔레트. | 따뜻한 레트로 색감을 선호할 때. |
+| `ouroboros` | 짙은 남색·청록 바탕에 라임색과 금색 포인트를 더한 다크 팔레트. | 어두운 배경에서 선명한 청록·녹색 대비를 원할 때. |
 
 ## 문제 해결
 
@@ -475,7 +496,7 @@ gjc customize doctor         # 사람이 읽는 출처와 해결책
 gjc customize doctor --json # CI/설정 도구용 안정적인 JSON
 ```
 
-`gjc customize doctor`는 유일한 읽기 전용 문제 해결 표면입니다. 발견한 모든 커스터마이징, 출처 규약과 범위(`gjc`, Claude 프로젝트, Codex 프로젝트, 플러그인, 명시적 설정), 실제 우선순위 및 섀도잉, loaded/enabled/disabled/quarantined/rejected/stored-only 상태, 제한된 이유 코드, 해결 명령, 신뢰 요구사항, 재시작/새 세션 필요 여부를 보고합니다. 크리덴셜, 엔드포인트 토큰, 인증 헤더, 안전하지 않은 원시 설정 덤프는 절대 출력하지 않습니다.
+`gjc customize doctor`는 커스터마이징 상태를 확인하는 읽기 전용 문제 해결 표면입니다. 발견한 커스터마이징, 출처 규약과 범위(`gjc`, Claude 프로젝트, Codex 프로젝트, 플러그인, 명시적 설정), 실제 우선순위와 섀도잉, loaded/enabled/disabled/quarantined/rejected/stored-only 상태, 제한된 이유 코드, 해결 명령, 신뢰 요구사항, 재시작/새 세션 필요 여부를 보고합니다. 크리덴셜, 엔드포인트 토큰, 인증 헤더, 안전하지 않은 원시 설정 덤프는 출력하지 않습니다.
 
 ## 개발
 

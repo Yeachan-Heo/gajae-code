@@ -1005,7 +1005,7 @@ function resolveBedrockThinkingBudget(
 	model: Model<"bedrock-converse-stream">,
 	options?: SimpleStreamOptions,
 ): { budget: number; level: Effort } | null {
-	if (!options?.reasoning || !model.reasoning) return null;
+	if (!options?.reasoning || options.disableReasoning || !model.reasoning) return null;
 	const level = requireSupportedEffort(model, options.reasoning);
 	const budget = options.thinkingBudgets?.[level] ?? BEDROCK_CLAUDE_THINKING[level];
 	return { budget, level };
@@ -1133,7 +1133,7 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
-			const reasoning = options?.reasoning;
+			const reasoning = options?.disableReasoning ? undefined : options?.reasoning;
 			if (!reasoning || !model.reasoning) {
 				return castApi<"anthropic-messages">({
 					...base,
@@ -1144,7 +1144,7 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
-			let thinkingBudget = options.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning];
+			let thinkingBudget = options?.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning];
 			if (thinkingBudget <= 0) {
 				return castApi<"anthropic-messages">({
 					...base,
@@ -1238,7 +1238,7 @@ function mapOptionsForApi<TApi extends Api>(
 		case "bedrock-converse-stream": {
 			const bedrockBase: BedrockOptions = {
 				...base,
-				reasoning: options?.reasoning,
+				reasoning: options?.disableReasoning ? undefined : options?.reasoning,
 				thinkingBudgets: options?.thinkingBudgets,
 				toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 				thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,

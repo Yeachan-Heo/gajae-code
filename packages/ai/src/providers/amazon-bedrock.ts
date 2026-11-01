@@ -10,10 +10,12 @@
 import { $credentialEnv, $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
 import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import { parseBedrockClaudeGeneration, supportsBedrockClaudePromptCaching } from "../bedrock-claude-cache-policy";
+import { getAnthropicCacheWriteOneHourRate } from "../model-pricing";
 import type { Effort } from "../model-thinking";
 import {
 	mapEffortToAnthropicAdaptiveEffort,
 	requireSupportedEffort,
+	requiresAnthropicThinkingDisableWhenOff,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -213,12 +215,30 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
 			const toolConfig = convertToolConfig(context.tools, resolvedToolChoice.resolvedChoice);
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
+			// Selected reasoning fields before forced-tool normalization, restored if the forced
+			// tool choice is later dropped on retry (Haiku 5+ only; see below).
+			let unforcedModelRequestFields: Record<string, unknown> | undefined;
 
 			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
 			// When the resolved tool_choice forces tool use, disable thinking to avoid API errors.
 			if (toolConfig?.toolChoice && additionalModelRequestFields) {
 				const tc = toolConfig.toolChoice;
-				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
+				if ((tc.any || tc.tool) && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+					// Haiku 5+ enables adaptive thinking when the field is omitted, which a forced
+					// tool choice rejects, and applies the effort to tool-call arguments too: send an
+					// explicit `disabled` and keep the selected effort (capped at `high` while
+					// thinking is disabled).
+					const effort = (additionalModelRequestFields.output_config as { effort?: string } | undefined)?.effort;
+					unforcedModelRequestFields = additionalModelRequestFields;
+					additionalModelRequestFields = {
+						thinking: { type: "disabled" },
+						...(effort
+							? { output_config: { effort: effort === "xhigh" || effort === "max" ? "high" : effort } }
+							: {}),
+					};
+				} else if (tc.any || tc.tool) {
+					additionalModelRequestFields = undefined;
+				}
 			}
 
 			let commandInput: ConverseStreamRequest = {
@@ -307,7 +327,12 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					reason,
 					registryKey: resolvedToolChoice.registryKey,
 				});
-				stripBedrockForcedToolChoiceForRetry(commandInput);
+				stripBedrockForcedToolChoiceForRetry(
+					commandInput,
+					unforcedModelRequestFields
+						? { forced: additionalModelRequestFields, restored: unforcedModelRequestFields }
+						: undefined,
+				);
 				const retryBodyText = JSON.stringify(commandInput);
 				const retryBody = new TextEncoder().encode(retryBodyText);
 				if (rawRequestDump) rawRequestDump.body = commandInput;
@@ -429,7 +454,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 							break;
 						}
 						case "metadata": {
-							handleMetadata(payload as MetadataEvent, model, output);
+							handleMetadata(payload as MetadataEvent, model, output, cacheRetention);
 							break;
 						}
 						default:
@@ -580,13 +605,28 @@ function handleContentBlockDelta(
 	}
 }
 
-function handleMetadata(event: MetadataEvent, model: Model<"bedrock-converse-stream">, output: AssistantMessage): void {
+/** Exported for unit tests of the usage-to-cost path. */
+export function handleMetadata(
+	event: MetadataEvent,
+	model: Model<"bedrock-converse-stream">,
+	output: AssistantMessage,
+	cacheRetention: CacheRetention,
+): void {
 	if (event.usage) {
 		output.usage.input = event.usage.inputTokens || 0;
 		output.usage.output = event.usage.outputTokens || 0;
 		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
 		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
 		output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
+		// Converse reports aggregate cache writes only. Where 1-hour writes have their own rate
+		// (Haiku 5.5), the request's `ttl: "1h"` cache points mean every write was 1-hour.
+		if (
+			cacheRetention === "long" &&
+			output.usage.cacheWrite > 0 &&
+			getAnthropicCacheWriteOneHourRate(model, 0) !== undefined
+		) {
+			output.usage.cttl = { ephemeral1h: output.usage.cacheWrite };
+		}
 		calculateCost(model, output.usage);
 	}
 }
@@ -829,9 +869,17 @@ function convertMessages(
 	return result;
 }
 
-export function stripBedrockForcedToolChoiceForRetry<T extends { toolConfig?: { toolChoice?: unknown } }>(body: T): T {
+export function stripBedrockForcedToolChoiceForRetry<
+	T extends { toolConfig?: { toolChoice?: unknown }; additionalModelRequestFields?: Record<string, unknown> },
+>(body: T, thinking?: { forced: Record<string, unknown> | undefined; restored: Record<string, unknown> }): T {
 	if (body.toolConfig) {
 		body.toolConfig = { ...body.toolConfig, toolChoice: undefined };
+	}
+	// The forced request replaced the selected thinking fields with a disabled block; with the
+	// forced constraint gone, put the selected reasoning back. A payload the caller replaced via
+	// onPayload (not the object this provider sent) is left untouched.
+	if (thinking && body.additionalModelRequestFields === thinking.forced) {
+		body.additionalModelRequestFields = thinking.restored;
 	}
 	return body;
 }
@@ -888,6 +936,9 @@ function buildAdditionalModelRequestFields(
 	options: BedrockOptions,
 ): Record<string, unknown> | undefined {
 	const reasoning = options.reasoning;
+	if (requiresAnthropicThinkingDisableWhenOff(model.id) && (!reasoning || !model.reasoning)) {
+		return { thinking: { type: "disabled" } };
+	}
 	if (!reasoning || !model.reasoning) return undefined;
 
 	const mode = model.thinking?.mode;

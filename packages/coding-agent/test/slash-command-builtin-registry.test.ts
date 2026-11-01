@@ -3,7 +3,10 @@ import type { Model } from "@gajae-code/ai";
 import { generateTierChains } from "@gajae-code/coding-agent/config/autorouting-generator";
 import { CURATED_TIER_MAP } from "@gajae-code/coding-agent/config/autorouting-tier-map";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	getBuiltinSlashCommandsForSession,
+} from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { getCurrentThemeName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/slash-commands/acp-builtins";
@@ -676,6 +679,30 @@ describe("builtin /aside slash command", () => {
 });
 
 describe("builtin /mcp slash command", () => {
+	it("shows /mcp metadata only to sessions with exact MCP controls", () => {
+		const ordinaryCommands = getBuiltinSlashCommandsForSession(false);
+		const exactMcpCommands = getBuiltinSlashCommandsForSession(true);
+
+		expect(ordinaryCommands.some(command => command.name === "mcp")).toBe(false);
+		expect(ordinaryCommands.some(command => command.name === "help")).toBe(true);
+		expect(exactMcpCommands.some(command => command.name === "mcp")).toBe(true);
+		expect(exactMcpCommands).toBe(BUILTIN_SLASH_COMMANDS);
+	});
+
+	it("passes /mcp input through as a prompt without exact MCP controls", async () => {
+		const showError = vi.fn();
+		const ctx = {
+			session: { hasExactMcpControls: false },
+			showError,
+			editor: { setText: vi.fn() },
+		} as unknown as InteractiveModeContext;
+
+		expect(await executeBuiltinSlashCommand("/mcp status", { ctx, handleBackgroundCommand: () => undefined })).toBe(
+			"/mcp status",
+		);
+		expect(showError).not.toHaveBeenCalled();
+	});
+
 	it("sanitizes project-controlled server names in status output", async () => {
 		const showStatus = vi.fn();
 		const session = {

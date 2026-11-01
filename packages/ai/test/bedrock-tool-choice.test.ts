@@ -74,6 +74,31 @@ describe("Bedrock tool choice", () => {
 		expect(retry.additionalModelRequestFields).toEqual({ customInjected: "kept" });
 	});
 
+	it("fallback retry restores selected reasoning only for the fields this provider sent", () => {
+		const forced = { thinking: { type: "disabled" }, output_config: { effort: "high" } };
+		const restored = { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "xhigh" } };
+		const sent = {
+			toolConfig: { tools: [{}], toolChoice: { any: {} } },
+			additionalModelRequestFields: forced as Record<string, unknown>,
+		};
+		stripBedrockForcedToolChoiceForRetry(sent, { forced, restored });
+		expect(sent.toolConfig.toolChoice).toBeUndefined();
+		expect(sent.additionalModelRequestFields).toBe(restored);
+
+		// A caller-replaced payload (onPayload) keeps its own fields.
+		const replaced = {
+			toolConfig: { tools: [{}], toolChoice: { any: {} } },
+			additionalModelRequestFields: { customInjected: "kept" } as Record<string, unknown>,
+		};
+		stripBedrockForcedToolChoiceForRetry(replaced, { forced, restored });
+		expect(replaced.additionalModelRequestFields).toEqual({ customInjected: "kept" });
+
+		// Without a thinking context (non-Haiku, nothing forced) the fields are untouched.
+		const plain = { toolConfig: { tools: [{}], toolChoice: { any: {} } }, additionalModelRequestFields: forced };
+		stripBedrockForcedToolChoiceForRetry(plain);
+		expect(plain.additionalModelRequestFields).toBe(forced);
+	});
+
 	it("classifies Bedrock validationException forced tool_choice errors as unsupported", () => {
 		const error = Object.assign(new Error("validationException: This model does not support forced toolChoice"), {
 			status: 400,

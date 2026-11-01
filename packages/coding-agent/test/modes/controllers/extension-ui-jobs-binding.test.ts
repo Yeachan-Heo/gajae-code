@@ -29,6 +29,7 @@ type Fixture = {
 	controller: ExtensionUiController;
 	ctx: InteractiveModeContext;
 	getContextActions: () => ExtensionContextActions;
+	getCommandActions: () => ExtensionCommandContextActions;
 	/** Replace the snapshot source of the CURRENT session only. */
 	setSnapshot: (source: SnapshotSource) => void;
 	/** Swap in a brand-new session with its own independent snapshot source. */
@@ -90,15 +91,17 @@ function runningItem(id: string): AsyncJobSnapshotItem {
 
 function createFixture(): Fixture {
 	let contextActions: ExtensionContextActions | undefined;
+	let commandActions: ExtensionCommandContextActions | undefined;
 	let calls = 0;
 	const extensionRunner = {
 		initialize(
 			_actions: ExtensionActions,
 			capturedContextActions: ExtensionContextActions,
-			_commandActions?: ExtensionCommandContextActions,
+			capturedCommandActions?: ExtensionCommandContextActions,
 			_uiContext?: ExtensionUIContext,
 		): void {
 			contextActions = capturedContextActions;
+			commandActions = capturedCommandActions;
 		},
 		onError: () => () => {},
 		emit: vi.fn(async () => undefined),
@@ -113,6 +116,9 @@ function createFixture(): Fixture {
 		return {
 			extensionRunner,
 			isStreaming: false,
+			navigateTree: vi.fn(async () => ({ cancelled: false })),
+			reload: vi.fn(async () => {}),
+			notifySessionIdentityChanged: vi.fn(async () => undefined),
 			getAsyncJobSnapshot: (): AsyncJobSnapshot | null => {
 				calls += 1;
 				return own.source();
@@ -143,6 +149,7 @@ function createFixture(): Fixture {
 		rebuildChatFromMessages: vi.fn(),
 		resetIrcSidebarSession: vi.fn(),
 		reloadTodos: vi.fn(async () => undefined),
+		refreshSlashCommandState: vi.fn(async () => undefined),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	} as unknown as InteractiveModeContext;
@@ -153,6 +160,10 @@ function createFixture(): Fixture {
 		getContextActions: () => {
 			if (!contextActions) throw new Error("Extension context actions were not initialized");
 			return contextActions;
+		},
+		getCommandActions: () => {
+			if (!commandActions) throw new Error("Extension command actions were not initialized");
+			return commandActions;
 		},
 		setSnapshot: next => {
 			current.source = next;
@@ -251,6 +262,19 @@ describe("ExtensionUiController async-job binding", () => {
 			expect(observed.delivery).toBe(delivery);
 		});
 	}
+
+	it("notifies the session identity listener after extension navigation and reload", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+		const commandActions = fixture.getCommandActions();
+		const notifyIdentityChanged = vi.spyOn(fixture.ctx.session, "notifySessionIdentityChanged");
+
+		await commandActions.navigateTree("target", {});
+		await commandActions.reload();
+
+		expect(notifyIdentityChanged).toHaveBeenCalledTimes(2);
+		expect(fixture.ctx.refreshSlashCommandState).not.toHaveBeenCalled();
+	});
 });
 
 describe("ExtensionUiController jobs binding through the real extension runner", () => {

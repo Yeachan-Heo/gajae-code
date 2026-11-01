@@ -71,7 +71,7 @@ import {
 	type WorkflowGateTerminalController,
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
 	createSessionWorkLease,
@@ -102,11 +102,17 @@ import {
 	registerAskAnswerSource,
 	registerWorkflowGateEmitterListener,
 } from "../../tools/ask-answer-registry";
+import type { AwaitingInputKind } from "../../tools/awaiting-input";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
+import {
+	allocateSessionEventGeneration,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionIndexEvent,
+} from "../broker/session-index";
 import {
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
@@ -117,6 +123,7 @@ import {
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
+	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import {
@@ -129,6 +136,7 @@ import {
 } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
+import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { RESPONSE_CEILING_BYTES } from "../host/query/handlers";
 import type { SdkFrame } from "../host/types";
@@ -197,7 +205,13 @@ import {
 	EXISTING_THREAD_BIND_ENV,
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
-import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import {
+	imageAttachmentsFromMessage,
+	messageContinuesToolLoop,
+	notificationActionPayload,
+	summaryFromMessage,
+	truncate,
+} from "./helpers";
 import {
 	createKindAwareReconciliation,
 	type KindAwareReconciliation,
@@ -1239,9 +1253,25 @@ export class PresentationArbiter {
 	}
 }
 
+/** One deferred lean receipt: the text a finalized turn would settle as. */
+interface SettlementReceipt {
+	text: string;
+	messageRef?: string;
+	origin: "user" | "autonomous" | "continuation";
+	/**
+	 * False for tool-loop narration: the turn requested tools, so the agent was
+	 * still working and the text is not an answer that may anchor a composition.
+	 */
+	settled: boolean;
+}
+
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	imageUploads: PromptImageUploadStore | undefined;
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
+	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
+	releaseAcceptedImages: () => void;
 	getJoinedPromptCorrelations: (owner: AgentTerminalOwnerContext) => Array<{ commandId: string; turnId: string }>;
 	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
 	retireJoinedPromptOwners: () => void;
@@ -1402,7 +1432,7 @@ interface SessionRuntime {
 	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
 	pendingFinal?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
+		receipts: SettlementReceipt[];
 	};
 	/** Monotonic user-request boundary for deferred lean delivery. */
 	settlementWindow: number;
@@ -1414,12 +1444,13 @@ interface SessionRuntime {
 	 * Lean-mode deferred receipts for the current user-request settlement window.
 	 * Ordinary tool-loop turns retain latest-turn-wins behaviour. An autonomous
 	 * continuation has no new user request, so it appends instead of erasing the
-	 * prior receipt. The small fixed receipt bound prevents an unbounded idle wait
-	 * from retaining the full transcript.
+	 * prior settled receipt; tool-loop narration never anchors that composition.
+	 * The small fixed receipt bound prevents an unbounded idle wait from retaining
+	 * the full transcript.
 	 */
 	pendingSettled?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
+		receipts: SettlementReceipt[];
 	};
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
@@ -1428,6 +1459,12 @@ interface SessionRuntime {
 		string,
 		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 	>;
+	/**
+	 * Running tool calls that reported an awaiting-input signal, keyed by tool call
+	 * id. An entry stays undelivered while notifications are inactive or policy is
+	 * provisional, and is dropped when the call ends; one notification per call.
+	 */
+	awaitingInput: Map<string, { toolName: string; kind: AwaitingInputKind; delivered: boolean }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1437,6 +1474,48 @@ interface SessionRuntime {
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
+
+/** The `awaitingInput` signal a running bash update carries, validated at the extension boundary. */
+function readAwaitingInput(partialResult: unknown): { kind: AwaitingInputKind } | undefined {
+	if (!partialResult || typeof partialResult !== "object") return undefined;
+	const details = (partialResult as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return undefined;
+	const signal = (details as { awaitingInput?: unknown }).awaitingInput;
+	if (!signal || typeof signal !== "object") return undefined;
+	const kind = (signal as { kind?: unknown }).kind;
+	return kind === "browser_auth" || kind === "device_code" ? { kind } : undefined;
+}
+
+/**
+ * Deliver every undelivered awaiting-input notice once stable policy admits it.
+ * The notice describes the present ("a command is waiting now"), so it goes out
+ * on the live native leg only and never enters the replay ring: a client that
+ * reconnects after the command exited must not receive it. The native server
+ * still withholds it from connections without `awaiting_input_v1`.
+ */
+function deliverAwaitingInput(
+	runtime: Pick<SessionRuntime, "server" | "awaitingInput" | "notificationsActive" | "policySuspended">,
+	sessionId: string,
+): void {
+	if (!runtime.notificationsActive || runtime.policySuspended) return;
+	for (const [toolCallId, entry] of runtime.awaitingInput) {
+		if (entry.delivered) continue;
+		entry.delivered = true;
+		try {
+			runtime.server.pushFrame(
+				JSON.stringify({
+					type: "awaiting_input",
+					sessionId,
+					toolCallId,
+					toolName: entry.toolName,
+					kind: entry.kind,
+				}),
+			);
+		} catch (e) {
+			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
+		}
+	}
+}
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
 type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
@@ -2466,11 +2545,13 @@ function sdkQuerySurface(
 	}),
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	primaryControlSurface: "cli" | "sdk" = "sdk",
+	imageUploadsAvailable = false,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
 		id,
 		api,
+		imageUploadsAvailable,
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
@@ -2619,6 +2700,19 @@ function sdkControlSurface(
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
 	gatePresentations: PresentationArbiter | undefined,
 	api: ExtensionAPI,
+	imageUploads: PromptImageUploadStore | undefined,
+	imageUploadsAvailable: boolean,
+	retainAcceptedImage: (
+		correlation: { commandId: string; turnId: string },
+		release: () => void,
+		preflightSignal: AbortSignal,
+		submissionSettled: Promise<void>,
+	) => {
+		accepted: () => void;
+		promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		refused: () => boolean;
+	},
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void,
 	isBusy: () => boolean,
 	onPromptAccepted: (
 		correlation: { commandId: string; turnId: string },
@@ -2633,6 +2727,12 @@ function sdkControlSurface(
 		correlation: { commandId: string; turnId: string },
 		error: unknown,
 	) => void | Promise<void> = () => {},
+	onQueuedRunStartFailed: (
+		correlation: { commandId: string; turnId: string },
+		failure: QueuedRunStartFailure,
+		sdkRunToken: string | undefined,
+		refuseImage: (() => boolean) | undefined,
+	) => boolean,
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	onPromptDiverted: (correlation: { commandId: string; turnId: string }) => void,
 	onPromptPromoted: (
@@ -2666,6 +2766,10 @@ function sdkControlSurface(
 		// the session-wide preflight seam must not be invoked while another
 		// connection's active preflight could be cancelled by it (review P1).
 		noOtherConnectionPreflights?: () => boolean,
+		// True only for an operator terminal abort that the broker control route already
+		// authorized (`TerminalAbortInput.operator`, which a public SDK caller cannot grant):
+		// it addresses the session's active turn, not the requesting connection's own prompt.
+		operatorAuthorized?: boolean,
 	) => Promise<
 		| {
 				ok: true;
@@ -2733,6 +2837,7 @@ function sdkControlSurface(
 		ctx,
 		id: ctx.sessionManager.getSessionId(),
 		api,
+		imageUploadsAvailable,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -2918,6 +3023,18 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation = false,
+		onCorrelation?: (
+			correlation: { commandId: string; turnId: string },
+			preflightSignal: AbortSignal,
+			submissionSettled: Promise<void>,
+		) =>
+			| {
+					accepted: () => void;
+					promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+					refused: () => boolean;
+			  }
+			| undefined,
+		resolveImages?: () => unknown,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -2963,6 +3080,8 @@ function sdkControlSurface(
 						code: "busy",
 					},
 				);
+			// Staged bytes are one-shot: reserve reconciliation before consuming them.
+			if (resolveImages) images = resolveImages();
 		} catch (error) {
 			admission.abandon();
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
@@ -2994,6 +3113,8 @@ function sdkControlSurface(
 		const submissionSettled = Promise.withResolvers<void>();
 		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		let queuedRunRefused = false;
+		const imageLifecycle = onCorrelation?.(correlation, preflightController.signal, submissionSettled.promise);
 		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
@@ -3044,6 +3165,8 @@ function sdkControlSurface(
 			admission.accepted();
 			accepting = false;
 			accepted = true;
+			// A late durable acceptance after direct abort cannot end image retention.
+			if (!preflightController.signal.aborted) imageLifecycle?.accepted();
 			if (effectiveDeliverAs !== undefined) onPromptDiverted(correlation);
 			// #4743: an accepted run owns a durable terminal publication when it
 			// settles; teardown joins it via this latch (never-accepted preflights
@@ -3071,12 +3194,21 @@ function sdkControlSurface(
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
 					onQueuedPromoted: promotion => {
+						if (queuedRunRefused) return;
+						if (promotion.startsOwnRun === true) imageLifecycle?.promoted(promotion);
 						admission.hooks.onQueuedPromoted(promotion);
 						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
+						if (promotion.startsOwnRun !== true) imageLifecycle?.promoted(promotion);
+						if (promotion.removed) releaseAcceptedImage(correlation);
 					},
 					onDispatchDisposition: disposition => {
+						if (queuedRunRefused) return;
 						admission.hooks.onDispatchDisposition(disposition);
 						if (!disposition.startsOwnRun) onPromptDiverted(correlation);
+					},
+					onQueuedRunStartFailed: failure => {
+						if (queuedRunRefused) return;
+						queuedRunRefused = onQueuedRunStartFailed(correlation, failure, sdkRunToken, imageLifecycle?.refused);
 					},
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
@@ -3085,7 +3217,7 @@ function sdkControlSurface(
 		} catch (error) {
 			submissionSettled.resolve();
 			admission.abandon();
-			if (accepted && !preflightController.signal.aborted)
+			if (accepted && !queuedRunRefused && !preflightController.signal.aborted)
 				trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 			else settlePreflight({ status: "rejected", error });
 		}
@@ -3107,7 +3239,7 @@ function sdkControlSurface(
 				},
 				error => {
 					admission.abandon();
-					if (accepted && !preflightController.signal.aborted)
+					if (accepted && !queuedRunRefused && !preflightController.signal.aborted)
 						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					else settlePreflight({ status: "rejected", error });
 					submissionSettled.resolve();
@@ -3130,8 +3262,52 @@ function sdkControlSurface(
 		cancelPendingPreflights(): Promise<void>;
 		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 	} = {
-		prompt: (text, images, clientRef) =>
-			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
+		prompt: async (text, images, clientRef, stagedImages) => {
+			if (stagedImages !== undefined && images !== undefined)
+				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
+			const requesterConnectionId = controlRequesterContext.getStore();
+			let reservation: { images: ImageContent[]; release: () => void } | undefined;
+			let correlation: { commandId: string; turnId: string } | undefined;
+			try {
+				return await submitPrompt(
+					text,
+					images,
+					false,
+					undefined,
+					true,
+					requesterConnectionId,
+					clientRef,
+					true,
+					(current, preflightSignal, submissionSettled) => {
+						correlation = current;
+						if (reservation)
+							return retainAcceptedImage(current, reservation.release, preflightSignal, submissionSettled);
+					},
+					stagedImages === undefined
+						? undefined
+						: () => {
+								if (!imageUploads)
+									throw Object.assign(new Error("Staged images are unavailable."), {
+										code: "image_upload_unavailable",
+									});
+								reservation = imageUploads.redeem(requesterConnectionId, stagedImages);
+								return reservation.images;
+							},
+				);
+			} catch (error) {
+				if (correlation) releaseAcceptedImage(correlation);
+				else reservation?.release();
+				throw error;
+			}
+		},
+		...(imageUploads
+			? {
+					imageBegin: (input: unknown) => imageUploads.begin(controlRequesterContext.getStore(), input),
+					imageAppend: (input: unknown) => imageUploads.append(controlRequesterContext.getStore(), input),
+					imageFinish: (input: unknown) => imageUploads.finish(controlRequesterContext.getStore(), input),
+					imageDiscard: (input: unknown) => imageUploads.discard(controlRequesterContext.getStore(), input),
+				}
+			: {}),
 		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
@@ -3188,6 +3364,9 @@ function sdkControlSurface(
 				// invoking it (review thread P1).
 				() =>
 					![...pendingPreflightCancellations.values()].some(entry => entry.connectionId !== requesterConnectionId),
+				// Broker-authorized operator authority is the one case where the abort
+				// addresses a turn another connection submitted (see the parameter note).
+				input.operator === true,
 			);
 			// Preflight cancellation happens ONLY for a NEWLY ADMITTED abort,
 			// after the durable admission/replay decision inside
@@ -4292,6 +4471,34 @@ export function boundedCorrelatedAgentEndFrame(frame: Record<string, unknown>): 
 	};
 }
 
+/** Connection-scoped identity of a queued prompt submission an abort may address. */
+export interface TerminalAbortSubmissionScope {
+	connectionId?: string;
+	terminal: boolean;
+}
+
+/**
+ * Whether a terminal abort addresses this prompt submission.
+ *
+ * An ordinary abort is scoped to the requesting connection's own prompt: `connectionId`
+ * identifies the connection that submitted it, and a submission that already reached a
+ * terminal state is never addressed. Broker-authorized operator authority
+ * (`TerminalAbortInput.operator`, granted only through the broker control route) is the
+ * documented exception — "operator authority changes only connection ownership, never
+ * those settlement proofs" — so it addresses the session's submission even when another
+ * connection submitted it. Without that override every operator abort issued over a
+ * second connection (the SDK client case, where each request is its own connection)
+ * reported no_active_turn while the turn was still running.
+ */
+export function terminalAbortAddressesSubmission(input: {
+	connectionId: string | undefined;
+	operatorAuthorized: boolean;
+	submission: TerminalAbortSubmissionScope;
+}): boolean {
+	if (input.submission.terminal) return false;
+	return input.operatorAuthorized || input.submission.connectionId === input.connectionId;
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -4324,6 +4531,8 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
+			/** Definitive event-driven observation; never mutates the owning run. */
+			waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
 			getRunOwnerDomain?: (handle: string) => RunCancellationDomain | undefined;
 			getTerminalTurnEpoch: () => number | undefined;
@@ -4613,6 +4822,7 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.imageUploads?.close();
 			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
 		}
@@ -4791,6 +5001,7 @@ export function createNotificationsExtension(
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
 		}
+		rt.releaseAcceptedImages();
 		if (cleanupRetries.get(id) === rt) cleanupRetries.delete(id);
 		return true;
 	}
@@ -4880,6 +5091,8 @@ export function createNotificationsExtension(
 		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
 		if (lifecycleRequired && !lifecycleAgentDir)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
+		// The session index this host publishes to; it also owns the session's event-generation authority.
+		const brokerAgentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
@@ -5065,7 +5278,11 @@ export function createNotificationsExtension(
 		};
 
 		type HostConnectionIncarnation = { generation: number; closed: boolean };
-		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		type HostCapabilityCacheEntry = {
+			generation: number;
+			capabilities: ReadonlySet<string>;
+			nativeConfirmed: ReadonlySet<string>;
+		};
 		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
 		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
 		const hostAttachedConnections = new Set<string>();
@@ -5079,12 +5296,28 @@ export function createNotificationsExtension(
 			hostConnectionIncarnations.set(connectionId, incarnation);
 			return incarnation;
 		};
-		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+		const rememberHostCapabilities = (
+			connectionId: string,
+			capabilities: readonly string[],
+			source: "replay" | "native",
+		): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
+			const previous = hostCapCache.get(connectionId);
+			const merged =
+				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			const nativeConfirmed =
+				previous?.generation === incarnation.generation ? new Set(previous.nativeConfirmed) : new Set<string>();
+			for (const capability of capabilities) merged.add(capability);
+			// Replay claims enable stream routing immediately, but only native snapshots
+			// can remove a socket from host demand. Merge delayed snapshots monotonically.
+			if (source === "native") {
+				for (const capability of capabilities) nativeConfirmed.add(capability);
+			}
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
-				capabilities: new Set(capabilities),
+				capabilities: merged,
+				nativeConfirmed,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -5106,6 +5339,17 @@ export function createNotificationsExtension(
 			hostCapCache.delete(connectionId);
 			hostAttachedConnections.delete(connectionId);
 		};
+		const imageUploadsAvailable =
+			typeof terminalAbortSeams?.waitForRunSettlement === "function" &&
+			typeof terminalAbortSeams.getRunOwnerDomain === "function" &&
+			typeof terminalAbortSeams.getTerminalRunOwnerForEvent === "function" &&
+			typeof ctx.getActivePromptHandle === "function";
+		const imageUploads = imageUploadsAvailable
+			? new PromptImageUploadStore(connectionId => {
+					const incarnation = hostConnectionIncarnations.get(connectionId);
+					return incarnation !== undefined && !incarnation.closed;
+				})
+			: undefined;
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -5121,6 +5365,115 @@ export function createNotificationsExtension(
 		const OWNED_SETTLEMENT_GRACE_MS = 500;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
+		type AcceptedImageReservation = {
+			release: () => void;
+			preflightSignal: AbortSignal;
+			/** The producer can still retain ImageContent until settlement or exact run adoption. */
+			submissionPending: boolean;
+			/** A promoted queue entry needs its own run's proof before release authority transfers. */
+			awaitingAdoption: boolean;
+			accepted: boolean;
+			releaseRequested: boolean;
+		};
+		const acceptedImages = new Map<string, AcceptedImageReservation>();
+		// Absence means never consumed; a present undefined owner means execution
+		// started without exact ownership evidence and must remain charged.
+		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext | undefined>();
+		const retiringImages = new Set<string>();
+		const retireAcceptedImage = (key: string): void => {
+			const reservation = acceptedImages.get(key);
+			if (!reservation) return;
+			if (reservation.submissionPending || reservation.awaitingAdoption) {
+				reservation.releaseRequested = true;
+				return;
+			}
+			if (retiringImages.has(key)) return;
+			const discard = (): void => {
+				if (acceptedImages.get(key) !== reservation) return;
+				acceptedImages.delete(key);
+				acceptedImageRunOwners.delete(key);
+				retiringImages.delete(key);
+				reservation.release();
+			};
+			const owner = acceptedImageRunOwners.get(key);
+			if (!owner) {
+				if (acceptedImageRunOwners.has(key)) {
+					retiringImages.add(key);
+					logger.warn("SDK image capacity retained for execution without an exact resource owner");
+					return;
+				}
+				discard();
+				return;
+			}
+			const waitForSettlement = terminalAbortSeams?.waitForRunSettlement;
+			if (!waitForSettlement) return;
+			retiringImages.add(key);
+			retirePromptImageReservation(
+				owner.resourceRunId,
+				waitForSettlement,
+				() => acceptedImages.get(key) === reservation,
+				discard,
+			);
+		};
+		const settleAcceptedImageSubmission = (key: string, reservation: AcceptedImageReservation): void => {
+			if (acceptedImages.get(key) !== reservation || !reservation.submissionPending) return;
+			reservation.submissionPending = false;
+			if (reservation.releaseRequested) retireAcceptedImage(key);
+		};
+		const retainAcceptedImage = (
+			correlation: { commandId: string; turnId: string },
+			release: () => void,
+			preflightSignal: AbortSignal,
+			submissionSettled: Promise<void>,
+		): {
+			accepted: () => void;
+			promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			refused: () => boolean;
+		} => {
+			const key = promptSubmissionKey(correlation);
+			const reservation: AcceptedImageReservation = {
+				release,
+				preflightSignal,
+				submissionPending: true,
+				awaitingAdoption: false,
+				accepted: false,
+				releaseRequested: false,
+			};
+			acceptedImages.set(key, reservation);
+			void submissionSettled.then(() => settleAcceptedImageSubmission(key, reservation));
+			return {
+				accepted: () => {
+					reservation.accepted = true;
+					if (reservation.preflightSignal.aborted) return;
+					if (acceptedImageRunOwners.get(key) && !reservation.awaitingAdoption) {
+						settleAcceptedImageSubmission(key, reservation);
+						if (reservation.releaseRequested) retireAcceptedImage(key);
+					}
+				},
+				promoted: promotion => {
+					reservation.awaitingAdoption = promotion.startsOwnRun === true && promotion.removed !== true;
+					if (!reservation.awaitingAdoption && reservation.releaseRequested) retireAcceptedImage(key);
+				},
+				refused: () => {
+					if (acceptedImages.get(key) !== reservation || acceptedImageRunOwners.has(key)) return false;
+					reservation.awaitingAdoption = false;
+					retireAcceptedImage(key);
+					return true;
+				},
+			};
+		};
+		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }): void =>
+			retireAcceptedImage(promptSubmissionKey(correlation));
+		const releaseAcceptedImagesForRun = (owner: AgentTerminalOwnerContext): void => {
+			for (const [key, runOwner] of acceptedImageRunOwners) {
+				if (!runOwner || runOwner.resourceRunId !== owner.resourceRunId || runOwner.domain !== owner.domain)
+					continue;
+				retireAcceptedImage(key);
+			}
+		};
+		const releaseAcceptedImages = (): void => {
+			for (const key of acceptedImages.keys()) retireAcceptedImage(key);
+		};
 		type PromptLifecycleFrame =
 			| {
 					type: "agent_start" | "agent_end";
@@ -5826,7 +6179,7 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime) return;
+			if (!runtime || runtime.stopping || runtime.serverStopped || runtimes.get(id) !== runtime) return;
 			cleanupPromptRecords();
 			const handle = ctx.getActivePromptHandle();
 			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
@@ -5839,12 +6192,14 @@ export function createNotificationsExtension(
 				)
 			)
 				correlations.unshift(root);
+			const owners = new Set<string>();
 			for (const correlation of correlations) {
 				// Renewal is attributed exactly like the correlated delivery below.
 				renewPromptDeadline(correlation, event);
 				noteToolDispatchBoundary(correlation, event);
 				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 				if (!submission || submission.abandoned) continue;
+				owners.add(submission.connectionId);
 				const frame = {
 					type: "event",
 					kind: event.type,
@@ -5856,6 +6211,22 @@ export function createNotificationsExtension(
 					continue;
 				}
 				deliverCorrelatedFrame(submission, frame);
+			}
+			// Broker-created hosts use this bus, not the SDK-only extension. Stream
+			// connections opt into turn_stream and receive no other client's correlation.
+			// Keep cumulative partialResult snapshots and authoritative final result
+			// intact, and off the durable lifecycle replay ring, like owner content.
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]) ?? []) {
+				if (owners.has(connectionId)) continue;
+				try {
+					sdkRuntime?.sendFrameTo(connectionId, {
+						type: "event",
+						kind: event.type,
+						payload: toAgentWireEventPayload(event),
+					});
+				} catch {
+					// Content delivery is best-effort and must not interrupt execution.
+				}
 			}
 		};
 		/**
@@ -6176,6 +6547,7 @@ export function createNotificationsExtension(
 					logger.warn(`sdk: failed to cancel fenced preflight: ${String(error)}`),
 				);
 			fencedConnections.add(submission.connectionId);
+			imageUploads?.disconnect(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
 			for (const [key, owned] of promptSubmissions)
 				if (owned.connectionId === submission.connectionId) {
@@ -6207,6 +6579,21 @@ export function createNotificationsExtension(
 				}
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
+			}
+			if (acceptedImages.has(key) && !acceptedImageRunOwners.has(key)) {
+				acceptedImageRunOwners.set(key, undefined);
+				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+				if (handle && domain) acceptedImageRunOwners.set(key, { resourceRunId: handle, domain });
+			}
+			const imageReservation = acceptedImages.get(key);
+			if (
+				imageReservation?.accepted &&
+				!imageReservation.preflightSignal.aborted &&
+				acceptedImageRunOwners.get(key)
+			) {
+				imageReservation.awaitingAdoption = false;
+				settleAcceptedImageSubmission(key, imageReservation);
+				if (imageReservation.releaseRequested) retireAcceptedImage(key);
 			}
 		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
@@ -6395,6 +6782,7 @@ export function createNotificationsExtension(
 					return;
 				}
 				if (capture) capture.proof = proof;
+				releaseAcceptedImage(correlation);
 			}
 			if (deadlineAttempt) {
 				// Durability BEFORE the durable terminal (#5583, #5623 review round 4).
@@ -6613,7 +7001,8 @@ export function createNotificationsExtension(
 		};
 		const recordPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission) return;
+			if (!submission || submission.terminal || submission.failed) return;
+			releaseAcceptedImage(correlation);
 			submission.failed = true;
 			removePendingPromptCorrelation(correlation);
 			if (
@@ -6622,6 +7011,29 @@ export function createNotificationsExtension(
 			)
 				runtime.activePromptCorrelation = undefined;
 			await emitPromptFailure(correlation, error);
+		};
+		const recordQueuedRunStartFailure = (
+			correlation: { commandId: string; turnId: string },
+			failure: QueuedRunStartFailure,
+			sdkRunToken: string | undefined,
+			refuseImage: (() => boolean) | undefined,
+		): boolean => {
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
+			// A present undefined owner is already-started execution, not no-start evidence.
+			if (
+				failure.disposition !== "not-started" ||
+				(submission && submission.sdkRunToken !== sdkRunToken) ||
+				submission?.executionHandle !== undefined ||
+				acceptedImageRunOwners.has(key)
+			)
+				return false;
+			// Reservation proof outlives the mutable receipt. The captured lifecycle
+			// checks reservation identity and keeps the pending producer fenced.
+			if (refuseImage ? !refuseImage() : !submission) return false;
+			if (submission && !submission.terminal && !submission.failed)
+				trackReconciliationProducer(recordPromptFailure(correlation, failure.error));
+			return true;
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
 			const key = promptSubmissionKey(correlation);
@@ -6655,6 +7067,7 @@ export function createNotificationsExtension(
 				selector => kindReconciliation.lookupSteer(selector),
 				() => host,
 				options.primaryControlSurface ?? "sdk",
+				imageUploadsAvailable,
 			),
 			id,
 			revisions,
@@ -6665,12 +7078,17 @@ export function createNotificationsExtension(
 			pendingInteractive,
 			gatePresentations,
 			api,
+			imageUploads,
+			imageUploadsAvailable,
+			retainAcceptedImage,
+			releaseAcceptedImage,
 			() =>
 				runtime?.busy === true ||
 				pendingPromptCorrelations.length > 0 ||
 				pendingPromptCorrelationsBySdkRunToken.size > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
+			recordQueuedRunStartFailure,
 			discardPromptAcceptance,
 			onPromptDiverted,
 			onPromptPromoted,
@@ -6734,11 +7152,19 @@ export function createNotificationsExtension(
 						await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
 							fence: hasExecutionHandle || !submission.preflightAbort,
 						});
+						if (!hasExecutionHandle && submission.preflightAbort) releaseAcceptedImage({ commandId, turnId });
 					}
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
-			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
+			async (
+				connectionId,
+				scope,
+				idempotencyKey,
+				preflightCancel,
+				noOtherConnectionPreflights,
+				operatorAuthorized = false,
+			) => {
 				// Capture the steering snapshot at ADMISSION (before the durable
 				// marker transaction): client steering admitted while the abort
 				// is in flight classifies as post-snapshot and is preserved at
@@ -7100,9 +7526,9 @@ export function createNotificationsExtension(
 						return "failed";
 					}
 				};
-				let active = [...promptSubmissions.entries()].find(
-					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-				);
+				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
+					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
+				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 				if (!active) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
@@ -7132,9 +7558,7 @@ export function createNotificationsExtension(
 					// and the durable no-effect row would block a same-key retry from
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
-					active = [...promptSubmissions.entries()].find(
-						([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-					);
+					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
@@ -7850,6 +8274,12 @@ export function createNotificationsExtension(
 
 		sdkRuntime = new SessionSdkSessionRuntime({
 			masterOwnerSessionId: options.masterOwnerSessionId,
+			...(brokerAgentDir === undefined
+				? {}
+				: {
+						allocateEventGeneration: (sessionId: string, floor: number) =>
+							allocateSessionEventGeneration(brokerAgentDir, sessionId, floor),
+					}),
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -8164,6 +8594,10 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			imageUploads,
+			releaseAcceptedImage,
+			releaseAcceptedImagesForRun,
+			releaseAcceptedImages,
 			getJoinedPromptCorrelations,
 			isPromptRunOwner: (correlation, owner) => {
 				const handle = promptSubmissions.get(promptSubmissionKey(correlation))?.executionHandle;
@@ -8303,6 +8737,7 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
+			awaitingInput: new Map(),
 			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
@@ -8422,7 +8857,18 @@ export function createNotificationsExtension(
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
+					if (typedFrame.type === "control_request" && !liveHostConnection(inbound.connectionId)) {
+						sendEndpointStale(inbound.connectionId, typedFrame);
+						return;
+					}
 					if (typedFrame.type === "event_replay") {
+						const capabilities = typedFrame.capabilities;
+						if (
+							Array.isArray(capabilities) &&
+							capabilities.every((capability: unknown) => typeof capability === "string")
+						) {
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[], "replay");
+						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
@@ -8467,7 +8913,7 @@ export function createNotificationsExtension(
 				const negotiated = tuple?.[1] ?? capabilities;
 				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
 				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
-				rememberHostCapabilities(id, normalized);
+				rememberHostCapabilities(id, normalized, "native");
 				if (liveHostCapabilities(id) === undefined) return;
 				hostAttachedConnections.add(id);
 				negotiatedCapabilitiesHandler?.(id, normalized);
@@ -8475,6 +8921,7 @@ export function createNotificationsExtension(
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				closeHostConnection(connectionId);
+				imageUploads?.disconnect(connectionId);
 				connectionCloseHandler?.(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)
@@ -9010,8 +9457,10 @@ export function createNotificationsExtension(
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
 					if (workLease.isHeld()) return 0;
-					const observers = [...hostCapCache.keys()].filter(connectionId =>
-						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					const observers = [...hostCapCache.entries()].filter(
+						([connectionId, entry]) =>
+							liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY) &&
+							entry.nativeConfirmed.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
 					return Math.min(server.clientCount(), observers);
 				},
@@ -9059,7 +9508,7 @@ export function createNotificationsExtension(
 				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
-			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
+			const agentDir = brokerAgentDir;
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
 			if (lifecycleRequired && !lifecycleRequestId)
 				throw new Error("Lifecycle SDK host requires a capability-bound request identity.");
@@ -9466,6 +9915,7 @@ export function createNotificationsExtension(
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
 			flushPendingSettled(runtime, runtime.id);
+			deliverAwaitingInput(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		reproveOwnership: async binding => {
@@ -9857,14 +10307,17 @@ export function createNotificationsExtension(
 	const deferLeanReceipt = (
 		rt: SessionRuntime,
 		text: string,
+		settled: boolean,
 		messageRef?: string,
 		window: number = rt.currentTurnSettlementWindow ?? rt.settlementWindow,
 		origin: SettlementOrigin = rt.currentTurnSettlementOrigin ?? "continuation",
 	): void => {
 		if (window !== rt.settlementWindow) return;
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
+		const receipt: SettlementReceipt = { text, ...(messageRef ? { messageRef } : {}), origin, settled };
 		const pending = rt.pendingSettled;
-		if (!pending || pending.window !== window) {
+		// Tool-loop narration is superseded by any later receipt; only a settled
+		// answer may anchor the bounded composition with a later autonomous outcome.
+		if (!pending || pending.window !== window || !pending.receipts[0]?.settled) {
 			rt.pendingSettled = { window, receipts: [receipt] };
 			return;
 		}
@@ -9882,14 +10335,19 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
-	const deferProvisionalReceipt = (rt: SessionRuntime, text: string | undefined, messageRef?: string): void => {
+	const deferProvisionalReceipt = (
+		rt: SessionRuntime,
+		text: string | undefined,
+		settled: boolean,
+		messageRef?: string,
+	): void => {
 		if (!text) return;
 		const window = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
 		if (window !== rt.settlementWindow) return;
 		const origin = rt.currentTurnSettlementOrigin ?? "continuation";
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
+		const receipt: SettlementReceipt = { text, ...(messageRef ? { messageRef } : {}), origin, settled };
 		const pending = rt.pendingFinal;
-		if (!pending || pending.window !== window) {
+		if (!pending || pending.window !== window || !pending.receipts[0]?.settled) {
 			rt.pendingFinal = { window, receipts: [receipt] };
 			return;
 		}
@@ -9905,7 +10363,10 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
-	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
+	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => {
+		const anchor = rt.pendingSettled?.receipts[0];
+		return anchor?.origin === "user" && anchor.settled;
+	};
 	const composeSettlementText = (receipts: ReadonlyArray<{ text: string }>): string =>
 		receipts.map(receipt => receipt.text).join("\n\n");
 
@@ -9934,7 +10395,7 @@ export function createNotificationsExtension(
 			// activation emits one composed terminal receipt, not two messages.
 			if (rt.verbosity === "lean" && (rt.busy || rt.pendingSettled?.window === pending.window)) {
 				for (const receipt of pending.receipts)
-					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
+					deferLeanReceipt(rt, receipt.text, receipt.settled, receipt.messageRef, pending.window, receipt.origin);
 			} else {
 				const text = composeSettlementText(pending.receipts);
 				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
@@ -10076,6 +10537,7 @@ export function createNotificationsExtension(
 		// The Agent's terminal owner is independent of delivery correlation. Never
 		// borrow a successor's run handle to settle a predecessor's SDK prompts.
 		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
+		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner);
 		const rootCorrelation = rt.activePromptCorrelation;
 		const correlations = terminalOwner ? rt.getJoinedPromptCorrelations(terminalOwner) : [];
 		if (
@@ -10092,6 +10554,7 @@ export function createNotificationsExtension(
 			// subsequent durable terminal claim fails. A fatal transport closure
 			// clears attribution, so an unrelated later agent_end cannot settle a
 			// predecessor's prompt correlation.
+			if (terminalOwner) rt.releaseAcceptedImage(correlation);
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
@@ -10367,8 +10830,18 @@ export function createNotificationsExtension(
 	});
 
 	api.on("tool_execution_update", (event, ctx) => {
-		const rt = runtimes.get(sessionId(ctx));
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
+		if (!rt) return;
+		const awaitingInput = readAwaitingInput(event.partialResult);
+		if (!awaitingInput || rt.awaitingInput.has(event.toolCallId)) return;
+		// Notify-only and content-free (prompt kind only, never the URL or code), so
+		// it is delivered under redaction exactly like the idle marker. While policy
+		// is provisional it stays pending; activation delivers it if the call is
+		// still running.
+		rt.awaitingInput.set(event.toolCallId, { toolName: event.toolName, kind: awaitingInput.kind, delivered: false });
+		deliverAwaitingInput(rt, id);
 	});
 
 	api.on("tool_execution_end", (event, ctx) => {
@@ -10376,6 +10849,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.emitPromptEvent(event);
+		rt.awaitingInput.delete(event.toolCallId);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!inFlight) return;
 		if (!rt.notificationsActive) {
@@ -10469,8 +10943,9 @@ export function createNotificationsExtension(
 			: rt.redact
 				? undefined
 				: summaryFromMessage(event.message, turnTextMax());
+		const settled = !messageContinuesToolLoop(event.message);
 		if (rt.policySuspended) {
-			deferProvisionalReceipt(rt, text, rt.liveRef);
+			deferProvisionalReceipt(rt, text, settled, rt.liveRef);
 			rt.turnClosed = true;
 			return;
 		}
@@ -10485,7 +10960,7 @@ export function createNotificationsExtension(
 			} else if (text !== rt.preAskFlushedText) {
 				// Lean: hold the latest answer until agent_end. Skip when this turn
 				// already flushed the same text as an ask lead-in (no duplicate at idle).
-				deferLeanReceipt(rt, text, rt.liveRef);
+				deferLeanReceipt(rt, text, settled, rt.liveRef);
 			} else {
 				// Lead-in already flushed: drop any older deferred settled text so idle
 				// does not re-emit intermediate narration after the ask prompt (#2863).
@@ -10548,9 +11023,10 @@ export function createNotificationsExtension(
 				}
 				rt.pendingSettled = undefined;
 				rt.pendingFinal = undefined;
-			} else if (message.role !== "assistant") {
+			} else if (message.role !== "assistant" && message.role !== "toolResult") {
 				// The assembled direct prompt can contain framework context after its
-				// user message. A user boundary is authoritative for this turn.
+				// user message. A user boundary is authoritative for this turn. Tool
+				// results answer the turn's own tool calls and keep its provenance.
 				if (rt.currentTurnSettlementOrigin !== "user" || !isFrameworkPromptContext(message)) {
 					rt.currentTurnSettlementWindow = rt.settlementWindow;
 					rt.currentTurnSettlementOrigin = "autonomous";

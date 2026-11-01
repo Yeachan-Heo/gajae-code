@@ -112,6 +112,11 @@ condition in prose. Error guidance states the safe recovery action without
 showing credentials. Confirmations are explicit focused choices; destructive
 remove/disable actions are never the default side effect of navigation.
 
+Guidance the user must act on (for example the subagent await-timeout
+"inspect before cancelling" instruction) wraps to the terminal width instead of
+being clipped to one preview line, so the action survives narrow terminals. It
+stays bounded: at most 12 wrapped rows, the last ending in `…` if cut.
+
 A non-cancellable action visibly locks navigation and names the reason. A
 cancellable action names cancellation while it is pending, aborts on exit, and
 must not render a late completion after disposal. This follows the selector's
@@ -469,3 +474,49 @@ differently named bundles, and a stored `uri#ref` differs from a bare `uri`, so
 locator-based refusal would refuse installs that should proceed. Refusing on a
 guess is worse than reporting the real failure, so identity must be readable for
 refusal to apply.
+
+## Subagent compact await panel
+
+Source: `tools/subagent-render.ts` (the `subagent` await panel), behind the
+`task.compactSubagentPanel` setting (default off). This section extends the
+existing tool-panel grammar; it adds no tokens.
+
+- **Scope:** live await progress only. A final result (timeout guidance,
+  failure and completion receipts, status/steer/resume replies) always keeps the
+  full per-subagent rendering, so nothing the user must act on is summarized.
+- **Anatomy (collapsed, setting on):** a height independent of the number of
+  subagents — the existing status header, one `dim` summary row of group counts
+  joined by ` · `, at most one `warning` row naming the most-degraded provider and
+  how many more providers degrade (the expanded view keeps one row per provider), and one `dim` hint row in parentheses
+  naming the effective `app.tools.expand` key and, while anything runs, the
+  existing `ctrl+s to observe sessions` hint.
+- **Count order:** `N subagents running`, then `failed`, `retrying`,
+  `idle >30s`, `queued`, `paused`, `done`, `cancelled`. Zero counts are omitted.
+  Attention states come first because a narrow terminal truncates the row end;
+  truncation shows `…` so a dropped count is visible.
+- **States:** collapsed → summary; expanded (the existing tool-output toggle)
+  → the unchanged per-subagent list. With the setting off the panel is the
+  unchanged per-subagent list in both states. Status is carried by words and
+  counts, never by color or the spinner alone; ASCII/no-color keeps the same
+  text.
+- **Motion:** no new animation. With the setting on, await progress re-emits
+  only when the summary counts or per-provider retry counts change (plus the
+  existing liveness interval).
+- **International text:** the summary and hint are fixed English labels and
+  numbers; subagent descriptions (which may be CJK) appear only in the expanded
+  list, whose layout is unchanged.
+
+Capture command (fixture-backed, real renderer, fixed clock):
+
+```sh
+bun packages/coding-agent/scripts/capture-subagent-compact-panel-showcase.ts --out .gjc/qa/subagent-compact-panel-<run>
+```
+
+The matrix is every state at `80x24`, `120x36`, and `160x48` in
+`unicode-color` (including `compact-final-timeout`, a final timeout receipt
+with the setting on), plus `compact-collapsed-15-live` and `compact-collapsed-mixed`
+at `80x24/ascii-no-color`, `compact-collapsed-mixed/48x36/unicode-color`, and
+`narrow-cjk/48x36` in both render modes: 26 entries. An entry whose panel fits
+the viewport is captured once (`top`); an overflowing entry is captured at
+`top`, `middle`, and `bottom` so no tail is hidden. Every capture has
+`terminal.txt`, `terminal-ansi.txt`, `terminal.html`, and `metadata.json`.

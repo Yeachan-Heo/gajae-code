@@ -14,6 +14,7 @@ import { ExtensionUiController } from "../src/modes/controllers/extension-ui-con
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import type { InteractiveModeContext } from "../src/modes/types";
+import { attachExactMcpControls } from "../src/runtime-mcp/redaction";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -78,6 +79,18 @@ describe("Issue #2261 InteractiveMode session-switch preparation", () => {
 			finalPlanFilePath: planFilePath,
 		});
 	}
+
+	it("removes /mcp metadata after a new session retires exact controls", async () => {
+		attachExactMcpControls(session, {
+			grantSource: "root-interactive-exact-config",
+			configPath: path.join(tempDir.path(), "mcp.json"),
+		});
+		await mode.init();
+		expect(mode.getSlashCommands().some(command => command.name === "mcp")).toBe(true);
+
+		expect(await mode.handleClearCommand()).toBe(true);
+		expect(mode.getSlashCommands().some(command => command.name === "mcp")).toBe(false);
+	});
 
 	for (const [command, method] of [
 		["/new", "handleClearCommand"],

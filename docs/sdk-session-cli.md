@@ -89,10 +89,20 @@ discovery pid is the supervised process itself.
   failure.
 - It exits 1 without serving when another live broker already owns the agent
   directory (even one this version cannot reuse), or when startup fails. It
-  never retires the other owner.
+  never retires the other owner. Startup also fails when the off-thread
+  publication-liveness watchdog cannot be armed. That attempt removes its
+  discovery file and lock instead of leaving a live pid published without
+  the watchdog.
 - It exits 1 when it stops abnormally while serving: its discovery root was
   lost or replaced, or its heartbeat could not be renewed. A requested
   `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.
+- It is SIGKILLed (signal status 137, not exit 1) when a discovery
+  publication write blocks the process so the event loop cannot reach that
+  same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
+  TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
+  `SuccessExitStatus`. The watchdog does not write a diagnostic before SIGKILL,
+  so a blocked stderr cannot postpone termination. While the event loop is still running, the
+  exit-1 path above is the one that runs.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
   if its session hosts should stay attach-only.
@@ -364,6 +374,61 @@ not proof that the create did not execute, so callers must not resubmit solely
 because lookup reports `not_found`. Reconciliation failures exit nonzero while
 preserving the structured outcome in JSON.
 
+### Legacy lifecycle admission fence
+
+`operation_failed` with diagnostic `lifecycle_legacy_history_ambiguous` means the
+broker refused the **new request before dispatch** because a pre-index ledger
+row cannot establish that its target is unrelated. The underlying broker code is
+`legacy_lifecycle_ambiguous`, distinct from key reuse (`idempotency_conflict`) and
+an already admitted operation with an uncertain effect (`terminal_uncertain`).
+The public outcome and retryability remain `unknown`: refusing this request does
+not settle earlier effects.
+
+- Preserve the original operation, caller request key, exact target/input, and
+  ledger. A new key, empty/config-only transcript, `live:false`, or `deleted:false`
+  is not proof that a legacy effect did not occur. Do not force deletion or edit,
+  truncate, or remove the ledger.
+- For a prior `session.create` whose original key and create target are known,
+  use the read-only `session.lookup` command above. `not_found`, `conflict`, and
+  `uncertain` do not authorize another mutation. Public lookup currently supports
+  create only; do not invent a lookup for delete or close.
+- `retire` is limited to its complete identity-bound uncertain-create proof.
+  It is not an override for opaque legacy rows. Missing original identity or
+  terminal effect evidence requires operator/maintainer investigation; there is
+  no automatic safe retirement for such a row. Preserve it unresolved.
+- Proven final `terminal_ok`/`terminal_error` legacy rows recording only other
+  sessions may already pass admission with an unrelated key. Rows recording the
+  target, lacking target evidence, or reusing its key remain fenced. Unresolved
+  `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
+  history stays fenced even for an apparently unrelated empty session. Recovery
+  after restart marking a row `terminal_uncertain` is not proof of no effect.
+- `session.spawn` claim mirrors are not legacy requests. Current brokers mark
+  each mirror with `spawnAnchor: true` in its row, and a marked mirror never
+  fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
+  written by brokers that predate the marker have no durable field, position, or
+  timestamp that proves they are mirrors (in-place legacy migration rewrites
+  row timestamps), so the broker never infers them: they stay fenced like any
+  other unkeyed row.
+- Operator release of a pre-marker mirror: with the broker stopped, write
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
+  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
+  only identities you can match to a `claim.lifecycleIdentity` in a preserved
+  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
+  genuine legacy request removes its fence. The broker never writes or derives
+  this file. It honors a listed identity only while that identity's entire
+  history is a single unkeyed, unmarked `accepted` row with no session target
+  and no quarantined or corruption-uncertain history; other entries, and the
+  whole file when it is malformed or cannot be read (for example a directory or
+  a file without read permission), are ignored and stay fenced. An unreadable
+  file is logged as a broker warning and never stops the broker from starting. A still-fenced
+  identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
+  restores its fence at the next broker start.
+
+This diagnostic identifies the actual admission guard without exposing ledger
+identities, request hashes, filesystem paths, credentials, or broker free text.
+Other failures do not receive it; do not attribute every unknown delete outcome
+to legacy history.
+
 A separately connected local controller can stop the active turn and its exact
 owned work with an explicitly confirmed operator abort:
 
@@ -385,6 +450,19 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+The route reaches every session host on the current gjc, including a TUI or a
+direct CLI session the Broker did not launch. A Broker-launched host is bound by
+its lifecycle request id; any other host publishes a process-local random marker
+in its own endpoint registration in the Broker-owned session index, and the
+Broker echoes exactly that marker. The marker never appears in endpoint
+discovery, `session list`, or any SDK response, so an endpoint-token holder
+cannot forge it. When the operator abort stops a turn, the host's terminal shows
+`Turn stopped by a remote operator.` A host that published no marker (a gjc that
+predates the operator route) is refused before dispatch with
+`authorization_denied`, `outcomeCertainty: "not-applied"`, and diagnostic
+`sdk_operator_control_unsupported`; unlike `endpoint_stale`, retrying the same
+request cannot succeed until the session restarts on a current gjc.
 
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and
@@ -539,6 +617,25 @@ continuation that supplies a different scope or anchor fails with
 
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+Rows also carry Broker-recorded ownership. `role: "master"` marks a session
+whose index row records a master role, including the caller's own row.
+`spawnedBy: { masterSessionId }` names the master whose `gjc sdk spawn` created
+the session, from Broker spawn authority, which keeps the owner after the child
+closes. `masterSessionId` is the master's lineage owner id, which can differ
+from its current row id after a session switch. `spawnedBy` is omitted when
+the Broker has no spawn authority for the session (for example a spawn that
+never reached host registration), or when recorded authorities disagree. When
+the command runs inside a master session's Bash tool, `spawnedBy.self` is
+`true` for that master's own children and `false` for another master's; the Bash
+tool in a non-master session never passes an inherited owner id through, so
+`self` is absent there. The same fields appear on `gjc sdk session list` and
+`gjc sdk session inspect` rows. The `gjc sdk search` table shows them in the
+`OWNER` column: `self`, `other`, or `spawned` (no viewer) for spawned children,
+`master` for master sessions (`master/self`, `master/other`, or
+`master/spawned` when a master was itself spawned), and `-` otherwise. `role`
+has no self flag, so the caller's own master row also renders as `master`;
+match it against `GJC_SESSION_ID`.
 
 ## Read-only broker observation (`gjc sdk diagnostics broker`)
 

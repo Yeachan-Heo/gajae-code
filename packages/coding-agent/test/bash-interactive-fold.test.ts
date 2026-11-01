@@ -14,6 +14,8 @@ import {
 	type InteractivePtyControls,
 	runInteractiveBashPty,
 } from "@gajae-code/coding-agent/tools/bash-interactive";
+import { getKeybindings, setKeybindings } from "@gajae-code/tui";
+import { KeybindingsManager } from "../src/config/keybindings";
 
 interface CapturedComponent {
 	dispose?: () => void;
@@ -236,18 +238,90 @@ describe("interactive PTY fold ownership", () => {
 		}
 	});
 
-	it("has no kill entry point left in the overlay lifecycle", async () => {
-		// Structural guard: the overlay's dismiss/dispose handlers used to call
-		// session.kill(). Owner teardown is allowed to kill the process, but the
-		// observer view must remain a non-owning lifecycle participant.
-		const source = await Bun.file(new URL("../src/tools/bash-interactive.ts", import.meta.url).pathname).text();
-		const overlayStart = source.indexOf("class BashInteractiveOverlayComponent");
-		const runnerStart = source.indexOf("export async function runInteractiveBashPty");
-		expect(overlayStart).toBeGreaterThanOrEqual(0);
-		expect(runnerStart).toBeGreaterThan(overlayStart);
-		expect(source.slice(overlayStart, runnerStart)).not.toContain(".kill(");
-		expect(source).toContain('getKeybindings().matches(data, "app.tool.backgroundFold")');
-	});
+	it("honors a rebound fold key while a disposed view leaves the PTY alive", async () => {
+		const dir = await tempDir();
+		const gate = path.join(dir, "release-fold");
+		const captured: { component?: CapturedComponent } = {};
+		const controller = new AbortController();
+		let controls: InteractivePtyControls | undefined;
+		let terminalSettled = false;
+		let viewDisposed = false;
+		let output = "";
+		let foldRequests = 0;
+		const detachOutcomes: string[] = [];
+		try {
+			await Settings.init({ inMemory: true, cwd: dir });
+			const foregroundPromise = runInteractiveBashPty(createTestUi(captured), {
+				command:
+					"printf 'KEY-BEFORE\\n'; while [ ! -f \"$FOLD_RELEASE_GATE\" ]; do sleep 0.01; done; printf 'KEY-AFTER\\n'",
+				cwd: dir,
+				env: { FOLD_RELEASE_GATE: gate },
+				timeoutMs: 20_000,
+				signal: controller.signal,
+				onOutput: chunk => {
+					output += chunk;
+				},
+				onControls: next => {
+					controls = next;
+					void next.terminalCompletion.then(() => {
+						terminalSettled = true;
+					});
+				},
+				onFoldKey: () => {
+					if (!controls) throw new Error("Expected live PTY controls before keyboard folding");
+					foldRequests++;
+					detachOutcomes.push(controls.detachObserver(FOLD_RESULT));
+					controls.detachForegroundCancellation();
+					return true;
+				},
+			});
+			await waitFor(
+				() => output.includes("KEY-BEFORE") && captured.component !== undefined && controls !== undefined,
+			);
+			const component = captured.component;
+			if (!controls || !component?.handleInput || !component.dispose) {
+				throw new Error("Expected live PTY controls and a disposable input overlay");
+			}
+			const previous = getKeybindings();
+			try {
+				setKeybindings(KeybindingsManager.inMemory({ "app.tool.backgroundFold": "ctrl+g" }));
+				component.handleInput("\x1bB");
+				expect(foldRequests).toBe(0);
+				component.handleInput("\x07");
+				component.handleInput("\x07");
+			} finally {
+				setKeybindings(previous);
+			}
+			expect(foldRequests).toBe(1);
+			expect(detachOutcomes).toEqual(["resolved"]);
+			expect(await foregroundPromise).toEqual(FOLD_RESULT);
+			viewDisposed = true;
+			component.dispose();
+			controller.abort();
+			expect(terminalSettled).toBe(false);
+			// Output after the fold requires this gate; no startup-duration assumption.
+			await Bun.write(gate, "release");
+			const outcome = await controls.terminalCompletion;
+			expect(outcome.exitCode).toBe(0);
+			expect(outcome.cancelled).toBe(false);
+			expect(outcome.timedOut).toBe(false);
+			expect(outcome.output).toContain("KEY-BEFORE");
+			expect(outcome.output).toContain("KEY-AFTER");
+		} finally {
+			try {
+				controller.abort();
+				if (controls && !terminalSettled) controls.kill();
+				await controls?.terminalCompletion;
+			} finally {
+				try {
+					if (!viewDisposed) captured.component?.dispose?.();
+				} finally {
+					resetSettingsForTest();
+					await fs.rm(dir, { recursive: true, force: true });
+				}
+			}
+		}
+	}, 30_000);
 
 	it("keeps its original deadline after folding, surfacing the expiry as a real outcome", async () => {
 		const dir = await tempDir();

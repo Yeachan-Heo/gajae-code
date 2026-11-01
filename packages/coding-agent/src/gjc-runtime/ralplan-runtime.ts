@@ -3,7 +3,9 @@ import type { Dirent } from "node:fs";
 import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { isSettingsInitialized, Settings } from "../config/settings";
+import { sanitizeImportedString } from "../session-import/redact";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -805,6 +807,7 @@ export async function resolveRalplanTargetRoot(
 	// resolving a repository root: an unborn or non-commit HEAD still fails the
 	// same validation, while the argv remains shell-safe on every platform.
 	const verified = Bun.spawn(["git", "-C", canonical, "rev-parse", "--verify", "HEAD"], {
+		env: projectSafeSpawnEnv(),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -814,6 +817,7 @@ export async function resolveRalplanTargetRoot(
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
 	}
 	const objectType = Bun.spawn(["git", "-C", canonical, "cat-file", "-t", headObject], {
+		env: projectSafeSpawnEnv(),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -2319,6 +2323,97 @@ function buildIndexedReviewArtifacts(indexText: string | undefined): Map<string,
 	return map;
 }
 
+function scrubImported(value: string): string {
+	return sanitizeImportedString(value);
+}
+
+/** Scrub, then trim the same way the disposition parser does. An empty result is not an id. */
+function canonicalDispositionId(value: string): string {
+	const canonical = scrubImported(value).trim();
+	if (canonical === "") {
+		throw new RalplanCommandError(
+			2,
+			"refusing to persist ralplan disposition: credential scrub removed an identifier",
+		);
+	}
+	return canonical;
+}
+
+/**
+ * Scrub a validated disposition, then rebuild conflict ids from the scrubbed
+ * finding and target ids. Only `sourceReceipt.path` and `sourceReceipt.sha256`
+ * stay literal. A result that no longer parses is refused instead of stored.
+ */
+function scrubDispositionDocument(normalized: string): string {
+	const doc = parseReviewConflictDocument(normalized);
+	const findingIds = new Map(
+		doc.findings.map(finding => [finding.findingId, canonicalDispositionId(finding.findingId)]),
+	);
+	const targetIds = new Map<string, string>();
+	const originalsByScrubbedTarget = new Map<string, string>();
+	for (const finding of doc.findings) {
+		const canonical = canonicalDispositionId(finding.targetId);
+		const prior = originalsByScrubbedTarget.get(canonical);
+		if (prior !== undefined && prior !== finding.targetId) {
+			throw new RalplanCommandError(
+				2,
+				"refusing to persist ralplan disposition: distinct target ids collapse after credential scrub",
+			);
+		}
+		originalsByScrubbedTarget.set(canonical, finding.targetId);
+		targetIds.set(finding.targetId, canonical);
+	}
+	const priorConflicts = doc.conflicts.map(conflict => ({
+		conflictId: conflict.conflictId,
+		targetId: conflict.targetId,
+		findingIds: [...conflict.findingIds] as [string, string],
+	}));
+	for (const finding of doc.findings) {
+		finding.findingId = findingIds.get(finding.findingId) ?? finding.findingId;
+		finding.targetId = targetIds.get(finding.targetId) ?? finding.targetId;
+		finding.evidence = scrubImported(finding.evidence);
+		if (finding.proposedOwner !== undefined) finding.proposedOwner = scrubImported(finding.proposedOwner);
+	}
+	for (const disposition of doc.dispositions) {
+		const prior = priorConflicts.find(conflict => conflict.conflictId === disposition.conflictId);
+		if (!prior) {
+			throw new RalplanCommandError(2, "refusing to persist ralplan disposition: conflict id did not survive scrub");
+		}
+		const targetId = targetIds.get(prior.targetId) ?? canonicalDispositionId(prior.targetId);
+		const mapped = prior.findingIds.map(id => findingIds.get(id) ?? canonicalDispositionId(id));
+		const [left, right] = mapped[0]! <= mapped[1]! ? [mapped[0]!, mapped[1]!] : [mapped[1]!, mapped[0]!];
+		disposition.conflictId = `conflict:${targetId}:${left}:${right}`;
+		disposition.rationale = scrubImported(disposition.rationale);
+		disposition.decisionOwner = scrubImported(disposition.decisionOwner);
+		disposition.affectedSections = disposition.affectedSections.map(section => scrubImported(section));
+		if (disposition.dispositionedAt !== undefined)
+			disposition.dispositionedAt = scrubImported(disposition.dispositionedAt);
+	}
+	const raw = JSON.parse(serializeReviewConflictDocument(doc)) as Record<string, unknown>;
+	delete raw.conflicts;
+	let rewritten: ReturnType<typeof parseReviewConflictDocument>;
+	try {
+		rewritten = parseReviewConflictDocument(`${JSON.stringify(raw, null, 2)}\n`);
+	} catch (error) {
+		throw new RalplanCommandError(
+			2,
+			`refusing to persist ralplan disposition: credential scrub broke the document (${error instanceof Error ? error.message : String(error)})`,
+		);
+	}
+	return serializeReviewConflictDocument(rewritten);
+}
+
+/**
+ * Credential scrub for a ralplan stage body. The result is what
+ * `gjc ralplan --write` hashes and stores.
+ */
+export function scrubRalplanPersistedBody(stage: string, content: string): string {
+	const normalized = content.endsWith("\n") ? content : `${content}\n`;
+	if (stage === "disposition") return scrubDispositionDocument(normalized);
+	const scrubbed = sanitizeImportedString(normalized);
+	return scrubbed.endsWith("\n") ? scrubbed : `${scrubbed}\n`;
+}
+
 async function handleArtifactWrite(
 	args: readonly string[],
 	cwd: string,
@@ -2380,7 +2475,9 @@ async function handleArtifactWrite(
 		resolved.stage === "disposition"
 			? normalizeDispositionArtifact(resolved.artifact, resolved.stageN, indexLoad.rawText)
 			: resolved.artifact;
-	const content = normalizedArtifact.endsWith("\n") ? normalizedArtifact : `${normalizedArtifact}\n`;
+	// Scrub before the content hash. The ledger, dedupe, and pending-approval copy
+	// all trust this digest, so it has to name the bytes that actually land on disk.
+	const content = scrubRalplanPersistedBody(resolved.stage, normalizedArtifact);
 	const sha256 = createHash("sha256").update(content).digest("hex");
 
 	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not

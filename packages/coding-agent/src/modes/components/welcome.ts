@@ -3,6 +3,7 @@ import { APP_NAME } from "@gajae-code/utils";
 import { formatBuildLabel } from "../../build-metadata";
 import { formatKeyHint, type KeyDisplayContext } from "../../config/keybindings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import { sanitizeStatusText } from "../shared";
 
 export interface RecentSession {
 	name: string;
@@ -29,6 +30,8 @@ export interface WelcomeComponentOptions {
 }
 
 const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
+/** One drawn LSP label. Longer text is omitted so paint does not scan it. */
+const WELCOME_LSP_LABEL_CAP = 256;
 const DEFAULT_WHATS_NEW_ROWS = 3;
 const MAX_WHATS_NEW_ROWS = 12;
 
@@ -188,8 +191,17 @@ export class WelcomeComponent implements Component {
 						: server.status === "error"
 							? theme.styledSymbol("status.error", "error")
 							: theme.styledSymbol("status.pending", "muted");
-				const exts = server.fileTypes.slice(0, 3).join(" ");
-				lspLines.push(` ${icon} ${theme.fg("muted", server.name)} ${theme.fg("dim", exts)}`);
+				const safeName = server.name.length > WELCOME_LSP_LABEL_CAP ? "" : sanitizeStatusText(server.name);
+				const safeTypes: string[] = [];
+				const typeLimit = Math.min(3, server.fileTypes.length);
+				for (let index = 0; index < typeLimit; index++) {
+					const fileType = server.fileTypes[index] ?? "";
+					if (fileType.length > WELCOME_LSP_LABEL_CAP) continue;
+					const safeType = sanitizeStatusText(fileType);
+					if (safeType.length > 0) safeTypes.push(safeType);
+				}
+				const exts = safeTypes.join(" ");
+				lspLines.push(` ${icon} ${theme.fg("muted", safeName)} ${theme.fg("dim", exts)}`);
 			}
 		}
 
@@ -536,7 +548,8 @@ export class WelcomeComponent implements Component {
 	}
 
 	#pill(icon: string, text: string, color: ThemeColor): string {
-		return `${theme.fg("borderMuted", "[")} ${theme.fg(color, icon)} ${theme.fg("muted", text)} ${theme.fg(
+		const safeText = sanitizeStatusText(text);
+		return `${theme.fg("borderMuted", "[")} ${theme.fg(color, icon)} ${theme.fg("muted", safeText)} ${theme.fg(
 			"borderMuted",
 			"]",
 		)}`;

@@ -953,6 +953,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			this.session.cwd,
 			{ sessionId: this.session.getSessionId?.() ?? null },
 			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
+			params,
 		);
 		assertDeepInterviewStructuredResponseWithinLimit(params);
 		// Recheck at execution time as well: direct SDK callers and a phase change

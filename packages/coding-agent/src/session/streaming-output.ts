@@ -1,4 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
 
 import { sanitizeText } from "@gajae-code/utils";
@@ -1065,6 +1068,291 @@ export class TailBuffer {
 // OutputSink — line-buffered output with file spill support
 // =============================================================================
 
+const ARTIFACT_PUBLISH_MODE = 0o600;
+const ARTIFACT_WRITE_HIGH_WATER = 64 * 1024;
+
+type ArtifactByteSink = {
+	write(chunk: string | Uint8Array): number;
+	settled(): Promise<void> | undefined;
+	writeFailed(): boolean;
+	end(): Promise<void>;
+};
+
+function artifactNoFollowFlag(): number {
+	return process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+}
+
+function unlinkStagingIfSame(stagingPath: string, staged: { dev: bigint; ino: bigint }): void {
+	try {
+		const leftover = fs.lstatSync(stagingPath, { bigint: true });
+		if (leftover.isSymbolicLink() || leftover.dev !== staged.dev || leftover.ino !== staged.ino) return;
+		fs.unlinkSync(stagingPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+/**
+ * Publish a 0600 staging inode onto `destination`.
+ * `rename` replaces the directory entry and does not follow a symlink there.
+ */
+function publishArtifactStaging(stagingPath: string, destination: string, staged: { dev: bigint; ino: bigint }): void {
+	let existing: fs.Stats | undefined;
+	try {
+		existing = fs.lstatSync(destination);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	if (existing && !existing.isFile() && !existing.isSymbolicLink()) {
+		throw new Error("artifact destination is not a regular file");
+	}
+	try {
+		fs.renameSync(stagingPath, destination);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform !== "win32" || (code !== "EEXIST" && code !== "EPERM") || !existing) throw error;
+		const again = fs.lstatSync(destination);
+		if (again.isSymbolicLink() !== existing.isSymbolicLink() || again.ino !== existing.ino) {
+			throw new Error("artifact destination changed");
+		}
+		fs.unlinkSync(destination);
+		fs.renameSync(stagingPath, destination);
+	}
+	const named = fs.lstatSync(destination, { bigint: true });
+	if (named.isSymbolicLink() || !named.isFile() || named.dev !== staged.dev || named.ino !== staged.ino) {
+		throw new Error("artifact destination changed");
+	}
+	if (process.platform !== "win32" && (Number(named.mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) {
+		throw new Error("artifact mode");
+	}
+}
+
+class ArtifactStagingSink implements ArtifactByteSink {
+	#fd: number | undefined;
+	#ended = false;
+	#queued = 0;
+	#busy = false;
+	#pending: Buffer | undefined;
+	#pendingLen = 0;
+	#tail: Promise<void> = Promise.resolve();
+	#writeError: unknown;
+	readonly #stagingPath: string;
+	readonly #destination: string;
+	readonly #inPlace: boolean;
+
+	constructor(fd: number, stagingPath: string, destination: string, inPlace = false) {
+		this.#fd = fd;
+		this.#stagingPath = stagingPath;
+		this.#destination = destination;
+		this.#inPlace = inPlace;
+	}
+
+	write(chunk: string | Uint8Array): number {
+		const fd = this.#fd;
+		if (fd === undefined || this.#ended) throw new Error("artifact sink closed");
+		if (this.#writeError) throw this.#writeError;
+		const incoming = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
+		if (incoming.length === 0) return 0;
+		// Callers that ignore settled() still run. One fs.write stays in flight; the rest share one buffer.
+		this.#queued += incoming.length;
+		this.#appendPending(incoming);
+		this.#schedule(fd);
+		return incoming.length;
+	}
+
+	settled(): Promise<void> | undefined {
+		return this.#queued > ARTIFACT_WRITE_HIGH_WATER ? this.#tail : undefined;
+	}
+
+	writeFailed(): boolean {
+		return this.#writeError !== undefined;
+	}
+
+	#appendPending(incoming: Buffer): void {
+		if (this.#pending === undefined || this.#pendingLen === 0) {
+			this.#pending = incoming;
+			this.#pendingLen = incoming.length;
+			return;
+		}
+		const need = this.#pendingLen + incoming.length;
+		if (need > this.#pending.length) {
+			const grown = Buffer.allocUnsafe(Math.max(need, this.#pending.length * 2));
+			this.#pending.copy(grown, 0, 0, this.#pendingLen);
+			this.#pending = grown;
+		}
+		incoming.copy(this.#pending, this.#pendingLen);
+		this.#pendingLen = need;
+	}
+
+	#schedule(fd: number): void {
+		if (this.#busy) return;
+		this.#busy = true;
+		this.#tail = this.#tail
+			.then(() => this.#drain(fd))
+			.finally(() => {
+				this.#busy = false;
+				const next = this.#fd;
+				if (next !== undefined && this.#pendingLen > 0 && !this.#writeError) this.#schedule(next);
+			});
+	}
+
+	async #drain(fd: number): Promise<void> {
+		while (this.#pending && this.#pendingLen > 0 && !this.#writeError) {
+			const pending = this.#pending;
+			const length = this.#pendingLen;
+			const buffer = length === pending.length ? pending : pending.subarray(0, length);
+			this.#pending = undefined;
+			this.#pendingLen = 0;
+			await this.#flush(fd, buffer);
+			this.#queued -= length;
+		}
+	}
+
+	async #flush(fd: number, buffer: Buffer): Promise<void> {
+		let offset = 0;
+		try {
+			while (!this.#writeError && offset < buffer.length) {
+				const wrote = await new Promise<number>((resolve, reject) => {
+					fs.write(fd, buffer, offset, buffer.length - offset, (error, bytes) =>
+						error ? reject(error) : resolve(bytes),
+					);
+				});
+				if (wrote <= 0) throw new Error("artifact write failed");
+				offset += wrote;
+			}
+		} catch (error) {
+			this.#writeError ??= error;
+		}
+	}
+
+	async end(): Promise<void> {
+		if (this.#ended) return;
+		this.#ended = true;
+		while (this.#busy || (this.#pendingLen > 0 && !this.#writeError)) {
+			if (!this.#busy && this.#fd !== undefined) this.#schedule(this.#fd);
+			const tail = this.#tail;
+			await tail;
+			if (tail === this.#tail && !this.#busy && (this.#pendingLen === 0 || this.#writeError)) break;
+		}
+		if (this.#writeError) {
+			const failed = this.#fd;
+			this.#fd = undefined;
+			if (failed !== undefined)
+				try {
+					fs.closeSync(failed);
+				} catch {
+					/* keep the write error */
+				}
+			throw this.#writeError;
+		}
+		const fd = this.#fd;
+		this.#fd = undefined;
+		let staged: { dev: bigint; ino: bigint } | undefined;
+		let closeError: unknown;
+		try {
+			if (fd === undefined) return;
+			if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+			fs.fsyncSync(fd);
+			const stat = fs.fstatSync(fd, { bigint: true });
+			if (!stat.isFile()) throw new Error("artifact staging is not a regular file");
+			if (process.platform !== "win32" && (Number(stat.mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) {
+				throw new Error("artifact mode");
+			}
+			staged = { dev: stat.dev, ino: stat.ino };
+		} finally {
+			if (fd !== undefined) {
+				try {
+					fs.closeSync(fd);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EBADF") closeError = error;
+				}
+			}
+		}
+		if (closeError) throw closeError;
+		if (!staged) return;
+		if (this.#inPlace) {
+			const named = fs.lstatSync(this.#destination, { bigint: true });
+			if (named.isSymbolicLink() || !named.isFile() || named.dev !== staged.dev || named.ino !== staged.ino) {
+				throw new Error("artifact destination changed");
+			}
+			if (process.platform !== "win32" && (Number(named.mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) {
+				throw new Error("artifact mode");
+			}
+			return;
+		}
+		try {
+			publishArtifactStaging(this.#stagingPath, this.#destination, staged);
+		} catch (error) {
+			unlinkStagingIfSame(this.#stagingPath, staged);
+			throw error;
+		}
+	}
+}
+
+function openExistingArtifactNoCreate(destination: string, createError: NodeJS.ErrnoException): ArtifactStagingSink {
+	let existing: fs.BigIntStats;
+	try {
+		existing = fs.lstatSync(destination, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw createError;
+		throw error;
+	}
+	// A missing write bit on the parent blocks create and rename. An existing regular file can still be opened.
+	if (existing.isSymbolicLink() || !existing.isFile()) {
+		throw new Error("artifact destination is not a regular file");
+	}
+	const flags = fs.constants.O_WRONLY | artifactNoFollowFlag();
+	const fd = fs.openSync(destination, flags);
+	try {
+		const opened = fs.fstatSync(fd, { bigint: true });
+		if (!opened.isFile() || opened.dev !== existing.dev || opened.ino !== existing.ino) {
+			throw new Error("artifact destination changed");
+		}
+		if (process.platform !== "win32") {
+			fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+			if ((Number(fs.fstatSync(fd).mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) throw new Error("artifact mode");
+		}
+		fs.ftruncateSync(fd, 0);
+		return new ArtifactStagingSink(fd, destination, destination, true);
+	} catch (error) {
+		try {
+			fs.closeSync(fd);
+		} catch {
+			// The original open error is the one callers record.
+		}
+		throw error;
+	}
+}
+
+function openArtifactStaging(destination: string): ArtifactStagingSink {
+	const stagingPath = path.join(path.dirname(destination), `.${randomUUID()}.staging`);
+	const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | artifactNoFollowFlag();
+	let fd: number;
+	try {
+		fd = fs.openSync(stagingPath, flags, ARTIFACT_PUBLISH_MODE);
+	} catch (error) {
+		const denied = error as NodeJS.ErrnoException;
+		if (denied.code === "EACCES" || denied.code === "EPERM") return openExistingArtifactNoCreate(destination, denied);
+		throw error;
+	}
+	try {
+		if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+		return new ArtifactStagingSink(fd, stagingPath, destination);
+	} catch (error) {
+		try {
+			fs.closeSync(fd);
+		} catch {
+			// The original open error is the one callers record.
+		}
+		try {
+			if (!fs.lstatSync(stagingPath).isSymbolicLink()) fs.unlinkSync(stagingPath);
+		} catch {
+			// Staging is already gone.
+		}
+		throw error;
+	}
+}
+
 export class OutputSink {
 	#buffer = "";
 	#bufferBytes = 0;
@@ -1101,7 +1389,7 @@ export class OutputSink {
 	#file?: {
 		path: string;
 		artifactId?: string;
-		sink: Bun.FileSink;
+		sink: ArtifactByteSink;
 	};
 
 	// Raw prefix chunks not yet confirmed written to the file sink. This queue is
@@ -1197,15 +1485,13 @@ export class OutputSink {
 	 */
 	// F21: with coalescing enabled, accumulate raw chunks and process them in batches; the default
 	// (disabled) path calls #ingest directly and is byte-identical to the historical per-chunk path.
-	push(chunk: string): void {
-		if (!this.#coalesceSanitize) {
-			this.#ingest(chunk);
-			return;
+	push(chunk: string): void | Promise<void> {
+		if (!this.#coalesceSanitize) this.#ingest(chunk);
+		else {
+			this.#coalesceBuf += chunk;
+			if (this.#coalesceBuf.length >= COALESCE_FLUSH_CHARS) this.#flushCoalesced();
 		}
-		this.#coalesceBuf += chunk;
-		if (this.#coalesceBuf.length >= COALESCE_FLUSH_CHARS) {
-			this.#flushCoalesced();
-		}
+		return this.#file?.sink.settled();
 	}
 
 	/** Process any buffered coalesced chunks as a single batch (F21). */
@@ -1508,7 +1794,7 @@ export class OutputSink {
 	}
 
 	// A failed write may have committed only a prefix, so the replay queue is no longer trustworthy.
-	#failArtifact(phase: "create" | "write" | "end", error: unknown, sink?: Bun.FileSink): void {
+	#failArtifact(phase: "create" | "write" | "end", error: unknown, sink?: ArtifactByteSink): void {
 		this.#recordArtifactFailure(phase, error);
 		this.#artifactFinalizationFailed = true;
 		this.#file = undefined;
@@ -1604,9 +1890,9 @@ export class OutputSink {
 		if (!this.#artifactPath) return false;
 		if (this.#fileReady) return this.#file != null;
 
-		let sink: Bun.FileSink;
+		let sink: ArtifactByteSink;
 		try {
-			sink = Bun.file(this.#artifactPath).writer();
+			sink = openArtifactStaging(this.#artifactPath);
 		} catch (error) {
 			this.#recordArtifactFailure("create", error);
 			return false;
@@ -1615,9 +1901,7 @@ export class OutputSink {
 
 		try {
 			const pending = this.#pendingFileWrites;
-			if (pending) {
-				for (const chunk of pending) sink.write(chunk);
-			}
+			if (pending && pending.length > 0) sink.write(pending.join(""));
 		} catch (error) {
 			this.#failArtifact("write", error, sink);
 			return false;
@@ -1694,9 +1978,7 @@ export class OutputSink {
 			this.push(dec.decode());
 		};
 		return new WritableStream({
-			write: chunk => {
-				this.push(typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true }));
-			},
+			write: chunk => this.push(typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true })),
 			close: finalize,
 			abort: finalize,
 		});
@@ -1764,7 +2046,7 @@ export class OutputSink {
 						artifactId = this.#file.artifactId;
 						this.#finalized = true;
 					} catch (error) {
-						this.#recordArtifactFailure("end", error);
+						this.#recordArtifactFailure(this.#file.sink.writeFailed() ? "write" : "end", error);
 						this.#artifactFinalizationFailed = true;
 						this.#file = undefined;
 						this.#fileReady = false;

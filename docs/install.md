@@ -92,6 +92,38 @@ GJC's shell tool requires a bash-compatible shell on Windows. After a binary ins
 
 Native Windows `gjc --tmux` needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux. See [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
 
+### Windows DACL and ACL requirements
+
+When `gjc update` fails with an ACL error on Windows, the executable at `%LOCALAPPDATA%\gjc\gjc.exe` has inherited or custom access control entries (ACEs) that grant write access to principals other than:
+- The current user
+- `BUILTIN\Administrators`
+- `NT AUTHORITY\SYSTEM`
+
+This can occur when `%LOCALAPPDATA%` has been granted access to a sandbox boundary (e.g. Codex CLI's `CodexSandboxUsers` group) or has non-inherited custom ACEs. GJC's update mechanism cannot proceed because the binary might be modified or replaced by an untrusted principal.
+
+To fix this:
+
+1. **Disable inheritance** on `%LOCALAPPDATA%\gjc` (the directory, not the file):
+   ```powershell
+   icacls "$env:LOCALAPPDATA\gjc" /inheritance:d
+   ```
+
+2. **Remove the offending principal** using the account name or SID shown in the error:
+   ```powershell
+   # For a named principal (e.g., "CodexSandboxUsers")
+   icacls "$env:LOCALAPPDATA\gjc" /remove "BUILTIN\CodexSandboxUsers"
+   
+   # Or use the numeric SID if the account cannot be resolved; replace the example with the SID from the error and keep the leading *
+   icacls "$env:LOCALAPPDATA\gjc" /remove "*S-1-5-21-..."
+   ```
+
+3. **Re-run the update**:
+   ```powershell
+   gjc update
+   ```
+
+If you need the inherited ACL (e.g., for your sandboxed development environment), consider granting access only at the level where it is required, or use a dedicated directory outside `%LOCALAPPDATA%` for GJC (set via `%GJC_INSTALL_DIR%` before installation).
+
 ## Shell completion
 
 GJC can generate a Fig/withfig-compatible spec for [Microsoft inshellisense](https://github.com/microsoft/inshellisense):
@@ -108,6 +140,7 @@ Interactive startup checks GitHub releases for a newer GJC version in the backgr
 
 - Standalone binary or former Bun/npm install on a supported platform → `gjc update` installs the matching GitHub release binary. Existing standalone binaries are atomically replaced. Package-manager installs migrate to a separate user binary path, even at the same version; shims are neither overwritten nor uninstalled. A target that already passes release-checksum, version, and smoke-test verification is reused without downloading the binary again (unless `--force` is set).
 - Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
+- Project dependency install (`<project>/node_modules/.bin/gjc`, including the real `.exe` that Windows dependency installs place there) → update the dependency, not the file: `gjc update` refuses with package-manager instructions because that file belongs to the project's lockfile, and replacing it fails on Windows ACLs (#6842).
 - Unsupported platform or unknown target → rerun the documented platform installer.
 
 Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
@@ -167,7 +200,7 @@ install or update.
 
 ## Retry configuration
 
-Provider retry budgets live in `~/.gjc/config.yml`:
+Provider retry budgets live in `~/.gjc/agent/config.yml`:
 
 ```yaml
 retry:

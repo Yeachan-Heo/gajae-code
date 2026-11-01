@@ -12,7 +12,14 @@ SESSION="$1"
 WORKDIR="$2"
 GJC_BIN="${GJC_BIN-$(command -v gjc || true)}"
 TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
-STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
+if [[ -n "${GJC_SESSION_STATE_DIR:-}" ]]; then
+  STATE_DIR="$GJC_SESSION_STATE_DIR"
+else
+  # The owner-lifecycle writers refuse a link anywhere in the state path, so the
+  # default names the workspace physically, once, at this trust boundary.
+  PHYSICAL_WORKDIR="$(CDPATH='' cd -P -- "$WORKDIR" 2>/dev/null && pwd -P)" || PHYSICAL_WORKDIR="$WORKDIR"
+  STATE_DIR="$PHYSICAL_WORKDIR/.gjc-session-state/$SESSION"
+fi
 RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 SOCKET_KEY="gjc-${SESSION//[^A-Za-z0-9_.-]/_}"
 MONITOR_SESSION="${SESSION}-owner-monitor"

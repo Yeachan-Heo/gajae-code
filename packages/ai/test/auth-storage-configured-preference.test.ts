@@ -10,24 +10,30 @@ import type { UsageLimit, UsageProvider, UsageReport } from "../src/usage";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+const CHEAP = "cheap@example.test";
+const SHARED = "shared@example.test";
+const PERSONAL = "personal@example.test";
+
 const openStores: SqliteAuthCredentialStore[] = [];
 const usageByEmail = new Map<string, UsageReport>();
 
-const usageProvider: UsageProvider = {
-	id: "anthropic",
-	async fetchUsage(params) {
-		const email = params.credential.email;
-		return email ? (usageByEmail.get(email) ?? null) : null;
-	},
+/**
+ * Usage-report shapes by provider type. Each provider names its windows differently; the cap must read the windows
+ * each provider actually reports rather than assume Anthropic's ids.
+ */
+type ProviderCase = "anthropic" | "openai-codex" | "kimi-code";
+const WINDOW_IDS: Record<ProviderCase, { short: string; long: string }> = {
+	anthropic: { short: "anthropic:5h", long: "anthropic:7d" },
+	"openai-codex": { short: "openai-codex:primary", long: "openai-codex:secondary" },
+	"kimi-code": { short: "kimi-code:0", long: "kimi-code:1" },
 };
 
-function limit(provider: string, windowId: "5h" | "7d", usedFraction: number): UsageLimit {
-	const durationMs = windowId === "5h" ? 5 * HOUR_MS : 7 * DAY_MS;
+function limit(id: string, provider: string, durationMs: number, usedFraction: number): UsageLimit {
 	return {
-		id: `${provider}:${windowId}`,
-		label: windowId,
-		scope: { provider, windowId, shared: true },
-		window: { id: windowId, label: windowId, durationMs, resetsAt: Date.now() + durationMs / 2 },
+		id,
+		label: id,
+		scope: { provider, windowId: id, shared: true },
+		window: { id, label: id, durationMs, resetsAt: Date.now() + durationMs / 2 },
 		amount: {
 			unit: "percent",
 			used: usedFraction * 100,
@@ -40,45 +46,60 @@ function limit(provider: string, windowId: "5h" | "7d", usedFraction: number): U
 	};
 }
 
-function report(email: string, fiveHourUsed: number, sevenDayUsed: number, provider = "anthropic"): UsageReport {
-	return {
+function setUsage(email: string, shortUsed: number, longUsed: number, provider: ProviderCase = "anthropic"): void {
+	const ids = WINDOW_IDS[provider];
+	usageByEmail.set(email, {
 		provider,
 		fetchedAt: Date.now(),
-		limits: [limit(provider, "5h", fiveHourUsed), limit(provider, "7d", sevenDayUsed)],
+		limits: [limit(ids.short, provider, 5 * HOUR_MS, shortUsed), limit(ids.long, provider, 7 * DAY_MS, longUsed)],
 		metadata: { email },
+	});
+}
+
+function oauth(email: string, accountId?: string): OAuthCredential {
+	return {
+		type: "oauth",
+		access: `token-${email}`,
+		refresh: `refresh-${email}`,
+		expires: Date.now() + HOUR_MS,
+		email,
+		...(accountId ? { accountId } : {}),
 	};
 }
 
-function oauth(access: string, email: string): OAuthCredential {
-	return { type: "oauth", access, refresh: `refresh-${access}`, expires: Date.now() + HOUR_MS, email };
+function token(email: string): string {
+	return `token-${email}`;
+}
+
+function prefer(email: string, maxUsedPercent?: number): ConfiguredCredentialPreference {
+	return maxUsedPercent === undefined
+		? { selector: { kind: "email", value: email } }
+		: { selector: { kind: "email", value: email }, maxUsedFraction: maxUsedPercent / 100 };
 }
 
 async function createStorage(
-	preference?: ConfiguredCredentialPreference,
-	rankingStrategyResolver?: () => undefined,
-	provider: "anthropic" | "kimi-code" = "anthropic",
+	preferences: readonly ConfiguredCredentialPreference[] | undefined,
+	options: { provider?: ProviderCase; reportsUsage?: boolean; emails?: readonly string[] } = {},
 ): Promise<AuthStorage> {
+	const provider = options.provider ?? "anthropic";
 	const store = await SqliteAuthCredentialStore.open(":memory:");
 	openStores.push(store);
-	const usageProviderForStorage: UsageProvider =
-		provider === "anthropic"
-			? usageProvider
-			: {
-					id: provider,
-					async fetchUsage(params) {
-						const email = params.credential.email;
-						return email ? (usageByEmail.get(email) ?? null) : null;
-					},
-				};
+	const usageProvider: UsageProvider = {
+		id: provider,
+		async fetchUsage(params) {
+			const email = params.credential.email;
+			return email ? (usageByEmail.get(email) ?? null) : null;
+		},
+	};
 	const storage = new AuthStorage(store, {
-		usageProviderResolver: resolvedProvider => (resolvedProvider === provider ? usageProviderForStorage : undefined),
-		...(rankingStrategyResolver ? { rankingStrategyResolver } : {}),
-		...(preference ? { credentialPreferences: { [provider]: preference } } : {}),
+		usageProviderResolver: resolved =>
+			options.reportsUsage !== false && resolved === provider ? usageProvider : undefined,
+		...(preferences ? { credentialPreferences: { [provider]: preferences } } : {}),
 	});
-	await storage.set(provider, [
-		oauth("token-personal", "personal@example.test"),
-		oauth("token-cheap", "cheap@example.test"),
-	]);
+	await storage.set(
+		provider,
+		(options.emails ?? [PERSONAL, CHEAP, SHARED]).map(email => oauth(email)),
+	);
 	return storage;
 }
 
@@ -87,97 +108,190 @@ afterEach(() => {
 	for (const store of openStores.splice(0)) store.close();
 });
 
-describe("configured credential preference", () => {
-	test("balanced ranking picks the less-used account without a preference", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.5, 0.5));
-		const storage = await createStorage();
+describe("ordered credential preferences", () => {
+	test("balanced ranking picks the least-used account without preferences", async () => {
+		setUsage(PERSONAL, 0.1, 0.1);
+		setUsage(CHEAP, 0.5, 0.5);
+		setUsage(SHARED, 0.3, 0.3);
+		const storage = await createStorage(undefined);
 
-		expect(await storage.getApiKey("anthropic", "no-preference")).toBe("token-personal");
+		expect(await storage.getApiKey("anthropic", "no-preference")).toBe(token(PERSONAL));
 	});
 
-	test("the preferred account is used ahead of the balanced ranking", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.5, 0.5));
-		const storage = await createStorage({ selector: { kind: "email", value: "cheap@example.test" } });
+	test("the first listed account is used ahead of balanced ranking", async () => {
+		setUsage(PERSONAL, 0.1, 0.1);
+		setUsage(CHEAP, 0.5, 0.5);
+		setUsage(SHARED, 0.3, 0.3);
+		const storage = await createStorage([prefer(CHEAP), prefer(SHARED, 75)]);
 
-		expect(await storage.getApiKey("anthropic", "preferred")).toBe("token-cheap");
+		expect(await storage.getApiKey("anthropic", "first")).toBe(token(CHEAP));
 	});
 
-	test("the preference yields to balanced ranking once any window reaches maxUsedFraction", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.9, 0.2));
-		const storage = await createStorage({
-			selector: { kind: "email", value: "cheap@example.test" },
-			maxUsedFraction: 0.9,
-		});
+	test("a rate-limited first account moves selection to the second listed account, not to balanced ranking", async () => {
+		setUsage(PERSONAL, 0.1, 0.1);
+		setUsage(CHEAP, 1, 0.4);
+		setUsage(SHARED, 0.3, 0.3);
+		const storage = await createStorage([prefer(CHEAP), prefer(SHARED, 75)]);
 
-		expect(await storage.getApiKey("anthropic", "over-threshold")).toBe("token-personal");
+		expect(await storage.getApiKey("anthropic", "second")).toBe(token(SHARED));
 	});
 
-	test("the long window alone can push the preference over maxUsedFraction", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.05, 0.95));
-		const storage = await createStorage({
-			selector: { kind: "email", value: "cheap@example.test" },
-			maxUsedFraction: 0.9,
-		});
+	test.each([
+		[74, SHARED],
+		[75, PERSONAL],
+	])("a listed account at %i%% of a 75%% cap resolves to %s", async (usedPercent, expected) => {
+		setUsage(PERSONAL, 0.5, 0.5);
+		setUsage(CHEAP, 1, 0.4);
+		setUsage(SHARED, usedPercent / 100, 0.1);
+		const storage = await createStorage([prefer(CHEAP), prefer(SHARED, 75)]);
 
-		expect(await storage.getApiKey("anthropic", "long-window-over-threshold")).toBe("token-personal");
+		expect(await storage.getApiKey("anthropic", `cap-${usedPercent}`)).toBe(token(expected));
 	});
 
-	test("the threshold applies when usage is available without a ranking strategy", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1, "kimi-code"));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.95, 0.2, "kimi-code"));
-		const storage = await createStorage(
-			{
-				selector: { kind: "email", value: "cheap@example.test" },
-				maxUsedFraction: 0.9,
-			},
-			() => undefined,
-			"kimi-code",
-		);
+	test("the long window alone can put a listed account over its cap", async () => {
+		setUsage(PERSONAL, 0.5, 0.5);
+		setUsage(CHEAP, 0.05, 0.95);
+		const storage = await createStorage([prefer(CHEAP, 90)], { emails: [PERSONAL, CHEAP] });
 
-		expect(await storage.getApiKey("kimi-code")).toBe("token-personal");
+		expect(await storage.getApiKey("anthropic", "long-window")).toBe(token(PERSONAL));
 	});
 
-	test("the preference still applies just below maxUsedFraction", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.89, 0.2));
-		const storage = await createStorage({
-			selector: { kind: "email", value: "cheap@example.test" },
-			maxUsedFraction: 0.9,
-		});
+	test("once every listed account is past its cap the unlisted accounts are ranked normally", async () => {
+		setUsage(PERSONAL, 0.6, 0.6);
+		setUsage(CHEAP, 0.8, 0.2);
+		setUsage(SHARED, 0.9, 0.2);
+		const storage = await createStorage([prefer(CHEAP, 50), prefer(SHARED, 75)]);
 
-		expect(await storage.getApiKey("anthropic", "under-threshold")).toBe("token-cheap");
+		expect(await storage.getApiKey("anthropic", "all-capped")).toBe(token(PERSONAL));
 	});
 
-	test("unknown usage does not count as over the threshold", async () => {
-		const storage = await createStorage({
-			selector: { kind: "email", value: "cheap@example.test" },
-			maxUsedFraction: 0.5,
-		});
+	test("an account past its cap is still used when every other account is rate-limited", async () => {
+		setUsage(PERSONAL, 1, 0.9);
+		setUsage(CHEAP, 1, 0.5);
+		setUsage(SHARED, 0.9, 0.2);
+		const storage = await createStorage([prefer(CHEAP), prefer(SHARED, 75)]);
 
-		expect(await storage.getApiKey("anthropic", "unknown-usage")).toBe("token-cheap");
+		expect(await storage.getApiKey("anthropic", "capped-last-resort")).toBe(token(SHARED));
 	});
 
-	test("a quota failure on the preferred account rotates away for the rest of the session", async () => {
-		const storage = await createStorage({ selector: { kind: "email", value: "cheap@example.test" } });
+	test.each([
+		"openai-codex",
+		"kimi-code",
+	] as const)("%s caps read the windows that provider reports", async provider => {
+		setUsage(PERSONAL, 0.5, 0.5, provider);
+		setUsage(CHEAP, 0.2, 0.2, provider);
+		setUsage(SHARED, 0.8, 0.1, provider);
+		const storage = await createStorage([prefer(SHARED, 75), prefer(CHEAP)], { provider });
 
-		expect(await storage.getApiKey("anthropic", "quota")).toBe("token-cheap");
+		expect(await storage.getApiKey(provider, `${provider}-cap`)).toBe(token(CHEAP));
+	});
+
+	test("a provider without usage reporting follows list order and treats caps as not reached", async () => {
+		const storage = await createStorage([prefer(SHARED, 10), prefer(CHEAP)], { reportsUsage: false });
+
+		expect(await storage.getApiKey("anthropic", "no-usage")).toBe(token(SHARED));
+	});
+
+	test("unknown usage for one account does not count as over its cap", async () => {
+		setUsage(PERSONAL, 0.1, 0.1);
+		const storage = await createStorage([prefer(CHEAP, 50)], { emails: [PERSONAL, CHEAP] });
+
+		expect(await storage.getApiKey("anthropic", "unknown-usage")).toBe(token(CHEAP));
+	});
+
+	test("a quota failure during a session moves to the next listed account", async () => {
+		const storage = await createStorage([prefer(CHEAP), prefer(SHARED, 75)]);
+
+		expect(await storage.getApiKey("anthropic", "quota")).toBe(token(CHEAP));
 		expect(await storage.markUsageLimitReached("anthropic", "quota", { retryAfterMs: 60_000 })).toMatchObject({
 			state: "marked",
 		});
-		expect(await storage.getApiKey("anthropic", "quota")).toBe("token-personal");
-		expect(await storage.getApiKey("anthropic", "quota-next-session")).toBe("token-personal");
+		expect(await storage.getApiKey("anthropic", "quota")).toBe(token(SHARED));
 	});
 
-	test("a preference that matches no stored account leaves ranking untouched", async () => {
-		usageByEmail.set("personal@example.test", report("personal@example.test", 0.5, 0.5));
-		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.1, 0.1));
-		const storage = await createStorage({ selector: { kind: "email", value: "removed@example.test" } });
+	test("a session keeps its account after crossing the cap instead of switching mid-session", async () => {
+		setUsage(PERSONAL, 0.5, 0.5);
+		setUsage(SHARED, 0.5, 0.1);
+		const storage = await createStorage([prefer(SHARED, 75)], { emails: [PERSONAL, SHARED] });
 
-		expect(await storage.getApiKey("anthropic", "missing")).toBe("token-cheap");
+		expect(await storage.getApiKey("anthropic", "sticky")).toBe(token(SHARED));
+		setUsage(SHARED, 0.9, 0.1);
+		expect(await storage.getApiKey("anthropic", "sticky")).toBe(token(SHARED));
+	});
+
+	test("a listed account that is not stored is skipped", async () => {
+		setUsage(PERSONAL, 0.1, 0.1);
+		setUsage(CHEAP, 0.5, 0.5);
+		setUsage(SHARED, 0.3, 0.3);
+		const storage = await createStorage([prefer("removed@example.test"), prefer(CHEAP)]);
+
+		expect(await storage.getApiKey("anthropic", "missing")).toBe(token(CHEAP));
+	});
+
+	describe("a list that names one stored account twice", () => {
+		const CHEAP_ACCOUNT = "acct-cheap";
+		const aliasedPreferences: ConfiguredCredentialPreference[] = [
+			{ selector: { kind: "email", value: CHEAP }, maxUsedFraction: 0.5 },
+			prefer(SHARED),
+			{ selector: { kind: "account", value: CHEAP_ACCOUNT } },
+		];
+
+		async function createAliasedStorage(
+			preferences: readonly ConfiguredCredentialPreference[],
+			credentials: readonly OAuthCredential[],
+		): Promise<AuthStorage> {
+			const store = await SqliteAuthCredentialStore.open(":memory:");
+			openStores.push(store);
+			const storage = new AuthStorage(store, {
+				usageProviderResolver: () => ({
+					id: "anthropic",
+					async fetchUsage(params) {
+						const email = params.credential.email;
+						return email ? (usageByEmail.get(email) ?? null) : null;
+					},
+				}),
+				credentialPreferences: { anthropic: preferences },
+			});
+			await storage.set("anthropic", [...credentials]);
+			return storage;
+		}
+
+		test("through email and account selectors is reported with the shared row", async () => {
+			const storage = await createAliasedStorage(aliasedPreferences, [
+				oauth(PERSONAL),
+				oauth(CHEAP, CHEAP_ACCOUNT),
+				oauth(SHARED),
+			]);
+			const cheapRow = storage.listCredentialInventory("anthropic").find(row => row.email === CHEAP);
+
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([
+				{ provider: "anthropic", credentialId: cheapRow!.id },
+			]);
+		});
+
+		test("is ignored as a whole instead of honoring only the first entry's cap", async () => {
+			setUsage(PERSONAL, 0.1, 0.1);
+			setUsage(CHEAP, 0.6, 0.1);
+			setUsage(SHARED, 0.3, 0.3);
+			const storage = await createAliasedStorage(aliasedPreferences, [
+				oauth(PERSONAL),
+				oauth(CHEAP, CHEAP_ACCOUNT),
+				oauth(SHARED),
+			]);
+
+			// Applied, the list would pick SHARED (CHEAP is over its 50% cap); ignored, balanced ranking picks PERSONAL.
+			expect(await storage.getApiKey("anthropic", "aliased")).toBe(token(PERSONAL));
+		});
+
+		test("is not reported when the aliases designate different rows", async () => {
+			const storage = await createAliasedStorage(aliasedPreferences, [
+				oauth(PERSONAL, CHEAP_ACCOUNT),
+				oauth(CHEAP),
+				oauth(SHARED),
+			]);
+
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+		});
 	});
 
 	test.each([
@@ -186,26 +300,22 @@ describe("configured credential preference", () => {
 	] as const)("%s selects the designated OAuth row in a pool that also stores an API key", async (_label, source) => {
 		const store = await SqliteAuthCredentialStore.open(":memory:");
 		openStores.push(store);
-		const selector = { kind: "email", value: "cheap@example.test" } as const;
+		const selector = { kind: "email", value: CHEAP } as const;
 		const storage = new AuthStorage(store, {
 			rankingStrategyResolver: () => undefined,
 			configValueResolver: async value => (value === "unusable-api-key" ? undefined : value),
-			...(source === "configured" ? { credentialPreferences: { anthropic: { selector } } } : {}),
+			...(source === "configured" ? { credentialPreferences: { anthropic: [{ selector }] } } : {}),
 		});
-		await storage.set("anthropic", [
-			{ type: "api_key", key: "unusable-api-key" },
-			oauth("token-cheap", "cheap@example.test"),
-			oauth("token-personal", "personal@example.test"),
-		]);
+		await storage.set("anthropic", [{ type: "api_key", key: "unusable-api-key" }, oauth(CHEAP), oauth(PERSONAL)]);
 		if (source === "runtime") storage.setRuntimePreferredCredentialSelector("anthropic", selector);
 
-		expect(await storage.getApiKey("anthropic", `mixed-${source}`)).toBe("token-cheap");
+		expect(await storage.getApiKey("anthropic", `mixed-${source}`)).toBe(token(CHEAP));
 	});
 
-	test("a runtime --prefer-credential selector outranks the configured preference", async () => {
-		const storage = await createStorage({ selector: { kind: "email", value: "cheap@example.test" } });
-		storage.setRuntimePreferredCredentialSelector("anthropic", { kind: "email", value: "personal@example.test" });
+	test("a runtime --prefer-credential selector outranks configured preferences", async () => {
+		const storage = await createStorage([prefer(CHEAP)]);
+		storage.setRuntimePreferredCredentialSelector("anthropic", { kind: "email", value: PERSONAL });
 
-		expect(await storage.getApiKey("anthropic", "runtime-wins")).toBe("token-personal");
+		expect(await storage.getApiKey("anthropic", "runtime-wins")).toBe(token(PERSONAL));
 	});
 });

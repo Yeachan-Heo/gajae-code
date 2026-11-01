@@ -132,10 +132,52 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 	);
 }
 
-function resolveBuildOutputDirPrefix(profileLabel: string): string {
-	const buildTarget = crossTarget ?? `${targetPlatform}-${targetArch}`;
-	const variantLabel = effectiveVariant ?? "default";
-	return path.join(nativeDir, ".build", `${buildTarget}-${variantLabel}-${profileLabel}-`);
+type NativePathApi = Pick<typeof path, "resolve" | "dirname" | "basename">;
+
+function nativeTargetHasSeparator(value: string): boolean {
+	return value.includes("/") || value.includes("\\") || value.includes("\0");
+}
+
+export function resolveNativeBuildOutputPaths(
+	input: {
+		nativeDir: string;
+		crossTarget?: string;
+		targetPlatform: string;
+		targetArch: string;
+		variantSuffix: string;
+		variantLabel: string;
+		profileLabel: string;
+	},
+	pathApi: NativePathApi = path,
+): { buildOutputDirPrefix: string; canonicalAddonFilename: string; canonicalAddonPath: string } {
+	if (input.crossTarget !== undefined && nativeTargetHasSeparator(input.crossTarget)) {
+		throw new Error("Unsupported CROSS_TARGET: path separators are not allowed");
+	}
+	if (nativeTargetHasSeparator(input.targetPlatform)) {
+		throw new Error("Unsupported TARGET_PLATFORM: path separators are not allowed");
+	}
+	if (nativeTargetHasSeparator(input.targetArch)) {
+		throw new Error("Unsupported TARGET_ARCH: path separators are not allowed");
+	}
+	const root = pathApi.resolve(input.nativeDir);
+	const buildRoot = pathApi.resolve(root, ".build");
+	const buildTarget = input.crossTarget ?? `${input.targetPlatform}-${input.targetArch}`;
+	const buildOutputDirPrefix = pathApi.resolve(
+		buildRoot,
+		`${buildTarget}-${input.variantLabel}-${input.profileLabel}-`,
+	);
+	if (pathApi.dirname(buildOutputDirPrefix) !== buildRoot) {
+		throw new Error("Native build output path escapes the native build directory");
+	}
+	const canonicalAddonFilename = `pi_natives.${input.targetPlatform}-${input.targetArch}${input.variantSuffix}.node`;
+	const canonicalAddonPath = pathApi.resolve(root, canonicalAddonFilename);
+	if (
+		pathApi.dirname(canonicalAddonPath) !== root ||
+		pathApi.basename(canonicalAddonPath) !== canonicalAddonFilename
+	) {
+		throw new Error("Native build install path escapes the native directory");
+	}
+	return { buildOutputDirPrefix, canonicalAddonFilename, canonicalAddonPath };
 }
 
 async function installGeneratedBindings(outputDir: string): Promise<void> {
@@ -204,6 +246,7 @@ const requiredGeneratedBindingSymbols = [
 	"openRecoveryFsRoot",
 	"rasterizeSvg",
 	"TtyWriter",
+	"reassertRawTty",
 	"repairOwnerOnlyPathSecurityExpected",
 	"structuredPatchHunks",
 	"verifyOwnerOnlyPathSecurityExpected",
@@ -211,6 +254,7 @@ const requiredGeneratedBindingSymbols = [
 	"__gjcInstallTokioRuntime",
 	"PowerAssertion",
 	"currentExecutablePath",
+	"readOwnerOnlyFile",
 	"windowsOrdinalCaseFold",
 ] as const;
 
@@ -250,7 +294,15 @@ const profileLabel = resolveNativeBuildProfile({
 });
 const profileSuffix = ` (${profileLabel})`;
 
-const buildOutputDirPrefix = resolveBuildOutputDirPrefix(profileLabel);
+const { buildOutputDirPrefix, canonicalAddonFilename, canonicalAddonPath } = resolveNativeBuildOutputPaths({
+	nativeDir,
+	crossTarget,
+	targetPlatform,
+	targetArch,
+	variantSuffix,
+	variantLabel: effectiveVariant ?? "default",
+	profileLabel,
+});
 
 // Build napi args
 const napiArgs = [
@@ -272,74 +324,77 @@ const napiArgs = [
 if (crossTarget) napiArgs.push("--target", crossTarget);
 if (languageSet === "full") napiArgs.push("--", "--features", "full-langs");
 
-const canonicalAddonFilename = `pi_natives.${targetPlatform}-${targetArch}${variantSuffix}.node`;
-const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
+async function runNativeBuild(): Promise<void> {
+	console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuffix}${profileSuffix}…`);
 
-console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuffix}${profileSuffix}…`);
-
-// Resolve napi bin directly: `bunx @napi-rs/cli` can pick up the wrong bin on
-// systems where `cli` exists on PATH (e.g. Mono's /usr/bin/cli on Ubuntu).
-const napiBin = Bun.which("napi", {
-	PATH: `${path.join(import.meta.dir, "..", "node_modules", ".bin")}:${path.join(repoRoot, "node_modules", ".bin")}:${process.env.PATH ?? ""}`,
-});
-if (!napiBin) {
-	throw new Error("Could not locate @napi-rs/cli `napi` binary in node_modules/.bin");
-}
-
-const cargoPathResolution = await resolveCargoToolchainPath({
-	cwd: repoRoot,
-	currentPath: Bun.env.PATH ?? "",
-});
-if (!cargoPathResolution) {
-	throw new Error(
-		"Could not locate Cargo for native addon build. Install Rust with rustup, or ensure `cargo` is available on PATH.",
-	);
-}
-Bun.env.PATH = cargoPathResolution.pathValue;
-Bun.env.PCRE2_SYS_STATIC = "1";
-
-await fs.mkdir(nativeDir, { recursive: true });
-await cleanupStaleTemps(nativeDir);
-await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
-const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
-napiArgs[10] = buildOutputDir;
-
-try {
-	const buildResult = await $`${napiBin} ${napiArgs}`.nothrow();
-	if (buildResult.exitCode !== 0) {
-		const stderr = buildResult.stderr?.toString("utf-8").trim() ?? "";
-		const stdout = buildResult.stdout?.toString("utf-8").trim() ?? "";
-		const details = [stderr, stdout].filter(detail => detail !== "").join("\n");
-		throw new Error(`napi build failed${details ? `:\n${details}` : ""}`);
-	}
-
-	const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);
-	if (builtAddonPath !== canonicalAddonPath) {
-		console.log(`Normalizing native addon filename: ${path.basename(builtAddonPath)} → ${canonicalAddonFilename}`);
-		await installBinary(builtAddonPath, canonicalAddonPath);
-	}
-
-	await installGeneratedBindings(buildOutputDir);
-
-	const { version } = (await Bun.file(packageJsonPath).json()) as { version: string };
-	await Bun.write(
-		`${canonicalAddonPath}.build.json`,
-		`${JSON.stringify({ languageSet, profile: profileLabel, version, builtAt: new Date().toISOString() }, null, 2)}\n`,
-	);
-
-	await recordDiagnosticArtifactDigest({
-		addonPath: canonicalAddonPath,
-		nativeDir,
-		packageJsonPath,
-		profile: profileLabel,
+	// Resolve napi bin directly: `bunx @napi-rs/cli` can pick up the wrong bin on
+	// systems where `cli` exists on PATH (e.g. Mono's /usr/bin/cli on Ubuntu).
+	const napiBin = Bun.which("napi", {
+		PATH: `${path.join(import.meta.dir, "..", "node_modules", ".bin")}:${path.join(repoRoot, "node_modules", ".bin")}:${process.env.PATH ?? ""}`,
 	});
+	if (!napiBin) {
+		throw new Error("Could not locate @napi-rs/cli `napi` binary in node_modules/.bin");
+	}
 
-	await generateEnumExports();
-	await normalizeGeneratedDeclarationSpacing();
-	await ensurePublishDiagnosticDeclaration();
-	await validateGeneratedBindings();
+	const cargoPathResolution = await resolveCargoToolchainPath({
+		cwd: repoRoot,
+		currentPath: Bun.env.PATH ?? "",
+	});
+	if (!cargoPathResolution) {
+		throw new Error(
+			"Could not locate Cargo for native addon build. Install Rust with rustup, or ensure `cargo` is available on PATH.",
+		);
+	}
+	Bun.env.PATH = cargoPathResolution.pathValue;
+	Bun.env.PCRE2_SYS_STATIC = "1";
 
-	console.log("Build complete.");
-} finally {
-	await fs.rm(buildOutputDir, { recursive: true, force: true });
+	await fs.mkdir(nativeDir, { recursive: true });
+	await cleanupStaleTemps(nativeDir);
+	await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
+	const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
+	napiArgs[10] = buildOutputDir;
+
+	try {
+		const buildResult = await $`${napiBin} ${napiArgs}`.nothrow();
+		if (buildResult.exitCode !== 0) {
+			const stderr = buildResult.stderr?.toString("utf-8").trim() ?? "";
+			const stdout = buildResult.stdout?.toString("utf-8").trim() ?? "";
+			const details = [stderr, stdout].filter(detail => detail !== "").join("\n");
+			throw new Error(`napi build failed${details ? `:\n${details}` : ""}`);
+		}
+
+		const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);
+		if (builtAddonPath !== canonicalAddonPath) {
+			console.log(`Normalizing native addon filename: ${path.basename(builtAddonPath)} → ${canonicalAddonFilename}`);
+			await installBinary(builtAddonPath, canonicalAddonPath);
+		}
+
+		await installGeneratedBindings(buildOutputDir);
+
+		const { version } = (await Bun.file(packageJsonPath).json()) as { version: string };
+		await Bun.write(
+			`${canonicalAddonPath}.build.json`,
+			`${JSON.stringify({ languageSet, profile: profileLabel, version, builtAt: new Date().toISOString() }, null, 2)}\n`,
+		);
+
+		await recordDiagnosticArtifactDigest({
+			addonPath: canonicalAddonPath,
+			nativeDir,
+			packageJsonPath,
+			profile: profileLabel,
+		});
+
+		await generateEnumExports();
+		await normalizeGeneratedDeclarationSpacing();
+		await ensurePublishDiagnosticDeclaration();
+		await validateGeneratedBindings();
+
+		console.log("Build complete.");
+	} finally {
+		await fs.rm(buildOutputDir, { recursive: true, force: true });
+	}
+}
+
+if (import.meta.main) {
+	await runNativeBuild();
 }

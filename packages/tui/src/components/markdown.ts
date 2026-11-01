@@ -1,3 +1,7 @@
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
+import { sanitizeText } from "@gajae-code/utils";
 import { LRUCache } from "lru-cache/raw";
 import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
 import { hasSvgFence, isClosedSvgFence } from "../chat/svg-source";
@@ -455,17 +459,78 @@ type ListToken = Token & { items: Array<{ tokens?: Token[] }>; ordered: boolean;
 type TableCellToken = { tokens?: Token[] };
 type TableToken = Token & { header: TableCellToken[]; rows: TableCellToken[][]; raw?: string };
 
+/** Relative markdown links follow the active session's process cwd and home. */
+function markdownLinkContextKey(): string {
+	let cwd = "<unavailable>";
+	let home = "<unavailable>";
+	try {
+		cwd = process.cwd();
+	} catch {}
+	try {
+		home = os.homedir();
+	} catch {}
+	return `${cwd}\x00${home}`;
+}
+
+/** Decodes valid `%XX` runs; a `%` that does not start a valid UTF-8 escape stays a literal percent sign. */
+function decodePercentEscapes(value: string): string {
+	return value.replace(/(?:%[0-9a-f]{2})+/giu, escapes => {
+		try {
+			return decodeURIComponent(escapes);
+		} catch {
+			return escapes;
+		}
+	});
+}
+
+/**
+ * Converts a local Markdown link destination to an absolute `file://` URI. The destination is a URI
+ * reference: its path may be percent-encoded, and `?` or `#` starts the query or fragment, which stay
+ * URI components instead of becoming part of the filename.
+ */
+function localFileUri(target: string): string {
+	const suffixStart = target.search(/[?#]/u);
+	const pathPart = suffixStart === -1 ? target : target.slice(0, suffixStart);
+	const suffix = suffixStart === -1 ? "" : target.slice(suffixStart);
+	const filePath = decodePercentEscapes(pathPart);
+	let absolutePath: string;
+	if (path.isAbsolute(filePath)) {
+		absolutePath = filePath;
+	} else if (filePath === "~") {
+		absolutePath = os.homedir();
+	} else if (filePath.startsWith("~/")) {
+		absolutePath = path.resolve(os.homedir(), filePath.slice(2));
+	} else {
+		absolutePath = path.resolve(process.cwd(), filePath);
+	}
+	const fileUrl = url.pathToFileURL(absolutePath);
+	return suffix ? new URL(suffix, fileUrl).href : fileUrl.href;
+}
+
 function formatHyperlink(text: string, target: string): string {
 	if (!TERMINAL.hyperlinks || !target) {
 		return text;
 	}
 
-	const safeTarget = target.replaceAll("\x1b", "").replaceAll("\x07", "");
-	if (!safeTarget) {
+	if (/[\u0000-\u001f\u007f-\u009f]/u.test(target)) {
 		return text;
 	}
 
-	return `\x1b]8;;${safeTarget}\x07${text}\x1b]8;;\x07`;
+	// `#fragment` and `//authority/path` (network-path reference) are URI references, not local paths.
+	let destination = target;
+	if (
+		!target.startsWith("#") &&
+		!target.startsWith("//") &&
+		(path.isAbsolute(target) || !/^[a-z][a-z\d+.-]*:/iu.test(target))
+	) {
+		try {
+			destination = localFileUri(target);
+		} catch {
+			return text;
+		}
+	}
+
+	return `\x1b]8;;${destination}\x07${text}\x1b]8;;\x07`;
 }
 
 function stripHtmlComments(raw: string): string {
@@ -489,6 +554,15 @@ function stripHtmlComments(raw: string): string {
 	}
 
 	return result;
+}
+
+// Untrusted source is sanitized before marked parses it. Theme SGR, OSC 8, and
+// copy APCs are added later and must stay. sanitizeText drops CR, which is a
+// line break today, so normalize CR/CRLF to LF first.
+function sanitizeMarkdownSource(text: string | null | undefined): string {
+	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
+	if (typeof text !== "string") return "";
+	return sanitizeText(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
 }
 
 export class Markdown implements Component {
@@ -525,6 +599,7 @@ export class Markdown implements Component {
 	#hasActiveDynamicSvgFigures = false;
 	#hasRetryableSvgFigureFallback = false;
 	#cachedImageProtocol: typeof TERMINAL.imageProtocol | undefined;
+	#cachedLinkContextKey?: string;
 	#dynamicFigures = new Map<number, Component>();
 	#nextDynamicFigureIndex = 0;
 	#disposed = false;
@@ -537,10 +612,11 @@ export class Markdown implements Component {
 		defaultTextStyle?: DefaultTextStyle,
 		codeBlockIndent: number = 2,
 	) {
-		this.#text = text;
+		const source = sanitizeMarkdownSource(text);
+		this.#text = source;
 		this.#svgResolverAvailable = theme.resolveSvgFigure !== undefined;
 		if (this.#svgResolverAvailable) __markdownPerfCounters.svgFenceDetectionCalls++;
-		this.#mayHaveDynamicSvgFigures = this.#svgResolverAvailable && hasSvgFence(text);
+		this.#mayHaveDynamicSvgFigures = this.#svgResolverAvailable && hasSvgFence(source);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -553,12 +629,13 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string, options?: { streaming?: boolean }): void {
+		const source = sanitizeMarkdownSource(text);
 		if (options?.streaming !== undefined) {
 			this.setStreaming(options.streaming);
 		}
-		if (this.#text !== text) this.#rejectedParseKey = undefined;
-		const textChanged = this.#text !== text;
-		this.#text = text;
+		if (this.#text !== source) this.#rejectedParseKey = undefined;
+		const textChanged = this.#text !== source;
+		this.#text = source;
 		const svgResolverAvailable = this.#theme.resolveSvgFigure !== undefined;
 		const svgResolverChanged = svgResolverAvailable !== this.#svgResolverAvailable;
 		this.#svgResolverAvailable = svgResolverAvailable;
@@ -571,7 +648,7 @@ export class Markdown implements Component {
 			if (textChanged || svgResolverChanged) this.#svgFenceDetectionPending = true;
 		} else {
 			__markdownPerfCounters.svgFenceDetectionCalls++;
-			this.#mayHaveDynamicSvgFigures = hasSvgFence(text);
+			this.#mayHaveDynamicSvgFigures = hasSvgFence(source);
 			this.#svgFenceDetectionPending = false;
 		}
 		if (this.#streaming) {
@@ -735,6 +812,8 @@ export class Markdown implements Component {
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		const copyEnabled = copyAnnotationsEnabled();
+		// Only bracketed Markdown can contain a link target; plain text stays shared.
+		const linkContextKey = this.#text.includes("]") ? markdownLinkContextKey() : "";
 		if (
 			!this.#hasActiveDynamicSvgFigures &&
 			!this.#hasRetryableSvgFigureFallback &&
@@ -743,6 +822,7 @@ export class Markdown implements Component {
 			this.#cachedText === this.#text &&
 			this.#cachedWidth === width &&
 			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedLinkContextKey === linkContextKey &&
 			this.#cachedCopyEnabled === copyEnabled &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
@@ -759,6 +839,7 @@ export class Markdown implements Component {
 			this.#cachedLines &&
 			this.#cachedWidth === width &&
 			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedLinkContextKey === linkContextKey &&
 			this.#cachedCopyEnabled === copyEnabled &&
 			this.#lastFullParseAt > 0 &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
@@ -787,6 +868,7 @@ export class Markdown implements Component {
 			this.#cachedCopyEnabled = copyEnabled;
 			this.#cachedAnchorSpans = includeAnchors ? [] : undefined;
 			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			return { lines: result, spans: this.#cachedAnchorSpans };
 		}
 
@@ -812,7 +894,8 @@ export class Markdown implements Component {
 		// and verify it on hit so hash collisions can never serve wrong output.
 		const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
 		const headingProbe = this.#theme.heading("");
-		const cacheKey = `${renderContentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
+		const linkContextSuffix = linkContextKey ? `\x00${linkContextKey}` : "";
+		const cacheKey = `${renderContentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}${linkContextSuffix}\x00${bgColorProbe}\x00${headingProbe}`;
 		const cached = renderCache.get(cacheKey);
 		if (
 			!this.#mayHaveDynamicSvgFigures &&
@@ -828,6 +911,7 @@ export class Markdown implements Component {
 			this.#cachedLines = lines;
 			this.#cachedAnchorSpans = cached.anchorSpans;
 			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			if (!this.#streaming || this.#currentParse?.source !== normalizedText) this.#currentParse = undefined;
 			return { lines, spans: cached.anchorSpans };
 		}
@@ -1237,12 +1321,14 @@ export class Markdown implements Component {
 			this.#cachedLines = undefined;
 			this.#cachedAnchorSpans = undefined;
 			this.#cachedImageProtocol = undefined;
+			this.#cachedLinkContextKey = undefined;
 		} else {
 			this.#cachedText = renderedText;
 			this.#cachedWidth = width;
 			this.#cachedLines = copyBoundResult;
 			this.#cachedAnchorSpans = anchorSpans;
 			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			this.#lastFullParseAt = markdownNow();
 		}
 
@@ -2025,7 +2111,7 @@ export class Markdown implements Component {
 export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseColor?: (t: string) => string): string {
 	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
 	if (typeof text !== "string") return (baseColor ?? (t => t))(text != null ? String(text) : "");
-	const tokens = marked.lexer(text);
+	const tokens = marked.lexer(sanitizeMarkdownSource(text));
 	const applyText = baseColor ?? ((t: string) => t);
 	let result = "";
 	for (const token of tokens) {

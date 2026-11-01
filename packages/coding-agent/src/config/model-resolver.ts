@@ -97,7 +97,7 @@ export async function refreshMissingQualifiedModelProviders(
 			.getRefreshableProviders()
 			.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase());
 		if (!provider || refreshedProviders.has(provider)) continue;
-		const availableModels = modelRegistry.getAvailable();
+		const availableModels = modelRegistry.getAvailable(credentialSessionId);
 		const rawModelId = selector.slice(selector.indexOf("/") + 1);
 		if (
 			resolveProviderModelReference(provider, rawModelId, availableModels) ||
@@ -1047,9 +1047,10 @@ export function resolveModelOverride(
 	settings?: Settings,
 	sessionId?: string,
 	aliasIntent?: "preset-equivalent" | "reject",
+	credentialSessionId?: string,
 ): { model?: Model<Api>; thinkingLevel?: ThinkingLevel; explicitThinkingLevel: boolean } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
 	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
 	for (const pattern of modelPatterns) {
 		const { model, thinkingLevel, explicitThinkingLevel } = resolveModelRoleValue(pattern, availableModels, {
@@ -1141,13 +1142,13 @@ async function resolveModelChainEntries(
 	startIndex: number,
 	circuitPolicy: { skipOpenCircuits: boolean },
 ): Promise<ModelChainResolution & { firstOpenCircuit?: { index: number; skipCount: number } }> {
-	const availableModels = modelRegistry.getAvailable();
-	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
-	const skips: Array<{ selector: string; reason: string }> = [];
-	const authFailedModels = new Set<string>();
 	const canonicalSessionId =
 		options?.canonicalSessionId === null ? undefined : (options?.canonicalSessionId ?? sessionId);
 	const credentialSessionId = options?.credentialSessionId ?? sessionId;
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
+	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
+	const skips: Array<{ selector: string; reason: string }> = [];
+	const authFailedModels = new Set<string>();
 	let firstOpenCircuit: { index: number; skipCount: number } | undefined;
 	for (let activeIndex = startIndex; activeIndex < modelPatterns.length; activeIndex += 1) {
 		const selector = modelPatterns[activeIndex];
@@ -1279,7 +1280,8 @@ export async function resolveModelOverrideWithAuthFallback(
 	parentFallbackSelector?: string;
 	skips: Array<{ selector: string; reason: string }>;
 }> {
-	const availableModels = modelRegistry.getAvailable();
+	const credentialSessionId = options?.credentialSessionId ?? authSessionId;
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
 	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
 	let requestedModel: Model<Api> | undefined;
 	let requestedResolution: ResolvedModelRoleValue | undefined;
@@ -1294,6 +1296,7 @@ export async function resolveModelOverrideWithAuthFallback(
 			settings,
 			undefined,
 			options?.aliasIntent,
+			credentialSessionId,
 		).model;
 		if (parentActiveModel) {
 			modelRegistry.seedCanonicalVariant?.(canonicalScope, parentActiveModel);
@@ -1315,7 +1318,7 @@ export async function resolveModelOverrideWithAuthFallback(
 			matchPreferences,
 			modelRegistry,
 			sessionId: canonicalScope,
-			credentialSessionId: authSessionId,
+			credentialSessionId,
 			aliasIntent: options?.aliasIntent,
 		});
 		if (!requestedModel && candidate.model) {
@@ -1335,7 +1338,7 @@ export async function resolveModelOverrideWithAuthFallback(
 				continue;
 			}
 		}
-		const key = await modelRegistry.getApiKey(candidate.model, authSessionId);
+		const key = await modelRegistry.getApiKey(candidate.model, credentialSessionId);
 		if (isAuthenticatedOrKeyless(key)) {
 			return { ...candidate, requestedModel: candidate.model, authFallbackUsed: false, activeIndex, skips };
 		}
@@ -1345,8 +1348,9 @@ export async function resolveModelOverrideWithAuthFallback(
 		) {
 			const equivalentRetry = await resolveModelChainWithAuth([pattern], modelRegistry, settings, authSessionId, {
 				managedFallback: options.managedFallback,
-				aliasIntent: options.aliasIntent,
+				aliasIntent: options?.aliasIntent,
 				canonicalSessionId: canonicalScope,
+				credentialSessionId,
 			});
 			if (equivalentRetry.model) {
 				return {
@@ -1367,10 +1371,17 @@ export async function resolveModelOverrideWithAuthFallback(
 		return { explicitThinkingLevel: false, requestedModel, authFallbackUsed: false, activeIndex, skips };
 	}
 	const fallback = parentActiveModelPattern
-		? resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, authSessionId, options?.aliasIntent)
+		? resolveModelOverride(
+				[parentActiveModelPattern],
+				modelRegistry,
+				settings,
+				credentialSessionId,
+				options?.aliasIntent,
+				credentialSessionId,
+			)
 		: { explicitThinkingLevel: false };
 	if (fallback.model) {
-		const fallbackKey = await modelRegistry.getApiKey(fallback.model, authSessionId);
+		const fallbackKey = await modelRegistry.getApiKey(fallback.model, credentialSessionId);
 		if (isAuthenticatedOrKeyless(fallbackKey)) {
 			const isParentSubstitution = requestedModel === undefined || !modelsAreEqual(fallback.model, requestedModel);
 			return {
@@ -1452,8 +1463,9 @@ export async function resolveModelScope(
 	patterns: string[],
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getCanonicalVariants">,
 	preferences?: ModelMatchPreferences,
+	credentialSessionId?: string,
 ): Promise<ScopedModel[]> {
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
 
 	const scopedModels: ScopedModel[] = [];
 	const addScopedModel = (selection: ScopedModel): void => {
@@ -1558,13 +1570,14 @@ export async function resolveAllowedModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getCanonicalVariants">,
 	settings: Settings | undefined,
 	preferences?: ModelMatchPreferences,
+	credentialSessionId?: string,
 ): Promise<Model<Api>[]> {
-	const available = modelRegistry.getAvailable();
+	const available = modelRegistry.getAvailable(credentialSessionId);
 	const patterns = settings?.get("enabledModels");
 	if (!patterns || patterns.length === 0) {
 		return available;
 	}
-	const scoped = await resolveModelScope(patterns, modelRegistry, preferences);
+	const scoped = await resolveModelScope(patterns, modelRegistry, preferences, credentialSessionId);
 	if (scoped.length === 0) {
 		return [];
 	}
@@ -1688,6 +1701,7 @@ export async function findInitialModel(options: {
 	defaultModelId?: string;
 	defaultThinkingSelector?: ThinkingLevel;
 	modelRegistry: InitialModelRegistry;
+	credentialSessionId?: string;
 }): Promise<InitialModelResult> {
 	const {
 		cliProvider,
@@ -1698,6 +1712,7 @@ export async function findInitialModel(options: {
 		defaultModelId,
 		defaultThinkingSelector,
 		modelRegistry,
+		credentialSessionId,
 	} = options;
 
 	let model: Model<Api> | undefined;
@@ -1705,7 +1720,11 @@ export async function findInitialModel(options: {
 
 	// 1. CLI args take priority
 	if (cliProvider && cliModel) {
-		const found = resolveProviderModelReference(cliProvider, cliModel, modelRegistry.getAvailable());
+		const found = resolveProviderModelReference(
+			cliProvider,
+			cliModel,
+			modelRegistry.getAvailable(credentialSessionId),
+		);
 
 		if (!found) {
 			console.error(chalk.red(`Model ${cliProvider}/${cliModel} not found`));
@@ -1730,7 +1749,11 @@ export async function findInitialModel(options: {
 
 	// 3. Try saved default from settings
 	if (defaultProvider && defaultModelId) {
-		const found = resolveProviderModelReference(defaultProvider, defaultModelId, modelRegistry.getAvailable());
+		const found = resolveProviderModelReference(
+			defaultProvider,
+			defaultModelId,
+			modelRegistry.getAvailable(credentialSessionId),
+		);
 
 		if (found) {
 			model = found;
@@ -1745,7 +1768,7 @@ export async function findInitialModel(options: {
 	}
 
 	// 4. Try first available model with valid API key
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
 
 	if (availableModels.length > 0) {
 		// Try to find a default model from known providers
@@ -1774,11 +1797,16 @@ export async function restoreModelFromSession(
 	currentModel: Model<Api> | undefined,
 	shouldPrintMessages: boolean,
 	modelRegistry: RestorableModelRegistry,
+	credentialSessionId?: string,
 ): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = resolveProviderModelReference(savedProvider, savedModelId, modelRegistry.getAvailable());
+	const restoredModel = resolveProviderModelReference(
+		savedProvider,
+		savedModelId,
+		modelRegistry.getAvailable(credentialSessionId),
+	);
 
 	// Check if restored model exists and has a valid API key
-	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel)) : false;
+	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel, credentialSessionId)) : false;
 
 	if (restoredModel && hasApiKey) {
 		if (shouldPrintMessages) {
@@ -1806,7 +1834,7 @@ export async function restoreModelFromSession(
 	}
 
 	// Try to find any available model
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
 
 	if (availableModels.length > 0) {
 		// Try to find a default model from known providers

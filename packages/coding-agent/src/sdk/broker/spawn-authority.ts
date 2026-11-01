@@ -79,6 +79,12 @@ export type SpawnSubstrateProof = {
 	stateFileProof?: Readonly<Record<string, string | number>>;
 };
 
+export type SpawnLifecycleOwner = { pid: number; incarnation: string };
+
+export type SpawnLifecycleOwnerResolution =
+	| { ok: true; owner: SpawnLifecycleOwner }
+	| { ok: false; code: "owner_deadline" | "owner_unsupported" | "owner_proof_failed" | "owner_ambiguous" };
+
 export interface SpawnSubstrateProvider {
 	launch(
 		spec: SpawnSubstrateLaunchSpec,
@@ -87,6 +93,8 @@ export interface SpawnSubstrateProvider {
 		| { ok: false; code: "substrate_unavailable" | "substrate_proof_failed"; message: string }
 	>;
 	verify(proof: SpawnSubstrateProof): Promise<"verified" | "mismatch" | "gone">;
+	/** Live-only host mapping; the substrate proof remains cleanup authority. */
+	resolveLifecycleOwner(proof: SpawnSubstrateProof, deadlineAt: number): Promise<SpawnLifecycleOwnerResolution>;
 	close(proof: SpawnSubstrateProof): Promise<{ ok: boolean; code?: string }>;
 }
 
@@ -597,6 +605,23 @@ export class SpawnAuthorityStore {
 
 	authority(lifecycleIdentity: string): SpawnAuthorityV1 | undefined {
 		return cloneAuthority(this.#authorities.get(lifecycleIdentity));
+	}
+
+	/**
+	 * Spawning master per child session id. A child that more than one recorded
+	 * authority attributes to different owners is omitted: ownership is reported
+	 * only when the durable evidence names exactly one master.
+	 */
+	spawnOwnersByChild(): ReadonlyMap<string, string> {
+		const owners = new Map<string, string>();
+		const conflicted = new Set<string>();
+		for (const authority of this.#authorities.values()) {
+			const prior = owners.get(authority.childId);
+			if (prior !== undefined && prior !== authority.ownerSessionId) conflicted.add(authority.childId);
+			else owners.set(authority.childId, authority.ownerSessionId);
+		}
+		for (const childId of conflicted) owners.delete(childId);
+		return owners;
 	}
 
 	async open(): Promise<void> {
@@ -1152,11 +1177,15 @@ export class SpawnAuthorityStore {
 				// state never accepted, and the retry would append a duplicate that
 				// makes the journal unreopenable.
 				if (write) await this.#options.beforeDirectorySyncForTest?.(write);
-				const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
-				try {
-					await directory.sync();
-				} finally {
-					await directory.close();
+				// Windows cannot open or flush a directory handle; the appended row is
+				// still flushed above. Same rule as lifecycle-ledger.ts #syncDirectory.
+				if (process.platform !== "win32") {
+					const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
+					try {
+						await directory.sync();
+					} finally {
+						await directory.close();
+					}
 				}
 			} catch (error) {
 				try {

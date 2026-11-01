@@ -138,6 +138,7 @@ export interface LoadNativeOptions {
 	acquireStagedCandidateLease?: (candidate: string) => () => void;
 	requireCandidate?: (candidate: string) => Record<string, unknown>;
 	validateCandidate?: (bindings: Record<string, unknown>, candidate: string) => void;
+	loadNativeLibrary?: (runtime: string) => bigint | number | null;
 }
 
 export function loadNative(options?: LoadNativeOptions): Record<string, unknown>;

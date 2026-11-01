@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { type Hook, hookCapability } from "../src/capability/hook";
 import { Settings } from "../src/config/settings";
 import { getProviderInfo, loadCapability } from "../src/discovery";
@@ -424,9 +425,11 @@ describe("production discovery integration", () => {
 		}
 	});
 
-	it("loads native directory hooks into session ExtensionRunner and ignores foreign duplicates", async () => {
+	it("keeps loading a user-agent directory hook into session ExtensionRunner and ignores foreign duplicates", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-session-"));
-		const hooksDir = path.join(root, ".gjc", "hooks", "pre");
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(root, "agent");
+		const hooksDir = path.join(agentDir, "hooks", "pre");
 		const foreignHooksDir = path.join(root, ".codex", "hooks");
 		const executionMarker = path.join(root, "executed");
 		const foreignExecutionMarker = path.join(root, "foreign-executed");
@@ -434,6 +437,7 @@ describe("production discovery integration", () => {
 		const throwingHookPath = path.join(hooksDir, "bash.ts");
 		await fs.mkdir(hooksDir, { recursive: true });
 		await fs.mkdir(foreignHooksDir, { recursive: true });
+		setAgentDir(agentDir);
 		await Bun.write(
 			path.join(hooksDir, "read.ts"),
 			`export default (api) => api.on("tool_call", async (_event, ctx) => { await Bun.write(${JSON.stringify(executionMarker)}, ctx.hasQueuedMessages() ? "queued" : "read"); });\n`,
@@ -454,7 +458,7 @@ describe("production discovery integration", () => {
 		try {
 			const { session } = await createAgentSession({
 				cwd: root,
-				agentDir: root,
+				agentDir,
 				settings: Settings.isolated(),
 				sessionManager: SessionManager.inMemory(root),
 				skills: [],
@@ -501,9 +505,99 @@ describe("production discovery integration", () => {
 				await session.dispose();
 			}
 		} finally {
+			setAgentDir(previousAgentDir);
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
+
+	it("does not import repository pre and post hook modules at session startup", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-repo-"));
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(root, "agent");
+		const preMarker = path.join(root, "pre-imported");
+		const postMarker = path.join(root, "post-imported");
+		const preHook = path.join(root, ".gjc", "hooks", "pre", "bash.ts");
+		const postHook = path.join(root, ".gjc", "hooks", "post", "read.ts");
+		await fs.mkdir(path.dirname(preHook), { recursive: true });
+		await fs.mkdir(path.dirname(postHook), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		const moduleText = (marker: string) =>
+			`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "imported"); export default (api) => api.on("tool_call", () => undefined);\n`;
+		await Bun.write(preHook, moduleText(preMarker));
+		await Bun.write(postHook, moduleText(postMarker));
+		setAgentDir(agentDir);
+		try {
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir,
+				settings: Settings.isolated(),
+				sessionManager: SessionManager.inMemory(root),
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["__none__"],
+			});
+			try {
+				expect(session.extensionRunner?.getExtensionPaths() ?? []).not.toContain(`hook:${preHook}`);
+				expect(session.extensionRunner?.getExtensionPaths() ?? []).not.toContain(`hook:${postHook}`);
+			} finally {
+				await session.dispose();
+			}
+			expect(await Bun.file(preMarker).exists()).toBe(false);
+			expect(await Bun.file(postMarker).exists()).toBe(false);
+		} finally {
+			setAgentDir(previousAgentDir);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("does not let a repository hook replace the same-named user-agent hook", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-shadow-"));
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(root, "agent");
+		const userMarker = path.join(root, "user-imported");
+		const repoMarker = path.join(root, "repo-imported");
+		const userHook = path.join(agentDir, "hooks", "pre", "bash.ts");
+		const repoHook = path.join(root, ".gjc", "hooks", "pre", "bash.ts");
+		await fs.mkdir(path.dirname(userHook), { recursive: true });
+		await fs.mkdir(path.dirname(repoHook), { recursive: true });
+		const moduleText = (marker: string) =>
+			`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "imported"); export default () => undefined;\n`;
+		await Bun.write(userHook, moduleText(userMarker));
+		await Bun.write(repoHook, moduleText(repoMarker));
+		setAgentDir(agentDir);
+		try {
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir,
+				settings: Settings.isolated(),
+				sessionManager: SessionManager.inMemory(root),
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["__none__"],
+			});
+			try {
+				expect(session.extensionRunner?.getExtensionPaths() ?? []).toContain(`hook:${userHook}`);
+				expect(session.extensionRunner?.getExtensionPaths() ?? []).not.toContain(`hook:${repoHook}`);
+			} finally {
+				await session.dispose();
+			}
+			expect(await Bun.file(userMarker).text()).toBe("imported");
+			expect(await Bun.file(repoMarker).exists()).toBe(false);
+		} finally {
+			setAgentDir(previousAgentDir);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 	it("loads explicit configured hook paths into session ExtensionRunner without foreign authority", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-configured-"));

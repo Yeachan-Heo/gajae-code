@@ -17,7 +17,33 @@ const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts")
 const HOOK_KEYS = [
 	"BASH_ENV",
 	"BUN_OPTIONS",
+	"PERLLIB",
+	"_JAVA_OPTIONS",
+	"NPM_CONFIG_NODE_OPTIONS",
+	"RIPGREP_CONFIG_PATH",
+	"TAR_OPTIONS",
+	"RSYNC_RSH",
+	"MAKEFLAGS",
+	"MAKEFILES",
+	"SHELLOPTS",
+	"PS4",
+	"NODE_OPTIONS",
+	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
+	"PERL5OPT",
+	"PERL5LIB",
+	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
+	"GTK_MODULES",
+	"GTK3_MODULES",
+	"GTK_PATH",
+	"LD_PRELOAD",
+	"LD_AUDIT",
+	"LD_LIBRARY_PATH",
+	"DYLD_LIBRARY_PATH",
 	"GIT_ASKPASS",
+	"SSH_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",
 	"GIT_SEQUENCE_EDITOR",
@@ -44,6 +70,7 @@ type Probe = Record<
 > & {
 	PROJECT_DYNAMIC_BASH_ENV: boolean;
 	PROJECT_HAS_BASH_ENV_VALUE: boolean;
+	NPM_NODE_OPTIONS_NAMES: string[];
 };
 
 const tempDirs: string[] = [];
@@ -81,6 +108,10 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
 	"GIT_ASKPASS=./hook.sh",
+	"SSH_ASKPASS=./hook.sh",
+	"GTK_MODULES=planted",
+	"GTK3_MODULES=planted",
+	"GTK_PATH=./gtk",
 	"GIT_EXEC_PATH=./git-exec",
 	"GIT_PROXY_COMMAND=./proxy.sh",
 	"GIT_SEQUENCE_EDITOR=./hook.sh",
@@ -112,6 +143,10 @@ describe.each([
 		expect(probe).toMatchObject({
 			BASH_ENV: null,
 			GIT_ASKPASS: null,
+			SSH_ASKPASS: null,
+			GTK_MODULES: null,
+			GTK3_MODULES: null,
+			GTK_PATH: null,
 			GIT_EXEC_PATH: null,
 			GIT_PROXY_COMMAND: null,
 			GIT_SEQUENCE_EDITOR: null,
@@ -223,5 +258,120 @@ describe("bash spawn env Bun startup options", () => {
 	it("keeps a trusted inherited BUN_OPTIONS value when the project does not declare it", async () => {
 		const probe = await probeIn(tempDir(), false, { BUN_OPTIONS: "--no-env-file" });
 		expect(probe.BUN_OPTIONS).toBe("--no-env-file");
+	});
+});
+
+describe("bash spawn env interpreter injection", () => {
+	for (const autoload of [true, false]) {
+		it(`drops project interpreter and loader declarations (autoload=${autoload})`, async () => {
+			const probe = await probeIn(
+				tempDir(
+					"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nPYTHONUSERBASE=./userbase\nPYTHONSTARTUP=./startup.py\nJAVA_TOOL_OPTIONS=-javaagent:./agent.jar\nJDK_JAVA_OPTIONS=-javaagent:./agent.jar\nLD_PRELOAD=./planted.so\nLD_AUDIT=./audit.so\nLD_LIBRARY_PATH=./lib\nDYLD_LIBRARY_PATH=./lib\n",
+				),
+				autoload,
+			);
+			expect(probe).toMatchObject({
+				NODE_OPTIONS: null,
+				PYTHONPATH: null,
+				PYTHONUSERBASE: null,
+				PYTHONSTARTUP: null,
+				JAVA_TOOL_OPTIONS: null,
+				JDK_JAVA_OPTIONS: null,
+				LD_PRELOAD: null,
+				LD_AUDIT: null,
+				LD_LIBRARY_PATH: null,
+				DYLD_LIBRARY_PATH: null,
+			});
+		});
+	}
+
+	it("keeps interpreter variables the launching shell exported with a different value", async () => {
+		const probe = await probeIn(
+			tempDir(
+				"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nPYTHONUSERBASE=./userbase\nPYTHONSTARTUP=./startup.py\nJAVA_TOOL_OPTIONS=-javaagent:./agent.jar\nJDK_JAVA_OPTIONS=-javaagent:./agent.jar\nLD_LIBRARY_PATH=./lib\n",
+			),
+			true,
+			{
+				NODE_OPTIONS: "--max-old-space-size=4096",
+				PYTHONPATH: "/opt/operator/lib",
+				PYTHONUSERBASE: "/opt/operator/python",
+				PYTHONSTARTUP: "/opt/operator/startup.py",
+				JAVA_TOOL_OPTIONS: "-XX:+UseContainerSupport",
+				JDK_JAVA_OPTIONS: "-XX:+UseContainerSupport",
+				LD_LIBRARY_PATH: "/opt/cuda/lib64",
+			},
+		);
+		expect(probe).toMatchObject({
+			NODE_OPTIONS: "--max-old-space-size=4096",
+			PYTHONPATH: "/opt/operator/lib",
+			PYTHONUSERBASE: "/opt/operator/python",
+			PYTHONSTARTUP: "/opt/operator/startup.py",
+			JAVA_TOOL_OPTIONS: "-XX:+UseContainerSupport",
+			JDK_JAVA_OPTIONS: "-XX:+UseContainerSupport",
+			LD_LIBRARY_PATH: "/opt/cuda/lib64",
+		});
+	});
+});
+
+describe("bash spawn env tool configuration programs", () => {
+	for (const autoload of [true, false]) {
+		it(`drops project tool-config and sibling injection declarations (autoload=${autoload})`, async () => {
+			const probe = await probeIn(
+				tempDir(
+					[
+						"PERLLIB=./lib",
+						"_JAVA_OPTIONS=-javaagent:./a.jar",
+						"NPM_CONFIG_NODE_OPTIONS=--require ./r.js",
+						"RIPGREP_CONFIG_PATH=./rgconfig",
+						"TAR_OPTIONS=--use-compress-program=./x.sh",
+						"RSYNC_RSH=./x.sh",
+						"MAKEFLAGS=SHELL=./x.sh",
+						"MAKEFILES=./inc.mk",
+						"SHELLOPTS=xtrace",
+						"PS4='$(./x.sh)'",
+						"",
+					].join("\n"),
+				),
+				autoload,
+			);
+			expect(probe).toMatchObject({
+				PERLLIB: null,
+				_JAVA_OPTIONS: null,
+				NPM_CONFIG_NODE_OPTIONS: null,
+				RIPGREP_CONFIG_PATH: null,
+				TAR_OPTIONS: null,
+				RSYNC_RSH: null,
+				MAKEFLAGS: null,
+				MAKEFILES: null,
+				SHELLOPTS: null,
+				PS4: null,
+			});
+		});
+	}
+
+	// npm reads `npm_config_*` in any case and treats `-` like `_`, so every
+	// spelling a dotenv file can declare must be dropped, not just the two
+	// canonical ones.
+	for (const name of [
+		"npm_config_Node_Options",
+		"Npm_Config_Node_Options",
+		"npm_config_node-options",
+		"npm_config_script_shell",
+		"NPM_CONFIG_SCRIPT-SHELL",
+	]) {
+		for (const autoload of [true, false]) {
+			it(`drops a project ${name} declaration (autoload=${autoload})`, async () => {
+				const probe = await probeIn(tempDir(`${name}=./planted\n`), autoload);
+				expect(probe.NPM_NODE_OPTIONS_NAMES).toEqual([]);
+			});
+		}
+	}
+
+	it("keeps tool configuration the launching shell exported", async () => {
+		const probe = await probeIn(tempDir("RIPGREP_CONFIG_PATH=./rgconfig\nMAKEFLAGS=SHELL=./x.sh\n"), true, {
+			RIPGREP_CONFIG_PATH: "/home/operator/.ripgreprc",
+			MAKEFLAGS: "-j8",
+		});
+		expect(probe).toMatchObject({ RIPGREP_CONFIG_PATH: "/home/operator/.ripgreprc", MAKEFLAGS: "-j8" });
 	});
 });

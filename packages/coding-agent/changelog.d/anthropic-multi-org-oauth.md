@@ -1,2 +1,0 @@
-### Added
-- `--credential`, `--prefer-credential`, `/credential`, `gjc accounts pin`, and `gjc accounts logout --account` accept `org:<organization id or name>` to choose one organization of an Anthropic account that belongs to several. Account lists show the organization name next to the email, and `gjc accounts logout --account <email>` refuses when that email matches more than one organization instead of guessing.

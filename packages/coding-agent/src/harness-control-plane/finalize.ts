@@ -13,7 +13,9 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { type LinuxProcPidProbeResult, probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
+import { checkTmuxSelfInjection } from "../tools/tmux-self-injection-guard";
 import {
 	buildReceipt,
 	type CompletionEvidence,
@@ -396,6 +398,7 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 function git(workspace: string, args: string[]): string | null {
 	try {
 		return execFileSync("git", args, {
+			env: projectSafeSpawnEnv(),
 			cwd: workspace,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
@@ -558,6 +561,16 @@ export function defaultFinalizeChecks(
 	return {
 		async runValidation(spec, signal) {
 			if (signal?.aborted) throw new ValidationObservationUncertainError(spec.command, workspace, signal.reason);
+			// Same preflight as BashTool: refuse before spawn so a plan command cannot type into this pane.
+			const injection = await checkTmuxSelfInjection(spec.command, {
+				env: process.env,
+				cwd: workspace,
+				executionEnv: process.env,
+			});
+			if (signal?.aborted) throw new ValidationObservationUncertainError(spec.command, workspace, signal.reason);
+			if (injection.block) {
+				return { exactCommand: spec.command, cwd: workspace, exitStatus: 1, pass: false };
+			}
 			let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 			try {
 				proc = Bun.spawn(["bash", "-lc", spec.command], {

@@ -207,6 +207,23 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
+Live tool content on both the broker-created bus host and SDK-only host uses
+`{type:"event", kind:"tool_execution_start"|"tool_execution_update"|"tool_execution_end", payload:{event_type,event}}`.
+Prompt owners receive their command/turn correlation. Any other connection that
+negotiates `turn_stream` receives an uncorrelated copy, including turns typed in the
+host's terminal; an owner that also negotiated it receives no duplicate.
+`session_host_observer_v1` does not gate delivery: it only marks the connection as
+a non-demanding observer, so it does not keep a detached host alive. ACP attaches
+with `turn_stream` alone and stays demanding; notification daemons send both.
+On the internal wire, `hello` or `event_replay.capabilities` declares these opt-ins
+on the authenticated connection; replay negotiation merges with existing caps.
+Capabilities do not confer lifecycle or session identity authority.
+Tool updates carry cumulative `partialResult` snapshots, not append-only deltas;
+replace the prior snapshot. The end frame's `result` is authoritative, including
+when it differs from the last update. These content frames are best-effort and
+not retained in lifecycle replay. A replay acknowledgement without content is
+not evidence that a running tool produced no output.
+
 `bash_folded` — a foreground bash wait left the foreground and became a background job. Emitted once per fold into the replayable session event ring (so late-connecting clients receive it on `event_replay`), with `generic_safe` adapter disposition:
 
 ```json
@@ -217,7 +234,7 @@ Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 - A replayed frame may describe a job that has since finished. `runtime.jobs.list` is the source of truth: each running/recent job carries `metadata.backgrounded` and, whenever it is `true` because of a fold, `metadata.foldReason` with the same values. The `bash.background` control (C52) returns `{ backgrounded: true, jobId }` on a fresh fold, `already_backgrounded` when no wait is foldable but a running job of this session was already folded (by steer, chord, timer, or a prior control call), `no_active_bash` when nothing is running or foldable, and `not_foldable` when a live wait refused the fold.
 - A `turn.steer` that folds a running bash behaves exactly like a TUI steer: the steer is consumed by the same turn at the tool boundary immediately after the fold result; `turn.steer_status` is unchanged.
 
-The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
+The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), `awaiting_input` (a foreground `bash` command printed a browser sign-in or device-code prompt and went quiet; carries only `toolCallId`, `toolName`, and `kind` — `browser_auth` or `device_code` — never the URL, code, command, or output; delivered live only to clients that advertise the `awaiting_input_v1` capability and never retained for `event_replay`; a notice detected while notification policy is provisional is held and delivered on activation if the command is still running), and `pong`.
 
 ### Internal inbound frames
 
@@ -468,6 +485,91 @@ does not replay a response or produce `idempotency_conflict`. A retained duplica
 `clientRef` fails before execution with `client_ref_conflict`, but callers must not
 reuse a `clientRef` as a retry mechanism: after eviction the same value can identify
 a new prompt while the old outcome remains unknown.
+
+### GJC-private SDK image staging
+
+Authenticated machine attachments can stage image bytes without enlarging the
+private SDK's **256 KiB frame limit**. These are internal GJC SDK controls, not
+standard ACP methods, MCP tools, or a new public image capability. Attach through
+the Router as usual; do not discover endpoints or credentials yourself.
+
+When installed, `runtime.capabilities` lists `turn.image.begin`, `turn.image.append`,
+`turn.image.finish`, and `turn.image.discard`. A custom host transport must provide
+authoritative live-connection membership and the host's internal read-only definitive
+exact-run settlement observer; otherwise the controls are not installed. This observer
+waits for ledger settlement events independently of socket or host lifetime, not a
+bounded snapshot or polling loop.
+The notifications host also requires its internal run-domain and terminal-owner
+observers and active-handle accessor before advertising staging.
+Model-facing and chat adapters cannot invoke these machine-only controls.
+
+1. `turn.image.begin` takes `{ mimeType, byteLength, sha256, batchId? }` and returns
+   `{ id, nextSequence: 0 }`. Supported formats are static PNG, JPEG, WebP, and GIF;
+   animated PNG, WebP, and GIF images are rejected. The digest is lowercase SHA-256
+   of the original bytes. Each image is at most 20 MiB.
+2. `turn.image.append` takes `{ id, sequence, data }`, with canonical base64 encoding
+   of at most 96 KiB decoded bytes, and acknowledges `nextSequence` and
+   `receivedBytes`. Sequence numbers must be contiguous.
+3. `turn.image.finish` takes `{ id }` and validates size, digest, MIME, dimensions,
+   static-image policy, and decoding without transcoding. `turn.image.discard` takes
+   `{ id }` to abandon an unredeemed upload.
+4. `turn.prompt` can take `stagedImages: [{ id }]` instead of `images`. Redemption is
+   atomic, ordered, one-shot, and scoped to the same authenticated connection and
+   session. Image-only prompts may use `text: ""`; direct and staged images cannot
+   be mixed. Provider input retains the original bytes and MIME without transcoding or
+   byte loss.
+
+There are at most 16 outstanding uploads and 16 images per prompt. Each session has
+separate 64 MiB upload-source and accepted-source admission limits; accepted base64
+storage is charged in addition to source bytes against the shared 256 MiB process
+budget, along with transient decode memory. Each session permits one in-flight
+`finish`; another session can decode concurrently when process capacity permits. Uploads
+expire after 120 seconds without valid progress; optional same-owner `batchId`
+progress renews only live peers. Stock hosts remove unredeemed leases on
+disconnect. Custom transports should forward close notifications for immediate
+reclamation; every access, including async decode completion, also rechecks
+liveness, and missed close notifications cannot extend the expiry deadline. Accepted
+image capacity belongs to the consuming execution, not the socket: disconnect,
+queue residence, an unrelated terminal, or uncertainty alone cannot release it.
+Failed admission or confirmed queue removal releases never-executed capacity.
+Acceptance or cancellation does not prove an unadopted producer has stopped retaining
+images: its capacity remains charged until that submission actually settles.
+Once execution starts, an exact resource-settlement proof is required: even an
+attributed cancelled `agent_end` or transport teardown may leave tools running.
+Each retiring reservation has one event-driven settlement continuation, with no
+polling or observation cutoff. A late exact settlement releases its capacity even
+after transport or host teardown; shutdown does not wait for a still-live producer.
+Unknown runs, quarantine, and observer failures retain capacity and produce a
+process-level diagnostic rather than claiming settlement. Internal budget snapshots
+expose retained process source/accepted and transient charges. The existing ledger makes quarantine
+irreversible, so quarantined executions remain charged for this process's lifetime
+rather than claiming their tombstones prove settlement. An adopted execution
+without an exact resource handle or owning domain also stays charged.
+
+Promotion into an own-run is not itself proof that execution started. If the
+execution producer positively refuses that exact queued invocation before it can
+start, its image reservation retires only after the enqueue producer returns.
+This is a failed prompt, not queue cancellation; normal durable-publication
+rules still apply. Missing lifecycle events, a generic error, or teardown do not
+provide this no-start authority. Started or ambiguous executions still require
+their exact settlement proof.
+
+An ambiguous prompt response must not be replayed: recover the original `clientRef`
+through the correlated `turn.result` contract. Reusing a retained
+`clientRef` returns `client_ref_conflict` before staged-image redemption, not a second
+acknowledgement or execution. Missing or consumed staged IDs return
+`image_upload_unavailable`; a closed session or connection still returns `resource_gone`.
+
+ACP's public contract remains `session/prompt` with `ContentBlock.image`
+(`type: "image"`, base64 `data`, and `mimeType`), negotiated through
+`agentCapabilities.promptCapabilities.image`. See the pinned
+`@agentclientprotocol/sdk` schema and the upstream [content specification](https://agentclientprotocol.com/protocol/content).
+That capability does not advertise `turn.image.*` or `stagedImages`. This SDK
+foundation does **not** change ACP's existing oversized-prompt rejection; a separate
+ACP consumer must bridge standard inline images to staging internally and retain
+the public schema, cancellation, and capability semantics.
+
+### Cancellation outcomes and inactivity limits
 
 `turn.abort` returns a typed disposition. A caller that does not own the target
 receives `resource_gone`; it must not treat that result as cancellation of another
@@ -828,6 +930,21 @@ The result is an observation of one locked index reconciliation cut:
   lifecycle state rather than treating `unknown` as retired. Expired positive
   evidence is reported specifically as `proof_expired`.
 
+Every host start takes a new event generation from the agent directory's
+per-session generation authority (`sdk/event-generations/`). Allocation runs
+under a cross-process file lock and returns a value strictly above every
+generation previously issued for the session, with the host's wall-clock start
+time in milliseconds only as a floor. A session resumed by a later process
+therefore never reuses an earlier host's `(generation, seq)` event coordinates,
+still outranks the earlier host's retained index identity after the clock steps
+backward, and two hosts started in the same millisecond never share a
+generation. A host that cannot reach the authority keeps serving its local
+endpoint but publishes to the session index only after the authority reserves
+exactly the generation it serves. Treat a generation as an opaque safe integer,
+not a counter that starts at `1`: replay cursors and notification publication
+ids recorded against one generation never position or deduplicate another
+generation's events.
+
 Proof survives Broker, Router, and consumer process restart because it is read
 from the durable session index, not Router attachment memory. Positive terminal
 proof has the session-index `maxAgeMs` lifetime (30 days by default), even when a
@@ -1033,8 +1150,9 @@ or gateway details outside logged payloads.
 answer remotely, so its `question` and `options` are always sent unredacted
 (otherwise it would be unanswerable). When redaction is enabled, `idle`
 summaries are removed and streamed content frames (`turn_stream`,
-`context_update`, `image_attachment`) are suppressed at their emit sites. When
-redaction is disabled, all content is delivered unchanged.
+`context_update`, `image_attachment`) are suppressed at their emit sites. The
+content-free `awaiting_input` notice is still delivered. When redaction is
+disabled, all content is delivered unchanged.
 
 ### Local `/notify`
 
@@ -1153,6 +1271,10 @@ master session (default scope `repo`). The master receives one bundled
 operating-guidance block appended after custom system-prompt transformation and
 exactly one scoped, no-probe broker peer snapshot immediately before its first
 accepted provider request; idle masters collect nothing.
+Snapshot rows mark other master sessions with `role: "master"` and name each
+child's spawning master with `spawnedBy: { masterSessionId, self }`, so two
+masters in one scope can tell their own children (`self: true`) from each
+other's.
 
 Master orchestration is broker-routed and best effort: scoped discovery via
 `gjc sdk search` (result-level scope envelopes, exact worktree/cwd identity,
@@ -1164,3 +1286,273 @@ blindly re-sent), close mutates only an exactly re-proven substrate, and
 orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
+
+Supervised managed tmux launches (Broker-spawned sessions and interactive root
+`gjc --tmux` launches, on macOS and Linux) publish a private (`0600` file in a
+`0700` lifecycle root) child binding before the supervised child starts.
+Windows has no owner-only reader for that binding, so a managed launch there is
+refused before allocation. Launches that do not
+run the supervisor, such as `gjc session create` without a launch
+specification, start `gjc` directly and receive neither a binding nor exact CLI
+admission. The derived state path of a supervised launch is named through its
+canonical trusted anchor (the workspace, or its `.gjc` when present), so a
+workspace, an in-repository `.worktrees` bucket or a `.gjc`
+reached through a symlink passes the no-follow verification of the private
+lifecycle root. The `_session-*` tail below `.gjc` stays lexical, so a link
+inside managed storage is still refused (`gjc_tmux_managed_storage_unsafe` or
+`managed_owner_storage_unsafe`); an operator-pinned
+`GJC_COORDINATOR_SESSION_STATE_FILE` is used as given (after the usual trimming
+of the environment value) and never lexically normalized, because a `..` after a
+symlink resolves elsewhere than its lexical form. A supervised root launch
+refuses a pin whose directory is not absolute, contains `..`, or ends in
+whitespace (`gjc_tmux_state_file_pin_unsafe`), because its supervisor would
+reject that directory or read it trimmed as another one. The refusal comes
+before any tmux lifecycle storage, coordinator bootstrap directory or tmux
+session is created. A Broker-redacted
+launch, and every macOS launch, publishes an opaque binding that carries
+neither the launch command nor a command digest, so prompts and flags such as
+`--api-key` never reach disk there; an ordinary Linux launch publishes a
+recoverable binding with its exact command and digest, which only Linux
+owner-loss recovery uses. The supervisor receives the child argv as its own
+arguments (`--internal-managed-owner-supervisor -- <argv...>`), shell quoted
+once in the pane command and never re-encoded, and accepts any argv with a
+nonempty executable; empty later arguments of a root `gjc --tmux` launch are
+passed through (a Broker launch spec still requires nonempty arguments). The CLI validates its
+exact session, generation, run, incarnation and child token through
+`readOwnerOnlyFile`, a bounded native read (at most 64 KiB) that keeps the
+acquired descriptor authority for the whole read, reads the bytes twice, and
+fails on any link, ownership, mode, ACL, size, or metadata change. Launcher and
+supervisor publish sibling evidence in the same private lifecycle root, so a
+read whose metadata changed mid-window (`metadata_changed`) is re-acquired from
+scratch a bounded number of times; identity, link-count, ownership and ACL
+failures are never retried. There is no pathname fallback.
+
+Because the argv is not re-encoded, an argument that fit tmux's pane command
+limit (about 16 KiB, `command too long`) before supervision still fits. JSON
+escaping can still expand a Linux recoverable binding (a control character
+becomes six bytes), so a Linux launch whose serialized argv exceeds 63 KiB is
+refused with `managed_owner_command_too_large` before any tmux session exists,
+rather than failing in the supervisor; pass such input through a file.
+
+Opaque bindings never grant crash-recovery authority. Recoverable predecessor
+bindings and SIGABRT receipts remain a separate Linux-only capability backed by
+recovery-fs; stale binding schemas are rejected rather than migrated. Windows
+managed-owner admission is unsupported: managed tmux/psmux launches are rejected
+before supervisor or session allocation and lifecycle-state writes, with the
+bounded reason `gjc_tmux_managed_launch_platform_unsupported:win32`. This guard
+is defense in depth for direct managed launches: Broker `session.spawn` selects
+the headless substrate on Windows before any launch, so it never reaches this
+guard. A rejected managed launch is never retried as headless. Ordinary
+unmanaged Windows launches are unchanged.
+Off Linux, a child binding without any receipt is ordinary history once its exact
+supervisor and every process admitted through it have positively exited, so
+relaunching the same pinned session then starts fresh; any receipt there still
+fails closed as unavailable recovery evidence.
+
+Every owner generation publication (a pinned relaunch, `gjc session create`
+from a pinned shell, a harness launch, or a raw `publish_generation` request)
+checks its predecessor inside the same generation lock that publishes the
+replacement; callers cannot publish around the check. A supervised child whose
+generation is already published is admitted only while that generation is
+still current, read under that lock; a child whose generation a relaunch
+replaced first (for example because its supervisor had not yet published the
+binding the relaunch would have found) is blocked with
+`owner_generation_stale`, and an unreadable current generation blocks it with
+`owner_generation_unverifiable`. So a relaunch either sees the live
+predecessor's binding and refuses, or the predecessor's child never runs. On
+Linux a child whose generation is not yet published is admitted; its launcher's
+own publication then fails against any replacement and removes the session. Off
+Linux that cleanup is not relied on, because the launcher may have died: the
+launcher passes the generation baseline it captured before creating the session
+(`GJC_MANAGED_OWNER_LAUNCH_BASELINE`), and a child of a generation not yet
+published is admitted only while that baseline is still current, read under the
+lock; otherwise it is blocked with `owner_generation_stale`, and without the
+baseline with `owner_generation_unverifiable`. Before any publication has created
+the session's lock database, only an absent baseline is admitted, without the
+lock; a publisher that runs later scans after taking the lock and finds the
+child's record.
+
+Admission denial does not depend on being able to save a diagnostic. Unsafe or
+unavailable storage never receives a fallback pathname write: the child stays
+blocked with exit 75, and when the durable handoff cannot be persisted through
+retained private authority (always the case off Linux) it writes the bounded
+`managed_owner_admission_blocked: handoff_not_persisted` diagnostic.
+
+Source installations must rebuild the native addon (`bun run build:native`)
+when updating this admission boundary; the native loader rejects any candidate
+addon, including a retained same-version variant, that lacks `readOwnerOnlyFile`
+and moves on to the next compatible one; compiled installations need a matching
+CLI/native build. Editing source or replacing files does not update a running
+Broker.
+
+Darwin has no identity-bound signal API for an external process, so managed
+shutdown there uses the existing generation-fenced owner intent instead of
+signaling a reconstructed supervisor PID. `forceCloseGjcTmuxSession` proves the
+pinned supervisor, its child binding and the tmux session metadata, then
+publishes the intent no-replace while holding the generation lock that the
+supervisor also takes. The binding is found through the generation's own
+supervisor index (`supervisor-<generation>.json`, published by that supervisor
+after its binding), never by scanning the lifecycle root, so history that a
+reused pinned session leaves from earlier generations never limits a close. A close that arrives before the supervisor
+has published its binding waits inside the same close deadline only while that
+exact supervisor stays live; an untrusted, ambiguous, or still-unavailable
+binding fails closed. A binding's `created_at` is never compared with the
+current wall clock, so a backward clock step does not block a close, and the
+close deadline itself runs on monotonic time: the verdict wait accepts a verdict
+only if its reads completed inside that deadline, and a forward clock step during
+the child's cleanup does not reject a verdict accepted that way.
+Before its CLI starts, an admitted Darwin child installs a handler for the
+cooperative signal (SIGUSR2) and recorders for SIGTERM, SIGHUP and SIGINT, then
+publishes `cooperative-ready-<generation>.json` naming its pid and child token.
+Whichever of these signals the child handles first creates
+`shutdown-cause-<generation>.json` exclusively: `cooperative` for SIGUSR2, which
+then starts the ordinary SIGTERM shutdown, or `signal` for any other. A
+cooperative signal that arrives after another cause records nothing and starts
+no second shutdown. A child whose shutdown already began before the installer
+ran (its postmortem cleanup started) publishes no readiness and is never
+relayed to.
+The supervisor polls for that intent,
+validates it against its own binding, generation and server key, relays only to
+a child whose readiness record names that exact child, and relays in
+two durable phases under that lock: it publishes a pending record for that
+exact intent (`relay-<generation>.pending.json`), samples the relay instant,
+rechecks the intent's deadline on that instant, relays SIGUSR2 exactly once
+through its original child spawn handle (by signal number: Bun's
+`Subprocess.kill` resolves signal names with Linux numbers), and only after the signal was actually
+sent publishes the confirmed relay record (`relay-<generation>.json`, stamped
+with that instant) and removes the pending record. A declined, expired or
+unverifiable attempt renames the pending record to an `.unsent` name instead. A
+close succeeds only when the pinned supervisor has exited, the terminal verdict
+matching the published intent exists, and the supervisor's reconciliation of
+the child's exit (`supervised-exit-<generation>.json`) explains it: the child
+recorded the relay as its first cause and ended through its own exit with 0 or
+143, or through SIGTERM. Publication alone, a timeout, an exit without a
+verdict, a verdict while the supervisor is still alive, or an unexplained child
+exit (`owner_term_child_exit_unexplained`; the supervisor publishes the
+generation's `unexpected_owner_loss` incident before the exit record) is not success, and guarded session cleanup is
+skipped. A verdict the child published before such an exit stays immutable
+history but never completes the close. The child's runtime-state marker is its
+own signed report at the moment it wrote it, and the supervisor cannot re-sign
+it: a child that persisted `completed` and then died keeps that marker, so the
+failed close, the incident and the `supervised-exit` record are the reconciled
+outcome. A plain OS SIGTERM to the
+supervisor still stops its child but never claims an operator verdict: on
+Darwin, and on any generation with a supervisor index, a terminal is classified
+as an operator shutdown only when the confirmed relay record names the pending
+intent, the intent was still valid at the relay instant, the terminal was
+observed at or after that instant, and the indexed child recorded the relay as
+its first termination cause. An unrelated signal observed before the
+relay is therefore recorded as owner loss, whichever observer (supervisor or
+child sidecar) publishes first, while a child that handles a timely relay late
+still completes. A child observer that finds the generation lock held while a
+relay is pending or its confirmed record is being flushed waits up to 3 seconds
+for it instead of ending with `owner_verdict_unavailable`. That wait stays inside
+the child's postmortem cleanup deadline, and only the child holds the key that
+signs its runtime marker, so a relay whose persistence outlasts the wait leaves
+the recoverable `owner_verdict_unavailable` marker even if the close later
+succeeds. A pinned relaunch is
+refused with `managed_owner_predecessor_live` while a supervisor of the session,
+or any process admitted through one of its bindings, is still live.
+A supervisor killed after admission leaves no SIGABRT receipt and never reconciles
+its child, so each admitted process first publishes an owner-only
+`admitted-<token>-<pid>-<incarnation digest>.json` record of its exact pid and
+start time, before its generation fence. The fence and the relaunch's
+predecessor check run under the same generation lock: the relaunch either finds
+the record and requires that exact process to be gone (a reused pid is a
+different process), or replaces the generation first and the fence refuses the
+child with `owner_generation_stale`. A child that cannot publish its record is
+refused with `admitted_child_record_unavailable`, an unobservable admitted
+process fails the relaunch with `managed_owner_replacement_evidence_unavailable`,
+and a record that does not match its name or binding fails it with
+`managed_owner_replacement_evidence_untrusted`. The check covers every binding in
+the session's lifecycle root except the publishing launch's own, not only the
+current generation's: a launch that crashed after creating its session but before
+publishing leaves a generation that never became current, and its owner may still
+be live. A child of such a generation whose binding appears only after a relaunch
+published is refused at its fence, because its launch baseline is no longer
+current. The closer holds a per-generation closer lock
+(`closer-<generation>.sqlite`) from before its intent is visible until it stops
+waiting. The supervisor checks that lock before publishing its pending record
+and again immediately before signaling, so no relay is newly authorized after
+the closer gave up, exited or crashed, whatever the wall clock says. A relay
+that had already passed that final check when the supervisor was suspended can
+still complete; its pending record then marks the delivery as uncertain. The
+child sidecar captures the intent's dispatch synchronously when its postmortem
+begins, and only if a relay record for that intent is already visible, so a
+SIGTERM whose postmortem began before the relay is never attributed to it. A
+SIGTERM that arrives after the pending record is published but before delivery
+wins the exclusive cause record, so it is not attributed either. The
+supervisor never relays to a child the OS already reports terminated but not
+yet reaped. When the child publishes no verdict of its own, the supervisor's
+fallback observation claims the relayed intent only if the child ended through
+its own exit or the default SIGTERM action; any other fatal signal, such as
+SIGABRT, is published with its actual termination as `unexpected_owner_loss`.
+Signals carry no sender identity, so the remaining limit is the order in which
+the runtime dispatches two signals that are pending at the same time: the one
+handled first is the cause.
+
+A supervisor that is stopped or stalled past the intent's deadline, before or
+during publication, refuses the expired intent and never relays it. A close
+that times out or sees a mismatched verdict retires its own intent at once,
+under the generation lock, when it has neither a pending or confirmed relay
+record nor a verdict. Otherwise the next close, under the same generation lock,
+retires such an intent once expired (renamed to
+`intent-<generation>.<intent_id>.undelivered`) when it is expired and has
+neither a pending or confirmed relay record nor a verdict, and then publishes a
+fresh intent, so retries are not blocked by `owner_intent_replay`. A delivered
+intent stays permanent replay history for its generation. A pending record
+left without confirmation (for example a supervisor crash between publication
+and signal), a verdict, or unreadable relay evidence is uncertain evidence: it
+never classifies a SIGTERM as an operator shutdown, and it keeps the intent in
+place, so cooperative closes of that generation keep failing with
+`owner_intent_replay` until the owner exits. Linux keeps
+its kernel-signaled owner path.
+
+Interactive `gjc --tmux` root launches on Linux and Darwin both exec the
+managed owner supervisor as the tmux pane process, so ordinary root sessions
+and Broker-spawned sessions share the same close path. Because the pane process
+must be that exact supervisor, these launches do not wrap it in the
+`tmux-exit.json` exit-marker shell; other platforms keep the marker. On macOS
+the pane command unsets `MallocStackLogging` and `MallocStackLoggingNoCompact`,
+and a source-mode launch runs Bun with `--no-env-file` (as a compiled binary
+already does), so neither the tmux server environment nor a cwd `.env` can make
+the CLI malloc guard re-exec the supervisor below the pane PID.
+
+Closing a spawned headless child first sends `session.close` to the exact
+registration-pinned host endpoint, authorized by the Broker lifecycle marker the
+host was launched with and carries in its own index row, then waits up to the
+host cleanup deadline (5 s, on monotonic time) for that exact process to exit.
+Only a refused, unreachable or still-running host is closed through the
+substrate escalation (SIGTERM, then SIGKILL; `TerminateProcess` on Windows). The
+close is proven by the exact process being gone, so a child that already exited
+(for example after a lost acknowledgement) closes without any signal, and an
+identity that is no longer re-proven is never asked or signaled.
+
+On Windows, Broker `session.spawn` (including custom trusted hosts) selects the
+identity-fenced headless substrate before any multiplexer probe, because a
+managed tmux/psmux child cannot pass owner admission there: Windows has no
+owner-only reader for its private child binding. The headless proof file is
+still flushed and exclusively created, but Windows offers no directory-entry
+flush, so that step is skipped as lifecycle storage already does. The same
+applies to the spawn authority journal, which every fresh spawn appends to
+before launch: each row is still flushed, and only the directory flush is
+skipped on Windows.
+
+Substrate supervisor identity and registered SDK-host identity are distinct
+proofs. Before publishing the lifecycle marker, the Broker resolves the actual
+host under the original readiness deadline: the headless process itself, or the
+positively verified direct child of the pinned managed supervisor. Registration
+must match that host's pid and incarnation and the lifecycle request marker.
+The supervisor proof remains separate cleanup authority; an empty process
+observation is not proof of absence, and ambiguous or replaced children are not
+adopted. A generic registration uncertainty is not permission to retry seed
+delivery or discard the Broker claim. The Broker selects a managed multiplexer
+only where that host can be resolved (macOS and Linux tmux); Windows uses the
+headless substrate described above. An
+owner that cannot be resolved fails as `lifecycle_owner_unresolved` once the
+substrate release is proven, and stays `terminal_uncertain` while it is not. A
+substrate that exits on its own while its exact close runs (a host that gave up
+at its readiness cutoff) counts as released once its exact proof reports it
+gone; a live or replaced substrate does not. Editing source or replacing files does not
+update a running Broker; verify a fresh isolated runtime before a separately
+controlled Broker replacement.

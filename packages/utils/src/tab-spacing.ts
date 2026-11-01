@@ -228,14 +228,18 @@ function resolveEditorConfigMatch(absoluteFile: string): EditorConfigMatch | und
 			}
 
 			const style = section.properties.get("indent_style");
-			if (style === "space") {
+			if (style === "unset") {
+				delete match.indentStyle;
+			} else if (style === "space") {
 				match.indentStyle = IndentStyle.Space;
 			} else if (style === "tab") {
 				match.indentStyle = IndentStyle.Tab;
 			}
 
 			const rawSize = section.properties.get("indent_size");
-			if (rawSize === "tab") {
+			if (rawSize === "unset") {
+				delete match.indentSize;
+			} else if (rawSize === "tab") {
 				match.indentSize = { kind: "tab" };
 			} else if (rawSize !== undefined) {
 				const n = parsePositiveInteger(rawSize);
@@ -244,7 +248,9 @@ function resolveEditorConfigMatch(absoluteFile: string): EditorConfigMatch | und
 				}
 			}
 
-			const tw = parsePositiveInteger(section.properties.get("tab_width"));
+			const rawTabWidth = section.properties.get("tab_width");
+			if (rawTabWidth === "unset") delete match.tabWidth;
+			const tw = parsePositiveInteger(rawTabWidth);
 			if (tw !== undefined) {
 				match.tabWidth = tw;
 			}
@@ -260,19 +266,16 @@ function resolveEditorConfigMatch(absoluteFile: string): EditorConfigMatch | und
 function resolveEditorConfigTabWidth(match: EditorConfigMatch | undefined, fallback: number): number | undefined {
 	if (match === undefined) return undefined;
 
+	if (match.tabWidth !== undefined) {
+		return match.tabWidth;
+	}
+
 	if (match.indentSize?.kind === "spaces") {
 		return match.indentSize.n;
 	}
 
 	if (match.indentSize?.kind === "tab") {
-		if (match.tabWidth !== undefined) {
-			return match.tabWidth;
-		}
 		return fallback;
-	}
-
-	if (match.tabWidth !== undefined) {
-		return match.tabWidth;
 	}
 
 	if (match.indentStyle === IndentStyle.Tab) {

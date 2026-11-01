@@ -86,7 +86,7 @@ describe("recovery turn retry idempotency", () => {
 		const requests: Context[] = [];
 		const audits: Array<{ action: string }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onHarmonyLeak: event => {
 				audits.push(event as unknown as { action: string });
@@ -134,7 +134,7 @@ describe("recovery turn retry idempotency", () => {
 			],
 		});
 		const requests: Context[] = [];
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(
 			agentLoopContinue(context, config, undefined, (...args: Parameters<typeof mock.stream>) => {
@@ -193,7 +193,7 @@ describe("non-append-only recovery conversion seam", () => {
 			}
 			return converted;
 		};
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: contextSensitiveConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: contextSensitiveConverter };
 		const capture = (...args: Parameters<typeof mock.stream>) => {
 			requests.push(args[1]);
 			return mock.stream(...args);
@@ -251,7 +251,7 @@ describe("recovery terminal error/aborted exit", () => {
 				],
 			});
 			const requests: Context[] = [];
-			const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+			const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 			const stream = agentLoopContinue(context, config, undefined, (...args: Parameters<typeof mock.stream>) => {
 				requests.push(args[1]);

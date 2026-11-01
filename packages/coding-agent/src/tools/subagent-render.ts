@@ -8,8 +8,9 @@
  * producer is available (resumed-from-disk or backward-compat records).
  */
 import type { Component } from "@gajae-code/tui";
-import { Text } from "@gajae-code/tui";
+import { getKeybindings, Text } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
+import { isSettingsInitialized, settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { providerRetryPhaseLabel } from "../task/provider-retry-status";
@@ -18,21 +19,26 @@ import {
 	formatDuration,
 	formatStatusIcon,
 	getPreviewLines,
+	pluralize,
 	replaceTabs,
 	type ToolUIStatus,
 	truncateToWidth,
+	wrapTextWithAnsi,
 } from "./render-utils";
 import {
 	SUBAGENT_ACTIVITY_BUCKET_MS,
+	SUBAGENT_COMPACT_IDLE_MS,
 	type SubagentLiveProgress,
 	type SubagentSnapshot,
 	type SubagentToolDetails,
 	subagentAwaitRenderedStateSignature,
+	summarizeSubagentGroup,
 } from "./subagent";
 
 export { subagentAwaitRenderedStateSignature } from "./subagent";
 
 const PREVIEW_LINES_COLLAPSED = 1;
+const GUIDANCE_MAX_LINES = 12;
 const PREVIEW_LINES_EXPANDED = 4;
 const PREVIEW_LINE_WIDTH = 80;
 
@@ -114,8 +120,88 @@ function collectProviderDegradationGroups(
 		.sort((a, b) => b.count - a.count || a.provider.localeCompare(b.provider));
 }
 
+function compactSubagentPanelEnabled(): boolean {
+	return isSettingsInitialized() && settings.get("task.compactSubagentPanel") === true;
+}
+
+// One summary line for the whole group. Counts only, so the line stays O(1) in the
+// number of subagents; each subagent is still one expand toggle away.
+function renderCompactSubagentSummary(subagents: readonly SubagentSnapshot[], theme: Theme): string {
+	const summary = summarizeSubagentGroup(subagents, Date.now());
+	const parts: string[] = [];
+	if (summary.running > 0) parts.push(`${summary.running} ${pluralize("subagent", summary.running)} running`);
+	// Attention-worthy counts come first so a narrow terminal truncates the rest.
+	if (summary.failed > 0) parts.push(`${summary.failed} failed`);
+	if (summary.retrying > 0) parts.push(`${summary.retrying} retrying`);
+	if (summary.idle > 0) parts.push(`${summary.idle} idle >${SUBAGENT_COMPACT_IDLE_MS / 1000}s`);
+	if (summary.queued > 0) parts.push(`${summary.queued} queued`);
+	if (summary.paused > 0) parts.push(`${summary.paused} paused`);
+	if (summary.completed > 0) parts.push(`${summary.completed} done`);
+	if (summary.cancelled > 0) parts.push(`${summary.cancelled} cancelled`);
+	return `  ${theme.fg("dim", parts.join(" · "))}`;
+}
+
+// At most one warning row in compact mode, however many providers degrade, so the
+// collapsed height stays independent of the subagent count. The expanded view keeps
+// one row per provider.
+function renderCompactDegradationLine(
+	groups: ReadonlyArray<{ provider: string; count: number }>,
+	theme: Theme,
+): string | undefined {
+	const [worst] = groups;
+	if (!worst) return undefined;
+	const more = groups.length > 1 ? ` (+${groups.length - 1} more ${pluralize("provider", groups.length - 1)})` : "";
+	return `  ${theme.fg("warning", `provider degraded: ${worst.count} subagents retrying on ${worst.provider}${more}`)}`;
+}
+
+// The expand hint gets its own line so a long summary never truncates it away.
+function renderCompactSubagentHint(running: boolean, theme: Theme): string {
+	const expandKey = getKeybindings().getKeys("app.tools.expand")[0];
+	const hints = [expandKey ? `${expandKey} to list each` : "expand tool output to list each"];
+	if (running) hints.push("ctrl+s to observe sessions");
+	return `  ${theme.fg("dim", `(${hints.join(" · ")})`)}`;
+}
+
 function boundSubagentBodyLines(lines: string[], width: number): string[] {
 	return lines.map(line => (line.length > 0 ? truncateToWidth(replaceTabs(line), width, Ellipsis.Omit) : ""));
+}
+
+// Guidance is an instruction the caller must act on (e.g. "inspect before
+// cancelling" after an await timeout), so it wraps to the terminal width instead
+// of being cut to one preview line.
+function renderSubagentGuidanceLines(snapshot: SubagentSnapshot, width: number, theme: Theme): string[] {
+	const guidance = snapshot.guidance?.trim();
+	if (!guidance) return [];
+	const indent = "  ";
+	const wrapWidth = Math.max(1, width - indent.length);
+	const wrapped = guidance.split("\n").flatMap(segment => wrapTextWithAnsi(replaceTabs(segment), wrapWidth));
+	// Still bounded: producer guidance is a short fixed sentence, so the cap only
+	// bites on pathologically narrow terminals.
+	if (wrapped.length > GUIDANCE_MAX_LINES) {
+		wrapped.length = GUIDANCE_MAX_LINES;
+		wrapped[GUIDANCE_MAX_LINES - 1] = truncateToWidth(
+			`${wrapped[GUIDANCE_MAX_LINES - 1]!}…`,
+			wrapWidth,
+			Ellipsis.Unicode,
+		);
+	}
+	return wrapped.map(line => `${indent}${theme.fg("dim", line)}`);
+}
+
+function renderBoundSubagentBody(
+	snapshot: SubagentSnapshot,
+	expanded: boolean,
+	width: number,
+	theme: Theme,
+	staticTime: boolean,
+): string[] {
+	return boundSubagentBodyLines(
+		[
+			...renderSubagentSnapshotBody(snapshot, expanded, theme, staticTime),
+			...renderSubagentGuidanceLines(snapshot, width, theme),
+		],
+		width,
+	);
 }
 
 function renderCachedSubagentBody(
@@ -133,7 +219,7 @@ function renderCachedSubagentBody(
 		subagentBodyCache.set(key, hit);
 		return hit;
 	}
-	const lines = boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme), width);
+	const lines = renderBoundSubagentBody(snapshot, expanded, width, theme, true);
 	subagentBodyRenderCount += 1;
 	subagentBodyCache.set(key, lines);
 	if (subagentBodyCache.size > SUBAGENT_BODY_CACHE_MAX) {
@@ -150,7 +236,7 @@ function renderDynamicSubagentBody(
 	theme: Theme,
 ): string[] {
 	subagentBodyRenderCount += 1;
-	return boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme, false), width);
+	return renderBoundSubagentBody(snapshot, expanded, width, theme, false);
 }
 
 function statusIconKind(status: SubagentSnapshot["status"]): ToolUIStatus {
@@ -363,11 +449,7 @@ function renderSubagentSnapshotBody(
 		}
 	}
 
-	if (snapshot.guidance) {
-		for (const line of getPreviewLines(snapshot.guidance, 1, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
-			lines.push(`  ${theme.fg("dim", replaceTabs(line))}`);
-		}
-	}
+	// `snapshot.guidance` is appended by renderBoundSubagentBody, wrapped to width.
 
 	return lines;
 }
@@ -421,6 +503,29 @@ export const subagentToolRenderer = {
 					theme,
 				);
 				const out: string[] = [truncateToWidth(replaceTabs(header), width, Ellipsis.Omit)];
+				const liveProgress = subagents.flatMap(snapshot =>
+					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
+				);
+				const degradationGroups = collectProviderDegradationGroups(liveProgress);
+				// Compact applies only to live await progress. Final results (timeout
+				// guidance, failure and completion receipts, status/steer replies) keep
+				// the full per-subagent rendering.
+				if (!expanded && options.isPartial && compactSubagentPanelEnabled()) {
+					out.push(
+						truncateToWidth(replaceTabs(renderCompactSubagentSummary(subagents, theme)), width, Ellipsis.Unicode),
+					);
+					const compactDegradation = renderCompactDegradationLine(degradationGroups, theme);
+					if (compactDegradation)
+						out.push(truncateToWidth(replaceTabs(compactDegradation), width, Ellipsis.Unicode));
+					out.push(
+						truncateToWidth(
+							replaceTabs(renderCompactSubagentHint(runningCount > 0, theme)),
+							width,
+							Ellipsis.Unicode,
+						),
+					);
+					return out;
+				}
 				// Discoverability: the inline panel is a bounded preview; the session
 				// observer (ctrl+s) streams the full per-subagent message history.
 				if (runningCount > 0) {
@@ -432,10 +537,7 @@ export const subagentToolRenderer = {
 						),
 					);
 				}
-				const liveProgress = subagents.flatMap(snapshot =>
-					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
-				);
-				for (const group of collectProviderDegradationGroups(liveProgress)) {
+				for (const group of degradationGroups) {
 					out.push(
 						truncateToWidth(
 							replaceTabs(

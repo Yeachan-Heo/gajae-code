@@ -350,8 +350,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 
 			expect(received).toHaveLength(1);
 			expect(received[0].options).toEqual([
-				{ value: "JWT", label: "JWT", description: undefined },
-				{ value: "OAuth2", label: "OAuth2", description: undefined },
+				{ value: { selected: ["JWT"] }, label: "JWT", description: undefined },
+				{ value: { selected: ["OAuth2"] }, label: "OAuth2", description: undefined },
 			]);
 			expect(JSON.stringify(result.details)).toContain("JWT");
 		} finally {

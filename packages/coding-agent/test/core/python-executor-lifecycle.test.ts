@@ -15,7 +15,7 @@ class FakeKernel {
 	});
 	ping = vi.fn(async () => true);
 	alive = true;
-	private _exitCode: number | null = null;
+	#exitCode: number | null = null;
 
 	constructor(private readonly result: KernelExecuteResult) {}
 
@@ -24,11 +24,11 @@ class FakeKernel {
 	}
 
 	getExitCode(): number | null {
-		return this._exitCode;
+		return this.#exitCode;
 	}
 
 	setExitCode(code: number | null): void {
-		this._exitCode = code;
+		this.#exitCode = code;
 	}
 }
 

@@ -53,10 +53,10 @@ test("SDK tool session separates workflow identity from async endpoint identity"
 
 	try {
 		const job = session.getToolByName("job") as unknown as
-			| { materializeForTests?: () => Promise<{ session?: ToolSession }> }
+			| { materialize?: () => Promise<{ session?: ToolSession }> }
 			| undefined;
 		if (!job) throw new Error(`Job tool unavailable: ${session.getAllToolNames().join(", ")}`);
-		const toolSession = (await job.materializeForTests?.())?.session;
+		const toolSession = (await job.materialize?.())?.session;
 		expect(toolSession).toBeDefined();
 
 		const sessionId = toolSession?.getSessionId?.();

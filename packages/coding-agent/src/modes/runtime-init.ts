@@ -206,7 +206,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getProjectProgress: async () =>
 				toProjectProgressSnapshot(await buildSessionProjectProgress(session, session.sessionManager)),
 			onJobFold: listener => session.onJobFold(listener),
-			onSessionEvent: listener => session.subscribe(listener),
+			onSessionEvent: listener => session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
@@ -262,7 +262,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						const slashIndex = selector.indexOf("/");
 						const model =
 							slashIndex > 0
-								? session.modelRegistry.find(selector.slice(0, slashIndex), selector.slice(slashIndex + 1))
+								? session.modelRegistry.find(
+										selector.slice(0, slashIndex),
+										selector.slice(slashIndex + 1),
+										session.credentialSessionId,
+									)
 								: undefined;
 						if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
 							throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {

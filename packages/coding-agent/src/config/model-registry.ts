@@ -45,6 +45,7 @@ import {
 } from "@gajae-code/ai/core";
 import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
 import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
+import { getAntigravityDiscoveryUserAgent } from "@gajae-code/ai/utils/discovery/antigravity";
 import {
 	detectDiscoveredApiFamily,
 	isSafeCatalogModelId,
@@ -97,6 +98,7 @@ import {
 } from "./model-preset-registry";
 import {
 	ModelProfileReplacementRequiredError,
+	readDurableModelProfileOwnership,
 	readDurableModelProfileOwnershipFromRaw,
 	UnresolvedModelProfileOwnershipError,
 } from "./model-profile-ownership";
@@ -485,6 +487,30 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(
 		model => model.id.toLowerCase() === modelId.toLowerCase(),
 	)?.api as Api | undefined;
+}
+
+/**
+ * A catalog that mixes chat rows with image, audio, video, embedding, or
+ * transcription rows can opt into `discovery.outputModalities` and
+ * `discovery.inputModalities`. Each set list admits only rows whose advertised
+ * modalities all fall inside it, so a non-chat entry never becomes a
+ * chat-completion model. Rows that omit the filtered field are skipped,
+ * because they cannot be classified. An unset list does not filter.
+ */
+function admitsAdvertisedModalities(allowed: readonly string[] | undefined, advertised: unknown): boolean {
+	if (allowed === undefined) return true;
+	return (
+		Array.isArray(advertised) &&
+		advertised.length > 0 &&
+		advertised.every(modality => typeof modality === "string" && allowed.includes(modality))
+	);
+}
+
+function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: Record<string, unknown>): boolean {
+	return (
+		admitsAdvertisedModalities(discovery.outputModalities, item.output_modalities) &&
+		admitsAdvertisedModalities(discovery.inputModalities, item.input_modalities)
+	);
 }
 
 function resolveModelApiOverrideFromDiscovery(
@@ -1115,7 +1141,8 @@ function filterMaterializedRegistryProfiles(
 type SpecialProviderDescriptor = {
 	providerId: string;
 	resolveKey: (value: string | undefined) => string | undefined;
-	createOptions: (key: string) => ModelManagerOptions<Api>;
+	resolveProjectId?: (key: string, rawValue: string | undefined) => string | undefined;
+	createOptions: (key: string, projectId?: string) => ModelManagerOptions<Api>;
 };
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -1293,21 +1320,43 @@ function fingerprintConfiguredDiscoveryRequestShape(
 		api: providerConfig.api,
 		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
 		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+		...(providerConfig.discovery.outputModalities
+			? { outputModalities: [...providerConfig.discovery.outputModalities].sort() }
+			: {}),
+		...(providerConfig.discovery.inputModalities
+			? { inputModalities: [...providerConfig.discovery.inputModalities].sort() }
+			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
 
-function fingerprintDescriptorDiscoveryProvenance(authEvidence: string, endpoint: string): string | undefined {
+function fingerprintDescriptorDiscoveryProvenance(
+	providerId: string,
+	authEvidence: string,
+	endpoint: string,
+	projectId?: string,
+): string | undefined {
 	try {
 		const parsed = new URL(endpoint);
 		if (parsed.username || parsed.password || parsed.search) return undefined;
 	} catch {
 		return undefined;
 	}
+	const discoveryIdentity =
+		providerId === "google-antigravity" || providerId === "google-gemini-cli"
+			? getAntigravityDiscoveryUserAgent()
+			: undefined;
 	return crypto
 		.createHash("sha256")
 		.update("gajae:model-discovery-provenance\0")
-		.update(JSON.stringify({ authEvidence, endpoint }))
+		.update(
+			JSON.stringify({
+				authEvidence,
+				endpoint,
+				...(projectId !== undefined ? { projectId } : {}),
+				...(discoveryIdentity !== undefined ? { discoveryIdentity } : {}),
+			}),
+		)
 		.digest("hex");
 }
 
@@ -1442,6 +1491,48 @@ function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: stri
 	if (!providerEntry) return [];
 	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
 	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
+}
+
+/** Internal pure parser shared by discovery; exported for regression coverage. */
+export function extractGoogleOAuthProjectId(value: string | undefined, accessToken: string): string | undefined {
+	if (!value) return undefined;
+	try {
+		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown; project_id?: unknown };
+		if (typeof parsed.token !== "string" || parsed.token.trim() !== accessToken) return undefined;
+		const projectId = typeof parsed.projectId === "string" ? parsed.projectId : parsed.project_id;
+		return typeof projectId === "string" ? projectId.trim() || undefined : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function resolveGoogleOAuthProjectId(
+	authStorage: AuthStorage,
+	provider: string,
+	accessToken: string,
+	rawValue?: string,
+	sessionId?: string,
+	owner?: object,
+): string | undefined {
+	const configuredProjectId = extractGoogleOAuthProjectId(rawValue, accessToken);
+	if (authStorage.getEffectiveCredentialType(provider, sessionId, owner ? { owner } : undefined) !== "oauth") {
+		return configuredProjectId;
+	}
+	const selector = authStorage.resolveEffectiveCredentialSelector(provider, sessionId);
+	if (selector) {
+		const selectedCredential = authStorage.getOAuthCredential(provider, sessionId, owner ? { owner } : undefined);
+		if (selectedCredential?.access !== accessToken) return configuredProjectId;
+		return selectedCredential.projectId?.trim() || configuredProjectId;
+	}
+	const matchingCredentials = getOAuthCredentialsForProvider(authStorage, provider).filter(
+		credential => credential.access === accessToken,
+	);
+	if (matchingCredentials.length === 0) return configuredProjectId;
+	const projectId = matchingCredentials[0]?.projectId?.trim();
+	if (matchingCredentials.some(credential => (credential.projectId?.trim() ?? "") !== (projectId ?? ""))) {
+		return configuredProjectId;
+	}
+	return projectId || configuredProjectId;
 }
 
 function resolveOAuthAccountIdForAccessToken(
@@ -2010,6 +2101,12 @@ interface ModelManagerDiscoveryOptions {
 	apiKey: string | undefined;
 	endpoint: string;
 	endpointContainsUserinfo: boolean;
+	projectId?: string;
+	isCurrentContext?: () => boolean;
+}
+
+interface GoogleSessionDiscoveryCatalog {
+	models: Model<Api>[];
 }
 
 interface ConfiguredDiscoveryResult {
@@ -2232,9 +2329,11 @@ export class ModelRegistry {
 		bySelector: new Map(),
 		aliases: new Map(),
 	};
-	#availableModelsCache: Model<Api>[] | undefined;
-	#availableModelsDisabledProviders: string | undefined;
-	#availableModelsEnvFingerprint: string | undefined;
+	#availableModelsCache = new Map<
+		string,
+		{ models: Model<Api>[]; disabledProviders: string; envFingerprint: string }
+	>();
+	#googleSessionDiscoveryCatalogs = new Map<string, Map<string, GoogleSessionDiscoveryCatalog>>();
 	#sessionCanonicalVariants = new Map<string, string>();
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#customProviderApiKeyEnvNames: Map<string, string> = new Map();
@@ -2254,6 +2353,7 @@ export class ModelRegistry {
 			modelIds: ReadonlySet<string>;
 			authGeneration: string;
 			endpoint: string;
+			projectId?: string;
 		}
 	>();
 	#descriptorDiscoveryGenerations = new Map<string, number>();
@@ -2295,7 +2395,7 @@ export class ModelRegistry {
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#selectorCircuits: Map<string, SelectorCircuit> = new Map();
-	#backgroundRefresh?: Promise<void>;
+	#backgroundRefreshes: Map<string, Promise<void>> = new Map();
 	#catalogMutationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogMutations = 0;
 	#catalogRefreshGeneration = 0;
@@ -2392,6 +2492,12 @@ export class ModelRegistry {
 
 	#copyRuntimeStateFrom(source: ModelRegistry): void {
 		this.#sessionCanonicalVariants = new Map(source.#sessionCanonicalVariants);
+		this.#googleSessionDiscoveryCatalogs = new Map(
+			[...source.#googleSessionDiscoveryCatalogs].map(([provider, catalogs]) => [
+				provider,
+				new Map([...catalogs].map(([identity, catalog]) => [identity, { models: [...catalog.models] }])),
+			]),
+		);
 		this.#suppressedSelectors = new Map(source.#suppressedSelectors);
 		this.#selectorCircuits = new Map(
 			[...source.#selectorCircuits].map(([selector, circuit]) => [selector, structuredClone(circuit)]),
@@ -2471,13 +2577,9 @@ export class ModelRegistry {
 			other.#availableModelsCache,
 			this.#availableModelsCache,
 		];
-		[this.#availableModelsDisabledProviders, other.#availableModelsDisabledProviders] = [
-			other.#availableModelsDisabledProviders,
-			this.#availableModelsDisabledProviders,
-		];
-		[this.#availableModelsEnvFingerprint, other.#availableModelsEnvFingerprint] = [
-			other.#availableModelsEnvFingerprint,
-			this.#availableModelsEnvFingerprint,
+		[this.#googleSessionDiscoveryCatalogs, other.#googleSessionDiscoveryCatalogs] = [
+			other.#googleSessionDiscoveryCatalogs,
+			this.#googleSessionDiscoveryCatalogs,
 		];
 		[this.#customProviderApiKeys, other.#customProviderApiKeys] = [
 			other.#customProviderApiKeys,
@@ -2626,7 +2728,7 @@ export class ModelRegistry {
 		other.#modelBindingsApplier.setBindings(previousBindings);
 		this.#modelBindingsApplier.apply();
 		this.#modelsConfigFile.invalidate();
-		this.#availableModelsCache = undefined;
+		this.#invalidateAvailableModels();
 	}
 
 	#reconcileOwnedConfigApiKeys(
@@ -2792,6 +2894,7 @@ export class ModelRegistry {
 			for (const provider of changedProviders) {
 				copyProviderEntry(registry.#configuredDiscoveryEvidence, this.#configuredDiscoveryEvidence, provider);
 				copyProviderEntry(registry.#descriptorDiscoveryEvidence, this.#descriptorDiscoveryEvidence, provider);
+				registry.#googleSessionDiscoveryCatalogs.delete(provider);
 				copyProviderEntry(registry.#descriptorDiscoveryGenerations, this.#descriptorDiscoveryGenerations, provider);
 				copyProviderEntry(registry.#providerEvidenceApiKeys, this.#providerEvidenceApiKeys, provider);
 				copyProviderEntry(
@@ -3088,9 +3191,12 @@ export class ModelRegistry {
 	}
 
 	refreshInBackground(strategy: ModelRefreshStrategy = "online-if-uncached", credentialSessionId?: string): void {
-		if (this.#backgroundRefresh) {
-			return;
-		}
+		// Each credential context has an isolated discovery catalog. Coalescing every
+		// request behind one global promise discarded B's refresh when A was pending.
+		// Equivalent contexts still coalesce; distinct ones queue through the catalog
+		// mutation tail so their overlays remain independently populated.
+		const contextKey = `${strategy}\u0000${credentialSessionId ?? ""}`;
+		if (this.#backgroundRefreshes.has(contextKey)) return;
 		const refreshPromise = this.refresh(strategy, credentialSessionId)
 			.catch(error => {
 				logger.warn("background model refresh failed", {
@@ -3098,11 +3204,11 @@ export class ModelRegistry {
 				});
 			})
 			.finally(() => {
-				if (this.#backgroundRefresh === refreshPromise) {
-					this.#backgroundRefresh = undefined;
+				if (this.#backgroundRefreshes.get(contextKey) === refreshPromise) {
+					this.#backgroundRefreshes.delete(contextKey);
 				}
 			});
-		this.#backgroundRefresh = refreshPromise;
+		this.#backgroundRefreshes.set(contextKey, refreshPromise);
 	}
 
 	async refreshProvider(
@@ -3698,6 +3804,7 @@ export class ModelRegistry {
 			}
 			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const expectedProvenance = fingerprintDescriptorDiscoveryProvenance(
+				descriptor.providerId,
 				authEvidence ?? this.#getProviderEvidenceGeneration(descriptor.providerId),
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? ""),
 			);
@@ -4298,7 +4405,17 @@ export class ModelRegistry {
 					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
 				);
 			}
-			await this.#writeCheckedModelsConfig(checkedConfig.data);
+			await this.#writeCheckedModelsConfig(checkedConfig.data, () => {
+				// A settings write can claim this profile while the batch is suspended on
+				// the filesystem. The claim wins: refuse before the deletion reaches disk,
+				// otherwise the durable owner would point at a profile that no longer exists.
+				const live = this.#settings;
+				if (!live) return;
+				const currentOwnership = readDurableModelProfileOwnership(live);
+				if (currentOwnership.marker.kind === "profile" && currentOwnership.marker.profile === normalizedName) {
+					throw new ModelProfileReplacementRequiredError(normalizedName);
+				}
+			});
 			deletedProfile = profile;
 			return [];
 		});
@@ -4328,7 +4445,7 @@ export class ModelRegistry {
 		return { current, profile };
 	}
 
-	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
+	async #writeCheckedModelsConfig(config: ModelsConfig, beforeCommit?: () => void): Promise<void> {
 		const configPath = this.#modelsConfigFile.path();
 		const parentPath = path.dirname(configPath);
 		await fs.mkdir(parentPath, { recursive: true, mode: 0o700 });
@@ -4337,6 +4454,10 @@ export class ModelRegistry {
 		// still reach the same file. The final name stays lexical, so a symlink
 		// at models.yml is still opened with O_NOFOLLOW.
 		const parent = await fs.realpath(parentPath);
+		// Runs after every await in this write path so a caller can re-assert a
+		// precondition that another actor may have changed while the write was
+		// suspended, before any bytes reach the file.
+		beforeCommit?.();
 		writeExplicitOwnerOnlyTextSync(path.join(parent, path.basename(configPath)), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
@@ -4367,6 +4488,12 @@ export class ModelRegistry {
 		credentialSessionId?: string,
 	): Promise<void> {
 		const profileAvailabilityEvidenceBefore = this.#profileAvailabilityEvidenceFingerprint();
+		const googleDescriptorGenerationsBefore = new Map(
+			(["google-antigravity", "google-gemini-cli"] as const).map(provider => [
+				provider,
+				this.#descriptorDiscoveryGenerations.get(provider) ?? 0,
+			]),
+		);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
 			providerFilter
@@ -4518,6 +4645,38 @@ export class ModelRegistry {
 				return false;
 			}
 		});
+		let sessionCatalogChanged = false;
+		for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+			if (
+				this.authStorage.getEffectiveCredentialType(provider, credentialSessionId, {
+					owner: this.#authStorageConfigOwner,
+				}) !== "oauth"
+			) {
+				continue;
+			}
+			if (
+				(this.#descriptorDiscoveryGenerations.get(provider) ?? 0) ===
+				googleDescriptorGenerationsBefore.get(provider)
+			) {
+				continue;
+			}
+			const evidence = this.#descriptorDiscoveryEvidence.get(provider);
+			if (!evidence) continue;
+			const identity = this.#googleDescriptorContextIdentity(
+				provider,
+				evidence.authGeneration,
+				evidence.endpoint,
+				evidence.projectId,
+			);
+			if (!identity || identity !== this.#googleSessionDescriptorIdentity(provider, credentialSessionId)) continue;
+			const catalogs = this.#googleSessionDiscoveryCatalogs.get(provider) ?? new Map();
+			const models = currentBuiltInDiscovered.filter(model => model.provider === provider);
+			const previous = catalogs.get(identity);
+			if (models.length === 0 && evidence.fresh === false && previous !== undefined) continue;
+			if (!isDeepStrictEqual(previous?.models, models)) sessionCatalogChanged = true;
+			catalogs.set(identity, { models });
+			this.#googleSessionDiscoveryCatalogs.set(provider, catalogs);
+		}
 		const configuredDiscoveryEvidence = new Map(
 			currentConfiguredDiscoveryResults
 				.filter(result => result.current)
@@ -4585,6 +4744,10 @@ export class ModelRegistry {
 				);
 			});
 		}
+		if (sessionCatalogChanged) {
+			this.#invalidateAvailableModels();
+			this.#notifyCatalogChanged();
+		}
 		if (discovered.length === 0) {
 			if (
 				clearPublishedModelIds.size > 0 ||
@@ -4597,6 +4760,53 @@ export class ModelRegistry {
 		this.#mergeDiscoveredModels(discovered);
 	}
 
+	#googleDescriptorContextIdentity(
+		provider: "google-antigravity" | "google-gemini-cli",
+		authGeneration: string,
+		endpoint: string,
+		projectId?: string,
+	): string | undefined {
+		return fingerprintDescriptorDiscoveryProvenance(provider, authGeneration, endpoint, projectId);
+	}
+
+	#googleSessionDescriptorIdentity(
+		provider: "google-antigravity" | "google-gemini-cli",
+		credentialSessionId?: string,
+	): string | undefined {
+		if (
+			this.authStorage.getEffectiveCredentialType(provider, credentialSessionId, {
+				owner: this.#authStorageConfigOwner,
+			}) !== "oauth"
+		) {
+			return undefined;
+		}
+		const credential = this.authStorage.getOAuthCredential(provider, credentialSessionId, {
+			owner: this.#authStorageConfigOwner,
+		});
+		if (!credential) return undefined;
+		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "");
+		try {
+			return this.#googleDescriptorContextIdentity(
+				provider,
+				this.#getProviderEvidenceGeneration(provider, credential.access),
+				endpoint,
+				credential.projectId?.trim() || undefined,
+			);
+		} catch {
+			return undefined;
+		}
+	}
+
+	#getGoogleSessionDiscoveryModels(credentialSessionId?: string): Model<Api>[] {
+		const models: Model<Api>[] = [];
+		for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+			const identity = this.#googleSessionDescriptorIdentity(provider, credentialSessionId);
+			if (!identity) continue;
+			models.push(...(this.#googleSessionDiscoveryCatalogs.get(provider)?.get(identity)?.models ?? []));
+		}
+		return models;
+	}
+
 	#profileAvailabilityEvidenceFingerprint(): string {
 		return JSON.stringify({
 			descriptor: [...this.#descriptorDiscoveryEvidence.entries()]
@@ -4606,6 +4816,7 @@ export class ModelRegistry {
 					evidence.fresh,
 					evidence.authGeneration,
 					evidence.endpoint,
+					evidence.projectId,
 					[...evidence.modelIds].sort(),
 				]),
 			configured: [...this.#configuredDiscoveryEvidence.entries()]
@@ -4619,23 +4830,37 @@ export class ModelRegistry {
 		});
 	}
 
+	#removeDescriptorDiscoveredModels(provider: string, modelIds: ReadonlySet<string>): boolean {
+		const staticModelIds = this.#providerActivity.get(provider)?.staticModelIds;
+		const previousLength = this.#models.length;
+		this.#models = this.#models.filter(model => {
+			if (model.provider !== provider || !modelIds.has(model.id)) return true;
+			return staticModelIds?.has(model.id) === true;
+		});
+		return this.#models.length !== previousLength;
+	}
+
 	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {
+		this.#models = this.#resolveDiscoveredModelCatalog(this.#models, discovered);
+		this.#rebuildCanonicalIndex();
+	}
+
+	#resolveDiscoveredModelCatalog(baseModels: readonly Model<Api>[], discovered: readonly Model<Api>[]): Model<Api>[] {
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
 				mergeDiscoveredModel(
 					model,
-					this.find(model.provider, model.id),
+					baseModels.find(candidate => candidate.provider === model.provider && candidate.id === model.id),
 					this.#resolveProviderOverride(model.provider),
 				),
 			),
 		);
-		const resolved = this.#mergeResolvedModels(this.#models, discoveredModels);
+		const resolved = this.#mergeResolvedModels([...baseModels], discoveredModels);
 		const withConfigModels = this.#mergeCustomModels(resolved, this.#customModelOverlays);
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
-		this.#rebuildCanonicalIndex();
+		return this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
 	}
 
 	async #discoverProviderModels(
@@ -4966,19 +5191,39 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
+				resolveProjectId: (oauthToken, rawValue) =>
+					resolveGoogleOAuthProjectId(
+						this.authStorage,
+						"google-antigravity",
+						oauthToken,
+						rawValue,
+						credentialSessionId,
+						this.#authStorageConfigOwner,
+					),
+				createOptions: (oauthToken, projectId) =>
 					googleAntigravityModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-antigravity"),
+						project: projectId,
 					}),
 			},
 			{
 				providerId: "google-gemini-cli",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
+				resolveProjectId: (oauthToken, rawValue) =>
+					resolveGoogleOAuthProjectId(
+						this.authStorage,
+						"google-gemini-cli",
+						oauthToken,
+						rawValue,
+						credentialSessionId,
+						this.#authStorageConfigOwner,
+					),
+				createOptions: (oauthToken, projectId) =>
 					googleGeminiCliModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-gemini-cli"),
+						project: projectId,
 					}),
 			},
 			{
@@ -5087,7 +5332,11 @@ export class ModelRegistry {
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKeyValue) &&
 				isAuthenticated(key)
 			) {
-				const managerOptions = descriptor.createOptions(key);
+				const projectId = descriptor.resolveProjectId?.(key, apiKeyValue);
+				const isCurrentContext = descriptor.resolveProjectId
+					? () => descriptor.resolveProjectId?.(key, apiKeyValue) === projectId
+					: undefined;
+				const managerOptions = descriptor.createOptions(key, projectId);
 				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? "";
 				options.push({
 					options: managerOptions,
@@ -5095,6 +5344,8 @@ export class ModelRegistry {
 					apiKey: apiKeyValue,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(baseUrl),
 					endpointContainsUserinfo: this.#urlContainsUserinfo(baseUrl),
+					projectId,
+					...(isCurrentContext ? { isCurrentContext } : {}),
 				});
 			}
 		}
@@ -5102,12 +5353,28 @@ export class ModelRegistry {
 	}
 
 	async #discoverWithModelManager(
-		{ options, authGeneration, apiKey, endpoint, endpointContainsUserinfo }: ModelManagerDiscoveryOptions,
+		{
+			options,
+			authGeneration,
+			apiKey,
+			endpoint,
+			endpointContainsUserinfo,
+			projectId,
+			isCurrentContext,
+		}: ModelManagerDiscoveryOptions,
 		strategy: ModelRefreshStrategy,
 		providerRefresh?: ProviderRefreshFence,
 	): Promise<Model<Api>[]> {
 		const generation = (this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) + 1;
 		this.#descriptorDiscoveryGenerations.set(options.providerId, generation);
+		const previousEvidence = this.#descriptorDiscoveryEvidence.get(options.providerId);
+		const discoveryContextChanged =
+			previousEvidence !== undefined &&
+			(previousEvidence.authGeneration !== authGeneration ||
+				previousEvidence.endpoint !== endpoint ||
+				previousEvidence.projectId !== projectId);
+		const isGoogleProjectScopedProvider =
+			options.providerId === "google-antigravity" || options.providerId === "google-gemini-cli";
 		const canUseCredentialDerivedXiaomiEndpoint =
 			options.providerId === "xiaomi" &&
 			apiKey?.startsWith("tp-") === true &&
@@ -5117,8 +5384,7 @@ export class ModelRegistry {
 		let credentialDerivedEndpoint: string | undefined;
 		const reusableCacheProvenance = endpointContainsUserinfo
 			? undefined
-			: fingerprintDescriptorDiscoveryProvenance(authGeneration, endpoint);
-		if (reusableCacheProvenance === undefined && strategy === "offline") return [];
+			: fingerprintDescriptorDiscoveryProvenance(options.providerId, authGeneration, endpoint, projectId);
 		// Signed/userinfo endpoints may still publish a sanitized best-effort row,
 		// but each refresh gets a new opaque nonce. The nonce contains no endpoint
 		// secret and can never match a previous invocation, so constructor loads,
@@ -5128,6 +5394,7 @@ export class ModelRegistry {
 		const isCurrentDiscoveryContext = () =>
 			(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
 			this.#getProviderEvidenceGeneration(options.providerId, apiKey) === authGeneration &&
+			(isCurrentContext?.() ?? true) &&
 			(endpoint ===
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(options.providerId) ?? "") ||
 				(canUseCredentialDerivedXiaomiEndpoint && credentialDerivedEndpoint !== undefined));
@@ -5148,6 +5415,40 @@ export class ModelRegistry {
 					? strategy !== "online-if-uncached" || isCurrentDiscovery()
 					: isCurrentProviderRefresh()));
 		try {
+			if (!isCurrentDiscovery()) return [];
+			if (discoveryContextChanged && previousEvidence) {
+				const removedPreviousModels = this.#removeDescriptorDiscoveredModels(
+					options.providerId,
+					previousEvidence.modelIds,
+				);
+				if (removedPreviousModels) {
+					this.#rebuildProviderActivity();
+					this.#rebuildCanonicalIndex();
+				}
+			}
+			if (strategy === "offline") {
+				const cache =
+					reusableCacheProvenance !== undefined && isGoogleProjectScopedProvider
+						? readModelCache<Api>(options.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath)
+						: null;
+				const hasCurrentProjectCache =
+					cache?.dynamicModelIds !== undefined && cache.dynamicModelProvenance === reusableCacheProvenance;
+				if (reusableCacheProvenance === undefined || (isGoogleProjectScopedProvider && !hasCurrentProjectCache)) {
+					if (discoveryContextChanged) {
+						this.#providerEvidenceApiKeys.set(options.providerId, apiKey);
+						this.#descriptorDiscoveryEvidence.set(options.providerId, {
+							fresh: false,
+							modelIds: new Set(),
+							authGeneration,
+							endpoint,
+							projectId,
+						});
+						this.#rebuildProviderActivity();
+						this.#rebuildCanonicalIndex();
+					}
+					return [];
+				}
+			}
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
@@ -5179,7 +5480,9 @@ export class ModelRegistry {
 			const evidence = this.#descriptorDiscoveryEvidence.get(options.providerId);
 			const refreshStrategy =
 				strategy === "online-if-uncached" &&
-				(evidence?.authGeneration !== authGeneration || evidence.endpoint !== endpoint)
+				(evidence?.authGeneration !== authGeneration ||
+					evidence.endpoint !== endpoint ||
+					evidence.projectId !== projectId)
 					? "online"
 					: strategy;
 			const result = await manager.refresh(refreshStrategy);
@@ -5194,7 +5497,7 @@ export class ModelRegistry {
 			const preservesExistingDescriptorEvidence =
 				(result.dynamicModelIds === undefined && !result.fetched && !result.stale) ||
 				(result.stale && result.cacheFresh && result.cacheAuthoritative && evidence?.fresh === true) ||
-				(strategy === "offline" && result.dynamicModelIds === undefined);
+				(strategy === "offline" && result.dynamicModelIds === undefined && !discoveryContextChanged);
 			if (
 				isCurrentDiscovery() &&
 				!preservesExistingDescriptorEvidence &&
@@ -5202,13 +5505,15 @@ export class ModelRegistry {
 					result.dynamicModelIds !== undefined ||
 					result.stale ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
-					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
+					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint ||
+					this.#descriptorDiscoveryEvidence.get(options.providerId)?.projectId !== projectId)
 			) {
 				this.#descriptorDiscoveryEvidence.set(options.providerId, {
 					fresh: result.fetched,
 					modelIds: new Set(models.map(model => model.id)),
 					authGeneration,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
+					projectId,
 				});
 			}
 			if (!isCurrentDiscovery()) {
@@ -5234,6 +5539,7 @@ export class ModelRegistry {
 					modelIds: new Set(),
 					authGeneration,
 					endpoint,
+					projectId,
 				});
 			}
 			logger.warn("model discovery failed for provider", {
@@ -5693,6 +5999,7 @@ export class ModelRegistry {
 			// check, so IDs that appear only between requests cannot enter
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			if (!admitsDiscoveredCatalogModalities(providerConfig.discovery, item)) continue;
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same
@@ -6213,9 +6520,7 @@ export class ModelRegistry {
 	}
 
 	#invalidateAvailableModels(): void {
-		this.#availableModelsCache = undefined;
-		this.#availableModelsDisabledProviders = undefined;
-		this.#availableModelsEnvFingerprint = undefined;
+		this.#availableModelsCache.clear();
 	}
 
 	#notifyCatalogChanged(): void {
@@ -6290,10 +6595,11 @@ export class ModelRegistry {
 
 	/**
 	 * Get all models (embedded + accepted registry + custom).
+	 * Supplying a credential session selects only that session's Google OAuth discovery catalog.
 	 * If models.yml had errors, returns embedded plus accepted registry models.
 	 */
-	getAll(): Model<Api>[] {
-		return this.#models;
+	getAll(credentialSessionId?: string): Model<Api>[] {
+		return credentialSessionId === undefined ? this.#models : this.#getCredentialScopedCatalog(credentialSessionId);
 	}
 
 	/** Provider ids declared in models.yml, including override-only providers. */
@@ -6381,12 +6687,16 @@ export class ModelRegistry {
 		);
 	}
 
-	#isModelAvailable(model: Model<Api>, disabledProviders?: ReadonlySet<string>): boolean {
+	#isModelAvailable(
+		model: Model<Api>,
+		disabledProviders?: ReadonlySet<string>,
+		credentialSessionId?: string,
+	): boolean {
 		const disabled = disabledProviders ?? getDisabledProviderIdsFromSettings(this.#settings);
 		return (
 			!disabled.has(model.provider) &&
 			(this.#keylessProviders.has(model.provider) ||
-				this.authStorage.hasAuth(model.provider, undefined, { owner: this.#authStorageConfigOwner }))
+				this.authStorage.hasAuth(model.provider, credentialSessionId, { owner: this.#authStorageConfigOwner }))
 		);
 	}
 	/** Per-query precomputed variant filter inputs; plan fields are authoritative when provided. */
@@ -6821,23 +7131,54 @@ export class ModelRegistry {
 	 * is authoritative for visibility: live discovery only enriches entries and
 	 * adds unknown ids, and never removes a bundled model. A provider that cannot
 	 * serve a model reports its own error when the model is used.
+	 * Without a credential session, project-scoped Google OAuth discoveries are omitted.
 	 */
-	getAvailable(): Model<Api>[] {
+	getAvailable(credentialSessionId?: string): Model<Api>[] {
 		this.#synchronizeEnvironmentCredentials();
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
 		const envFingerprint = envAvailabilityFingerprint(this.#configuredApiKeyEnvNames);
-		if (
-			this.#availableModelsCache &&
-			this.#availableModelsDisabledProviders === disabledProviderKey &&
-			this.#availableModelsEnvFingerprint === envFingerprint
-		) {
-			return this.#availableModelsCache;
+		const cacheKey = credentialSessionId ?? "";
+		const cached = this.#availableModelsCache.get(cacheKey);
+		if (cached?.disabledProviders === disabledProviderKey && cached.envFingerprint === envFingerprint) {
+			return cached.models;
 		}
-		this.#availableModelsCache = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
-		this.#availableModelsDisabledProviders = disabledProviderKey;
-		this.#availableModelsEnvFingerprint = envFingerprint;
-		return this.#availableModelsCache;
+		const catalog = this.#getCredentialScopedCatalog(credentialSessionId);
+		const models = catalog.filter(model => this.#isModelAvailable(model, disabledProviders, credentialSessionId));
+		this.#availableModelsCache.set(cacheKey, {
+			models,
+			disabledProviders: disabledProviderKey,
+			envFingerprint,
+		});
+		return models;
+	}
+
+	#getCredentialScopedCatalog(credentialSessionId?: string): Model<Api>[] {
+		const sessionScopedProviders = new Set(
+			(["google-antigravity", "google-gemini-cli"] as const).filter(
+				provider =>
+					this.authStorage.getEffectiveCredentialType(provider, credentialSessionId, {
+						owner: this.#authStorageConfigOwner,
+					}) === "oauth",
+			),
+		);
+		const commonModels = this.#models.filter(model => {
+			if (model.provider !== "google-antigravity" && model.provider !== "google-gemini-cli") {
+				return true;
+			}
+			if (!sessionScopedProviders.has(model.provider) || this.#discoveryManager.providerIds().has(model.provider))
+				return true;
+			return this.#providerActivity.get(model.provider)?.staticModelIds.has(model.id) === true;
+		});
+		// Commands such as `--list-models` read without a credential session. The
+		// effective (default) credential still has a descriptor identity, so its
+		// discovery overlay must be visible here instead of being dropped.
+		const scopedDiscovered = this.#getGoogleSessionDiscoveryModels(credentialSessionId);
+		const catalog =
+			scopedDiscovered.length > 0
+				? this.#resolveDiscoveredModelCatalog(commonModels, scopedDiscovered)
+				: commonModels;
+		return catalog;
 	}
 
 	#synchronizeEnvironmentCredentials(): void {
@@ -7023,8 +7364,9 @@ export class ModelRegistry {
 	/**
 	 * Find a model by provider and ID.
 	 */
-	find(provider: string, modelId: string): Model<Api> | undefined {
-		return resolveProviderModelReference(provider, modelId, this.#models);
+	find(provider: string, modelId: string, credentialSessionId?: string): Model<Api> | undefined {
+		const models = credentialSessionId === undefined ? this.#models : this.getAll(credentialSessionId);
+		return resolveProviderModelReference(provider, modelId, models);
 	}
 
 	/**
@@ -7113,6 +7455,35 @@ export class ModelRegistry {
 		);
 		this.#applyEffectiveAuthHeader(model, apiKey);
 		return apiKey;
+	}
+
+	/** Get a model API key together with the stored row that resolved it, when any. */
+	async getApiKeyWithCredentialRowId(
+		model: Model<Api>,
+		sessionId?: string,
+		options: {
+			credentialSelector?: AuthCredentialSelector;
+			preferredCredentialSelector?: AuthCredentialSelector;
+			signal?: AbortSignal;
+		} = {},
+	): Promise<{ apiKey: string | undefined; credentialRowId: number | undefined }> {
+		this.#refreshRotatingConfigApiKey(model.provider);
+		let credentialRowId: number | undefined;
+		const apiKey = await this.#getApiKeyOrNoAuth(model.provider, async () => {
+			const resolved = await this.authStorage.getApiKeyWithCredentialRowId(model.provider, sessionId, {
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				credentialSelector: options.credentialSelector,
+				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
+				signal: options.signal,
+			});
+			credentialRowId = isVllmNoAuthToken(model.provider, resolved.apiKey) ? undefined : resolved.credentialRowId;
+			return resolved.apiKey;
+		});
+		if (apiKey === kNoAuth) credentialRowId = undefined;
+		this.#applyEffectiveAuthHeader(model, apiKey);
+		return { apiKey, credentialRowId };
 	}
 
 	/**
@@ -7710,7 +8081,7 @@ export class ModelRegistry {
 		const probe = circuit.probe;
 		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
 		if (probeOwner !== undefined) {
-			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 30_000) };
 		}
 		return false;
 	}

@@ -2,12 +2,19 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { appendCrashEvent, computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
+import {
+	appendCrashEvent,
+	computeCrashFingerprint,
+	formatCrashRecordMarker,
+	sanitizeDisplayLine,
+} from "@gajae-code/utils";
+import fc from "fast-check";
 import { type CrashStatePaths, compactCrashIndex, readCrashIndex } from "../src/crash/index-store";
 import {
 	buildPrefillUrl,
 	CRASH_REPORT_REPO,
 	type CrashReportIo,
+	checkForDuplicateIssue,
 	isCanonicalIssueUrl,
 	runCrashReportFlow,
 } from "../src/crash/report";
@@ -256,6 +263,119 @@ describe("runCrashReportFlow — duplicate handling", () => {
 			now: () => new Date(NOW),
 		});
 		expect(outcome.status).toBe("refused");
+	});
+
+	it("does not emit terminal controls from a duplicate issue title", async () => {
+		const esc = "\u001b";
+		const bel = "\u0007";
+		const title =
+			`visible${esc}]52;c;cGF5bG9hZA==${bel}${esc}[2J\n  "forged line" by attacker` +
+			`${esc}]0;spoofed-title${bel}\u009d52;c;c1payload${bel}\u202e`;
+		const author = `login${bel}${esc}[31m`;
+		const h = await harness();
+		const outcome = await runCrashReportFlow({
+			io: scriptedIo(h, { selects: [0, 0, 0], confirms: [true], inputs: ["", "", "", "", ""] }),
+			paths: h.paths,
+			snapshotDir: h.snapshotDir,
+			runGh: gh(h, {
+				"api user": IDENTITY,
+				"issue list": {
+					exitCode: 0,
+					stdout: JSON.stringify([{ url: ISSUE_URL, title, author: { login: author } }]),
+					stderr: "",
+				},
+			}),
+			interactive: true,
+			environment: ENVIRONMENT,
+			now: () => new Date(NOW),
+		});
+		expect(outcome).toEqual({ status: "duplicate", url: ISSUE_URL });
+		const printed = h.output.join("");
+		expect(printed).toContain(ISSUE_URL);
+		expect(printed).not.toContain(esc);
+		expect(printed).not.toContain(bel);
+		expect(printed).not.toContain("\u009d");
+		expect(printed).not.toContain("cGF5bG9hZA");
+		expect(printed).not.toContain("spoofed-title");
+		expect(printed).not.toContain("\u202e");
+		const titleRow = printed.split("\n").find(line => line.includes("visible"));
+		expect(titleRow).toBe(`  "visible   "forged line" by attacker" by login`);
+		expect(printed.split("\n").some(line => line.startsWith('  "forged'))).toBe(false);
+	});
+
+	it("still allows a spaced punctuation duplicate title", async () => {
+		const title = "  Crash:\tTypeError in renderer #12 (macOS) — see https://example.com/issues/12  ";
+		const author = "Some-User";
+		const h = await harness();
+		const outcome = await runCrashReportFlow({
+			io: scriptedIo(h, { selects: [0, 0, 0], confirms: [true], inputs: ["", "", "", "", ""] }),
+			paths: h.paths,
+			snapshotDir: h.snapshotDir,
+			runGh: gh(h, {
+				"api user": IDENTITY,
+				"issue list": {
+					exitCode: 0,
+					stdout: JSON.stringify([{ url: ISSUE_URL, title, author: { login: author } }]),
+					stderr: "",
+				},
+			}),
+			interactive: true,
+			environment: ENVIRONMENT,
+			now: () => new Date(NOW),
+		});
+		expect(outcome).toEqual({ status: "duplicate", url: ISSUE_URL });
+		expect(h.output.join("")).toContain(`  "${title}" by ${author}\n`);
+	});
+
+	it("still allows a missing author login to read as unknown", async () => {
+		const h = await harness();
+		const outcome = await runCrashReportFlow({
+			io: scriptedIo(h, { selects: [0, 0, 0], confirms: [true], inputs: ["", "", "", "", ""] }),
+			paths: h.paths,
+			snapshotDir: h.snapshotDir,
+			runGh: gh(h, {
+				"api user": IDENTITY,
+				"issue list": {
+					exitCode: 0,
+					stdout: JSON.stringify([{ url: ISSUE_URL, title: "crash: Error in topics.ts" }]),
+					stderr: "",
+				},
+			}),
+			interactive: true,
+			environment: ENVIRONMENT,
+			now: () => new Date(NOW),
+		});
+		expect(outcome).toEqual({ status: "duplicate", url: ISSUE_URL });
+		expect(h.output.join("")).toContain(`  "crash: Error in topics.ts" by unknown\n`);
+	});
+});
+
+describe("duplicate candidate display", () => {
+	const marker = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\r\n\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
+	it("property: duplicate candidate title and author are one display row", async () => {
+		const prop = fc.asyncProperty(
+			fc.string({ unit: "binary", maxLength: 80 }),
+			fc.string({ unit: "binary", maxLength: 40 }),
+			async (title, login) => {
+				const result = await checkForDuplicateIssue(
+					async () => ({
+						exitCode: 0,
+						stdout: JSON.stringify([{ url: ISSUE_URL, title, author: { login } }]),
+						stderr: "",
+					}),
+					FINGERPRINT,
+				);
+				expect(result.status).toBe("candidate");
+				if (result.status !== "candidate") return false;
+				expect(result.candidate.title).toBe(sanitizeDisplayLine(title));
+				expect(result.candidate.author).toBe(sanitizeDisplayLine(login));
+				expect(marker.test(result.candidate.title)).toBe(false);
+				expect(marker.test(result.candidate.author)).toBe(false);
+				return true;
+			},
+		);
+		await fc.assert(prop, { seed: 6532026, numRuns: 64 });
 	});
 });
 

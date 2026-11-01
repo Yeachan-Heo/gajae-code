@@ -39,9 +39,9 @@
   <a href="#documentation">Docs</a>
 </p>
 
-**Log in with the subscription you already have, plan before a single file mutates, execute with evidence — and answer the agent's questions from your terminal, your phone, or your own bot.**
+**Connect a supported subscription or API key, choose a planning workflow when needed, execute with evidence — and answer the agent's questions from your terminal, your phone, or your own bot.**
 
-Gajae-Code (`gjc`) is an external coding-agent harness: drop it into any repository or worktree. No separate API billing. No per-token anxiety. No terminal babysitting.
+Gajae-Code (`gjc`) is an external coding-agent harness: drop it into any repository or worktree. Supported subscription routes use your provider's plan; API-key routes follow that provider's billing and usage limits.
 
 > Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
 
@@ -54,7 +54,7 @@ Most coding agents fail on three fronts: they bill you twice, they mutate before
 | Problem | What Happens | Gajae-Code Fix |
 | :--- | :--- | :--- |
 | Separate API billing | You pay for a plan *and* per-token API costs | `/login` with the coding plan you already pay for — Claude, Codex, Cursor, Copilot, OpenCode Go, GOAT, ClinePass, and more |
-| Code-first agents | The agent edits before it understands; you rework | Plan-gated workflow: interview → plan → critique → *then* mutate, with approval gates |
+| Code-first agents | The agent edits before it understands; you rework | Opt-in plan-gated workflow: interview → plan → critique → *then* authorized execution |
 | Terminal-bound sessions | Agent asks a question at 2 AM; work stalls until morning | Questions route to Telegram/Discord/Slack; you answer from anywhere |
 | Context bloat | Whole-file reads and log floods burn the window | Structural summaries, artifact spill, cache-aware routing, compaction |
 
@@ -62,7 +62,7 @@ Most coding agents fail on three fronts: they bill you twice, they mutate before
 
 ## Quick Start
 
-**Install** — prebuilt binaries for Linux (x64/arm64), macOS (arm64/x64), and Windows (x64). Bun is not required:
+**Install** — prebuilt binaries for Linux (x64/arm64, glibc only), macOS (arm64/x64), and Windows (x64). Bun is not required:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.sh -o gjc-install.sh
@@ -83,12 +83,17 @@ Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo
 powershell -File gjc-install.ps1
 ```
 
-**First use** — pick your plan and go:
+**First use** — inside an interactive `gjc` session:
 
 ```text
 /login                       pick a provider / coding plan
 /skill:deep-interview        clarify ambiguous requirements
 /skill:ralplan               build and critique the plan
+```
+
+After approving the plan, ask the active GJC session to run this through its Bash tool, which supplies `GJC_SESSION_ID`, to create durable goals. With goal mode enabled, the session can activate inline goal mode and begin work in the same turn, before another user action; run this only when ready for execution. The command does not start the durable scheduler. A standalone shell without that session context fails:
+
+```sh
 gjc ultragoal create-goals --brief-file <approved-plan>
 ```
 
@@ -113,7 +118,7 @@ Nightly channel: `sh gjc-install.sh --channel nightly` (use the tagged installer
 
 Log in once and run GJC on the subscription you already pay for. Run `/login` inside a session and pick your plan:
 
-| Plan / subscription | OAuth login |
+| Plan / subscription | `/login` provider ID |
 | :--- | :--- |
 | Claude Pro / Max | `anthropic` |
 | ChatGPT Plus / Pro (Codex) | `openai-codex` (browser) · `openai-codex-device` (headless) |
@@ -126,18 +131,18 @@ Log in once and run GJC on the subscription you already pay for. Run `/login` in
 | xAI (Grok) | `xai` |
 | Alibaba Token Plan / Qwen Portal | `alibaba-token-plan` · `qwen-portal` |
 
-More OAuth plans — Google Gemini CLI, GitLab Duo, Perplexity Pro/Max, Fire Pass, Xiaomi Token Plan — are covered in [docs/models.md](docs/models.md).
+`/login` supports both OAuth and key-based onboarding; for example, Z.AI and MiniMax Coding Plan require a plan API key, not an OAuth browser login. More login options — Google Gemini CLI, GitLab Duo, Perplexity Pro/Max, Fire Pass, Xiaomi Token Plan — are covered in [docs/models.md](docs/models.md). Availability, entitlement, and usage limits depend on the provider.
 
 ### New: coding-plan presets
 
-Key-based coding plans onboard with one command — the preset writes the API type, base URL, env var, compatibility flags, and a **live model catalog** together, so new models show up without a GJC update:
+Key-based coding plans onboard with one command — the preset writes the API type, base URL, env-var reference, compatibility flags, and model configuration. The two discovery-backed presets below resolve a **live model catalog** at runtime; setup itself does not validate credentials:
 
 ```sh
 gjc setup provider --preset commandcode-goat   # Command Code GOAT plan (CMD_API_KEY)
 gjc setup provider --preset cline-pass         # ClinePass (CLINE_API_KEY)
 ```
 
-- **Command Code GOAT** — discovers the provider's live `/provider/v1/models` catalog and keeps every discovered model, including Claude-named IDs, on the provider's OpenAI-compatible `/chat/completions` transport. Login verifies entitlement with a fixed harmless inference probe before persisting credentials. Aliases: `commandcode`, `goat`.
+- **Command Code GOAT** — discovers the provider's live `/provider/v1/models` catalog. Claude model IDs use the Anthropic Messages transport; other models use OpenAI-compatible Chat Completions. `/login` verifies the key with a small inference probe before persisting it; this can consume provider quota and is separate from preset setup. Aliases: `commandcode`, `goat`.
 - **ClinePass** — no hardcoded models; GJC fetches Cline's live catalog the same way Cline generates its own. Aliases: `clinepass`, `cline`.
 - Also available as presets: `minimax`, `minimax-cn`, `glm`, `alibaba-token-plan` — or `/provider add --preset <name>` inside the TUI.
 
@@ -161,11 +166,11 @@ API-key providers, local runtimes (Ollama, LM Studio, vLLM), and gateways (Cloud
   <img src="assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-When the agent needs a decision, it pings you on Telegram — and you answer from anywhere:
+After you configure notifications (off by default), the agent can ping you on Telegram when it needs a decision — and you answer from anywhere:
 
 - **Coordinator/lifecycle session forum topics** with live/finalized output, context updates, image attachments, inline buttons, free-text replies, and typing indicators.
 - **Configure once** from `/settings` → Notifications in a running session, or headless via `gjc notify setup|status|health|test|recovery`. Tokens are masked on entry and never displayed again.
-- **`gjc daemon`** keeps one safe long-poll owner per bot token, so new sessions attach cleanly without Telegram 409 conflicts.
+- **`gjc daemon`** lets sessions sharing a local agent directory and bot/chat configuration reuse a long-poll owner. Other GJC profiles, hosts, or applications polling the same token can still cause Telegram 409 conflicts.
 - Discord and Slack delivery ship alongside; the generic `action_needed`/`reply` protocol lets any bot or mobile app route answers back without terminal scraping.
 
 [Telegram onboarding](docs/telegram-onboarding.md) · [Discord](docs/discord-onboarding.md) · [Slack](docs/slack-onboarding.md)
@@ -181,6 +186,8 @@ deep-interview -> ralplan -> ultragoal
                └─ optional autoresearch mission when research must ground the plan
 ```
 
+These workflows are explicitly invoked, not an automatic prerequisite for every request. Clear, low-risk changes can use direct execution. Planning workflows do not authorize implementation by themselves: execution requires explicit approval or an admitted `ralplan` runtime handoff.
+
 | Surface | What it does |
 | :--- | :--- |
 | `deep-interview` | Turns vague requests into concrete requirements. |
@@ -189,7 +196,7 @@ deep-interview -> ralplan -> ultragoal
 | `autoresearch` | Runs goal-directed research missions and ends on a structured verdict. |
 | `executor` / `architect` / `planner` / `critic` | Bundled role agents for implementation and read-only review lanes. |
 
-Also included, opt-in: **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
+Also available: the experimental **`computer` tool** for Apple Silicon macOS desktop control (not a fifth bundled workflow skill). It is callable by default on supported hosts, subject to supervisor and macOS permissions; set `computer.enabled=false` to disable it. See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
 
 ## Custom skills
 
@@ -215,7 +222,7 @@ The default dark TUI identity is the GJC red-claw theme; light-appearance termin
 GJC optimizes both sides of the token bill:
 
 - **Cache hits** — per-provider `cacheRetention` control; Anthropic defaults to long (1h) cache retention because short caches are fragile for long agent runs; provider ranking prefers cheap `cacheRead` paths; opt-in session-affinity headers let OpenAI-compatible relays reuse server-side prompt caches.
-- **Context savings** — file reads return structural summaries instead of whole files; oversized shell output is minimized and spilled to retrievable `artifact://` references instead of flooding the context; compaction and branch summaries keep long sessions inside the window without losing prior work.
+- **Context savings** — supported code reads return structural summaries by default; oversized shell output can be minimized and spilled to `artifact://` references. Retrieve omitted output only when an artifact reference is actually returned. Compaction and branch summaries reduce context size but are lossy, not a guarantee that every detail is retained.
 
 [Cache retention & provider compat](docs/models.md) · [Compaction & branch summaries](docs/compaction.md)
 
@@ -249,41 +256,43 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
      sdk-skills/gjc-sdk-operate/SKILL.md    -- the allowlisted control/lifecycle operations
      sdk-skills/gjc-sdk-author/SKILL.md     -- TypeScript/Python templates for scripted flows
    Follow their allowlists exactly. Pass every value as an argv item, never as a shell string.
+   Add --json to machine CLI calls so ordinary errors use the structured stdout envelope;
+   preserve outcome certainty and references. Missing success JSON is not proof of non-execution.
 
 2. Prove the surface works (read-only). Run from inside the target repository:
      gjc --version
-     gjc sdk session list
+     gjc sdk session list --json
    `list` returns a credential-free JSON DTO of indexed sessions. Fail closed on missing,
    unavailable, stale, dead, unknown, or ambiguous rows. Exit 2 = usage error, exit 1 =
    operational failure (broker unavailable, session unavailable, retention gap, wait timeout).
 
 3. Understand a session before touching it:
-     gjc sdk session inspect <sessionId>
-     gjc sdk session raw query <sessionId> --query session.metadata
-     ... then context.get, goal.list, todo.list, workflow.gates.list, session.stats
+     gjc sdk session inspect <sessionId> --json
+     gjc sdk session raw query <sessionId> --query session.metadata --json
+     ... then context.get, goal.list/get, todo.list, workflow.gates.list, session.stats
    These reads are not an atomic snapshot: label every reported field confirmed / inferred /
    stale / unavailable / unknown. Never invent a missing value.
 
 4. Start work in an isolated session:
      gjc sdk session raw global --op session.create \
-       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}'
+       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}' --json
    Lifecycle ops allowed: session.create, session.fork, session.resume, session.close.
    session.delete is NOT allowed. session.get_endpoint is refused unconditionally.
 
 5. Drive a turn and reconcile it:
-     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid>
-     gjc sdk session status <sessionId> <opRef>        # lossless turn.result lookup
-     gjc sdk session tail <sessionId> --until-idle     # replay + live follow
+     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid> --json
+     gjc sdk session status <sessionId> <opRef> --json # lossless turn.result lookup
+     gjc sdk session tail <sessionId> --until-idle --json # replay + live follow
    Use `send --wait --timeout-ms <ms>` for a bounded wait; a wait window that elapses reports
    wait_timeout and never cancels the running turn. One fresh op-ref per logical prompt --
    `unknown` means uncertainty, never proof of non-execution, so reconcile with `status`
    instead of replaying a prompt.
 
-6. Answer what the agent asks you:
-     gjc sdk session raw control <sessionId> --op ask.answer --json-input '{...}'
-     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}'
+6. Answer durable workflow-gate questions:
+     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}' --json
    For gate answers use the durable workflow gate ID plus expectedSessionId; a transient
-   action_needed.id is never durable authority. Other allowed per-session controls:
+   action_needed.id is never durable authority. The current host does not implement the
+   protocol's general ask.answer operation. Other allowed per-session controls:
    turn.prompt, turn.steer, turn.follow_up, todo.replace, session.switch, session.rename.
 
 7. Show the human the exact operation and target before any mutating call, and treat the
@@ -297,8 +306,9 @@ Long prompts are safe to leave running: the SDK prompt deadline is a progress-aw
 by attributable tool execution for the accepted turn — not by heartbeats or streaming text.
 
 Need event-driven fan-out across many worktrees instead of one session at a time? The native
-[Coordinator MCP bridge](docs/hermes-mcp-bridge.md) (`gjc mcp-serve coordinator`, installed by
-`gjc setup hermes`) exposes the delegation tools for that shape.
+[Coordinator MCP bridge](docs/hermes-mcp-bridge.md) (`gjc mcp-serve coordinator`) exposes the delegation
+tools for that shape. `gjc setup hermes` renders a configuration preview; installation requires
+`--install` with `--target` or `--profile-dir` (see the guide).
 
 - [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar and the `/aside` composer command
 - [SDK session CLI](docs/sdk-session-cli.md) · [SDK & wire protocol](docs/sdk.md) · [SDK app guide](docs/sdk-app-guide.md) · [External-control readiness](docs/external-control-readiness.md)
@@ -401,7 +411,7 @@ gjc setup defaults --check
 
 | Tool or bot | Recommended GJC command | Boundary |
 | ----------- | ----------------------- | -------- |
-| Codex CLI | `gjc --tmux --worktree <name>` or `gjc` | `--worktree` names a GJC-managed sibling worktree; for an existing path, `cd` there first. |
+| Codex CLI | `gjc --tmux --worktree <name>` or `gjc` | `--worktree` names a GJC-managed worktree (by default under `<repo>/.worktrees/`); for an existing path, `cd` there first. |
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
@@ -421,12 +431,12 @@ For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/a
 
 ## Configuration
 
-Provider retry budgets live in `~/.gjc/config.yml`:
+Provider retry budgets can be configured in `~/.gjc/agent/config.yml` (the default global agent directory). The defaults for these keys are:
 
 ```yaml
 retry:
-  requestMaxRetries: 4
-  streamMaxRetries: 100
+  requestMaxRetries: 5
+  streamMaxRetries: 5
   maxRetries: 3
   maxDelayMs: 300000
 ```

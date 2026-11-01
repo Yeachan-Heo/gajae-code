@@ -17,6 +17,7 @@ import { getEnvApiKey } from "./stream";
 import type { Provider } from "./types";
 import {
 	type CredentialRankingStrategy,
+	resolveAntigravityQuotaPool,
 	UsageAuthenticationError,
 	type UsageCredential,
 	type UsageFetchContext,
@@ -699,19 +700,22 @@ export interface CredentialDisabledEvent {
 export type CredentialRankingMode = "balanced" | "earliest-reset";
 
 /**
- * Persisted soft preference for one provider's OAuth pool.
+ * One entry of a provider's ordered, persisted soft preference list.
  *
- * The matching credential is moved ahead of the normal ranking while it is
- * usable. It yields to the normal ranking when it is blocked, when it cannot be
- * found, or when its most-used known usage window has reached
- * `maxUsedFraction`. Unknown usage never counts as over the threshold.
+ * Entries are consulted in list order when a credential is selected. Usable
+ * entries under their cap are tried first, in list order; the remaining
+ * credentials follow in the normal ranking order. An entry whose most-used
+ * known usage window has reached `maxUsedFraction` is demoted behind every
+ * other credential, so it is used only when nothing else is available. A
+ * blocked or missing entry is skipped. Unknown usage never counts as over the
+ * cap.
  *
  * Runtime selectors (`--credential`, `--prefer-credential`) and session
- * stickiness take precedence over a configured preference.
+ * stickiness take precedence over configured preferences.
  */
 export interface ConfiguredCredentialPreference {
 	selector: AuthCredentialSelector;
-	/** Used fraction in (0, 1] at which the preference stops applying. Absent means only blocking rotates away. */
+	/** Used fraction in (0, 1] at which this entry stops being preferred. Absent means only blocking moves past it. */
 	maxUsedFraction?: number;
 }
 
@@ -731,8 +735,8 @@ export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	credentialRankingMode?: CredentialRankingMode;
-	/** Persisted soft preferences keyed by provider id. */
-	credentialPreferences?: Readonly<Record<string, ConfiguredCredentialPreference>>;
+	/** Persisted ordered soft preferences keyed by provider id. */
+	credentialPreferences?: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
@@ -991,9 +995,61 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 30 * 24 * 60 * 60 * 1000 },
 		} satisfies CredentialRankingStrategy,
 	],
+	[
+		"google-antigravity",
+		{
+			findWindowLimits(report) {
+				const isUntouchedFiveHour = (limit: UsageLimit): boolean => {
+					const windowId = (limit.window?.id ?? limit.scope.windowId)?.toLowerCase();
+					const used = limit.amount.usedFraction;
+					return windowId === "5h" && typeof used === "number" && Number.isFinite(used) && used === 0;
+				};
+				const fiveHour = report.limits.find(
+					limit => (limit.window?.id ?? limit.scope.windowId)?.toLowerCase() === "5h",
+				);
+				const weekly = report.limits.find(limit => {
+					const windowId = (limit.window?.id ?? limit.scope.windowId)?.toLowerCase();
+					return windowId === "7d" || windowId === "weekly";
+				});
+				const fallback = report.limits[0];
+				const primary = fiveHour ?? weekly ?? fallback;
+				const secondary = weekly ?? fiveHour ?? fallback;
+				// An untouched 5h window in Antigravity reports a sliding `now + 5h`
+				// horizon rather than an active countdown; strip `resetsAt` from that
+				// unstarted horizon so `earliest-reset` drains accounts with actively
+				// ticking windows before starting a fresh account's 5h timer.
+				const normalizeHorizon = (limit: UsageLimit | undefined): UsageLimit | undefined => {
+					if (!limit || !isUntouchedFiveHour(limit) || !limit.window?.resetsAt) return limit;
+					const { resetsAt: _slidingResetAt, ...restWindow } = limit.window;
+					return { ...limit, window: restWindow };
+				};
+				return {
+					primary: normalizeHorizon(primary),
+					secondary: normalizeHorizon(secondary),
+				};
+			},
+			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
+		} satisfies CredentialRankingStrategy,
+	],
 ]);
 
 const USAGE_CACHE_PREFIX = "usage_cache:";
+
+/**
+ * Report-shape version per provider. Bump when a provider's limits change
+ * meaning under an unchanged credential identity so rows written by an older
+ * binary are never read back as if they had the current shape. Antigravity
+ * schema 2 separates the 5-hour and weekly horizons and the Gemini / Gemini
+ * Argon / Claude-GPT quota pools; schema 1 rows carry window `default` with
+ * per-model labels and pool nothing.
+ */
+const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2 };
+
+function usageReportSchemaTag(provider: string): string {
+	const version = USAGE_REPORT_SCHEMA_VERSIONS[provider];
+	return version === undefined ? "" : `|schema:${version}`;
+}
+
 function hashUsageDiagnosticValue(value: unknown): string | undefined {
 	if (typeof value !== "string" || value.length === 0) return undefined;
 	return Bun.hash(value).toString(16);
@@ -1207,7 +1263,7 @@ export function formatOAuthIdentityLabel(
 	return base ? `${base} (${organization})` : organization;
 }
 
-type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
+type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential; credentialRowId: number };
 
 /**
  * Refreshed OAuth access plus identity metadata returned by
@@ -1244,6 +1300,19 @@ const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
 function safeUsageReport(report: UsageReport): SafeUsageReport {
 	const { raw: _raw, ...safe } = report;
 	return safe;
+}
+
+function isUsageReportValue(value: unknown): value is UsageReport {
+	if (typeof value !== "object" || value === null) return false;
+	const report = value as Partial<UsageReport>;
+	return typeof report.provider === "string" && typeof report.fetchedAt === "number" && Array.isArray(report.limits);
+}
+
+/** Persist the same projection `safeUsageReport` already returns to readers. */
+function persistedUsageCacheValue<T>(value: T): T {
+	if (Array.isArray(value)) return value.map(item => persistedUsageCacheValue(item)) as T;
+	if (isUsageReportValue(value)) return safeUsageReport(value) as T;
+	return value;
 }
 
 function scrubHealthReason(reason: unknown, secrets: readonly string[] = []): string {
@@ -1478,7 +1547,8 @@ class AuthStorageUsageCache implements UsageCache {
 	}
 
 	set<T>(key: string, entry: UsageCacheEntry<T>): void {
-		const payload = JSON.stringify({ value: entry.value, expiresAt: entry.expiresAt });
+		const value = persistedUsageCacheValue(entry.value);
+		const payload = JSON.stringify({ value, expiresAt: entry.expiresAt });
 		const durableExpiresAt =
 			entry.value === null ? entry.expiresAt : Math.max(entry.expiresAt, Date.now() + USAGE_LAST_GOOD_RETENTION_MS);
 		this.store.setCache(`${USAGE_CACHE_PREFIX}${key}`, payload, Math.floor(durableExpiresAt / 1000));
@@ -1522,6 +1592,15 @@ type ConfigApiKeyOwnerFork = {
  * Reads from storage on reload(), manages round-robin credential selection,
  * usage limit tracking, and OAuth token refresh.
  */
+/** Tier names that denote a model family rather than a plan or quota tier. */
+const MODEL_FAMILY_TIERS: ReadonlySet<string> = new Set(["opus", "sonnet", "haiku"]);
+
+/** A recorded usage-limit backoff; `modelId` scopes it to one model or model family. */
+interface CredentialBackoffEntry {
+	untilMs: number;
+	modelId?: string;
+}
+
 export class AuthStorage {
 	static readonly #defaultBackoffMs = 60_000; // Default backoff when no reset time available
 
@@ -1546,8 +1625,10 @@ export class AuthStorage {
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Soft runtime credential preference per provider; quota failures may rotate away from it. */
 	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
-	/** Persisted soft credential preference per provider; usage threshold and quota failures may rotate away from it. */
-	#configuredCredentialPreferences: Map<string, ConfiguredCredentialPreference> = new Map();
+	/** Persisted ordered soft credential preferences per provider; usage caps and quota failures move past entries. */
+	#configuredCredentialPreferences: Map<string, readonly ConfiguredCredentialPreference[]> = new Map();
+	/** Providers already warned that their preference list names one stored row twice. */
+	#warnedDuplicateCredentialPreferences = new Set<string>();
 	/** Credential selectors explicitly attached to a credential session scope. */
 	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
@@ -1561,7 +1642,7 @@ export class AuthStorage {
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
 	#sessionLastCredential: Map<string, Map<string, { type: AuthCredential["type"]; index: number }>> = new Map();
 	/** Maps provider:type -> credentialIndex -> blockedUntilMs for temporary backoff. */
-	#credentialBackoff: Map<string, Map<number, number>> = new Map();
+	#credentialBackoff: Map<string, Map<number, CredentialBackoffEntry[]>> = new Map();
 	#usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	#rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	#usageCache: UsageCache;
@@ -1638,8 +1719,10 @@ export class AuthStorage {
 				: DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
 		this.#usageFetchLeaseMs = usageTimeoutForLease + USAGE_FETCH_LEASE_GRACE_MS;
 		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
-		for (const [provider, preference] of Object.entries(options.credentialPreferences ?? {})) {
-			this.#configuredCredentialPreferences.set(resolveOAuthStorageProvider(provider), preference);
+		for (const [provider, preferences] of Object.entries(options.credentialPreferences ?? {})) {
+			if (preferences.length > 0) {
+				this.#configuredCredentialPreferences.set(resolveOAuthStorageProvider(provider), preferences);
+			}
 		}
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
@@ -2504,8 +2587,12 @@ export class AuthStorage {
 		return this.#storedApiKeyUsability(storageProvider, entry.credential.key);
 	}
 
-	/** Whether an enabled stored row is currently available outside quota backoff. */
-	isCredentialAvailable(provider: string, rowId: number): boolean {
+	/**
+	 * Whether an enabled stored row is currently available outside quota backoff.
+	 * Pass `modelId` when the caller knows the requested model so a backoff scoped
+	 * to another model does not hide the row; without it every backoff applies.
+	 */
+	isCredentialAvailable(provider: string, rowId: number, modelId?: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const entries = this.#getStoredCredentials(storageProvider);
 		const index = entries.findIndex(entry => entry.id === rowId);
@@ -2520,7 +2607,7 @@ export class AuthStorage {
 		const entry = entries[index];
 		return (
 			entry !== undefined &&
-			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index)
+			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index, modelId)
 		);
 	}
 
@@ -3043,32 +3130,68 @@ export class AuthStorage {
 		return order;
 	}
 
-	/** Returns block expiry timestamp for a credential, cleaning up expired entries. */
-	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number): number | undefined {
+	/**
+	 * Returns the block expiry for a credential, cleaning up expired entries.
+	 * A block recorded for one model only applies to that model; a block without a
+	 * model applies to the whole credential. `modelId` is the requested model;
+	 * omitting it conservatively treats every live block, scoped or not, as applicable.
+	 */
+	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number, modelId?: string): number | undefined {
 		const backoffMap = this.#credentialBackoff.get(providerKey);
 		if (!backoffMap) return undefined;
-		const blockedUntil = backoffMap.get(credentialIndex);
-		if (!blockedUntil) return undefined;
-		if (blockedUntil <= Date.now()) {
-			backoffMap.delete(credentialIndex);
-			if (backoffMap.size === 0) {
-				this.#credentialBackoff.delete(providerKey);
+		const entries = backoffMap.get(credentialIndex);
+		if (!entries || entries.length === 0) return undefined;
+		const now = Date.now();
+		const live = entries.filter(entry => entry.untilMs > now);
+		if (live.length !== entries.length) {
+			if (live.length > 0) backoffMap.set(credentialIndex, live);
+			else backoffMap.delete(credentialIndex);
+			if (backoffMap.size === 0) this.#credentialBackoff.delete(providerKey);
+		}
+		let blockedUntil: number | undefined;
+		const wanted = modelId?.trim().toLowerCase();
+		const isAntigravity = providerKey.startsWith("google-antigravity:");
+		const wantedPool = wanted && isAntigravity ? resolveAntigravityQuotaPool(wanted) : undefined;
+		const hasExactEntryForWanted =
+			wanted !== undefined && live.some(entry => entry.modelId?.toLowerCase() === wanted);
+		// A recorded scope may name a model or a model-family tier, so match a tier
+		// against the requested model id the same way limit scoping does.
+		const entryApplies = (entryModel: string): boolean => {
+			if (wanted === undefined) return true;
+			const scope = entryModel.toLowerCase();
+			if (scope === wanted) return true;
+			if (MODEL_FAMILY_TIERS.has(scope) && wanted.includes(scope)) return true;
+			if (wantedPool !== undefined && !hasExactEntryForWanted) {
+				return resolveAntigravityQuotaPool(scope) === wantedPool;
 			}
-			return undefined;
+			return false;
+		};
+		for (const entry of live) {
+			if (entry.modelId !== undefined && !entryApplies(entry.modelId)) continue;
+			if (blockedUntil === undefined || entry.untilMs > blockedUntil) blockedUntil = entry.untilMs;
 		}
 		return blockedUntil;
 	}
 
 	/** Checks if a credential is temporarily blocked due to usage limits. */
-	#isCredentialBlocked(providerKey: string, credentialIndex: number): boolean {
-		return this.#getCredentialBlockedUntil(providerKey, credentialIndex) !== undefined;
+	#isCredentialBlocked(providerKey: string, credentialIndex: number, modelId?: string): boolean {
+		return this.#getCredentialBlockedUntil(providerKey, credentialIndex, modelId) !== undefined;
 	}
 
-	/** Marks a credential as blocked until the specified time. */
-	#markCredentialBlocked(providerKey: string, credentialIndex: number, blockedUntilMs: number): void {
-		const backoffMap = this.#credentialBackoff.get(providerKey) ?? new Map<number, number>();
-		const existing = backoffMap.get(credentialIndex) ?? 0;
-		backoffMap.set(credentialIndex, Math.max(existing, blockedUntilMs));
+	/** Marks a credential as blocked until the specified time, optionally for one model. */
+	#markCredentialBlocked(
+		providerKey: string,
+		credentialIndex: number,
+		blockedUntilMs: number,
+		modelId?: string,
+	): void {
+		const scoped = modelId?.trim() || undefined;
+		const backoffMap = this.#credentialBackoff.get(providerKey) ?? new Map<number, CredentialBackoffEntry[]>();
+		const entries = backoffMap.get(credentialIndex) ?? [];
+		const existing = entries.find(entry => entry.modelId === scoped);
+		if (existing) existing.untilMs = Math.max(existing.untilMs, blockedUntilMs);
+		else entries.push({ untilMs: blockedUntilMs, modelId: scoped });
+		backoffMap.set(credentialIndex, entries);
 		this.#credentialBackoff.set(providerKey, backoffMap);
 	}
 
@@ -3222,10 +3345,41 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Move the configured preferred credential to the front of `candidates` while it is usable and under its usage
-	 * threshold. A missing row, a blocked row, or a row at its threshold leaves the normal ranking untouched.
+	 * Providers whose configured preference list names one stored credential row through more than one entry, for
+	 * example `email:` and `account:` selectors for the same login. Startup rejects such a list.
 	 */
-	async #applyConfiguredCredentialPreference(
+	findDuplicateCredentialPreferences(): Array<{ provider: string; credentialId: number }> {
+		const duplicates: Array<{ provider: string; credentialId: number }> = [];
+		for (const [provider, preferences] of this.#configuredCredentialPreferences) {
+			const credentialId = this.#duplicateConfiguredPreferenceRow(provider, preferences);
+			if (credentialId !== undefined) duplicates.push({ provider, credentialId });
+		}
+		return duplicates;
+	}
+
+	/** Id of the first stored row that two entries of `preferences` both designate; undefined when every entry differs. */
+	#duplicateConfiguredPreferenceRow(
+		provider: string,
+		preferences: readonly ConfiguredCredentialPreference[],
+	): number | undefined {
+		const designatedIds = new Set<number>();
+		for (const { selector } of preferences) {
+			const credentialId = this.#findCredentialBySelector(provider, selector)?.id;
+			if (credentialId === undefined) continue;
+			if (designatedIds.has(credentialId)) return credentialId;
+			designatedIds.add(credentialId);
+		}
+		return undefined;
+	}
+
+	/**
+	 * Reorder `candidates` by the provider's configured preference list: usable entries under their cap first, in list
+	 * order; then the remaining candidates in their ranked order; then entries at or over their cap, in list order.
+	 * Missing and blocked entries are skipped and keep their ranked position. A list that names one stored row twice
+	 * (startup rejects it, but a later login can make two entries resolve to one row) is ignored as a whole rather than
+	 * applying one entry's position and cap and dropping the other's.
+	 */
+	async #applyConfiguredCredentialPreferences(
 		provider: string,
 		providerKey: string,
 		candidates: Array<{
@@ -3236,28 +3390,71 @@ export class AuthStorage {
 		strategy: CredentialRankingStrategy | undefined,
 		options?: AuthApiKeyOptions,
 	): Promise<void> {
-		const preference = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
-		if (!preference) return;
-		const preferredCandidate = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
-		if (preferredCandidate < 0) return;
-		const { maxUsedFraction } = preference;
-		if (maxUsedFraction !== undefined) {
-			const candidate = candidates[preferredCandidate]!;
-			if (!candidate.usageChecked) {
+		const preferences = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
+		if (!preferences) return;
+		const duplicateCredentialId = this.#duplicateConfiguredPreferenceRow(provider, preferences);
+		if (duplicateCredentialId !== undefined) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			if (!this.#warnedDuplicateCredentialPreferences.has(storageProvider)) {
+				this.#warnedDuplicateCredentialPreferences.add(storageProvider);
+				logger.warn("Configured credential preferences name one account twice; using normal ranking", {
+					provider: storageProvider,
+					credentialId: duplicateCredentialId,
+				});
+			}
+			return;
+		}
+		type Candidate = (typeof candidates)[number];
+		const matched: Array<{ candidate: Candidate; maxUsedFraction: number | undefined }> = [];
+		const claimed = new Set<Candidate>();
+		for (const preference of preferences) {
+			const position = this.#findUsableOAuthCandidate(
+				provider,
+				providerKey,
+				candidates,
+				preference.selector,
+				options?.modelId,
+			);
+			if (position < 0) continue;
+			const candidate = candidates[position]!;
+			claimed.add(candidate);
+			matched.push({ candidate, maxUsedFraction: preference.maxUsedFraction });
+		}
+		if (matched.length === 0) return;
+		// Ranking already fetched usage for strategy-backed providers; fetch only what a cap still needs.
+		await Promise.all(
+			matched.map(async ({ candidate, maxUsedFraction }) => {
+				if (maxUsedFraction === undefined || candidate.usageChecked) return;
 				candidate.usage = await this.#getUsageReport(provider, candidate.selection.credential, {
 					baseUrl: options?.baseUrl,
 					timeoutMs: this.#usageRequestTimeoutMs,
 					signal: options?.signal,
 				});
 				candidate.usageChecked = true;
+			}),
+		);
+		const preferred: Candidate[] = [];
+		const capped: Candidate[] = [];
+		for (const { candidate, maxUsedFraction } of matched) {
+			const scopedUsage =
+				candidate.usage && options?.modelId
+					? {
+							...candidate.usage,
+							limits: candidate.usage.limits.filter(limit =>
+								this.#limitAppliesToModel(limit, options.modelId, candidate.usage!.limits),
+							),
+						}
+					: candidate.usage;
+			const usedFraction =
+				maxUsedFraction === undefined ? undefined : this.#maxKnownUsedFraction(scopedUsage, strategy);
+			if (maxUsedFraction !== undefined && usedFraction !== undefined && usedFraction >= maxUsedFraction) {
+				capped.push(candidate);
+			} else {
+				preferred.push(candidate);
 			}
-			const usedFraction = this.#maxKnownUsedFraction(candidate.usage, strategy);
-			if (usedFraction !== undefined && usedFraction >= maxUsedFraction) return;
 		}
-		if (preferredCandidate > 0) {
-			const [preferred] = candidates.splice(preferredCandidate, 1);
-			candidates.unshift(preferred);
-		}
+		const rest = candidates.filter(candidate => !claimed.has(candidate));
+		candidates.splice(0, candidates.length, ...preferred, ...rest, ...capped);
 	}
 
 	/**
@@ -3270,12 +3467,13 @@ export class AuthStorage {
 		providerKey: string,
 		candidates: ReadonlyArray<{ selection: OAuthCredentialSelection }>,
 		selector: AuthCredentialSelector,
+		modelId?: string,
 	): number {
 		const designated = this.#findCredentialBySelector(provider, selector);
 		if (designated?.credential.type !== "oauth") return -1;
 		const position = candidates.findIndex(candidate => candidate.selection.id === designated.id);
 		if (position < 0) return -1;
-		return this.#isCredentialBlocked(providerKey, candidates[position]!.selection.index) ? -1 : position;
+		return this.#isCredentialBlocked(providerKey, candidates[position]!.selection.index, modelId) ? -1 : position;
 	}
 
 	/** Highest reported used fraction across known usage windows; undefined when no window reports one. */
@@ -3300,12 +3498,14 @@ export class AuthStorage {
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a runtime API key override is active`,
 			);
 		}
-		if (this.#hasConfigOverride(provider, owner)) {
+		const selected = this.#findCredentialBySelector(provider, selector);
+		const configOverride = this.#configOverrideRegistration(provider, owner);
+		if (configOverride && !(configOverride.envSourced && selected?.credential.type === "api_key")) {
 			throw new Error(
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a config API key override is active`,
 			);
 		}
-		if (!this.#findCredentialBySelector(provider, selector)) {
+		if (!selected) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
 		}
 	}
@@ -4468,15 +4668,16 @@ export class AuthStorage {
 	#buildUsageReportCacheKey(request: UsageRequestDescriptor): string {
 		const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
 		const identity = this.#buildUsageCacheIdentity(request.credential);
-		return `report:${request.provider}:${baseUrl}:${identity}`;
+		return `report:${request.provider}:${baseUrl}:${identity}${usageReportSchemaTag(request.provider)}`;
 	}
 
 	#buildUsageReportsCacheKey(requests: ReadonlyArray<UsageRequestDescriptor>): string {
 		const snapshot = requests
-			.map(
-				request =>
-					`${request.provider}:${this.#normalizeUsageBaseUrl(request.baseUrl) || "default"}:${this.#buildUsageCacheIdentity(request.credential)}`,
-			)
+			.map(request => {
+				const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
+				const identity = this.#buildUsageCacheIdentity(request.credential);
+				return `${request.provider}:${baseUrl}:${identity}${usageReportSchemaTag(request.provider)}`;
+			})
 			.sort()
 			.join("\n");
 		return `reports:${Bun.hash(snapshot).toString(16)}`;
@@ -5057,15 +5258,70 @@ export class AuthStorage {
 	}
 
 	/** Returns true if usage indicates rate limit has been reached. */
-	#isUsageLimitReached(report: UsageReport): boolean {
-		return report.limits.some(limit => this.#isUsageLimitExhausted(limit));
+	/**
+	 * True when an exhausted limit applies to `modelId`. A limit scoped to one
+	 * model (or one tier's model entry) does not exhaust the credential for other
+	 * models; a limit with no model scope and not marked shared-blocking applies to
+	 * every model.
+	 */
+	#isModelScopedLimit(limit: UsageLimit): boolean {
+		if (limit.scope?.modelId?.trim()) return true;
+		const tier = limit.scope?.tier?.trim().toLowerCase();
+		return Boolean(tier && MODEL_FAMILY_TIERS.has(tier));
+	}
+
+	#isUsageLimitReached(report: UsageReport, modelId?: string): boolean {
+		const wanted = modelId?.trim();
+		if (wanted === undefined) {
+			const hasExhaustedWideLimit = report.limits.some(
+				limit => !this.#isModelScopedLimit(limit) && this.#isUsageLimitExhausted(limit),
+			);
+			if (hasExhaustedWideLimit) return true;
+			const scopedLimits = report.limits.filter(limit => this.#isModelScopedLimit(limit));
+			return scopedLimits.length > 0 && scopedLimits.every(limit => this.#isUsageLimitExhausted(limit));
+		}
+		return report.limits.some(
+			limit => this.#limitAppliesToModel(limit, wanted, report.limits) && this.#isUsageLimitExhausted(limit),
+		);
+	}
+
+	/**
+	 * Whether a usage limit constrains the requested model. Only model-family
+	 * tiers are treated as model scoping: `scope.tier` also carries plans
+	 * (Codex/Copilot) and quota tiers (Gemini), which apply to every model.
+	 */
+	#limitAppliesToModel(limit: UsageLimit, modelId?: string, allLimits?: readonly UsageLimit[]): boolean {
+		const wanted = modelId?.trim();
+		// Without a requested model, every limit applies: callers that do not know
+		// the model keep today's conservative "any exhausted limit blocks".
+		if (wanted === undefined) return true;
+		const wantedLower = wanted.toLowerCase();
+		const scopedModel = limit.scope?.modelId?.trim();
+		if (scopedModel) {
+			if (wantedLower === scopedModel.toLowerCase()) return true;
+			if (limit.scope?.provider === "google-antigravity") {
+				const hasExactModelInReport = allLimits?.some(
+					entry => entry.scope?.modelId?.trim().toLowerCase() === wantedLower,
+				);
+				if (!hasExactModelInReport) {
+					const wantedPool = resolveAntigravityQuotaPool(wanted);
+					if (wantedPool !== undefined && wantedPool === resolveAntigravityQuotaPool(scopedModel)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+		const tier = limit.scope?.tier?.trim().toLowerCase();
+		if (tier && MODEL_FAMILY_TIERS.has(tier)) return wantedLower.includes(tier);
+		return true;
 	}
 
 	/** Extracts the earliest reset timestamp from exhausted windows (in ms). */
-	#getUsageResetAtMs(report: UsageReport, nowMs: number): number | undefined {
+	#getUsageResetAtMs(report: UsageReport, nowMs: number, modelId?: string): number | undefined {
 		const candidates: number[] = [];
 		for (const limit of report.limits) {
-			if (!this.#isUsageLimitExhausted(limit)) continue;
+			if (!this.#limitAppliesToModel(limit, modelId, report.limits) || !this.#isUsageLimitExhausted(limit)) continue;
 			const window = limit.window;
 			if (window?.resetsAt && window.resetsAt > nowMs) {
 				candidates.push(window.resetsAt);
@@ -5073,6 +5329,62 @@ export class AuthStorage {
 		}
 		if (candidates.length === 0) return undefined;
 		return Math.min(...candidates);
+	}
+
+	/**
+	 * Backoff targets implied by an exhausted usage report: a credential-wide
+	 * until for limits that are not model-scoped, plus one entry per exhausted
+	 * model-scoped limit must not take the whole credential
+	 * out of rotation for other models.
+	 *
+	 * An exhausted limit without a usable (future) reset still produces a target,
+	 * expiring at `fallbackUntilMs`, so a reset-less wide limit keeps blocking the
+	 * credential and a reset-less scoped limit stays confined to its model.
+	 */
+	#exhaustedLimitBlockTargets(
+		report: UsageReport,
+		nowMs: number,
+		fallbackUntilMs: number,
+	): { wideUntil?: number; scoped: Array<{ modelId: string; untilMs: number }> } {
+		let wideUntil: number | undefined;
+		let wideWithoutReset = false;
+		const scoped: Array<{ modelId: string; untilMs: number }> = [];
+		for (const limit of report.limits) {
+			if (!this.#isUsageLimitExhausted(limit)) continue;
+			const resetsAt = limit.window?.resetsAt;
+			const usableReset = resetsAt !== undefined && resetsAt > nowMs ? resetsAt : undefined;
+			const scopeModel = limit.scope?.modelId?.trim();
+			const tier = limit.scope?.tier?.trim().toLowerCase();
+			if (!scopeModel && !(tier && MODEL_FAMILY_TIERS.has(tier))) {
+				if (usableReset === undefined) wideWithoutReset = true;
+				else wideUntil = wideUntil === undefined ? usableReset : Math.min(wideUntil, usableReset);
+				continue;
+			}
+			scoped.push({ modelId: scopeModel ?? tier!, untilMs: usableReset ?? fallbackUntilMs });
+		}
+		if (wideUntil === undefined && wideWithoutReset) wideUntil = fallbackUntilMs;
+		return wideUntil === undefined ? { scoped } : { wideUntil, scoped };
+	}
+
+	/**
+	 * Records the backoff implied by an exhausted usage report on one credential:
+	 * a credential-wide block only when a non-model-scoped limit is exhausted (or
+	 * nothing more specific is known), plus one block per exhausted scoped limit.
+	 */
+	#markExhaustedUsageBlocks(
+		providerKey: string,
+		credentialIndex: number,
+		report: UsageReport,
+		nowMs: number,
+		fallbackUntilMs: number,
+	): void {
+		const targets = this.#exhaustedLimitBlockTargets(report, nowMs, fallbackUntilMs);
+		if (targets.wideUntil !== undefined || targets.scoped.length === 0) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, targets.wideUntil ?? fallbackUntilMs);
+		}
+		for (const scoped of targets.scoped) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, scoped.untilMs, scoped.modelId);
+		}
 	}
 
 	async #getUsageReport(
@@ -5603,7 +5915,15 @@ export class AuthStorage {
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
+		options?: {
+			retryAfterMs?: number;
+			baseUrl?: string;
+			signal?: AbortSignal;
+			owner?: object;
+			rowId?: number;
+			/** Scope the block to one model; other models keep using the credential. */
+			modelId?: string;
+		},
 	): Promise<UsageLimitMarkResult> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
@@ -5624,11 +5944,19 @@ export class AuthStorage {
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
+		// Model-scoped exhausted limits only constrain their own model; an
+		// unscoped or shared limit raises the credential-wide backoff.
+		let scopedBlocks: Array<{ modelId: string; untilMs: number }> = [];
+		let reportHasWideLimit = false;
 		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
 			const report = await this.#getUsageReport(provider, initial.credential, options);
-			if (report && this.#isUsageLimitReached(report)) {
-				const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
-				if (resetAtMs && resetAtMs > blockedUntil) blockedUntil = resetAtMs;
+			if (report) {
+				const targets = this.#exhaustedLimitBlockTargets(report, Date.now(), blockedUntil);
+				if (targets.wideUntil !== undefined) {
+					reportHasWideLimit = true;
+					if (targets.wideUntil > blockedUntil) blockedUntil = targets.wideUntil;
+				}
+				scopedBlocks = targets.scoped;
 			}
 		}
 
@@ -5646,7 +5974,11 @@ export class AuthStorage {
 						candidate.entry.credential.type === credentialKind &&
 						candidate.entry.id !== failedRowId &&
 						(!enabledIds || enabledIds.has(candidate.entry.id)) &&
-						!this.#isCredentialBlocked(this.#getProviderTypeKey(provider, credentialKind), candidate.index),
+						!this.#isCredentialBlocked(
+							this.#getProviderTypeKey(provider, credentialKind),
+							candidate.index,
+							options?.modelId,
+						),
 				)
 				.map(candidate => candidate.entry.id);
 		};
@@ -5659,13 +5991,48 @@ export class AuthStorage {
 			};
 		}
 		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
-		this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
+		// An exhausted wide limit in the report takes the whole credential out of
+		// rotation regardless of which model hit it. A report whose only exhausted
+		// limits are model-scoped must not; those scopes carry the backoff instead.
+		// Without report evidence the caller's retry-after applies to its model.
+		if (reportHasWideLimit) {
+			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
+		} else if (scopedBlocks.length === 0) {
+			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil, options?.modelId);
+		}
+		for (const scoped of scopedBlocks) {
+			this.#markCredentialBlocked(providerKey, targetIndex, scoped.untilMs, scoped.modelId);
+		}
 		return {
 			state: "marked",
 			failedRowId,
 			credentialKind,
 			remainingCredentialIds: remainingCredentialIds(),
 		};
+	}
+
+	/**
+	 * Opaque stored row IDs for credentials whose resolved key matches `apiKey`.
+	 * Unlike the session's sticky row pointer, these remain tied to the actual key
+	 * when concurrent requests share a credential session ID.
+	 * A row that cannot be resolved is skipped so an unrelated resolver failure
+	 * cannot prevent callers from using already-known credential identity.
+	 */
+	async getCredentialRowIdsMatchingApiKey(provider: string, apiKey: string): Promise<number[]> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const rowIds: number[] = [];
+		for (const entry of this.#getStoredCredentials(storageProvider)) {
+			try {
+				if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) rowIds.push(entry.id);
+			} catch (error) {
+				logger.warn("Failed to resolve stored API key while matching credential rows", {
+					provider: storageProvider,
+					credentialId: entry.id,
+					errorType: error instanceof Error ? error.name : typeof error,
+				});
+			}
+		}
+		return rowIds;
 	}
 
 	/**
@@ -5800,7 +6167,11 @@ export class AuthStorage {
 			args.order.map(async idx => {
 				const selection = args.credentials[idx];
 				if (!selection) return null;
-				const blockedUntil = this.#getCredentialBlockedUntil(args.providerKey, selection.index);
+				const blockedUntil = this.#getCredentialBlockedUntil(
+					args.providerKey,
+					selection.index,
+					args.options?.modelId,
+				);
 				if (blockedUntil !== undefined) return { selection, usage: null, usageChecked: false, blockedUntil };
 				const usage = await this.#getUsageReport(args.provider, selection.credential, {
 					baseUrl: args.options?.baseUrl,
@@ -5838,13 +6209,25 @@ export class AuthStorage {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
-			if (!blocked && usage && this.#isUsageLimitReached(usage)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs);
-				blockedUntil = resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs;
-				this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
+			if (!blocked && usage && this.#isUsageLimitReached(usage, args.options?.modelId)) {
+				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, args.options?.modelId);
+				const fallbackUntilMs = Date.now() + AuthStorage.#defaultBackoffMs;
+				blockedUntil = resetAtMs ?? fallbackUntilMs;
+				this.#markExhaustedUsageBlocks(args.providerKey, selection.index, usage, nowMs, fallbackUntilMs);
 				blocked = true;
 			}
-			const windows = usage ? strategy.findWindowLimits(usage) : undefined;
+			// Rank on the windows that apply to the requested model so a limit scoped
+			// to another model does not depress this credential's drain metrics.
+			const scopedUsage =
+				usage && args.options?.modelId
+					? {
+							...usage,
+							limits: usage.limits.filter(limit =>
+								this.#limitAppliesToModel(limit, args.options?.modelId, usage.limits),
+							),
+						}
+					: usage;
+			const windows = scopedUsage ? strategy.findWindowLimits(scopedUsage) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
 			const secondaryTarget = secondary ?? primary;
@@ -5971,7 +6354,8 @@ export class AuthStorage {
 		// (no preference) and sessions whose preferred is blocked still rank, so we pick the account
 		// with the most headroom proactively and fall back intelligently when rate-limited.
 		const sessionPreferredIsAvailable =
-			sessionPreferredIndex !== undefined && !this.#isCredentialBlocked(providerKey, sessionPreferredIndex);
+			sessionPreferredIndex !== undefined &&
+			!this.#isCredentialBlocked(providerKey, sessionPreferredIndex, options?.modelId);
 		const shouldRank = !selectedCredential && checkUsage && !sessionPreferredIsAvailable;
 		const candidates = shouldRank
 			? await this.#rankOAuthSelections({ providerKey, provider, order, credentials, options, strategy: strategy! })
@@ -5994,22 +6378,24 @@ export class AuthStorage {
 				);
 			}
 			const preferredCandidate = preferredSelector
-				? this.#findUsableOAuthCandidate(provider, providerKey, candidates, preferredSelector)
+				? this.#findUsableOAuthCandidate(provider, providerKey, candidates, preferredSelector, options?.modelId)
 				: -1;
 			if (preferredCandidate >= 0) {
 				if (preferredCandidate > 0) {
 					const [preferred] = candidates.splice(preferredCandidate, 1);
 					candidates.unshift(preferred);
 				}
-			} else if (!preferredSelector) {
-				await this.#applyConfiguredCredentialPreference(provider, providerKey, candidates, strategy, options);
+			} else if (!preferredSelector && !sessionPreferredIsAvailable) {
+				// Configured preferences choose a credential; a session that already sticks to a usable one keeps it, so
+				// the list (and any usage fetch its caps need) is consulted only at selection time.
+				await this.#applyConfiguredCredentialPreferences(provider, providerKey, candidates, strategy, options);
 			}
 		}
 
 		if (!selectedCredential && sessionPreferredIndex !== undefined) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
-					!this.#isCredentialBlocked(providerKey, candidate.selection.index) &&
+					!this.#isCredentialBlocked(providerKey, candidate.selection.index, options?.modelId) &&
 					candidate.selection.index === sessionPreferredIndex,
 			);
 			if (sessionPreferredCandidate > 0) {
@@ -6075,7 +6461,7 @@ export class AuthStorage {
 			if (resolved) return resolved;
 		}
 
-		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index)) {
+		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index, options?.modelId)) {
 			return this.#tryOAuthCredential(
 				provider,
 				fallback.selection,
@@ -6472,7 +6858,7 @@ export class AuthStorage {
 	): Promise<OAuthResolutionResult | undefined> {
 		const { checkUsage, allowBlocked, prefetchedUsage = null, usagePrechecked = false } = usageOptions;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
-		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
+		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index, options?.modelId)) {
 			return undefined;
 		}
 
@@ -6494,12 +6880,14 @@ export class AuthStorage {
 				});
 				usageChecked = true;
 			}
-			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
-				this.#markCredentialBlocked(
+			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
+				const nowMs = Date.now();
+				this.#markExhaustedUsageBlocks(
 					providerKey,
 					selection.index,
-					resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
+					usage,
+					nowMs,
+					nowMs + AuthStorage.#defaultBackoffMs,
 				);
 				return undefined;
 			}
@@ -6576,12 +6964,14 @@ export class AuthStorage {
 					});
 					usageChecked = true;
 				}
-				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
-					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
-					this.#markCredentialBlocked(
+				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
+					const nowMs = Date.now();
+					this.#markExhaustedUsageBlocks(
 						providerKey,
 						selection.index,
-						resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
+						usage,
+						nowMs,
+						nowMs + AuthStorage.#defaultBackoffMs,
 					);
 					return undefined;
 				}
@@ -6589,7 +6979,7 @@ export class AuthStorage {
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
-			return { apiKey: result.apiKey, credential: updated };
+			return { apiKey: result.apiKey, credential: updated, credentialRowId: selection.id };
 		} catch (error) {
 			if (options?.signal?.aborted) throw error;
 			if (isSqliteError(error)) throw error;
@@ -6932,6 +7322,31 @@ export class AuthStorage {
 	 * 10. Fallback resolver (models.yml custom providers, last-resort)
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+		return this.#resolveApiKey(provider, sessionId, options);
+	}
+
+	/**
+	 * Resolve an API key and retain the selected stored row identity across token refreshes
+	 * and concurrent changes to the session's sticky credential pointer.
+	 */
+	async getApiKeyWithCredentialRowId(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+	): Promise<{ apiKey: string | undefined; credentialRowId: number | undefined }> {
+		let credentialRowId: number | undefined;
+		const apiKey = await this.#resolveApiKey(provider, sessionId, options, rowId => {
+			credentialRowId = rowId;
+		});
+		return { apiKey, credentialRowId };
+	}
+
+	async #resolveApiKey(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+		onCredentialRowResolved?: (rowId: number) => void,
+	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
@@ -6953,7 +7368,12 @@ export class AuthStorage {
 			// (validated at login, rotated on 401), while the pointed-to env
 			// value can go stale with no recovery path — prefer the stored
 			// credential. Stored OAuth credentials still yield to the override.
-			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, sessionId);
+			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(
+				provider,
+				selectedCredential,
+				sessionId,
+				onCredentialRowResolved,
+			);
 			if (storedApiKey) return storedApiKey;
 			return configKey;
 		}
@@ -6968,14 +7388,19 @@ export class AuthStorage {
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
-			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			const apiKey = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			if (apiKey) onCredentialRowResolved?.(selectedCredential.id);
+			return apiKey;
 		}
 
 		let oauthAttempted = false;
 		if (!selectedCredential && this.#getSessionCredential(provider, sessionId)?.type === "oauth") {
 			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
 			oauthAttempted = true;
-			if (oauthResolved) return oauthResolved.apiKey;
+			if (oauthResolved) {
+				onCredentialRowResolved?.(oauthResolved.credentialRowId);
+				return oauthResolved.apiKey;
+			}
 		}
 
 		const attemptedApiKeyIndices = new Set<number>();
@@ -6987,6 +7412,7 @@ export class AuthStorage {
 				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 				if (resolved) {
 					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					onCredentialRowResolved?.(apiKeySelection.id);
 					return resolved;
 				}
 			}
@@ -6994,7 +7420,10 @@ export class AuthStorage {
 
 		if (!oauthAttempted) {
 			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
-			if (oauthResolved) return oauthResolved.apiKey;
+			if (oauthResolved) {
+				onCredentialRowResolved?.(oauthResolved.credentialRowId);
+				return oauthResolved.apiKey;
+			}
 		}
 
 		if (!selectedCredential) {
@@ -7005,6 +7434,7 @@ export class AuthStorage {
 				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 				if (resolved) {
 					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					onCredentialRowResolved?.(apiKeySelection.id);
 					return resolved;
 				}
 			}
@@ -7023,21 +7453,25 @@ export class AuthStorage {
 	/**
 	 * Resolve a stored api_key credential that outranks an env-sourced config
 	 * override (`apiKeyEnv`). Mirrors the api_key branches of {@link getApiKey}:
-	 * the selector-pinned credential first, then the round-robin/session pool.
-	 * Returns undefined when no stored api_key credential resolves, leaving the
-	 * env-sourced override in effect.
+	 * a selected credential must resolve or fail closed; unpinned resolution then
+	 * tries the round-robin/session pool. Returns undefined when no unpinned
+	 * stored api_key credential resolves, leaving the env-sourced override in
+	 * effect.
 	 */
 	async #resolveStoredApiKeyOverEnvConfig(
 		provider: string,
 		selectedCredential: ({ index: number } & StoredCredential) | undefined,
 		sessionId?: string,
+		onCredentialRowResolved?: (rowId: number) => void,
 	): Promise<string | undefined> {
 		if (selectedCredential?.credential.type === "api_key") {
 			const resolved = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 			if (resolved) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
+				onCredentialRowResolved?.(selectedCredential.id);
 				return resolved;
 			}
+			throw new Error(`Selected credential for ${provider} (id:${selectedCredential.id}) is unavailable`);
 		}
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {
@@ -7047,6 +7481,7 @@ export class AuthStorage {
 			const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 			if (resolved) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+				onCredentialRowResolved?.(apiKeySelection.id);
 				return resolved;
 			}
 		}

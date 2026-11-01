@@ -14,12 +14,13 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isCompiledBinary, VERSION } from "@gajae-code/utils";
+import { isCompiledBinary, logger, VERSION } from "@gajae-code/utils";
 import { isUpdateChannel } from "../../config/update-channel";
 import {
 	activationRecordPath,
 	type DirectoryIdentity,
 	type FileIdentity,
+	InstallationAclPresentError,
 	readActivationRecord,
 	sameDirectoryIdentity,
 	sameFileIdentity,
@@ -27,8 +28,11 @@ import {
 	snapshotRegularFile,
 } from "../install-activation";
 import {
+	ActivationRetryCandidateRepointError,
 	acquireBinaryUpdateLock,
 	fetchAndVerifyOfficialPinnedCandidate,
+	InstallationAccessDeniedError,
+	InstallationRollbackAclPresentError,
 	isProtectedSourcePathForInstall,
 	replaceBinaryForUpdate,
 	smokeTestPinnedCandidate,
@@ -109,10 +113,13 @@ export type InstallRepairState = "verified" | "not_needed" | "pending_activation
 export interface InstallRepairResult {
 	readonly state: InstallRepairState;
 	readonly reason?: string;
+	readonly diagnostic?: string;
 	readonly recordPath?: string;
 	readonly sideEffectStarted: boolean;
-	/** Present only for a pre-mutation Windows sharing violation (nothing was renamed). */
+	/** Native Windows status returned by exact replacement. */
 	readonly windowsErrorCode?: string;
+	readonly stagingCleanupWarning?: string;
+	readonly retainedPaths?: InstallationAccessDeniedError["retainedPaths"];
 	readonly before?: { readonly identity?: FileIdentity; readonly digest?: string };
 	readonly after?: { readonly identity?: FileIdentity; readonly digest?: string; readonly version?: string };
 }
@@ -272,6 +279,7 @@ export async function repairStandaloneBinary(
 		return blocked("candidate_provenance_mismatch");
 	const release = await acquireBinaryUpdateLock(targetPath);
 	let started = false;
+	let releaseAttempted = false;
 	try {
 		const rechecked = await snapshotRegularFile(targetPath);
 		const parentNow = await snapshotDirectory(path.dirname(path.resolve(targetPath)));
@@ -317,19 +325,75 @@ export async function repairStandaloneBinary(
 		};
 	} catch (error) {
 		const pendingActivation = error instanceof Error && error.message === "installation_pending_activation";
+		const accessDeniedError = error instanceof InstallationAccessDeniedError ? error : undefined;
+		const aclError = error instanceof InstallationAclPresentError ? error : undefined;
+		const rollbackAcl =
+			error instanceof AggregateError &&
+			error.message === "installation_rollback_unverified" &&
+			error.errors[1] instanceof InstallationRollbackAclPresentError
+				? error.errors[1]
+				: undefined;
+		const rawPrincipal = rollbackAcl?.detail.aclFailurePrincipal;
+		const principal =
+			rawPrincipal && rawPrincipal.length <= 184 && /^S-1-\d+(?:-\d+){1,15}$/.test(rawPrincipal)
+				? rawPrincipal
+				: undefined;
+		const side = rollbackAcl?.detail.aclFailureSide;
+		const inherited = rollbackAcl?.detail.aclFailureInherited;
+		const artifact =
+			side === "source" ? "retained backup" : side === "destination" ? "installed binary" : "unknown artifact";
+		let rollbackDiagnostic = rollbackAcl
+			? `Installation failed; binary rollback was blocked by an ${inherited === true ? "inherited" : inherited === false ? "explicit" : "unknown"} ACL on the ${artifact}${principal ? ` for SID ${principal}` : "; principal omitted"}. Inspect the selected binary's installation directory and activation record locally before retrying.`
+			: undefined;
+		if (rollbackDiagnostic) {
+			releaseAttempted = true;
+			try {
+				await release();
+			} catch {
+				rollbackDiagnostic += " Lock release could not be verified.";
+			}
+		}
+		const repointError = error instanceof ActivationRetryCandidateRepointError ? error : undefined;
 		const reason = pendingActivation
 			? "sharing_violation"
-			: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
-				? error.message
-				: "installation_execution_unverified";
+			: accessDeniedError
+				? accessDeniedError.code
+				: repointError
+					? repointError.reasonCode
+					: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
+						? error.message
+						: (aclError?.code ?? "installation_execution_unverified");
+		if (aclError) logger.warn(aclError.message, { targetPath, code: aclError.code });
+		if (rollbackDiagnostic) logger.warn(rollbackDiagnostic, { code: "installation_rollback_unverified" });
+		if (accessDeniedError)
+			logger.warn("Doctor standalone binary restore failed with access denied", {
+				targetPath,
+				code: accessDeniedError.code,
+				...(accessDeniedError.windowsErrorCode ? { windowsErrorCode: accessDeniedError.windowsErrorCode } : {}),
+				...(accessDeniedError.stagingCleanupWarning
+					? { stagingCleanupWarning: accessDeniedError.stagingCleanupWarning }
+					: {}),
+				...(accessDeniedError.retainedPaths ? { retainedPaths: accessDeniedError.retainedPaths } : {}),
+			});
+		if (repointError)
+			logger.warn("Doctor standalone binary restore retained a retry candidate after record repoint failed", {
+				path: repointError.candidatePath,
+				reason: repointError.reasonCode,
+			});
 		return {
 			state: pendingActivation ? "pending_activation" : started ? "failed" : "blocked",
 			reason,
+			...(rollbackDiagnostic ? { diagnostic: rollbackDiagnostic } : {}),
 			sideEffectStarted: started,
 			before,
 			recordPath,
+			...(accessDeniedError?.windowsErrorCode ? { windowsErrorCode: accessDeniedError.windowsErrorCode } : {}),
+			...(accessDeniedError?.stagingCleanupWarning
+				? { stagingCleanupWarning: accessDeniedError.stagingCleanupWarning }
+				: {}),
+			...(accessDeniedError?.retainedPaths ? { retainedPaths: accessDeniedError.retainedPaths } : {}),
 		};
 	} finally {
-		await release();
+		if (!releaseAttempted) await release();
 	}
 }

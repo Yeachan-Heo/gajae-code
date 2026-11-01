@@ -14,10 +14,9 @@
     },
     "packages/agent": {
       "name": "@gajae-code/agent-core",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "dependencies": {
         "@gajae-code/ai": "catalog:",
-        "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
         "@opentelemetry/api": "catalog:",
       },
@@ -29,7 +28,7 @@
     },
     "packages/ai": {
       "name": "@gajae-code/ai",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "bin": {
         "pi-ai": "./src/cli.ts",
       },
@@ -49,7 +48,7 @@
     },
     "packages/coding-agent": {
       "name": "@gajae-code/coding-agent",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "bin": {
         "gjc": "bin/gjc.js",
         "가재씨": "bin/gajaessi.js",
@@ -93,11 +92,12 @@
         "@types/babel__traverse": "catalog:",
         "@types/bun": "catalog:",
         "@types/ws": "catalog:",
+        "fast-check": "catalog:",
       },
     },
     "packages/gajae-code": {
       "name": "gajae-code",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "bin": {
         "gjc": "bin/gjc.js",
         "가재씨": "bin/gajaessi.js",
@@ -108,7 +108,7 @@
     },
     "packages/natives": {
       "name": "@gajae-code/natives",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "devDependencies": {
         "@napi-rs/cli": "catalog:",
         "@types/bun": "catalog:",
@@ -125,23 +125,23 @@
     },
     "packages/natives-darwin-arm64": {
       "name": "@gajae-code/natives-darwin-arm64",
-      "version": "0.18.11",
+      "version": "0.19.2",
     },
     "packages/natives-darwin-x64": {
       "name": "@gajae-code/natives-darwin-x64",
-      "version": "0.18.11",
+      "version": "0.19.2",
     },
     "packages/natives-linux-arm64": {
       "name": "@gajae-code/natives-linux-arm64",
-      "version": "0.18.11",
+      "version": "0.19.2",
     },
     "packages/natives-linux-x64": {
       "name": "@gajae-code/natives-linux-x64",
-      "version": "0.18.11",
+      "version": "0.19.2",
     },
     "packages/natives-win32-x64": {
       "name": "@gajae-code/natives-win32-x64",
-      "version": "0.18.11",
+      "version": "0.19.2",
     },
     "packages/orchestration-token-benchmark": {
       "name": "@gajae-code/orchestration-token-benchmark",
@@ -155,7 +155,7 @@
     },
     "packages/stats": {
       "name": "@gajae-code/stats",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "bin": {
         "gjc-stats": "./src/index.ts",
       },
@@ -180,7 +180,7 @@
     },
     "packages/tui": {
       "name": "@gajae-code/tui",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
@@ -221,7 +221,7 @@
     },
     "packages/utils": {
       "name": "@gajae-code/utils",
-      "version": "0.18.11",
+      "version": "0.19.2",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "handlebars": "catalog:",
@@ -243,18 +243,18 @@
     "@biomejs/biome": "2.5.2",
     "@bufbuild/protobuf": "^2.12.0",
     "@bufbuild/protoc-gen-es": "^2.12.0",
-    "@gajae-code/agent-core": "0.18.11",
-    "@gajae-code/ai": "0.18.11",
-    "@gajae-code/coding-agent": "0.18.11",
-    "@gajae-code/natives": "0.18.11",
-    "@gajae-code/natives-darwin-arm64": "0.18.11",
-    "@gajae-code/natives-darwin-x64": "0.18.11",
-    "@gajae-code/natives-linux-arm64": "0.18.11",
-    "@gajae-code/natives-linux-x64": "0.18.11",
-    "@gajae-code/natives-win32-x64": "0.18.11",
-    "@gajae-code/stats": "0.18.11",
-    "@gajae-code/tui": "0.18.11",
-    "@gajae-code/utils": "0.18.11",
+    "@gajae-code/agent-core": "0.19.2",
+    "@gajae-code/ai": "0.19.2",
+    "@gajae-code/coding-agent": "0.19.2",
+    "@gajae-code/natives": "0.19.2",
+    "@gajae-code/natives-darwin-arm64": "0.19.2",
+    "@gajae-code/natives-darwin-x64": "0.19.2",
+    "@gajae-code/natives-linux-arm64": "0.19.2",
+    "@gajae-code/natives-linux-x64": "0.19.2",
+    "@gajae-code/natives-win32-x64": "0.19.2",
+    "@gajae-code/stats": "0.19.2",
+    "@gajae-code/tui": "0.19.2",
+    "@gajae-code/utils": "0.19.2",
     "@mozilla/readability": "^0.6.0",
     "@napi-rs/cli": "3.6.2",
     "@opentelemetry/api": "^1.9.0",
@@ -275,6 +275,7 @@
     "chart.js": "^4.5.1",
     "date-fns": "^4.1.0",
     "diff": "^9.0.0",
+    "fast-check": "4.10.2",
     "fflate": "0.8.2",
     "handlebars": "^4.7.9",
     "linkedom": "^0.18.12",
@@ -801,6 +802,8 @@
 
     "extract-zip": ["extract-zip@2.0.1", "", { "dependencies": { "debug": "^4.1.1", "get-stream": "^5.1.0", "yauzl": "^2.10.0" }, "optionalDependencies": { "@types/yauzl": "^2.9.1" }, "bin": { "extract-zip": "cli.js" } }, "sha512-GDhU9ntwuKyGXdZBUgTIe+vXnWj0fppUEtMDL0+idd5Sta8TGpHssn/eusA9mrPr9qNDym6SxAYZjNvCn/9RBg=="],
 
+    "fast-check": ["fast-check@4.10.2", "", { "dependencies": { "pure-rand": "^8.0.0" } }, "sha512-iK2f+YrcmoeGqk6fA0ea2bptcu/itMIm4NfEozq6N25+aG6h7s5HZbB/k1aV7b5w5sFLMCbbtRUsTVR+BgC3xw=="],
+
     "fast-fifo": ["fast-fifo@1.3.2", "", {}, "sha512-/d9sfos4yxzpwkDkuN7k2SqFKtYNmCTzgfEpz82x34IM9/zc8KGxQoXg1liNC/izpRM/MBdt44Nmx41ZWqk+FQ=="],
 
     "fast-string-truncated-width": ["fast-string-truncated-width@3.0.3", "", {}, "sha512-0jjjIEL6+0jag3l2XWWizO64/aZVtpiGE3t0Zgqxv0DPuxiMjvB3M24fCyhZUO4KomJQPj3LTSUnDP3GpdwC0g=="],
@@ -1006,6 +1009,8 @@
     "pump": ["pump@3.0.4", "", { "dependencies": { "end-of-stream": "^1.1.0", "once": "^1.3.1" } }, "sha512-VS7sjc6KR7e1ukRFhQSY5LM2uBWAUPiOPa/A3mkKmiMwSmRFUITt0xuj+/lesgnCv+dPIEYlkzrcyXgquIHMcA=="],
 
     "puppeteer-core": ["puppeteer-core@24.43.1", "", { "dependencies": { "@puppeteer/browsers": "2.13.2", "chromium-bidi": "14.0.0", "debug": "^4.4.3", "devtools-protocol": "0.0.1608973", "typed-query-selector": "^2.12.2", "webdriver-bidi-protocol": "0.4.1", "ws": "^8.20.0" } }, "sha512-T5ScUMAsmhdNbgDR41AGESYeS6V9MSgetkSnVhhW+gXvzC42VesKCn5ld87gAZDJ6vLHL9GkRvY9WtQWSnwFbw=="],
+
+    "pure-rand": ["pure-rand@8.4.2", "", {}, "sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng=="],
 
     "react": ["react@19.2.5", "", {}, "sha512-llUJLzz1zTUBrskt2pwZgLq59AemifIftw4aB7JxOqf1HY2FDaGDxgwpAPVzHU1kdWabH7FauP4i1oEeer2WCA=="],
 

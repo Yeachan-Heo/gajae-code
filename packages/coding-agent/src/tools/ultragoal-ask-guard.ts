@@ -1,4 +1,5 @@
 import type { AgentTool } from "@gajae-code/agent-core";
+import { resolveRalplanCurrentFinal, selectsRalplanApprovalGate } from "../gjc-runtime/ralplan-current-final";
 import {
 	consumeUltragoalAskNudge,
 	isUltragoalAskBlocked,
@@ -33,6 +34,7 @@ export async function assertUltragoalAskAllowed(
 	cwd: string,
 	context: UltragoalAskGuardContext = {},
 	agentDir?: string,
+	pendingQuestions?: unknown,
 ): Promise<void> {
 	// Durable Ultragoal state is session-scoped, so only the caller's own run may
 	// block `ask`. An anonymous caller has no run attributable to it, so the guard
@@ -43,6 +45,16 @@ export async function assertUltragoalAskAllowed(
 	if (!sessionId) return;
 	const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
 	if (!diagnostic.active) return;
+	// The one ask that may proceed while a goal is blocked is the execution
+	// approval for an authenticated current ralplan final (issue #6578). The
+	// request must select that gate and the final must validate on disk; a
+	// caller-declared tag alone never lifts the guard. AskTool still captures and
+	// authenticates the publication it records consent against.
+	if (selectsRalplanApprovalGate(pendingQuestions)) {
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId, agentDir });
+		if (resolution.ok) return;
+		throw new ToolError(`Ultragoal ask guard refused the ralplan execution approval: ${resolution.refusal.reason}`);
+	}
 	const nudge = await consumeUltragoalAskNudge(cwd, sessionId, agentDir);
 	if (nudge.nudged) throw new ToolError(nudge.message);
 	throw new ToolError(formatUltragoalAskBlockMessage(diagnostic));
@@ -66,7 +78,7 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 				// budget against the SESSION profile, never the process-global one.
 				// The caller session id is the only binding, so a foreign session's
 				// durable run can never gate this ask.
-				await assertUltragoalAskAllowed(getCwd(), getContext(), getSessionAgentDir());
+				await assertUltragoalAskAllowed(getCwd(), getContext(), getSessionAgentDir(), args[1]);
 				return Reflect.apply(target.execute, target, args);
 			};
 		},

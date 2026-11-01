@@ -1,7 +1,7 @@
 import { INTENT_FIELD, type ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { Markdown } from "@gajae-code/tui";
-import { prompt } from "@gajae-code/utils";
+import { prompt, sanitizeText } from "@gajae-code/utils";
 import chalk from "chalk";
 import typesDescriptionPrompt from "../../commit/prompts/types-description.md" with { type: "text" };
 import type { ModelRegistry } from "../../config/model-registry";
@@ -81,7 +81,7 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 	const toolArgsById = new Map<string, { name: string; args?: Record<string, unknown> }>();
 	const writeThinkingLine = (text: string) => {
 		if (!process.stdout.isTTY) return;
-		const line = chalk.dim(`… ${text}`);
+		const line = chalk.dim(`… ${sanitizeText(text)}`);
 		process.stdout.write(`\r\x1b[2K${line}`);
 		thinkingLineActive = true;
 	};
@@ -118,7 +118,7 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 					clearThinkingLine();
 					const assistantMessage = event.message as { stopReason?: string; errorMessage?: string };
 					if (assistantMessage.stopReason === "error" && assistantMessage.errorMessage) {
-						process.stdout.write(`● Error: ${assistantMessage.errorMessage}\n`);
+						process.stdout.write(`● Error: ${sanitizeText(assistantMessage.errorMessage)}\n`);
 					}
 					const messageText = extractMessageText(event.message?.content ?? []);
 					if (messageText) {
@@ -131,10 +131,10 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 				const stored = toolArgsById.get(event.toolCallId) ?? { name: event.toolName };
 				toolArgsById.delete(event.toolCallId);
 				clearThinkingLine();
-				const toolLabel = formatToolLabel(stored.name);
+				const toolLabel = sanitizeText(formatToolLabel(stored.name));
 				const symbol = event.isError ? "" : "";
 				process.stdout.write(`${symbol} ${toolLabel}\n`);
-				const argsLines = formatToolArgs(stored.args);
+				const argsLines = formatToolArgs(stored.args).map(line => sanitizeText(line));
 				if (argsLines.length > 0) {
 					process.stdout.write(`${formatToolArgsBlock(argsLines)}\n`);
 				}
@@ -201,7 +201,7 @@ function extractMessageText(content: Array<{ type: string; text?: string }>): st
 }
 
 function writeAssistantMessage(message: string): void {
-	const lines = renderMarkdownLines(message);
+	const lines = renderMarkdownLines(sanitizeText(message));
 	if (lines.length === 0) return;
 	let firstContentIndex = lines.findIndex(line => line.trim().length > 0);
 	if (firstContentIndex === -1) {

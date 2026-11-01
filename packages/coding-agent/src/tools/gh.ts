@@ -11,6 +11,7 @@ import githubDescription from "../prompts/tools/github.md" with { type: "text" }
 import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
+import { publishExplicitArtifactText, wrapUntrustedContent } from "./fetch";
 import { formatShortSha } from "./gh-format";
 import { type CacheStatus, getOrFetchView, resolveGithubCacheAuthKey } from "./github-cache";
 import { githubMutationTool, isGithubReadOnlyOp } from "./github-side-effect";
@@ -2542,7 +2543,7 @@ async function saveArtifactText(session: ToolSession, toolType: string, text: st
 		return undefined;
 	}
 
-	await Bun.write(artifactPath, text);
+	await publishExplicitArtifactText(artifactPath, text);
 	return artifactId;
 }
 
@@ -2558,11 +2559,13 @@ function buildTextResult(
 	text: string,
 	sourceUrl?: string,
 	details?: GhToolDetails,
-	options?: { artifactId?: string; artifactLabel?: string },
+	options?: { artifactId?: string; artifactLabel?: string; untrusted?: boolean },
 ): AgentToolResult<GhToolDetails> {
-	const builder = toolResult<GhToolDetails>(details).text(
-		appendArtifactReference(text, options?.artifactId, options?.artifactLabel ?? "Saved artifact"),
-	);
+	const visible = appendArtifactReference(text, options?.artifactId, options?.artifactLabel ?? "Saved artifact");
+	// Remote GitHub prose (titles, bodies, comments, search hits, logs) is third-party text.
+	// Pass untrusted:false only for a local confirmation that contains none of it.
+	const modelText = options?.untrusted === false ? visible : wrapUntrustedContent(visible);
+	const builder = toolResult<GhToolDetails>(details).text(modelText);
 	if (sourceUrl) {
 		builder.sourceUrl(sourceUrl);
 	}
@@ -3395,6 +3398,7 @@ async function executePrPush(
 			remote: target.remoteName,
 			remoteBranch: target.remoteBranch,
 		},
+		{ untrusted: false },
 	);
 }
 
@@ -3660,7 +3664,7 @@ async function executeRunWatch(
 				pollCount,
 			});
 			onUpdate?.({
-				content: [{ type: "text", text: formatRunWatchSnapshot(repo, run, pollCount) }],
+				content: [{ type: "text", text: wrapUntrustedContent(formatRunWatchSnapshot(repo, run, pollCount)) }],
 				details,
 			});
 
@@ -3674,7 +3678,7 @@ async function executeRunWatch(
 						content: [
 							{
 								type: "text",
-								text: formatRunWatchSnapshot(repo, run, pollCount, note),
+								text: wrapUntrustedContent(formatRunWatchSnapshot(repo, run, pollCount, note)),
 							},
 						],
 						details: buildRunWatchDetails(repo, run, {
@@ -3701,7 +3705,7 @@ async function executeRunWatch(
 				const artifactId = await saveArtifactText(
 					session,
 					toolName,
-					formatRunWatchResult(repo, run, failedJobLogs, tail, { mode: "full" }),
+					wrapUntrustedContent(formatRunWatchResult(repo, run, failedJobLogs, tail, { mode: "full" })),
 				);
 				return buildTextResult(
 					formatRunWatchResult(repo, run, failedJobLogs, tail),
@@ -3739,7 +3743,12 @@ async function executeRunWatch(
 			pollCount,
 		});
 		onUpdate?.({
-			content: [{ type: "text", text: formatCommitRunWatchSnapshot(repo, headSha, branch, runs, pollCount) }],
+			content: [
+				{
+					type: "text",
+					text: wrapUntrustedContent(formatCommitRunWatchSnapshot(repo, headSha, branch, runs, pollCount)),
+				},
+			],
 			details,
 		});
 
@@ -3751,7 +3760,9 @@ async function executeRunWatch(
 					content: [
 						{
 							type: "text",
-							text: formatCommitRunWatchSnapshot(repo, headSha, branch, runs, pollCount, note),
+							text: wrapUntrustedContent(
+								formatCommitRunWatchSnapshot(repo, headSha, branch, runs, pollCount, note),
+							),
 						},
 					],
 					details: buildCommitRunWatchDetails(repo, headSha, branch, runs, {
@@ -3778,7 +3789,9 @@ async function executeRunWatch(
 			const artifactId = await saveArtifactText(
 				session,
 				toolName,
-				formatCommitRunWatchResult(repo, headSha, branch, runs, failedJobLogs, tail, { mode: "full" }),
+				wrapUntrustedContent(
+					formatCommitRunWatchResult(repo, headSha, branch, runs, failedJobLogs, tail, { mode: "full" }),
+				),
 			);
 			return buildTextResult(
 				formatCommitRunWatchResult(repo, headSha, branch, runs, failedJobLogs, tail),
@@ -3807,7 +3820,9 @@ async function executeRunWatch(
 				content: [
 					{
 						type: "text",
-						text: formatCommitRunWatchSnapshot(repo, headSha, branch, runs, pollCount, note),
+						text: wrapUntrustedContent(
+							formatCommitRunWatchSnapshot(repo, headSha, branch, runs, pollCount, note),
+						),
 					},
 				],
 				details: buildCommitRunWatchDetails(repo, headSha, branch, runs, {

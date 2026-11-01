@@ -458,6 +458,11 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		);
 	});
 
+	it("accepts Windows access-denied owner-only security results", () => {
+		const failure = { ok: false, code: "access_denied" } as const;
+		expect(validateNativeSecurityResult(failure, "verify", "directory")).toEqual(failure);
+	});
+
 	it("does not re-adopt a replaced managed leaf or write into its external replacement", async () => {
 		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
 		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
@@ -553,6 +558,52 @@ describe("managed session write protocol", () => {
 		expect(startupError.message).not.toContain(scope.directoryPath);
 		expect(JSON.stringify(startupError.cause)).not.toContain(scope.directoryPath);
 		// The injected failure must not damage the existing binding or leak the spy.
+		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
+	});
+
+	it("names a refused cleanup receipt instead of reporting a corrupted binding (#6820)", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+
+		// The receipt preflight inside the binding publish refuses a stale
+		// receipt (e.g. a device number that changed across a reboot). The binding
+		// itself is healthy, so the operator must be pointed at the receipt.
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw new Error("managed_replace_cleanup_receipt_invalid");
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			publish.mockRestore();
+		}
+
+		expect(injected).toBe(1);
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({
+			classification: "managed_replace_cleanup_receipt_invalid",
+			diagnostic: "prepare:binding_publish",
+		});
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (managed_replace_cleanup_receipt_invalid: prepare:binding_publish).",
+		);
+		expect(startupError.message).not.toContain(scope.directoryPath);
 		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
 	});
 

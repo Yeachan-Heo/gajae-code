@@ -13,7 +13,8 @@ function shouldAdhocSignDarwinBinary(): boolean {
 }
 
 async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): Promise<void> {
-	const proc = Bun.spawn(command, {
+	const argv = command[0] === "bun" ? [process.execPath, ...command.slice(1)] : command;
+	const proc = Bun.spawn(argv, {
 		cwd: packageDir,
 		env,
 		stdout: "inherit",

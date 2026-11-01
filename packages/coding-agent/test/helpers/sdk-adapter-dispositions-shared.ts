@@ -9,6 +9,7 @@
  */
 import { expect } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
@@ -107,6 +108,12 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	// The generic disposition probe intentionally supplies no upload payload.
+	// Machine routing reaches the real store, which rejects that invalid input.
+	"turn.image.begin": "invalid_input",
+	"turn.image.append": "invalid_input",
+	"turn.image.finish": "invalid_input",
+	"turn.image.discard": "invalid_input",
 	"ask.answer": "resource_gone",
 	"workflow.gate_answer": "resource_gone",
 	"workflow.plan_approve": "resource_gone",
@@ -359,11 +366,12 @@ export async function fixture(): Promise<AdapterFixture> {
 	};
 	const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${sessionId}.json`)).mtimeMs;
 	const hostIncarnation = currentHostIncarnation();
+	const endpointGeneration = await productionHost.readGeneration();
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
 		locator: { cwd: repo, worktreeRoot: null, stateRoot },
-		endpointGeneration: 1,
+		endpointGeneration,
 		pid: process.pid,
 		processIncarnation: hostIncarnation,
 		hostIncarnation,
@@ -372,7 +380,7 @@ export async function fixture(): Promise<AdapterFixture> {
 	await broker.heartbeatSessions();
 	const acpAttachment: SessionAttachment = {
 		sessionId,
-		generation: 1,
+		generation: endpointGeneration,
 		isCurrent: () => true,
 		send: async () => undefined,
 		sendMaintenance: () => {},
@@ -535,6 +543,11 @@ export async function assertMcpRow(operation: Operation, secret: boolean): Promi
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;
 		const input = inputFor(operation, secret);
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			await fsPromises.mkdir(target);
+			input.path = target;
+		}
 		mcp = createSdkMcpServer({ agentDir: host.agentDir });
 		const tool =
 			operation.kind === "global"
@@ -599,6 +612,11 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		const input =
 			lifecycleInput ??
 			(operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret));
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			await fsPromises.mkdir(target);
+			input.path = target;
+		}
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,

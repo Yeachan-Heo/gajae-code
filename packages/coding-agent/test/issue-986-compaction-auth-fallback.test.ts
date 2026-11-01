@@ -57,6 +57,11 @@ describe("issue #986 compaction auth fallback", () => {
 			authStorage.setRuntimeApiKey(fallbackModel.provider, "anthropic-token");
 		}
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		if (options?.configureFallbackAuth === false) {
+			// Keep the role candidate discoverable while the real row-aware resolver
+			// observes missing credentials, as when auth disappears after discovery.
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([currentModel, fallbackModel]);
+		}
 
 		session = new AgentSession({
 			agent,
@@ -102,11 +107,6 @@ describe("issue #986 compaction auth fallback", () => {
 				details: { provider: model.provider },
 			};
 		});
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
-			if (model.provider === currentModel.provider && model.id === currentModel.id) return "codex-token";
-			if (model.provider === fallbackModel.provider && model.id === fallbackModel.id) return "anthropic-token";
-			return undefined;
-		});
 
 		const result = await session.compact();
 
@@ -129,7 +129,7 @@ describe("issue #986 compaction auth fallback", () => {
 	it("fails fast with a clear provider-specific error when no authenticated fallback exists", async () => {
 		const { currentModel, fallbackModel } = await createSession({
 			fallbackModelRole: "default",
-			configureFallbackAuth: true,
+			configureFallbackAuth: false,
 		});
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			if (model.provider === currentModel.provider && model.id === currentModel.id) {
@@ -138,10 +138,6 @@ describe("issue #986 compaction auth fallback", () => {
 				);
 			}
 			throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
-		});
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
-			if (model.provider === currentModel.provider && model.id === currentModel.id) return "codex-token";
-			return undefined;
 		});
 
 		const error = await session.compact().catch(err => err);
@@ -220,9 +216,9 @@ describe("issue #986 compaction auth fallback", () => {
 	});
 
 	it("does not announce a credentialless fallback candidate as used", async () => {
-		const { currentModel, fallbackModel } = await createSession({
+		const { fallbackModel } = await createSession({
 			fallbackModelRole: "default",
-			configureFallbackAuth: true,
+			configureFallbackAuth: false,
 		});
 		const events: Array<{
 			type: string;
@@ -235,10 +231,6 @@ describe("issue #986 compaction auth fallback", () => {
 		vi.spyOn(compactionModule, "compact").mockRejectedValue(
 			new Error("Summarization failed: 503 auth_unavailable: no auth available"),
 		);
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
-			if (model.provider === currentModel.provider && model.id === currentModel.id) return "codex-token";
-			return undefined;
-		});
 
 		await session.runIdleCompaction();
 

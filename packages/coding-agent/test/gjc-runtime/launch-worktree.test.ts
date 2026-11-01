@@ -150,7 +150,7 @@ describe("default launch worktrees", () => {
 		expect(await Bun.file(path.join(expectedPath, ".git")).exists()).toBe(true);
 		expect((await fs.lstat(path.join(expectedPath, "node_modules"))).isSymbolicLink()).toBe(true);
 
-		const second = prepareLaunchWorktree(repo, ["--worktree", "--slow", "opus"]);
+		const second = prepareLaunchWorktree(repo, ["--worktree", "--model", "opus"]);
 		expect(await fs.realpath(second.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
 	});

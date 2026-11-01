@@ -5,7 +5,7 @@ export class FakeKernel implements PythonKernelExecutor {
 	id = `fake-kernel-${Math.random().toString(36).slice(2)}`;
 	private result: KernelExecuteResult;
 	private onExecute: (options?: KernelExecuteOptions) => Promise<void> | void;
-	private _exitCode: number | null = null;
+	#exitCode: number | null = null;
 
 	constructor(result: KernelExecuteResult, onExecute: (options?: KernelExecuteOptions) => Promise<void> | void) {
 		this.result = result;
@@ -18,10 +18,10 @@ export class FakeKernel implements PythonKernelExecutor {
 	}
 
 	getExitCode(): number | null {
-		return this._exitCode;
+		return this.#exitCode;
 	}
 
 	setExitCode(code: number | null): void {
-		this._exitCode = code;
+		this.#exitCode = code;
 	}
 }

@@ -919,13 +919,18 @@ describe("InputController keybinding setup", () => {
 
 	it("steers streaming Enter submissions by default", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
+		const clearSuggestion = vi.fn();
+		ctx.promptSuggestion = { clear: clearSuggestion } as unknown as InteractiveModeContext["promptSuggestion"];
 		const session = ctx.session as unknown as { isStreaming: boolean };
 		session.isStreaming = true;
 		editor.setText("steer by default while busy");
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
+		await editor.onSubmit?.("   ");
+		expect(clearSuggestion).not.toHaveBeenCalled();
 		await editor.onSubmit?.("steer by default while busy");
+		expect(clearSuggestion).toHaveBeenCalledTimes(1);
 
 		expect(ctx.locallySubmittedUserSignatures.has("steer by default while busy\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("steer by default while busy", {

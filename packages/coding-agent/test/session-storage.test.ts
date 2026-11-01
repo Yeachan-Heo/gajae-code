@@ -42,6 +42,69 @@ import {
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
 
+describe.skipIf(process.platform === "win32")("link-fallback no-replace publication durability", () => {
+	const unsupported = {
+		ok: false,
+		code: "atomic_unavailable",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "atomic_unavailable",
+		primitive: "renameat2_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "complete", osCode: 38 },
+	};
+
+	afterEach(() => vi.restoreAllMocks());
+
+	for (const mode of ["sync", "async"] as const)
+		it(`syncs the parent after removing the fallback staging link: ${mode}`, async () => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-link-fallback-")));
+			try {
+				fs.chmodSync(root, 0o700);
+				const destination = path.join(root, "evidence.json");
+				vi.spyOn(native, "renameNoReplacePath").mockReturnValue(unsupported as never);
+				vi.spyOn(native, "renameNoReplacePathAsync").mockResolvedValue(unsupported as never);
+				const events: string[] = [];
+				const isStaging = (file: unknown) => typeof file === "string" && file.endsWith(".staging");
+				const isRootDirectory = (file: unknown, flags: unknown) =>
+					file === root && typeof flags === "number" && (flags & fs.constants.O_DIRECTORY) !== 0;
+				const unlinkSync = fs.unlinkSync;
+				vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+					if (isStaging(file)) events.push("unlink-staging");
+					return unlinkSync(file);
+				});
+				const unlink = fsp.unlink;
+				vi.spyOn(fsp, "unlink").mockImplementation(async file => {
+					if (isStaging(file)) events.push("unlink-staging");
+					return await unlink(file);
+				});
+				const openSync = fs.openSync;
+				vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+					if (isRootDirectory(file, flags)) events.push("sync-parent");
+					return openSync(file, flags ?? "r", mode);
+				}) as typeof fs.openSync);
+				const open = fsp.open;
+				vi.spyOn(fsp, "open").mockImplementation((async (
+					file: fs.PathLike,
+					flags?: string | number,
+					mode?: fs.Mode,
+				) => {
+					if (isRootDirectory(file, flags)) events.push("sync-parent");
+					return await open(file, flags, mode);
+				}) as typeof fsp.open);
+				const bytes = Buffer.from("{}\n");
+				if (mode === "sync") publishManagedFileNoReplaceSync(destination, bytes, managedDirectoryRoot(root));
+				else await publishManagedFileNoReplace(destination, bytes, undefined, managedDirectoryRoot(root));
+				expect(fs.lstatSync(destination).nlink).toBe(1);
+				expect(fs.readdirSync(root)).toEqual(["evidence.json"]);
+				// The staging removal is itself made durable before success is reported.
+				expect(events.slice(events.indexOf("unlink-staging"))).toEqual(["unlink-staging", "sync-parent"]);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+});
+
 describe("native publish outcome classification", () => {
 	const preMutation = {
 		ok: false,
@@ -2662,6 +2725,33 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 
 		expect(fs.existsSync(receipt)).toBe(false);
 		expect(fs.existsSync(path.join(root, "cleanup-io-error-retry"))).toBe(true);
+	});
+
+	it("retries a retained canonical receipt after a transient access-denied failure", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realExactUnlink = native.exactUnlink;
+		let firstAttempt = true;
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname === receipt && firstAttempt) {
+				firstAttempt = false;
+				return { ok: false, code: "access_denied" };
+			}
+			return realExactUnlink(pathname, expected);
+		});
+		replay("cleanup-access-denied-first-attempt");
+		expect(fs.existsSync(receipt)).toBe(true);
+
+		replay("cleanup-access-denied-retry");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "cleanup-access-denied-retry"))).toBe(true);
 	});
 
 	it("keeps canonical receipt identity failures fail-closed", () => {

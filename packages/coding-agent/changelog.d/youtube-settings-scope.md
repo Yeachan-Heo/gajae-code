@@ -1,3 +1,0 @@
-### Fixed
-
-- The YouTube scraper reads `providers.parallelFetch` from the settings of the caller that dispatched it instead of the process-global settings singleton. A runtime that never calls `Settings.init()` — the SDK/ACP host path and workflow lanes that drive `read`/`fetch` — threw `Settings not initialized. Call Settings.init() first.` on every YouTube URL before any fetch was attempted. Special handlers now receive `settings` alongside `storage`, and the registry exposes the real `handleYouTube` instead of a wrapper that dropped both trailing arguments, so Parallel extract is reachable and no scraper needs the global singleton.

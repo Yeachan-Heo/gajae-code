@@ -980,14 +980,14 @@ describe("tool descriptor compatibility gate", () => {
 				load: () => (++loads === 1 ? first.promise : second.promise),
 			};
 			const lazy = new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session);
-			const oldLoad = lazy.materializeForTests().then(
+			const oldLoad = lazy.materialize().then(
 				tool => ({ tool, error: undefined }),
 				error => ({ tool: undefined, error }),
 			);
 			await Promise.resolve();
 			expect(loads).toBe(1);
 			lazy.invalidateForSessionMove();
-			const newLoad = lazy.materializeForTests();
+			const newLoad = lazy.materialize();
 			await Promise.resolve();
 			expect(loads).toBe(2);
 			if (staleOutcome === "resolved") first.resolve(oldTool);
@@ -995,13 +995,13 @@ describe("tool descriptor compatibility gate", () => {
 			const oldResult = await oldLoad;
 			if (staleOutcome === "resolved") expect(oldResult.tool).toBe(oldTool);
 			else expect(String(oldResult.error)).toContain("old context load failed");
-			const joinedLoad = lazy.materializeForTests();
+			const joinedLoad = lazy.materialize();
 			await Promise.resolve();
 			expect(loads).toBe(2);
 			second.resolve(newTool);
 			expect(await newLoad).toBe(newTool);
 			expect(await joinedLoad).toBe(newTool);
-			expect(await lazy.materializeForTests()).toBe(newTool);
+			expect(await lazy.materialize()).toBe(newTool);
 		});
 	}
 

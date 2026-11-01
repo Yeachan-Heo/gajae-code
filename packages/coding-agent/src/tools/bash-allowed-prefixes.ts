@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import {
 	classifyStateArgv,
 	STATE_ACTION_NAMES,
@@ -245,6 +246,33 @@ function isLongOption(word: string, option: string): boolean {
 	return word === option || word.startsWith(`${option}=`);
 }
 
+function fileCompilesMagic(words: readonly string[]): boolean {
+	const valueOptions = ["--exclude", "--exclude-quiet", "--files-from", "--separator", "--magic-file", "--parameter"];
+	for (let index = 1; index < words.length; index += 1) {
+		const word = words[index]!;
+		if (word === "--") break;
+		if (word.startsWith("--")) {
+			const equalsAt = word.indexOf("=");
+			const name = equalsAt === -1 ? word : word.slice(0, equalsAt);
+			if (name.length > 2 && "--compile".startsWith(name)) return true;
+			if (equalsAt === -1 && valueOptions.some(option => name.length > 2 && option.startsWith(name))) {
+				index += 1;
+			}
+		} else if (word.startsWith("-")) {
+			for (let offset = 1; offset < word.length; offset += 1) {
+				const flag = word[offset]!;
+				if (flag === "C") return true;
+				// Required arguments consume the rest of the cluster, or the next word (even `--`).
+				if ("eFfmMP".includes(flag)) {
+					if (offset === word.length - 1) index += 1;
+					break;
+				}
+			}
+		}
+	}
+	return false;
+}
+
 function hasShortOption(word: string, option: string): boolean {
 	return word.startsWith("-") && !word.startsWith("--") && word.slice(1).includes(option);
 }
@@ -253,7 +281,9 @@ function shellQuote(value: string): string {
 }
 
 function resolvedExternalCommand(command: string): string | undefined {
-	return Bun.which(command) ?? undefined;
+	// Bun.which caches a command name until PATH is passed explicitly, so a test
+	// or a later session that changes PATH must be visible here.
+	return Bun.which(command, { PATH: process.env.PATH ?? "" }) ?? undefined;
 }
 
 function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesCheck {
@@ -267,6 +297,9 @@ function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesC
 		for (const option of options) {
 			if (isLongOption(option, "--pre") || isLongOption(option, "--pre-glob")) {
 				return { allowed: false, reason: "read-only bash does not allow ripgrep preprocessors" };
+			}
+			if (isLongOption(option, "--hostname-bin")) {
+				return { allowed: false, reason: "read-only bash does not allow ripgrep hostname commands" };
 			}
 			if (isLongOption(option, "--search-zip") || hasShortOption(option, "z")) {
 				return { allowed: false, reason: "read-only bash does not allow ripgrep compressed-file subprocesses" };
@@ -282,10 +315,28 @@ function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesC
 		}
 	}
 
+	if (command === "file" && fileCompilesMagic(words)) {
+		return { allowed: false, reason: "read-only bash does not allow file magic compilation" };
+	}
+
 	const gitWrite = rejectGitHostAccess(words);
 	if (gitWrite) return gitWrite;
 
 	return { allowed: true };
+}
+
+const GIT_DIFF_FAMILY_SUBCOMMANDS = new Set(["blame", "diff", "log", "show"]);
+
+function gitOptionName(word: string): string {
+	const equalsAt = word.indexOf("=");
+	return equalsAt === -1 ? word : word.slice(0, equalsAt);
+}
+
+/** Enabling forms only. `--no-ext-diff` and `--no-textconv` stay allowed. */
+function gitEnablesExternalHelper(word: string): boolean {
+	if (!word.startsWith("--")) return false;
+	const name = gitOptionName(word);
+	return name === "--ext-diff" || name === "--textconv";
 }
 
 function rejectGitHostAccess(words: readonly string[]): BashAllowedPrefixesCheck | undefined {
@@ -294,8 +345,28 @@ function rejectGitHostAccess(words: readonly string[]): BashAllowedPrefixesCheck
 		if (isLongOption(option, "--output") || isLongOption(option, "--no-index")) {
 			return { allowed: false, reason: "restricted bash does not allow git --output or --no-index" };
 		}
+		if (gitEnablesExternalHelper(option)) {
+			return {
+				allowed: false,
+				reason: "restricted bash does not allow git external diff or textconv helpers",
+			};
+		}
 	}
 	return undefined;
+}
+
+/**
+ * Diff-family git commands run `diff.external`, `GIT_EXTERNAL_DIFF`, and textconv
+ * filters unless these flags are present. Place them immediately after the
+ * subcommand so a later value-taking option cannot consume them and they stay
+ * before a `--` pathspec. The gate rejects a later `--ext-diff` or `--textconv`,
+ * which would otherwise win.
+ */
+function disableGitExternalHelpers(commandName: string, argv: readonly string[]): string[] {
+	if (commandName !== "git" || !GIT_DIFF_FAMILY_SUBCOMMANDS.has(argv[1] ?? "")) return [...argv];
+	const next = [...argv];
+	next.splice(2, 0, "--no-ext-diff", "--no-textconv");
+	return next;
 }
 
 const GJC_SESSION_BIND_REASON = "restricted role-agent bash binds gjc to the current session";
@@ -341,6 +412,7 @@ function inlineStateSessionIds(words: readonly string[]): string[] {
 
 function gitCommonDir(directory: string): string | undefined {
 	const result = Bun.spawnSync(["git", "-C", directory, "rev-parse", "--git-common-dir"], {
+		env: projectSafeSpawnEnv(),
 		stdout: "pipe",
 		stderr: "ignore",
 	});
@@ -436,6 +508,30 @@ function commandAllowedPrefixesReason(normalizedPrefixes: readonly string[], opt
 	return options.profile === "read-only"
 		? `read-only bash only allows commands starting with: ${prefixList}`
 		: `restricted role-agent bash only allows commands starting with: ${prefixList}`;
+}
+
+/**
+ * Workflow restricted bash keeps the lexical prefix check, then runs the resolved
+ * executable. Callers also skip the shell snapshot and shell prefix, because a
+ * snapshot function can be named for that absolute path.
+ */
+export function normalizeWorkflowBashCommand(
+	command: string,
+	allowedPrefixes: readonly string[] | undefined,
+	options: BashRestrictionOptions = {},
+): string | undefined {
+	if (options.profile === "read-only") return undefined;
+	const gate = checkBashAllowedPrefixes(command, allowedPrefixes, { ...options, profile: "workflow" });
+	if (!gate.allowed) return undefined;
+	const parsed = parseShellWords(command.trim());
+	if (parsed.reason || parsed.words.length === 0) return undefined;
+	const [head, ...rest] = parsed.words;
+	if (!head) return undefined;
+	const resolvedHead = resolvedExternalCommand(head);
+	if (!resolvedHead) return undefined;
+	return disableGitExternalHelpers(head, [resolvedHead, ...rest])
+		.map(shellQuote)
+		.join(" ");
 }
 
 export function normalizeReadOnlyBashCommand(command: string): string | undefined {

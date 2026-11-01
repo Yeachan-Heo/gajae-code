@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	applyGjcBundleRestore,
@@ -32,6 +34,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	setAgentDir(originalAgentDir);
 	await fs.rm(agentDir, { recursive: true, force: true });
 	await fs.rm(cwd, { recursive: true, force: true });
@@ -100,13 +103,17 @@ interface PrivateMarketplaceFixture {
 /** Sets up a locally hosted, pinned-SHA "private marketplace" with one plugin installed at a corrupt canonical cache path. */
 async function setupPrivateMarketplace(
 	managerOverrides: Partial<ConstructorParameters<typeof MarketplaceManager>[0]> = {},
+	fixtureOptions: { marketplaceName?: string; pluginName?: string; version?: string } = {},
 ): Promise<PrivateMarketplaceFixture> {
+	const marketplaceName = fixtureOptions.marketplaceName ?? "private";
+	const pluginName = fixtureOptions.pluginName ?? "private-plugin";
+	const version = fixtureOptions.version ?? "1.0.0";
 	const marketplaceRoot = path.join(cwd, "private-marketplace");
 	const pluginRepo = path.join(cwd, "plugin-repo");
 	await fs.mkdir(path.join(pluginRepo, ".claude-plugin"), { recursive: true });
 	await fs.writeFile(
 		path.join(pluginRepo, ".claude-plugin", "plugin.json"),
-		JSON.stringify({ name: "private-plugin", version: "1.0.0" }),
+		JSON.stringify({ name: pluginName, version }),
 	);
 	spawnSync("git", ["init", "-q", pluginRepo]);
 	spawnSync("git", ["-C", pluginRepo, "config", "user.email", "test@example.invalid"]);
@@ -118,15 +125,15 @@ async function setupPrivateMarketplace(
 	await fs.mkdir(marketplaceRoot, { recursive: true });
 	const catalogPath = path.join(marketplaceRoot, "marketplace.json");
 	const catalog = {
-		name: "private",
+		name: marketplaceName,
 		owner: { name: "test" },
-		plugins: [{ name: "private-plugin", source: { source: "url", url: pluginRepo, sha }, version: "1.0.0" }],
+		plugins: [{ name: pluginName, source: { source: "url", url: pluginRepo, sha }, version }],
 	};
 	await fs.writeFile(catalogPath, JSON.stringify(catalog));
 
 	const pluginsCacheDir = path.join(cwd, "cache");
 	// Canonical private per-(marketplace,name,version) layout: <cacheDir>/<marketplace>___<name>___<version>/
-	const installedRoot = path.join(pluginsCacheDir, "private___private-plugin___1.0.0");
+	const installedRoot = path.join(pluginsCacheDir, `${marketplaceName}___${pluginName}___${version}`);
 	await fs.mkdir(installedRoot, { recursive: true });
 	await fs.writeFile(path.join(installedRoot, "corrupt"), "bad");
 
@@ -136,7 +143,7 @@ async function setupPrivateMarketplace(
 		version: 1,
 		marketplaces: [
 			{
-				name: "private",
+				name: marketplaceName,
 				sourceType: "local",
 				sourceUri: marketplaceRoot,
 				catalogPath,
@@ -146,7 +153,7 @@ async function setupPrivateMarketplace(
 		],
 	};
 	await writeMarketplacesRegistry(marketplacesRegistryPath, marketplacesRegistry);
-	const pluginId = "private-plugin@private";
+	const pluginId = `${pluginName}@${marketplaceName}`;
 	const installedRegistry: InstalledPluginsRegistry = {
 		version: 2,
 		plugins: {
@@ -154,7 +161,7 @@ async function setupPrivateMarketplace(
 				{
 					scope: "user",
 					installPath: installedRoot,
-					version: "1.0.0",
+					version,
 					installedAt: "2020-01-01T00:00:00.000Z",
 					lastUpdated: "2020-01-01T00:00:00.000Z",
 					enabled: false,
@@ -189,7 +196,11 @@ describe("private marketplace artifact restore", () => {
 		expect(token.originalInstallPath).toBe(installedRoot);
 		expect(token.stagedArtifactPath).not.toBe(installedRoot);
 
+		const removeTree = vi.spyOn(native, "exactRemoveDirectoryTree");
 		const restored = await manager.applyPluginRestore(token);
+		expect(
+			removeTree.mock.calls.some(([target, , , detachOnly]) => target === installedRoot && detachOnly === true),
+		).toBe(true);
 		expect(restored.status).toBe("verified");
 		expect(restored.sideEffectStarted).toBe(true);
 		expect(restored.entry.enabled).toBe(false);
@@ -269,6 +280,62 @@ describe("private marketplace artifact restore", () => {
 		const retriedAgain = await manager.applyPluginRestore(token);
 		expect(retriedAgain.status).toBe("not_needed");
 		expect(retriedAgain.sideEffectStarted).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")("restores a canonical cache entry near NAME_MAX", async () => {
+		const marketplaceName = "m".repeat(63);
+		const pluginName = "p".repeat(64);
+		const version = `1.0.0+${"a".repeat(108)}`;
+		const { manager, pluginId, installedRoot, pluginsCacheDir } = await setupPrivateMarketplace(
+			{},
+			{ marketplaceName, pluginName, version },
+		);
+		expect(pluginId.length).toBe(128);
+		expect(path.basename(installedRoot).length).toBe(247);
+
+		const plan = await manager.previewPluginRestore(pluginId, "user");
+		const token = await manager.authorizePluginRestore(plan, ["plugin-change", "install-replace", "network"]);
+		const restored = await manager.applyPluginRestore(token);
+
+		expect(restored.status).toBe("verified");
+		expect(restored.entry.installPath).toBe(installedRoot);
+		expect(await fs.readdir(installedRoot)).toContain(".claude-plugin");
+		expect(await fs.readdir(installedRoot)).not.toContain("corrupt");
+		expect(await fs.readdir(pluginsCacheDir)).toContain(path.basename(installedRoot));
+	});
+
+	test("reports a failed post-detach restoration as an uncertain mutation", async () => {
+		const { manager, pluginId, installedRoot } = await setupPrivateMarketplace();
+		const plan = await manager.previewPluginRestore(pluginId, "user");
+		const token = await manager.authorizePluginRestore(plan, ["plugin-change", "install-replace", "network"]);
+		const detachedPath = `${installedRoot}.removing`;
+		const exactRemove = native.exactRemoveDirectoryTree;
+		const removeTree = vi
+			.spyOn(native, "exactRemoveDirectoryTree")
+			.mockImplementation((target, snapshot, parent, detachOnly) => {
+				if (target !== installedRoot || detachOnly !== true)
+					return exactRemove(target, snapshot, parent, detachOnly);
+				syncFs.renameSync(target, detachedPath);
+				return { ok: false, code: "restore_failed", detachedPath };
+			});
+
+		try {
+			await manager.applyPluginRestore(token);
+			throw new Error("expected post-detach restoration to be reported as uncertain");
+		} catch (error) {
+			expect(error).toBeInstanceOf(MarketplaceRestoreError);
+			const restoreError = error as MarketplaceRestoreError;
+			expect(restoreError.reasonCode).toBe("backup_detach_unverified");
+			expect(restoreError.sideEffectStarted).toBe(true);
+			expect(restoreError.outcome).toBe("uncertain");
+			expect(restoreError.retainedBackupPath).toBe(detachedPath);
+		}
+
+		expect(
+			removeTree.mock.calls.some(([target, , , detachOnly]) => target === installedRoot && detachOnly === true),
+		).toBe(true);
+		await expect(fs.lstat(installedRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readdir(detachedPath)).toContain("corrupt");
 	});
 
 	test("preview never mutates the registry or cache", async () => {
@@ -455,22 +522,31 @@ describe("private marketplace artifact restore", () => {
 			expect(error).toBeInstanceOf(MarketplaceRestoreError);
 			const restoreError = error as MarketplaceRestoreError;
 			expect(restoreError.sideEffectStarted).toBe(true);
-			// The published tree is detached from the canonical name, but the native
-			// removal could not finish scrubbing it (the bundle carries a read-only
-			// file), so the rollback is genuinely unfinished. It must be reported as
-			// `uncertain` rather than upgraded to a clean `conflict`, and never as a
-			// foreign claim — nothing foreign is involved.
-			expect(restoreError.outcome).toBe("uncertain");
-			expect(restoreError.reasonCode).toBe("rollback_rename_failed");
-			// The prior artifact is retained and named, never silently discarded.
-			expect(restoreError.retainedBackupPath).toBeDefined();
-			expect(await fs.readdir(restoreError.retainedBackupPath!)).toContain("corrupt");
+			if (process.platform === "win32") {
+				// Windows can remove the read-only published file and complete the
+				// rollback. The registry-write failure is then a clean conflict, with the
+				// original artifact back at its canonical path.
+				expect(restoreError.outcome).toBe("conflict");
+				expect(restoreError.reasonCode).toBe("registry_write_failed");
+				expect(restoreError.retainedBackupPath).toBeUndefined();
+			} else {
+				// POSIX cannot finish scrubbing this read-only bundle. The original is
+				// retained at the backup path and the incomplete rollback is uncertain.
+				expect(restoreError.outcome).toBe("uncertain");
+				expect(restoreError.reasonCode).toBe("rollback_rename_failed");
+				expect(restoreError.retainedBackupPath).toBeDefined();
+				expect(await fs.readdir(restoreError.retainedBackupPath!)).toContain("corrupt");
+			}
 		} finally {
 			await fs.rm(tmpBlockerPath, { recursive: true, force: true });
 		}
-		// The canonical name is vacated rather than left holding a half-published
-		// artifact the registry no longer references.
-		await expect(fs.readdir(installedRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		if (process.platform === "win32") {
+			expect(await fs.readdir(installedRoot)).toEqual(["corrupt"]);
+		} else {
+			// The canonical name is vacated rather than left holding a half-published
+			// artifact the registry no longer references.
+			await expect(fs.readdir(installedRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		}
 	});
 
 	test("apply reports foreign_owner_conflict with a retained, untouched backup when a concurrent owner republishes finalPath", async () => {

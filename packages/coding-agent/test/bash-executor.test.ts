@@ -46,7 +46,7 @@ function makeTempDir(): string {
 
 describe("executeBash", () => {
 	it("caps minimizer captures to the supported protocol boundary", () => {
-		const base = { enabled: true, settingsPath: "", only: [], except: [] };
+		const base = { enabled: true, settingsPath: "", settingsHash: undefined, only: [], except: [] };
 		expect(buildMinimizerOptions({ ...base, maxCaptureBytes: Number.MAX_SAFE_INTEGER })?.maxCaptureBytes).toBe(
 			4 * 1024 * 1024,
 		);
@@ -389,10 +389,14 @@ describe("executeBash", () => {
 		if (process.platform === "win32") return;
 		await disposeAllShellSessions();
 		const ready = Promise.withResolvers<void>();
+		const readyEntered = Promise.withResolvers<void>();
 		const closeSpy = vi.fn(async () => undefined);
 		const runSpy = vi.fn(async () => ({ exitCode: 0, cancelled: false, timedOut: false }));
 		setShellFactoryForTests(() => ({
-			ready: async () => await ready.promise,
+			ready: async () => {
+				readyEntered.resolve();
+				await ready.promise;
+			},
 			run: runSpy,
 			abort: async () => undefined,
 			close: closeSpy,
@@ -403,7 +407,7 @@ describe("executeBash", () => {
 			timeout: 1_000,
 			sessionKey: "dispose-during-startup",
 		});
-		for (let attempt = 0; attempt < 40 && getShellSessionCount() === 0; attempt++) await Bun.sleep(5);
+		await Promise.race([readyEntered.promise, execution]);
 		expect(getShellSessionCount()).toBe(1);
 
 		await disposeAllShellSessions();
@@ -1252,7 +1256,6 @@ describe("executeBash", () => {
 			// Explicitly unset managed-owner vars like the bash tool does
 			const unsetEnv = [
 				"GJC_MANAGED_OWNER_CHILD_TOKEN",
-				"GJC_MANAGED_OWNER_COMMAND_JSON",
 				"GJC_COORDINATOR_SESSION_ID",
 				"GJC_TMUX_OWNER_GENERATION",
 				"GJC_TMUX_OWNER_STATE_DIR",

@@ -6,7 +6,7 @@ Sends short text messages to other live agents in this process and receives thei
 - `op: "send"` delivers `message` to `to`. `to` may be a specific id or `"all"` to broadcast.
 - `awaitReply` (optional): wait for a prose reply. Defaults to `true` for DMs and `false` for `to: "all"` broadcasts.
 - The recipient generates the reply via an ephemeral side-channel turn that uses their current model, system prompt, and history — it does **not** wait for the recipient's main loop to be free, so it is safe to IRC an agent that is currently inside a long-running tool call.
-- The exchange (incoming question + auto-reply) is queued for injection into the recipient's persisted history; the recipient sees it on its next turn and can follow up if needed.
+- The exchange (incoming question + auto-reply) is injected into the recipient's persisted history as soon as it can be delivered: an idle recipient gets it immediately, and a recipient that is already streaming receives it at its next step boundary instead of at the end of its turn. The recipient can then follow up if needed.
 </instruction>
 
 <conditions>

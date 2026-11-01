@@ -1,3 +1,4 @@
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -180,10 +181,10 @@ export async function writeCrashReport(
 	}
 
 	try {
-		const dir = getCrashDiagnosticsDirectory(options.env);
-		await ensurePrivateDiagnosticsDirectory(dir);
+		const directory = diagnosticsDirectoryPath(getCrashDiagnosticsDirectory(options.env));
+		await ensurePrivateDiagnosticsDirectory(directory);
 		const filename = `${report.createdAt.replace(/[:.]/g, "-")}-${report.kind}-${report.class}-${process.pid}.json`;
-		const reportPath = path.join(dir, filename);
+		const reportPath = path.join(directory, filename);
 		await writePrivateCrashReport(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 		return { report, path: reportPath, enabled };
 	} catch {
@@ -197,19 +198,100 @@ export function formatCrashDiagnosticNotice(result: CrashReportWriteResult): str
 	return `[crash:${result.report.kind}:${result.report.class}] ${result.report.reason}${location}`;
 }
 
+const POSIX_NOFOLLOW = process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0);
+
+function isFilesystemRoot(dir: string): boolean {
+	const root = path.parse(dir).root;
+	return root.length > 0 && dir === root;
+}
+
+/** Drop trailing platform separators and "." segments. A backslash stays in the name on POSIX. ".." is unchanged. */
+function diagnosticsDirectoryPath(dir: string): string {
+	const sep = path.sep;
+	let current = dir;
+	while (!isFilesystemRoot(current)) {
+		let end = current.length;
+		while (end > 0 && current[end - 1] === sep) end -= 1;
+		if (end !== current.length) {
+			const stripped = current.slice(0, end);
+			if (stripped === "" || isFilesystemRoot(stripped)) return path.parse(current).root || current;
+			if (process.platform === "win32" && /^[A-Za-z]:$/.test(stripped)) return `${stripped}\\`;
+			current = stripped;
+			continue;
+		}
+		const dotSuffix = `${sep}.`;
+		if (current.endsWith(dotSuffix) && !current.endsWith(`${sep}..`)) {
+			const parent = current.slice(0, -dotSuffix.length);
+			if (parent === "" || isFilesystemRoot(parent)) {
+				return parent === "" ? path.parse(current).root || current : parent;
+			}
+			if (process.platform === "win32" && /^[A-Za-z]:$/.test(parent)) return `${parent}\\`;
+			current = parent;
+			continue;
+		}
+		return current;
+	}
+	return current;
+}
+
 async function ensurePrivateDiagnosticsDirectory(dir: string): Promise<void> {
+	await assertRealDiagnosticsDirectory(dir);
 	await fs.mkdir(dir, { recursive: true, mode: DIRECTORY_MODE });
+	await assertRealDiagnosticsDirectory(dir);
+	await chmodRealDiagnosticsDirectory(dir);
+}
+
+async function assertRealDiagnosticsDirectory(dir: string): Promise<void> {
+	let stat: Awaited<ReturnType<typeof fs.lstat>>;
+	try {
+		stat = await fs.lstat(dir);
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return;
+		throw error;
+	}
+	if (stat.isSymbolicLink() || !stat.isDirectory()) {
+		throw new Error("crash diagnostics path is not a private directory");
+	}
+}
+
+async function chmodRealDiagnosticsDirectory(dir: string): Promise<void> {
+	const stat = await fs.lstat(dir);
+	if (stat.isSymbolicLink() || !stat.isDirectory()) {
+		throw new Error("crash diagnostics path is not a private directory");
+	}
+	// macOS lchmod sets the mode without read permission and without following a symlink.
+	// Linux has no equivalent here, so an unreadable directory is left unchanged. A path chmod would follow a swapped symlink.
+	if (process.platform === "darwin" && typeof fs.lchmod === "function") {
+		await fs.lchmod(dir, DIRECTORY_MODE);
+		return;
+	}
+	const directoryFlag = fsConstants.O_DIRECTORY ?? 0;
+	const pathFlag = (fsConstants as { O_PATH?: number }).O_PATH ?? 0;
+	if (POSIX_NOFOLLOW !== 0 && directoryFlag !== 0) {
+		const openFlag = pathFlag !== 0 ? pathFlag : fsConstants.O_RDONLY;
+		const handle = await fs.open(dir, openFlag | directoryFlag | POSIX_NOFOLLOW);
+		try {
+			await handle.chmod(DIRECTORY_MODE);
+		} finally {
+			await handle.close();
+		}
+		return;
+	}
 	await fs.chmod(dir, DIRECTORY_MODE);
 }
 
 async function writePrivateCrashReport(reportPath: string, contents: string): Promise<void> {
-	const file = await fs.open(reportPath, "wx", REPORT_FILE_MODE);
+	const file = await fs.open(
+		reportPath,
+		fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | POSIX_NOFOLLOW,
+		REPORT_FILE_MODE,
+	);
 	try {
 		await file.writeFile(contents);
+		await file.chmod(REPORT_FILE_MODE);
 	} finally {
 		await file.close();
 	}
-	await fs.chmod(reportPath, REPORT_FILE_MODE);
 }
 
 function stringifyError(error: unknown): string {

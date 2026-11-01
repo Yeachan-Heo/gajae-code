@@ -66,3 +66,67 @@ export async function resolveAstEditPreviewWritePaths(
 	}
 	return resolved;
 }
+
+/** Refusal prefix when a single-file real path leaves its reference root. */
+export const AST_EDIT_OUTSIDE_ROOT_MESSAGE = "AST edit target resolves outside its root";
+
+function isEnoent(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+function staysInside(root: string, target: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function realOrLexical(target: string): Promise<string> {
+	try {
+		return await fs.realpath(target);
+	} catch (error) {
+		if (isEnoent(error)) return path.resolve(target);
+		throw error;
+	}
+}
+
+/**
+ * Native astEdit canonicalizes one file and writes that real path. Directory
+ * scans do not follow links. A lexical path inside cwd uses the real cwd as
+ * the reference root; an explicit path outside cwd uses its real parent, so a
+ * direct file there still applies. Returns the lexical path that would leave
+ * that root, if any.
+ */
+export async function astEditSingleFileOutsideReferenceRoot(
+	cwd: string,
+	candidatePaths: readonly string[],
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	signal?.throwIfAborted();
+	const resolvedCwd = path.resolve(cwd);
+	const realCwd = await realOrLexical(resolvedCwd);
+	for (const candidate of candidatePaths) {
+		signal?.throwIfAborted();
+		const lexical = path.resolve(resolvedCwd, candidate);
+		let followed: string;
+		try {
+			followed = await fs.realpath(lexical);
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		let stat: Awaited<ReturnType<typeof fs.stat>>;
+		try {
+			stat = await fs.stat(followed);
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		if (!stat.isFile()) continue;
+		const root =
+			staysInside(resolvedCwd, lexical) || staysInside(realCwd, lexical)
+				? realCwd
+				: await realOrLexical(path.dirname(lexical));
+		signal?.throwIfAborted();
+		if (!staysInside(root, followed)) return lexical;
+	}
+	return undefined;
+}

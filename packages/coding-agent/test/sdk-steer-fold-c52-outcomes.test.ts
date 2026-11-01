@@ -68,7 +68,11 @@ async function captureSdkControl(
 	if (dispatcher === "runtime-init") {
 		await initializeExtensions(target, { reportSendError: () => {}, reportRuntimeError: () => {} });
 	} else {
-		const controller = new ExtensionUiController({ session: target } as unknown as InteractiveModeContext);
+		const controller = new ExtensionUiController({
+			session: target,
+			// The real dispatcher refreshes editor chrome even when a control request rejects.
+			updateEditorChrome: () => {},
+		} as unknown as InteractiveModeContext);
 		controller.initializeHookRunner({} as ExtensionUIContext, false);
 	}
 	const sdkControl = captured?.sdkControl;

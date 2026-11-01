@@ -37,7 +37,7 @@ describe("managed Cursor fallback", () => {
 			},
 		};
 		const agent = new Agent({
-			initialState: { model: cursorModel(mock.model), systemPrompt: ["test"], tools: [tool], messages: [] },
+			initialState: { model: cursorModel(mock), systemPrompt: ["test"], tools: [tool], messages: [] },
 			cursorExecHandlers: {
 				write: async () => {
 					providerHandlerCalls += 1;
@@ -73,7 +73,7 @@ describe("managed Cursor fallback", () => {
 		const mock = createMockModel({ responses: [{ content: ["done"] }] });
 		let captured: SimpleStreamOptions | undefined;
 		const agent = new Agent({
-			initialState: { model: cursorModel(mock.model), systemPrompt: ["test"], tools: [], messages: [] },
+			initialState: { model: cursorModel(mock), systemPrompt: ["test"], tools: [], messages: [] },
 			cursorExecHandlers: { read: async () => ({}) as never },
 			cursorOnToolResult: async result => result,
 			streamFn: (model, context, options) => {

@@ -1,3 +1,4 @@
+import { setSessionOutboundRedact } from "../host/events";
 import {
 	type GenericNotificationSessionSource,
 	getCurrentTelegramActivationMarker,
@@ -480,6 +481,7 @@ export class NotificationSessionController {
 		policy: Omit<NotificationRuntimePolicy, "mode">,
 		mode: NotificationRuntimePolicy["mode"],
 	): void {
+		setSessionOutboundRedact(binding.sessionId, policy.redact);
 		runtime?.refreshPolicy?.(binding, { ...policy, mode });
 	}
 

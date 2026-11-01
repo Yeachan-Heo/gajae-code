@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, hasFsCode, isEnoent, Snowflake } from "@gajae-code/utils";
+import { $which, hasFsCode, isEnoent } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -10,6 +11,7 @@ import {
 } from "../commit/git/diff";
 import type { FileDiff, FileHunks, NumstatEntry } from "../commit/types";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
+import { ghSpawnEnv } from "./gh";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Types
@@ -198,7 +200,10 @@ async function runCommand(
 	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
 	const child = Bun.spawn(["git", ...commandArgs], {
 		cwd,
-		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
+		// The inherited environment holds the autoloaded project `.env`; without
+		// filtering, a repository could set e.g. `GIT_CONFIG_*` (`core.hooksPath`)
+		// or `GIT_SSH_COMMAND` and have GJC's own commit/fetch/push run its code.
+		env: options.env ? { ...projectSafeSpawnEnv(), GIT_OPTIONAL_LOCKS: "0", ...options.env } : projectSafeSpawnEnv(),
 		signal: options.signal,
 		stdin: normalizeStdin(options.stdin),
 		stdout: "pipe",
@@ -365,9 +370,24 @@ function buildApplyArgs(patchPath: string, options: PatchOptions): string[] {
 }
 
 async function writeTempPatch(content: string): Promise<string> {
-	const tempPath = path.join(os.tmpdir(), `gjc-git-patch-${Snowflake.next()}.patch`);
-	await Bun.write(tempPath, content);
-	return tempPath;
+	// Random directory plus an exclusive create: a preexisting symlink under the
+	// shared temp directory is not opened, and the patch is not left world-readable.
+	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-git-patch-"));
+	try {
+		if (process.platform !== "win32") await fs.promises.chmod(tempDir, 0o700);
+		const tempPath = path.join(tempDir, "patch");
+		const handle = await fs.promises.open(tempPath, "wx", 0o600);
+		try {
+			await handle.writeFile(content);
+		} finally {
+			await handle.close();
+		}
+		if (process.platform !== "win32") await fs.promises.chmod(tempPath, 0o600);
+		return tempPath;
+	} catch (error) {
+		await fs.promises.rm(tempDir, { recursive: true, force: true });
+		throw error;
+	}
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1232,7 +1252,7 @@ export const patch = {
 		try {
 			await patch.apply(cwd, tempPath, options);
 		} finally {
-			await fs.promises.rm(tempPath, { force: true });
+			await fs.promises.rm(path.dirname(tempPath), { recursive: true, force: true });
 		}
 	},
 
@@ -1253,7 +1273,7 @@ export const patch = {
 		try {
 			return await patch.canApply(cwd, tempPath, options);
 		} finally {
-			await fs.promises.rm(tempPath, { force: true });
+			await fs.promises.rm(path.dirname(tempPath), { recursive: true, force: true });
 		}
 	},
 
@@ -1609,6 +1629,10 @@ export const github = {
 		try {
 			const child = Bun.spawn(["gh", ...args], {
 				cwd,
+				// Same project-dotenv filtering as git: `gh` runs git for checkout
+				// and push. Output is captured, so gh must never page or act as if
+				// on a terminal; pin both so a project `.env` cannot select a pager.
+				env: ghSpawnEnv(),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",

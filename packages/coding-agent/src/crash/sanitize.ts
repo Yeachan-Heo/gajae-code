@@ -99,8 +99,10 @@ export function sanitizeExternalCrashV1(text: string, maxBytes: number = CRASH_F
 	let value = text.replace(/\r\n?/g, "\n");
 	value = value.replace(OSC_PATTERN, " ").replace(CSI_PATTERN, "");
 	value = value.replace(CONTROL_PATTERN, "").replace(INVISIBLE_PATTERN, "");
+	// Redact each URL separately so an unquoted query value cannot absorb prose
+	// after the URL; then sanitize the remaining crash text normally.
+	value = value.replace(URL_PATTERN, match => sanitizeUrl(redactCrashSecrets(match)));
 	value = redactCrashSecrets(value);
-	value = value.replace(URL_PATTERN, match => sanitizeUrl(match));
 	value = replaceAbsolutePaths(value);
 	value = value.replace(UUID_PATTERN, "<uuid>");
 	value = value.replace(HEX_RUN_PATTERN, match => (/[a-fA-F]/.test(match) ? "<hex>" : "<num>"));

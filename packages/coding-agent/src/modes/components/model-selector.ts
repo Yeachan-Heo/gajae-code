@@ -1,3 +1,4 @@
+import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	getMiniMaxThinkingMode,
@@ -9,6 +10,7 @@ import {
 import {
 	Container,
 	fuzzyFilter,
+	fuzzyMatch,
 	getKeybindings,
 	Input,
 	matchesKey,
@@ -67,11 +69,12 @@ import { getProviderAuthHealth } from "../../config/provider-auth-health";
 import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
-import type { SmartRoutingIntent, SmartRoutingPreview } from "./smart-routing-panel";
+import type { SmartRoutingIntent } from "./smart-routing-panel";
 import { SmartRoutingPanelComponent } from "./smart-routing-panel";
 
 function makeInvertedBadge(label: string, color: ThemeColor): string {
@@ -99,6 +102,150 @@ function computeModelRank(model: Model, roles: Record<string, RoleAssignment | u
 	return roles.default && modelsAreEqual(roles.default.model, model) ? 0 : 1;
 }
 
+/**
+ * Compute and assign fuzzy scores to model items based on a query.
+ * Scores are based on fuzzy matching against the model's searchable text.
+ */
+function fuzzyTokensScore(query: string, text: string): number | undefined {
+	const tokens = query
+		.trim()
+		.split(/\s+/)
+		.filter(token => token.length > 0);
+	if (tokens.length === 0) return undefined;
+	let total = 0;
+	for (const token of tokens) {
+		const match = fuzzyMatch(token, text);
+		if (!match.matches) return undefined;
+		total += match.score;
+	}
+	return total;
+}
+
+export function assignFuzzyScoresToModels(items: ModelItem[], query: string): void {
+	if (!query.trim()) {
+		for (const item of items) item.fuzzyScore = undefined;
+		return;
+	}
+	for (const item of items) {
+		// Overwrite every item so a raw-query miss cannot retain an earlier score.
+		item.fuzzyScore = fuzzyTokensScore(query, `${item.id} ${item.provider}`);
+	}
+}
+
+/**
+ * Compute and assign fuzzy scores to canonical model items based on a query.
+ */
+export function assignFuzzyScoresToCanonicalModels(items: CanonicalModelItem[], query: string): void {
+	if (!query.trim()) {
+		for (const item of items) item.fuzzyScore = undefined;
+		return;
+	}
+	for (const item of items) {
+		item.fuzzyScore = fuzzyTokensScore(query, item.searchText);
+	}
+}
+
+export interface RankedModelOrderContext {
+	roles: RoleAssignments;
+	mruIndex: ReadonlyMap<string, number>;
+	providerAuthStateById: ReadonlyMap<string, ProviderAuthState>;
+}
+
+const MODEL_DATE_RE = /-(\d{8})$/;
+const MODEL_LATEST_RE = /-latest$/;
+
+/** Ranking shared by the provider view: fuzzy quality, default, MRU, provider, recency. */
+export function compareModelItemsForRanking(a: ModelItem, b: ModelItem, context: RankedModelOrderContext): number {
+	const { roles, mruIndex, providerAuthStateById } = context;
+	const aHasFuzzyScore = a.fuzzyScore !== undefined;
+	const bHasFuzzyScore = b.fuzzyScore !== undefined;
+	if (aHasFuzzyScore || bHasFuzzyScore) {
+		const aScore = a.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		const bScore = b.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		if (aScore !== bScore) return aScore - bScore;
+		// Ties keep the established default-first, then MRU/provider ordering.
+	}
+
+	const aRank = computeModelRank(a.model, roles);
+	const bRank = computeModelRank(b.model, roles);
+	if (aRank !== bRank) return aRank - bRank;
+
+	const aMru = mruIndex.get(a.selector) ?? Number.MAX_SAFE_INTEGER;
+	const bMru = mruIndex.get(b.selector) ?? Number.MAX_SAFE_INTEGER;
+	if (aMru !== bMru) return aMru - bMru;
+
+	const providerCmp = compareRankedProviders(
+		{ id: a.provider, label: a.provider, authState: providerAuthStateById.get(a.provider) ?? "none" },
+		{ id: b.provider, label: b.provider, authState: providerAuthStateById.get(b.provider) ?? "none" },
+	);
+	if (providerCmp !== 0) return providerCmp;
+
+	// Priority field (lower = better, e.g. OpenAI code backend priority values)
+	const aPri = a.model.priority ?? Number.MAX_SAFE_INTEGER;
+	const bPri = b.model.priority ?? Number.MAX_SAFE_INTEGER;
+	if (aPri !== bPri) return aPri - bPri;
+
+	// Version number descending (higher version = better model)
+	const aVer = extractVersionNumber(a.id);
+	const bVer = extractVersionNumber(b.id);
+	if (aVer !== bVer) return bVer - aVer;
+
+	const aIsLatest = MODEL_LATEST_RE.test(a.id);
+	const bIsLatest = MODEL_LATEST_RE.test(b.id);
+	const aDate = a.id.match(MODEL_DATE_RE)?.[1] ?? "";
+	const bDate = b.id.match(MODEL_DATE_RE)?.[1] ?? "";
+
+	const aHasRecency = aIsLatest || aDate !== "";
+	const bHasRecency = bIsLatest || bDate !== "";
+	if (aHasRecency !== bHasRecency) return aHasRecency ? -1 : 1;
+	if (!aHasRecency) return a.id.localeCompare(b.id);
+	if (aIsLatest !== bIsLatest) return aIsLatest ? -1 : 1;
+	if (aDate && bDate) return bDate.localeCompare(aDate);
+	return aIsLatest ? -1 : bIsLatest ? 1 : a.id.localeCompare(b.id);
+}
+
+/** Ranking shared by the canonical view: fuzzy quality, default, MRU, provider, then id. */
+export function compareCanonicalModelItemsForRanking(
+	a: CanonicalModelItem,
+	b: CanonicalModelItem,
+	context: RankedModelOrderContext,
+): number {
+	const { roles, mruIndex, providerAuthStateById } = context;
+	const aHasFuzzyScore = a.fuzzyScore !== undefined;
+	const bHasFuzzyScore = b.fuzzyScore !== undefined;
+	if (aHasFuzzyScore || bHasFuzzyScore) {
+		const aScore = a.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		const bScore = b.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+		if (aScore !== bScore) return aScore - bScore;
+		// Ties keep the established default-first, then MRU/provider ordering.
+	}
+
+	const aRank = computeModelRank(a.model, roles);
+	const bRank = computeModelRank(b.model, roles);
+	if (aRank !== bRank) return aRank - bRank;
+
+	const aKey = `${a.model.provider}/${a.model.id}`;
+	const bKey = `${b.model.provider}/${b.model.id}`;
+	const aMru = mruIndex.get(aKey) ?? Number.MAX_SAFE_INTEGER;
+	const bMru = mruIndex.get(bKey) ?? Number.MAX_SAFE_INTEGER;
+	if (aMru !== bMru) return aMru - bMru;
+
+	const providerCmp = compareRankedProviders(
+		{
+			id: a.model.provider,
+			label: a.model.provider,
+			authState: providerAuthStateById.get(a.model.provider) ?? "none",
+		},
+		{
+			id: b.model.provider,
+			label: b.model.provider,
+			authState: providerAuthStateById.get(b.model.provider) ?? "none",
+		},
+	);
+	if (providerCmp !== 0) return providerCmp;
+	return a.id.localeCompare(b.id);
+}
+
 interface ModelItem {
 	kind: "provider";
 	provider: string;
@@ -107,6 +254,7 @@ interface ModelItem {
 	selector: string;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel?: boolean;
+	fuzzyScore?: number;
 }
 
 interface CanonicalModelItem {
@@ -120,6 +268,7 @@ interface CanonicalModelItem {
 	compactSearchText: string;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel?: boolean;
+	fuzzyScore?: number;
 }
 
 type ScopedModelItem = ScopedModelSelection;
@@ -187,7 +336,10 @@ interface PendingThinkingChoice {
 	levels: ThinkingLevel[];
 }
 
-type RoleSelectCallback = (selection: ModelSelectorSelection) => void | Promise<void>;
+type RoleSelectCallback =
+	| ((selection: ModelSelectorSelection) => void)
+	| ((selection: ModelSelectorSelection) => Promise<void>)
+	| ((selection: ModelSelectorSelection) => Promise<RoutingSettingsPreview | undefined>);
 type CancelCallback = () => void;
 
 interface ProviderTabState {
@@ -443,7 +595,10 @@ export class ModelSelectorComponent extends Container {
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
-	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	#smartRoutingStateUnknown = false;
+	#isSmartRoutingStateUnknown?: () => boolean;
+	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	#smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 	#isBillingDismissed?: (key: string) => boolean;
 	#markBillingDismissed?: (key: string) => void;
 	#pendingBillingNoticeKey?: string;
@@ -472,7 +627,9 @@ export class ModelSelectorComponent extends Container {
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
-			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+			smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
+			smartRoutingStateUnknown?: () => boolean;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -493,6 +650,8 @@ export class ModelSelectorComponent extends Container {
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
+		this.#smartRoutingDiscardPreview = options?.smartRoutingDiscardPreview;
+		this.#isSmartRoutingStateUnknown = options?.smartRoutingStateUnknown;
 		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
 		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
@@ -646,7 +805,7 @@ export class ModelSelectorComponent extends Container {
 			this.#configuredDefaultChain ?? normalizeModelSelectorValue(this.#settings.getModelRole("default"));
 		if (configuredChain.length < 2) return false;
 
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = this.#modelRegistry.getAll(this.#authSessionId);
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		return configuredChain.slice(1).some(selector => {
 			const resolved = resolveModelRoleValue(selector, allModels, {
@@ -662,7 +821,7 @@ export class ModelSelectorComponent extends Container {
 
 	#loadRoleModels(): RoleAssignments {
 		const roles: RoleAssignments = {};
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = this.#modelRegistry.getAll(this.#authSessionId);
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		const agentModelOverrides = this.#settings.get("task.agentModelOverrides");
 		const activeProfile = this.#activeModelProfile
@@ -738,7 +897,6 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#sortModels(models: ModelItem[], roles: RoleAssignments = this.#roles): void {
-		// Sort: default-tagged model first, then MRU, then provider ranking
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
 		const providerAuthStateById = new Map<string, ProviderAuthState>();
@@ -747,74 +905,7 @@ export class ModelSelectorComponent extends Container {
 				providerAuthStateById.set(item.provider, this.#resolveProviderAuthState(item.provider));
 			}
 		}
-
-		const modelRank = (item: ModelItem) => computeModelRank(item.model, roles);
-
-		const dateRe = /-(\d{8})$/;
-		const latestRe = /-latest$/;
-
-		models.sort((a, b) => {
-			const aKey = a.selector;
-			const bKey = b.selector;
-
-			const aRank = modelRank(a);
-			const bRank = modelRank(b);
-			if (aRank !== bRank) return aRank - bRank;
-
-			// Then MRU order (models in mruIndex come before those not in it)
-			const aMru = mruIndex.get(aKey) ?? Number.MAX_SAFE_INTEGER;
-			const bMru = mruIndex.get(bKey) ?? Number.MAX_SAFE_INTEGER;
-			if (aMru !== bMru) return aMru - bMru;
-
-			// By provider, then recency within provider
-			const providerCmp = compareRankedProviders(
-				{
-					id: a.provider,
-					label: a.provider,
-					authState: providerAuthStateById.get(a.provider) ?? "none",
-				},
-				{
-					id: b.provider,
-					label: b.provider,
-					authState: providerAuthStateById.get(b.provider) ?? "none",
-				},
-			);
-			if (providerCmp !== 0) return providerCmp;
-
-			// Priority field (lower = better, e.g. OpenAI code backend priority values)
-			const aPri = a.model.priority ?? Number.MAX_SAFE_INTEGER;
-			const bPri = b.model.priority ?? Number.MAX_SAFE_INTEGER;
-			if (aPri !== bPri) return aPri - bPri;
-
-			// Version number descending (higher version = better model)
-			const aVer = extractVersionNumber(a.id);
-			const bVer = extractVersionNumber(b.id);
-			if (aVer !== bVer) return bVer - aVer;
-
-			const aIsLatest = latestRe.test(a.id);
-			const bIsLatest = latestRe.test(b.id);
-			const aDate = a.id.match(dateRe)?.[1] ?? "";
-			const bDate = b.id.match(dateRe)?.[1] ?? "";
-
-			// Both have dates or latest tags — sort by recency
-			const aHasRecency = aIsLatest || aDate !== "";
-			const bHasRecency = bIsLatest || bDate !== "";
-
-			// Models with recency info come before those without
-			if (aHasRecency !== bHasRecency) return aHasRecency ? -1 : 1;
-
-			// If neither has recency info, fall back to alphabetical
-			if (!aHasRecency) return a.id.localeCompare(b.id);
-
-			// -latest always sorts first within recency group
-			if (aIsLatest !== bIsLatest) return aIsLatest ? -1 : 1;
-
-			// Both have dates — descending (newest first)
-			if (aDate && bDate) return bDate.localeCompare(aDate);
-
-			// One has date, other is latest — latest first
-			return aIsLatest ? -1 : bIsLatest ? 1 : a.id.localeCompare(b.id);
-		});
+		models.sort((a, b) => compareModelItemsForRanking(a, b, { roles, mruIndex, providerAuthStateById }));
 	}
 
 	#sortCanonicalModels(models: CanonicalModelItem[], roles: RoleAssignments = this.#roles): void {
@@ -826,34 +917,7 @@ export class ModelSelectorComponent extends Container {
 				providerAuthStateById.set(item.model.provider, this.#resolveProviderAuthState(item.model.provider));
 			}
 		}
-
-		const modelRank = (item: CanonicalModelItem) => computeModelRank(item.model, roles);
-
-		models.sort((a, b) => {
-			const aRank = modelRank(a);
-			const bRank = modelRank(b);
-			if (aRank !== bRank) return aRank - bRank;
-
-			const aMru = mruIndex.get(`${a.model.provider}/${a.model.id}`) ?? Number.MAX_SAFE_INTEGER;
-			const bMru = mruIndex.get(`${b.model.provider}/${b.model.id}`) ?? Number.MAX_SAFE_INTEGER;
-			if (aMru !== bMru) return aMru - bMru;
-
-			const providerCmp = compareRankedProviders(
-				{
-					id: a.model.provider,
-					label: a.model.provider,
-					authState: providerAuthStateById.get(a.model.provider) ?? "none",
-				},
-				{
-					id: b.model.provider,
-					label: b.model.provider,
-					authState: providerAuthStateById.get(b.model.provider) ?? "none",
-				},
-			);
-			if (providerCmp !== 0) return providerCmp;
-
-			return a.id.localeCompare(b.id);
-		});
+		models.sort((a, b) => compareCanonicalModelItemsForRanking(a, b, { roles, mruIndex, providerAuthStateById }));
 	}
 
 	#buildScopedModelItems(): ModelItem[] {
@@ -869,7 +933,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#buildAvailableModelItems(): ModelItem[] {
-		return this.#modelRegistry.getAvailable().map((model: Model) => ({
+		return this.#modelRegistry.getAvailable(this.#authSessionId).map((model: Model) => ({
 			kind: "provider",
 			provider: model.provider,
 			id: model.id,
@@ -1205,10 +1269,12 @@ export class ModelSelectorComponent extends Container {
 							? alphaFiltered
 							: baseCanonicalModels;
 				const fuzzyMatches = fuzzyFilter(fuzzySource, query, ({ searchText }) => searchText);
+				assignFuzzyScoresToCanonicalModels(fuzzyMatches, query);
 				this.#sortCanonicalModels(fuzzyMatches);
 				this.#filteredCanonicalModels = fuzzyMatches;
 			} else {
 				const fuzzyMatches = fuzzyFilter(baseModels, query, ({ id, provider }) => `${id} ${provider}`);
+				assignFuzzyScoresToModels(fuzzyMatches, query);
 				this.#sortModels(fuzzyMatches);
 				this.#filteredModels = fuzzyMatches;
 			}
@@ -1256,7 +1322,7 @@ export class ModelSelectorComponent extends Container {
 			if (isInheritedRoleSelector(configuredSelector)) continue;
 			const selectors = resolveConfiguredModelPatterns(configuredSelector, this.#settings);
 			for (const selector of selectors.length > 0 ? selectors : [configuredSelector]) {
-				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
 					settings: this.#settings,
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
@@ -1369,7 +1435,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#getProfileAvailableModels(): Model[] {
-		return this.#modelRegistry.getAvailable();
+		return this.#modelRegistry.getAvailable(this.#authSessionId);
 	}
 
 	#createProfileResolutionRegistry(availableModels: readonly Model[]) {
@@ -1889,18 +1955,24 @@ export class ModelSelectorComponent extends Container {
 		return autoroutingProviderOrderHint(declared, this.#modelRegistry.autoroutingProviderOrder());
 	}
 
-	#smartRoutingPreview(setup: AutoroutingSetup): SmartRoutingPreview {
+	#smartRoutingPreview(setup: AutoroutingSetup): RoutingSettingsPreview {
 		if (!this.#smartRoutingPreviewBuilder) {
 			throw new Error("Smart-routing preview is unavailable in this selector context.");
 		}
 		return this.#smartRoutingPreviewBuilder(setup);
 	}
 
-	#smartRoutingIsStale(): boolean {
+	#smartRoutingUnknown(): boolean {
+		return this.#smartRoutingStateUnknown || this.#isSmartRoutingStateUnknown?.() === true;
+	}
+
+	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
+		if (this.#smartRoutingUnknown()) return false;
 		const provenance = this.#settings.get("task.autorouting.provenance");
-		if (!provenance || validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+		if (!provenance) return false;
 		try {
-			const preview = this.#smartRoutingPreview(this.#smartRoutingSetup());
+			if (validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+			const preview = committedPreview ?? this.#smartRoutingPreview(this.#smartRoutingSetup());
 			const state = evaluateAutoroutingProvenanceState(provenance, {
 				catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
 				mapFingerprint: preview.sourceIdentity.mapFingerprint,
@@ -1917,6 +1989,12 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#enterSmartRoutingMode(): void {
+		if (this.#smartRoutingUnknown()) {
+			this.#viewMode = "presets";
+			this.#presetLoginHint = "Smart-routing settings are unknown; reload Settings before continuing.";
+			this.#renderPresetLanding();
+			return;
+		}
 		if (!this.#smartRoutingPreviewBuilder) {
 			if (this.#smartRoutingOnly) {
 				this.#onCancelCallback();
@@ -1947,14 +2025,17 @@ export class ModelSelectorComponent extends Container {
 			tiers,
 			provenance,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
+			isStateUnknown: () => this.#smartRoutingUnknown(),
 			stale: this.#smartRoutingIsStale(),
 			preview,
 			generatePreview: draft => this.#smartRoutingPreview(draft),
+			discardPreview: preview => this.#smartRoutingDiscardPreview?.(preview),
 			onSelect: async intent => {
-				await this.#onSelectCallback({ kind: "smartRouting", intent });
-				return intent.kind === "apply" ? this.#smartRoutingPreview(intent.draft) : undefined;
+				const result = await this.#onSelectCallback({ kind: "smartRouting", intent });
+				return result || undefined;
 			},
 			onCancel: () => (this.#smartRoutingOnly ? this.#onCancelCallback() : this.#switchToPresetMode()),
 		});
@@ -1975,18 +2056,58 @@ export class ModelSelectorComponent extends Container {
 		this.#requestRender();
 	}
 
-	refreshSmartRoutingState(): void {
+	#hasEffectiveGeneratedSetup(): boolean {
+		return (
+			this.#settings.get("task.autorouting.setup") !== undefined ||
+			this.#settings.get("task.autorouting.provenance") !== undefined ||
+			Object.keys(this.#settings.get("task.autorouting.tiers") ?? {}).length > 0
+		);
+	}
+
+	/** The Settings snapshot cannot be trusted after an unresolved durable rollback. */
+	invalidateSmartRoutingState(): void {
+		this.#smartRoutingStateUnknown = true;
+	}
+
+	markSmartRoutingEffectiveStateUnknown(): void {
+		this.#smartRoutingPanel?.markEffectiveStateUnknown();
+	}
+
+	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
+		if (this.#smartRoutingUnknown()) return;
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
-		const setup = this.#smartRoutingSetup();
-		const preview = this.#smartRoutingPreview(setup);
+		// Catalog and provider-order reads are advisory after publication. A failure must
+		// invalidate the preview, not turn an already committed write into a failure.
+		let setup = committedPreview?.setup ?? panel.getDraft();
+		let preview = committedPreview;
+		let providerOrderHint: AutoroutingProviderOrderHint | undefined;
+		try {
+			if (!committedPreview) {
+				setup = this.#smartRoutingSetup();
+				preview = this.#smartRoutingPreview(setup);
+			}
+			providerOrderHint = this.#providerOrderHintFor(setup.providers);
+		} catch {
+			if (!committedPreview) {
+				if (preview) this.#smartRoutingDiscardPreview?.(preview);
+				preview = undefined;
+			}
+		}
+		const effectiveDiffersFromSaved =
+			committedPreview !== undefined &&
+			(!util.isDeepStrictEqual(this.#settings.get("task.autorouting.setup"), committedPreview.setup) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.tiers"), committedPreview.tiers) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.provenance"), committedPreview.provenance));
 		panel.refreshState({
 			setup,
-			tiers: normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
-			provenance: this.#settings.get("task.autorouting.provenance"),
+			tiers: committedPreview?.tiers ?? normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
+			provenance: committedPreview?.provenance ?? this.#settings.get("task.autorouting.provenance"),
+			effectiveDiffersFromSaved,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
-			providerOrderHint: this.#providerOrderHintFor(setup.providers),
-			stale: this.#smartRoutingIsStale(),
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
+			providerOrderHint,
+			stale: committedPreview ? false : preview ? this.#smartRoutingIsStale(preview) : false,
 			preview,
 		});
 		this.#requestRender();
@@ -2013,7 +2134,11 @@ export class ModelSelectorComponent extends Container {
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			if (row.kind === "smartRouting") {
 				const stale = this.#smartRoutingIsStale();
-				const label = stale ? "Smart routing (stale)" : "Smart routing setup";
+				const label = this.#smartRoutingUnknown()
+					? "Smart routing (unknown)"
+					: stale
+						? "Smart routing (stale)"
+						: "Smart routing setup";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
@@ -2108,7 +2233,7 @@ export class ModelSelectorComponent extends Container {
 		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
 			const selector = profile.modelMapping[role];
 			if (!selector) continue;
-			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
 				settings: this.#settings,
 				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,
@@ -2432,6 +2557,15 @@ export class ModelSelectorComponent extends Container {
 		return this.#isCanonicalTab()
 			? this.#filteredCanonicalModels[this.#selectedIndex]
 			: this.#filteredModels[this.#selectedIndex];
+	}
+
+	render(width: number): string[] {
+		// The service does not notify the TUI: observe shared invalidation on the next render.
+		if (this.#viewMode === "presets" && this.#smartRoutingUnknown() && !this.#smartRoutingStateUnknown) {
+			this.#smartRoutingStateUnknown = true;
+			this.#renderPresetLanding();
+		}
+		return super.render(width);
 	}
 
 	handleInput(keyData: string): void {

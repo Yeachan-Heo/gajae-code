@@ -4,10 +4,23 @@ import * as fsPromises from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, type AgentOptions, markNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
+import { deflateSync } from "node:zlib";
+import {
+	Agent,
+	type AgentOptions,
+	createRunResourceLedger,
+	markNonDispatchedToolEvent,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import { createAttemptMinter } from "@gajae-code/agent-core/attempt-scope";
 import { CompactionCancelledError } from "@gajae-code/agent-core/compaction";
-import { type AssistantMessage, getBundledModel, type Model, type UserMessage } from "@gajae-code/ai/core";
+import {
+	type AssistantMessage,
+	getBundledModel,
+	type ImageContent,
+	type Model,
+	type UserMessage,
+} from "@gajae-code/ai/core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { logger } from "@gajae-code/utils";
@@ -17,7 +30,7 @@ import { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
 import { ExtensionRunner } from "../../extensibility/extensions/runner";
-import { AgentSession } from "../../session/agent-session";
+import { AgentSession, type QueuedRunStartFailure, type SendUserMessageOptions } from "../../session/agent-session";
 import { AuthStorage } from "../../session/auth-storage";
 import { SessionManager } from "../../session/session-manager";
 import {
@@ -38,7 +51,8 @@ import {
 } from "../bus/reconciliation-store";
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
-import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
+import { SESSION_HOST_OBSERVER_CAPABILITY, TOOL_ACTIVITY_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
+import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	type CreateSdkSessionRuntimeOptions,
@@ -1661,6 +1675,62 @@ describe("SessionSdkSessionRuntime", () => {
 		expect(transport.sent).toContainEqual({ type: "event", kind: "message_update", payload: {} });
 		await runtime.stop();
 	});
+	test("applies authoritative replay capabilities before live delivery when the native callback lags", async () => {
+		const replayResponse = Promise.withResolvers<SdkFrame>();
+		const transport = memoryTransport(frame => {
+			if (frame.type === "event_replay_result" && frame.id === "replay-before-capability-update")
+				replayResponse.resolve(frame);
+		});
+		let negotiateCapabilities: ((connectionId: string, capabilities: readonly string[]) => void) | undefined;
+		const hookedTransport: SessionSdkTransport = {
+			...transport,
+			onNegotiatedCapabilities(handler) {
+				negotiateCapabilities = handler;
+				return () => {
+					if (negotiateCapabilities === handler) negotiateCapabilities = undefined;
+				};
+			},
+		};
+		const runtime = new SessionSdkSessionRuntime({ transport: hookedTransport });
+		await runtime.start();
+		try {
+			if (!negotiateCapabilities) throw new Error("transport capability callback was not registered");
+			const observerCapabilities = [
+				TOOL_ACTIVITY_CAPABILITY,
+				TURN_STREAM_CAPABILITY,
+				SESSION_HOST_OBSERVER_CAPABILITY,
+			];
+			runtime.emitEvent({ kind: "tool_activity", payload: { phase: "started" } });
+			transport.feed("observer", {
+				type: "event_replay",
+				id: "replay-before-capability-update",
+				sinceGeneration: runtime.generation,
+				sinceSeq: 0,
+				capabilities: observerCapabilities,
+			});
+			const replay = await replayResponse.promise;
+			expect(replay.events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "tool_activity" })]));
+			const observerRequirements = [TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY];
+			expect(runtime.connectionIdsWithCapabilities(observerRequirements)).toEqual(["observer"]);
+
+			runtime.sendFrameToCapabilities(observerRequirements, {
+				type: "event",
+				kind: "tool_activity",
+				payload: { phase: "updated" },
+			});
+			expect(transport.sent).toContainEqual({
+				type: "event",
+				kind: "tool_activity",
+				payload: { phase: "updated" },
+			});
+
+			// A delayed hello snapshot can omit event_replay additions; capability sets only grow per connection.
+			negotiateCapabilities("observer", [TOOL_ACTIVITY_CAPABILITY]);
+			expect(runtime.connectionIdsWithCapabilities(observerRequirements)).toEqual(["observer"]);
+		} finally {
+			await runtime.stop();
+		}
+	});
 	test("ignores late negotiated capabilities after the authoritative connection closes", async () => {
 		const transport = memoryTransport();
 		let closeConnection: ((connectionId: string) => void) | undefined;
@@ -1860,7 +1930,11 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 			},
 		});
-		const ctx = extensionContext(transport.sessionId, cwd);
+		const notices: Array<{ message: string; type?: string }> = [];
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			ui: { notify: (message: string, type?: string) => notices.push({ message, type }) },
+		} as unknown as ExtensionContext;
 		try {
 			await handlers.get("session_start")?.({}, ctx);
 			const waitForFrame = async (id: string) => {
@@ -1986,6 +2060,9 @@ describe("SessionSdkSessionRuntime", () => {
 				if (Date.now() > deliveryDeadline) throw new Error("Timed out waiting for operator delivery receipt");
 				await Bun.sleep(20);
 			}
+			// Only the operator abort is attributed at the terminal; the session's own
+			// client stopping its turn is not announced as someone else's action.
+			expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
 		} finally {
 			setBrokerRuntimeAbortCapabilityForTest(undefined);
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -4197,11 +4274,21 @@ describe("SessionSdkSessionRuntime", () => {
 			// Optional registration now completes independently of the event handler.
 			const deadline = Date.now() + 15_000;
 			await handlers.get("turn_start")?.({}, context);
-			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			const registeredBroker = broker;
+			const indexedGeneration = async (): Promise<number> => {
+				await registeredBroker.index.refresh();
+				return (
+					registeredBroker.index.listSessions().sessions.find(session => session.sessionId === sessionId)
+						?.endpointGeneration ?? 0
+				);
+			};
+			let endpointGeneration = await indexedGeneration();
+			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 			while (!endpoint.ok && Date.now() < deadline) {
 				await Bun.sleep(20);
 				await handlers.get("turn_start")?.({}, context);
-				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+				endpointGeneration = await indexedGeneration();
+				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 			}
 			expect(endpoint).toMatchObject({
 				ok: true,
@@ -4212,18 +4299,19 @@ describe("SessionSdkSessionRuntime", () => {
 			// a matching generation on a terminal row is terminally gone (no endpoint will
 			// ever be issued again, and close takes its signal fallback), while a rotated
 			// generation is still merely stale and worth re-reading.
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
-				{
-					ok: false,
-					error: { code: "resource_gone", message: "session endpoint record is gone" },
-				},
-			);
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 2 })).toMatchObject(
-				{
-					ok: false,
-					error: { code: "endpoint_stale", message: "session endpoint is stale" },
-				},
-			);
+			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
+				ok: false,
+				error: { code: "resource_gone", message: "session endpoint record is gone" },
+			});
+			expect(
+				await broker.handleRequest("session.get_endpoint", {
+					sessionId,
+					endpointGeneration: endpointGeneration + 1,
+				}),
+			).toMatchObject({
+				ok: false,
+				error: { code: "endpoint_stale", message: "session endpoint is stale" },
+			});
 		} finally {
 			await broker?.stop();
 			await rm(cwd, { recursive: true, force: true });
@@ -4552,6 +4640,7 @@ interface PreflightHooks {
 	expectedSdkRunToken?: string;
 	preflightSignal?: AbortSignal;
 	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+	onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 }
 
 interface ResponseFrame {
@@ -4565,6 +4654,59 @@ interface ResponseFrame {
 		turnId?: string;
 		error?: { code: string; message: string };
 	};
+}
+
+const TEST_PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function testPngCrc32(bytes: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function testPngChunk(type: string, data: Uint8Array): Buffer {
+	const typeBytes = Buffer.from(type, "ascii");
+	const payload = Buffer.from(data);
+	const chunk = Buffer.alloc(12 + payload.length);
+	chunk.writeUInt32BE(payload.length, 0);
+	typeBytes.copy(chunk, 4);
+	payload.copy(chunk, 8);
+	chunk.writeUInt32BE(testPngCrc32(Buffer.concat([typeBytes, payload])), 8 + payload.length);
+	return chunk;
+}
+
+/** A valid deterministic 300x300 PNG whose source exceeds the old 256 KiB frame limit. */
+function makeTestPng(): Buffer {
+	const width = 300;
+	const height = 300;
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	const stride = 1 + width * 4;
+	const pixels = Buffer.alloc(stride * height);
+	let state = 0x12345678;
+	for (let y = 0; y < height; y++) {
+		const row = y * stride;
+		for (let x = 0; x < width; x++) {
+			const pixel = row + 1 + x * 4;
+			for (let channel = 0; channel < 3; channel++) {
+				state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+				pixels[pixel + channel] = state >>> 24;
+			}
+			pixels[pixel + 3] = 255;
+		}
+	}
+	return Buffer.concat([
+		TEST_PNG_SIGNATURE,
+		testPngChunk("IHDR", ihdr),
+		testPngChunk("IDAT", deflateSync(pixels, { level: 0 })),
+		testPngChunk("IEND", Buffer.alloc(0)),
+	]);
 }
 
 interface InvocationHarness {
@@ -4583,6 +4725,8 @@ interface InvocationHarness {
 	sendToSession(sessionId: string, frame: Record<string, unknown>): void;
 	sent(sessionId: string): SdkFrame[];
 	readonly broadcasts: SdkFrame[];
+	connect(connectionId: string): void;
+	disconnect(connectionId: string): void;
 	stop(): Promise<void>;
 }
 
@@ -4599,6 +4743,8 @@ async function invocationHarness(
 		abort?: () => void;
 		isIdle?: () => boolean;
 		settings?: Settings;
+		/** Install the authoritative test transport liveness and disconnect callbacks. */
+		connectionLiveness?: boolean;
 		/** Throw to inject a durable-write failure for matching transitions. */
 		persistInterceptor?: (transition: { type: string }) => void;
 		/** Hold one matching durable transition until the test releases it. */
@@ -4614,6 +4760,7 @@ async function invocationHarness(
 			type: string | undefined;
 			commandId?: string;
 			turnId?: string;
+			terminalAt?: number;
 			outcome: "rejected" | "committed";
 		}) => void;
 		branch?: unknown[];
@@ -4628,6 +4775,8 @@ async function invocationHarness(
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>();
 	const broadcasts: SdkFrame[] = [];
 	let deliver: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	const openConnections = new Set<string>();
+	let connectionCloseHandler: ((connectionId: string) => void) | undefined;
 	const deliveries = new Map<string, (connectionId: string, frame: SdkFrame) => void>();
 	const sentFrames = new Map<string, SdkFrame[]>();
 	let nextId = 0;
@@ -4651,13 +4800,16 @@ async function invocationHarness(
 	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
-		...(interceptorStore || hooks.terminalAbortSeams || hooks.onPersistenceInstrumentation
+		...(interceptorStore || hooks.terminalAbortSeams || hooks.onPersistenceInstrumentation || hooks.connectionLiveness
 			? {
 					terminalAbortSeams: {
 						getTerminalTurnEpoch: () => undefined,
-						getActivePromptHandle: () => undefined,
+						getActivePromptHandle: () => (hooks.connectionLiveness ? "test-image-run" : undefined),
 						cancelPendingPreflightForTerminalAbort: () => {},
 						abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+						...(hooks.connectionLiveness
+							? { waitForRunSettlement: async () => ({ status: "settled" as const }) }
+							: {}),
 						...(interceptorStore ? { getReconciliationStore: () => interceptorStore } : {}),
 						...(hooks.onPersistenceInstrumentation
 							? { onPersistenceInstrumentationForTests: hooks.onPersistenceInstrumentation }
@@ -4685,6 +4837,17 @@ async function invocationHarness(
 					if (deliveries.get(id) === handler) deliveries.delete(id);
 				};
 			},
+			...(hooks.connectionLiveness
+				? {
+						isConnectionOpen: (connectionId: string) => openConnections.has(connectionId),
+						onConnectionClose(handler: (connectionId: string) => void) {
+							connectionCloseHandler = handler;
+							return () => {
+								if (connectionCloseHandler === handler) connectionCloseHandler = undefined;
+							};
+						},
+					}
+				: {}),
 			sendFrame(_connectionId, frame) {
 				const response = frame as ResponseFrame;
 				const frames = sentFrames.get(id) ?? [];
@@ -4739,6 +4902,13 @@ async function invocationHarness(
 			),
 		query: (name, input) => request({ type: "query_request", query: name, input }),
 		broadcasts,
+		connect: connectionId => {
+			openConnections.add(connectionId);
+		},
+		disconnect: connectionId => {
+			openConnections.delete(connectionId);
+			connectionCloseHandler?.(connectionId);
+		},
 		emit: async (event, payload) => {
 			await handlers.get(event)?.(payload ?? {}, ctx);
 		},
@@ -4785,6 +4955,1288 @@ async function invocationHarness(
 		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
+
+async function stageRuntimeImage(harness: InvocationHarness, bytes: Buffer, connectionId = "client"): Promise<string> {
+	const begun = await harness.controlAs(connectionId, "turn.image.begin", {
+		mimeType: "image/png",
+		byteLength: bytes.length,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	});
+	expect(begun).toMatchObject({ ok: true });
+	const id = (begun.result as { id?: unknown } | undefined)?.id;
+	if (typeof id !== "string") throw new Error("SDK runtime did not return a staged image ID.");
+	let sequence = 0;
+	for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+		const data = bytes.subarray(offset, offset + 96 * 1024).toString("base64");
+		expect(Buffer.byteLength(JSON.stringify({ id, sequence, data }))).toBeLessThan(256 * 1024);
+		expect(await harness.controlAs(connectionId, "turn.image.append", { id, sequence, data })).toMatchObject({
+			ok: true,
+		});
+		sequence++;
+	}
+	expect(await harness.controlAs(connectionId, "turn.image.finish", { id })).toMatchObject({ ok: true });
+	return id;
+}
+
+test.each([
+	"liveness",
+	"settlement",
+] as const)("SDK-only custom transports without authoritative image ownership omit image controls (%s)", async missing => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-no-image-transport-"));
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("sdk-no-image-transport", cwd, {
+			connectionLiveness: missing !== "liveness",
+			terminalAbortSeams: {
+				waitForRunSettlement: missing === "settlement" ? undefined : async () => ({ status: "settled" }),
+			},
+		});
+		harness.connect("client");
+		const capabilities = await harness.query("runtime.capabilities", {});
+		const operations = (capabilities as unknown as { page?: { items?: Array<{ operations?: string[] }> } }).page
+			?.items?.[0]?.operations;
+		expect(operations?.some(operation => operation.startsWith("turn.image."))).toBe(false);
+		const response = await harness.control("turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: 1,
+			sha256: "0".repeat(64),
+		});
+		expect(response).toMatchObject({ ok: false, error: { code: "operation_not_session_owned" } });
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only private staged images are connection-owned, one-shot, and reach the provider losslessly", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-provider-staged-image-"));
+	const bytes = makeTestPng();
+	expect(bytes.length).toBeGreaterThan(256 * 1024);
+	const releaseCalls: string[] = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releaseCalls.push("released");
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	try {
+		const providerCalled = Promise.withResolvers<void>();
+		let providerImages: ImageContent[] = [];
+		const mock = createMockModel({ responses: [{ content: ["The staged image reached the model."] }] });
+		const real = await createTerminalizationSession(cwd, (model, context, options) => {
+			providerImages = context.messages.flatMap(message =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.filter((block): block is ImageContent => block.type === "image")
+					: [],
+			);
+			providerCalled.resolve();
+			return mock.stream(model, context, options);
+		});
+		session = real.session;
+		authStorage = real.authStorage;
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness("sdk-provider-staged-image", cwd, {
+			connectionLiveness: true,
+			terminalAbortSeams: {
+				getActivePromptHandle: () => real.session.activePromptHandle,
+				waitForRunSettlement: handle =>
+					real.session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
+			},
+			sendUserMessage: (content, options) => send(content, options),
+		});
+		harness.connect("image-owner");
+		harness.connect("image-observer");
+		session.subscribe(async event => {
+			await harness?.emit(event.type, event);
+		});
+
+		const id = await stageRuntimeImage(harness, bytes, "image-owner");
+		const forgedOwnerPrompt = await harness.controlAs("image-observer", "turn.prompt", {
+			text: "A different authenticated connection cannot redeem this image.",
+			stagedImages: [{ id }],
+		});
+		expect(forgedOwnerPrompt).toMatchObject({ ok: false, error: { code: "image_upload_unavailable" } });
+		const mixedPrompt = await harness.controlAs("image-owner", "turn.prompt", {
+			text: "Direct and staged image blocks cannot be mixed.",
+			images: [{ data: "cG5n", mimeType: "image/png" }],
+			stagedImages: [{ id }],
+		});
+		expect(mixedPrompt).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(releaseCalls).toEqual([]);
+
+		const accepted = await harness.controlAs("image-owner", "turn.prompt", {
+			text: "Inspect this losslessly staged image.",
+			stagedImages: [{ id }],
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		await providerCalled.promise;
+		expect(providerImages).toEqual([{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }]);
+		await session.waitForIdle();
+		await settledStatus(harness, "turn.result", {
+			kind: "prompt",
+			commandId: accepted.result?.commandId,
+			turnId: accepted.result?.turnId,
+		});
+		for (let attempt = 0; releaseCalls.length === 0 && attempt < 200; attempt++) await Bun.sleep(10);
+		expect(releaseCalls).toHaveLength(1);
+		expect(
+			await harness.controlAs("image-owner", "turn.prompt", {
+				text: "The image descriptor is one-shot.",
+				stagedImages: [{ id }],
+			}),
+		).toMatchObject({ ok: false, error: { code: "image_upload_unavailable" } });
+
+		const rejectedId = await stageRuntimeImage(harness, bytes, "image-owner");
+		expect(
+			await harness.controlAs("image-owner", "turn.prompt", {
+				text: "Rejected before admission.",
+				clientRef: " ",
+				stagedImages: [{ id: rejectedId }],
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		// Invalid clientRef admission must not consume or release staged bytes.
+		expect(releaseCalls).toHaveLength(1);
+		expect(await harness.controlAs("image-owner", "turn.image.discard", { id: rejectedId })).toMatchObject({
+			ok: true,
+		});
+
+		const disconnectedId = await stageRuntimeImage(harness, bytes, "image-owner");
+		harness.disconnect("image-owner");
+		expect(await harness.controlAs("image-owner", "turn.image.finish", { id: disconnectedId })).toMatchObject({
+			ok: false,
+			error: { code: "resource_gone" },
+		});
+	} finally {
+		await session?.waitForIdle().catch(() => undefined);
+		await harness?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only real queued image refusal before agent_start fails Q26 and retires only its reservation", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-real-queued-image-refusal-"));
+	const before = getPromptImageProcessBudgetSnapshot();
+	const entered = Promise.withResolvers<void>();
+	const releasePredecessor = Promise.withResolvers<void>();
+	const enqueueReturned = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	let releases = 0;
+	let providerCalls = 0;
+	const actualRefusals: QueuedRunStartFailure[] = [];
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	let harness: InvocationHarness | undefined;
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	try {
+		const real = await createTerminalizationSession(cwd, (model, context, options) => {
+			const call = ++providerCalls;
+			return createMockModel({
+				responses: [
+					async () => {
+						if (call === 1) {
+							entered.resolve();
+							await releasePredecessor.promise;
+						}
+						return { content: ["independent completion"] };
+					},
+				],
+			}).stream(model, context, options);
+		});
+		session = real.session;
+		authStorage = real.authStorage;
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness("real-queued-image-refusal", cwd, {
+			connectionLiveness: true,
+			isIdle: () => !real.session.isStreaming,
+			terminalAbortSeams: {
+				getActivePromptHandle: () => real.session.activePromptHandle,
+				waitForRunSettlement: handle =>
+					real.session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
+			},
+			sendUserMessage: async (content, options) => {
+				// Exercise the real follow-up queue with the staged-image SDK prompt.
+				const image = Array.isArray(content) && content.some(block => block.type === "image");
+				await send(
+					content,
+					image
+						? {
+								...options,
+								deliverAs: "followUp",
+								onQueuedRunStartFailed: failure => {
+									actualRefusals.push(failure);
+									options?.onQueuedRunStartFailed?.(failure);
+								},
+							}
+						: options,
+				);
+				if (image) enqueueReturned.resolve();
+			},
+		});
+		harness.connect("client");
+		session.subscribe(event => harness?.emit(event.type, event));
+		expect(await harness.control("turn.prompt", { text: "hold predecessor" })).toMatchObject({ ok: true });
+		await entered.promise;
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		const accepted = await harness.control("turn.prompt", {
+			text: "queued image requires a model",
+			stagedImages: [{ id }],
+			clientRef: "real-refused-image",
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		await enqueueReturned.promise;
+		expect(releases).toBe(0);
+		expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(before.sourceBytes);
+		session.agent.setModel(undefined);
+		releasePredecessor.resolve();
+		const failed = await settledStatus(harness, "turn.result", { kind: "prompt", clientRef: "real-refused-image" });
+		expect(failed).toMatchObject({
+			status: "failed",
+			outcome: { kind: "failed" },
+			error: { code: "internal", message: "Prompt submission failed." },
+		});
+		await released.promise;
+		await session.waitForIdle();
+		expect(actualRefusals).toHaveLength(1);
+		expect(actualRefusals[0]).toMatchObject({
+			disposition: "not-started",
+			error: { message: "No model configured" },
+		});
+		expect(providerCalls).toBe(1);
+		expect(releases).toBe(1);
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(before);
+		// The same session store can stage/discard bytes again after retirement.
+		const laterImage = await stageRuntimeImage(harness, makeTestPng());
+		expect(await harness.control("turn.image.discard", { id: laterImage })).toMatchObject({ ok: true });
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(before);
+		session.agent.setModel(real.model);
+		const fresh = await harness.control("turn.prompt", { text: "restored model starts independent work" });
+		expect(
+			await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				commandId: fresh.result?.commandId,
+				turnId: fresh.result?.turnId,
+			}),
+		).toMatchObject({ status: "terminal_ok" });
+		expect(await harness.query("turn.result", { kind: "prompt", clientRef: "real-refused-image" })).toMatchObject({
+			result: { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId, status: "failed" },
+		});
+		expect(providerCalls).toBe(2);
+		expect(releases).toBe(1);
+	} finally {
+		releasePredecessor.resolve();
+		await session?.waitForIdle().catch(() => undefined);
+		await harness?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"pending-producer",
+	"returned-producer",
+	"promoted-returned-producer",
+	"post-start",
+	"same-text-rejection",
+	"late-refusal",
+] as const)("SDK-only queued image refusal respects producer and execution authority (%s)", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-refusal-authority-"));
+	const before = getPromptImageProcessBudgetSnapshot();
+	const producer = Promise.withResolvers<void>();
+	const returned = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const proofRequested = Promise.withResolvers<void>();
+	const settlement = Promise.withResolvers<{ status: "settled" }>();
+	let callbacks: PreflightHooks | undefined;
+	let releases = 0;
+	const proofHandles: string[] = [];
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness(`image-refusal-${mode}`, cwd, {
+			connectionLiveness: true,
+			// Deliberately idle snapshot, then actual queue diversion.
+			isIdle: () => true,
+			terminalAbortSeams: {
+				getActivePromptHandle: () => (mode === "post-start" ? "started-image-run" : undefined),
+				waitForRunSettlement: handle => {
+					proofHandles.push(handle);
+					proofRequested.resolve();
+					return settlement.promise;
+				},
+			},
+			sendUserMessage: async (_content, options) => {
+				callbacks = options;
+				await options?.onPreflightAcceptCommit?.();
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
+				try {
+					await producer.promise;
+				} finally {
+					returned.resolve();
+				}
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		const accepted = await harness.control("turn.prompt", {
+			text: "image queue authority",
+			stagedImages: [{ id }],
+			clientRef: `authority-${mode}`,
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		if (mode === "promoted-returned-producer") callbacks?.onQueuedPromoted?.({ startsOwnRun: true });
+		if (mode === "returned-producer" || mode === "promoted-returned-producer") {
+			producer.resolve();
+			await returned.promise;
+			// Yield through the submit.then fallback: the diverted idle snapshot is not completion.
+			expect(await harness.query("turn.result", { kind: "prompt", clientRef: `authority-${mode}` })).toMatchObject({
+				result: { status: "accepted" },
+			});
+		}
+		if (mode !== "promoted-returned-producer") callbacks?.onQueuedPromoted?.({ startsOwnRun: true });
+		if (mode === "post-start") await harness.emit("agent_start");
+		const failure: QueuedRunStartFailure = { disposition: "not-started", error: new Error("No model configured") };
+		if (mode === "same-text-rejection" || mode === "late-refusal") {
+			producer.reject(
+				Object.assign(
+					new Error("No model configured"),
+					mode === "late-refusal" ? { code: "original_failure" } : {},
+				),
+			);
+		} else {
+			callbacks?.onQueuedRunStartFailed?.(failure);
+			callbacks?.onQueuedRunStartFailed?.(failure);
+		}
+		if (mode === "post-start") {
+			expect(await harness.query("turn.result", { kind: "prompt", clientRef: `authority-${mode}` })).toMatchObject({
+				result: { status: "in_flight" },
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: "done" }] });
+			await proofRequested.promise;
+			expect(proofHandles).toEqual(["started-image-run"]);
+			expect(releases).toBe(0);
+			settlement.resolve({ status: "settled" });
+		} else {
+			expect(
+				await settledStatus(harness, "turn.result", { kind: "prompt", clientRef: `authority-${mode}` }),
+			).toMatchObject({
+				status: "failed",
+				outcome: { kind: "failed" },
+				error: {
+					code: mode === "late-refusal" ? "original_failure" : "internal",
+					message: "Prompt submission failed.",
+				},
+			});
+			if (mode !== "returned-producer" && mode !== "promoted-returned-producer") {
+				expect(releases).toBe(0);
+				expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(before.sourceBytes);
+			}
+		}
+		producer.resolve();
+		await returned.promise;
+		if (mode === "late-refusal") callbacks?.onQueuedRunStartFailed?.(failure);
+		if (mode === "same-text-rejection") {
+			// A text-identical generic rejection is not proof; teardown cannot release either.
+			await harness.stop();
+			expect(releases).toBe(0);
+			expect(proofHandles).toEqual([]);
+		} else {
+			await released.promise;
+			expect(releases).toBe(1);
+			expect(getPromptImageProcessBudgetSnapshot()).toEqual(before);
+			callbacks?.onQueuedRunStartFailed?.(failure);
+			if (mode !== "post-start") callbacks?.onQueuedPromoted?.({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: "later" }] });
+			expect(await harness.query("turn.result", { kind: "prompt", clientRef: `authority-${mode}` })).toMatchObject({
+				result: { status: mode === "post-start" ? "terminal_ok" : "failed" },
+			});
+			expect(releases).toBe(1);
+			if (mode === "late-refusal")
+				expect(
+					await harness.query("turn.result", { kind: "prompt", clientRef: `authority-${mode}` }),
+				).toMatchObject({ result: { error: { code: "original_failure" } } });
+		}
+	} finally {
+		producer.resolve();
+		settlement.resolve({ status: "settled" });
+		await harness?.stop().catch(() => undefined);
+		for (const release of cleanupReservations) release();
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only staged prompts reconcile clientRef before redeeming during preflight and in-flight execution", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-staged-client-ref-"));
+	const allowAcceptance = Promise.withResolvers<void>();
+	const producer = Promise.withResolvers<void>();
+	const entered = Promise.withResolvers<void>();
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let releases = 0;
+	let sends = 0;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("staged-client-ref", cwd, {
+			connectionLiveness: true,
+			sendUserMessage: async (_content, options) => {
+				sends++;
+				entered.resolve();
+				await allowAcceptance.promise;
+				await options?.onPreflightAcceptCommit?.();
+				await producer.promise;
+			},
+		});
+		harness.connect("image-owner");
+		harness.connect("reconnecting-client");
+		const id = await stageRuntimeImage(harness, makeTestPng(), "image-owner");
+		const input = { text: "Original staged producer", clientRef: "staged-ref", stagedImages: [{ id }] };
+		const first = harness.controlAs("image-owner", "turn.prompt", input);
+		void first.catch(() => {});
+		await entered.promise;
+		// Ordered controls serialize per session, even on separate connections.
+		// A retry arriving during preflight cannot finish before the first receipt.
+		const duplicate = harness.controlAs("reconnecting-client", "turn.prompt", input);
+		void duplicate.catch(() => {});
+		expect(redeemSpy.mock.calls).toHaveLength(1);
+		expect(sends).toBe(1);
+		expect(releases).toBe(0);
+		allowAcceptance.resolve();
+		const accepted = await first;
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "staged-ref" } });
+		expect(await duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+		await harness.emit("agent_start");
+		// The original receipt may have been lost. Reconnection never replays it,
+		// and cannot replace the original producer's retained image ownership.
+		expect(await harness.controlAs("image-owner", "turn.prompt", input)).toMatchObject({
+			ok: false,
+			error: { code: "client_ref_conflict" },
+		});
+		expect(await harness.query("turn.result", { kind: "prompt", clientRef: "staged-ref" })).toMatchObject({
+			result: { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId, status: "in_flight" },
+		});
+		expect(redeemSpy.mock.calls).toHaveLength(1);
+		expect(sends).toBe(1);
+		expect(releases).toBe(0);
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "done" }],
+		});
+		producer.resolve();
+		await settledStatus(harness, "turn.result", { kind: "prompt", clientRef: "staged-ref" });
+		expect(await harness.controlAs("image-owner", "turn.prompt", input)).toMatchObject({
+			ok: false,
+			error: { code: "client_ref_conflict" },
+		});
+		expect(redeemSpy.mock.calls).toHaveLength(1);
+		expect(sends).toBe(1);
+	} finally {
+		allowAcceptance.resolve();
+		producer.resolve();
+		try {
+			await harness?.stop();
+		} finally {
+			redeemSpy.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("SDK-only staged image reservations follow the exact consuming run across disconnect and unrelated end", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-staged-image-run-owner-"));
+	const bytes = makeTestPng();
+	const releases: string[] = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases.push("released");
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	const imagePromotions: Array<PreflightHooks["onQueuedPromoted"]> = [];
+	let promptDeadlineMs = 60_000;
+	try {
+		harness = await invocationHarness("staged-image-run-owner", cwd, {
+			connectionLiveness: true,
+			settings: {
+				get: (key: string) =>
+					key === "sdk.promptDeadlineMs"
+						? promptDeadlineMs
+						: key === "sdk.promptMaxRuntimeMs"
+							? 60_000
+							: undefined,
+			} as unknown as Settings,
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (content === "root run") await neverSettlingPromise();
+				if (options?.deliverAs === "followUp") {
+					options.onDispatchDisposition?.({ startsOwnRun: false });
+					options.preflightSignal?.addEventListener("abort", () => options.onQueuedPromoted?.({ removed: true }), {
+						once: true,
+					});
+					return;
+				}
+				if (Array.isArray(content)) {
+					expect(
+						content.some(block => typeof block === "object" && block !== null && block.type === "image"),
+					).toBe(true);
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+					imagePromotions.push(options?.onQueuedPromoted);
+				}
+			},
+		});
+		harness.connect("root-owner");
+		harness.connect("image-owner");
+		harness.connect("cancel-owner");
+		const root = await harness.controlAs("root-owner", "turn.prompt", { text: "root run" });
+		expect(root).toMatchObject({ ok: true, result: { accepted: true } });
+		await harness.emit("agent_start");
+		const id = await stageRuntimeImage(harness, bytes, "image-owner");
+		const image = await harness.controlAs("image-owner", "turn.prompt", {
+			text: "queued image run",
+			stagedImages: [{ id }],
+		});
+		expect(image).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = { commandId: image.result?.commandId, turnId: image.result?.turnId };
+		const cancelledId = await stageRuntimeImage(harness, bytes, "cancel-owner");
+		const cancelled = await harness.controlAs("cancel-owner", "turn.prompt", {
+			text: "queued image that will be removed",
+			stagedImages: [{ id: cancelledId }],
+		});
+		expect(cancelled).toMatchObject({ ok: true, result: { accepted: true } });
+		const cancelledCorrelation = { commandId: cancelled.result?.commandId, turnId: cancelled.result?.turnId };
+		expect(imagePromotions).toHaveLength(2);
+		expect(releases).toEqual([]);
+
+		// The stage lease was redeemed already. Losing its source connection and
+		// completing the unrelated root run must not release quota owned by the
+		// still-queued image submission.
+		harness.disconnect("image-owner");
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "root finished" }],
+		});
+		expect(releases).toEqual([]);
+
+		imagePromotions[1]?.({ startsOwnRun: false, removed: true });
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...cancelledCorrelation })).toMatchObject({
+			status: "failed",
+			error: { code: "cancelled" },
+		});
+		expect(releases).toEqual(["released"]);
+
+		imagePromotions[0]?.({ startsOwnRun: true });
+		await harness.emit("agent_start");
+		expect(releases).toEqual(["released"]);
+		promptDeadlineMs = 25;
+		const unrelatedFollowUp = await harness.controlAs("cancel-owner", "turn.follow_up", {
+			text: "unrelated follow-up past its admission deadline",
+		});
+		expect(unrelatedFollowUp).toMatchObject({ ok: true, result: { accepted: true } });
+		await Bun.sleep(100);
+		expect(
+			await harness.query("turn.result", {
+				kind: "prompt",
+				commandId: unrelatedFollowUp.result?.commandId,
+				turnId: unrelatedFollowUp.result?.turnId,
+			}),
+		).toMatchObject({ result: { status: "accepted" } });
+		expect(releases).toEqual(["released"]);
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "image finished" }],
+		});
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation })).toMatchObject({
+			status: "terminal_ok",
+		});
+		expect(releases).toEqual(["released", "released"]);
+	} finally {
+		try {
+			await harness?.stop();
+		} finally {
+			redeemSpy.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("SDK-only terminal preflight abort retains staged-image quota until submission settlement", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-preflight-abort-"));
+	const sessionId = "image-preflight-abort";
+	const sessionFile = path.join(cwd, "session.json");
+	await Bun.write(sessionFile, "");
+	const reconciliationStore = createReconciliationStore({ sessionFile, sessionId });
+	const producer = Promise.withResolvers<void>();
+	const submissionStarted = Promise.withResolvers<void>();
+	const preflightAborted = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	let releases = 0;
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness(sessionId, cwd, {
+			connectionLiveness: true,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => undefined,
+				getActivePromptHandle: () => undefined,
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async () => {
+					throw new Error("idle preflight abort must not stop an active run");
+				},
+			},
+			sendUserMessage: async (content, options) => {
+				expect(Array.isArray(content) && content.some(block => block.type === "image")).toBe(true);
+				options?.preflightSignal?.addEventListener("abort", () => preflightAborted.resolve(), { once: true });
+				submissionStarted.resolve();
+				await producer.promise;
+				expect(Array.isArray(content) && content.some(block => block.type === "image")).toBe(true);
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		const prompt = harness.control("turn.prompt", {
+			text: "hold the pending staged-image producer",
+			stagedImages: [{ id }],
+		});
+		await submissionStarted.promise;
+		const abort = await harness.controlAs("client", "turn.abort", { mode: "terminal" }, "image-preflight-abort-key");
+		expect(abort).toMatchObject({
+			ok: true,
+			result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+		});
+		expect(await prompt).toMatchObject({ ok: false, error: { code: "busy" } });
+		await preflightAborted.promise;
+		expect(releases).toBe(0);
+
+		producer.resolve();
+		await released.promise;
+		expect(releases).toBe(1);
+	} finally {
+		producer.resolve();
+		try {
+			await harness?.stop();
+		} finally {
+			redeemSpy.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("SDK-only shutdown after acceptance retains unadopted staged-image quota until submission settlement", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-accepted-unadopted-"));
+	const producer = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	let releases = 0;
+	let preflightSignal: AbortSignal | undefined;
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("image-accepted-unadopted", cwd, {
+			connectionLiveness: true,
+			sendUserMessage: async (content, options) => {
+				preflightSignal = options?.preflightSignal;
+				await options?.onPreflightAcceptCommit?.();
+				await producer.promise;
+				expect(Array.isArray(content) && content.some(block => block.type === "image")).toBe(true);
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		const accepted = await harness.control("turn.prompt", {
+			text: "accepted producer has not adopted an execution",
+			stagedImages: [{ id }],
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toBe(0);
+		await harness.stop();
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(releases).toBe(0);
+		producer.resolve();
+		await released.promise;
+		expect(releases).toBe(1);
+	} finally {
+		producer.resolve();
+		try {
+			await harness?.stop();
+		} finally {
+			redeemSpy.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("SDK-only shutdown during durable preflight acceptance retains staged-image quota until submission settlement", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-shutdown-preflight-"));
+	const sessionId = "image-shutdown-preflight";
+	const sessionFile = path.join(cwd, "session.json");
+	await Bun.write(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId });
+	const clientRef = "image-shutdown-preflight-client";
+	const producer = Promise.withResolvers<void>();
+	const acceptanceHeld = Promise.withResolvers<void>();
+	const resumeAcceptance = Promise.withResolvers<void>();
+	const acceptanceResumed = Promise.withResolvers<void>();
+	const submissionFinished = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	let submissionEntered = false;
+	let held = false;
+	let releases = 0;
+	const originalRename = fsPromises.rename;
+	const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!held && String(to) === store.path) {
+			const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+			if (document.records.some(record => record.clientRef === clientRef && record.status === "accepted")) {
+				held = true;
+				acceptanceHeld.resolve();
+				await resumeAcceptance.promise;
+			}
+		}
+		await originalRename(from, to);
+	});
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	let preflightSignal: AbortSignal | undefined;
+	try {
+		harness = await invocationHarness(sessionId, cwd, {
+			connectionLiveness: true,
+			terminalAbortSeams: { getReconciliationStore: () => store },
+			sendUserMessage: async (content, options) => {
+				expect(Array.isArray(content) && content.some(block => block.type === "image")).toBe(true);
+				submissionEntered = true;
+				preflightSignal = options?.preflightSignal;
+				await options?.onPreflightAcceptCommit?.();
+				acceptanceResumed.resolve();
+				await producer.promise;
+				submissionFinished.resolve();
+				expect(Array.isArray(content) && content.some(block => block.type === "image")).toBe(true);
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		void harness
+			.control("turn.prompt", {
+				text: "hold the staged-image producer through shutdown acceptance",
+				stagedImages: [{ id }],
+				clientRef,
+			})
+			.catch(() => undefined);
+		await acceptanceHeld.promise;
+		expect(releases).toBe(0);
+
+		await harness.stop();
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(releases).toBe(0);
+
+		resumeAcceptance.resolve();
+		await acceptanceResumed.promise;
+		expect(releases).toBe(0);
+		producer.resolve();
+		await submissionFinished.promise;
+		await released.promise;
+		expect(releases).toBe(1);
+	} finally {
+		resumeAcceptance.resolve();
+		producer.resolve();
+		if (submissionEntered) await submissionFinished.promise;
+		await harness?.stop().catch(() => undefined);
+		redeemSpy.mockRestore();
+		renameSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only queued image promotion retains quota through shutdown until exact-run settlement proof", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-queued-adoption-"));
+	const proofAttempted = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const promotionReady = Promise.withResolvers<void>();
+	let activeHandle: string | undefined;
+	const settlement = Promise.withResolvers<{ status: "settled" }>();
+	let releases = 0;
+	let promoted: PreflightHooks["onQueuedPromoted"];
+	const proofHandles: string[] = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("queued-image-adoption", cwd, {
+			connectionLiveness: true,
+			isIdle: () => false,
+			terminalAbortSeams: {
+				getActivePromptHandle: () => activeHandle,
+				waitForRunSettlement: handle => {
+					proofHandles.push(handle);
+					proofAttempted.resolve();
+					return settlement.promise;
+				},
+			},
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (!Array.isArray(content) || !content.some(block => block.type === "image"))
+					throw new Error("Expected the queued submission to retain its staged image.");
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
+				promoted = options?.onQueuedPromoted;
+				promotionReady.resolve();
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		expect(
+			await harness.control("turn.prompt", {
+				text: "queue image work for a later own-run promotion",
+				stagedImages: [{ id }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await promotionReady.promise;
+		expect(promoted).toBeDefined();
+		promoted?.({ startsOwnRun: true });
+		await harness.stop();
+		expect(releases).toBe(0);
+
+		activeHandle = "queued-image-run";
+		await harness.emit("agent_start");
+		await proofAttempted.promise;
+		expect(proofHandles).toEqual(["queued-image-run"]);
+		expect(releases).toBe(0);
+
+		await harness.stop();
+		expect(proofHandles).toEqual(["queued-image-run"]);
+		settlement.resolve({ status: "settled" });
+		await released.promise;
+		expect(releases).toBe(1);
+	} finally {
+		settlement.resolve({ status: "settled" });
+		await harness?.stop().catch(() => undefined);
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"pending",
+	"slow-pending",
+	"shutdown-slow-pending",
+	"quarantined",
+	"held-start-pending",
+	"held-start-quarantined",
+	"held-start-missing-handle",
+] as const)("SDK-only forced image terminals retain unsettled producer capacity (%s)", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-forced-"));
+	const sourceBytesBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
+	const ledger = createRunResourceLedger();
+	ledger.open("image-run");
+	const tool = Promise.withResolvers<void>();
+	const run = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const startEntered = Promise.withResolvers<void>();
+	const releaseStart = Promise.withResolvers<void>();
+	const holdStart = mode.startsWith("held-start");
+	const proofAttempted = Promise.withResolvers<void>();
+	const proofHandles: string[] = [];
+	let drainTimeouts = 0;
+	ledger.track("image-run", "tool", "abort-ignoring-tool", tool.promise);
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const original = PromptImageUploadStore.prototype.redeem;
+	const spy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = original.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness(`image-forced-${mode}`, cwd, {
+			connectionLiveness: true,
+			...(holdStart
+				? {
+						persistInterceptor: () => {},
+						persistHold: { type: "agent_start", onEntered: startEntered.resolve, release: releaseStart.promise },
+						onLifecycleDrainTimeout: () => {
+							drainTimeouts++;
+						},
+					}
+				: {}),
+			terminalAbortSeams: {
+				getActivePromptHandle: () => (mode.endsWith("missing-handle") ? undefined : "image-run"),
+				waitForRunSettlement: handle => {
+					proofHandles.push(handle);
+					proofAttempted.resolve();
+					return ledger.waitForSettlement(handle, { graceMs: null });
+				},
+			},
+			sendUserMessage: async (_content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				await run.promise;
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		expect(
+			await harness.control("turn.prompt", { text: "hold the exact producer", stagedImages: [{ id }] }),
+		).toMatchObject({ ok: true });
+		await harness.emit("agent_start");
+		if (holdStart) await startEntered.promise;
+		harness.disconnect("client");
+		ledger.seal("image-run");
+		if (mode.endsWith("quarantined")) ledger.quarantine("image-run");
+		if (holdStart) {
+			await harness.stop();
+			expect(drainTimeouts).toBe(1);
+			expect(releases).toBe(0);
+			releaseStart.resolve();
+		} else await harness.emit("agent_end", { stopReason: "cancelled" });
+		if (mode.includes("slow")) {
+			await proofAttempted.promise;
+			const chargedBytes = getPromptImageProcessBudgetSnapshot().sourceBytes;
+			expect(chargedBytes).toBeGreaterThan(sourceBytesBefore);
+			await harness.emit("agent_end", { stopReason: "cancelled" });
+			if (mode.startsWith("shutdown")) {
+				run.resolve();
+				await harness.stop();
+				await harness.stop();
+			}
+			// Exceed the retired helper's entire 100 x 100 ms polling window.
+			await Bun.sleep(10_100);
+			expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(chargedBytes);
+			expect(proofHandles).toEqual(["image-run"]);
+		} else await Bun.sleep(150);
+		expect(releases).toBe(0);
+		tool.resolve();
+		if (mode.endsWith("pending")) {
+			await released.promise;
+			expect(releases).toBe(1);
+			if (mode.includes("slow")) {
+				expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBytesBefore);
+				await harness.stop();
+				expect(proofHandles).toEqual(["image-run"]);
+				expect(releases).toBe(1);
+			}
+		} else {
+			await harness.stop();
+			await Bun.sleep(150);
+			expect(releases).toBe(0);
+			expect(await ledger.waitForSettlement("image-run", { graceMs: 0 })).toMatchObject(
+				mode.endsWith("quarantined") ? { status: "unfenced", reason: "quarantined" } : { status: "settled" },
+			);
+		}
+	} finally {
+		releaseStart.resolve();
+		tool.resolve();
+		run.resolve();
+		try {
+			await harness?.stop();
+		} finally {
+			spy.mockRestore();
+			for (const release of cleanupReservations) release();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("SDK-only failed queued cancellation retains the predecessor image cleanup owner for retry", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-cleanup-retry-"));
+	let failTerminal = true;
+	let deadlineMs = 60_000;
+	let releases = 0;
+	let queued: { commandId?: unknown; turnId?: unknown } | undefined;
+	const producer = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const repaired = Promise.withResolvers<void>();
+	const original = PromptImageUploadStore.prototype.redeem;
+	const spy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = original.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+				released.resolve();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("image-cleanup-retry", cwd, {
+			connectionLiveness: true,
+			settings: {
+				get: (key: string) =>
+					key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+			} as unknown as Settings,
+			terminalAbortSeams: {
+				getActivePromptHandle: () => undefined,
+			},
+			persistInterceptor: transition => {
+				if (failTerminal && transition.type === "agent_end") throw new Error("held queue terminal persistence");
+			},
+			onDurableAttempt: attempt => {
+				if (
+					!failTerminal &&
+					attempt.type === "agent_end" &&
+					attempt.outcome === "committed" &&
+					attempt.terminalAt !== undefined &&
+					attempt.commandId === queued?.commandId &&
+					attempt.turnId === queued?.turnId
+				)
+					repaired.resolve();
+			},
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (Array.isArray(content)) {
+					options?.onDispatchDisposition?.({ startsOwnRun: true });
+					await producer.promise;
+				}
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
+				options?.preflightSignal?.addEventListener("abort", () => options.onQueuedPromoted?.({ removed: true }), {
+					once: true,
+				});
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, makeTestPng());
+		expect(
+			await harness.control("turn.prompt", { text: "retain predecessor image", stagedImages: [{ id }] }),
+		).toMatchObject({ ok: true });
+		deadlineMs = 100;
+		const followUp = await harness.control("turn.follow_up", { text: "queue a removal with failed publication" });
+		expect(followUp).toMatchObject({ ok: true });
+		queued = followUp.result;
+		await expect(harness.stop()).rejects.toMatchObject({ code: "sdk_reconciliation_teardown_failed" });
+		expect(releases).toBe(0);
+		failTerminal = false;
+		await repaired.promise;
+		expect(releases).toBe(0);
+		// Either the original removal publisher or deadline recovery can retire
+		// this cancellation. Until then shutdown must still fail closed.
+		const retryUntil = Date.now() + 5_000;
+		for (;;) {
+			try {
+				await harness.stop();
+				break;
+			} catch (error) {
+				expect(error).toMatchObject({ code: "sdk_reconciliation_teardown_failed" });
+				expect(releases).toBe(0);
+				if (Date.now() >= retryUntil) throw error;
+				await Bun.sleep(10);
+			}
+		}
+		expect(releases).toBe(0);
+		await harness.switchSession("image-cleanup-successor");
+		expect(releases).toBe(0);
+		producer.resolve();
+		await released.promise;
+		expect(releases).toBe(1);
+	} finally {
+		failTerminal = false;
+		producer.resolve();
+		try {
+			await harness?.stop();
+		} finally {
+			spy.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("SDK-only shutdown retains staged-image quota when runtime stop fails and releases it after retry", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-staged-image-shutdown-"));
+	const bytes = makeTestPng();
+	const releases: string[] = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases.push("released");
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	let stopSpy: { mockRestore(): void } | undefined;
+	try {
+		harness = await invocationHarness("staged-image-shutdown", cwd, {
+			connectionLiveness: true,
+			sendUserMessage: async (_content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				options?.onDispatchDisposition?.({ startsOwnRun: true });
+				await neverSettlingPromise();
+			},
+		});
+		harness.connect("client");
+		const id = await stageRuntimeImage(harness, bytes);
+		const accepted = await harness.control("turn.prompt", {
+			text: "retain through failed stop",
+			stagedImages: [{ id }],
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		await harness.emit("agent_start");
+		expect(releases).toEqual([]);
+
+		stopSpy = spyOn(SessionSdkSessionRuntime.prototype, "stop").mockImplementationOnce(async () => {
+			throw new Error("injected transport stop failure");
+		});
+		await expect(harness.stop()).rejects.toThrow("injected transport stop failure");
+		expect(releases).toEqual([]);
+
+		stopSpy.mockRestore();
+		stopSpy = undefined;
+		await harness.stop();
+		expect(releases).toEqual(["released"]);
+	} finally {
+		stopSpy?.mockRestore();
+		await harness?.stop().catch(() => undefined);
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 test.each(["natural", "removed"] as const)("SDK-only text follow-up has a durable terminal (%s)", async mode => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-sdk-only-text-followup-${mode}-`));
@@ -5296,6 +6748,7 @@ function createInterceptorReconciliationStore(
 		type: string | undefined;
 		commandId?: string;
 		turnId?: string;
+		terminalAt?: number;
 		outcome: "rejected" | "committed";
 	}) => void,
 ): SdkOnlyReconciliationStore {
@@ -5310,6 +6763,7 @@ function createInterceptorReconciliationStore(
 			let transitionType: string | undefined;
 			for (const record of records as Array<{
 				status?: string;
+				startedAt?: number;
 				terminalAt?: number;
 				commandId?: string;
 				pendingOutcome?: unknown;
@@ -5338,6 +6792,7 @@ function createInterceptorReconciliationStore(
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
 				const previous = backing.records.find(candidate => candidate.commandId === record.commandId);
+				if (record.startedAt !== undefined && previous?.startedAt === undefined) transitionType ??= "agent_start";
 				const previousPendingOutcome = (
 					previous as
 						| (SdkOnlyInvocationRecord & { pendingOutcome?: { kind?: string; code?: string; reason?: string } })
@@ -5367,11 +6822,12 @@ function createInterceptorReconciliationStore(
 				hold.onEntered();
 				await hold.release;
 			}
-			for (const record of records as Array<{ commandId?: string; turnId?: string }>)
+			for (const record of records as Array<{ commandId?: string; turnId?: string; terminalAt?: number }>)
 				onDurableAttempt?.({
 					type: transitionType,
 					commandId: record?.commandId,
 					turnId: record?.turnId,
+					terminalAt: record?.terminalAt,
 					outcome: "committed",
 				});
 			backing.records = records;
@@ -5508,7 +6964,7 @@ function realSendUserMessage(session: AgentSession) {
 	return async (content: unknown, options?: PreflightHooks & { deliverAs?: string }): Promise<void> => {
 		await options?.onPreflightAcceptCommit?.();
 		const { onPreflightAcceptCommit: _onPreflightAcceptCommit, ...dispatchOptions } = options ?? {};
-		await session.sendUserMessage(content as string, dispatchOptions as never);
+		await session.sendUserMessage(content as string, dispatchOptions as SendUserMessageOptions);
 	};
 }
 
@@ -8540,8 +9996,25 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("a captured cancelled end stays private and recoverable while tools are unproven", async () => {
+	test("a captured cancelled end retains staged-image quota until confirmed tool recovery", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-captured-uncertain-"));
+		const bytes = makeTestPng();
+		const releaseCalls: string[] = [];
+		const originalRedeem = PromptImageUploadStore.prototype.redeem;
+		const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+			this: PromptImageUploadStore,
+			owner,
+			ids,
+		) {
+			const reservation = originalRedeem.call(this, owner, ids);
+			return {
+				images: reservation.images,
+				release: () => {
+					releaseCalls.push("released");
+					reservation.release();
+				},
+			};
+		});
 		const sessionId = "deadline-captured-uncertain";
 		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
 		await Bun.write(sessionFile, "");
@@ -8562,17 +10035,20 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const terminalPublication = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
 		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
 		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
-		let boundaryWaitStarted = false;
+		const boundaryWaitStarted = Promise.withResolvers<void>();
 		let abortCalls = 0;
+		let sends = 0;
 		let harness: InvocationHarness | undefined;
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
+				connectionLiveness: true,
 				settings: {
 					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
 						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
+					sends++;
 					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
 				},
@@ -8590,7 +10066,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 							terminalPublication.resolve(checkpoint);
 					},
 					pendingToolExecutions: () => {
-						if (activeTools.size > 0) boundaryWaitStarted = true;
+						if (activeTools.size > 0) boundaryWaitStarted.resolve();
 						const pending = [...activeTools];
 						if (pending.length === 0) toolDrainObserved.resolve();
 						return pending;
@@ -8601,7 +10077,13 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					},
 				},
 			});
-			const accepted = await harness.control("turn.prompt", { text: "capture uncertain end" });
+			harness.connect("client");
+			const id = await stageRuntimeImage(harness, bytes);
+			const accepted = await harness.control("turn.prompt", {
+				text: "capture uncertain end",
+				clientRef: "captured-uncertain-image",
+				stagedImages: [{ id }],
+			});
 			expect(accepted.ok).toBe(true);
 			const commandId = accepted.result?.commandId;
 			const turnId = accepted.result?.turnId;
@@ -8614,12 +10096,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "apply_patch",
 				args: {},
 			});
-			const waitDeadline = Date.now() + 2_000;
-			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
-			expect(boundaryWaitStarted).toBe(true);
+			await boundaryWaitStarted.promise;
 			await harness.emit("agent_end", { stopReason: "cancelled" });
 			await Bun.sleep(5_200);
 			expect(abortCalls).toBe(0);
+			expect(releaseCalls).toEqual([]);
 			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
@@ -8631,6 +10112,17 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				deadlineRecoveryPending: true,
 				pendingOutcome: { kind: "stopped", reason: "cancelled" },
 			});
+			// An uncertain retained outcome is reconciliation-only, never replayable.
+			expect(
+				await harness.control("turn.prompt", {
+					text: "capture uncertain end",
+					clientRef: "captured-uncertain-image",
+					stagedImages: [{ id }],
+				}),
+			).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+			expect(redeemSpy.mock.calls).toHaveLength(1);
+			expect(sends).toBe(1);
+			expect(releaseCalls).toEqual([]);
 			const reopened = createInvocationReconciliation({
 				store: createReconciliationStore({ sessionFile, sessionId }),
 			});
@@ -8679,8 +10171,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(releaseCalls).toEqual(["released"]);
 		} finally {
 			await harness?.stop();
+			redeemSpy.mockRestore();
 			await Bun.sleep(10);
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -8808,7 +10302,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "bash",
 				args: {},
 			});
-			const boundaryDeadline = Date.now() + 2_000;
+			// This checks ordering, not prompt latency; allow the scheduler to reach
+			// the boundary when many CI shards are contending for the event loop.
+			const boundaryDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(abortCalls).toHaveLength(0);
@@ -8822,7 +10318,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			await Bun.sleep(30);
 			expect(abortCalls).toHaveLength(0);
-			const abortDeadline = Date.now() + 2_000;
+			const abortDeadline = Date.now() + 10_000;
 			while (abortCalls.length === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
 			expect(abortCalls).toEqual([{ handle: "deadline-tool-run", scope: "owned", expectedEpoch: epoch }]);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
@@ -9126,6 +10622,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
 		const claimEntered = Promise.withResolvers<void>();
 		const releaseClaim = Promise.withResolvers<void>();
+		const persistenceEvents: PersistenceInstrumentationEvent[] = [];
+		const durableAttempts: string[] = [];
 		const epoch = 83;
 		let harness: InvocationHarness | undefined;
 		let startPromise: Promise<void> | undefined;
@@ -9141,6 +10639,20 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				},
 				persistInterceptor: () => {},
 				agentFailedWriteFailures: 0,
+				onPersistenceInstrumentation: event => {
+					if (persistenceEvents.length < 64)
+						persistenceEvents.push({
+							...event,
+							error: event.error?.slice(0, 256),
+							detail: event.detail?.slice(0, 256),
+						});
+				},
+				onDurableAttempt: attempt => {
+					if (durableAttempts.length < 64)
+						durableAttempts.push(
+							`${attempt.type ?? "unclassified"}:${attempt.outcome}:${attempt.commandId ?? ""}:${attempt.turnId ?? ""}:${attempt.terminalAt ?? ""}`,
+						);
+				},
 				persistHolds: [
 					{
 						type: "deadline_claim",
@@ -9172,12 +10684,30 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const accepted = await harness.control("turn.prompt", { text: "start while expiring" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			const claimDeadline = Date.now() + 2_000;
+			const claimWaitStartedAt = Date.now();
+			const claimDeadline = claimWaitStartedAt + 10_000;
 			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
-			expect(claimWasEntered).toBe(true);
+			try {
+				expect(claimWasEntered).toBe(true);
+			} catch (error) {
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)}; claim_setup=${JSON.stringify({
+						accepted,
+						correlation,
+						elapsedMs: Date.now() - claimWaitStartedAt,
+						claimWasEntered,
+						handleReads,
+						abortCalls,
+						persistenceEvents,
+						durableAttempts,
+						broadcasts: harness.broadcasts.slice(-16),
+					})}`,
+					{ cause: error },
+				);
+			}
 			await claimEntered.promise;
 			startPromise = harness.emit("agent_start");
-			const captureDeadline = Date.now() + 2_000;
+			const captureDeadline = Date.now() + 10_000;
 			while (handleReads === 0 && Date.now() < captureDeadline) await Bun.sleep(5);
 			expect(handleReads).toBeGreaterThan(0);
 			releaseClaim.resolve();
@@ -9196,7 +10726,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("agent_start during an expiry claim keeps the queued correlation owned", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
@@ -9209,8 +10739,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		let claimWasEntered = false;
 		let handleReads = 0;
 		let boundaryWaitStarted = false;
+		let toolDrainWasObserved = false;
 		let abortCalls = 0;
-		let terminalEventPromise: Promise<void> | undefined;
 		try {
 			harness = await invocationHarness("deadline-start-race", cwd, {
 				settings: zeroProgressSettings,
@@ -9238,8 +10768,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					},
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
-						else if (boundaryWaitStarted && terminalEventPromise === undefined)
-							terminalEventPromise = harness?.emit("agent_end", { stopReason: "cancelled" });
+						else if (boundaryWaitStarted) toolDrainWasObserved = true;
 						return [...activeTools];
 					},
 					abortPromptAndWaitWithTerminal: async () => {
@@ -9264,15 +10793,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(5);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+			// The producer emits its real end after tool settlement; the ledger observer stays read-only.
 			activeTools.clear();
-			const terminalEventDeadline = Date.now() + 2_000;
-			while (terminalEventPromise === undefined && Date.now() < terminalEventDeadline) await Bun.sleep(5);
-			expect(terminalEventPromise).toBeDefined();
-			await terminalEventPromise;
+			await harness.emit("agent_end", { stopReason: "cancelled" });
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
+			expect(toolDrainWasObserved).toBe(true);
 			expect(abortCalls).toBeLessThanOrEqual(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
@@ -9281,7 +10809,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+		// Real timers plus a reconciliation claim exceed the default 5s on a loaded shard.
+	}, 20_000);
 
 	test("a sibling publication failure does not hide the expiring correlation's end", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-sibling-publication-"));

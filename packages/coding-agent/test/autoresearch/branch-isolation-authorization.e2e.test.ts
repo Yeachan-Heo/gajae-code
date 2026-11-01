@@ -19,7 +19,10 @@ import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { ensureAutoresearchBranch, getCurrentAutoresearchBranch } from "../../src/autoresearch/git";
 import { activeSnapshotPath, modeStatePath, sessionStateDir } from "../../src/gjc-runtime/session-layout";
-import { getWorkflowMutationDecision } from "../../src/skill-state/workflow-mutation-guard";
+import {
+	assertWorkflowMutationAllowed,
+	getWorkflowMutationDecision,
+} from "../../src/skill-state/workflow-mutation-guard";
 
 const TEST_SESSION_ID = "session-branch-isolation";
 const tempRoots: string[] = [];
@@ -139,6 +142,88 @@ describe("autoresearch research-only authorization (real git, nothing stubbed)",
 		// The harness artifact remains writable on the branch.
 		const harness = await decideWrite(cwd, "autoresearch.sh");
 		expect(harness.blocked).toBe(false);
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"blocks harness symlinks into existing or missing product files",
+		async () => {
+			for (const target of ["src/product.ts", "src/new-product.ts"]) {
+				const cwd = initRepo();
+				await activateMission(cwd);
+				const harness = path.join(cwd, "autoresearch.sh");
+				await fs.symlink(target, harness);
+				const mutate = async () => {
+					await assertWorkflowMutationAllowed({
+						cwd,
+						sessionId: TEST_SESSION_ID,
+						tool: writeTool(),
+						args: { path: "autoresearch.sh", content: "modified\n" },
+					});
+					await Bun.write(harness, "modified\n");
+				};
+				await expect(mutate()).rejects.toThrow("research-only");
+				expect(await Bun.file(path.join(cwd, "src/product.ts")).text()).toBe("export const x = 1;\n");
+				expect(await Bun.file(path.join(cwd, "src/new-product.ts")).exists()).toBe(false);
+				const bash = await getWorkflowMutationDecision({
+					cwd,
+					sessionId: TEST_SESSION_ID,
+					tool: { ...writeTool(), name: "bash" },
+					args: { command: "printf modified > autoresearch.sh" },
+				});
+				expect(bash.blocked).toBe(true);
+				expect(bash.message).toContain("research-only");
+			}
+		},
+	);
+
+	it("still allows creating and replacing a regular mission harness", async () => {
+		const cwd = initRepo();
+		await activateMission(cwd);
+		for (const content of ["#!/bin/sh\n", "#!/bin/sh\nprintf research\n"]) {
+			await assertWorkflowMutationAllowed({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				tool: writeTool(),
+				args: { path: "./autoresearch.sh", content },
+			});
+			await Bun.write(path.join(cwd, "autoresearch.sh"), content);
+			expect(await Bun.file(path.join(cwd, "autoresearch.sh")).text()).toBe(content);
+		}
+	});
+
+	it("blocks compound Bash commands from retargeting the harness before a redirected write", async () => {
+		const cwd = initRepo();
+		await activateMission(cwd);
+
+		// A dedicated file tool can write the regular harness, but Bash cannot
+		// safely honor that exception: any preceding command could replace the
+		// harness with a symlink before the redirect is opened.
+		expect((await decideWrite(cwd, "autoresearch.sh")).blocked).toBe(false);
+
+		const bash = { ...writeTool(), name: "bash" };
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			tool: bash,
+			args: {
+				command: "ln -sf src/product.ts autoresearch.sh && printf changed > autoresearch.sh",
+			},
+		});
+
+		expect(decision.blocked).toBe(true);
+		expect(decision.message).toContain("research-only");
+		expect(decision.targets).toContain("autoresearch.sh");
+		expect(await Bun.file(path.join(cwd, "src/product.ts")).text()).toBe("export const x = 1;\n");
+		expect(await Bun.file(path.join(cwd, "autoresearch.sh")).exists()).toBe(false);
+	});
+
+	it.skipIf(process.platform === "win32")("still allows a regular harness through a symlinked workspace", async () => {
+		const cwd = initRepo();
+		await activateMission(cwd);
+		await Bun.write(path.join(cwd, "autoresearch.sh"), "#!/bin/sh\n");
+		const alias = path.join(cwd, "workspace-alias");
+		await fs.symlink(cwd, alias, "dir");
+		expect((await decideWrite(alias, "autoresearch.sh")).blocked).toBe(false);
 	});
 
 	it("does not authorize a lookalike harness path or nested harness copies", async () => {

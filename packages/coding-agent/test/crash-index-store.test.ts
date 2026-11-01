@@ -6,6 +6,7 @@ import {
 	appendCrashEvent,
 	type CrashOccurrenceEvent,
 	computeCrashFingerprint,
+	computeCrashFingerprintV1,
 	formatCrashEventLine,
 	formatCrashRecordMarker,
 	parseCrashEventLine,
@@ -39,11 +40,11 @@ async function tempPaths(): Promise<CrashStatePaths> {
 	};
 }
 
-function occurrence(fingerprint: string, recordId: string, at = NOW): CrashOccurrenceEvent {
+function occurrence(fingerprint: string, recordId: string, at = NOW, fpv = 1): CrashOccurrenceEvent {
 	return {
 		kind: "occurrence",
 		fingerprint,
-		fpv: 1,
+		fpv,
 		recordId,
 		at,
 		errorName: "Error",
@@ -63,16 +64,13 @@ function recoverableRecord(
 	const id = recordId(seed);
 	const headline = `Error: ${message}`;
 	const stack = `${headline}\n    at recovered (packages/coding-agent/src/crash/recovery.ts:1:1)`;
-	const fingerprint = computeCrashFingerprint(
-		{ name: "Error", message, stack },
-		{ installRoot: process.cwd() },
-	).fingerprint;
+	const computed = computeCrashFingerprint({ name: "Error", message, stack }, { installRoot: process.cwd() });
 	return {
-		fingerprint,
+		fingerprint: computed.fingerprint,
 		recordId: id,
 		text:
 			`${at} pid=1 [Uncaught Exception] ${headline}\n` +
-			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, id)}\n\n`,
+			`${stack}\n${formatCrashRecordMarker(computed.fingerprint, computed.version, id)}\n\n`,
 	};
 }
 
@@ -90,6 +88,18 @@ describe("compactCrashIndex", () => {
 		// Re-running with an empty journal must not change counts.
 		const again = await compactCrashIndex({ paths, now: NOW });
 		expect(again.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(8);
+	});
+
+	it("updates a signature's version when an unchanged fingerprint gets a newer algorithm marker", () => {
+		const index = emptyCrashIndex();
+		const fingerprint = fingerprintFor(2);
+		expect(applyCrashEvent(index, occurrence(fingerprint, recordId(20), NOW, 1), NOW)).toBe(true);
+		expect(applyCrashEvent(index, occurrence(fingerprint, recordId(21), NOW + 1, 2), NOW + 1)).toBe(true);
+		expect(index.signatures[fingerprint]).toMatchObject({
+			fpv: 2,
+			lifetimeCount: 2,
+			lastAppendRecordId: recordId(21),
+		});
 	});
 
 	it("excludes eval and Bun test occurrences without changing legacy or product events", () => {
@@ -223,7 +233,7 @@ describe("compactCrashIndex", () => {
 		expect(replayed.signatures[fingerprintFor(40)]?.lifetimeCount).toBe(300);
 	});
 
-	it("recovers a complete fingerprint-bound v1 record when its journal append was lost", async () => {
+	it("recovers a complete fingerprint-bound current-version record when its journal append was lost", async () => {
 		const paths = await tempPaths();
 		const recovered = recoverableRecord(200);
 		await fs.writeFile(paths.crashLog, recovered.text);
@@ -237,6 +247,31 @@ describe("compactCrashIndex", () => {
 		});
 		expect(index.signatures[recovered.fingerprint]?.reportedAt).toBeUndefined();
 		expect(index.signatures[recovered.fingerprint]?.acknowledgedAt).toBeUndefined();
+	});
+
+	it("recovers a base-era v1 pw marker when its journal append was lost", async () => {
+		const paths = await tempPaths();
+		const message = "failed to authenticate pw=legacy-secret";
+		const headline = `Error: ${message}`;
+		const stack = `${headline}\n    at recovered (packages/coding-agent/src/crash/recovery.ts:1:1)`;
+		const historical = computeCrashFingerprintV1({ name: "Error", message, stack }, { installRoot: process.cwd() });
+		expect(historical.fingerprint).toBe("e91ef2ac7473805c195da1947ae9afab");
+		const id = recordId(202);
+		await fs.writeFile(
+			paths.crashLog,
+			`2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] ${headline}\n` +
+				`${stack}\n${formatCrashRecordMarker(historical.fingerprint, 1, id)}\n\n`,
+		);
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[historical.fingerprint]).toMatchObject({
+			fpv: 1,
+			messageClass: "failed to authenticate pw=«redacted»",
+			lifetimeCount: 1,
+			retainedCount: 1,
+			lastRecordId: id,
+			lastAppendRecordId: id,
+		});
 	});
 
 	it("recovers lastAppendRecordId from log order rather than display-time lastSeen", async () => {

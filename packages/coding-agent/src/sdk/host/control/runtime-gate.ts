@@ -1,3 +1,4 @@
+import { publishedRuntimeAbortCapability } from "../../broker/runtime-abort-capability";
 import { findOperation } from "../../protocol/operation-registry";
 
 /**
@@ -225,8 +226,17 @@ export function setBrokerRuntimeAbortCapabilityForTest(capability: string | unde
 	brokerRuntimeAbortCapabilityOverrideForTest = capability;
 }
 
+/**
+ * Runtime-local authority check for the Broker-routed operator terminal abort.
+ *
+ * A lifecycle child expects its GJC_LIFECYCLE_REQUEST_ID. A TUI or direct CLI
+ * host expects the marker it published in its own index registration
+ * (`runtime-abort-capability.ts`); before that registration it accepts none.
+ */
 export function hasBrokerRuntimeAbortCapability(input: unknown): boolean {
-	const expected = brokerRuntimeAbortCapabilityOverrideForTest ?? EXPECTED_BROKER_RUNTIME_ABORT_CAPABILITY;
+	const expected =
+		brokerRuntimeAbortCapabilityOverrideForTest ??
+		(EXPECTED_BROKER_RUNTIME_ABORT_CAPABILITY || publishedRuntimeAbortCapability());
 	const actual = brokerRuntimeAbortCapability(input);
 	return typeof expected === "string" && expected.length > 0 && actual === expected;
 }

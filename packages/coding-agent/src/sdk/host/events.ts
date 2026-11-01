@@ -26,10 +26,37 @@ export interface EventReplay {
 	gap?: EventReplayGap;
 }
 
+/** Kinds emit sites suppress once notification redaction is on. */
+const REDACTED_REPLAY_KINDS: ReadonlySet<string> = new Set([
+	"turn_stream",
+	"context_update",
+	"image_attachment",
+	"file_attachment",
+	"reasoning_summary",
+	"tool_activity",
+]);
+
+const outboundRedactBySession = new Map<string, boolean>();
+
+/** Notification policy refresh records the live redaction bit for one session ring. */
+export function setSessionOutboundRedact(sessionId: string, enabled: boolean): void {
+	outboundRedactBySession.set(sessionId, enabled);
+}
+
+function frameSessionId(frame: SdkFrame): string | undefined {
+	if (typeof frame.sessionId === "string") return frame.sessionId;
+	const payload = frame.payload;
+	if (!payload || typeof payload !== "object") return undefined;
+	const sessionId = (payload as { sessionId?: unknown }).sessionId;
+	return typeof sessionId === "string" ? sessionId : undefined;
+}
+
 export class SessionEventStream {
 	#generation = 0;
 	#seq = 0;
 	#frames: EventFrame[] = [];
+	#outboundRedact = false;
+	#sessionId: string | undefined;
 	readonly #ringSize: number;
 	readonly #resyncQueries: string[];
 	readonly #revisionProvider: (() => number | undefined) | undefined;
@@ -55,14 +82,30 @@ export class SessionEventStream {
 		return this.#seq;
 	}
 
-	restart(): number {
-		this.#generation += 1;
+	/** Follow the session redaction bit. Replay then drops kinds emit sites already suppress. */
+	setOutboundRedact(enabled: boolean): void {
+		this.#outboundRedact = enabled;
+		if (this.#sessionId !== undefined) outboundRedactBySession.set(this.#sessionId, enabled);
+	}
+
+	/**
+	 * Open the next event namespace. `floor` lets the owning host keep namespaces
+	 * distinct across host instances of one session; within one stream the
+	 * generation still only advances.
+	 */
+	restart(floor = 0): number {
+		if (!Number.isSafeInteger(floor)) throw new Error("SDK event generation floor must be a safe integer.");
+		const next = Math.max(this.#generation + 1, floor);
+		if (!Number.isSafeInteger(next)) throw new Error("SDK event generation is exhausted.");
+		this.#generation = next;
 		this.#seq = 0;
 		this.#frames = [];
 		return this.#generation;
 	}
 
 	emit(frame: SdkFrame): EventFrame {
+		this.#noteSession(frame);
+		this.#noteConfigRedact(frame);
 		const suppliedRevision = frame.revision;
 		const providedRevision = this.#revisionProvider?.();
 		const revision =
@@ -85,10 +128,9 @@ export class SessionEventStream {
 
 	/** Replays retained current-generation events and reports any required resynchronization. */
 	replay(lastSeq: number, generation = this.#generation): EventReplay {
-		const events = this.#frames.filter(frame => frame.seq > lastSeq);
 		if (generation !== this.#generation) {
 			return {
-				events: [...this.#frames],
+				events: this.#visible(this.#frames),
 				gap: {
 					kind: "generation_reset",
 					fromGeneration: generation,
@@ -101,7 +143,7 @@ export class SessionEventStream {
 		const replayFrom = lastSeq + 1;
 		if (replayFrom < oldest) {
 			return {
-				events: this.#frames.filter(frame => frame.seq >= oldest),
+				events: this.#visible(this.#frames.filter(frame => frame.seq >= oldest)),
 				gap: {
 					kind: "sequence_gap",
 					fromSeq: replayFrom,
@@ -110,6 +152,35 @@ export class SessionEventStream {
 				},
 			};
 		}
-		return { events };
+		return { events: this.#visible(this.#frames.filter(frame => frame.seq > lastSeq)) };
+	}
+
+	#noteSession(frame: SdkFrame): void {
+		if (this.#sessionId !== undefined) return;
+		this.#sessionId = frameSessionId(frame);
+	}
+
+	#noteConfigRedact(frame: SdkFrame): void {
+		if (frame.kind !== "config_update") return;
+		const payload = frame.payload;
+		if (!payload || typeof payload !== "object") return;
+		const redact = (payload as { redact?: unknown }).redact;
+		if (typeof redact !== "boolean") return;
+		this.setOutboundRedact(redact);
+	}
+
+	#replayRedact(): boolean {
+		if (this.#sessionId !== undefined) {
+			const noted = outboundRedactBySession.get(this.#sessionId);
+			if (noted !== undefined) return noted;
+		}
+		return this.#outboundRedact;
+	}
+
+	#visible(frames: readonly EventFrame[]): EventFrame[] {
+		const retained = this.#replayRedact()
+			? frames.filter(frame => !REDACTED_REPLAY_KINDS.has(String(frame.kind)))
+			: frames;
+		return [...retained];
 	}
 }

@@ -51,6 +51,7 @@ import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { PlanModeState } from "../plan-mode/state";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
@@ -59,13 +60,16 @@ import { discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
 import { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
+import type { ClientBridge } from "../session/client-bridge";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+import { isCanonicalGjcWorkflowSkillFilesystemAlias } from "../skill-state/canonical-skills";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
 import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
+import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -74,11 +78,13 @@ import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
 import { classifyProviderRetryFromTransport, providerNameFromModel } from "./provider-retry-status";
+import { containSubagentRoleBody } from "./role-body";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type AgentSource,
 	type AutoroutingAttempt,
 	type AutoroutingAttemptCode,
 	type AutoroutingPreflightFailure,
@@ -220,6 +226,89 @@ export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model 
 	};
 }
 
+/**
+ * A repository agent may preload an ordinary skill. Bundled workflow names stay
+ * on the interactive skill path. User and bundled agents still preload those names.
+ */
+export function projectAgentMayPreloadSkill(source: AgentSource, skillName: string): boolean {
+	return source !== "project" || !isCanonicalGjcWorkflowSkillFilesystemAlias(skillName);
+}
+
+/**
+ * Not an approved command word. Paired with the read-only profile, a quoted
+ * form of this word is rejected too. An empty overlap must stay distinct from
+ * an unrestricted child, which has no profile and no prefixes.
+ */
+const CHILD_BASH_EMPTY_OVERLAP_PREFIX = ";";
+
+function normalizedBashPrefixes(prefixes: readonly string[] | undefined): string[] {
+	const unique: string[] = [];
+	for (const prefix of prefixes ?? []) {
+		const trimmed = prefix.trim();
+		if (trimmed.length === 0 || unique.includes(trimmed)) continue;
+		unique.push(trimmed);
+	}
+	return unique;
+}
+
+function bashPrefixWords(prefix: string): string[] {
+	return prefix
+		.trim()
+		.split(/\s+/u)
+		.filter(word => word.length > 0);
+}
+
+/** True when every command matched by `specific` is also matched by `broader`. */
+function bashPrefixCovers(broader: string, specific: string): boolean {
+	const left = bashPrefixWords(broader);
+	const right = bashPrefixWords(specific);
+	if (left.length === 0 || left.length > right.length) return false;
+	return left.every((word, index) => word === right[index]);
+}
+
+/**
+ * Bash posture for a task child. An unrestricted parent keeps the child agent's
+ * allowlist. A restricted parent is copied, and a child allowlist can only narrow it.
+ * An empty overlap is read-only with a prefix the bash gate cannot approve.
+ */
+export function resolveChildBashRestriction(input: {
+	parentProfile?: BashRestrictionProfile;
+	parentPrefixes?: readonly string[];
+	childPrefixes?: readonly string[];
+}): { bashRestrictionProfile?: BashRestrictionProfile; bashAllowedPrefixes?: string[] } {
+	const parentPrefixes = normalizedBashPrefixes(input.parentPrefixes);
+	const childPrefixes = normalizedBashPrefixes(input.childPrefixes);
+	if (input.parentProfile === undefined && parentPrefixes.length === 0) {
+		return childPrefixes.length > 0 ? { bashAllowedPrefixes: childPrefixes } : {};
+	}
+	let bashAllowedPrefixes: string[] | undefined;
+	if (parentPrefixes.length === 0) {
+		bashAllowedPrefixes = childPrefixes.length > 0 ? childPrefixes : undefined;
+	} else if (childPrefixes.length === 0) {
+		bashAllowedPrefixes = parentPrefixes;
+	} else {
+		const merged: string[] = [];
+		for (const parentPrefix of parentPrefixes) {
+			for (const childPrefix of childPrefixes) {
+				if (bashPrefixCovers(childPrefix, parentPrefix)) merged.push(parentPrefix);
+				else if (bashPrefixCovers(parentPrefix, childPrefix)) merged.push(childPrefix);
+			}
+		}
+		const unique = normalizedBashPrefixes(merged);
+		if (unique.length === 0) {
+			return {
+				bashRestrictionProfile: "read-only",
+				bashAllowedPrefixes: [CHILD_BASH_EMPTY_OVERLAP_PREFIX],
+			};
+		}
+		bashAllowedPrefixes = unique;
+	}
+	return {
+		...(input.parentProfile ? { bashRestrictionProfile: input.parentProfile } : {}),
+		...(bashAllowedPrefixes ? { bashAllowedPrefixes } : {}),
+	};
+}
+
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -300,6 +389,27 @@ export interface ExecutorOptions {
 	 * the same immutable child settings snapshot.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/**
+	 * Parent ACP/SDK approval mode. `deny` and `prompt` replace the child
+	 * default (`allow`) before the first prompt. `allow` is that default.
+	 */
+	sdkPermissionMode?: "prompt" | "allow" | "deny";
+	/**
+	 * Parent plan-mode state. Copied onto the child before the first prompt so
+	 * `enforcePlanModeWrite` still refuses product-file writes.
+	 */
+	planModeState?: PlanModeState;
+	/**
+	 * Parent bash posture. Applied before the child prompt so a read-only or
+	 * workflow allowlist cannot be cleared by spawn. A child allowlist may only narrow it.
+	 */
+	bashRestrictionProfile?: BashRestrictionProfile;
+	parentBashAllowedPrefixes?: string[];
+	/**
+	 * Parent client bridge. Only `requestPermission` is copied onto the child.
+	 * Terminal, filesystem, and deferAgentInitiatedTurns stay on the parent.
+	 */
+	clientBridge?: ClientBridge;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -1014,6 +1124,16 @@ function autoroutingAttemptDisposition(failure: AutoroutingPreflightFailure): {
 	if (failure.kind === "local" && (!failure.transient || failure.op === "preflight_validation"))
 		return { code: "config_invalid_terminal", advance: false };
 	return { code: "unclassified_terminal", advance: false };
+}
+
+/** Permission callback only. Terminal, filesystem, and defer flags stay on the parent. */
+function permissionOnlyBridge(bridge: ClientBridge | undefined): ClientBridge | undefined {
+	if (!bridge?.requestPermission || bridge.capabilities.requestPermission !== true) return undefined;
+	const requestPermission = bridge.requestPermission.bind(bridge);
+	return {
+		capabilities: { requestPermission: true },
+		requestPermission: (toolCall, options, signal) => requestPermission(toolCall, options, signal),
+	};
 }
 
 export async function runSubprocessOnce(options: ExecutorOptions): Promise<SingleResult> {
@@ -2032,6 +2152,11 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			}
 
 			if (options.preflightProbe || options.preflightDurable) preflightOperation = "tool_bootstrap";
+			const childBash = resolveChildBashRestriction({
+				parentProfile: options.bashRestrictionProfile,
+				parentPrefixes: options.parentBashAllowedPrefixes,
+				childPrefixes: agent.bashAllowedPrefixes,
+			});
 			const { session } = await awaitAbortable(
 				canonicalSdk.createAgentSession({
 					cwd: worktree ?? cwd,
@@ -2059,14 +2184,15 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					promptTemplates: options.promptTemplates,
 					workspaceTree: options.workspaceTree,
 					systemPrompt: defaultPrompt => {
-						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: prompt.render(agent.systemPrompt, {
-								// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
-								ultragoalRedTeam: resolveUltragoalRedTeamActivation({
-									executionMode: options.executionMode,
-									assignment: options.assignment ?? task,
-								}),
+						const renderedRole = prompt.render(agent.systemPrompt, {
+							// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
+							ultragoalRedTeam: resolveUltragoalRedTeamActivation({
+								executionMode: options.executionMode,
+								assignment: options.assignment ?? task,
 							}),
+						});
+						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+							agent: containSubagentRoleBody(renderedRole),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
@@ -2103,7 +2229,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					agentId: id,
 					agentDisplayName: agent.name,
 					agentRosterLabel: options.description,
-					bashAllowedPrefixes: agent.bashAllowedPrefixes,
+					bashAllowedPrefixes: childBash.bashAllowedPrefixes,
+					bashRestrictionProfile: childBash.bashRestrictionProfile,
 					enableLsp: lspEnabled,
 					skipPythonPreflight,
 					enableMCP,
@@ -2116,6 +2243,22 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			);
 
 			activeSession = session;
+			// Plan mode is session state, not a tool-list filter. Copy it before the
+			// first prompt so product writes hit the same read-only guard as the parent.
+			if (options.planModeState?.enabled) {
+				session.setPlanModeState({
+					enabled: true,
+					planFilePath: options.planModeState.planFilePath,
+					...(options.planModeState.workflow ? { workflow: options.planModeState.workflow } : {}),
+					...(options.planModeState.reentry !== undefined ? { reentry: options.planModeState.reentry } : {}),
+				});
+			}
+			// `allow` is the child default. deny/prompt must be copied before the first prompt.
+			if (options.sdkPermissionMode === "deny" || options.sdkPermissionMode === "prompt") {
+				session.setSdkPermissionMode(options.sdkPermissionMode);
+			}
+			const approvalBridge = permissionOnlyBridge(options.clientBridge);
+			if (approvalBridge) session.setClientBridge(approvalBridge);
 			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
 			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
 			if (!parentFallbackSelector) {
@@ -2166,7 +2309,9 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const parentOwnedToolNames = new Set(["todo_write"]);
 			const filteredSubagentTools = subagentToolNames.filter(name => !parentOwnedToolNames.has(name));
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
-				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
+				await awaitAbortable(
+					session.setActiveToolsByName(filteredSubagentTools, { explicit: false, persistMCPSelection: false }),
+				);
 			}
 
 			if (!options.preflightProbe && !options.preflightDurable) {
@@ -2376,6 +2521,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
+					if (!projectAgentMayPreloadSkill(options.agent.source, skill.name)) continue;
 					const { message } = await buildSkillPromptMessage(skill, "");
 					await session.sendCustomMessage(
 						{

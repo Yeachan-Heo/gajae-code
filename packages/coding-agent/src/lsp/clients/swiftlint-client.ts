@@ -2,6 +2,7 @@
  * SwiftLint CLI-based linter client.
  * Parses SwiftLint's JSON reporter output into LSP Diagnostic format.
  */
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 /** Shape of a single violation from `swiftlint lint --reporter json`. */
@@ -36,6 +37,7 @@ async function runSwiftLint(
 	try {
 		const proc = Bun.spawn([command, ...args], {
 			cwd,
+			env: projectSafeSpawnEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,

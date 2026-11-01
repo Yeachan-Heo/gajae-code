@@ -33,13 +33,14 @@ import { embeddedAddon } from "./embedded-addon.js";
  * post-build `--reset` stub) is the authoritative compiled-mode signal.
  */
 
-const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
+const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"];
 const OPTIONAL_PACKAGE_BY_PLATFORM_TAG = {
 	"darwin-arm64": "@gajae-code/natives-darwin-arm64",
 	"darwin-x64": "@gajae-code/natives-darwin-x64",
 	"linux-arm64": "@gajae-code/natives-linux-arm64",
 	"linux-x64": "@gajae-code/natives-linux-x64",
 	"win32-x64": "@gajae-code/natives-win32-x64",
+	"win32-arm64": "@gajae-code/natives-win32-arm64",
 };
 const WINDOWS_GENERIC_READ = 0x80000000;
 const WINDOWS_FILE_SHARE_READ = 0x00000001;
@@ -139,6 +140,32 @@ function validateStagedCandidate(ctx, candidate) {
 	}
 }
 
+function preloadSiblingNativeRuntime(ctx, candidate, loadLibrary) {
+	if (process.platform !== "win32") return;
+	// Staging copies only the .node into the versioned cache and drops the
+	// package directory from the candidate list. The DLL stays beside the
+	// recorded source addon, not beside that cache copy or bun.exe.
+	const sourcePath = ctx.stagedSourceSnapshots?.get(candidate)?.sourcePath;
+	const runtimes = [
+		typeof sourcePath === "string" ? path.join(path.dirname(sourcePath), "libunwind.dll") : null,
+		path.join(path.dirname(candidate), "libunwind.dll"),
+		path.join(path.dirname(process.execPath), "libunwind.dll"),
+	];
+	const seen = new Set();
+	for (const runtime of runtimes) {
+		if (!runtime || seen.has(runtime) || !fs.existsSync(runtime)) continue;
+		seen.add(runtime);
+		const handle = loadLibrary(runtime);
+		if (handle !== 0 && handle !== 0n && handle != null) return;
+	}
+}
+
+function loadSiblingNativeLibrary(runtime) {
+	const widePath = new Uint16Array(runtime.length + 1);
+	for (let index = 0; index < runtime.length; index++) widePath[index] = runtime.charCodeAt(index);
+	return windowsKernel32Bindings().symbols.LoadLibraryW(ptr(widePath));
+}
+
 function windowsKernel32Bindings() {
 	if (windowsKernel32) return windowsKernel32;
 	windowsKernel32 = dlopen("kernel32.dll", {
@@ -148,6 +175,7 @@ function windowsKernel32Bindings() {
 		},
 		CloseHandle: { args: ["i64"], returns: "u32" },
 		GetLastError: { args: [], returns: "u32" },
+		LoadLibraryW: { args: ["ptr"], returns: "ptr" },
 	});
 	return windowsKernel32;
 }
@@ -817,6 +845,9 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.currentExecutablePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required executable identity capability \`currentExecutablePath\`.`);
 	}
+	if (typeof bindings.readOwnerOnlyFile !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required owner-only reader capability \`readOwnerOnlyFile\`.`);
+	}
 }
 
 function buildHelpMessage(ctx) {
@@ -965,6 +996,7 @@ export function loadNative(options = {}) {
 			}
 			try {
 				validateStagedCandidate(ctx, candidate);
+				preloadSiblingNativeRuntime(ctx, candidate, options.loadNativeLibrary ?? loadSiblingNativeLibrary);
 				const bindings = options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
 				if (typeof bindings.__gjcInstallTokioRuntime === "function") {
 					bindings.__gjcInstallTokioRuntime();

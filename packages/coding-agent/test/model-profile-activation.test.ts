@@ -15,6 +15,8 @@ import {
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
 	publishPreparedModelProfileActivation,
+	resolveMaterializationProfileIdentity,
+	resolveMaterializedDefaultSelector,
 	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
@@ -47,6 +49,22 @@ const model = (provider: string, id: string, thinking?: Model["thinking"]): Mode
 		reasoning: thinking !== undefined,
 		compat: thinking ? { supportsReasoningEffort: true } : undefined,
 	}) as Model;
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state ^= state << 13;
+		state ^= state >>> 17;
+		state ^= state << 5;
+		return (state >>> 0) / 0x1_0000_0000;
+	};
+}
+
+function generatedSelector(random: () => number, label: string, index: number): string {
+	const provider = Math.floor(random() * 5);
+	const modelId = Math.floor(random() * 1000);
+	return `provider-${provider}/${label}-${index}-${modelId}`;
+}
 
 function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelProfileDefinition[] }) {
 	const profiles = new Map<string, ModelProfileDefinition>();
@@ -165,6 +183,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 
 function fakeSession(initial = model("provider-a", "initial")) {
 	let activeModelProfile: string | undefined;
+	let activatedModelProfile: string | undefined;
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -221,11 +240,15 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		getSessionDefaultModelSelector() {
 			return this.resumeDefaultSelectors.at(-1);
 		},
-		setActiveModelProfile(name: string | undefined) {
+		setActiveModelProfile(name: string | undefined, activatedByThisProcess = false) {
 			activeModelProfile = name;
+			activatedModelProfile = activatedByThisProcess ? name : undefined;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getActivatedModelProfile() {
+			return activatedModelProfile === activeModelProfile ? activeModelProfile : undefined;
 		},
 	};
 }
@@ -553,6 +576,7 @@ describe("model profile activation", () => {
 				},
 			},
 			{ modelRoles: [], agentModelOverrides: [] },
+			["provider-a/default:high"],
 		);
 	});
 
@@ -2513,7 +2537,7 @@ describe("model profile activation", () => {
 			resolveModelByLookupAlias: (alias: string) => (alias === "shared-model" ? selected : undefined),
 		} as unknown as ModelRegistry;
 		const session = Object.assign(fakeSession(), { modelRegistry: registry });
-		session.setActiveModelProfile("provider-agnostic-profile");
+		session.setActiveModelProfile("provider-agnostic-profile", true);
 		const settings = Settings.isolated({ "modelProfile.default": "provider-agnostic-profile" });
 		settings.override("modelRoles", { default: "shared-model" });
 		settings.override("task.agentModelOverrides", {
@@ -2563,6 +2587,7 @@ describe("model profile activation", () => {
 		expect(settings.get("modelRoles")).toEqual(previousRoles);
 		expect(settings.get("task.agentModelOverrides")).toEqual(previousOverrides);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+		expect(session.getActivatedModelProfile()).toBe("profile-a");
 	});
 
 	test("materialization restores canonical affinity when concretization mutates before persistence fails", () => {
@@ -2584,7 +2609,7 @@ describe("model profile activation", () => {
 			},
 		} as unknown as ModelRegistry;
 		Object.assign(session, { modelRegistry: registry });
-		session.setActiveModelProfile("profile-a");
+		session.setActiveModelProfile("profile-a", true);
 		const setConfiguredModelChain = session.setConfiguredModelChain.bind(session);
 		let chainWrites = 0;
 		session.setConfiguredModelChain = (role: string, entries: readonly string[]) => {
@@ -2633,6 +2658,189 @@ describe("model profile activation", () => {
 		});
 
 		expect(settings.get("modelRoles").default).toBe("provider-b/executor");
+	});
+
+	test("role materialization keeps the activated alternative provider after a CLI override", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "alternative-provider-profile",
+			requiredProviders: [],
+			alternativeProviderGroups: [["provider-a", "provider-b"]],
+			modelMapping: { default: "provider-a/default", executor: "provider-a/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile], missingProviders: ["provider-a"] });
+		const defaultAlternative = model("provider-b", "default");
+		const executorAlternative = model("provider-b", "executor");
+		const registry = {
+			...baseRegistry,
+			getAll: () => [...baseRegistry.getAll(), defaultAlternative, executorAlternative],
+			getAvailable: () => [...baseRegistry.getAll(), defaultAlternative, executorAlternative],
+		};
+		const startupModel = model("provider-c", "cli-model");
+		let profileState: AgentSessionProfileInstalledOverrideState = {
+			modelRoles: new Map(),
+			agentModelOverrides: new Map(),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map(),
+			manualModelRoles: new Set(),
+			manualAgentModelOverrides: new Set(),
+			configuredAgentModelOverrides: new Set(),
+			preProfileModel: undefined,
+		};
+		const baseSession = fakeSession(model("provider-a", "default"));
+		const session = Object.assign(baseSession, {
+			modelRegistry: registry as unknown as ModelRegistry,
+			getProfileInstalledOverrideState: () => profileState,
+			noteProfileInstalledOverrides: (...args: Parameters<AgentSession["noteProfileInstalledOverrides"]>) => {
+				const currentChain = baseSession.getConfiguredModelChainState("default");
+				const chain =
+					args[6] ??
+					(currentChain?.origin === "profile-activation" &&
+					currentChain.identity === baseSession.getActiveModelProfile()
+						? currentChain.entries
+						: undefined);
+				profileState = {
+					...profileState,
+					configuredDefaultChain: chain ? [...chain] : undefined,
+				};
+			},
+		});
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		settings.overrideModelRoles({ default: "cli-model-alias" });
+		expect(await registry.getApiKeyForProvider("provider-a")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("provider-b")).toBe("key-provider-b");
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profile.name });
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-b/default"]);
+		expect(profileState.configuredDefaultChain).toEqual(["provider-b/default"]);
+
+		session.model = startupModel;
+		session.setConfiguredModelChain("default", [`${startupModel.provider}/${startupModel.id}`], "startup-override");
+		await applyModelProfileRuntimeBindings({ session, modelRegistry: registry, settings, profileName: profile.name });
+		expect(session.getConfiguredModelChainState("default")?.origin).toBe("startup-override");
+		expect(profileState.configuredDefaultChain).toEqual(["provider-b/default"]);
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor",
+		});
+		expect(session.model).toBe(startupModel);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [`${startupModel.provider}/${startupModel.id}`],
+			origin: "startup-override",
+		});
+
+		const reloadedSettings = Settings.isolated({
+			modelRoles: settings.getGlobal("modelRoles"),
+			"task.agentModelOverrides": settings.getGlobal("task.agentModelOverrides"),
+			"modelProfile.default": settings.getGlobal("modelProfile.default"),
+		});
+		expect(settings.getGlobal("modelRoles")?.default).toBe("provider-b/default");
+		expect(reloadedSettings.getModelRole("default")).toBe("provider-b/default");
+		expect(reloadedSettings.getGlobal("modelProfile.default")).toBeUndefined();
+	});
+
+	test("materializing a role-only profile does not promote a startup model to the global default", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "role-only-profile",
+			requiredProviders: [],
+			modelMapping: { executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = { ...baseRegistry, getAvailable: () => baseRegistry.getAll() };
+		const startupModel = model("provider-c", "cli-model");
+		const session = Object.assign(fakeSession(startupModel), { modelRegistry: registry as unknown as ModelRegistry });
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		settings.overrideModelRoles({ default: "cli-model-alias" });
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profile.name });
+
+		session.model = startupModel;
+		session.setConfiguredModelChain("default", [`${startupModel.provider}/${startupModel.id}`], "startup-override");
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor",
+		});
+
+		expect(settings.getGlobal("modelRoles")?.default).toBeUndefined();
+	});
+
+	test("role selections never materialize a persisted profile whose activation failed", async () => {
+		const baseRegistry = fakeRegistry({ missingProviders: ["provider-a"] });
+		const registry = { ...baseRegistry, getAvailable: () => baseRegistry.getAll() };
+		const startupModel = model("provider-c", "cli-model");
+		const startupSelector = `${startupModel.provider}/${startupModel.id}`;
+		const session = Object.assign(fakeSession(startupModel), { modelRegistry: registry as unknown as ModelRegistry });
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+
+		settings.overrideModelRoles({ default: startupSelector });
+		session.setConfiguredModelChain("default", [startupSelector], "startup-override");
+
+		expect(
+			materializeActiveModelProfileAssignments({
+				session,
+				settings,
+				assignments: new Map([["executor", "provider-c/executor"]]),
+			}),
+		).toBe(false);
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "architect",
+				selector: "provider-c/architect",
+			}),
+		).toBe(false);
+		// Callers fall back to persisting only the requested roles.
+		settings.setAgentModelOverride("executor", "provider-c/executor");
+		settings.setAgentModelOverride("architect", "provider-c/architect");
+
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [startupSelector],
+			origin: "startup-override",
+		});
+		const reloadedSettings = Settings.isolated({
+			modelRoles: settings.getGlobal("modelRoles"),
+			"task.agentModelOverrides": settings.getGlobal("task.agentModelOverrides"),
+			"modelProfile.default": settings.getGlobal("modelProfile.default"),
+		});
+		expect(reloadedSettings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(reloadedSettings.getModelRole("default")).toBeUndefined();
+		expect(reloadedSettings.getGlobal("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+			architect: "provider-c/architect",
+		});
+	});
+
+	test("an explicit default selection still supersedes a persisted profile whose activation failed", async () => {
+		const registry = fakeRegistry({ missingProviders: ["provider-a"] });
+		const session = Object.assign(fakeSession(model("provider-c", "cli-model")), {
+			modelRegistry: { ...registry, getAvailable: () => registry.getAll() } as unknown as ModelRegistry,
+		});
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		session.setConfiguredModelChain("default", ["provider-c/cli-model"], "startup-override");
+
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "default",
+				selector: "provider-c/default",
+			}),
+		).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/default" });
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
 	});
 
 	test("profile deletion materializes the complete default fallback chain", async () => {
@@ -2854,6 +3062,151 @@ describe("model profile activation", () => {
 		expect(materialized).toBe(false);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "provider-a/old-critic" });
 		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("seeded materialization properties preserve failed profiles and startup defaults", () => {
+		const seed = 0x6881;
+		const random = seededRandom(seed);
+		const assignmentKinds = ["single", "batch"] as const;
+
+		for (let index = 0; index < 24; index++) {
+			const durableProfile = `durable-profile-${index}`;
+			const durableDefault = generatedSelector(random, "durable-default", index);
+			const startupSelector = generatedSelector(random, "startup", index);
+			const storedExecutor = generatedSelector(random, "stored-executor", index);
+
+			for (const kind of assignmentKinds) {
+				const inactiveSession = fakeSession(model("startup-provider", `startup-model-${index}`));
+				inactiveSession.setConfiguredModelChain("default", [startupSelector], "startup-override");
+				const inactiveSettings = Settings.isolated({
+					"modelProfile.default": durableProfile,
+					modelRoles: { default: durableDefault },
+					"task.agentModelOverrides": { executor: storedExecutor },
+				});
+				const inactiveMaterialized =
+					kind === "single"
+						? materializeActiveModelProfileAssignment({
+								session: inactiveSession,
+								settings: inactiveSettings,
+								role: "executor",
+								selector: generatedSelector(random, "selected-single", index),
+							})
+						: materializeActiveModelProfileAssignments({
+								session: inactiveSession,
+								settings: inactiveSettings,
+								assignments: new Map([
+									["executor", generatedSelector(random, "selected-executor", index)],
+									["architect", generatedSelector(random, "selected-architect", index)],
+								]),
+							});
+				expect(inactiveMaterialized).toBe(false);
+				expect(inactiveSettings.getGlobal("modelProfile.default")).toBe(durableProfile);
+				expect(inactiveSettings.getGlobal("modelRoles")?.default).toBe(durableDefault);
+				expect(inactiveSettings.getGlobal("task.agentModelOverrides")?.executor).toBe(storedExecutor);
+			}
+
+			const activeProfile = `activated-profile-${index}`;
+			const profileDefault =
+				index % 4 === 3
+					? undefined
+					: index % 4 === 2
+						? [
+								generatedSelector(random, "profile-default-head", index),
+								generatedSelector(random, "profile-default-fallback", index),
+							]
+						: generatedSelector(random, "profile-default", index);
+			const globalDefault =
+				index % 5 === 4
+					? undefined
+					: index % 5 === 2
+						? [
+								generatedSelector(random, "global-default-head", index),
+								generatedSelector(random, "global-default-fallback", index),
+							]
+						: generatedSelector(random, "global-default", index);
+			const activatedDefaultChain =
+				index % 4 === 0
+					? [
+							generatedSelector(random, "activated-chain-head", index),
+							generatedSelector(random, "activated-chain-fallback", index),
+						]
+					: index % 4 === 1
+						? [generatedSelector(random, "activated-chain-head", index)]
+						: undefined;
+			const expectedDefault = activatedDefaultChain?.length
+				? activatedDefaultChain.length === 1
+					? activatedDefaultChain[0]
+					: [...activatedDefaultChain]
+				: (profileDefault ?? globalDefault);
+			expect(resolveMaterializationProfileIdentity(undefined, durableProfile, false)).toBeUndefined();
+			expect(resolveMaterializationProfileIdentity(undefined, durableProfile, true)).toBe(durableProfile);
+			expect(resolveMaterializationProfileIdentity(activeProfile, durableProfile, false)).toBe(activeProfile);
+			expect(resolveMaterializedDefaultSelector(activatedDefaultChain, profileDefault, globalDefault)).toEqual(
+				expectedDefault,
+			);
+
+			const profile: ModelProfileDefinition = {
+				name: activeProfile,
+				requiredProviders: [],
+				modelMapping: profileDefault === undefined ? {} : { default: profileDefault },
+				source: "user",
+			};
+			const baseRegistry = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...baseRegistry,
+				getAvailable: () => [],
+			} as unknown as ModelRegistry;
+			const profileInstalledState: AgentSessionProfileInstalledOverrideState = {
+				modelRoles: new Map(),
+				agentModelOverrides: new Map(),
+				installedModelRoles: new Map(),
+				installedAgentModelOverrides: new Map(),
+				manualModelRoles: new Set(),
+				manualAgentModelOverrides: new Set(),
+				configuredAgentModelOverrides: new Set(),
+				configuredDefaultChain: activatedDefaultChain,
+				preProfileModel: undefined,
+			};
+
+			for (const kind of assignmentKinds) {
+				const activeSession = Object.assign(fakeSession(model("startup-provider", `startup-model-${index}`)), {
+					modelRegistry: registry,
+					getProfileInstalledOverrideState: () => profileInstalledState,
+				});
+				activeSession.setActiveModelProfile(activeProfile, true);
+				activeSession.setConfiguredModelChain("default", [startupSelector], "startup-override");
+				const activeSettings = Settings.isolated({
+					"modelProfile.default": activeProfile,
+					modelRoles: globalDefault === undefined ? {} : { default: globalDefault },
+				});
+				activeSettings.overrideModelRoles({ default: startupSelector });
+
+				const activeMaterialized =
+					kind === "single"
+						? materializeActiveModelProfileAssignment({
+								session: activeSession,
+								settings: activeSettings,
+								role: "executor",
+								selector: generatedSelector(random, "active-single", index),
+							})
+						: materializeActiveModelProfileAssignments({
+								session: activeSession,
+								settings: activeSettings,
+								assignments: new Map([
+									["executor", generatedSelector(random, "active-executor", index)],
+									["architect", generatedSelector(random, "active-architect", index)],
+								]),
+							});
+				expect(activeMaterialized).toBe(true);
+				expect(activeSettings.getGlobal("modelRoles")?.default).toEqual(expectedDefault);
+				expect(activeSettings.getGlobal("modelRoles")?.default).not.toBe(startupSelector);
+				expect(activeSettings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(activeSession.getConfiguredModelChainState("default")).toMatchObject({
+					entries: [startupSelector],
+					origin: "startup-override",
+				});
+			}
+		}
 	});
 
 	test("--default persists profile default, clears persisted assignments, and flushes", async () => {

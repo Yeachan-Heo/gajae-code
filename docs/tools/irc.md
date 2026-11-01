@@ -57,7 +57,7 @@
 10. `respondAsBackground` accepts each delivery into the recipient's volatile current-session exchange queue before observing it in the recipient or main UI, and before reporting sender delivery success:
     - `awaitReply === false`: accepts/queues the incoming message, then emits its `irc_message` event and forwards the display-only relay to the main session UI.
     - `awaitReply === true`: renders `packages/coding-agent/src/prompts/system/irc-incoming.md` and runs `runEphemeralTurn` with `toolChoice: "none"`. After a reply succeeds, it constructs and accepts/queues the ordered incoming + auto-reply pair, commits its IRC roster claim, then emits both `irc_message` events and forwards both display-only relays. A failed or aborted reply turn accepts and surfaces nothing.
-11. Deferred injection waits until the recipient is no longer streaming; `#flushPendingBackgroundExchanges` appends accepted custom messages through normal `message_start`/`message_end` external events so persistence and listeners see them.
+11. Injection delivers as soon as the exchange can be accepted: an idle recipient appends it immediately through `#flushPendingBackgroundExchanges`, and a streaming recipient admits it as one steering cohort (`Agent.steerCohort`) that the live run commits at its next tool boundary. A batch no live run accepts stays queued for the next agent event, and an admitted batch stays queued until its records are committed, so a run that ends before that boundary (a session switch aborts the outgoing turn) still appends the exchange to the outgoing session's history.
 12. `send` aggregates `delivered`, `replies`, `failed`, and `notFound`, then returns one text summary plus matching `details`.
 
 ## Modes / Variants
@@ -95,7 +95,7 @@
 - Reply execution:
   - No tools are available in auto-reply turns (`toolChoice: "none"` in `runEphemeralTurn`).
   - No internal timeout, retry, backoff, rate limit, or reply length cap is defined in `irc.ts`; behavior relies on the underlying model stream and any upstream API limits.
-- Flush scheduling: deferred history injection polls every `50` ms while the recipient is still streaming (`#scheduleBackgroundExchangeFlush` in `packages/coding-agent/src/session/agent-session.ts`).
+- Flush scheduling: event-driven, no polling. Idle recipients append immediately; a busy recipient hands each exchange to the live run's steering queue, which commits it at the next tool boundary, and any batch that cannot be admitted yet is retried on the next agent event (`#flushOrSchedulePendingBackgroundExchanges` in `packages/coding-agent/src/session/agent-session.ts`).
 
 ## Errors
 - The tool returns text errors, not thrown exceptions, for:

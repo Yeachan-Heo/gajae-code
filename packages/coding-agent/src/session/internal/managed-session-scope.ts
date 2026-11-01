@@ -228,14 +228,22 @@ function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandid
 function assertRetainedManagedDirectoryIdentity(scope: ManagedScope): void {
 	const expected = managedDirectoryIdentities.get(scope);
 	if (!expected) return;
-	const current = fs.lstatSync(scope.directoryPath, { bigint: true });
-	if (
-		!current.isDirectory() ||
-		current.isSymbolicLink() ||
-		current.dev !== expected.dev ||
-		current.ino !== expected.ino
-	)
-		throw new Error("Managed session directory changed");
+	assertSameManagedDirectoryIdentity(fs.lstatSync(scope.directoryPath, { bigint: true }), expected);
+}
+
+/**
+ * Fence a managed directory to the identity it was bound with. The decision is
+ * the same for every mismatch; only the reported reason differs. The same
+ * inode on a different `dev` is the shape a remount, drive-letter change or
+ * volume-serial change leaves behind (#6750). It is still refused, because an
+ * inode is only unique within one volume, but it is named so an operator is
+ * not sent looking for a corrupted binding.
+ */
+function assertSameManagedDirectoryIdentity(current: fs.BigIntStats, expected: { dev: bigint; ino: bigint }): void {
+	if (!current.isDirectory() || current.isSymbolicLink()) throw new Error("Managed session directory changed");
+	if (current.dev === expected.dev && current.ino === expected.ino) return;
+	if (current.ino === expected.ino) throw new Error("volume_identity_changed");
+	throw new Error("Managed session directory changed");
 }
 
 export function managedDirectoryAuthorityForScope(scope: ManagedScope): RecoveryFsRoot | undefined {
@@ -319,7 +327,22 @@ export type ManagedScopeResolution =
  * propagating them keeps startup redaction intact while telling the operator
  * which invariant actually failed instead of a blanket `binding_invalid`.
  */
-const managedScopeIdentityFailureCodes = new Set(["identity_mismatch", "reparse_point", "not_directory", "not_file"]);
+const managedScopeIdentityFailureCodes = new Set([
+	"identity_mismatch",
+	"volume_identity_changed",
+	"reparse_point",
+	"not_directory",
+	"not_file",
+]);
+
+/**
+ * Fixed, path-free tokens from the replacement-cleanup receipt preflight that
+ * runs before every no-replace publish. A stale receipt the preflight refuses
+ * (for example one whose filename encodes a device number that changed after a
+ * reboot, #6820) blocks an otherwise healthy binding publish; reporting it as
+ * `binding_invalid` sends operators to the binding instead of the receipt.
+ */
+const managedScopeReceiptFailureCodes = new Set(["managed_replace_cleanup_receipt_invalid"]);
 
 /**
  * Fixed, path-free errno tokens. A managed scope that fails to prepare because
@@ -376,6 +399,7 @@ function isManagedScopeCapacityMessage(message: string): boolean {
 function managedScopeResidualClassification(error: unknown): string | undefined {
 	if (!(error instanceof Error)) return undefined;
 	if (managedScopeIdentityFailureCodes.has(error.message)) return error.message;
+	if (managedScopeReceiptFailureCodes.has(error.message)) return error.message;
 	const errno = (error as NodeJS.ErrnoException).code;
 	return errno !== undefined && managedScopeErrnoFailureCodes.has(errno) ? errno : undefined;
 }
@@ -508,6 +532,7 @@ type NativeIdentity =
 type CanonicalNativeIdentity = Extract<NativeIdentity, { ok: true }>;
 
 type NativeIdentityFailureCode =
+	| "access_denied"
 	| "not_found"
 	| "not_directory"
 	| "not_utf8"
@@ -618,6 +643,12 @@ function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution 
 		return { kind: "error", code: "cwd_missing", message: "The workspace directory does not exist." };
 	if (code === "not_directory")
 		return { kind: "error", code: "cwd_not_directory", message: "The workspace path is not a directory." };
+	if (code === "access_denied")
+		return {
+			kind: "error",
+			code: "permission_denied",
+			message: "Permission was denied while identifying the workspace directory.",
+		};
 	if (code === "network_unsupported") {
 		return {
 			kind: "error",
@@ -626,6 +657,10 @@ function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution 
 		};
 	}
 	return { kind: "error", code: "identity_unavailable", message: "Workspace directory identity is unavailable." };
+}
+
+function nativeIdentityDiagnosticCode(code: NativeIdentityFailureCode): string {
+	return code === "access_denied" ? "permission_denied" : `cwd_${code}`;
 }
 
 function bindingFor(scope: ManagedScope): Binding {
@@ -1107,7 +1142,7 @@ function inspectCandidate(
 		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
 			return { code: "invalid_header" };
 		const cwdIdentity = identityFor(header.cwd);
-		if (!cwdIdentity.ok) return { code: `cwd_${cwdIdentity.code}` };
+		if (!cwdIdentity.ok) return { code: nativeIdentityDiagnosticCode(cwdIdentity.code) };
 		const named = fs.lstatSync(filePath, { bigint: true });
 		if (
 			!named.isFile() ||
@@ -1872,13 +1907,7 @@ export function prepareManagedSessionScopeForWriteSync(
 		managedDirectoryAuthorities.set(scope, retainedAuthority);
 		stage = "scope_revalidate";
 		const directoryStat = fs.lstatSync(scope.directoryPath, { bigint: true });
-		if (
-			!directoryStat.isDirectory() ||
-			directoryStat.isSymbolicLink() ||
-			directoryStat.dev !== preparedDirectory.dev ||
-			directoryStat.ino !== preparedDirectory.ino
-		)
-			throw new Error("Managed session directory changed");
+		assertSameManagedDirectoryIdentity(directoryStat, preparedDirectory);
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
 		if (validated) {
 			if (validated.kind !== "error") throw new Error("Unexpected managed scope binding result");
@@ -1954,7 +1983,7 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				const candidateIdentity = identityFor(candidate.cwd);
 				if (!candidateIdentity.ok) {
 					invalid.push({
-						code: `cwd_${candidateIdentity.code}`,
+						code: nativeIdentityDiagnosticCode(candidateIdentity.code),
 						...(safeManagedCandidateSessionId(candidate.sessionId) === undefined
 							? {}
 							: { sessionId: candidate.sessionId }),
@@ -1974,7 +2003,8 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				}
 			}
 		}
-		const visible = owned.filter(candidate => !isRetired(scope, candidate));
+		const retired = owned.length > 0 ? retiredTargetKeys(scope) : new Set<string>();
+		const visible = owned.filter(candidate => !isRetiredIn(retired, candidate));
 		const active = visible.filter(
 			candidate =>
 				candidate.provenance === "v2" ||
@@ -6300,8 +6330,96 @@ function tombstonePathContaining(scope: ManagedScope, candidate: ManagedCandidat
 	return undefined;
 }
 
-function isRetired(scope: ManagedScope, candidate: ManagedCandidate): boolean {
+/**
+ * Identity fields a retired tombstone target must match exactly for a candidate
+ * to be hidden. `dev`, `ino`, and `mtimeNs` are persisted as decimal strings.
+ */
+type RetiredTargetIdentity = readonly [
+	path: string,
+	sessionId: string,
+	cwd: string,
+	canonicalPath: string,
+	dev: string,
+	ino: string,
+	size: number,
+	mtimeNs: string,
+	sha256: string,
+];
+
+function candidateRetiredIdentity(candidate: ManagedCandidate): RetiredTargetIdentity {
+	return [
+		candidate.path,
+		candidate.sessionId,
+		candidate.cwd,
+		candidate.identity.canonicalPath,
+		String(candidate.identity.dev),
+		String(candidate.identity.ino),
+		candidate.identity.size,
+		String(candidate.identity.mtimeNs),
+		candidate.identity.sha256,
+	];
+}
+
+/** Returns the target's identity only when every field has the type a candidate can carry. */
+function parseRetiredTargetIdentity(target: unknown): RetiredTargetIdentity | undefined {
+	if (!target || typeof target !== "object") return undefined;
+	const value = target as { path?: unknown; sessionId?: unknown; cwd?: unknown; identity?: unknown };
+	if (!value.identity || typeof value.identity !== "object") return undefined;
+	const identity = value.identity as {
+		canonicalPath?: unknown;
+		dev?: unknown;
+		ino?: unknown;
+		size?: unknown;
+		mtimeNs?: unknown;
+		sha256?: unknown;
+	};
+	if (
+		typeof value.path !== "string" ||
+		typeof value.sessionId !== "string" ||
+		typeof value.cwd !== "string" ||
+		typeof identity.canonicalPath !== "string" ||
+		typeof identity.dev !== "string" ||
+		typeof identity.ino !== "string" ||
+		typeof identity.size !== "number" ||
+		typeof identity.mtimeNs !== "string" ||
+		typeof identity.sha256 !== "string"
+	)
+		return undefined;
+	return [
+		value.path,
+		value.sessionId,
+		value.cwd,
+		identity.canonicalPath,
+		identity.dev,
+		identity.ino,
+		identity.size,
+		identity.mtimeNs,
+		identity.sha256,
+	];
+}
+
+/**
+ * Key equality matches strict equality of every member: strings and finite
+ * numbers encode distinctly. A non-finite tombstone `size` encodes as `null`,
+ * which no candidate produces.
+ */
+function retiredIdentityKey(identity: RetiredTargetIdentity): string {
+	return JSON.stringify(identity);
+}
+
+/**
+ * Snapshot of the identities retired by a scope's tombstones.
+ *
+ * Tombstones are visited in directory order and the walk stops at the first
+ * unreadable or malformed one: it grants no retirement authority, and neither do
+ * the tombstones after it. Listing builds this once and checks every candidate
+ * against it, so its cost is linear in tombstones rather than in
+ * candidates x tombstones.
+ */
+function retiredTargetKeys(scope: ManagedScope): ReadonlySet<string> {
+	const keys = new Set<string>();
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
+	const digest = scopeDigest(scope.platform, scope.canonicalCwd);
 	try {
 		for (const name of fs.readdirSync(directory)) {
 			const pathname = path.join(directory, name);
@@ -6311,47 +6429,27 @@ function isRetired(scope: ManagedScope, candidate: ManagedCandidate): boolean {
 			if (
 				record.schemaVersion !== 2 ||
 				record.state !== "retired" ||
-				record.scope !== scopeDigest(scope.platform, scope.canonicalCwd) ||
+				record.scope !== digest ||
 				!Array.isArray(record.targets)
 			)
 				continue;
-			if (
-				record.targets.some(target => {
-					if (!target || typeof target !== "object") return false;
-					const value = target as {
-						path?: unknown;
-						sessionId?: unknown;
-						cwd?: unknown;
-						identity?: {
-							canonicalPath?: unknown;
-							dev?: unknown;
-							ino?: unknown;
-							size?: unknown;
-							mtimeNs?: unknown;
-							sha256?: unknown;
-						};
-					};
-					const identity = value.identity;
-					if (!identity) return false;
-					return (
-						value.path === candidate.path &&
-						value.sessionId === candidate.sessionId &&
-						value.cwd === candidate.cwd &&
-						identity.canonicalPath === candidate.identity.canonicalPath &&
-						identity.dev === String(candidate.identity.dev) &&
-						identity.ino === String(candidate.identity.ino) &&
-						identity.size === candidate.identity.size &&
-						identity.mtimeNs === String(candidate.identity.mtimeNs) &&
-						identity.sha256 === candidate.identity.sha256
-					);
-				})
-			)
-				return true;
+			for (const target of record.targets) {
+				const identity = parseRetiredTargetIdentity(target);
+				if (identity) keys.add(retiredIdentityKey(identity));
+			}
 		}
 	} catch {
 		/* a missing/malformed tombstone grants no retirement authority */
 	}
-	return false;
+	return keys;
+}
+
+function isRetiredIn(retired: ReadonlySet<string>, candidate: ManagedCandidate): boolean {
+	return retired.has(retiredIdentityKey(candidateRetiredIdentity(candidate)));
+}
+
+function isRetired(scope: ManagedScope, candidate: ManagedCandidate): boolean {
+	return isRetiredIn(retiredTargetKeys(scope), candidate);
 }
 
 type ArtifactManifestEntry =

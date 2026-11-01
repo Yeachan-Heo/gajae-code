@@ -54,7 +54,7 @@ describe("createAgentSession browser.backend", () => {
 		}
 	}, 60_000);
 
-	it("hides the built-in browser tool and injects Aside guidance for the aside backend", async () => {
+	it("hides the built-in browser tool and injects usable Aside session guidance", async () => {
 		const { session } = await createAgentSession(sessionOptions("aside"));
 		try {
 			expect(session.getActiveToolNames()).not.toContain("browser");
@@ -65,11 +65,15 @@ describe("createAgentSession browser.backend", () => {
 			expect(prompt).toContain("aside repl");
 			expect(prompt).not.toContain("MCP `repl`");
 			// The routing contract requires a structured declaration on every
-			// Aside Bash call, for repl, for exec, and for exec --session follow-ups.
+			// Aside Bash call, including session follow-ups.
 			expect(prompt).toContain("`activity` argument");
 			expect(prompt).toContain('{"kind":"browser","provider":"aside","mode":"repl"}');
 			expect(prompt).toContain('{"kind":"browser","provider":"aside","mode":"exec"}');
-			expect(prompt).toContain("`--session <id>` follow-ups");
+			expect(prompt).toContain("aside session resume <id> '<follow-up>'");
+			expect(prompt).not.toContain("exec --session");
+			expect(prompt).toContain(
+				"for all other Aside commands, including `aside exec` and `aside session resume|steer|queue <id>` follow-ups",
+			);
 			expect(prompt).toContain("omit it on Bash calls that do not invoke Aside");
 		} finally {
 			await session.dispose();

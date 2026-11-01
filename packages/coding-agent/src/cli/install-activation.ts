@@ -21,7 +21,52 @@ import {
 	exactReplaceRetained,
 	exactRestore,
 	type NativeExactFileIdentity,
+	type NativeExactUnlinkResult,
 } from "@gajae-code/natives";
+
+function quotePowerShellLiteral(value: string): string {
+	return `'${value.replace(/['‘’‚‛]/g, "$&$&")}'`;
+}
+
+export class InstallationAclPresentError extends Error {
+	readonly code = "acl_present";
+
+	constructor(
+		readonly targetPath: string,
+		readonly sourcePath: string,
+		readonly detail: Pick<NativeExactUnlinkResult, "aclFailurePrincipal" | "aclFailureInherited" | "aclFailureSide">,
+		retryAfterRemediation = true,
+	) {
+		const principal = detail.aclFailurePrincipal;
+		const inherited = detail.aclFailureInherited;
+		const side = detail.aclFailureSide;
+		// The native check validates the source before the destination; remediate the object it rejected.
+		const rejectedPath = side === "source" ? sourcePath : targetPath;
+		const parent = path.win32.isAbsolute(rejectedPath)
+			? path.win32.dirname(rejectedPath)
+			: path.dirname(rejectedPath);
+
+		let message = "acl_present";
+		if (principal && typeof inherited === "boolean") {
+			const icaclsPrincipal = quotePowerShellLiteral(principal.startsWith("S-1-") ? `*${principal}` : principal);
+			const sideLabel = side === "source" ? ` on the source file ${sourcePath}` : side ? ` on the ${side} file` : "";
+			const retry = retryAfterRemediation ? "; if ($?) { gjc update }" : "";
+
+			if (inherited) {
+				// PowerShell 5.1 misquotes spaced roots ending in a backslash; device paths do not normalize dot segments.
+				const ordinaryRoot =
+					parent.endsWith("\\") && !parent.startsWith("\\\\?\\") && !parent.startsWith("\\\\.\\");
+				const directory = quotePowerShellLiteral(ordinaryRoot ? `${parent}.` : parent);
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory${sideLabel}. Run in PowerShell: icacls ${directory} /inheritance:d; if ($?) { icacls ${directory} /remove ${icaclsPrincipal}${retry} }`;
+			} else {
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run in PowerShell: icacls ${quotePowerShellLiteral(rejectedPath)} /remove ${icaclsPrincipal}${retry}`;
+			}
+		}
+
+		super(message);
+		this.name = "InstallationAclPresentError";
+	}
+}
 
 export type ActivationPhase = "staged" | "published" | "verified" | "pending_activation" | "rolled_back" | "uncertain";
 
@@ -484,7 +529,10 @@ export async function updateActivationRecordFile(
 		toNativeIdentity(source.identity),
 		toNativeIdentity(expectedIdentity),
 	);
-	if (!replaced.ok) throw new Error("activation_record_compare_and_swap_failed");
+	if (!replaced.ok) {
+		if (replaced.code === "acl_present") throw new InstallationAclPresentError(recordPath, tempPath, replaced);
+		throw new Error("activation_record_compare_and_swap_failed");
+	}
 	return source.identity;
 }
 
@@ -504,8 +552,14 @@ export interface ReconcileResult {
 	readonly record?: ActivationRecordV1;
 	readonly recordIdentity?: FileIdentity;
 	readonly reason?: string;
-	/** Present only for a pre-mutation Windows sharing violation on the destination open. */
+	/** Present only for a pre-mutation Windows exact-replacement failure. */
 	readonly windowsErrorCode?: string;
+	readonly aclFailurePrincipal?: string;
+	readonly aclFailureInherited?: boolean;
+	readonly detachedPath?: string;
+	readonly retainedSuccessorPath?: string;
+	readonly retainedPlaceholderPath?: string;
+	readonly retainedUnknownPath?: string;
 }
 
 /**
@@ -519,9 +573,11 @@ export interface ReconcileResult {
  * records are re-verified and advanced to `verified` once the target
  * digest/identity matches the candidate. `verified` records are read-only
  * re-confirmations. Anything else (target/parent drift, missing staged
- * candidate, an already-occupied backup name, a pre-mutation Windows
- * sharing violation) is reported as `conflict` with the exact reason and
- * never silently promoted.
+ * candidate, an already-occupied backup name) is reported as `conflict` with
+ * the exact reason and never silently promoted. A pre-mutation Windows
+ * sharing violation becomes `pending_activation`; an access-denied result is
+ * also recorded as pending for safe reuse but remains a `conflict` so the
+ * caller reports the publication failure.
  */
 export async function reconcileActivationRecord(
 	targetPath: string,
@@ -637,11 +693,55 @@ export async function reconcileActivationRecord(
 					};
 				}
 			}
+			if (
+				record.targetIdentity &&
+				record.stagingIdentity &&
+				result.code === "access_denied" &&
+				(process.platform === "win32" || result.windowsErrorCode === "0xC0000022") &&
+				!result.detachedPath &&
+				!result.retainedSuccessorPath &&
+				!result.retainedUnknownPath &&
+				!result.retainedPlaceholderPath
+			) {
+				const unchangedTarget = await snapshotRegularFile(targetPath);
+				const unchangedStaging = await snapshotRegularFile(record.stagingPath);
+				if (
+					unchangedTarget &&
+					unchangedStaging &&
+					sameFileIdentity(record.targetIdentity, unchangedTarget.identity) &&
+					sameFileIdentity(record.stagingIdentity, unchangedStaging.identity)
+				) {
+					const pending: ActivationRecordV1 = { ...record, phase: "pending_activation" };
+					const pendingIdentity = await updateActivationRecordFile(pending, recordIdentity);
+					return {
+						status: "conflict",
+						record: pending,
+						recordIdentity: pendingIdentity,
+						reason: "access_denied",
+						...(result.windowsErrorCode ? { windowsErrorCode: result.windowsErrorCode } : {}),
+					};
+				}
+			}
 			return {
 				status: "conflict",
 				record,
 				reason: result.code ?? "activation_promotion_failed",
+				...(result.code === "acl_present"
+					? {
+							aclFailurePrincipal: result.aclFailurePrincipal,
+							aclFailureInherited: result.aclFailureInherited,
+							aclFailureSide: result.aclFailureSide,
+						}
+					: {}),
 				...(result.windowsErrorCode ? { windowsErrorCode: result.windowsErrorCode } : {}),
+				...(result.detachedPath !== undefined ? { detachedPath: result.detachedPath } : {}),
+				...(result.retainedSuccessorPath !== undefined
+					? { retainedSuccessorPath: result.retainedSuccessorPath }
+					: {}),
+				...(result.retainedPlaceholderPath !== undefined
+					? { retainedPlaceholderPath: result.retainedPlaceholderPath }
+					: {}),
+				...(result.retainedUnknownPath !== undefined ? { retainedUnknownPath: result.retainedUnknownPath } : {}),
 			};
 		}
 		const promoted = await snapshotRegularFile(targetPath);

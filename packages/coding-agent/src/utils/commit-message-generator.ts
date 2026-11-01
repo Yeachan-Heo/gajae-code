@@ -44,8 +44,9 @@ function redactCommitMessageText(text: string): string {
 function getModelCandidates(
 	registry: ModelRegistry,
 	settings: Settings,
+	credentialSessionId?: string,
 ): Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> {
-	const availableModels = registry.getAvailable();
+	const availableModels = registry.getAvailable(credentialSessionId);
 	if (availableModels.length === 0) return [];
 
 	const candidates: Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> = [];
@@ -80,7 +81,7 @@ export async function generateCommitMessage(
 	settings: Settings,
 	sessionId?: string,
 ): Promise<string | null> {
-	const candidates = getModelCandidates(registry, settings);
+	const candidates = getModelCandidates(registry, settings, sessionId);
 	if (candidates.length === 0) {
 		logger.debug("commit-msg-generator: no model found");
 		return null;

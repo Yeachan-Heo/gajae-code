@@ -31,6 +31,7 @@ import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
+import type { PlanModeState } from "../plan-mode/state";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
@@ -207,6 +208,45 @@ function captureTaskExecutionScope(session: ToolSession): ToolSession {
 			return bound;
 		},
 	}) as ToolSession;
+}
+
+/** Approval policy copied into a task child. A missing mode stays `allow`, the child default. */
+function inheritedSubagentApproval(session: ToolSession) {
+	const mode = session.getSdkPermissionMode?.();
+	return {
+		sdkPermissionMode: mode === "deny" || mode === "prompt" ? mode : ("allow" as const),
+		clientBridge: session.getClientBridge?.(),
+	};
+}
+
+/** Enabled plan mode only. A missing or disabled state leaves the child writable. */
+function inheritedPlanMode(session: ToolSession): { planModeState?: PlanModeState } {
+	const state = session.getPlanModeState?.();
+	if (!state?.enabled || !state.planFilePath) return {};
+	return {
+		planModeState: {
+			enabled: true,
+			planFilePath: state.planFilePath,
+			...(state.workflow ? { workflow: state.workflow } : {}),
+			...(state.reentry !== undefined ? { reentry: state.reentry } : {}),
+		},
+	};
+}
+
+/** Parent bash posture for a task child. Blank prefixes are not a restriction. */
+function inheritedBashRestriction(session: ToolSession): {
+	bashRestrictionProfile?: ToolSession["bashRestrictionProfile"];
+	parentBashAllowedPrefixes?: string[];
+} {
+	const profile = session.bashRestrictionProfile;
+	const prefixes = (session.bashAllowedPrefixes ?? [])
+		.map(prefix => prefix.trim())
+		.filter(prefix => prefix.length > 0);
+	if (!profile && prefixes.length === 0) return {};
+	return {
+		...(profile ? { bashRestrictionProfile: profile } : {}),
+		...(prefixes.length > 0 ? { parentBashAllowedPrefixes: prefixes } : {}),
+	};
 }
 
 function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
@@ -2498,6 +2538,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentDir: session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 						profileAuthority: session.profileAuthority,
 						inheritedServiceTier: session.serviceTier,
+						...inheritedSubagentApproval(session),
+						...inheritedPlanMode(session),
+						...inheritedBashRestriction(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -2587,6 +2630,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentDir: session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 						profileAuthority: session.profileAuthority,
 						inheritedServiceTier: session.serviceTier,
+						...inheritedSubagentApproval(session),
+						...inheritedPlanMode(session),
+						...inheritedBashRestriction(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,

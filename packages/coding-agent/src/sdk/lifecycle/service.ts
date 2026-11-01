@@ -8,6 +8,7 @@ import {
 	type SdkSearchRowV1,
 	scopeRequestV1,
 	searchRowV1,
+	sessionOwnershipV1,
 } from "../broker/session-scope";
 import type { SessionBindingAuthority } from "../session-authority";
 import {
@@ -101,6 +102,10 @@ export type SessionCreateTarget = SessionLifecycleCoordinatorTarget & {
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
+	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
+	readonly env?: Readonly<Record<string, string>>;
+	/** Inherited broker environment names removed from the hosted session (#6735). */
+	readonly unsetEnv?: readonly string[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readiness?: "immediate" | "deferred";
 	readonly readinessTimeoutMs?: number;
@@ -115,6 +120,10 @@ export type SessionForkTarget = SessionLifecycleCoordinatorTarget & {
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
+	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
+	readonly env?: Readonly<Record<string, string>>;
+	/** Inherited broker environment names removed from the hosted session (#6735). */
+	readonly unsetEnv?: readonly string[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
 };
@@ -128,6 +137,10 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
+	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
+	readonly env?: Readonly<Record<string, string>>;
+	/** Inherited broker environment names removed from the hosted session (#6735). */
+	readonly unsetEnv?: readonly string[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
 };
@@ -234,6 +247,8 @@ export interface SessionLifecycleListEntry {
 	readonly terminalUncertain?: boolean;
 	readonly cwd?: string;
 	readonly locator?: { readonly cwd: string; readonly worktreeRoot: string | null; readonly stateRoot: string };
+	readonly role?: "master";
+	readonly spawnedBy?: { readonly masterSessionId: string };
 }
 
 export interface SessionLifecycleListResult {
@@ -550,7 +565,7 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 }
 
 function certaintyForBrokerCode(code: string): SessionLifecycleCertainty {
-	if (code === "terminal_uncertain") return "uncertain";
+	if (code === "terminal_uncertain" || code === "legacy_lifecycle_ambiguous") return "uncertain";
 	if (code === "cleanup_pending") return "cleanup_pending";
 	if (RETRYABLE_BROKER_ERRORS.has(code)) return "retryable";
 	return "terminal";
@@ -701,6 +716,7 @@ const savedSessionCandidateDetailCodes = new Set([
 	"cwd_not_utf8",
 	"cwd_network_unsupported",
 	"cwd_identity_unavailable",
+	"permission_denied",
 	"cwd_io_error",
 ]);
 
@@ -790,7 +806,9 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 			terminalUncertain?: boolean;
 			cwd?: string;
 			locator?: { cwd: string; worktreeRoot: string | null; stateRoot: string };
-		} = { sessionId: entry.sessionId, ...sessionEndpointProjection(entry) };
+			role?: "master";
+			spawnedBy?: { masterSessionId: string };
+		} = { sessionId: entry.sessionId, ...sessionEndpointProjection(entry), ...sessionOwnershipV1(entry) };
 		if (typeof entry.live === "boolean") item.live = entry.live;
 		if (typeof entry.terminalUncertain === "boolean") item.terminalUncertain = entry.terminalUncertain;
 		if (isRecord(entry.locator) && typeof entry.locator.cwd === "string") item.cwd = entry.locator.cwd;
@@ -851,6 +869,8 @@ function scopedSearchRows(sessions: readonly SessionLifecycleListEntry[]): SdkSe
 				sessionId: session.sessionId,
 				locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
 				live: session.live === true,
+				...(session.role === undefined ? {} : { role: session.role }),
+				...(session.spawnedBy === undefined ? {} : { spawnedBy: session.spawnedBy }),
 			}),
 		);
 	}

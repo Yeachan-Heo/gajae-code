@@ -32,11 +32,11 @@ The authoritative per-convention table is `CONVENTION_EVENT_CONTRACTS`. A single
 
 Runtime discovery paths:
 
-- native GJC: `~/.gjc/hooks/{pre,post}/` and `.gjc/hooks/{pre,post}/`;
+- native GJC user agent: `~/.gjc/agent/hooks/{pre,post}/`;
 
-Claude `.claude/hooks/{pre,post}/` and Codex `.codex/hooks/pre-<tool>.{ts,js}` / `post-<tool>.{ts,js}` layouts remain registered discovery providers for explicit import and diagnostics. Ordinary sessions do not import or execute them directly; importing an accepted hook writes the canonical `.gjc/hooks/` copy that becomes runtime authority.
+Claude `.claude/hooks/{pre,post}/` and Codex `.codex/hooks/pre-<tool>.{ts,js}` / `post-<tool>.{ts,js}` layouts remain registered discovery providers for explicit import and diagnostics. Ordinary sessions do not import or execute them directly. A repository `.gjc/hooks/` copy is not startup authority.
 
-These files are loaded with Bun `import()` and must export a hook factory. They receive the full in-process `HookAPI`, including `exec`, messages, renderers, and command registration. They are **not command/shell-script hooks** merely because some legacy discovery comments use that terminology.
+User-agent hook files are loaded with Bun `import()` and must export a hook factory. They receive the full in-process `HookAPI`, including `exec`, messages, renderers, and command registration. They are **not command/shell-script hooks** merely because some legacy discovery comments use that terminology.
 
 Current runtime truth:
 
@@ -46,7 +46,7 @@ Current runtime truth:
 | `tool_result` / `post_tool_use` | sequential, awaited | 30s | errors/timeouts are isolated | `content`, `details`, and `isError` replacements chain in registration order |
 | ordinary lifecycle events | sequential, awaited | 30s | errors/timeouts are isolated | event-specific |
 
-Project-directory hook modules execute as code during loading. There is currently no separate workspace-trust prompt in this hook loader. The normalization table therefore records `not-enforced` rather than claiming a nonexistent trust gate.
+A repository `.gjc/hooks/{pre,post}` module is not imported. A module under the user agent directory and an explicit hook path still load, and those loaded modules have no separate workspace-trust prompt. The normalization table therefore records `not-enforced` for modules that do load.
 
 Extension error listeners receive the extension path, event name, error message, and stack. The runner does not log whole event payloads, but error messages, stacks, and hook code can contain sensitive data; the canonical layer does not add a redaction boundary.
 

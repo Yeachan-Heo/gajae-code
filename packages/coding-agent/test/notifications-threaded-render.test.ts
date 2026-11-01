@@ -65,6 +65,32 @@ describe("renderThreadedFrame", () => {
 		expect(send?.coalesceKey).toBe("turn:m-7");
 	});
 
+	test("awaiting_input renders both sign-in kinds as audible, non-editable messages without keyboards", () => {
+		for (const [kind, text] of [
+			[
+				"browser_auth",
+				"⏳ A running command is waiting for browser sign-in. Finish it on the host; the agent continues when the command does.",
+			],
+			[
+				"device_code",
+				"⏳ A running command is waiting for a device-code sign-in. Finish it on the host; the agent continues when the command does.",
+			],
+		] as const) {
+			expect(renderThreadedFrame({ type: "awaiting_input", sessionId: "s", toolCallId: "call-1", kind })).toEqual({
+				method: "sendMessage",
+				lane: "ask",
+				text,
+				coalesceKey: "awaiting:call-1",
+			});
+		}
+	});
+
+	test("awaiting_input drops unknown kinds and missing tool call identities", () => {
+		expect(renderThreadedFrame({ type: "awaiting_input", toolCallId: "call-1", kind: "other" })).toBeUndefined();
+		expect(renderThreadedFrame({ type: "awaiting_input", toolCallId: "call-1" })).toBeUndefined();
+		expect(renderThreadedFrame({ type: "awaiting_input", kind: "browser_auth" })).toBeUndefined();
+	});
+
 	test("context_update omits empty fields and is undefined when fully empty", () => {
 		expect(renderThreadedFrame({ type: "context_update", sessionId: "s" })).toBeUndefined();
 		const send = renderThreadedFrame({

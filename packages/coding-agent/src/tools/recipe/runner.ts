@@ -1,3 +1,4 @@
+import { escapePromptMetadata } from "../../session/messages";
 import { ToolError } from "../tool-errors";
 
 export interface RunnerTask {
@@ -197,23 +198,33 @@ function findAmbiguityExample(runners: DetectedRunner[]): { runner: string; task
 	return firstRunner && firstTask ? { runner: firstRunner.id, task: firstTask.name } : undefined;
 }
 
+function escapeRecipePromptText(value: string | undefined): string | undefined {
+	return value === undefined ? undefined : escapePromptMetadata(value);
+}
+
 export function buildPromptModel(runners: DetectedRunner[]): RecipePromptModel {
 	const ambiguityExample = findAmbiguityExample(runners);
 	return {
 		hasMultipleRunners: runners.length > 1,
-		ambiguityExampleRunner: ambiguityExample?.runner,
-		ambiguityExampleTask: ambiguityExample?.task,
+		ambiguityExampleRunner: escapeRecipePromptText(ambiguityExample?.runner),
+		ambiguityExampleTask: escapeRecipePromptText(ambiguityExample?.task),
 		runners: runners.map(runner => ({
-			id: runner.id,
-			label: runner.label,
-			commandPrefix: runner.commandPrefix,
-			tasks: runner.tasks.slice(0, PROMPT_TASK_LIMIT).map(task => ({
-				name: task.name,
-				paramSig: task.parameters.length > 0 ? task.parameters.join(" ") : undefined,
-				command: buildCommand(task.commandPrefix ?? runner.commandPrefix, task.commandName ?? task.name, ""),
-				doc: task.doc,
-				cwd: task.cwd,
-			})),
+			id: escapePromptMetadata(runner.id),
+			label: escapePromptMetadata(runner.label),
+			commandPrefix: escapePromptMetadata(runner.commandPrefix),
+			// recipe.md is compiled with noEscape. Cap the list first, then encode the
+			// kept repository fields so a script key or path cannot close <instruction> or <runner>.
+			tasks: runner.tasks.slice(0, PROMPT_TASK_LIMIT).map(task => {
+				const paramSig = task.parameters.length > 0 ? task.parameters.join(" ") : undefined;
+				const command = buildCommand(task.commandPrefix ?? runner.commandPrefix, task.commandName ?? task.name, "");
+				return {
+					name: escapePromptMetadata(task.name),
+					paramSig: escapeRecipePromptText(paramSig),
+					command: escapePromptMetadata(command),
+					doc: escapeRecipePromptText(task.doc),
+					cwd: escapeRecipePromptText(task.cwd),
+				};
+			}),
 		})),
 	};
 }

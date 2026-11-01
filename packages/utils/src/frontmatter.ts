@@ -2,8 +2,29 @@ import { YAML } from "bun";
 import { truncate } from "./format";
 import * as logger from "./logger";
 
+const HTML_COMMENT_OPEN = "<!--";
+const HTML_COMMENT_CLOSE = "-->";
+
+// One forward scan. `/<!--[\s\S]*?-->/g` retries every unterminated opener
+// against the rest of the input, which is quadratic in the opener count.
+// An opener with no later close does not match, so that tail stays unchanged.
 function stripHtmlComments(content: string): string {
-	return content.replace(/<!--[\s\S]*?-->/g, "");
+	const parts: string[] = [];
+	let from = 0;
+	let i = 0;
+	const n = content.length;
+	while (i < n) {
+		const start = content.indexOf(HTML_COMMENT_OPEN, i);
+		if (start < 0) break;
+		const end = content.indexOf(HTML_COMMENT_CLOSE, start + HTML_COMMENT_OPEN.length);
+		if (end < 0) break;
+		if (start > from) parts.push(content.slice(from, start));
+		from = end + HTML_COMMENT_CLOSE.length;
+		i = from;
+	}
+	if (from === 0) return content;
+	if (from < n) parts.push(content.slice(from));
+	return parts.join("");
 }
 
 function stripLooseScalarTrailingCommas(metadata: string): string {
@@ -69,7 +90,12 @@ function normalizeKeys<T>(obj: T): T {
 	for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
 		const nk = key.includes("-") ? kebabToCamel(key) : key;
 		const nv = normalizeKeys(value);
-		result[nk] = nv;
+		// Assignment would route "__proto__" through Object.prototype's setter.
+		if (nk === "__proto__") {
+			Object.defineProperty(result, nk, { value: nv, writable: true, enumerable: true, configurable: true });
+		} else {
+			result[nk] = nv;
+		}
 		if (nk !== key || nv !== value) changed = true;
 	}
 	return (changed ? result : obj) as T;
