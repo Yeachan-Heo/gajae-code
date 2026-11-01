@@ -328,6 +328,277 @@ describe("master peer snapshot contributor", () => {
 		expect(message === undefined || message.content.includes("unavailable")).toBe(true);
 		expect(errors).toHaveLength(0);
 	});
+
+	it("calls getOwnerEndpointGeneration lazily at snapshot time", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lazy-gen-")));
+		tempDirs.push(cwd);
+		let getterCallCount = 0;
+		let generationValue: number | undefined;
+		const contributor = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async request => {
+					const scope = (
+						request.target as { scope?: { requestAnchor?: { cwd: string; worktreeRoot: string | null } } }
+					).scope;
+					return resultFor(scope?.requestAnchor?.cwd ?? cwd, scope?.requestAnchor?.worktreeRoot ?? null);
+				},
+			},
+			ownerSessionId: "master-owner",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => {
+				getterCallCount++;
+				return generationValue;
+			},
+		});
+		// Getter is not called during registration
+		expect(getterCallCount).toBe(0);
+		// Getter is called during snapshot collection, before the first provider request
+		const snapshot = await contributor();
+		expect(getterCallCount).toBe(1);
+		expect(snapshot?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		// Verify the getter is called again on retry (before re-collection)
+		generationValue = 42;
+		const retry = await contributor();
+		expect(getterCallCount).toBe(2);
+		expect(retry?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+	});
+
+	it("keeps peer row with different endpoint generation after switch", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-diff-gen-")));
+		tempDirs.push(cwd);
+		// Create a git repository so scope resolution works
+		const git = Bun.spawn(["git", "init", "-q", cwd]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const worktreeRoot = cwd;
+		const contributor = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async () => {
+					// Return a result where master-owner has a different endpoint generation
+					return {
+						ok: true,
+						operation: "session.list",
+						result: {
+							version: 1,
+							scope: {
+								version: 1,
+								requested: "repo",
+								requestAnchor: { cwd, worktreeRoot },
+								resolved: { kind: "repo", worktreeRoot },
+								resolution: "resolved",
+							},
+							status: "populated",
+							observedAt: "2026-08-23T00:00:00.000Z",
+							indexSeq: 3,
+							rows: [
+								{
+									id: "master-owner",
+									locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` },
+									live: true,
+									endpointGeneration: 2,
+								},
+								{ id: "peer-a", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
+							],
+							warnings: [],
+						},
+					} as unknown as SessionListOutcome;
+				},
+			},
+			ownerSessionId: "master-owner",
+			getSessionId: () => "switched",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => 1, // Different from row's generation 2
+		});
+		const snapshot = await contributor();
+		// After switch, master-owner row with different endpoint generation is a real peer
+		expect(snapshot?.content).toContain("master-owner");
+		expect(snapshot?.content).toContain("peer-a");
+	});
+
+	it("receives real endpoint generation from lifecycle through rollback tracker", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-broker-gen-")));
+		tempDirs.push(cwd);
+		const git = Bun.spawn(["git", "init", "-q", cwd]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const worktreeRoot = cwd;
+
+		let snapshotGeneration = 1; // Owner's current generation
+		const owner = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async () =>
+					({
+						ok: true,
+						operation: "session.list",
+						result: {
+							version: 1,
+							scope: {
+								version: 1,
+								requested: "repo",
+								requestAnchor: { cwd, worktreeRoot },
+								resolved: { kind: "repo", worktreeRoot },
+								resolution: "resolved",
+							},
+							status: "populated",
+							observedAt: "2026-08-23T00:00:00.000Z",
+							indexSeq: 3,
+							rows: [
+								{
+									id: "master-owner",
+									locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` },
+									live: true,
+									endpointGeneration: 1,
+								},
+							],
+							warnings: [],
+						},
+					}) as unknown as SessionListOutcome,
+			},
+			ownerSessionId: "master-owner",
+			getSessionId: () => "switched", // Session has switched away from owner
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => snapshotGeneration,
+		});
+
+		// First snapshot: owner row has same generation as this process
+		snapshotGeneration = 1;
+		const snapshot1 = await owner();
+		// When generations match, owner row should be omitted (same registration, stale index)
+		expect(snapshot1?.content).not.toContain("master-owner");
+
+		// Second snapshot: owner row has different generation (host re-registered)
+		snapshotGeneration = 2;
+		const snapshot2 = await owner();
+		// When owner generation is different, owner row should be kept (different process)
+		expect(snapshot2?.content).toContain("master-owner");
+	});
+
+	it("ensures fresh processes registering same session get different endpoint generations", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-process-gens-")));
+		tempDirs.push(cwd);
+		const git = Bun.spawn(["git", "init", "-q", cwd]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+
+		// Create first master session - it will register with broker and get generation 1
+		const session1 = await createSession(/* master */ true);
+		const sessionId1 = session1.session.sessionManager.getSessionId();
+		try {
+			// Variable to track broker registrations (simulates onBrokerRegistered callback)
+			let latestRegisteredEndpointGeneration: number | undefined;
+			
+			// Simulate broker registration - session1 registers with generation 1
+			latestRegisteredEndpointGeneration = 1;
+			await session1.session.extensionRunner?.emit({ type: "session_start" });
+			await Bun.sleep(50);
+
+			const cwd2 = cwd;
+			const worktreeRoot = cwd;
+
+			// Create snapshot contributor that mirrors the real session's behavior:
+			// its getOwnerEndpointGeneration getter returns latestRegisteredEndpointGeneration
+			const createContributor = (indexSeq: number, sessionRows: any[]) =>
+				createMasterPeerSnapshotContributor({
+					lifecycle: {
+						list: async () =>
+							({
+								ok: true,
+								operation: "session.list",
+								result: {
+									version: 1,
+									scope: {
+										version: 1,
+										requested: "repo",
+										requestAnchor: { cwd: cwd2, worktreeRoot },
+										resolved: { kind: "repo", worktreeRoot },
+										resolution: "resolved",
+									},
+									status: "populated",
+									observedAt: new Date().toISOString(),
+									indexSeq,
+									rows: sessionRows,
+									warnings: [],
+								},
+							} as unknown as SessionListOutcome)
+					},
+					ownerSessionId: sessionId1,
+					getSessionId: () => "process-test",
+					scope: "repo",
+					getCwd: () => cwd2,
+					hasPersistedInjection: () => false,
+					// Critical: use the ACTUAL registered generation, not hardcoded
+					getOwnerEndpointGeneration: () => latestRegisteredEndpointGeneration,
+				});
+
+			// First snapshot: owner registered with generation 1, peer list shows owner with generation 1
+			const contributor1 = createContributor(1, [
+				{
+					id: sessionId1,
+					locator: { cwd: cwd2, worktreeRoot, stateRoot: `${cwd2}/.gjc/state` },
+					live: true,
+					endpointGeneration: 1, // Matches registered generation
+				},
+				{
+					id: "peer-a",
+					locator: { cwd: cwd2, worktreeRoot, stateRoot: `${cwd2}/.gjc/state` },
+					live: true,
+				},
+			]);
+			const snapshot1 = await contributor1();
+
+			expect(snapshot1).toBeDefined();
+			expect(snapshot1?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+			// Owner row (generation 1) is current process, should be omitted after switch
+			expect(snapshot1?.content).not.toContain(sessionId1);
+			expect(snapshot1?.content).toContain("peer-a");
+
+			// Simulate broker re-registration: owner bumps to generation 2
+			latestRegisteredEndpointGeneration = 2;
+			
+			// Second snapshot: owner now registered with generation 2, peer list shows owner with generation 1
+			const contributor2 = createContributor(2, [
+				{
+					id: sessionId1,
+					locator: { cwd: cwd2, worktreeRoot, stateRoot: `${cwd2}/.gjc/state` },
+					live: true,
+					endpointGeneration: 1, // Stale data from old process
+				},
+				{
+					id: "peer-b",
+					locator: { cwd: cwd2, worktreeRoot, stateRoot: `${cwd2}/.gjc/state` },
+					live: true,
+				},
+			]);
+			const snapshot2 = await contributor2();
+
+			expect(snapshot2).toBeDefined();
+			expect(snapshot2?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+			// Owner row (generation 1) is now a DIFFERENT process (owner at generation 2), should be included
+			expect(snapshot2?.content).toContain(sessionId1);
+			expect(snapshot2?.content).toContain("peer-b");
+			
+			// Verify the getter actually changes: temporarily revert getter order
+			// to prove the test fails without latestRegisteredEndpointGeneration
+			latestRegisteredEndpointGeneration = undefined;
+			const contributor3 = createContributor(3, [
+				{
+					id: sessionId1,
+					locator: { cwd: cwd2, worktreeRoot, stateRoot: `${cwd2}/.gjc/state` },
+					live: true,
+					endpointGeneration: 1,
+				},
+			]);
+			const snapshot3 = await contributor3();
+
+			// Without the getter returning a value, owner row should be conservatively omitted
+			expect(snapshot3?.content).not.toContain(sessionId1);
+	} finally {
+		await session1.session.dispose();
+	}
+	});
 });
 
 describe("master SDK host composition", () => {

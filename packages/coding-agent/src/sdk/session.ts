@@ -4173,6 +4173,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		const sdkHostEligible =
 			shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true);
+		let latestRegisteredEndpointGeneration: number | undefined;
 		const notificationAdapterService = createLazyService({
 			id: "sdk.notifications.adapters",
 			enabled: () => notificationsExtensionEligible || sdkHostEligible,
@@ -4278,6 +4279,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										masterCapability: masterModeContext.getCapability(),
 										masterAttestationEpoch: masterModeContext.attestationEpoch,
 										masterOwnerSessionId: masterModeContext.ownerSessionId,
+										onBrokerRegistered: (generation: number) => {
+											latestRegisteredEndpointGeneration = generation;
+										},
 									}
 								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
@@ -5795,6 +5799,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					lifecycle: createSessionLifecycleService(agentDir),
 					ownerSessionId: masterModeContext.ownerSessionId,
 					getSessionId: () => sessionManager.getSessionId(),
+					getOwnerEndpointGeneration: () => {
+						const startup = lifecycleStartupCapability?.rollback?.result.endpointGeneration;
+						return latestRegisteredEndpointGeneration ?? startup ?? undefined;
+					},
 					scope: masterModeContext.scope,
 					getCwd: getLiveCwd,
 					hasPersistedInjection: () =>
