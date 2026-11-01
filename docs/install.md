@@ -113,8 +113,8 @@ To fix this:
    # For a named principal (e.g., "CodexSandboxUsers")
    icacls "$env:LOCALAPPDATA\gjc" /remove "BUILTIN\CodexSandboxUsers"
    
-   # Or use the SID if the account cannot be resolved
-   icacls "$env:LOCALAPPDATA\gjc" /remove "S-1-5-21-..."
+   # Or use the numeric SID if the account cannot be resolved; replace the example with the SID from the error and keep the leading *
+   icacls "$env:LOCALAPPDATA\gjc" /remove "*S-1-5-21-..."
    ```
 
 3. **Re-run the update**:
