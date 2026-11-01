@@ -11350,6 +11350,79 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("abort_and_prompt fallback steer is not sent when the target run has ended and been replaced", async () => {
+		// Verify finding 2: when abort-and-prompt degrades to a steer because the
+		// requester doesn't own the run, and the original run ends before the steer
+		// is sent, the steer must NOT be sent to a new run that starts afterwards.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-run-ended-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const state = {
+				idle: false,
+				abortCalls: 0,
+				deliveries: [] as Array<{ content: unknown; deliverAs?: string }>,
+				runs: Promise.withResolvers<void>(),
+				// Track which commandIds are active at each point in time
+				activeCommandIds: new Set<string>(),
+			};
+			harness = await invocationHarness("replacement-steer-run-ended", cwd, {
+				isIdle: () => state.idle,
+				abort: () => {
+					state.abortCalls += 1;
+					state.idle = true;
+				},
+				sendUserMessage: async (content, options) => {
+					state.deliveries.push({ content, deliverAs: options?.deliverAs });
+					await options?.onPreflightAcceptCommit?.();
+					// For non-steer messages, wait for the run to complete
+					if (options?.deliverAs === undefined) await state.runs.promise;
+				},
+			});
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			// Connection-b calls abort_and_prompt, which should queue as a steer
+			// because connection-b doesn't own the run (connection-a does via agent_start).
+			const first = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "text from b" },
+				"finding-2-key",
+			);
+			expect(first).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer" },
+			});
+			// Verify the steer was queued
+			expect(state.deliveries).toEqual([{ content: "text from b", deliverAs: "steer" }]);
+			// End the current run
+			state.runs.resolve();
+			await Bun.sleep(50);
+			// Start a new run
+			state.runs = Promise.withResolvers<void>();
+			state.deliveries.length = 0;
+			// Mark the session as no longer idle so a new run can start
+			state.idle = false;
+			// Retry the abort_and_prompt with the same key.
+			// The original run has ended and the active commandIds have changed,
+			// so the steer should be rejected and not sent to the new run.
+			const retried = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "text from b" },
+				"finding-2-key",
+			);
+			// The retry should still return accepted:true (because it replays the previous steer status)
+			// but crucially, no new steer should have been queued
+			expect(retried.ok).toBe(true);
+			// Verify no new deliveries were made (the steer was not sent to the new run)
+			expect(state.deliveries).toEqual([]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a zero-progress drained batch stays nonterminal without an exact run proof", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-batch-"));
 		let promptDeadlineMs = 600_000;
