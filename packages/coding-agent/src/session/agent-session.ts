@@ -26007,6 +26007,7 @@ export class AgentSession {
 				signal,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				rowId: failedRowId,
+				modelId: candidate.id,
 			});
 		}
 		const inventory = authStorage.listCredentialInventory(candidate.provider);
@@ -26019,7 +26020,7 @@ export class AgentSession {
 				peer.credentialKind !== credentialKind ||
 				failedRowIds.has(peer.id) ||
 				peer.disabled ||
-				!authStorage.isCredentialAvailable(candidate.provider, peer.id)
+				!authStorage.isCredentialAvailable(candidate.provider, peer.id, candidate.id)
 			) {
 				continue;
 			}
@@ -26045,10 +26046,11 @@ export class AgentSession {
 					signal,
 					owner: this.#modelRegistry.getAuthStorageOwner(),
 					rowId: peer.id,
+					modelId: candidate.id,
 				});
 				continue;
 			}
-			if (authStorage.isCredentialAvailable(candidate.provider, peer.id)) {
+			if (authStorage.isCredentialAvailable(candidate.provider, peer.id, candidate.id)) {
 				return { apiKey: resolved.apiKey, credentialRowId: peer.id };
 			}
 		}
@@ -26075,7 +26077,7 @@ export class AgentSession {
 		}
 		if (
 			resolved.credentialRowId !== undefined &&
-			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId, candidate.id)
 		) {
 			if (!this.#hasManagedFallbackCredentialPin(candidate.provider)) {
 				for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
@@ -26083,8 +26085,7 @@ export class AgentSession {
 						resolved = await resolveCurrentSelection();
 						break;
 					}
-					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id))
-						continue;
+					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)) continue;
 					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
 					try {
 						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
@@ -26115,7 +26116,7 @@ export class AgentSession {
 					if (
 						!alternative.apiKey ||
 						alternative.credentialRowId !== credential.id ||
-						!authStorage.isCredentialAvailable(candidate.provider, credential.id)
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)
 					) {
 						continue;
 					}
@@ -26125,7 +26126,7 @@ export class AgentSession {
 			}
 			if (
 				resolved.credentialRowId !== undefined &&
-				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId, candidate.id)
 			) {
 				return {
 					apiKey: undefined,
@@ -28111,7 +28112,7 @@ export class AgentSession {
 							credential.provider !== storageProvider ||
 							credential.credentialKind !== credentialKind ||
 							triedRows.has(credential.id) ||
-							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)
 						)
 							continue;
 						let credentialKeyResult: { kind: "resolved"; value: string | undefined } | { kind: "aborted" };
@@ -28122,7 +28123,7 @@ export class AgentSession {
 								}),
 							);
 						} catch (error) {
-							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)) {
+							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)) {
 								await rollbackCancelled();
 								throw error;
 							}
@@ -28147,7 +28148,7 @@ export class AgentSession {
 						if (
 							selectedRowId !== credential.id ||
 							selectedKind !== credentialKind ||
-							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id, resolvedModel.id)
 						)
 							continue;
 						selectedCredentialRowId = selectedRowId;
@@ -28433,6 +28434,7 @@ export class AgentSession {
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
+				modelId: model.id,
 			});
 			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
 			const trackedCredentialKind = credentialKind ?? beforeKind;
@@ -28447,14 +28449,14 @@ export class AgentSession {
 			if (credentialKind === undefined) return "unchanged";
 			for (const peerId of remainingCredentialIds) {
 				if (triedRows?.has(peerId)) continue;
-				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				if (!authStorage.isCredentialAvailable(provider, peerId, model.id)) continue;
 				let peerApiKey: string | undefined;
 				try {
 					peerApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(peerId) },
 					});
 				} catch (error) {
-					if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+					if (!authStorage.isCredentialAvailable(provider, peerId, model.id)) continue;
 					throw error;
 				}
 				if (!isAuthenticated(peerApiKey)) continue;
@@ -28463,7 +28465,7 @@ export class AgentSession {
 				if (
 					selectedRowId === peerId &&
 					selectedKind === credentialKind &&
-					authStorage.isCredentialAvailable(provider, peerId)
+					authStorage.isCredentialAvailable(provider, peerId, model.id)
 				) {
 					triedRows?.add(selectedRowId);
 					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before

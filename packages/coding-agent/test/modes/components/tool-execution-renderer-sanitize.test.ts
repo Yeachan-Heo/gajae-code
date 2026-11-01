@@ -403,7 +403,13 @@ describe("trusted renderer components", () => {
 			expect(textRaw).not.toContain("fallback-marker");
 		}
 		const clean = "\u001bPq~-ok\u001b\\";
-		expect(renderFind([`notes/${clean}plan.ts`])).toContain(clean);
+		// File paths are untrusted labels and sanitized by sanitizeFileLabel.
+		// Clean SIXEL should be stripped from find paths even though it's not hostile.
+		const findRawClean = renderFind([`notes/${clean}plan.ts`]);
+		expect(findRawClean).not.toContain(clean);
+		expect(findRawClean).toContain("notes/");
+		expect(findRawClean).toContain("plan.ts");
+		// Trusted renderResult content preserves clean SIXEL.
 		expect(paintText(`before${clean}after`)).toContain(clean);
 	});
 
