@@ -2774,11 +2774,7 @@ export default function App() {
 											))}
 										</div>
 									</SettingsSection>
-									<SettingsSection
-										id={`${settingsPanelPrefix}-font-size`}
-										title={t("shell.fontSize")}
-										hint={t("shell.fontSizeHint")}
-									>
+									<SettingsSection id={`${settingsPanelPrefix}-font-size`} title={t("shell.fontSize")}>
 										<div className="font-size-control" role="group" aria-label={t("shell.fontSize")}>
 											<Button
 												aria-label={t("shell.fontSizeSmaller")}

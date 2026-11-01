@@ -112,7 +112,6 @@ export const shell = {
 	"shell.noActivityOutput": "This activity has no readable output preview.",
 	"shell.activityLoading": "Loading activity…",
 	"shell.fontSize": "Font size",
-	"shell.fontSizeHint": "Scales the whole app. The default is 14.",
 	"shell.fontSizeSmaller": "Smaller text",
 	"shell.fontSizeLarger": "Larger text",
 	"shell.fontSizePixels": "Font size in pixels",
