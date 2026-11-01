@@ -492,11 +492,17 @@ Related APIs:
 canonical user-selected image bytes. Its `prompt(text, images, options)` and
 `submitUserMessage(text, images, options)` share the session's image admission
 budget; creating another controller does not reset that budget. The queued
-method returns the same tracked submission receipt described above. For direct
-`prompt` local dispatch, image-bearing extension/custom/MCP slash commands are
-rejected before their handler can run or discard the attached bytes. Queued
-`submitUserMessage` retains the slash text as queued message input; it does not
-execute a local command handler.
+method returns the same tracked submission receipt described above.
+
+`dispose()` is permanent: the factory keeps returning that same revoked
+controller, and every later `prompt`/`submitUserMessage` on it rejects with
+`resource_gone`. Call it only when the session goes away — a newer committed
+checkpoint rebinds the live controller on its own.
+
+For direct `prompt` local dispatch, image-bearing extension/custom/MCP slash
+commands are rejected before their handler can run or discard the attached
+bytes. Queued `submitUserMessage` retains the slash text as queued message
+input; it does not execute a local command handler.
 
 Both methods accept `onPreflightAcceptCommit?: () => void | Promise<void>`.
 The SDK awaits this callback before admitting the input. A rejected callback
