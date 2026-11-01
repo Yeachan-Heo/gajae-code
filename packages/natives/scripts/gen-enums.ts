@@ -14,11 +14,79 @@
  *
  * Run after `napi build`: `bun packages/natives/scripts/gen-enums.ts`
  */
+import * as crypto from "node:crypto";
+import * as fssync from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 const nativeDir = path.resolve(import.meta.dir, "../native");
-const dtsPath = path.join(nativeDir, "index.d.ts");
-const jsPath = path.join(nativeDir, "index.js");
+
+export async function refuseIfTempGone(tempPath: string, dest: string, err: unknown): Promise<void> {
+	const code = (err as NodeJS.ErrnoException).code;
+	const exists = await fs.lstat(tempPath).catch(() => null);
+	if (process.platform === "win32" && (code === "EPERM" || code === "EBUSY") && exists) return;
+	throw new Error(`Failed to install ${path.basename(dest)}: left the existing file in place`);
+}
+
+export async function writeReplacingDestination(dest: string, contents: string): Promise<void> {
+	const linked = fssync.lstatSync(dest, { throwIfNoEntry: false });
+	if (!linked || linked.isFile()) {
+		// Missing or regular: write in place without rename, so no inode is replaced and no symlink is followed.
+		const flags = fssync.constants.O_WRONLY | fssync.constants.O_CREAT;
+		const handle = await fs.open(dest, flags | (fssync.constants.O_NOFOLLOW ?? 0), 0o644);
+		try {
+			// Truncate only the file that was checked: a parent swapped after lstat opens another inode.
+			const opened = await handle.stat();
+			if (!opened.isFile() || (linked && (opened.ino !== linked.ino || opened.dev !== linked.dev))) {
+				throw new Error(`Refusing to write ${path.basename(dest)}: it changed after it was checked`);
+			}
+			await handle.truncate(0);
+			await handle.writeFile(contents);
+		} finally {
+			await handle.close();
+		}
+		return;
+	}
+	const tempPath = `${dest}.tmp.${process.pid}.${crypto.randomUUID()}`;
+	await fs.writeFile(tempPath, contents, { flag: "wx", mode: 0o644 });
+	try {
+		// rename replaces a destination symlink; writeFile/Bun.write would follow it.
+		await fs.rename(tempPath, dest);
+	} catch (renameErr) {
+		await refuseIfTempGone(tempPath, dest, renameErr);
+		try {
+			await fs.unlink(dest);
+		} catch (unlinkErr) {
+			if ((unlinkErr as NodeJS.ErrnoException).code !== "ENOENT") {
+				await fs.unlink(tempPath).catch(() => {});
+				const isWindows = process.platform === "win32";
+				throw new Error(
+					`Cannot replace ${path.basename(dest)}${isWindows ? " (file may be in use - close any running processes)" : ""}: ${(unlinkErr as Error).message}`,
+				);
+			}
+		}
+		try {
+			await fs.rename(tempPath, dest);
+		} catch (finalErr) {
+			await fs.unlink(tempPath).catch(() => {});
+			throw new Error(`Failed to install ${path.basename(dest)}: ${(finalErr as Error).message}`);
+		}
+	}
+}
+
+export function readRegularFileNoFollow(filePath: string): string {
+	const linked = fssync.lstatSync(filePath);
+	if (!linked.isFile()) throw new Error(`Refusing to read non-regular ${path.basename(filePath)}`);
+	const fd = fssync.openSync(filePath, fssync.constants.O_RDONLY | (fssync.constants.O_NOFOLLOW ?? 0));
+	try {
+		const opened = fssync.fstatSync(fd);
+		if (!opened.isFile() || opened.ino !== linked.ino || opened.dev !== linked.dev)
+			throw new Error("Refusing to read");
+		return fssync.readFileSync(fd, "utf8");
+	} finally {
+		fssync.closeSync(fd);
+	}
+}
 
 const MARKER_START = "// --- generated native exports (do not edit) ---";
 const MARKER_END = "// --- end generated native exports ---";
@@ -343,8 +411,10 @@ function patchCompatibilityDeclarations(dts: string): string {
 }
 
 export async function generateEnumExports(): Promise<void> {
-	const generatedDts = await Bun.file(dtsPath).text();
-	const existing = await Bun.file(jsPath).text();
+	const dtsFile = path.join(nativeDir, "index.d.ts");
+	const jsFile = path.join(nativeDir, "index.js");
+	const generatedDts = readRegularFileNoFollow(dtsFile);
+	const existing = readRegularFileNoFollow(jsFile);
 	const generatedBlock = buildGeneratedBlock(generatedDts);
 
 	// Patch the generated block in place. `native/index.js` is the hand-edited
@@ -355,13 +425,13 @@ export async function generateEnumExports(): Promise<void> {
 	const blockEnd = existing.indexOf(MARKER_END);
 	if (blockStart === -1 || blockEnd === -1 || blockEnd < blockStart) {
 		throw new Error(
-			`gen-enums: ${jsPath} is missing the generated marker block. ` +
+			`gen-enums: ${jsFile} is missing the generated marker block. ` +
 				`Add\n\n${MARKER_START}\n${MARKER_END}\n\nplaceholders before running.`,
 		);
 	}
 	const js = existing.slice(0, blockStart) + generatedBlock + existing.slice(blockEnd + MARKER_END.length);
 
-	await Bun.write(jsPath, js);
+	await writeReplacingDestination(jsFile, js);
 
 	// Also fix the .d.ts: replace `const enum` with `enum` so TS allows
 	// assigning string literals to enum types without casts.
@@ -373,7 +443,7 @@ export async function generateEnumExports(): Promise<void> {
 				.replaceAll("export declare const enum", "export declare enum"),
 		),
 	);
-	await Bun.write(dtsPath, dtsContent);
+	await writeReplacingDestination(dtsFile, dtsContent);
 
 	const symbolCount = (generatedBlock.match(/^export const /gm) ?? []).length;
 	console.log(
