@@ -208,6 +208,7 @@ export const ProviderDiscoverySchema = z.object({
 	apiByModelPrefix: z.record(z.string().min(1), z.enum(["openai-completions", "anthropic-messages"])).optional(),
 	modelsDevProvider: z.string().min(1).optional(),
 	outputModalities: z.array(z.string().min(1)).min(1).optional(),
+	inputModalities: z.array(z.string().min(1)).min(1).optional(),
 });
 
 const LocalOpenAICompatSchema = z
