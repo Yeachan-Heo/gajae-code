@@ -45,7 +45,7 @@ Review `#showcase-sessions`, `#showcase-toolbar`, `#showcase-messages`, `#showca
 
 ## States and accessibility
 
-Operations expose pending/failure, preserve drafts on failure, prevent duplicate submissions. Disconnected is not idle. Selected sidebar rows and execution states remain independently visible. Questions resolve real SDK requests. Visible 2px focus rings, semantic buttons/forms, labeled inputs. Dialogs support Escape, focus containment and trigger restoration. Streaming announcements are bounded and polite. Paths wrap anywhere; Korean prose uses word-break:keep-all. Follow scrolling only when already near bottom; bound long output/history.
+Operations expose pending/failure, preserve drafts on failure, prevent duplicate submissions. Disconnected is not idle. During bootstrap, `.connection-state` uses the centered `.empty` layout and mascot instead of an unstyled line beneath the toolbar; the conversation-selection empty state appears only after connection succeeds. Fatal connection failures remain actionable error banners. Selected sidebar rows and execution states remain independently visible. Questions resolve real SDK requests. Visible 2px focus rings, semantic buttons/forms, labeled inputs. Dialogs support Escape, focus containment and trigger restoration. Streaming announcements are bounded and polite. Paths wrap anywhere; Korean prose uses word-break:keep-all. Follow scrolling only when already near bottom; bound long output/history.
 
 ## Motion and depth
 

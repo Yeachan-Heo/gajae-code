@@ -2310,12 +2310,7 @@ export default function App() {
 						{t("shell.commands")}
 					</Button>
 				</header>
-				{connection &&
-					(fatal ? (
-						<ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>
-					) : (
-						<p role="status">{connection}</p>
-					))}
+				{connection && fatal && <ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>}
 				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
 				{!session && recoveries.map(recoveryPanel)}
 				{Object.entries(errors)
@@ -2518,6 +2513,11 @@ export default function App() {
 					</Modal>
 				</div>
 			)}
+				) : connection && !fatal ? (
+					<div className="empty connection-state" role="status">
+						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+						<p>{connection}</p>
+					</div>
 			{dialog === "btw" && dialogOwner === selected && btwOwner?.sessionId === selected && (
 				<BtwDialog
 					key={dialogGeneration.current}
