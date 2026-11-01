@@ -301,14 +301,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }
 .composer[data-disabled] { border-color: var(--border); background: var(--surface); }
 .composer-metrics { position: absolute; width: 1ch; height: 1lh; line-height: 1.55; visibility: hidden; pointer-events: none; }
-.composer-input { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8px; align-items: start; }
-.composer-input:not(:has(.attachment-picker)) { grid-template-columns: minmax(0, 1fr); }
-.composer textarea { grid-column: -2 / -1; grid-row: 1; background: transparent; border: 0; box-shadow: none; border-radius: var(--radius-sm); padding: 7px 6px; min-height: max(34px, calc(1lh + 12px)); max-height: 200px; resize: none; line-height: 1.55; }
+.composer-input { min-width: 0; }
+.composer textarea { background: transparent; border: 0; box-shadow: none; border-radius: var(--radius-sm); padding: 7px 6px; min-height: max(34px, calc(1lh + 12px)); max-height: 200px; resize: none; line-height: 1.55; }
 .composer textarea:focus-visible { box-shadow: none; }
-.composer-input .attachment-picker { display: contents; }
-.composer-input .attachment-trigger { grid-column: 1; grid-row: 1; width: 34px; height: 34px; padding: 0; }
-.composer-input .attachment-list, .composer-input [role="status"] { grid-column: 1 / -1; }
-.composer-input .attachment-list { margin-bottom: 4px; }
+.composer-controls .attachment-picker { display: contents; }
+.composer-controls .attachment-trigger { flex: none; width: 34px; height: 34px; padding: 0; }
+.composer-controls .attachment-list, .composer-controls .attachment-picker > [role="status"] { order: 1; flex-basis: 100%; }
 .composer textarea::placeholder { white-space: nowrap; }
 .composer textarea:focus-visible { outline-offset: 0; }
 /* Top-aligned, not baseline or centred: the controls block can be taller than the action when
@@ -316,9 +314,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .composer-footer { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; padding: 10px 0 2px; border-top: 1px solid var(--border-soft); margin-top: 6px; }
 /* Zero basis so the controls shrink to the row and never push the action onto a second line;
    their own content wraps instead. */
-.composer-controls { display: flex; align-items: center; flex: 1 1 0%; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
-/* One row: model, reasoning level and the single send/stop slot share the footer line. */
-.composer-footer .model-controls { flex: 1 1 auto; }
+.composer-controls { display: flex; align-items: flex-start; flex: 1 1 0%; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
+/* One panel: attachment, model, reasoning and the single send/stop slot share the footer line. */
+.composer-footer .model-controls { flex: 1 1 0%; }
 .composer-controls > * { min-width: 0; max-width: 100%; }
 .composer-actions { display: flex; align-items: center; margin-left: auto; flex: none; }
 .composer-action { min-width: 34px; min-height: 34px; aspect-ratio: 1; padding: 0; justify-content: center; border-radius: var(--radius-sm); }

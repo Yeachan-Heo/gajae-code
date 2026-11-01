@@ -176,14 +176,24 @@ describe("mounted compact composer", () => {
 		} finally { await closeComponentFixture(context, page); }
 	});
 
-	test("attachment trigger is an inline accessible icon and modal has fixed-header structure and focus restoration", async () => {
+	test("attachment trigger starts the footer, leaving a full-width input, and modal restores focus", async () => {
 		const { context, page } = await fixture();
 		try {
-			const attachment = await page.$eval('.composer-input', element => {
-				const button = element.querySelector('button[aria-label="Attach file"]');
-				return { iconOnly: button?.textContent === '', beforeTextarea: !!button && !!(button.compareDocumentPosition(element.querySelector('textarea')!) & Node.DOCUMENT_POSITION_FOLLOWING), input: !!element.querySelector('input[type=file][hidden]') };
+			const attachment = await page.$eval('.composer', element => {
+				const input = element.querySelector('.composer-input')!;
+				const textarea = input.querySelector('textarea')!;
+				const footer = element.querySelector('.composer-footer')!;
+				const button = footer.querySelector('button[aria-label="Attach file"]')!;
+				return {
+					iconOnly: button.textContent === '',
+					firstControl: footer.querySelector('button') === button,
+					inputOnly: input.children.length === 1 && input.firstElementChild === textarea,
+					fullWidth: Math.abs(textarea.getBoundingClientRect().width - input.getBoundingClientRect().width) < 1,
+					belowInput: button.getBoundingClientRect().top >= textarea.getBoundingClientRect().bottom,
+					hiddenPicker: !!footer.querySelector('input[type=file][hidden]'),
+				};
 			});
-			expect(attachment).toEqual({ iconOnly: true, beforeTextarea: true, input: true });
+			expect(attachment).toEqual({ iconOnly: true, firstControl: true, inputOnly: true, fullWidth: true, belowInput: true, hiddenPicker: true });
 			await page.$eval('.attachment-picker input[type=file]', input => input.addEventListener('click', event => { event.preventDefault(); input.setAttribute('data-clicked', 'yes'); }));
 			await page.click('.attachment-trigger');
 			expect(await page.$eval('.attachment-picker input[type=file]', input => input.getAttribute('data-clicked'))).toBe('yes');

@@ -1580,6 +1580,9 @@ describe("mounted composer delivery recovery", () => {
 					buttonLabel: buttons[0]?.getAttribute("aria-label"),
 					buttonText: (buttons[0]?.textContent ?? "").trim(),
 					selects: [...document.querySelectorAll(".composer select")].length,
+					attachmentRow: rowOf(controls?.querySelector(".attachment-trigger")),
+					attachmentFirst: controls?.querySelector("button")?.classList.contains("attachment-trigger"),
+					inputOnly: document.querySelector(".composer-input")?.children.length === 1,
 					controlsRow: rowOf(controls?.querySelector(".model-trigger")),
 					reasoningRow: rowOf(controls?.querySelector(".select-trigger")),
 					actionRow: rowOf(buttons[0]),
@@ -1596,13 +1599,18 @@ describe("mounted composer delivery recovery", () => {
 			expect(idle.selects).toBe(0);
 			// Same line means their vertical bands overlap, which holds even when the model
 			// control adds a status line underneath. The reasoning trigger must be on it too.
-			const bands = [idle.controlsRow, idle.reasoningRow, idle.actionRow];
+			expect(idle.attachmentFirst).toBe(true);
+			expect(idle.inputOnly).toBe(true);
+			const bands = [idle.attachmentRow, idle.controlsRow, idle.reasoningRow, idle.actionRow];
 			for (const band of bands) expect(band).not.toBeNull();
 			for (const band of bands) {
 				expect((band?.top ?? 0)).toBeGreaterThanOrEqual((idle.actionRow?.top ?? 0) - 0.5);
 				expect((band?.top ?? 0)).toBeLessThan((idle.actionRow?.top ?? 0) + (idle.actionRow?.height ?? 0));
 			}
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+			if (process.env.GJC_DESKTOP_VISUAL_DIR) {
+				await Bun.write(`${process.env.GJC_DESKTOP_VISUAL_DIR}/footer-wide.png`, await page.screenshot({ fullPage: true }));
+			}
 			// The same holds at a phone width: nothing overflows and the action stays on the row.
 			await page.setViewport({ width: 420, height: 900 });
 			await page.waitForFunction(() => window.innerWidth === 420);
@@ -1620,6 +1628,11 @@ describe("mounted composer delivery recovery", () => {
 			});
 			expect(narrow.overflow).toBe(false);
 			expect(narrow.actionTop).toBe(narrow.triggerTop);
+			await attach(page);
+			expect(await page.$eval('.composer-controls .attachment-list', element => element.getBoundingClientRect().top >= document.querySelector('.attachment-trigger')!.getBoundingClientRect().bottom)).toBe(true);
+			if (process.env.GJC_DESKTOP_VISUAL_DIR) {
+				await Bun.write(`${process.env.GJC_DESKTOP_VISUAL_DIR}/footer-narrow-attachment.png`, await page.screenshot({ fullPage: true }));
+			}
 			await page.setViewport({ width: 1400, height: 900 });
 			// Typing during a run turns the same slot back into send, still with no visible text.
 			await page.type(".composer textarea", "steer this run");

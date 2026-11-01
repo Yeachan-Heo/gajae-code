@@ -312,7 +312,6 @@ export function Composer({
 				{t("support.composerLabel")}
 			</label>
 			<div className="composer-input">
-				{attachment}
 				<textarea
 					ref={textarea}
 					id={id}
@@ -353,8 +352,9 @@ export function Composer({
 				/>
 			</div>
 			<div className="composer-footer">
-				{controls != null && (
+				{(attachment != null || controls != null) && (
 					<div className="composer-controls" role="group" aria-label={t("support.composerControls")}>
+						{attachment}
 						{controls}
 					</div>
 				)}
