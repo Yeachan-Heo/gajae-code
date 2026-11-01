@@ -21,7 +21,7 @@ At session start, if a memory summary exists for the current project, it is inje
 
 ### Memory artifacts
 
-Generated local-memory artifacts are private runtime state, not a public tool or URI surface. They may be summarized into the system prompt when local memory is enabled, but users and model-facing tool docs should not rely on direct `memory://` reads. The legacy internal `memory://` resolver remains only for compatibility with existing persisted guidance and is not part of the public coding harness contract; remove it after legacy local-memory prompts no longer reference it.
+Generated local-memory artifacts are private runtime state, not a public tool or URI surface. They may be summarized into the system prompt when local memory is enabled, but users and model-facing tool docs should not rely on direct `memory://` reads. The legacy internal `memory://` resolver remains only for compatibility with existing persisted guidance and is not part of the public coding harness contract; remove it after legacy local-memory prompts no longer reference it. Bash does not expand `memory://` into a filesystem path: the memory root folds `/`, `\`, and `:` in the project path to `-`, so distinct projects can share one root.
 ### `/memory` slash command
 
 | Subcommand            | Effect                                         |
