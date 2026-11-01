@@ -270,6 +270,16 @@ export function sortMCPToolsByName<T extends { name: string }>(tools: T[]): T[] 
 	return tools;
 }
 
+/**
+ * A repository plugin-bundle MCP tool. `plugin-mcp-name-filter` omits the whole
+ * plugin server once one of its tools meets a non-plugin owner of the same
+ * normalized name, and it can only see that collision while both candidates are
+ * in the published list.
+ */
+function isPluginBundleTool(tool: CustomTool<TSchema, MCPToolDetails>): boolean {
+	return (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.gjcPluginBundle;
+}
+
 export function resolveSubscriptionPostAction(
 	notificationsEnabled: boolean,
 	currentEpoch: number,
@@ -1831,10 +1841,10 @@ export class MCPManager {
 				});
 				for (const name of addressed) this.#shadowedServerTools.delete(name);
 				allTools.length = 0;
-				const names = new Set<string>();
+				const published = new Map<string, CustomTool<TSchema, MCPToolDetails>>();
 				for (const tool of candidates) {
 					const server = (tool as MCPTool | DeferredMCPTool).mcpServerName;
-					this.#addServerTool(server, tool, allTools, names);
+					this.#addServerTool(server, tool, allTools, published);
 				}
 				sortMCPToolsByName(allTools);
 			}
@@ -1867,8 +1877,8 @@ export class MCPManager {
 			// `mcp__foo_bar_*`). A server joining or refreshing a live catalog must never
 			// replace another server's tool under the same name: keep the existing tool and
 			// hold the incoming one until the name is free.
-			const publishedNames = new Set(publishedTools.map(tool => tool.name));
-			for (const tool of tools) this.#addServerTool(name, tool, publishedTools, publishedNames);
+			const published = new Map(publishedTools.map(tool => [tool.name, tool] as const));
+			for (const tool of tools) this.#addServerTool(name, tool, publishedTools, published);
 		}
 		// This server may have dropped a name another connected server is waiting for.
 		this.#promoteShadowedTools(publishedTools);
@@ -1882,9 +1892,17 @@ export class MCPManager {
 		name: string,
 		tool: CustomTool<TSchema, MCPToolDetails>,
 		publishedTools: CustomTool<TSchema, MCPToolDetails>[],
-		publishedNames: Set<string>,
+		published: Map<string, CustomTool<TSchema, MCPToolDetails>>,
 	): void {
-		if (publishedNames.has(tool.name)) {
+		const owner = published.get(tool.name);
+		if (owner !== undefined) {
+			// The plugin name filter adjudicates plugin collisions at the selection layer and
+			// needs both candidates published to drop the whole plugin server, so a plugin
+			// candidate must neither shadow nor be shadowed here.
+			if (!this.#toolsOnly && (isPluginBundleTool(owner) || isPluginBundleTool(tool))) {
+				publishedTools.push(tool);
+				return;
+			}
 			logger.warn("Skipping MCP tool whose name is already published by another server", {
 				path: `mcp:${name}`,
 				tool: tool.name,
@@ -1894,7 +1912,7 @@ export class MCPManager {
 			this.#shadowedServerTools.set(name, shadowed);
 			return;
 		}
-		publishedNames.add(tool.name);
+		published.set(tool.name, tool);
 		publishedTools.push(tool);
 	}
 

@@ -454,7 +454,11 @@ function formatModelSelectorForStatus(value: ModelSelectorValue | undefined): st
 }
 
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
-	const agentModelOverrides = runtime.session.getAgentModelOverrides();
+	// A partial session double (or an embedder driving the registry directly) may not
+	// expose the live reader, so fall back to the persisted selection map instead of
+	// throwing out of a read-only status command.
+	const agentModelOverrides =
+		runtime.session.getAgentModelOverrides?.() ?? runtime.settings.get("task.agentModelOverrides") ?? {};
 	const lines = ["Model assignments:"];
 	for (const targetId of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
