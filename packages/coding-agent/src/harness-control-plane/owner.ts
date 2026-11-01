@@ -180,6 +180,7 @@ export class RuntimeOwner {
 	#framePumpFailure: unknown = null;
 	#coalesced = new Map<string, true>();
 	#stopPromise: Promise<void> | null = null;
+	#preserveUnreadableLease = false;
 	#retiring = false;
 	#retirePromise: Promise<PrimitiveResponse> | null = null;
 	#lifecycleMutation: Promise<void> = Promise.resolve();
@@ -1030,7 +1031,8 @@ export class RuntimeOwner {
 		return this.#response(state, { retired: true });
 	}
 
-	stop(): Promise<void> {
+	stop(options: { preserveUnreadableLease?: boolean } = {}): Promise<void> {
+		this.#preserveUnreadableLease ||= options.preserveUnreadableLease === true;
 		// Every public caller receives the one truthful shared teardown result. Only
 		// the object capability passed to the exact transport.close() invocation can
 		// break a direct cleanup cycle; ambient synchronous callers have no bypass.
@@ -1168,7 +1170,23 @@ export class RuntimeOwner {
 					// verified closed, so there is no old authority left to release.
 					this.#leaseHeld = false;
 				} else {
-					await recordFailure("owner_lease_release_failed", error);
+					let unreadable = false;
+					if (this.#preserveUnreadableLease) {
+						try {
+							await readLease(this.#opts.root, this.#opts.sessionId);
+						} catch {
+							unreadable = true;
+						}
+					}
+					if (unreadable) {
+						// Terminal watchdog shutdown has already fenced and joined the
+						// heartbeat and verified child + endpoint cleanup. Leave the
+						// unreadable lease untouched: deleting it could erase a successor.
+						// Process exit makes any remaining lease for our PID terminal.
+						this.#leaseHeld = false;
+					} else {
+						await recordFailure("owner_lease_release_failed", error);
+					}
 				}
 			}
 		}

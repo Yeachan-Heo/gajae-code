@@ -53,6 +53,7 @@ import {
 	reconcileOwnerLifecycle,
 } from "../harness-control-plane/lifecycle-reconciliation";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
+import { readOwnerWatchdogExit, waitForOwnerShutdown } from "../harness-control-plane/owner-watchdog";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
 import {
 	RECEIPT_SPOOL_DIR_ENV,
@@ -346,6 +347,9 @@ interface OwnerExitEvidence {
 }
 
 function ownerExitGuidance(reason: string, startupBlocker: boolean): string {
+	if (reason === "owner-lease-read-failed") {
+		return "owner stopped after repeated lease read failures; fix access to the harness state directory, then run `gjc harness recover --session <id>` before retrying";
+	}
 	if (startupBlocker) {
 		return "owner started and reported live but exited before accepting the first prompt; run `gjc harness recover --session <id>` to respawn the owner, then resubmit the prompt";
 	}
@@ -363,9 +367,20 @@ function ownerExitGuidance(reason: string, startupBlocker: boolean): string {
 }
 
 async function buildOwnerExitEvidence(root: string, state: SessionState): Promise<OwnerExitEvidence> {
-	const lease = await readLease(root, state.sessionId);
-	const leaseStatus = classifyLeaseStatus(lease);
 	const events = await readEvents(root, state.sessionId, 0);
+	const generation = events.findLast(event => event.kind === "owner_started")?.writer;
+	const watchdogReason = generation ? await readOwnerWatchdogExit(root, state.sessionId, generation) : null;
+	let leaseReadFailed = false;
+	const lease = await readLease(root, state.sessionId).catch(error => {
+		if (!watchdogReason) throw error;
+		leaseReadFailed = true;
+		return null;
+	});
+	const leaseStatus = leaseReadFailed ? "unreadable" : classifyLeaseStatus(lease);
+	const currentWatchdogReason =
+		!lease || (lease.ownerId === generation?.ownerId && lease.leaseEpoch === generation?.leaseEpoch)
+			? watchdogReason
+			: null;
 	const lastEvent = events.at(-1) ?? null;
 	let lastSignal: string | null = null;
 	let promptAcceptedSeen = false;
@@ -405,6 +420,7 @@ async function buildOwnerExitEvidence(root: string, state: SessionState): Promis
 	const ownerStarted = events.some(event => event.kind === "owner_started");
 	const startupBlocker = terminal && ownerStarted && !promptAcceptedSeen && !completedSeen;
 	if (startupBlocker) reason = "owner-died-before-first-prompt";
+	if (currentWatchdogReason) reason = currentWatchdogReason;
 	return {
 		reason,
 		leaseStatus,
@@ -757,7 +773,9 @@ export default class Harness extends Command {
 		if (await this.#tryOwnerRoute(root, sessionId, "finalize", { ...input, sessionId })) return;
 		// finalize is owner-routed; without a live owner, report owner-not-live (start the owner first).
 		const state = await loadState(root, sessionId);
-		writeJson(buildResponse(state, false, { completed: false, reason: "owner-not-live" }, false));
+		const ownerExit = await buildOwnerExitEvidence(root, state);
+		const reason = ownerExit.reason === "owner-lease-read-failed" ? ownerExit.reason : "owner-not-live";
+		writeJson(buildResponse(state, false, { completed: false, reason, ownerExit }, false));
 		process.exitCode = 1;
 	}
 
@@ -794,23 +812,14 @@ export default class Harness extends Command {
 		const owner = new RuntimeOwner({ root, sessionId, transport });
 		const info = await owner.start();
 		writeJson({ ok: true, owner: info });
-		await new Promise<void>(resolve => {
-			const stop = (): void => {
-				clearInterval(timer);
-				process.removeListener("SIGTERM", stop);
-				process.removeListener("SIGINT", stop);
-				resolve();
-			};
-			const timer = setInterval(() => {
-				void resolveOwner(root, sessionId).then(resolved => {
-					if (!resolved.live) stop();
-				});
-			}, 500);
-			timer.unref?.();
-			process.on("SIGTERM", stop);
-			process.on("SIGINT", stop);
-		});
-		await owner.stop();
+		// A publication failure must also reach the caller after verified child and
+		// endpoint cleanup, rather than hang forever rereading the broken lease.
+		let preserveUnreadableLease = true;
+		try {
+			preserveUnreadableLease = (await waitForOwnerShutdown(root, sessionId, info)) !== null;
+		} finally {
+			await owner.stop({ preserveUnreadableLease });
+		}
 	}
 
 	#buildOwnerCommand(sessionId: string): string[] {
@@ -1390,7 +1399,13 @@ export default class Harness extends Command {
 		verb: string,
 		input: Record<string, unknown>,
 	): Promise<boolean> {
-		const owner = await resolveOwner(root, sessionId);
+		const owner = await resolveOwner(root, sessionId).catch(async error => {
+			const events = await readEvents(root, sessionId, 0);
+			const generation = events.findLast(event => event.kind === "owner_started")?.writer;
+			if (generation && (await readOwnerWatchdogExit(root, sessionId, generation))) return null;
+			throw error;
+		});
+		if (!owner) return false;
 		if (!owner.live || !owner.socketPath) return false;
 		const priorSpoolDir = input[RECEIPT_SPOOL_DIR_ENV];
 		try {
@@ -1507,6 +1522,23 @@ export default class Harness extends Command {
 		);
 		const lifecycleGate = submitUnavailableReason(state.lifecycle, false);
 		if (lifecycleGate && lifecycleGate !== "owner-not-live" && !blockedByOwnerLiveness) {
+			const events = await readEvents(root, sessionId, 0);
+			const generation = events.findLast(event => event.kind === "owner_started")?.writer;
+			if (generation && (await readOwnerWatchdogExit(root, sessionId, generation))) {
+				const ownerExit = await buildOwnerExitEvidence(root, state);
+				if (ownerExit.reason === "owner-lease-read-failed") {
+					writeJson(
+						buildResponse(
+							state,
+							false,
+							{ accepted: false, submitted: false, reason: ownerExit.reason, lifecycleGate, ownerExit },
+							false,
+						),
+					);
+					process.exitCode = 1;
+					return;
+				}
+			}
 			writeJson(buildResponse(state, false, { accepted: false, submitted: false, reason: lifecycleGate }, false));
 			process.exitCode = 1;
 			return;
@@ -1524,7 +1556,10 @@ export default class Harness extends Command {
 			built.completedTerminalEvent,
 			ownerExit.startupBlocker,
 		);
-		const reason = ownerExit.startupBlocker ? ownerExit.reason : "owner-not-live";
+		const reason =
+			ownerExit.reason === "owner-lease-read-failed" || ownerExit.startupBlocker
+				? ownerExit.reason
+				: "owner-not-live";
 		writeJson(
 			buildResponse(
 				state,
