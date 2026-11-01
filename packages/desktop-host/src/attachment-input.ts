@@ -48,9 +48,16 @@ export function validateDesktopAttachmentPromptRequest(value: unknown): DesktopA
 	const request = object(value, ["id", "method", "params"]);
 	if (typeof request.id !== "string" || !request.id || request.id.length > 128 || request.method !== "prompt")
 		throw new Error("Invalid attachment prompt envelope.");
-	const params = object(request.params, ["sessionId", "text", "attachments", "deliverAs"]);
+	const params = object(request.params, ["sessionId", "sessionGeneration", "text", "attachments", "deliverAs"]);
 	if (typeof params.sessionId !== "string" || !params.sessionId || typeof params.text !== "string")
 		throw new Error("Invalid attachment prompt parameters.");
+	const generation = params.sessionGeneration;
+	if (
+		generation !== undefined &&
+		generation !== null &&
+		(typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
+	)
+		throw new Error("Invalid prompt session generation.");
 	if (params.deliverAs !== undefined && params.deliverAs !== "steer" && params.deliverAs !== "followUp")
 		throw new Error("Unsupported queued attachment delivery.");
 	if (
@@ -64,6 +71,7 @@ export function validateDesktopAttachmentPromptRequest(value: unknown): DesktopA
 		method: "prompt",
 		params: {
 			sessionId: params.sessionId,
+			...(typeof generation === "number" || generation === null ? { sessionGeneration: generation } : {}),
 			text: params.text,
 			...(attachments ? { attachments } : {}),
 			...(params.deliverAs ? { deliverAs: params.deliverAs } : {}),

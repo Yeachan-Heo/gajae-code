@@ -21,6 +21,8 @@ export interface DesktopAttachmentPromptRequest {
 	method: "prompt";
 	params: {
 		sessionId: string;
+		/** Captured renderer owner, never a grant to reconnect or adopt a writer. */
+		sessionGeneration?: number | null;
 		text: string;
 		attachments?: DesktopAttachment[];
 		deliverAs?: "steer" | "followUp";

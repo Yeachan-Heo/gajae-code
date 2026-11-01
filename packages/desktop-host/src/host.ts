@@ -48,6 +48,7 @@ import {
 	DesktopGatePresentationError,
 	type DesktopGatePresenter,
 } from "./gate-presentation";
+import { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
 	countVisibleMessages,
@@ -314,6 +315,9 @@ interface SavedSession {
 	title: string;
 	starred: boolean;
 	file?: string;
+	createdAt?: number;
+	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
+	managed?: true;
 }
 interface Catalog {
 	version: 1;
@@ -413,6 +417,10 @@ export class DesktopHost {
 	#catalog: Catalog = { version: 1, projects: [], sessions: [] };
 	#deliveries!: DeliveryJournal;
 	#live = new Map<string, LiveSession>();
+	#managed = new Map<string, ManagedSession>();
+	#managedControlEpoch = 0;
+	#managedOpening = new Map<string, Promise<ManagedSession>>();
+	#managedProjectEpochs = new Map<string, number>();
 	/** Unpublished SDK ownership, retained until publication or proven disposal. */
 	#candidates = new Set<SessionCandidate>();
 	/** Retired publications remain owned even after their catalog/live entry is removed. */
@@ -526,7 +534,17 @@ export class DesktopHost {
 					title: requiredString(item, "title", 200),
 					starred: item.starred,
 				};
+				if (item.createdAt !== undefined) {
+					if (typeof item.createdAt !== "number" || !Number.isFinite(item.createdAt) || item.createdAt < 0)
+						throw new Error("Invalid session creation time");
+					session.createdAt = item.createdAt;
+				}
 				if (!projects.some(project => project.id === session.projectId)) throw new Error("Invalid session project");
+				if (item.managed !== undefined) {
+					if (item.managed !== true || item.file !== undefined)
+						throw new Error("Invalid managed session reference");
+					session.managed = true;
+				}
 				if (item.file !== undefined) {
 					session.file = requiredString(item, "file");
 					this.#sessionPath(session.file);
@@ -640,6 +658,8 @@ export class DesktopHost {
 		return save;
 	}
 	#dto(metadata: SavedSession, messageBudget = 2_000_000): DesktopSession {
+		const managed = this.#managed.get(metadata.id);
+		if (managed) return managed.dto(messageBudget);
 		const live = this.#live.get(metadata.id);
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
@@ -723,6 +743,7 @@ export class DesktopHost {
 						!this.#pendingForks.has(session.id) &&
 						this.#catalog.projects.some(project => project.id === session.projectId && !project.closed),
 				)
+				.toSorted((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0))
 				.map(session => this.#dto(session, Math.floor(500_000 / Math.max(1, this.#catalog.sessions.length)))),
 			models: this.#registry?.getAvailable().map(projectDesktopModel) ?? [],
 			capabilities: CAPABILITIES.map(capability => ({ ...capability })),
@@ -783,6 +804,10 @@ export class DesktopHost {
 		return metadata;
 	}
 	async #open(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
+		// Inventory membership is not a writer lease. Strict managed-file opening alone
+		// cannot fence a live TUI owner; only an SDK-owned lifecycle may admit a writer.
+		if (metadata.managed)
+			throw new Error("This terminal conversation requires SDK ownership admission before desktop resume.");
 		const pending = this.#opening.get(metadata.id);
 		if (pending) return pending;
 		const existing = this.#live.get(metadata.id);
@@ -1107,6 +1132,7 @@ export class DesktopHost {
 			projectId: live.metadata.projectId,
 			title: `${live.metadata.title.slice(0, 190)} (fork)`,
 			starred: false,
+			createdAt: Date.now(),
 		};
 		let manager: SessionManager | undefined;
 		let candidate: SessionCandidate | undefined;
@@ -1754,6 +1780,10 @@ export class DesktopHost {
 			await this.close();
 			return null;
 		}
+		if (typeof params.sessionId === "string") {
+			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
+			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
+		}
 		if (method === "auth.providers")
 			return this.#oauth!.providers().map(provider => ({
 				...provider,
@@ -1841,7 +1871,13 @@ export class DesktopHost {
 			const owning = this.#catalog.projects.find(item => item.id === projectId);
 			if (!owning) throw new Error("Project not found");
 			if (owning.closed) throw new Error("Workspace is closed. Open the folder again to use this conversation.");
-			const metadata: SavedSession = { id: crypto.randomUUID(), projectId, title: "New session", starred: false };
+			const metadata: SavedSession = {
+				id: crypto.randomUUID(),
+				projectId,
+				title: "New session",
+				starred: false,
+				createdAt: Date.now(),
+			};
 			this.#catalog.sessions.push(metadata);
 			try {
 				await this.#open(metadata);
@@ -2432,6 +2468,116 @@ export class DesktopHost {
 			method !== "session.fork" && method !== "session.delete",
 		);
 	}
+	async #openManaged(metadata: SavedSession): Promise<ManagedSession> {
+		const existing = this.#managed.get(metadata.id);
+		if (existing?.isAttached) return existing;
+		const pending = this.#managedOpening.get(metadata.id);
+		if (pending) return pending;
+		if (existing) this.#managed.delete(metadata.id);
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
+		const projectEpoch = this.#managedProjectEpochs.get(project.id) ?? 0;
+		const session = new ManagedSession({
+			agentDir: this.agentDir,
+			cwd: project.path,
+			id: metadata.id,
+			projectId: metadata.projectId,
+			title: metadata.title,
+			starred: metadata.starred,
+			nextControlGeneration: () => {
+				if (this.#managedControlEpoch >= Number.MAX_SAFE_INTEGER)
+					throw new Error("Desktop control generation exhausted");
+				return ++this.#managedControlEpoch;
+			},
+			redact: text => this.#redact(text),
+			delivery: (id, changes) => this.#delivery(id, changes),
+			onChange: () => {
+				if (this.#managed.get(metadata.id) === session && !this.#closed && !project.closed)
+					this.#emit({ type: "session", session: session.dto() });
+			},
+		});
+		const opening = (async () => {
+			try {
+				await existing?.close();
+				await session.open();
+				if (this.#closed || project.closed || (this.#managedProjectEpochs.get(project.id) ?? 0) !== projectEpoch)
+					throw new Error("Workspace closed while connecting to SDK owner");
+				this.#managed.set(metadata.id, session);
+				return session;
+			} catch (error) {
+				await session.close();
+				throw error;
+			}
+		})();
+		this.#managedOpening.set(metadata.id, opening);
+		try {
+			return await opening;
+		} finally {
+			if (this.#managedOpening.get(metadata.id) === opening) this.#managedOpening.delete(metadata.id);
+		}
+	}
+
+	async #dispatchManaged(request: DesktopRequest, metadata: SavedSession): Promise<unknown> {
+		const { method, params } = request;
+		const supported = [
+			"session.select",
+			"history.get",
+			"prompt",
+			"abort",
+			"models.list",
+			"model.set",
+			"thinking.set",
+		];
+		if (!supported.includes(method))
+			throw new Error(`The SDK owner does not support desktop ${method}. Use its original control surface.`);
+		const query = method === "session.select" || method === "history.get" || method === "models.list";
+		// A write must not resume/reconnect an owner on behalf of an old rendered
+		// intent. Only reads may establish or synchronize the current attachment.
+		const session = query ? await this.#openManaged(metadata) : this.#managed.get(metadata.id);
+		if (
+			!session ||
+			(!query &&
+				(!Number.isSafeInteger(params.sessionGeneration) || params.sessionGeneration !== session.controlGeneration))
+		)
+			throw new Error("SDK owner changed before control dispatch. Select the conversation again.");
+		switch (method) {
+			case "session.select":
+				await session.refresh();
+				this.#publishSnapshot();
+				return session.dto();
+			case "history.get": {
+				const offset = params.offset ?? 0;
+				const limit = params.limit ?? HISTORY_PAGE_LIMIT;
+				if (
+					typeof offset !== "number" ||
+					!Number.isInteger(offset) ||
+					offset < 0 ||
+					typeof limit !== "number" ||
+					!Number.isInteger(limit) ||
+					limit < 1 ||
+					limit > HISTORY_PAGE_LIMIT
+				)
+					throw new Error("Invalid history page");
+				await session.refresh();
+				return session.history(offset, limit);
+			}
+			case "prompt": {
+				const input = prepareDesktopAttachmentInput(request);
+				if (input.images.length) throw new Error("Image submission is unavailable for this SDK connection");
+				await session.prompt(request.id, input.text, params.deliverAs);
+				return null;
+			}
+			case "abort":
+				return session.control("turn.abort");
+			case "models.list":
+				await session.refresh();
+				return session.models();
+			case "model.set":
+				return session.setModel(requiredString(params, "modelId", 500), params.thinkingLevel);
+			case "thinking.set":
+				return session.setThinking(params.level);
+		}
+	}
+
 	/**
 	 * Hides a workspace's live conversations after its durable close. Teardown failures are
 	 * reported rather than rethrown: the close itself already succeeded and must not be undone
@@ -2441,6 +2587,21 @@ export class DesktopHost {
 		// The close already owns the workspace's queue entry, so teardown must finish on a budget:
 		// an uncooperative abort would otherwise keep every later reopen of this folder waiting.
 		const deadline = AbortSignal.timeout(CLOSE_TEARDOWN_TIMEOUT_MS);
+		this.#managedProjectEpochs.set(projectId, (this.#managedProjectEpochs.get(projectId) ?? 0) + 1);
+		const managedOpening = [...this.#managedOpening.entries()].filter(
+			([id]) => this.#catalog.sessions.find(session => session.id === id)?.projectId === projectId,
+		);
+		for (const [id] of managedOpening) this.#managedOpening.delete(id);
+		await Promise.allSettled(managedOpening.map(([, opening]) => bounded(opening, deadline)));
+		for (const [id, session] of [...this.#managed]) {
+			if (this.#catalog.sessions.find(item => item.id === id)?.projectId !== projectId) continue;
+			this.#managed.delete(id);
+			try {
+				await bounded(session.close(), deadline);
+			} catch (error) {
+				console.error(`Desktop workspace could not detach SDK session ${id}: ${String(error)}`);
+			}
+		}
 		// A session that is still opening when the workspace closes must not stay live either:
 		// settling each in-flight open lets its publish path see the closed project and refuse.
 		const opening = [...this.#opening.entries()]
@@ -2485,28 +2646,81 @@ export class DesktopHost {
 		return next;
 	}
 
-	/** Restores a closed workspace, or adds a new one, without racing a close of the same path. */
-	async #openProject(resolved: string): Promise<DesktopProject> {
-		let project = this.#catalog.projects.find(item => item.path === resolved);
-		if (project?.closed) {
-			delete project.closed;
-			try {
-				await this.#save();
-			} catch (error) {
-				project.closed = true;
-				throw error;
-			}
-			this.#publishSnapshot();
-			return project;
+	/** Read-only SDK inventory: no recovery, transcript copies, or eager live sessions. */
+	async #discoverProjectSessions(
+		project: DesktopProject,
+	): Promise<{ discovered: SavedSession[]; creationTimes: Map<string, number> }> {
+		const [managed, desktop] = await Promise.all([
+			SessionManager.listManagedForResumePickerReadOnly(project.path, this.agentDir),
+			SessionManager.listForResumePickerReadOnly(project.path, path.join(this.dataDir, "sessions", project.id)),
+		]);
+		const sessions = [...managed, ...desktop];
+		const discovered: SavedSession[] = [];
+		const creationTimes = new Map<string, number>();
+		const ids = new Set(this.#catalog.sessions.map(session => session.id));
+		for (const session of sessions.sort((left, right) => left.created.getTime() - right.created.getTime())) {
+			const createdAt = session.created.getTime();
+			if (!ID.test(session.id) || !session.cwd || !Number.isFinite(createdAt) || createdAt < 0) continue;
+			// Managed inventories can include legacy and project-local candidates. Header
+			// scope must still name this exact directory, never a parent or sibling project.
+			const cwd = await fs.realpath(session.cwd).catch(() => undefined);
+			if (cwd !== project.path) continue;
+			const existing = this.#catalog.sessions.find(
+				item =>
+					item.id === session.id ||
+					(item.projectId === project.id &&
+						item.file &&
+						path.resolve(session.path) === this.#sessionPath(item.file)),
+			);
+			if (
+				existing?.projectId === project.id &&
+				(existing.managed || (existing.file && path.resolve(session.path) === this.#sessionPath(existing.file)))
+			)
+				creationTimes.set(existing.id, createdAt);
+			if (existing || desktop.includes(session) || ids.has(session.id)) continue;
+			ids.add(session.id);
+			discovered.push({
+				id: session.id,
+				projectId: project.id,
+				title: (session.title || session.firstMessage.trim() || "Untitled session").slice(0, 200),
+				starred: session.starred,
+				managed: true,
+				createdAt,
+			});
 		}
-		if (!project) {
-			project = {
-				id: crypto.randomUUID(),
-				name: (path.basename(resolved) || resolved).slice(0, 200),
-				path: resolved,
-			};
-			this.#catalog.projects.push(project);
+		return { discovered, creationTimes };
+	}
+
+	/** Restores or refreshes a workspace under the same fence used by close. */
+	async #openProject(resolved: string): Promise<DesktopProject> {
+		const existing = this.#catalog.projects.find(item => item.path === resolved);
+		const project: DesktopProject = existing ?? {
+			id: crypto.randomUUID(),
+			name: (path.basename(resolved) || resolved).slice(0, 200),
+			path: resolved,
+		};
+		const { discovered, creationTimes } = await this.#discoverProjectSessions(project);
+		const previousCreationTimes = new Map(this.#catalog.sessions.map(session => [session, session.createdAt]));
+		for (const session of this.#catalog.sessions) {
+			const createdAt = creationTimes.get(session.id);
+			if (createdAt !== undefined) session.createdAt = createdAt;
+		}
+		const closed = project.closed;
+		delete project.closed;
+		if (!existing) this.#catalog.projects.push(project);
+		this.#catalog.sessions.push(...discovered);
+		try {
 			await this.#save();
+		} catch (error) {
+			for (const [session, createdAt] of previousCreationTimes) {
+				if (createdAt === undefined) delete session.createdAt;
+				else session.createdAt = createdAt;
+			}
+			const added = new Set(discovered);
+			this.#catalog.sessions = this.#catalog.sessions.filter(session => !added.has(session));
+			if (!existing) this.#catalog.projects = this.#catalog.projects.filter(item => item !== project);
+			if (closed !== undefined) project.closed = closed;
+			throw error;
 		}
 		this.#publishSnapshot();
 		return project;
@@ -2812,7 +3026,9 @@ export class DesktopHost {
 		// Attach a handler immediately while unrelated session cleanup drains.
 		void authorizationClose?.catch(() => {});
 		this.#cancelQuestions();
-		await Promise.allSettled([...this.#opening.values()]);
+		await Promise.allSettled([...this.#opening.values(), ...this.#managedOpening.values()]);
+		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
+		this.#managed.clear();
 		this.#cancelQuestions();
 		await Promise.allSettled([...this.#live.values()].map(live => live.sdk.abort()));
 		await Promise.allSettled([...this.#tasks]);

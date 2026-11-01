@@ -132,6 +132,16 @@ describe("desktop host attachment transport validation", () => {
 			).toThrow("Unknown");
 	});
 
+	test("preserves captured owner generations without interpreting them as SDK authority", () => {
+		for (const sessionGeneration of [0, 7, Number.MAX_SAFE_INTEGER, null]) {
+			const value = { ...request(), params: { ...request().params, sessionGeneration } };
+			expect(validateDesktopAttachmentPromptRequest(value).params.sessionGeneration).toBe(sessionGeneration);
+			expect(prepareDesktopAttachmentInput(value).text).toBe("Review these files");
+		}
+		for (const sessionGeneration of ["7", -1, 7.5, Infinity, {}, []])
+			expect(() => validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, sessionGeneration } })).toThrow("Invalid prompt session generation");
+	});
+
 	test("rejects invalid envelopes and prompt parameter types before framing", () => {
 		for (const value of [
 			null,

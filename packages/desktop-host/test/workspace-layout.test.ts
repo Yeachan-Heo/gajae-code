@@ -137,7 +137,7 @@ describe("desktop workspace layout", () => {
 		expect(snapshot().sessions.map(session => session.id)).toContain(kept.id);
 	});
 
-	test("workspaces and conversations keep an explicit order across restarts", async () => {
+	test("workspaces retain explicit order and conversations retain creation order across restarts", async () => {
 		const { call, snapshot, open, dataDir, createHost } = await launch();
 		const first = await open("first");
 		const second = await open("second");
@@ -149,10 +149,10 @@ describe("desktop workspace layout", () => {
 		const b = await call<DesktopSession>("session.create", { projectId: first.id });
 		await call("session.reorder", { projectId: first.id, ids: [b.id, a.id] });
 		const ordered = snapshot().sessions.filter(session => session.projectId === first.id);
-		expect(ordered.map(session => session.id)).toEqual([b.id, a.id]);
-		// Other workspaces are untouched by a per-workspace reorder.
+		expect(ordered.map(session => session.id)).toEqual([a.id, b.id]);
+		// Conversations remain scoped to the project that created them.
 		expect(snapshot().sessions.filter(session => session.projectId === second.id)).toHaveLength(0);
-		// The per-conversation order is durable, not a renderer-only arrangement.
+		// Creation chronology is durable, not just incidental in-memory array order.
 		const restarted = await createHost(dataDir);
 		expect(restarted.snapshot().projects.map(project => project.id)).toEqual([third.id, first.id, second.id]);
 		expect(
@@ -160,7 +160,7 @@ describe("desktop workspace layout", () => {
 				.snapshot()
 				.sessions.filter(session => session.projectId === first.id)
 				.map(session => session.id),
-		).toEqual([b.id, a.id]);
+		).toEqual([a.id, b.id]);
 	});
 
 	test("a closed workspace stays closed across a restart, and open ones still reorder", async () => {

@@ -421,7 +421,7 @@ describe("mounted preference ownership", () => {
 });
 
 
-async function selectionFixture(preferences: DesktopPreferences = deferralPreferences): Promise<{ context: BrowserContext; page: Page }> {
+async function selectionFixture(preferences: DesktopPreferences = deferralPreferences, preferencesError?: string): Promise<{ context: BrowserContext; page: Page }> {
 	const { context, page } = await fixture();
 	try {
 		await page.evaluate(() => {
@@ -435,7 +435,9 @@ async function selectionFixture(preferences: DesktopPreferences = deferralPrefer
 		await select(page);
 		await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.get"));
 		const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
-		await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: preferences });
+		await page.evaluate(({ id, result, error }) => window.fixture.emit(error
+			? { type: "response", id, ok: false, error }
+			: { type: "response", id, ok: true, result }), { id: read.id, result: preferences, error: preferencesError });
 		await selectionSession(page, "idle");
 		await page.waitForSelector(".model-trigger:not([disabled])");
 		await page.evaluate(() => {
@@ -483,6 +485,21 @@ async function selectionWrites(page: Page): Promise<DesktopRequest[]> {
 }
 
 describe("mounted model and preset scope confirmation", () => {
+	test("unavailable owner preferences do not discard valid session model controls", async () => {
+		const { context, page } = await selectionFixture(deferralPreferences, "Remote preferences unavailable");
+		try {
+			await page.waitForFunction(() => document.body.textContent?.includes("Remote preferences unavailable"));
+			await openSelectionScope(page, "model");
+			expect(await page.$eval('.model-scope-option[data-scope="default"]', element => (element as HTMLButtonElement).disabled)).toBe(true);
+			expect(await page.$eval('.model-scope-option[data-scope="session"]', element => (element as HTMLButtonElement).disabled)).toBe(false);
+			await page.click('.model-scope-option[data-scope="session"]');
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set"));
+			const writes = await selectionWrites(page);
+			expect(writes).toHaveLength(1);
+			expect(writes[0]!.method).toBe("model.set");
+			expect(writes[0]!.params).toEqual({ sessionId: "a", sessionGeneration: 1, modelId: "fixture/model-two" });
+		} finally { await closeFixture(context, page); }
+	}, 30000);
 	for (const kind of ["model", "profile"] as const) {
 		for (const scope of ["session", "default"] as const) {
 			test(`${kind} ${scope} confirmation dispatches the exact owner-scoped operation`, async () => {
@@ -496,7 +513,7 @@ describe("mounted model and preset scope confirmation", () => {
 					expect(writes).toHaveLength(1);
 					if (kind === "model" && scope === "session") {
 						expect(writes[0]!.method).toBe("model.set");
-						expect(writes[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two" });
+						expect(writes[0]!.params).toEqual({ sessionId: "a", sessionGeneration: 1, modelId: "fixture/model-two" });
 					} else {
 						expect(writes[0]!.method).toBe("preferences.apply");
 						expect(writes[0]!.params).toEqual({
@@ -618,7 +635,7 @@ describe("mounted model and preset scope confirmation", () => {
 				expect(writes).toHaveLength(1);
 				expect(writes[0]!.params).toEqual(kind === "profile"
 					? { sessionId: "a", action: { type: "profile.select", name: "focused", scope: "session" } }
-					: { sessionId: "a", modelId: "fixture/model-two" });
+					: { sessionId: "a", sessionGeneration: 1, modelId: "fixture/model-two" });
 			} finally { await closeFixture(context, page); }
 		}, 30000);
 	}
@@ -701,7 +718,7 @@ describe("mounted model selection deferral", () => {
 			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set"));
 			const applied = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set");
 			expect(applied).toHaveLength(1);
-			expect(applied[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two" });
+			expect(applied[0]!.params).toEqual({ sessionId: "a", sessionGeneration: 1, modelId: "fixture/model-two" });
 			await page.evaluate(({ id }) => window.fixture.response(id, true), { id: applied[0]!.id });
 			// The host reflects the applied model; the picker follows the host, not its own intent.
 			await page.evaluate(() =>
@@ -788,7 +805,7 @@ describe("mounted deferred selection intent", () => {
 			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "model.set"));
 			const applied = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set");
 			expect(applied).toHaveLength(1);
-			expect(applied[0]!.params).toEqual({ sessionId: "a", modelId: "fixture/model-two", thinkingLevel: "high" });
+			expect(applied[0]!.params).toEqual({ sessionId: "a", sessionGeneration: 1, modelId: "fixture/model-two", thinkingLevel: "high" });
 			await page.evaluate(({ id }) => window.fixture.response(id, true), { id: applied[0]!.id });
 			await sessionFrame("done", []);
 			// The intent is cleared: the picker returns to the host's own model and sends nothing more.

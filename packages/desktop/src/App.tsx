@@ -900,31 +900,29 @@ export default function App() {
 		setModelCatalog({ sessionId: selected, generation: modelGeneration, models: [], loading: true });
 		const refresh = refreshModelCatalog.current;
 		refreshModelCatalog.current = false;
-		void Promise.all([
+		void Promise.allSettled([
 			request<DesktopModel[]>("models.list", { sessionId: selected, ...(refresh ? { refresh: true } : {}) }),
 			request<DesktopPreferences>("preferences.get", { sessionId: selected }),
-		])
-			.then(([models, preferences]) => {
-				if (alive && modelOwnerRef.current === owner)
-					setModelCatalog({
-						sessionId: selected,
-						generation: modelGeneration,
-						models,
-						roles: preferences.roles,
-						profiles: preferences.profiles,
-						loading: false,
-					});
-			})
-			.catch(error => {
-				if (alive && modelOwnerRef.current === owner)
-					setModelCatalog({
-						sessionId: selected,
-						generation: modelGeneration,
-						models: [],
-						loading: false,
-						error: error instanceof Error ? error.message : t("shell.modelsLoadFailed"),
-					});
+		]).then(([models, preferences]) => {
+			if (!alive || modelOwnerRef.current !== owner) return;
+			const errors = [models, preferences].flatMap(result =>
+				result.status === "rejected"
+					? [result.reason instanceof Error ? result.reason.message : t("shell.modelsLoadFailed")]
+					: [],
+			);
+			setModelCatalog({
+				sessionId: selected,
+				generation: modelGeneration,
+				models: models.status === "fulfilled" ? models.value : [],
+				// Unsupported preferences do not invalidate the owner's model registry.
+				// Leave their capabilities absent and their error visible, not fabricated.
+				...(preferences.status === "fulfilled"
+					? { roles: preferences.value.roles, profiles: preferences.value.profiles }
+					: {}),
+				loading: false,
+				...(errors.length ? { error: errors.join("\n") } : {}),
 			});
+		});
 		return () => {
 			alive = false;
 		};
@@ -1054,6 +1052,7 @@ export default function App() {
 		// Another request owns the scope; keep the intent so it retries when the scope frees.
 		if (locks.current.has(scope) || pending[scope]) return;
 		const sessionId = session.id;
+		const controlOwner = { sessionId, sessionGeneration: session.controlGeneration };
 		const { modelId, thinkingLevel, preference } = target;
 		// A level only merges into model.set when the target model declares it, so an
 		// incompatible or inherited level cannot reject the model change wholesale.
@@ -1082,14 +1081,14 @@ export default function App() {
 				}
 			}
 			if (modelId !== undefined)
-				await request("model.set", { sessionId, modelId, ...(merged ? { thinkingLevel: merged } : {}) });
+				await request("model.set", { ...controlOwner, modelId, ...(merged ? { thinkingLevel: merged } : {}) });
 			else if (thinkingLevel !== undefined) {
-				await request("thinking.set", { sessionId, level: thinkingLevel });
+				await request("thinking.set", { ...controlOwner, level: thinkingLevel });
 				return;
 			}
 			// The model change is committed first; a level it does not declare is offered
 			// to the host afterwards so the real reason surfaces instead of being dropped.
-			if (followUp !== undefined) await request("thinking.set", { sessionId, level: followUp });
+			if (followUp !== undefined) await request("thinking.set", { ...controlOwner, level: followUp });
 		}).finally(() => {
 			// The optimistic value stays visible until the host answers; then the host value
 			// takes over, and a rejection leaves its error on this same scope.
@@ -1164,6 +1163,7 @@ export default function App() {
 	const send = () => {
 		if (!session || !connected || unsentBlockedRef.current.has(session.id)) return;
 		const sessionId = session.id;
+		const sessionGeneration = session.controlGeneration;
 		const text = drafts[sessionId] || "";
 		const ownedAttachments = attachmentDrafts[sessionId] ?? [];
 		if (!text.trim() && ownedAttachments.length === 0) return;
@@ -1185,6 +1185,7 @@ export default function App() {
 			const id = crypto.randomUUID();
 			const params = {
 				sessionId,
+				sessionGeneration,
 				text,
 				...(attachments.length ? { attachments } : {}),
 				...(queued ? { deliverAs: "steer" as const } : {}),
@@ -1304,10 +1305,12 @@ export default function App() {
 		// through the same queue-aware prompt path as the composer so it is never
 		// dropped when a run is active.
 		if (!text.trimStart().startsWith("/")) {
-			const queued = session?.status === "running" || session?.status === "waiting";
+			const owner = snapshot?.sessions.find(item => item.id === sessionId);
+			const sessionGeneration = owner?.controlGeneration ?? null;
+			const queued = owner?.status === "running" || owner?.status === "waiting";
 			void run(`command:${sessionId}`, async () => {
 				const id = crypto.randomUUID();
-				const params = { sessionId, text, ...(queued ? { deliverAs: "steer" as const } : {}) };
+				const params = { sessionId, sessionGeneration, text, ...(queued ? { deliverAs: "steer" as const } : {}) };
 				validateDesktopRequest("prompt", params, id);
 				const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
 				const commit = recoveryWork.current.then(async () => {
@@ -1667,6 +1670,7 @@ export default function App() {
 	};
 	const modelControls = (owner: DesktopSession) => {
 		const ownerKey = `${owner.id}:${owner.controlGeneration}`;
+		const controlOwner = { sessionId: owner.id, sessionGeneration: owner.controlGeneration };
 		const modelScope = `model:${ownerKey}`;
 		const thinkingScope = `thinking:${ownerKey}`;
 		const deferred = deferredSelection?.ownerKey === ownerKey ? deferredSelection : null;
@@ -1708,7 +1712,7 @@ export default function App() {
 				<ModelPicker
 					key={ownerKey}
 					models={catalog?.models ?? []}
-					roles={catalog?.roles ?? []}
+					roles={catalog?.roles}
 					profiles={catalog?.profiles}
 					onConfigureProviders={() => openSettingsTab("account")}
 					selectedId={deferred?.modelId ?? owner.model}
@@ -1719,51 +1723,66 @@ export default function App() {
 					}}
 					refreshing={catalog?.loading === true}
 					loading={loadingModels}
-					onApplyProfile={(profileId, scope) => {
-						if (modelOwnerRef.current !== ownerKey) return;
-						const action: DesktopPreferenceAction = { type: "profile.select", name: profileId, scope };
-						routePreference(
-							action,
-							() =>
-								void run(modelScope, async () => {
-									await request<DesktopPreferenceResult>("preferences.apply", { sessionId: owner.id, action });
-									if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
-								}),
-						);
-					}}
+					onApplyProfile={
+						catalog?.profiles
+							? (profileId, scope) => {
+									if (modelOwnerRef.current !== ownerKey) return;
+									const action: DesktopPreferenceAction = { type: "profile.select", name: profileId, scope };
+									routePreference(
+										action,
+										() =>
+											void run(modelScope, async () => {
+												await request<DesktopPreferenceResult>("preferences.apply", {
+													sessionId: owner.id,
+													action,
+												});
+												if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+											}),
+									);
+								}
+							: undefined
+					}
 					pending={pending[modelScope]}
 					applying={changing}
 					onSelect={modelId => {
 						if (modelOwnerRef.current !== ownerKey) return;
 						route(
-							() => void call("model.set", { sessionId: owner.id, modelId }, modelScope),
+							() => void call("model.set", { ...controlOwner, modelId }, modelScope),
 							() => deferModel(modelId),
 						);
 					}}
-					onAssign={(role, modelId, scope) => {
-						if (modelOwnerRef.current !== ownerKey) return;
-						if (role !== "default" && scope !== "session") return;
-						if (role === "default" && modelId !== null && scope === "session") {
-							route(
-								() =>
-									void run(modelScope, async () => {
-										await request("model.set", { sessionId: owner.id, modelId });
-										if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
-									}),
-								() => deferModel(modelId),
-							);
-							return;
-						}
-						const action: DesktopPreferenceAction = { type: "role.set", role, modelId };
-						routePreference(
-							action,
-							() =>
-								void run(modelScope, async () => {
-									await request<DesktopPreferenceResult>("preferences.apply", { sessionId: owner.id, action });
-									if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
-								}),
-						);
-					}}
+					onAssign={
+						catalog?.roles
+							? (role, modelId, scope) => {
+									if (modelOwnerRef.current !== ownerKey) return;
+									if (role !== "default" && scope !== "session") return;
+									if (role === "default" && modelId !== null && scope === "session") {
+										route(
+											() =>
+												void run(modelScope, async () => {
+													await request("model.set", { ...controlOwner, modelId });
+													if (modelOwnerRef.current === ownerKey)
+														setModelCatalogRevision(value => value + 1);
+												}),
+											() => deferModel(modelId),
+										);
+										return;
+									}
+									const action: DesktopPreferenceAction = { type: "role.set", role, modelId };
+									routePreference(
+										action,
+										() =>
+											void run(modelScope, async () => {
+												await request<DesktopPreferenceResult>("preferences.apply", {
+													sessionId: owner.id,
+													action,
+												});
+												if (modelOwnerRef.current === ownerKey) setModelCatalogRevision(value => value + 1);
+											}),
+									);
+								}
+							: undefined
+					}
 				/>
 				<ReasoningSelect
 					thinking={
@@ -1776,7 +1795,7 @@ export default function App() {
 					onChange={level => {
 						if (modelOwnerRef.current !== ownerKey) return;
 						route(
-							() => void call("thinking.set", { sessionId: owner.id, level }, thinkingScope),
+							() => void call("thinking.set", { ...controlOwner, level }, thinkingScope),
 							() => deferThinking(level),
 						);
 					}}
@@ -2612,7 +2631,13 @@ export default function App() {
 								value={drafts[selected] || ""}
 								onChange={value => changeText(selected, () => value)}
 								onSend={send}
-								onStop={() => void call("abort", { sessionId: selected }, `abort:${selected}`)}
+								onStop={() =>
+									void call(
+										"abort",
+										{ sessionId: session.id, sessionGeneration: session.controlGeneration },
+										`abort:${session.id}`,
+									)
+								}
 								busy={session.status === "running" || session.status === "waiting"}
 								onSlash={openCommands}
 								disabled={!connected || busyDrafts[session.id]}
