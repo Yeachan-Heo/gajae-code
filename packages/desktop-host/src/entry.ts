@@ -31,6 +31,6 @@ if (internal === BASH_SHELL_WORKER_ARG) {
 } else {
 	// Imported here so the desktop environment policy runs only for a real host
 	// launch, never inside an internal worker process.
-	const { main } = await import("./index");
-	await main();
+	const { runDesktopHostProcess } = await import("./index");
+	await runDesktopHostProcess();
 }

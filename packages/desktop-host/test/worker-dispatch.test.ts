@@ -64,14 +64,82 @@ describe("desktop host internal worker modes", () => {
 			const child = Bun.spawn([process.execPath, entry, "sdk", "--help"], {
 				cwd: root,
 				env: { HOME: home, PATH: "/usr/bin:/bin" },
-				stdin: "ignore", stdout: "pipe", stderr: "pipe",
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
 			});
-			const [code, output, errors] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+			const [code, output, errors] = await Promise.all([
+				child.exited,
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
 			expect({ code, errors }).toEqual({ code: 0, errors: "" });
 			expect(output).toContain('"id":"sdk/overview/summary"');
 			expect(output).not.toContain('"type":"fatal"');
-		} finally { await fs.rm(home, { recursive: true, force: true }); }
+		} finally {
+			await fs.rm(home, { recursive: true, force: true });
+		}
 	}, 30_000);
+
+	for (const source of [entry, path.join(root, "packages/desktop-host/src/index.ts")]) {
+		for (const exitCode of [0, 7]) {
+			test(`${path.basename(source)} joins process cleanup and preserves exit ${exitCode}`, async () => {
+				const home = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-process-cleanup-"));
+				const marker = path.join(home, "cleanup-completed");
+				const preload = path.join(home, "preload.ts");
+				let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+				let deadline: Timer | undefined;
+				try {
+					await Bun.write(
+						preload,
+						`import { postmortem } from ${JSON.stringify(path.join(root, "packages/utils/src/index.ts"))};
+process.exitCode = ${exitCode};
+const timer = setInterval(() => {}, 1000);
+postmortem.register("desktop-lifetime-fixture", async () => { clearInterval(timer); await Bun.write(${JSON.stringify(marker)}, "completed"); });
+`,
+					);
+					child = Bun.spawn([process.execPath, "--preload", preload, source], {
+						cwd: root,
+						env: {
+							HOME: home,
+							PATH: "/usr/bin:/bin",
+							GJC_DESKTOP_ISOLATED: "1",
+							GJC_DESKTOP_DATA_DIR: path.join(home, "data"),
+						},
+						stdin: "pipe",
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					const owned = child;
+					deadline = setTimeout(() => owned.kill("SIGKILL"), 15_000);
+					child.stdin.write(`${JSON.stringify({ id: "cleanup", method: "shutdown", params: {} })}\n`);
+					await child.stdin.flush();
+					child.stdin.end();
+					const [code, output, errors] = await Promise.all([
+						child.exited,
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+					]);
+					expect({ code, errors }).toEqual({ code: exitCode, errors: "" });
+					const frames = output
+						.trim()
+						.split("\n")
+						.map(line => JSON.parse(line) as Record<string, unknown>);
+					expect(frames.find(frame => frame.type === "response" && frame.id === "cleanup")).toMatchObject({
+						ok: true,
+					});
+					expect(await Bun.file(marker).text()).toBe("completed");
+				} finally {
+					if (deadline) clearTimeout(deadline);
+					if (child?.exitCode === null) {
+						child.kill("SIGKILL");
+						await child.exited;
+					}
+					await fs.rm(home, { recursive: true, force: true });
+				}
+			}, 25_000);
+		}
+	}
 
 	test("answers the guardian handshake with an authenticated record", async () => {
 		const { record, token } = await handshake("--internal-bash-shell-worker");

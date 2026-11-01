@@ -199,6 +199,7 @@ try {
 		throw new Error(`Bundled workflow command failed: ${JSON.stringify(operation)}`);
 	shutdownExpected = true;
 	await request("shutdown");
+	await bounded(Promise.resolve(child.stdin.end()), 5000, "Host input shutdown");
 	const code = await bounded(child.exited, 10_000, "Host shutdown exit");
 	await bounded(readFrames, 5000, "Host final frame drain");
 	if (readerFailure) throw readerFailure;

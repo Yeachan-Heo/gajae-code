@@ -1,4 +1,5 @@
 import "./environment";
+import { postmortem } from "@gajae-code/utils";
 import { createFrameWriter, createWritableFrameSink } from "./frame-writer";
 import { DesktopHost } from "./host";
 import { registerDesktopProcessShutdown } from "./process-lifecycle";
@@ -62,4 +63,10 @@ export async function main(): Promise<void> {
 	}
 }
 
-if (import.meta.main) await main();
+/** Process entrypoints also retire SDK-global workers after session/frame teardown. */
+export async function runDesktopHostProcess(): Promise<void> {
+	await main();
+	await postmortem.quit(Number(process.exitCode ?? 0));
+}
+
+if (import.meta.main) await runDesktopHostProcess();
