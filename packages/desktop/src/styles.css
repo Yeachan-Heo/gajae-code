@@ -445,7 +445,13 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-toolbar { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
 .model-toolbar > .model-search { flex: 1; min-width: 0; height: 36px; margin: 0; }
 .model-refresh { flex: none; width: 36px; height: 36px; min-height: 0; padding: 0; }
-.preset-roles { display: flex; flex-direction: column; gap: 2px; font-size: 0.75rem; color: var(--muted); }
+/* One role per line: the role reads as the same tag the model list uses, and its selector sits
+   at the right edge so a column of presets can be scanned down the selectors. */
+.preset-roles { display: flex; flex-direction: column; gap: 3px; font-size: 0.75rem; color: var(--muted); }
+.preset-role { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* The role name never wraps or shrinks; the selector beside it gives way instead. */
+.preset-role .model-role-tag { flex: none; white-space: nowrap; }
+.preset-role-model { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preset-group-list { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; }
 .preset-group { min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
 .preset-group-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px; padding: 6px 10px; border: 0; background: transparent; text-align: left; }
@@ -542,7 +548,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-role-reason { flex-basis: 100%; }
 .model-role-clear { font-size: 0.75rem; }
 .model-favorites-error { color: var(--error); font-size: 0.75rem; }
-.model-option-main { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 4px; }
+.model-option-main { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 4px; /* The row's text owns the full width so a role's selector can right-align against it. */ align-self: stretch; }
 .model-option-main strong { font-weight: 600; overflow-wrap: anywhere; }
 .model-option-main small { font-size: 0.75rem; color: var(--muted); overflow-wrap: anywhere; }
 .model-empty { padding: 24px 16px; border: 1px dashed var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); }

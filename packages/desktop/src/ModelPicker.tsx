@@ -484,8 +484,16 @@ export function ModelPicker({
 																				{entries.length > 0 && (
 																					<span className="preset-roles">
 																						{entries.map(entry => (
-																							<span key={entry.id}>
-																								· {entry.label} {entry.model}
+																							<span className="preset-role" key={entry.id}>
+																								<span className="model-role-tag">
+																									{entry.label}
+																								</span>
+																								<span
+																									className="preset-role-model"
+																									title={entry.model}
+																								>
+																									{entry.model}
+																								</span>
 																							</span>
 																						))}
 																					</span>

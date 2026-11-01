@@ -177,8 +177,18 @@ describe("mounted model picker tabs", () => {
 			const presets = await page.$$eval(".model-option-hit", nodes => nodes.map(node => node.textContent ?? ""));
 			expect(presets).toHaveLength(2);
 			expect(presets[0]).toContain("Focused");
-			expect(presets[0]).toContain("Default anthropic/claude-sonnet");
-			expect(presets[0]).toContain("Executor anthropic/claude-haiku");
+			// One line per role: its label as a tag, its selector beside it.
+			expect(
+				await page.$$eval(".model-result-list li:first-child .preset-role", rows =>
+					rows.map(row => [
+						row.querySelector(".model-role-tag")?.textContent,
+						row.querySelector(".preset-role-model")?.textContent,
+					]),
+				),
+			).toEqual([
+				["Default", "anthropic/claude-sonnet"],
+				["Executor", "anthropic/claude-haiku"],
+			]);
 			expect(presets[0]).not.toContain("Planner");
 			expect(presets[1]).toContain("Active");
 			expect(presets[1]).toContain("Default profile");
@@ -316,6 +326,54 @@ describe("mounted model picker tabs", () => {
 				{ name: "A live", dimmed: false },
 				{ name: "A dead", dimmed: true },
 			]);
+		} finally { await closeComponentFixture(context, page); }
+	}, 30000);
+
+	test("a preset states each role as a tag and right-aligns its model selector", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [
+				profile("focused", "Focused", [
+					{ id: "default", model: "openai-codex/gpt-6-astra:medium" },
+					{ id: "executor", model: "openai-codex/gpt-6-astra:low" },
+					{ id: "planner", model: null },
+				]),
+			]);
+			await open(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-group-head");
+			await page.click(".preset-group-head");
+			await page.waitForSelector(".preset-role");
+			expect(
+				await page.$$eval(".preset-role", rows =>
+					rows.map(row => ({
+						tag: row.querySelector(".model-role-tag")?.textContent,
+						model: row.querySelector(".preset-role-model")?.textContent,
+					})),
+				),
+			).toEqual([
+				{ tag: "Default", model: "openai-codex/gpt-6-astra:medium" },
+				{ tag: "Executor", model: "openai-codex/gpt-6-astra:low" },
+			]);
+			// The old line prefixed every role with a middle dot; the tag replaces it entirely.
+			expect(await page.$eval(".preset-roles", node => node.textContent)).not.toContain("·");
+			// A column of presets is scanned down the right edge, so every selector ends together.
+			const geometry = await page.$$eval(".preset-role", rows =>
+				rows.map(row => {
+					const rowBox = row.getBoundingClientRect();
+					const tag = row.querySelector(".model-role-tag")!.getBoundingClientRect();
+					const model = row.querySelector(".preset-role-model")!.getBoundingClientRect();
+					return {
+						rowRight: Math.round(rowBox.right),
+						modelRight: Math.round(model.right),
+						tagLeft: Math.round(tag.left) - Math.round(rowBox.left),
+						modelStartsAfterTag: model.left >= tag.right,
+					};
+				}),
+			);
+			expect(geometry.every(item => Math.abs(item.modelRight - item.rowRight) <= 1)).toBe(true);
+			expect(geometry.every(item => item.modelStartsAfterTag)).toBe(true);
+			expect(geometry.map(item => item.tagLeft)).toEqual([0, 0]);
 		} finally { await closeComponentFixture(context, page); }
 	}, 30000);
 
