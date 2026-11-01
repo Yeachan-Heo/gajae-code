@@ -171,8 +171,10 @@ export function ModelPicker({
 		.map(item => item.model);
 	const filteredProfiles = filterProfiles(profileList, presetQuery);
 	// Preset providers mirror the terminal: one collapsed header per family, expanded on demand.
-	// A search expands every group, so a match is never hidden behind a collapsed header. Groups
-	// follow the terminal's own order; families it does not list come last, alphabetically.
+	// A search expands every group, so a match is never hidden behind a collapsed header. A family
+	// whose providers are all unregistered sinks below every family that can still be selected,
+	// the same move an individual preset makes; within each tier the terminal's order wins, and
+	// families it does not list come last, alphabetically.
 	const searchingPresets = presetQuery.trim().length > 0;
 	const presetGroups = ((): [string, DesktopModelProfile[]][] => {
 		const groups = new Map<string, { rank: number; members: DesktopModelProfile[] }>();
@@ -188,8 +190,14 @@ export function ModelPicker({
 				members: [profile],
 			});
 		}
+		const usable = (members: DesktopModelProfile[]) => members.some(profile => profile.available);
 		return [...groups.entries()]
-			.sort((left, right) => left[1].rank - right[1].rank || left[0].localeCompare(right[0]))
+			.sort(
+				(left, right) =>
+					Number(usable(right[1].members)) - Number(usable(left[1].members)) ||
+					left[1].rank - right[1].rank ||
+					left[0].localeCompare(right[0]),
+			)
 			.map(([name, group]) => [
 				name,
 				group.members.slice().sort(
@@ -409,8 +417,15 @@ export function ModelPicker({
 									{presetGroups.map(([group, members]) => {
 										const expanded = groupOpen(group);
 										const holdsActive = groupHoldsActive(members);
+										// A family with nothing selectable inside is marked like its members, so the
+										// dimming starts at the header instead of appearing after a click.
+										const selectable = members.some(profile => profile.available);
 										return (
-											<li className="preset-group" key={group} data-active={holdsActive || undefined}>
+											<li
+												className={`preset-group${selectable ? "" : " preset-unavailable"}`}
+												key={group}
+												data-active={holdsActive || undefined}
+											>
 												<Button
 													className="preset-group-head"
 													aria-expanded={expanded}

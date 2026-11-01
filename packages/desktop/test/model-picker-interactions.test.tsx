@@ -236,11 +236,16 @@ describe("mounted model picker tabs", () => {
 			await open(page);
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
 			await page.waitForSelector(".preset-group");
+			// A family with nothing selectable inside sinks below the ones that still work, even
+			// though the terminal ranks it ahead of CUSTOM.
 			expect(await page.$$eval(".preset-group-head", heads => heads.map(head => head.textContent?.replace(/\d+ presets?/, "").trim()))).toEqual([
 				"CODEX",
-				"macOS Local (oMLX)",
 				"CUSTOM",
+				"macOS Local (oMLX)",
 			]);
+			expect(
+				await page.$$eval(".preset-group", groups => groups.map(group => group.classList.contains("preset-unavailable"))),
+			).toEqual([false, false, true]);
 			// The family holding the current preset is marked, so it is findable while collapsed.
 			expect(await page.$$eval(".preset-group", groups => groups.map(group => group.hasAttribute("data-active")))).toEqual([
 				true,
@@ -269,6 +274,48 @@ describe("mounted model picker tabs", () => {
 					};
 				}),
 			).toEqual({ apply: true, star: true, text: "Codex B" });
+		} finally { await closeComponentFixture(context, page); }
+	}, 30000);
+
+	test("a family is only dimmed when none of its presets can be selected", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [
+				// Terminal order A, B, C, D; B and D have no usable provider anywhere inside them.
+				profile("a-live", "A live", [], { group: "ALPHA", groupRank: 0 }),
+				profile("a-dead", "A dead", [], { group: "ALPHA", groupRank: 0, available: false }),
+				profile("b-dead", "B dead", [], { group: "BRAVO", groupRank: 1, available: false }),
+				profile("c-live", "C live", [], { group: "CHARLIE", groupRank: 2 }),
+				profile("d-dead", "D dead", [], { group: "DELTA", groupRank: 3, available: false }),
+			]);
+			await open(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			await page.waitForSelector(".preset-group");
+			expect(
+				await page.$$eval(".preset-group", groups =>
+					groups.map(group => ({
+						name: group.querySelector("strong")?.textContent,
+						dimmed: group.classList.contains("preset-unavailable"),
+					})),
+				),
+			).toEqual([
+				{ name: "ALPHA", dimmed: false },
+				{ name: "CHARLIE", dimmed: false },
+				{ name: "BRAVO", dimmed: true },
+				{ name: "DELTA", dimmed: true },
+			]);
+			// One usable preset keeps its whole family bright, and the unusable member inside it
+			// still dims on its own row.
+			await page.click(".preset-group-head");
+			await page.waitForSelector(".preset-group .model-result-row");
+			expect(
+				await page.$$eval(".preset-group:first-child .model-result-row", rows =>
+					rows.map(row => ({ name: row.querySelector("strong")?.textContent, dimmed: row.classList.contains("preset-unavailable") })),
+				),
+			).toEqual([
+				{ name: "A live", dimmed: false },
+				{ name: "A dead", dimmed: true },
+			]);
 		} finally { await closeComponentFixture(context, page); }
 	}, 30000);
 

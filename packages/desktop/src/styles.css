@@ -455,6 +455,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
    and surface instead of prose that would take a row from every entry. */
 .preset-unavailable { opacity: 0.5; }
 .preset-unavailable .model-option { border-color: var(--border-soft); background: transparent; }
+/* A family with no selectable preset dims from its header down, and the header keeps its surface
+   so the group still reads as a group rather than a floating label. */
+.preset-group.preset-unavailable { background: transparent; }
+.preset-group.preset-unavailable .preset-group-head { cursor: not-allowed; }
 .preset-unavailable .model-option-hit:disabled, .preset-unavailable .model-favorite:disabled { cursor: not-allowed; opacity: 1; }
 .select-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 /* The tab bar stays pinned while only the active panel scrolls. */
