@@ -10,7 +10,6 @@ import * as installActivation from "../src/cli/install-activation";
 import {
 	buildActivationRecord,
 	createActivationRecordFile,
-	InstallationAclPresentError,
 	readActivationRecord,
 	snapshotDirectory,
 	snapshotRegularFile,
@@ -1919,38 +1918,16 @@ async function replaceBinaryFixture(options: Omit<BinaryReplacementOptions, "ori
 }
 
 describe("update-cli binary replacement", () => {
-	it("distinguishes an activation-record ACL failure from a binary rollback ACL failure", () => {
-		const acl = new InstallationAclPresentError("record", "staging", {
-			aclFailurePrincipal: "SandboxUsers",
-			aclFailureInherited: false,
-		});
-		const message = formatInstallationRollbackAclError(
-			new AggregateError([new Error("primary"), acl], "installation_rollback_unverified"),
-		);
-		expect(message).toContain("rollback activation record update failed");
-		expect(message).toContain("SandboxUsers");
-		expect(message).not.toContain("gjc update");
-	});
-
-	it("removes retry instructions from an ACL primary when binary rollback is blocked", () => {
-		const detail = { aclFailurePrincipal: "SandboxUsers", aclFailureInherited: false };
-		const primary = new InstallationAclPresentError("record", "staging", detail);
-		const rollback = new InstallationRollbackAclPresentError("binary", "backup  two", detail, false);
-		const message = formatInstallationRollbackAclError(
-			new AggregateError([primary, rollback], "installation_rollback_unverified"),
-		);
-		expect(message).toContain("record");
-		expect(message).toContain("binary");
-		expect(message).toContain("backup  two");
-		expect(message).not.toContain("gjc update");
-		expect(message).not.toContain("icacls");
-	});
-
 	it("reports a postcheck identity conflict without disclosing unknown primary errors", () => {
-		const rollback = new InstallationAclPresentError("record", "record-stage", {
-			aclFailurePrincipal: "S-1-5-32-545",
-			aclFailureInherited: false,
-		});
+		const rollback = new InstallationRollbackAclPresentError(
+			"binary",
+			"backup  two",
+			{
+				aclFailurePrincipal: "S-1-5-32-545",
+				aclFailureInherited: false,
+			},
+			false,
+		);
 		const conflict = new AggregateError(
 			[new Error("installation_postcheck_identity_changed"), rollback],
 			"installation_rollback_unverified",
@@ -1964,48 +1941,8 @@ describe("update-cli binary replacement", () => {
 		);
 		expect(formatInstallationRollbackAclError(unknown)).toContain("unclassified installation failure");
 		expect(formatInstallationRollbackAclError(unknown)).not.toContain("private-primary-sentinel");
-	});
-
-	it("reports a rolled-back record ACL failure after removing a newly installed target", async () => {
-		const dir = await makeTempDir();
-		const targetPath = path.join(dir, "gjc");
-		const tempPath = `${targetPath}.new`;
-		await writeFixtureFile(tempPath, "new binary");
-		const updateRecord = installActivation.updateActivationRecordFile;
-		const recordSpy = vi
-			.spyOn(installActivation, "updateActivationRecordFile")
-			.mockImplementation(async (record, identity) => {
-				if (record.phase === "rolled_back")
-					throw new InstallationAclPresentError("record", "record-stage", {
-						aclFailurePrincipal: "RecordUsers",
-						aclFailureInherited: false,
-					});
-				return updateRecord(record, identity);
-			});
-		try {
-			let failure: unknown;
-			try {
-				await replaceBinaryFixture({
-					targetPath,
-					tempPath,
-					backupPath: `${targetPath}.bak`,
-					expectedVersion: "1.2.3",
-					verifyInstalledVersion: async () => {
-						throw new Error("verification failed");
-					},
-				});
-			} catch (error) {
-				failure = error;
-			}
-			expect(formatInstallationRollbackAclError(failure)).toContain("rollback activation record update failed");
-			expect(formatInstallationRollbackAclError(failure)).toContain("RecordUsers");
-			expect(await Bun.file(targetPath).exists()).toBe(false);
-			const record = await readActivationRecord(targetPath);
-			expect(record.status).toBe("valid");
-			if (record.status === "valid") expect(record.record.phase).toBe("uncertain");
-		} finally {
-			recordSpy.mockRestore();
-		}
+		expect(formatInstallationRollbackAclError(unknown)).toContain("backup  two");
+		expect(formatInstallationRollbackAclError(unknown)).not.toContain("icacls");
 	});
 
 	it("supersedes a pre-promotion record for an older candidate instead of refusing the newer release (#6096)", async () => {
@@ -2939,9 +2876,16 @@ describe("update-cli binary replacement", () => {
 		await writeFixtureFile(targetPath, "old binary");
 		await writeFixtureFile(tempPath, "new binary");
 		const replaceNative = native.exactReplaceRetained;
+		const snapshot = installActivation.snapshotRegularFile;
+		let rollbackRefused = false;
+		const snapshotSpy = vi.spyOn(installActivation, "snapshotRegularFile").mockImplementation(async file => {
+			if (rollbackRefused && file === targetPath) throw new Error("post-rollback snapshot failed");
+			return snapshot(file);
+		});
 		let calls = 0;
 		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
 			if (calls++ === 0) return replaceNative(...args);
+			rollbackRefused = true;
 			return {
 				ok: false,
 				code: "acl_present",
@@ -2995,6 +2939,7 @@ describe("update-cli binary replacement", () => {
 		} finally {
 			errorSpy.mockRestore();
 			replaceSpy.mockRestore();
+			snapshotSpy.mockRestore();
 		}
 	});
 

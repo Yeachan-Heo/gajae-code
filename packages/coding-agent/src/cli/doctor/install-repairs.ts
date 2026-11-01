@@ -329,7 +329,7 @@ export async function repairStandaloneBinary(
 		const rollbackAcl =
 			error instanceof AggregateError &&
 			error.message === "installation_rollback_unverified" &&
-			error.errors[1] instanceof InstallationAclPresentError
+			error.errors[1] instanceof InstallationRollbackAclPresentError
 				? error.errors[1]
 				: undefined;
 		const rawPrincipal = rollbackAcl?.detail.aclFailurePrincipal;
@@ -339,22 +339,10 @@ export async function repairStandaloneBinary(
 				: undefined;
 		const side = rollbackAcl?.detail.aclFailureSide;
 		const inherited = rollbackAcl?.detail.aclFailureInherited;
-		const rollbackStage =
-			rollbackAcl instanceof InstallationRollbackAclPresentError
-				? "binary rollback"
-				: "activation record update during rollback";
 		const artifact =
-			side === "source"
-				? rollbackAcl instanceof InstallationRollbackAclPresentError
-					? "retained backup"
-					: "temporary activation record"
-				: side === "destination"
-					? rollbackAcl instanceof InstallationRollbackAclPresentError
-						? "installed binary"
-						: "activation record"
-					: "unknown artifact";
+			side === "source" ? "retained backup" : side === "destination" ? "installed binary" : "unknown artifact";
 		const rollbackDiagnostic = rollbackAcl
-			? `Installation failed; ${rollbackStage} was blocked by an ${inherited === true ? "inherited" : inherited === false ? "explicit" : "unknown"} ACL on the ${artifact}${principal ? ` for SID ${principal}` : "; principal omitted"}. Inspect the selected binary's installation directory and activation record locally before retrying.`
+			? `Installation failed; binary rollback was blocked by an ${inherited === true ? "inherited" : inherited === false ? "explicit" : "unknown"} ACL on the ${artifact}${principal ? ` for SID ${principal}` : "; principal omitted"}. Inspect the selected binary's installation directory and activation record locally before retrying.`
 			: undefined;
 		const repointError = error instanceof ActivationRetryCandidateRepointError ? error : undefined;
 		const reason = pendingActivation

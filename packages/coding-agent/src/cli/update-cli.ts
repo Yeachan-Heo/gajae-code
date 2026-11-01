@@ -1229,9 +1229,9 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					toNativeIdentity(record.backupIdentity),
 					toNativeIdentity(record.targetIdentity),
 				);
-				const observed = await snapshotRegularFile(targetPath);
 				if (!restored.ok && restored.code === "acl_present")
 					throw new InstallationRollbackAclPresentError(targetPath, backupPath, restored, false);
+				const observed = await snapshotRegularFile(targetPath);
 				if (!restored.ok || !observed || !sameFileIdentity(record.backupIdentity, observed.identity))
 					throw new Error("rollback_unverified");
 				await updateActivationRecordFile(
@@ -1273,7 +1273,7 @@ function describeAclFailure(error: InstallationAclPresentError): string {
 export function formatInstallationRollbackAclError(error: unknown): string | undefined {
 	if (!(error instanceof AggregateError) || error.message !== "installation_rollback_unverified") return undefined;
 	const [primary, rollback] = error.errors;
-	if (!(rollback instanceof InstallationAclPresentError)) return undefined;
+	if (!(rollback instanceof InstallationRollbackAclPresentError)) return undefined;
 	const primaryMessage =
 		primary instanceof InstallationAclPresentError
 			? describeAclFailure(primary)
@@ -1282,9 +1282,7 @@ export function formatInstallationRollbackAclError(error: unknown): string | und
 				: primary instanceof Error && primary.message === "installation_postcheck_identity_changed"
 					? "installed target identity changed after verification"
 					: "unclassified installation failure";
-	const rollbackStage =
-		rollback instanceof InstallationRollbackAclPresentError ? "binary restore" : "activation record update";
-	return `${error}: Inspect the uncertain activation before retrying. Primary failure: ${primaryMessage}; rollback ${rollbackStage} failed: ${describeAclFailure(rollback)}`;
+	return `${error}: Inspect the uncertain activation before retrying. Primary failure: ${primaryMessage}; rollback binary restore failed: ${describeAclFailure(rollback)}`;
 }
 
 function formatPackageManagerInstallFailure(
