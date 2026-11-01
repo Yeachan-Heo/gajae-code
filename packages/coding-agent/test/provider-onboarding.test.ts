@@ -402,7 +402,7 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "https://cloudgpu.app/v1",
 			api: "openai-completions",
 			apiKeyEnv: "CLOUDGPU_API_KEY",
-			discovery: { type: "openai-models-list" },
+			discovery: { type: "openai-models-list", outputModalities: ["text"], inputModalities: ["text"] },
 		});
 		expect(result.modelIds).toEqual([]);
 		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
@@ -411,7 +411,11 @@ describe("provider onboarding setup core", () => {
 			supportsDeveloperRole: false,
 			reasoningContentField: "reasoning_content",
 		});
-		expect(findProviderPreset("cloudgpu")?.discovery).toEqual({ type: "openai-models-list" });
+		expect(findProviderPreset("cloudgpu")?.discovery).toEqual({
+			type: "openai-models-list",
+			outputModalities: ["text"],
+			inputModalities: ["text"],
+		});
 		expect(findProviderPreset("cloudgpu-app")?.id).toBe("cloudgpu");
 	});
 
