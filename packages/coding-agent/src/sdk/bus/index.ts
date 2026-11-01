@@ -6201,14 +6201,11 @@ export function createNotificationsExtension(
 				}
 				deliverCorrelatedFrame(submission, frame);
 			}
-			// Broker-created hosts use this bus, not the SDK-only extension. Observers
-			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Broker-created hosts use this bus, not the SDK-only extension. Stream
+			// connections opt into turn_stream and receive no other client's correlation.
 			// Keep cumulative partialResult snapshots and authoritative final result
 			// intact, and off the durable lifecycle replay ring, like owner content.
-			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
-				TURN_STREAM_CAPABILITY,
-				SESSION_HOST_OBSERVER_CAPABILITY,
-			]) ?? []) {
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]) ?? []) {
 				if (owners.has(connectionId)) continue;
 				try {
 					sdkRuntime?.sendFrameTo(connectionId, {
