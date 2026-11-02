@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	BROKER_UNIT,
+	discoverLoginPath,
 	GATEWAY_UNIT,
 	installServices,
 	restartStackCommands,
@@ -188,4 +189,96 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 	}
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
+});
+
+test("discoverLoginPath uses SHELL when set and executable", async () => {
+	const env = { SHELL: "/bin/sh" };
+	let ranCommand: string[] | undefined;
+	const runner = async (command: readonly string[]) => {
+		ranCommand = [...command];
+		if (command[0] === "/bin/sh") return "exported PATH value";
+		throw new Error("not reached");
+	};
+
+	const result = await discoverLoginPath(env, runner);
+
+	expect(result).toBe("exported PATH value");
+	expect(ranCommand).toEqual(["/bin/sh", "-lc", 'printf %s "$PATH"']);
+});
+
+test("discoverLoginPath falls back from SHELL to passwd shell", async () => {
+	const env = { SHELL: "/bin/nonexistent" };
+	const runner = async (command: readonly string[]) => {
+		// First call with SHELL fails.
+		if (command[0] === "/bin/nonexistent") throw new Error("no such file");
+		// Second call with passwd shell succeeds.
+		if (command[0] === "/bin/bash") return "exported PATH value";
+		throw new Error("unexpected command");
+	};
+
+	const result = await discoverLoginPath(env, runner);
+
+	// Falls back to /bin/bash (since we can't mock userInfo()).
+	expect(result).toBe("exported PATH value");
+});
+
+test("discoverLoginPath falls back through candidates in order", async () => {
+	const env: NodeJS.ProcessEnv = {};
+	const runner = async (command: readonly string[]) => {
+		// Fail on first two candidates, succeed on /bin/bash.
+		if (command[0] === "/bin/bash") return "success from /bin/bash";
+		throw new Error("no such shell");
+	};
+
+	const result = await discoverLoginPath(env, runner);
+
+	expect(result).toBe("success from /bin/bash");
+});
+
+test("discoverLoginPath returns empty string when all shells fail", async () => {
+	const env: NodeJS.ProcessEnv = {};
+	const runner = async () => {
+		throw new Error("all shells unavailable");
+	};
+
+	const result = await discoverLoginPath(env, runner);
+
+	expect(result).toBe("");
+});
+
+test("installServices succeeds even when shell discovery returns empty", async () => {
+	const { home, cleanup } = await configuredHome();
+	const binDir = join(home, "bin");
+	const written = new Map<string, string>();
+	try {
+		await mkdir(binDir);
+		for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+
+		const failingRunner = async () => {
+			throw new Error("shell discovery failed");
+		};
+
+		const paths = await installServices({
+			binDir,
+			platform: "linux",
+			unitDir: join(home, "units"),
+			env: { HOME: home, GAJAEWAY_HOME: home },
+			loginPathRunner: failingRunner,
+			writeFile: (path, contents) => {
+				written.set(path, contents);
+			},
+		});
+
+		// Should still write all units using FALLBACK_PATH_DIRS.
+		expect(paths).toHaveLength(serviceSpecs().length);
+		expect(written.size).toBe(serviceSpecs().length);
+
+		// Verify at least one unit was written and contains fallback paths.
+		const firstUnit = [...written.values()][0] ?? "";
+		expect(firstUnit).toContain("/usr/local/bin");
+		expect(firstUnit).toContain("/usr/bin");
+		expect(firstUnit).toContain("/bin");
+	} finally {
+		await cleanup();
+	}
 });
