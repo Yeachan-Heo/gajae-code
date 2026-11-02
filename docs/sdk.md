@@ -578,13 +578,30 @@ prompt.
 `turn.abort_and_prompt` carries the same authority. When the requester does not own
 the active run (another connection's prompt, or a turn the host started itself, such
 as an interactive terminal turn), nothing is aborted: the replacement text is queued
-as a steer for the running turn and the result is
+as a steer bound to that exact running turn. Successful queue admission returns
 `{ accepted: true, commandId, turnId, aborted: false, queuedAs: "steer" }`. When the
 request carries an `idempotencyKey`, that steer is recorded durably under the key: a
 retry with the same key returns the recorded steer, with the same `commandId` and
 `turnId`, without queueing the text again or starting a replacement run, even after
 the targeted run has ended. The replacement also leaves other connections' pending
 prompt preflights in place. An owner's replacement result is unchanged.
+
+The fallback cannot target a successor run: if the captured run ends before queue
+admission, the request is rejected without delivery; an unconsumed fallback is
+removed when its target run ends rather than promoted to a follow-up. A keyed
+rejection is durable, so retrying the same key cannot send it to a later run.
+An acceptance acknowledges queue admission, not that the running model consumed
+the text. If queueing succeeded but recording acceptance failed, the result has
+`accepted: false` and `status: "uncertain"`; reconcile using the **same**
+`idempotencyKey`, never a new key that could duplicate the delivery. Reusing a key
+with different text returns `client_ref_conflict`. The `abort-and-prompt:` prefix
+is reserved for internally derived steer references; explicit `turn.steer`
+requests cannot use it as their `clientRef`.
+
+Coordinator force-send and force-delegate recovery complete synthetic turn and
+prompt-reservation cleanup before replaying a persisted steer disposition. A
+crash between recording that disposition and cleanup must not leave a phantom
+active turn blocking subsequent work.
 
 `sdk.promptDeadlineMs` defaults to `3_600_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting

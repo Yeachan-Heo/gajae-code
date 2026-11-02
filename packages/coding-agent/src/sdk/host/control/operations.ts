@@ -101,14 +101,16 @@ export interface ControlSurface {
 	revisionProvider?(resource: string): Promise<string | undefined> | string | undefined;
 }
 
+export const ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX = "abort-and-prompt:";
+
 /**
  * Durable steer clientRef for a `turn.abort_and_prompt` request that degraded to a
  * steer. It is derived from the request idempotency key, so every retry of that
- * request names the same steer reservation; the prefix keeps it disjoint from
- * clientRefs that callers choose for `turn.steer`. Without a key there is no
+ * request names the same steer reservation; dispatch reserves the prefix so it
+ * cannot collide with caller-chosen `turn.steer` clientRefs. Without a key there is no
  * stable identity and the steer is not deduplicated.
  */
 export function abortAndPromptSteerClientRef(idempotencyKey: string | undefined): string | undefined {
 	if (idempotencyKey === undefined) return undefined;
-	return `abort-and-prompt:${createHash("sha256").update(idempotencyKey).digest("hex")}`;
+	return `${ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX}${createHash("sha256").update(idempotencyKey).digest("hex")}`;
 }

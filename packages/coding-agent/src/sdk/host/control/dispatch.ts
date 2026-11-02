@@ -6,7 +6,12 @@ import {
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
-import type { ControlInput, ControlSurface, ControlValue } from "./operations";
+import {
+	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
+	type ControlInput,
+	type ControlSurface,
+	type ControlValue,
+} from "./operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	brokerRuntimeCloseCapability,
@@ -270,6 +275,11 @@ function invoke(
 			if (!surface.imageDiscard) invalidInput("Image uploads are not installed for this session.");
 			return surface.imageDiscard(input);
 		case "turn.steer":
+			if (
+				typeof input.clientRef === "string" &&
+				input.clientRef.trim().startsWith(ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX)
+			)
+				invalidInput("The abort-and-prompt: clientRef prefix is reserved for fallback steers.");
 			return surface.steer(
 				text(input),
 				typeof input.clientRef === "string" ? input.clientRef : undefined,
