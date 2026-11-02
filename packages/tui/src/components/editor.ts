@@ -2015,6 +2015,12 @@ export class Editor implements Component, Focusable {
 					this.#tryTriggerAutocomplete();
 				}
 			}
+			// Skill slash commands have a literal colon delimiter. Trigger at the
+			// delimiter itself so inline `/skill:` suggestions appear before a name
+			// character is typed.
+			else if (char === ":" && this.#getSlashTokenBeforeCursor()?.toLowerCase().startsWith("/skill:") === true) {
+				this.#tryTriggerAutocomplete();
+			}
 			// Auto-trigger for "@" file reference (fuzzy search)
 			else if (char === "@") {
 				const currentLine = this.#state.lines[this.#state.cursorLine] || "";

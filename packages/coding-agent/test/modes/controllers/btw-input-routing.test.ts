@@ -281,4 +281,54 @@ describe("InputController /btw multi-turn routing", () => {
 			followUpQueuePolicy: "sequential",
 		});
 	});
+
+	it("loads a skill token inline in a follow-up prompt", async () => {
+		const harness = createHarness();
+		const skill = {
+			name: "demo",
+			description: "demo skill",
+			filePath: "demo.md",
+			baseDir: process.cwd(),
+			source: "user" as const,
+			disableModelInvocation: false,
+			content: "Demo skill body",
+		};
+		const ctxMut = harness.ctx as unknown as {
+			skillCommands: Map<string, typeof skill>;
+			session: {
+				sessionId: string;
+				promptCustomMessage: (message: unknown, options?: unknown) => Promise<void>;
+			};
+		};
+		ctxMut.skillCommands = new Map([["skill:demo", skill]]);
+		ctxMut.session.sessionId = "test-session";
+		const promptCustomMessage = vi.fn(async (_message: unknown, _options?: unknown) => {});
+		ctxMut.session.promptCustomMessage = promptCustomMessage;
+
+		harness.editor.setText("Please handle /skill:demo using this context");
+		await new InputController(harness.ctx).handleFollowUp();
+
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(promptCustomMessage.mock.calls[0]?.[0]).toMatchObject({
+			content: expect.stringContaining("Demo skill body"),
+			details: expect.objectContaining({ name: "demo", args: "Please handle using this context" }),
+		});
+		expect(harness.prompt).not.toHaveBeenCalled();
+	});
+
+	it("keeps an unknown inline skill token in the submitted prompt", async () => {
+		const harness = createHarness();
+		const text = "Please keep /skill:missing exactly as typed";
+		const ctxMut = harness.ctx as unknown as {
+			skillCommands: Map<string, { name: string }>;
+			withLocalSubmission: (text: string, action: () => Promise<void>) => Promise<void>;
+		};
+		ctxMut.skillCommands = new Map([["skill:demo", { name: "demo" }]]);
+		ctxMut.withLocalSubmission = async (_text, action) => action();
+
+		harness.editor.setText(text);
+		await new InputController(harness.ctx).handleFollowUp();
+
+		expect(harness.prompt).toHaveBeenCalledWith(text);
+	});
 });

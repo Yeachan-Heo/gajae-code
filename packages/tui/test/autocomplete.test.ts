@@ -495,6 +495,45 @@ describe("slash command suggestion position", () => {
 		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
 	});
 
+	it("offers inline skill suggestions without making ordinary slash commands inline", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "skill:demo", description: "Demo skill", value: "skill:demo" },
+				{ name: "model", description: "Switch model", value: "model" },
+			],
+			"/tmp",
+		);
+		const line = "explain this /skill:de";
+		const result = await provider.getSuggestions([line], 0, line.length);
+		expect(result).toMatchObject({ kind: "slash-command", prefix: "/skill:de" });
+		expect(result?.items.map(item => item.value)).toEqual(["skill:demo"]);
+
+		const startCommand = await provider.getSuggestions(["/mo"], 0, 3);
+		expect(startCommand?.kind).toBe("slash-command");
+		expect(startCommand?.items.map(item => item.value)).toContain("model");
+
+		const inlineModel = await provider.getSuggestions(["explain this /mo"], 0, "explain this /mo".length);
+		expect(inlineModel?.kind).not.toBe("slash-command");
+		expect(inlineModel?.items.map(item => item.value) ?? []).not.toContain("model");
+	});
+
+	it("applies an inline skill completion at its token and leaves path-like text alone", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "skill:demo", description: "Demo skill", value: "skill:demo" }],
+			"/tmp",
+		);
+		const line = "explain this /skill:de";
+		const suggestions = await provider.getSuggestions([line], 0, line.length);
+		const item = suggestions?.items[0];
+		if (!suggestions || !item) throw new Error("expected inline skill suggestion");
+
+		const applied = provider.applyCompletion([line], 0, line.length, item, suggestions.prefix);
+		expect(applied.lines).toEqual(["explain this /skill:demo "]);
+		expect(applied.cursorCol).toBe(applied.lines[0]?.length);
+		expect(extractSlashCommandTokenPrefix("path/skill:de")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("https://example.test/skill:de")).toBeNull();
+	});
+
 	it("preserves inline file-path suggestions after prompt text", async () => {
 		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-inline-path-test-"));
 		try {
@@ -569,6 +608,20 @@ describe("trySyncSlashCompletion", () => {
 		expect(result).not.toBeNull();
 		expect(result!.prefix).toBe("/mo");
 		expect(result!.items.map(i => i.value)).toEqual(["model"]);
+	});
+
+	it("synchronously completes inline skills but not inline ordinary commands", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "skill:demo", description: "Demo skill", value: "skill:demo" },
+				{ name: "model", description: "Switch model", value: "model" },
+			],
+			"/tmp",
+		);
+		const skillResult = provider.trySyncSlashCompletion("explain this /skill:de");
+		expect(skillResult?.prefix).toBe("/skill:de");
+		expect(skillResult?.items.map(item => item.value)).toEqual(["skill:demo"]);
+		expect(provider.trySyncSlashCompletion("explain this /model")).toBeNull();
 	});
 
 	it("matches multiple commands and sorts by relevance", () => {

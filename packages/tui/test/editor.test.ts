@@ -299,6 +299,21 @@ describe("Editor component", () => {
 			await expect(promise).resolves.toBe("/");
 		});
 
+		it("triggers skill autocomplete after prompt text", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider(
+					[{ name: "skill:demo", description: "Demo skill", value: "skill:demo" }],
+					process.cwd(),
+				),
+			);
+
+			for (const character of "explain this /skill:") editor.handleInput(character);
+			await Bun.sleep(0);
+
+			expect(editor.isAutocompleteOpen()).toBe(true);
+		});
+
 		it("triggers file-reference autocomplete when typing at-sign", async () => {
 			const editor = new Editor(defaultEditorTheme);
 			const { promise, resolve } = Promise.withResolvers<string>();
