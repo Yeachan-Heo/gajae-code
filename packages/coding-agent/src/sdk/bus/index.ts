@@ -126,7 +126,14 @@ import {
 	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
+import {
+	type AbortScope,
+	type ControlSurface,
+	createBtwAskHandler,
+	dispatchControl,
+	type EphemeralQuestionRunner,
+	TypedControlError,
+} from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
@@ -1462,6 +1469,8 @@ interface SessionRuntime {
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
 	abortEphemeralTurns: () => void;
+	/** Cancels connection-owned SDK BTW questions. */
+	abortBtwQuestions: () => void;
 }
 
 const SENSITIVE_MODEL_LABEL =
@@ -2814,6 +2823,9 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	// INTERNAL session-owned ephemeral side-question runner (`/btw`), threaded
+	// from the owning session (NOT on the public extension context).
+	askEphemeralQuestion?: EphemeralQuestionRunner,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -4030,6 +4042,7 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		askBtw: createBtwAskHandler(askEphemeralQuestion),
 		installedOperations: surfacePolicy.installedControls,
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
@@ -4811,6 +4824,7 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.abortBtwQuestions();
 			requestedRuntime.imageUploads?.close();
 			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
@@ -4857,6 +4871,7 @@ export function createNotificationsExtension(
 			rt.pendingInteractive.clear();
 			return true;
 		}
+		rt.abortBtwQuestions();
 		// Keep this exact object authoritative for the full terminal release, including
 		// the interval before a failed owner can be recorded for a later retry.
 		cleanupRetries.set(id, rt);
@@ -8145,6 +8160,14 @@ export function createNotificationsExtension(
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			// The notification daemon already owns the `/btw` runner for this
+			// session; the SDK control answers through the same ephemeral seam.
+			options.runBtwTurn === undefined
+				? undefined
+				: async (question, signal) => {
+						if (!signal) throw new Error("SDK BTW request has no lifetime signal.");
+						return (await options.runBtwTurn!(question, signal)).replyText;
+					},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -8496,7 +8519,7 @@ export function createNotificationsExtension(
 
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
-			control: async (connectionId, frame) => {
+			control: async (connectionId, frame, signal) => {
 				const request = frame as {
 					id?: unknown;
 					operation?: unknown;
@@ -8542,6 +8565,7 @@ export function createNotificationsExtension(
 								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
 							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
 							confirm: request.confirm === true,
+							signal,
 						},
 					),
 				);
@@ -8679,6 +8703,7 @@ export function createNotificationsExtension(
 			gatePresentations,
 			stopping: false,
 			inboundFenced: false,
+			abortBtwQuestions: () => sdkRuntime?.abortBtwQuestions(),
 			abortEphemeralTurns: () => {},
 			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
@@ -11043,6 +11068,8 @@ export function createNotificationsExtension(
 
 	api.on("session_shutdown", async (_event, ctx) => {
 		extensionShuttingDown = true;
+		for (const runtime of runtimes.values()) runtime.abortBtwQuestions();
+		for (const runtime of cleanupRetries.values()) runtime.abortBtwQuestions();
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
 		const id = sessionId(ctx);

@@ -118,7 +118,13 @@ import {
 	sanitizeTurnResultContent,
 	type TurnResultContent,
 } from "../turn-result";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl, terminalAbortIdentity } from "./control";
+import {
+	type ControlSurface,
+	controlRequestFromFrame,
+	createBtwAskHandler,
+	dispatchControl,
+	terminalAbortIdentity,
+} from "./control";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
@@ -360,7 +366,9 @@ export interface SessionSdkTransport {
 }
 
 export interface SessionSdkRuntimeOptions
-	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
+	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control"> {
+	/** The signal is supplied internally only for connection-owned BTW requests. */
+	control?: (connectionId: string, frame: SdkFrame, signal?: AbortSignal) => unknown | Promise<unknown>;
 	onDisconnected?: (connectionId: string) => void;
 	transport: SessionSdkTransport;
 	/** Session settings; enables `config.patch` application on this runtime. */
@@ -537,6 +545,8 @@ export class SessionSdkSessionRuntime {
 	readonly transport: SessionSdkTransport;
 	readonly #connectionCapabilities = new Map<string, ReadonlySet<string>>();
 	readonly #connectionIds = new Set<string>();
+	readonly #btwControllers = new Map<string, Set<AbortController>>();
+	#btwStopping = false;
 	readonly #connectionCapabilitiesProvider: (connectionId: string) => ReadonlySet<string> | undefined;
 	readonly #connectionDisposer?: () => void;
 	readonly #malformedDisposer?: () => void;
@@ -550,6 +560,24 @@ export class SessionSdkSessionRuntime {
 			options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId));
 		this.host = new SessionSdkHost({
 			...options,
+			...(options.control
+				? {
+						control: async (connectionId: string, frame: SdkFrame) => {
+							if (frame.operation !== "btw.ask") return await options.control!(connectionId, frame);
+							const controller = new AbortController();
+							const controllers = this.#btwControllers.get(connectionId) ?? new Set<AbortController>();
+							controllers.add(controller);
+							this.#btwControllers.set(connectionId, controllers);
+							if (this.#btwStopping || !this.#connectionIds.has(connectionId)) controller.abort();
+							try {
+								return await options.control!(connectionId, frame, controller.signal);
+							} finally {
+								controllers.delete(controller);
+								if (controllers.size === 0) this.#btwControllers.delete(connectionId);
+							}
+						},
+					}
+				: {}),
 			connectionCapabilities: this.#connectionCapabilitiesProvider,
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
@@ -578,6 +606,7 @@ export class SessionSdkSessionRuntime {
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
 			this.#connectionIds.delete(connectionId);
 			this.#connectionCapabilities.delete(connectionId);
+			for (const controller of this.#btwControllers.get(connectionId) ?? []) controller.abort();
 			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
@@ -714,7 +743,16 @@ export class SessionSdkSessionRuntime {
 		}
 	}
 
+	/** Fence new BTW work and cancel existing questions without touching durable turns. */
+	abortBtwQuestions(): void {
+		this.#btwStopping = true;
+		for (const controllers of this.#btwControllers.values()) {
+			for (const controller of controllers) controller.abort();
+		}
+	}
+
 	async stop(options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {}): Promise<void> {
+		this.abortBtwQuestions();
 		this.#connectionDisposer?.();
 		this.#capabilitiesDisposer?.();
 		this.#malformedDisposer?.();
@@ -770,6 +808,12 @@ export interface CreateSdkSessionRuntimeOptions {
 	masterOwnerSessionId?: string;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
+	/**
+	 * Private session-owned ephemeral side-question runner (`/btw`); never exposed
+	 * on ExtensionContext. Absent on hosts that cannot serve one, in which case
+	 * `btw.ask` reports `unavailable` instead of admitting turn work.
+	 */
+	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
 	/** Timer seams for deterministic broker-recovery lifecycle tests. */
@@ -3175,6 +3219,7 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		failure: QueuedRunStartFailure,
 	) => boolean,
+	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -4674,6 +4719,11 @@ function createControlSurface(
 			}
 		}
 	};
+	/**
+	 * Ephemeral side question (`/btw`): answered from the session-owned runner,
+	 * owning no turn and appending nothing to the transcript.
+	 */
+	const askBtw = createBtwAskHandler(askEphemeralQuestion);
 	return {
 		prompt: async (text, images, clientRef, stagedImages) => {
 			const invalid = validateRequiredPromptText("turn.prompt", { text, images, stagedImages });
@@ -4980,6 +5030,7 @@ function createControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		askBtw,
 		installedOperations: imageUploads
 			? surfacePolicy.installedControls
 			: new Set([...surfacePolicy.installedControls].filter(operation => !operation.startsWith("turn.image."))),
@@ -7683,6 +7734,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					void terminalizeAbandonedSubmission(kind, correlation, rejectionRecoveryIntent(failure.error));
 				return true;
 			},
+			// INTERNAL session-owned ephemeral side-question runner (`/btw`),
+			// threaded from the owning session (NOT on the public context).
+			options.askEphemeralQuestion,
 		);
 		// The person at this terminal did not stop the turn, so say who did. Only a
 		// Broker-routed operator terminal abort that actually stopped a turn is
@@ -7791,9 +7845,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}),
 			onFrameAdmission: (_connectionId, frame) =>
 				inputGate.quiescing ? quiescingFrame(frame as Record<string, unknown>) : undefined,
-			control: async (connectionId, frame) => {
+			control: async (connectionId, frame, signal) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
+				request.signal = signal;
 				// Scope preflight cancellation to the REQUESTING SDK connection: the
 				// requester preflight buckets are keyed by this context, so a
 				// terminal abort from one client must never cancel another client's
@@ -8314,6 +8369,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		current.quiesceInput();
 		current.fenceGateResolutions();
+		current.runtime.abortBtwQuestions();
 		const imageUploads = currentImageUploads;
 		imageUploads?.close();
 		let queueCancellationFailure: unknown;

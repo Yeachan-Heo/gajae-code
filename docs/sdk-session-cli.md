@@ -338,6 +338,21 @@ operation and returns the broker/host response:
   `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
 
+`btw.ask` answers one ephemeral side question (`/btw`) from the selected
+session's current context: `{"question":"..."}` in, `{"reply":"..."}` out. It
+owns no turn and appends nothing to the session transcript, so it needs no
+`--idempotency-key` and no `--confirm`. A second question asked while the first
+is still answering is refused with `busy`, questions outside the `/btw`
+contract (empty, or over 16 KiB of UTF-8) are refused as usage errors, and a
+host without an ephemeral runner answers `unavailable` instead of admitting
+turn work:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"what changed in this repo?"}'
+```
+
 `session.lookup` is a read-only reconciliation of a previously submitted
 `session.create`. Reuse the caller request key and the same create target that
 were retained before dispatch; GJC derives the Broker identity and fingerprint

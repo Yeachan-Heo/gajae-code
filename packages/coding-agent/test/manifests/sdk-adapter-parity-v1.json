@@ -5673,6 +5673,102 @@
 			"expected": "internal_only"
 		},
 		{
+			"adapterTestId": "AD-T-C60",
+			"sdkId": "btw.ask",
+			"adapter": "telegram",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-C60",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-C60:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-D-C60",
+			"sdkId": "btw.ask",
+			"adapter": "discord",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-C60",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-C60:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-S-C60",
+			"sdkId": "btw.ask",
+			"adapter": "slack",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-C60",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-C60:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-M-C60",
+			"sdkId": "btw.ask",
+			"adapter": "mcp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testNamePattern": "AD-M-C60",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"--test-name-pattern",
+				"^AD-M-C60:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-A-C60",
+			"sdkId": "btw.ask",
+			"adapter": "acp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testNamePattern": "AD-A-C60",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"--test-name-pattern",
+				"^AD-A-C60:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-L-C60",
+			"sdkId": "btw.ask",
+			"adapter": "daemonCli",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testNamePattern": "AD-L-C60",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"--test-name-pattern",
+				"^AD-L-C60:"
+			],
+			"expected": "forwarded"
+		},
+		{
 			"adapterTestId": "AD-T-G01",
 			"sdkId": "session.list",
 			"adapter": "telegram",
