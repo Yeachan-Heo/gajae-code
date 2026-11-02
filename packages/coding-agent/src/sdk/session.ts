@@ -3500,6 +3500,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		toolSession.getAgentModelOverrides = () =>
+			session?.getAgentModelOverrides() ?? settings.get("task.agentModelOverrides");
+		toolSession.hasSessionAgentModelOverride = role => session?.hasSessionAgentModelOverride(role) ?? false;
 		// Live parent profile accessor for task/subagent dispatch: profile-owned
 		// persisted model overrides may resolve through preset-equivalent aliases
 		// only while an active profile claims them (see task/executor.ts).
@@ -4922,6 +4925,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			return resolveEagerTaskDelegation({
 				settings,
 				profile: resolvedProfileName ? persistedProfiles.get(resolvedProfileName) : undefined,
+				agentModelOverrides: session?.getAgentModelOverrides(),
 			}).eagerTasks;
 		};
 		const eagerTasks = resolveEagerTasks();
@@ -6394,25 +6398,73 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		session.gjcRuntimeSnapshot = gjcRuntimeStore;
 		session.gjcActivationGeneration = gjcActivationGeneration;
 		let jobObservation: JobObservation | undefined;
+		let disposeJobObservation: (() => void) | undefined;
 		const observationSession = session;
 		const observationManager = asyncJobManager;
+		let observationGeneration = observationSession.sessionLifecycle.generation;
+		let observationSessionManager = observationSession.sessionManager;
+		let observationSessionId = observationSession.sessionId;
+		let observationScope = observationManager?.getSubagentControlScope();
+		let observationInvalidated = false;
 		return {
 			session,
 			get jobObservation() {
-				if (observationSession.isDisposed) {
-					jobObservation?.dispose();
+				const lifecycle = observationSession.sessionLifecycle;
+				if (lifecycle.disposed) {
+					disposeJobObservation?.();
 					return jobObservation;
 				}
-				if (!jobObservation && observationManager) {
+				if (!observationManager) return undefined;
+				if (lifecycle.transitioning) {
+					observationInvalidated = true;
+					disposeJobObservation?.();
+					return jobObservation;
+				}
+				// Only the canonical committed lifecycle can grant a fresh view. IDs,
+				// notifications, and manager rekeys alone never renew host authority.
+				if (lifecycle.generation > observationGeneration) {
+					disposeJobObservation?.();
+					jobObservation = undefined;
+					disposeJobObservation = undefined;
+					observationGeneration = lifecycle.generation;
+					observationSessionManager = observationSession.sessionManager;
+					observationSessionId = observationSession.sessionId;
+					observationScope = observationManager.getSubagentControlScope();
+					observationInvalidated = false;
+				}
+				if (
+					lifecycle.generation !== observationGeneration ||
+					observationSession.sessionManager !== observationSessionManager ||
+					observationSession.sessionId !== observationSessionId ||
+					observationManager.getSubagentControlScope() !== observationScope
+				)
+					observationInvalidated = true;
+				if (observationInvalidated) {
+					disposeJobObservation?.();
+					return jobObservation;
+				}
+				if (!jobObservation) {
 					const view = new JobObservation(observationManager, resolvedAgentId);
-					observationSession.registerToolSessionCleanup(() => view.dispose());
+					const unregisterDisposal = observationSession.registerToolSessionCleanup(() => cleanup());
+					const unregisterTransition = observationSession.registerToolSessionTransitionCleanup(() => cleanup());
+					let cleanedUp = false;
+					const cleanup = (): void => {
+						if (cleanedUp) return;
+						cleanedUp = true;
+						unregisterDisposal();
+						unregisterTransition();
+						view.dispose();
+					};
+					disposeJobObservation = cleanup;
 					jobObservation = view;
 				}
 				return jobObservation;
 			},
 			extensionsResult,
 			setToolUIContext,
-			mcpManager: ownsMcpManager && mcpManager?.isToolsOnly() ? undefined : mcpManager,
+			get mcpManager() {
+				return ownsMcpManager && mcpManager?.isToolsOnly() ? undefined : mcpManager;
+			},
 			startDeferredMcpConfig,
 			startDeferredMemoryBackend: options.deferMemoryBackendStartup ? startMemoryBackend : undefined,
 			modelFallbackMessage,

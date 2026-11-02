@@ -216,8 +216,8 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
-	safeErrorDescription,
 	Snowflake,
+	safeErrorDescription,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
@@ -555,8 +555,8 @@ import {
 	readPendingDisplayTag,
 	SILENT_ABORT_MARKER,
 	SKILL_PROMPT_MESSAGE_TYPE,
-	wrapUntrustedContent,
 	ttsrPromptFields,
+	wrapUntrustedContent,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import { readSdkRunCapability } from "./sdk-run-capability";
@@ -569,11 +569,11 @@ import type {
 	PreparedNewSession,
 	RecoveryHydrationContext,
 	RecoveryHydrationPromotionFence,
+	SessionArtifactPublication,
 	SessionContext,
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
-	SessionArtifactPublication,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -980,6 +980,16 @@ export interface AsyncJobSnapshot {
 export interface RetainedMemorySample {
 	tuiChatChildren?: number;
 	tuiCachedRenderBytes?: number;
+}
+
+/** Read-only lifecycle authority, independent of UI identity notifications. */
+export interface AgentSessionLifecycleState {
+	/** Committed session-transition generation; catalog-preserving compaction leaves it unchanged. */
+	readonly generation: number;
+	/** True throughout transition preparation and cleanup, including handoff. */
+	readonly transitioning: boolean;
+	/** True as soon as disposal starts, including incomplete or failed teardown. */
+	readonly disposed: boolean;
 }
 
 export interface AgentSessionConfig {
@@ -2278,9 +2288,7 @@ function getPermissionIntent(
 		}
 		const from = intent.paths[0];
 		const to = intent.paths[1];
-		const title = permissionPromptTitle(
-			from && to ? `Move ${from} to ${to}` : `Move ${from ?? to ?? "edit target"}`,
-		);
+		const title = permissionPromptTitle(from && to ? `Move ${from} to ${to}` : `Move ${from ?? to ?? "edit target"}`);
 		return {
 			toolName,
 			title: title || "edit",
@@ -2303,7 +2311,10 @@ function getPermissionIntent(
 		if (action !== "launch" && action !== "attach") return undefined;
 		if (action === "attach") return { toolName, title: "debug attach", cacheKey: "debug" };
 		const program = getStringProperty(a, "program");
-		const title = permissionPromptTitle(program ? `debug launch ${program}` : "debug launch", PERMISSION_TITLE_PREVIEW);
+		const title = permissionPromptTitle(
+			program ? `debug launch ${program}` : "debug launch",
+			PERMISSION_TITLE_PREVIEW,
+		);
 		return { toolName, title: title || "debug launch", cacheKey: "debug" };
 	}
 	return undefined;
@@ -2326,7 +2337,8 @@ async function assertDebugExecutionMutationAllowed(input: {
 			: undefined;
 	const action = record && typeof record.action === "string" ? record.action : undefined;
 	if (action !== "launch" && action !== "attach") return;
-	const program = record && typeof record.program === "string" && record.program.length > 0 ? record.program : undefined;
+	const program =
+		record && typeof record.program === "string" && record.program.length > 0 ? record.program : undefined;
 	await assertWorkflowMutationRawPathsAllowed({
 		cwd: input.cwd,
 		sessionId: input.sessionId,
@@ -2942,6 +2954,17 @@ export interface DefaultFallbackRuntimeState {
 	exhaustedLastTurn: boolean;
 }
 
+export type SessionAgentModelRole = "executor" | "planner" | "critic" | "architect";
+
+export interface SessionAgentModelOverrideState {
+	manager: SessionManager;
+	selections: Readonly<Record<string, string>>;
+	revision: number;
+	identityGeneration: number;
+	managerId: string;
+	file: string | undefined;
+}
+
 export interface AgentSessionProfileInstalledOverrideState {
 	modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
 	agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
@@ -3126,6 +3149,20 @@ export class AgentSession {
 	#activeModelProfile: string | undefined;
 	#activatedModelProfile: string | undefined;
 	#unavailableModelProfile: string | undefined;
+	#sessionAgentModelSelections: Record<string, string> = {};
+	#sessionAgentModelSelectionOwner:
+		| {
+				manager: SessionManager;
+				sessionId: string;
+				managerId: string;
+				file: string | undefined;
+				identityGeneration: number;
+		  }
+		| undefined;
+	#sessionAgentModelSelectionRevision = 0;
+	#eagerDelegationDirty:
+		| { manager: SessionManager; identity: number; sessionId: string; revision: symbol }
+		| undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledRoleValues = new Map<string, ModelSelectorValue>();
@@ -3747,7 +3784,8 @@ export class AgentSession {
 				callbackError ??= error;
 			}
 		}
-		if (callbackError !== undefined) logger.warn("Queued run start failure callback failed", { error: callbackError });
+		if (callbackError !== undefined)
+			logger.warn("Queued run start failure callback failed", { error: callbackError });
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		let callbackError: unknown;
@@ -4981,9 +5019,12 @@ export class AgentSession {
 			if (
 				continuationAdmission?.entry === owner &&
 				continuationAdmission.capability === owner.continuationCapability
-			)
+			) {
+				if (kind === "prompt") await this.#recoverEagerDelegation();
 				return await body({ release: () => {} });
+			}
 			if (options?.allowPromptContinuationReentry === true && owner.kind === "prompt") {
+				await this.#recoverEagerDelegation();
 				return await body({ release: () => {} });
 			}
 			throw this.#sessionAdmissionBusyError();
@@ -5090,7 +5131,24 @@ export class AgentSession {
 			const release = () => {
 				releaseEntry();
 			};
-			const admittedBody = () => this.#sessionAdmissionContext.run(entry, () => body({ release }));
+			const admittedBody = () =>
+				this.#sessionAdmissionContext.run(entry, async () => {
+					if (kind === "prompt") {
+						await this.#recoverEagerDelegation();
+						if (
+							entry.released ||
+							this.#activeSessionAdmission !== entry ||
+							this.#sessionAdmissionClosing ||
+							this.#sessionAdmissionClosed ||
+							this.#sessionTransitionKind !== undefined ||
+							this.#handoffTransitionActive ||
+							this.#isDisposed
+						) {
+							throw this.#sessionAdmissionBusyError();
+						}
+					}
+					return await body({ release });
+				});
 			return await (options?.skipModelRegistryLease
 				? admittedBody()
 				: this.#modelRegistry.withConsumerLease(admittedBody, signal));
@@ -7658,6 +7716,11 @@ export class AgentSession {
 
 	/** Notify UI projections after a committed session-identity transition. */
 	async notifySessionIdentityChanged(): Promise<void> {
+		const registry = this.#agentRegistry;
+		const agentId = this.#agentId;
+		if (registry && agentId !== undefined && registry.get(agentId)?.session === this) {
+			registry.attachSession(agentId, this, this.sessionManager.getSessionFile() ?? null);
+		}
 		for (const listener of [...this.#sessionIdentityChangeListeners]) {
 			try {
 				await listener();
@@ -11406,6 +11469,8 @@ export class AgentSession {
 			this.#disposeDeadlineTimer.unref?.();
 			this.#abortAdmissionEpoch++;
 			this.#isDisposed = true;
+			this.#promptRunAcceptedObservers.clear();
+			this.retireSessionAgentModelOverrides();
 			revokeExactMcpControls(this);
 			// Dispose disconnects the Agent event bridge before bounded abort cleanup;
 			// settle every accepted SDK handle now so consumed submissions cannot wait
@@ -11475,7 +11540,8 @@ export class AgentSession {
 
 	/** Join the retained teardown owner without allocating another public deadline. */
 	awaitDisposeCompletion(): Promise<void> {
-		return this.#disposeRunPromise ?? this.dispose();
+		if (!this.#disposeRunPromise) void this.dispose().catch(() => {});
+		return this.#disposeRunPromise!;
 	}
 
 	setDisposeTimeoutForTests(timeoutMs: number): void {
@@ -12507,6 +12573,77 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Run a trusted Host-JS MCP mutation under the existing control admission and
+	 * transition exclusion. This grants neither renderer authority nor resource
+	 * settlement proof; the callback must validate its manager's exact target.
+	 */
+	async withMcpControlAdmission<T>(expectedGeneration: number, body: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		this.#assertExternalSessionIngress();
+		if (this.#activeSessionAdmission || this.#pendingSelectionFences > 0) throw this.#sessionAdmissionBusyError();
+		const sessionManager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerSessionId = sessionManager.getSessionId();
+		const sessionFile = sessionManager.getSessionFile();
+		const manager = this.#ownedMcpManager;
+		const replacement = this.#mcpManagerReplacement;
+		let transitionCompletion = this.#sessionTransitionCompletion;
+		const abortEpoch = this.#abortAdmissionEpoch;
+		const promptGeneration = this.#promptGeneration;
+		const selectionGeneration = this.#selectionFenceGeneration;
+		const userSelectionRevision = this.#userModelSelectionRevision;
+		const signal = AbortSignal.any([
+			this.#disposeAbortController.signal,
+			this.#promptPreflightAbortController.signal,
+		]);
+		const assertCurrent = (entered = false) => {
+			signal.throwIfAborted();
+			this.#assertSessionAdmissionOpen();
+			if (
+				!Number.isSafeInteger(expectedGeneration) ||
+				expectedGeneration < 0 ||
+				this.#sessionTransitionGeneration !== expectedGeneration ||
+				this.sessionManager !== sessionManager ||
+				this.sessionId !== sessionId ||
+				sessionManager.getSessionId() !== managerSessionId ||
+				sessionManager.getSessionFile() !== sessionFile ||
+				this.#ownedMcpManager !== manager ||
+				this.#mcpManagerReplacement !== replacement ||
+				this.#sessionTransitionCompletion !== transitionCompletion ||
+				this.#abortAdmissionEpoch !== abortEpoch ||
+				this.#promptGeneration !== promptGeneration ||
+				this.#selectionFenceGeneration !== selectionGeneration ||
+				this.#userModelSelectionRevision !== userSelectionRevision
+			) {
+				throw Object.assign(new Error("Session changed before MCP control could complete."), {
+					code: "resource_gone",
+				});
+			}
+			if (this.#handoffTransitionActive || this.#sessionTransitionKind !== (entered ? "mcp-control" : undefined))
+				throw this.#sessionAdmissionBusyError();
+		};
+		assertCurrent();
+		return this.#withSessionAdmission(
+			"mcp-control",
+			async () => {
+				await awaitPromptInvocationPreflight(replacement, signal);
+				assertCurrent();
+				this.#beginSessionTransition("mcp-control");
+				transitionCompletion = this.#sessionTransitionCompletion;
+				try {
+					assertCurrent(true);
+					const result = await body(signal);
+					assertCurrent(true);
+					return result;
+				} finally {
+					// No committed session transition: MCP mutation does not advance identity.
+					this.#endSessionTransition();
+				}
+			},
+			signal,
+		);
+	}
+
 	get hasExactMcpControls(): boolean {
 		return getExactMcpControls(this) !== undefined;
 	}
@@ -12906,6 +13043,7 @@ export class AgentSession {
 			this.sessionManager.commitPreparedNewSession(prepared);
 		} finally {
 			if (this.sessionManager.getSessionId() !== id || this.sessionManager.getSessionFile() !== file) {
+				this.retireSessionAgentModelOverrides();
 				revokeExactMcpControls(this);
 			}
 		}
@@ -14286,6 +14424,7 @@ export class AgentSession {
 		}
 		await this.#awaitStartupTurnBarrier();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
+		await this.#withSessionAdmission("prompt", async () => {});
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
@@ -14328,6 +14467,7 @@ export class AgentSession {
 			// volatile-context/hindsight awaits above and this would otherwise start a
 			// turn against the session being handed off.
 			this.#assertExternalSessionIngress();
+			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
@@ -14458,6 +14598,15 @@ export class AgentSession {
 	/** Current session ID */
 	get sessionId(): string {
 		return this.#providerSessionId ?? this.sessionManager.getSessionId();
+	}
+
+	/** Frozen snapshot of existing session-transition and disposal state. */
+	get sessionLifecycle(): AgentSessionLifecycleState {
+		return Object.freeze({
+			generation: this.#sessionTransitionGeneration,
+			transitioning: this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive,
+			disposed: this.#isDisposed,
+		});
 	}
 
 	/** Credential selection identity; defaults to the provider-facing session identity. */
@@ -15108,8 +15257,147 @@ export class AgentSession {
 		return true;
 	}
 
+	#ownedSessionAgentModelSelections(): Record<string, string> {
+		const owner = this.#sessionAgentModelSelectionOwner;
+		if (!owner) return {};
+		if (
+			owner.manager !== this.sessionManager ||
+			owner.sessionId !== this.sessionId ||
+			owner.managerId !== this.sessionManager.getSessionId() ||
+			owner.file !== this.sessionManager.getSessionFile() ||
+			owner.identityGeneration !== this.sessionManager.getSessionIdentityGeneration()
+		) {
+			this.retireSessionAgentModelOverrides();
+			return {};
+		}
+		return this.#sessionAgentModelSelections;
+	}
+
+	#bindSessionAgentModelSelections(): void {
+		this.#sessionAgentModelSelectionOwner = {
+			manager: this.sessionManager,
+			sessionId: this.sessionId,
+			managerId: this.sessionManager.getSessionId(),
+			file: this.sessionManager.getSessionFile(),
+			identityGeneration: this.sessionManager.getSessionIdentityGeneration(),
+		};
+	}
+
+	/** Effective task-role selectors, detached from both Settings and this session. */
+	getAgentModelOverrides(): Record<string, ModelSelectorValue> {
+		return structuredClone({
+			...this.settings.get("task.agentModelOverrides"),
+			...this.#ownedSessionAgentModelSelections(),
+		});
+	}
+
+	hasSessionAgentModelOverride(role: string): boolean {
+		return Object.hasOwn(this.#ownedSessionAgentModelSelections(), role);
+	}
+
+	getSessionAgentModelOverrideState(): SessionAgentModelOverrideState {
+		return {
+			manager: this.sessionManager,
+			selections: { ...this.#ownedSessionAgentModelSelections() },
+			revision: this.#sessionAgentModelSelectionRevision,
+			identityGeneration: this.sessionManager.getSessionIdentityGeneration(),
+			managerId: this.sessionManager.getSessionId(),
+			file: this.sessionManager.getSessionFile(),
+		};
+	}
+
+	retireSessionAgentModelOverrides(): void {
+		this.#sessionAgentModelSelections = {};
+		this.#sessionAgentModelSelectionOwner = undefined;
+		this.#sessionAgentModelSelectionRevision++;
+	}
+
+	restoreSessionAgentModelOverrides(state: SessionAgentModelOverrideState, expectedRevision: number): void {
+		if (
+			state.manager !== this.sessionManager ||
+			state.identityGeneration !== this.sessionManager.getSessionIdentityGeneration() ||
+			state.managerId !== this.sessionManager.getSessionId() ||
+			state.file !== this.sessionManager.getSessionFile()
+		)
+			return;
+		this.#restoreSessionAgentModelOverrides(state, expectedRevision);
+	}
+
+	#restoreSessionAgentModelOverrides(state: SessionAgentModelOverrideState, expectedRevision: number): void {
+		if (
+			this.#isDisposed ||
+			state.manager !== this.sessionManager ||
+			this.#sessionAgentModelSelectionRevision !== expectedRevision
+		)
+			return;
+		this.#sessionAgentModelSelections = { ...state.selections };
+		this.#bindSessionAgentModelSelections();
+		this.#sessionAgentModelSelectionRevision++;
+	}
+
+	async setSessionAgentModelSelection(role: SessionAgentModelRole, model: Model | null): Promise<void> {
+		if (role !== "executor" && role !== "planner" && role !== "critic" && role !== "architect") {
+			throw new Error(`Unsupported session agent role: ${role}`);
+		}
+		this.#assertSessionAdmissionOpen();
+		const sessionId = this.sessionId;
+		const manager = this.sessionManager;
+		const sessionFile = manager.getSessionFile();
+		const managerId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		await this.withSdkControlMutation(async () => {
+			if (
+				this.sessionId !== sessionId ||
+				this.sessionManager !== manager ||
+				manager.getSessionFile() !== sessionFile ||
+				manager.getSessionId() !== managerId ||
+				manager.getSessionIdentityGeneration() !== identityGeneration ||
+				this.#sessionTransitionGeneration !== generation ||
+				this.#sessionTransitionKind !== undefined ||
+				this.#handoffTransitionActive
+			) {
+				throw new Error("Session changed while selecting agent model");
+			}
+			if (
+				model &&
+				!this.#modelRegistry
+					.getAvailable(this.credentialSessionId)
+					.some(candidate => candidate.provider === model.provider && candidate.id === model.id)
+			) {
+				throw new Error(`Model unavailable: ${model.provider}/${model.id}`);
+			}
+			const previous = this.getSessionAgentModelOverrideState();
+			this.#sessionAgentModelSelections = { ...previous.selections };
+			this.#bindSessionAgentModelSelections();
+			if (model) this.#sessionAgentModelSelections[role] = `${model.provider}/${model.id}`;
+			else delete this.#sessionAgentModelSelections[role];
+			const revision = ++this.#sessionAgentModelSelectionRevision;
+			try {
+				await this.syncEagerDelegation();
+			} catch (error) {
+				if (
+					this.sessionId === sessionId &&
+					this.sessionManager === manager &&
+					manager.getSessionFile() === sessionFile &&
+					manager.getSessionId() === managerId &&
+					manager.getSessionIdentityGeneration() === identityGeneration &&
+					this.#sessionTransitionGeneration === generation &&
+					!this.#isDisposed
+				) {
+					this.restoreSessionAgentModelOverrides(previous, revision);
+					if (this.#sessionTransitionKind === undefined && !this.#handoffTransitionActive) {
+						await this.syncEagerDelegation();
+					}
+				}
+				throw error;
+			}
+		});
+	}
+
 	resolveRoleModel(role: string): Model | undefined {
-		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(this.credentialSessionId), this.model).model;
+		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(this.credentialSessionId), this.model)
+			.model;
 	}
 
 	/**
@@ -15621,6 +15909,7 @@ export class AgentSession {
 			(this.#activeSessionAdmission?.kind === "prompt" ||
 				this.#sessionAdmissionQueue.some(entry => entry.kind === "prompt"));
 		if ((this.#isLiveTurnBusy() || promptAdmissionContended) && !waitedForAbortUnwind) {
+			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
@@ -15889,6 +16178,7 @@ export class AgentSession {
 				: preclaimedUserIntentEpoch;
 
 		if (this.isStreaming) {
+			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
@@ -17734,6 +18024,7 @@ export class AgentSession {
 		this.#assertRecoveryHydrationPromoted();
 		const trackedSuccessorAdmission = this.#hasCommittedSuccessorTrackedAdmission(options);
 		this.#assertExternalSessionIngress({ allowTrackedSuccessor: trackedSuccessorAdmission });
+		if (this.#eagerDelegationDirty && options?.deliverAs) throw new Error("Session delegation is not ready");
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released && !trackedSuccessorAdmission) throw this.#sessionAdmissionBusyError();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -19556,6 +19847,7 @@ export class AgentSession {
 		this.#beginSessionTransition("new-session");
 		const previousSessionId = this.sessionId;
 		const transition = this.#runNewSessionTransition(options).finally(async () => {
+			if (!this.#isDisposed) this.#reconnectToAgent();
 			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		});
 		this.#newSessionTransition = transition;
@@ -19833,6 +20125,7 @@ export class AgentSession {
 		this.#todoReminderCount = 0;
 		this.#planReferenceSent = false;
 		this.#planReferencePath = "local://PLAN.md";
+		await this.#syncCommittedSuccessorDelegation();
 		this.#reconnectToAgent();
 		this.#resetIrcRosterDeliveryState();
 		if (this.#extensionRunner) {
@@ -19974,6 +20267,7 @@ export class AgentSession {
 					if (!exactRetirement) revokeExactMcpControls(this);
 					await exactRetirement?.commit();
 					revokeExactMcpControls(this);
+					this.retireSessionAgentModelOverrides();
 					this.#commitSessionTransition();
 				} catch (error) {
 					try {
@@ -20052,6 +20346,7 @@ export class AgentSession {
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
 			this.#resetIrcRosterDeliveryState();
+			await this.#syncCommittedSuccessorDelegation();
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
@@ -20191,6 +20486,11 @@ export class AgentSession {
 	/** Revision fence for deferred activation after a user model selection. */
 	getUserModelSelectionRevision(): number {
 		return this.#userModelSelectionRevision;
+	}
+
+	/** Revision fence that distinguishes even same-value thinking intent during profile rollback. */
+	getThinkingLevelMutationRevision(): number {
+		return this.#thinkingLevelMutationRevision;
 	}
 
 	/** Latest concrete user choice that seeded or cleared the session's sticky canonical variant. */
@@ -20807,9 +21107,73 @@ export class AgentSession {
 	 * `has tools "task"` guard. Activating a vendor-separated profile mid-session
 	 * must therefore reach the live tool set, not just the next session.
 	 */
+	#markEagerDelegationDirty(): { manager: SessionManager; identity: number; sessionId: string; revision: symbol } {
+		const manager = this.sessionManager;
+		const dirty = {
+			manager,
+			identity: manager.getSessionIdentityGeneration(),
+			sessionId: this.sessionId,
+			revision: Symbol("eager-delegation"),
+		};
+		this.#eagerDelegationDirty = dirty;
+		return dirty;
+	}
+
+	#isCurrentEagerDelegation(dirty: {
+		manager: SessionManager;
+		identity: number;
+		sessionId: string;
+		revision: symbol;
+	}): boolean {
+		return (
+			this.sessionManager === dirty.manager &&
+			this.sessionId === dirty.sessionId &&
+			dirty.manager.getSessionIdentityGeneration() === dirty.identity &&
+			!this.#isDisposed
+		);
+	}
+
+	async #recoverEagerDelegation(): Promise<void> {
+		if (!this.#eagerDelegationDirty) return;
+		const manager = this.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
+		const sessionId = this.sessionId;
+		await this.syncEagerDelegation();
+		if (
+			this.#eagerDelegationDirty ||
+			this.sessionManager !== manager ||
+			manager.getSessionIdentityGeneration() !== identity ||
+			this.sessionId !== sessionId ||
+			this.#isDisposed
+		) {
+			throw new Error("Session delegation is not ready");
+		}
+	}
+
+	async #syncCommittedSuccessorDelegation(): Promise<void> {
+		this.#markEagerDelegationDirty();
+		try {
+			await this.syncEagerDelegation();
+		} catch (error) {
+			const dirty = this.#eagerDelegationDirty;
+			if (dirty && this.#isCurrentEagerDelegation(dirty)) {
+				this.emitNotice(
+					"warning",
+					"Session replaced, but delegation is not ready. A turn will retry synchronization before starting.",
+					"session-delegation",
+				);
+			}
+			logger.warn("Failed to refresh eager delegation after session replacement", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	async syncEagerDelegation(): Promise<void> {
+		const dirty = this.#markEagerDelegationDirty();
 		const { eagerTasks } = resolveEagerTaskDelegation({
 			settings: this.settings,
+			agentModelOverrides: this.getAgentModelOverrides(),
 			profile: this.#activeModelProfile
 				? this.#modelRegistry.getModelProfile?.(this.#activeModelProfile)
 				: undefined,
@@ -20820,9 +21184,21 @@ export class AgentSession {
 			this.#toolRegistry.has("task") &&
 			!this.getActiveToolNames().includes("task")
 		) {
-			await this.activateDiscoveredTools(["task"]);
+			if (this.#sessionTransitionKind !== undefined || this.#sessionAdmissionContext.getStore()?.kind === "prompt") {
+				await this.#activateDiscoveredTools(
+					["task"],
+					this.#sessionTransitionGeneration,
+					this.#explicitActiveToolSelectionGeneration,
+				);
+			} else {
+				await this.activateDiscoveredTools(["task"]);
+			}
 		}
 		await this.refreshBaseSystemPrompt();
+		if (this.#eagerDelegationDirty === dirty && this.#isCurrentEagerDelegation(dirty)) {
+			this.#eagerDelegationDirty = undefined;
+			this.yieldQueue.rearmIdle();
+		}
 	}
 
 	/** Resolver intent only for default assignments owned by an active or runtime-recovered durable profile. */
@@ -21517,12 +21893,30 @@ export class AgentSession {
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
 		signal?: AbortSignal,
+		options?: { validateCredentials: boolean },
 	): Promise<PreparedProfileModelSelection> {
 		signal?.throwIfAborted();
 		const sessionId = this.sessionId;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
+		const previousThinkingLevelMutationRevision = this.#thinkingLevelMutationRevision;
 		const previousEditMode = this.#resolveActiveEditMode();
+		// Reload preparation is read-only: probing live credentials here could
+		// refresh OAuth or wait on a concurrent user's credential selection.
+		// Activations probe before publication (and before the CAS for durable selections).
+		if (options?.validateCredentials) {
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+			signal?.throwIfAborted();
+			if (
+				this.sessionId !== sessionId ||
+				this.model !== previousModel ||
+				this.thinkingLevel !== previousThinkingLevel ||
+				this.#thinkingLevelMutationRevision !== previousThinkingLevelMutationRevision
+			) {
+				throw new Error("Session changed while preparing profile model selection");
+			}
+			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
 		const committedThinkingLevel = resolveThinkingLevelForModel(
 			model,
 			thinkingLevel ?? model.thinking?.defaultLevel ?? previousThinkingLevel,
@@ -23471,6 +23865,8 @@ export class AgentSession {
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
 			const rollbackSessionState = await this.sessionManager.captureRollbackState();
+			const rollbackSessionAgentModels = this.getSessionAgentModelOverrideState();
+			let retiredSessionAgentModelRevision: number | undefined;
 			const rollbackAgentMessages = [...this.agent.state.messages];
 			const rollbackSteeringMessages = [...this.#steeringMessages];
 			const rollbackFollowUpMessages = [...this.#followUpMessages];
@@ -23517,8 +23913,11 @@ export class AgentSession {
 
 				// Handoff can roll back after adoption. Keep an existing predecessor grant
 				// fenced until retirement succeeds; never recreate it on rollback.
-				if (exactRetirement) this.sessionManager.commitPreparedNewSession(prepared);
-				else this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+				if (exactRetirement) {
+					this.sessionManager.commitPreparedNewSession(prepared);
+					this.retireSessionAgentModelOverrides();
+				} else this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+				retiredSessionAgentModelRevision = this.#sessionAgentModelSelectionRevision;
 				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 				revokeExactMcpControls(this);
@@ -23571,6 +23970,7 @@ export class AgentSession {
 				// server-scoped and are preserved for the successor.
 				this.#suppressOwnAsyncJobDeliveries();
 				this.yieldQueue.clearKind("async-result");
+				await this.syncEagerDelegation();
 
 				// The successor identity/emitter/provider state is now fully live and
 				// predecessor deliveries are suppressed, so release the turn-admission
@@ -23620,9 +24020,18 @@ export class AgentSession {
 					revokeExactMcpControls(this);
 					throw error;
 				}
-				if (this.sessionManager.getSessionId() !== rollbackSessionState.sessionId ||
-					this.sessionManager.getSessionFile() !== rollbackSessionState.sessionFile) {
+				if (
+					this.sessionManager.getSessionId() !== rollbackSessionState.sessionId ||
+					this.sessionManager.getSessionFile() !== rollbackSessionState.sessionFile
+				) {
 					revokeExactMcpControls(this);
+				}
+				if (
+					retiredSessionAgentModelRevision !== undefined &&
+					this.sessionManager.getSessionId() === rollbackSessionState.sessionId &&
+					this.sessionManager.getSessionFile() === rollbackSessionState.sessionFile
+				) {
+					this.#restoreSessionAgentModelOverrides(rollbackSessionAgentModels, retiredSessionAgentModelRevision);
 				}
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -25079,7 +25488,7 @@ export class AgentSession {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[role as keyof typeof GJC_MODEL_ASSIGNMENT_TARGETS];
 		const roleModelStr =
 			target?.settingsPath === "task.agentModelOverrides"
-				? this.settings.get("task.agentModelOverrides")[role]
+				? (this.#ownedSessionAgentModelSelections()[role] ?? this.settings.get("task.agentModelOverrides")[role])
 				: role === "default"
 					? (this.settings.getModelRole("default") ??
 						(currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined))
@@ -25094,7 +25503,7 @@ export class AgentSession {
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
 			credentialSessionId: this.credentialSessionId,
-			...(this.#persistedModelProfileAliasIntent(role) ?? {}),
+			...(this.hasSessionAgentModelOverride(role) ? {} : (this.#persistedModelProfileAliasIntent(role) ?? {})),
 		});
 	}
 
@@ -30534,6 +30943,7 @@ export class AgentSession {
 			try {
 				await this.#runToolSessionTransitionCleanups();
 				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+				await this.syncEagerDelegation();
 			} catch (error) {
 				await publishCommittedBranchIdentity().catch((hookError: unknown) => {
 					logger.warn("Failed to publish the committed branch identity after a transition failure", {
