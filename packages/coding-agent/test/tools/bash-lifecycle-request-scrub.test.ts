@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 import { disposeAllShellSessions, executeBash } from "../../src/exec/bash-executor";
 import type { ToolSession } from "../../src/tools";
+import * as masterCli from "../../src/sdk/cli/master-cli";
 import { BashTool } from "../../src/tools/bash";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
@@ -132,6 +133,35 @@ describe("lifecycle request id is not inherited by bash", () => {
 		expect(output).toContain("decision=ADOPT");
 		expect(output).toContain(`${REQUEST}= explicit-marker `);
 		expect(output).toContain(`${SESSION}=kept-session`);
+	});
+
+	it("direct master spawn drops ambient and explicit request ids from runSdkSpawn", async () => {
+		const dir = await temp();
+		let seen: Record<string, string> | undefined;
+		const spy = spyOn(masterCli, "runSdkSpawn").mockImplementation((async (_args, deps) => {
+			const env = (deps as { env?: Record<string, string> } | undefined)?.env;
+			seen = env ? { ...env } : {};
+			return { exitCode: 0, rendered: { code: "ok" } };
+		}) as never);
+		try {
+			await withRequest("ambient-marker", async () => {
+				const session = createSession("master-session", dir);
+				(session as { getMasterBashCapability: () => string }).getMasterBashCapability = () =>
+					"master-capability-fixture";
+				(session as { getMasterOwnerSessionId: () => string }).getMasterOwnerSessionId = () => "master-owner";
+				(session as { getSessionAgentDir: () => string }).getSessionAgentDir = () => dir;
+				await new BashTool(session).execute("call", {
+					command: "gjc sdk spawn --cwd /tmp --prompt task",
+					cwd: dir,
+					env: { [REQUEST]: " explicit-marker " },
+				});
+			});
+			expect(seen?.[REQUEST]).toBeUndefined();
+			expect(JSON.stringify(seen ?? {})).not.toContain("ambient-marker");
+			expect(JSON.stringify(seen ?? {})).not.toContain("explicit-marker");
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("executeBash drops an inherited request id from the child", async () => {
