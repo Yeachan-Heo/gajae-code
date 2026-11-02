@@ -28,6 +28,7 @@ import {
 	type IrcArrivalSnapshot,
 	type TranscriptRebuildPolicy,
 } from "../../modes/types";
+import { BTW_HANDOFF_MESSAGE_TYPE, type BtwHandoffDetails } from "../../session/btw-contract";
 import {
 	type CustomMessage,
 	isSilentAbort,
@@ -590,6 +591,19 @@ export class UiHelpers {
 								.join(" ");
 							addChatChild(this.ctx, new Text(line, 1, 0));
 						}
+						break;
+					}
+					if (message.customType === BTW_HANDOFF_MESSAGE_TYPE) {
+						// The content is the model-facing nonce-framed handoff with the
+						// verbatim exchanges; show a compact marker instead.
+						const count = (message as CustomMessage<Partial<BtwHandoffDetails>>).details?.exchangeCount;
+						const countLabel =
+							typeof count === "number" ? ` (${count} ${count === 1 ? "exchange" : "exchanges"})` : "";
+						addChatChild(this.ctx, new Spacer(1));
+						addChatChild(
+							this.ctx,
+							new Text(`${theme.fg("accent", "Handed off /btw side chat")}${theme.fg("dim", countLabel)}`, 1, 0),
+						);
 						break;
 					}
 					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {

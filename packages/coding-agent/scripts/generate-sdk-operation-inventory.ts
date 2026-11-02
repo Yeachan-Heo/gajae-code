@@ -60,6 +60,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:drop": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:contribute-pr": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:btw": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:btw-handoff":
+		"hands the local TUI /btw panel to the main session; the panel exists only in interactive mode, not a user-facing SDK control seam",
 	"slash_command:debug": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:memory": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:exit": "visual/local-only command, not a user-facing SDK control seam",
