@@ -138,7 +138,7 @@ describe("lifecycle request id is not inherited by bash", () => {
 	it("direct master spawn drops ambient and explicit request ids from runSdkSpawn", async () => {
 		const dir = await temp();
 		let seen: Record<string, string> | undefined;
-		const spy = spyOn(masterCli, "runSdkSpawn").mockImplementation((async (_args, deps) => {
+		const spy = spyOn(masterCli, "runSdkSpawn").mockImplementation((async (_args: unknown, deps: unknown) => {
 			const env = (deps as { env?: Record<string, string> } | undefined)?.env;
 			seen = env ? { ...env } : {};
 			return { exitCode: 0, rendered: { code: "ok" } };
