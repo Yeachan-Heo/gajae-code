@@ -105,19 +105,19 @@ const PROJECT_SHELL_STARTUP_ENV = new Set(["BASH_ENV", "ENV", "ZDOTDIR"]);
 /**
  * Copy `env` for a shell child. Drop a startup name when the load-time project
  * snapshot recorded that value, or when the declaration is dynamic. A different
- * value is a caller override and stays. The live process environment is not
- * read: a cached shell config can still hold the project value after that key
- * changes. The input object is not modified.
+ * static value stays. The live process environment is not read: a cached shell
+ * config can still hold the project value after that key changes. The input
+ * object is not modified. Entries are rebuilt so an own `__proto__` value stays
+ * a data property.
  */
 export function omitProjectShellStartupEnv(env: Record<string, string>): Record<string, string> {
 	const snapshot = startupProjectEnvSnapshot();
-	const next: Record<string, string> = {};
-	for (const name of Object.keys(env)) {
-		const value = env[name];
-		if (value === undefined || isProjectShellStartupValue(snapshot, name, value)) continue;
-		next[name] = value;
-	}
-	return next;
+	return Object.fromEntries(
+		Object.entries(env).filter((entry): entry is [string, string] => {
+			const [name, value] = entry;
+			return typeof value === "string" && !isProjectShellStartupValue(snapshot, name, value);
+		}),
+	);
 }
 
 function isProjectShellStartupValue(

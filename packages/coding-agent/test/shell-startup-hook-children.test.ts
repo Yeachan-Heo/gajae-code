@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { runStatusLineCommand } from "../src/modes/components/status-line/command";
 
 /**
  * Status-line commands and finalize validation spawn a login shell.
@@ -270,3 +271,21 @@ test.skipIf(!hasBash)(
 	},
 	60_000,
 );
+
+test.skipIf(!hasBash)("keeps an own proto value in the status-line child", async () => {
+	const pathKey = "PATH";
+	const env = Object.fromEntries([
+		[pathKey, process.env[pathKey] ?? "/usr/bin:/bin"],
+		["__proto__", "allowed-value"],
+	]);
+	const result = await runStatusLineCommand("printenv __proto__", {
+		cwd: os.tmpdir(),
+		shell: "/bin/bash",
+		shellArgs: ["-c"],
+		env,
+		timeoutMs: 15_000,
+	});
+	expect(result.exitCode).toBe(0);
+	expect(result.stdout).toBe("allowed-value\n");
+	expect(Object.getOwnPropertyDescriptor(env, "__proto__")?.value).toBe("allowed-value");
+});
