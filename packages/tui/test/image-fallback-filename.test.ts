@@ -88,6 +88,10 @@ describe("image fallback filename", () => {
 		);
 	});
 
+	it("keeps a tab in the filename and the media type", () => {
+		expect(imageFallback("image/\tpng", DIMS, "a\tb.png")).toBe("[Image: a\tb.png [image/\tpng] 10x8]");
+	});
+
 	it("keeps an omitted filename and numeric dimensions", () => {
 		expect(imageFallback("image/png", DIMS)).toBe("[Image: [image/png] 10x8]");
 		expect(imageFallback("image/png", DIMS, "")).toBe("[Image: [image/png] 10x8]");
