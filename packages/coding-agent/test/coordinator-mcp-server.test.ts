@@ -24,6 +24,7 @@ import {
 	advanceDeliveryDiscoveryCursor,
 	bindCreationRequest,
 	type CanonicalCreateIntentV1,
+	type CoordinatorStatePaths,
 	claimPublicDelivery,
 	coordinatorStatePaths,
 	deterministicOutboxId,
@@ -652,6 +653,51 @@ async function createSdkControlServer(
 	});
 	if (serverOptions.establishedSidecarAuthority !== false) await seedEstablishedSidecarAuthority();
 	return server;
+}
+
+/** Rewrites an ambiguous force reservation into the durable state left by a coordinator killed
+ * after the steer disposition committed and before its synthetic reservation was cleaned. */
+async function seedPersistedSteerDispositionBeforeCleanup(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+): Promise<void> {
+	await withSessionTransaction(paths, sessionId, async transaction => {
+		const request = Object.values(transaction.requests.prompts).find(
+			candidate => candidate.operation === "turn.abort_and_prompt",
+		);
+		if (!request?.coordinator_turn_id) throw new Error("fixture expected a reserved force prompt");
+		request.steer_disposition = {
+			accepted: true,
+			command_id: "steer-command",
+			turn_id: "steer-runtime-turn",
+			queued_as: "steer",
+		};
+	});
+}
+
+/** Asserts a settled steer leaves only a terminal tombstone and no reserving synthetic prompt. */
+async function expectNoPhantomSteerReservation(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	firstTurnId: string,
+): Promise<void> {
+	const settled = await readSessionTransaction(paths, sessionId);
+	expect(settled?.canonical.queue.active_turn_id).toBe(firstTurnId);
+	expect(Object.keys(settled?.canonical.turns ?? {})).toEqual([firstTurnId]);
+	const prompts = Object.values(settled?.requests.prompts ?? {});
+	const tombstones = prompts.filter(request => request.operation === "turn.abort_and_prompt");
+	expect(tombstones).toHaveLength(1);
+	expect(tombstones[0]).toMatchObject({ phase: "completed", steer_disposition: { queued_as: "steer" } });
+	expect(tombstones[0]).not.toHaveProperty("coordinator_turn_id");
+	expect(prompts.filter(request => request.delegate_response_pending === true)).toEqual([]);
+	expect(
+		prompts.filter(
+			request =>
+				request.operation !== "turn.follow_up" &&
+				request.coordinator_turn_id !== firstTurnId &&
+				["claimed", "remote_started", "accepted"].includes(request.phase),
+		),
+	).toEqual([]);
 }
 
 async function registerSdkSession(server: CoordinatorMcpServer, root: string) {
@@ -2559,15 +2605,23 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				queue: { active_turn_id: string | null };
 				turns: Record<string, { status?: string }>;
 			};
-			requests: { prompts: Record<string, { operation?: string }> };
+			requests: {
+				prompts: Record<
+					string,
+					{ operation?: string; phase?: string; coordinator_turn_id?: string; steer_disposition?: unknown }
+				>;
+			};
 		};
-		// Nothing was superseded and no replacement turn or accepted prompt request remains.
+		// Nothing was superseded; the steer leaves only a terminal tombstone with no reserving turn.
 		expect(transaction.canonical.queue.active_turn_id).toBe(firstTurnId);
 		expect(transaction.canonical.turns[firstTurnId]?.status).toBe("active");
 		expect(Object.keys(transaction.canonical.turns)).toEqual([firstTurnId]);
-		expect(
-			Object.values(transaction.requests.prompts).filter(request => request.operation === "turn.abort_and_prompt"),
-		).toEqual([]);
+		const tombstones = Object.values(transaction.requests.prompts).filter(
+			request => request.operation === "turn.abort_and_prompt",
+		);
+		expect(tombstones).toHaveLength(1);
+		expect(tombstones[0]).toMatchObject({ phase: "completed", steer_disposition: { queued_as: "steer" } });
+		expect(tombstones[0]).not.toHaveProperty("coordinator_turn_id");
 		// An exact-key retry replays the cached tool response instead of dispatching again.
 		const retried = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -2646,6 +2700,184 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		};
 		expect(transaction.canonical.queue.active_turn_id).toBe(firstTurnId);
 		expect(Object.keys(transaction.canonical.turns)).toEqual([firstTurnId]);
+	});
+
+	it("recovers a crash between steer disposition persistence and synthetic reservation cleanup", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let lostAcknowledgement = true;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => {
+				if (control.operation !== "turn.abort_and_prompt")
+					return { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" };
+				if (lostAcknowledgement) {
+					lostAcknowledgement = false;
+					throw new SessionRouterError("ambiguous", "response crossed attachment rotation");
+				}
+				return {
+					accepted: true,
+					commandId: "steer-command",
+					turnId: "steer-runtime-turn",
+					aborted: false,
+					queuedAs: "steer",
+				};
+			},
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "crash-steer-initial",
+			allow_mutation: true,
+		});
+		const firstTurnId = first.turn_id;
+		if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+		const args = {
+			session_id: "visible-session",
+			prompt: "steer the run instead",
+			force: true,
+			idempotency_key: "crash-steer-force",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({
+			ok: false,
+			error: { code: "ambiguous" },
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await seedPersistedSteerDispositionBeforeCleanup(paths, "visible-session");
+		const crashed = await readSessionTransaction(paths, "visible-session");
+		expect(Object.keys(crashed?.canonical.turns ?? {}).length).toBe(2);
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", { ...args, prompt: "different payload" }),
+		).toMatchObject({ ok: false });
+		const recovered = await server.callTool("gjc_coordinator_send_prompt", args);
+		expect(recovered).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			aborted: false,
+			turn_id: firstTurnId,
+			active_turn_id: firstTurnId,
+			result: { command_id: "steer-command", turn_id: "steer-runtime-turn", queued_as: "steer" },
+		});
+		await expectNoPhantomSteerReservation(paths, "visible-session", firstTurnId);
+		expect(await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" })).toMatchObject({
+			ok: true,
+			session_state: { state: "running", current_turn_id: firstTurnId },
+		});
+		// Recovery never redispatches: only the original lost-acknowledgement send exists.
+		expect(controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(1);
+		// The session is not blocked: a new key can still steer the genuine active turn.
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", { ...args, idempotency_key: "crash-steer-force-2" }),
+		).toMatchObject({ ok: true, delivery: "steer", turn_id: firstTurnId });
+		expect(controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(2);
+	});
+
+	it("rejects a persisted steer disposition that is not accepted without redispatching", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => {
+				if (control.operation !== "turn.abort_and_prompt")
+					return { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" };
+				throw new SessionRouterError("ambiguous", "response crossed attachment rotation");
+			},
+		});
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "malformed-steer-initial",
+			allow_mutation: true,
+		});
+		const args = {
+			session_id: "visible-session",
+			prompt: "steer the run instead",
+			force: true,
+			idempotency_key: "malformed-steer-force",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({ ok: false });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await seedPersistedSteerDispositionBeforeCleanup(paths, "visible-session");
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			for (const request of Object.values(transaction.requests.prompts))
+				if (request.steer_disposition) request.steer_disposition.accepted = false;
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({ ok: false });
+		expect(controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(1);
+	});
+
+	it("evicts the oldest completed steer tombstones under WAL pressure and keeps recovery authority", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.abort_and_prompt"
+					? {
+							accepted: true,
+							commandId: "steer-command",
+							turnId: "steer-runtime-turn",
+							aborted: false,
+							queuedAs: "steer",
+						}
+					: { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" },
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "pressure-initial",
+			allow_mutation: true,
+		});
+		const firstTurnId = first.turn_id;
+		if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const count = 400;
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			const now = Date.now();
+			for (let index = 0; index < count; index++) {
+				const digest = createHash("sha256").update(`pressure-${index}`).digest("hex");
+				const at = new Date(now - (count - index) * 1000).toISOString();
+				transaction.requests.prompts[digest] = {
+					request_id: `prompt:${digest}`,
+					key_digest: digest,
+					request_digest: digest,
+					operation: "turn.abort_and_prompt",
+					canonical_prompt: { text: "x".repeat(4096) },
+					sdk_idempotency_key: `pressure-${index}`,
+					phase: "completed",
+					steer_disposition: {
+						accepted: true,
+						command_id: `pressure-command-${index}`,
+						turn_id: `pressure-turn-${index}`,
+						queued_as: "steer",
+					},
+					created_at: at,
+					updated_at: at,
+				};
+			}
+		});
+		// The next committed transaction compacts under pressure.
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "steer once more",
+				force: true,
+				idempotency_key: "pressure-trigger",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: true });
+		const after = await readSessionTransaction(paths, "visible-session");
+		const remaining = Object.values(after?.requests.prompts ?? {}).filter(
+			request => request.steer_disposition !== undefined,
+		);
+		expect(remaining.length).toBeLessThan(count);
+		expect(Buffer.byteLength(JSON.stringify(after))).toBeLessThanOrEqual(1024 * 1024);
+		// Newest tombstones survive; the oldest were evicted first.
+		expect(remaining.some(request => request.sdk_idempotency_key === `pressure-${count - 1}`)).toBe(true);
+		expect(remaining.some(request => request.sdk_idempotency_key === "pressure-0")).toBe(false);
+		expect(after?.canonical.queue.active_turn_id).toBe(firstTurnId);
 	});
 
 	it("rejects an abort-and-prompt acknowledgement with an unknown queuedAs disposition", async () => {
@@ -6750,6 +6982,57 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			// The exact-key retry replays the recorded response without dispatching again.
 			expect(await f.server.callTool("gjc_delegate_execute", request)).toEqual(degraded);
 			expect(f.controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(1);
+		});
+
+		it("recovers a force delegate crashed between steer disposition persistence and reservation cleanup", async () => {
+			let lostAcknowledgement = true;
+			const controlResult: NonNullable<SdkControlServerOptions["controlResult"]> = control => {
+				if (control.operation !== "turn.abort_and_prompt")
+					return { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" };
+				if (lostAcknowledgement) {
+					lostAcknowledgement = false;
+					throw new SessionRouterError("ambiguous", "response crossed attachment rotation");
+				}
+				return {
+					accepted: true,
+					commandId: "steer-command",
+					turnId: "steer-runtime-turn",
+					aborted: false,
+					queuedAs: "steer",
+				};
+			};
+			const f = await fixture(true, { controlResult });
+			const first = await f.server.callTool("gjc_delegate_execute", { ...f.request, await_completion: false });
+			const firstTurnId = first.turn_id;
+			if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+			const request = { ...f.request, idempotency_key: "delegate-steer-crash", force: true };
+			expect(await f.server.callTool("gjc_delegate_execute", request)).toMatchObject({ ok: false });
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			await seedPersistedSteerDispositionBeforeCleanup(paths, "visible-session");
+			const crashed = await readSessionTransaction(paths, "visible-session");
+			expect(Object.keys(crashed?.canonical.turns ?? {}).length).toBe(2);
+			// Reopen the coordinator and retry the exact key.
+			const reopened = await f.open({ controlResult });
+			expect(await reopened.callTool("gjc_delegate_execute", { ...request, task: "different task" })).toMatchObject({
+				ok: false,
+			});
+			const recovered = await reopened.callTool("gjc_delegate_execute", request);
+			expect(recovered).toMatchObject({
+				ok: true,
+				workflow: "execute",
+				delivery: "steer",
+				aborted: false,
+				turn_id: firstTurnId,
+				active_turn_id: firstTurnId,
+				result: { command_id: "steer-command", turn_id: "steer-runtime-turn", queued_as: "steer" },
+			});
+			expect(recovered).not.toHaveProperty("turn");
+			expect(recovered).not.toHaveProperty("completion");
+			await expectNoPhantomSteerReservation(paths, "visible-session", firstTurnId);
+			expect(f.controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(1);
+			expect(
+				await reopened.callTool("gjc_delegate_execute", { ...request, idempotency_key: "delegate-steer-crash-2" }),
+			).toMatchObject({ ok: true, delivery: "steer", turn_id: firstTurnId });
 		});
 
 		for (const mode of ["prompt", "force", "queue"] as const) {
