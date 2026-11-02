@@ -2840,12 +2840,13 @@ export interface SessionMcpControlResult {
 }
 export interface SessionMcpControlPort {
 	listDeclaredServers(): Promise<SessionMcpDeclaredServer[]>;
+	getGeneration(): number;
 	isSettled(): boolean;
 	getFailedServers(): ReadonlySet<string>;
 	markFailed(name: string): void;
 	clearFailed(name: string): void;
-	/** Reconnect autoload servers in the background; settles after their tools are published. */
 	restoreAutoload(names: readonly string[]): Promise<void>;
+	disposeRestoration(): Promise<void>;
 }
 export interface SessionMcpStatusSnapshot {
 	readonly available: boolean;
@@ -12055,8 +12056,12 @@ export class AgentSession {
 				await Promise.allSettled([...this.#coordinatorEventHandlers]);
 			}
 		};
+		// A reset can await restoration metadata or connector work. Start cancellation
+		// before joining admission/retirement, not from later tool cleanup.
+		const restorationDisposal = this.#sessionMcpControlPort?.disposeRestoration();
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		await awaitDisposeStep("session admission close", admissionClosed);
+		await awaitDisposeStep("session MCP restoration", restorationDisposal ?? Promise.resolve(), true);
 		if (this.#sessionTransitionKind === "mcp-control") {
 			await awaitDisposeStep("active MCP control", this.#sessionTransitionCompletion, true);
 		}
@@ -13324,24 +13329,81 @@ export class AgentSession {
 	async #prepareSessionMcpReset(): Promise<PreparedExactMcpRetirement | undefined> {
 		const port = this.#sessionMcpControlPort;
 		if (!this.hasSessionMcpControls || this.#sessionMcpOverrides.size === 0 || !port) return undefined;
+		const manager = this.#sessionMcpManager();
+		if (!manager) return undefined;
 		const overrides = new Map(this.#sessionMcpOverrides);
+		const portGeneration = port.getGeneration();
+		const completion = Promise.withResolvers<void>();
+		this.#exactMcpRetirementCompletion = completion.promise;
+		let finished = false;
+		const canCommit = (): boolean =>
+			!finished &&
+			!this.#isDisposed &&
+			manager === this.#sessionMcpManager() &&
+			port.getGeneration() === portGeneration &&
+			overrides.size === this.#sessionMcpOverrides.size &&
+			[...overrides].every(([name, value]) => this.#sessionMcpOverrides.get(name) === value);
+		const assertCurrent = (): void => {
+			if (!canCommit()) throw new Error("Session MCP reset ownership changed before completion");
+		};
+		const finish = (): void => {
+			finished = true;
+			if (this.#exactMcpRetirementCompletion === completion.promise) this.#exactMcpRetirementCompletion = undefined;
+			completion.resolve();
+		};
+		const sessionManager = this.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const sessionFile = sessionManager.getSessionFile();
+		const cwd = sessionManager.getCwd();
+		const generation = this.#sessionTransitionGeneration;
+		const predecessorIsCurrent = (): boolean =>
+			canCommit() &&
+			this.sessionManager === sessionManager &&
+			sessionManager.getSessionId() === sessionId &&
+			sessionManager.getSessionFile() === sessionFile &&
+			sessionManager.getCwd() === cwd &&
+			this.#sessionTransitionGeneration === generation;
+		const assertResetOwner = (): void => {
+			assertCurrent();
+			if (!predecessorIsCurrent()) throw new Error("Session identity changed while resetting MCP controls");
+		};
+		try {
+			// Complete fallible work while the caller still owns its pre-adoption identity.
+			// Keep intent until synchronous commit, so a later adoption failure stays retryable.
+			assertResetOwner();
+			const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
+			const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
+			for (const name of disconnect) {
+				await manager.disconnectServer(name);
+				assertResetOwner();
+			}
+			await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false });
+			assertResetOwner();
+			await port.restoreAutoload(restore);
+			assertResetOwner();
+			if (restore.length > 0) {
+				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false });
+				assertResetOwner();
+			}
+		} catch (error) {
+			if (predecessorIsCurrent()) for (const name of overrides.keys()) port.markFailed(name);
+			finish();
+			throw error;
+		}
 		return {
-			canCommit: () => true,
+			canCommit: predecessorIsCurrent,
 			commit: async () => {
-				this.#sessionMcpOverrides.clear();
-				const manager = this.#sessionMcpManager();
-				if (!manager) return;
-				const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
-				const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
-				for (const name of disconnect) {
-					await manager.disconnectServer(name).catch(() => {});
-					port.clearFailed(name);
+				try {
+					assertCurrent();
+					for (const name of overrides.keys()) {
+						port.clearFailed(name);
+						this.#sessionMcpOverrides.delete(name);
+					}
+				} finally {
+					finish();
 				}
-				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
-				// The replacement session's first turn waits for the restored tools.
-				if (restore.length > 0) this.extendStartupTurnBarrier(port.restoreAutoload(restore));
 			},
-			abort: async () => {},
+			abort: async () => finish(),
 		};
 	}
 
@@ -30963,15 +31025,10 @@ export class AgentSession {
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
 		let sessionIdentityCommitted = false;
-		// Committed-switch listeners rebind controllers from the successor file. A
-		// same-file reload whose exact ownership changed still publishes a new
-		// identity, but #rebindSwitchedSessionMode does not run for it, so the
-		// listeners must not detach the live mode either.
-		let differentSessionCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
-			const switchingToDifferentSession = previousSessionFile
+			let switchingToDifferentSession = previousSessionFile
 				? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 				: true;
 			// Emit session_before_switch event (can be cancelled)
@@ -30987,6 +31044,27 @@ export class AgentSession {
 				}
 			}
 			options?.onTransitionMutationStarted?.();
+
+			// A conventional same-path reload can replace the logical identity.
+			// Discover that before admitting owner shutdown and keep the expected
+			// target id fenced through load, without adopting the captured transcript.
+			let preflightSessionId: string | undefined;
+			if (
+				!switchingToDifferentSession &&
+				!getExactMcpControls(this) &&
+				this.hasSessionMcpControls &&
+				this.#sessionMcpOverrides.size > 0
+			) {
+				const captured = SessionManager.captureTranscriptStrict(sessionPath);
+				if (captured.kind !== "captured")
+					throw new Error(`Session MCP reload preflight failed: ${captured.reason}`);
+				try {
+					preflightSessionId = captured.snapshot.identity.sessionId;
+					switchingToDifferentSession = preflightSessionId !== this.sessionManager.getSessionId();
+				} finally {
+					captured.snapshot.close();
+				}
+			}
 
 			const asyncManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 			const ownerId = this.#agentId;
@@ -31014,10 +31092,12 @@ export class AgentSession {
 				while (this.isCompacting) await Bun.sleep(10);
 			}
 
-			this.#disconnectFromAgent();
+			await this.#settleBtwForSessionTransition();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
 			const previousSessionState = await this.sessionManager.captureRollbackState();
+			const previousSessionAgentModelOverrides = this.getSessionAgentModelOverrideState();
+			let stagedSessionAgentModelRevision: number | undefined;
 			const previousSessionContext = this.buildDisplaySessionContext();
 			// switchSession replaces these arrays wholesale during load/rollback, so retaining
 			// the existing message objects is sufficient and avoids structured-clone failures for
@@ -31058,6 +31138,7 @@ export class AgentSession {
 				: undefined;
 			const previousExplicitMCPToolSelectionPersistsForContext =
 				this.#committedExplicitMCPToolSelectionPersistsForContext;
+			const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 			const previousTools = [...this.agent.state.tools];
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -31071,32 +31152,54 @@ export class AgentSession {
 			const previousActiveAttemptScope = this.#activeAttemptScope;
 			const previousActiveLogicalRunId = this.#activeLogicalRunId;
 
-			// Once session state starts changing, resumes are safe only after rollback completes.
-			ownerShutdownCanDrainResumes = false;
-			this.#steeringMessages = [];
-			this.#followUpMessages = [];
-			this.#pendingNextTurnMessages = [];
-			this.#scheduledHiddenNextTurnGeneration = undefined;
-			const suspendedWorkflowGateEmitter = switchingToDifferentSession
-				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
-				: undefined;
+			// Conventional reset work must finish while the predecessor still owns its
+			// identity, history, queues, and workflow emitter.
+			let conventionalRetirement: PreparedExactMcpRetirement | undefined;
+			if (
+				switchingToDifferentSession &&
+				!getExactMcpControls(this) &&
+				this.hasSessionMcpControls &&
+				this.#sessionMcpOverrides.size > 0
+			) {
+				conventionalRetirement = await this.#prepareSessionMcpReset();
+			}
+			let suspendedWorkflowGateEmitter: WorkflowGateEmitter | undefined;
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
 			let recoveredThinkingLevel: ThinkingLevel | undefined;
 			let durableDefaultRecoveryError: string | undefined;
 			let transitionCleanupCommitted = false;
-			let exactRetirement: PreparedExactMcpRetirement | undefined;
+			let sessionIdentityRekeyed = false;
+			let exactRetirement: PreparedExactMcpRetirement | undefined = conventionalRetirement;
 			let exactOwnershipChanged = switchingToDifferentSession;
 
 			try {
+				// Once session state starts changing, resumes are safe only after rollback completes.
+				ownerShutdownCanDrainResumes = false;
+				this.#disconnectFromAgent();
+				this.#steeringMessages = [];
+				this.#followUpMessages = [];
+				this.#pendingNextTurnMessages = [];
+				this.#scheduledHiddenNextTurnGeneration = undefined;
+				suspendedWorkflowGateEmitter = switchingToDifferentSession
+					? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
+					: undefined;
+				if (conventionalRetirement && !conventionalRetirement.canCommit())
+					throw new Error("Session MCP reset ownership changed before session switch load");
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				if (preflightSessionId !== undefined && this.sessionManager.getSessionId() !== preflightSessionId)
+					throw new Error("Session MCP reload identity changed after preflight");
 				const loadedSessionFile = this.sessionManager.getSessionFile();
 				exactOwnershipChanged =
 					this.sessionManager.getSessionId() !== previousSessionState.sessionId ||
 					(loadedSessionFile ? path.resolve(loadedSessionFile) : undefined) !==
 						(previousSessionState.sessionFile ? path.resolve(previousSessionState.sessionFile) : undefined);
+				if (exactOwnershipChanged) {
+					this.retireSessionAgentModelOverrides();
+					stagedSessionAgentModelRevision = this.#sessionAgentModelSelectionRevision;
+				}
 				// setSessionFile rotated the endpoint identity to the successor;
 				// re-register the manager under it so post-transition lineage
 				// bindings resolve and owned aborts classify in the successor
@@ -31104,6 +31207,7 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, previousSessionState.sessionFile, {
 					retirePredecessorRegistrations: false,
 				});
+				sessionIdentityRekeyed = true;
 				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
@@ -31338,7 +31442,7 @@ export class AgentSession {
 				await this.sessionManager.ensureOnDisk();
 				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
-				if (switchingToDifferentSession) {
+				if (exactOwnershipChanged) {
 					// Profile cleanup changed the active role layer; refresh eager task
 					// delegation and its base prompt before reconnecting the successor.
 					await this.syncEagerDelegation();
@@ -31349,11 +31453,17 @@ export class AgentSession {
 				}
 
 				if (exactOwnershipChanged) {
-					exactRetirement = await this.#prepareExactMcpControlRetirement(previousSessionState.sessionId, true);
-					if (exactRetirement && !exactRetirement.canCommit())
-						throw new Error("Exact MCP control retirement changed before session switch commit");
+					if (!conventionalRetirement && getExactMcpControls(this)) {
+						exactRetirement = await this.#prepareExactMcpControlRetirement(previousSessionState.sessionId, true);
+						if (exactRetirement && !exactRetirement.canCommit())
+							throw new Error("Exact MCP control retirement changed before session switch commit");
+					}
+					// Conventional predecessor validity was checked before loading. Its
+					// commit checks manager/ledger/override ownership after adoption.
 					await exactRetirement?.commit();
 					revokeExactMcpControls(this);
+				} else {
+					await conventionalRetirement?.abort();
 				}
 				if (switchingToDifferentSession) {
 					const predecessorEndpointId = this.#asyncJobEndpointId(
@@ -31362,7 +31472,6 @@ export class AgentSession {
 					);
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
-					differentSessionCommitted = true;
 					// Bind plan before post-commit cleanup. A cleanup failure leaves this
 					// successor active and must not keep the predecessor plan slot.
 					this.#rebindSwitchedSessionMode(sessionContext);
@@ -31488,11 +31597,16 @@ export class AgentSession {
 					previousSessionState.sessionId,
 					previousSessionState.sessionFile,
 				);
-				const rekeyed = AsyncJobManager.rekeyForEndpoint(
-					successorEndpointId,
-					predecessorEndpointId,
-					AsyncJobManager.forEndpoint(successorEndpointId),
-				);
+				// Preflight rejection happens before endpoint registration moves. Do not
+				// rekey an unrelated manager that owns the unaccepted target identity.
+				let rekeyed = true;
+				if (sessionIdentityRekeyed) {
+					rekeyed = AsyncJobManager.rekeyForEndpoint(
+						successorEndpointId,
+						predecessorEndpointId,
+						AsyncJobManager.forEndpoint(successorEndpointId),
+					);
+				}
 				if (!rekeyed) {
 					revokeExactMcpControls(this);
 					// Another top-level session claimed the freed predecessor endpoint
@@ -31513,10 +31627,23 @@ export class AgentSession {
 				} catch (restoreError) {
 					sessionRestoreError = restoreError;
 				}
-				if (sessionRestoreError ||
+				if (
+					sessionRestoreError ||
 					this.sessionManager.getSessionId() !== previousSessionState.sessionId ||
-					this.sessionManager.getSessionFile() !== previousSessionState.sessionFile) {
+					this.sessionManager.getSessionFile() !== previousSessionState.sessionFile
+				) {
 					revokeExactMcpControls(this);
+				}
+				if (
+					!sessionRestoreError &&
+					stagedSessionAgentModelRevision !== undefined &&
+					this.sessionManager.getSessionId() === previousSessionState.sessionId &&
+					this.sessionManager.getSessionFile() === previousSessionState.sessionFile
+				) {
+					this.#restoreSessionAgentModelOverrides(
+						previousSessionAgentModelOverrides,
+						stagedSessionAgentModelRevision,
+					);
 				}
 				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#syncAgentSessionId(previousSessionState.sessionId);
@@ -31555,14 +31682,16 @@ export class AgentSession {
 				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
 				this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
 				this.#commitExplicitMCPToolSelectionAuthority();
-				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.#activeToolSelectionRevision++;
-				this.agent.setTools(previousTools);
-				this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
-				this.#baseSystemPrompt = previousBaseSystemPrompt;
-				this.agent.setSystemPrompt(previousSystemPrompt);
-				this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
-				this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+				if (!conventionalRetirement) {
+					this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+					this.#activeToolSelectionRevision++;
+					this.agent.setTools(previousTools);
+					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+					this.#baseSystemPrompt = previousBaseSystemPrompt;
+					this.agent.setSystemPrompt(previousSystemPrompt);
+					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+				}
 				this.agent.replaceMessages(previousAgentMessages, {
 					historyRewrite: {
 						reason: switchingToDifferentSession ? "session-switch-rollback" : "conversation-reload-rollback",
@@ -31592,10 +31721,39 @@ export class AgentSession {
 				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
 				this.agent.serviceTier = previousServiceTier;
 				this.#syncTodoPhasesFromBranch();
-				this.#reconnectToAgent();
-				const rollbackErrors = [exactRetirementAbortError, sessionRestoreError, restoreMcpError].filter(
-					value => value !== undefined,
-				);
+				let reconcileMcpError: unknown;
+				if (conventionalRetirement) {
+					try {
+						if (this.#isDisposed) throw new Error("Session disposed before MCP rollback reconciliation");
+						// Reset changed physical connections, not just selection. Keep its live
+						// MCP projection and retryable override intent; never revive old wrappers.
+						// Rebuild after restoring the predecessor's model and history as well.
+						this.#pruneSelectedMCPToolNames();
+						this.#lastAppliedToolSignature = undefined;
+						this.#pendingAppliedToolSignature = undefined;
+						const appliedRevision = await this.#applyActiveToolsByName(
+							[
+								...previousTools.filter(tool => !isMCPToolName(tool.name)).map(tool => tool.name),
+								...this.getActiveMCPToolNames(),
+							],
+							{
+								persistMCPSelection: false,
+								nextSelectedDiscoveredBuiltinToolNames: previousSelectedDiscoveredBuiltinToolNames,
+							},
+						);
+						if (this.#isDisposed || appliedRevision === undefined)
+							throw new Error("Session MCP rollback reconciliation was superseded");
+					} catch (reconcileError) {
+						reconcileMcpError = reconcileError;
+					}
+				}
+				if (!this.#isDisposed) this.#reconnectToAgent();
+				const rollbackErrors = [
+					exactRetirementAbortError,
+					sessionRestoreError,
+					restoreMcpError,
+					reconcileMcpError,
+				].filter(value => value !== undefined);
 				if (rollbackErrors.length > 0) {
 					if (rollbackErrors.length > 1) {
 						throw new AggregateError(
@@ -31632,8 +31790,7 @@ export class AgentSession {
 			}
 			this.#endSessionTransition();
 			if (sessionIdentityCommitted) {
-				const committedSwitchListeners = differentSessionCommitted ? [...this.#committedSessionSwitchListeners] : [];
-				for (const listener of committedSwitchListeners) {
+				for (const listener of [...this.#committedSessionSwitchListeners]) {
 					try {
 						await listener();
 					} catch (error) {
