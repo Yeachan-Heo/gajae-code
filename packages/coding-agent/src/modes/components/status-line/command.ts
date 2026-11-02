@@ -1,3 +1,6 @@
+import { canonicalEnvKey } from "@gajae-code/utils/dirs";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+
 const DEFAULT_TIMEOUT_MS = 500;
 const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 10_000;
@@ -97,6 +100,42 @@ function boundedDiagnostic(text: string): string {
 	return text.replace(/\s+/gu, " ").trim().slice(0, STATUS_LINE_COMMAND_MAX_DIAGNOSTIC_BYTES);
 }
 
+const PROJECT_SHELL_STARTUP_ENV = new Set(["BASH_ENV", "ENV", "ZDOTDIR"]);
+
+/**
+ * Copy `env` for a shell child. Drop a startup name when the load-time project
+ * snapshot recorded that value, or when the declaration is dynamic. A different
+ * value is a caller override and stays. The live process environment is not
+ * read: a cached shell config can still hold the project value after that key
+ * changes. The input object is not modified.
+ */
+export function omitProjectShellStartupEnv(env: Record<string, string>): Record<string, string> {
+	const snapshot = startupProjectEnvSnapshot();
+	const next: Record<string, string> = {};
+	for (const name of Object.keys(env)) {
+		const value = env[name];
+		if (value === undefined || isProjectShellStartupValue(snapshot, name, value)) continue;
+		next[name] = value;
+	}
+	return next;
+}
+
+function isProjectShellStartupValue(
+	snapshot: { values: Record<string, string>; dynamic: Set<string> },
+	name: string,
+	value: string,
+): boolean {
+	const key = canonicalEnvKey(name);
+	if (!PROJECT_SHELL_STARTUP_ENV.has(key)) return false;
+	const dynamic = snapshot.dynamic.has(key);
+	const recorded = snapshot.values[key];
+	if (recorded === undefined && !dynamic) return false;
+	if (dynamic) return true;
+	const declared = recorded ?? "";
+	const trimmed = value.trim();
+	return value === declared || trimmed === declared || trimmed === declared.trim();
+}
+
 /**
  * Run a configured status-line command without making the synchronous render
  * path wait on it. The streams are drained with a hard byte cap and the whole
@@ -115,7 +154,7 @@ export async function runStatusLineCommand(
 ): Promise<StatusLineCommandResult> {
 	const proc = Bun.spawn([options.shell, ...options.shellArgs, command], {
 		cwd: options.cwd,
-		env: options.env,
+		env: omitProjectShellStartupEnv(options.env),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
