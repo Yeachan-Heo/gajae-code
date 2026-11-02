@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Effort } from "@gajae-code/ai/model-thinking";
 import { TempDir } from "@gajae-code/utils";
 import {
 	commitDurableModelProfileOwnership,
@@ -136,7 +137,7 @@ describe("model-profile ownership contract", () => {
 		expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 0, marker: inherit });
 	});
 
-	it("keeps the legacy profile projection patchable until transaction routing lands", () => {
+	it("exposes the default projection in setting validation but keeps ownership records internal", () => {
 		expect(validateSettingPatch({ "modelProfile.default": "codex-medium" })).toEqual([]);
 		expect(
 			validateSettingPatch({ "modelProfile.ownership": { schemaVersion: 1, version: 1, marker: profileA } }),
@@ -214,6 +215,107 @@ describe("model-profile ownership contract", () => {
 
 		expect(lockReads).toBe(1);
 		expect(patches).toBeUndefined();
+	});
+
+	it("rejects an observed-owner ABA even when the profile name returns to the requested owner", async () => {
+		const settings = Settings.isolated();
+		const observed = await commitDurableModelProfileOwnership(settings, profileA);
+		await commitDurableModelProfileOwnership(settings, profileB);
+		const winner = await commitDurableModelProfileOwnership(settings, profileA);
+		const validate = vi.fn();
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(settings, profileA, [], validate, observed),
+		).rejects.toMatchObject({
+			code: "model_profile_ownership_conflict",
+			expectedVersion: observed.version,
+			actualVersion: winner.version,
+		});
+		expect(validate).not.toHaveBeenCalled();
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+	});
+
+	it("rejects a same-version different-marker winner without applying extra patches", async () => {
+		const settings = Settings.isolated();
+		const observed = await commitDurableModelProfileOwnership(settings, profileA);
+		const winner = { ...observed, marker: profileB };
+		await settings.commitAtomicBatch([
+			{ path: "modelProfile.ownership", op: "set", value: winner },
+			{ path: "modelProfile.default", op: "set", value: "profile-b" },
+		]);
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(
+				settings,
+				profileA,
+				[{ path: "modelRoles", op: "set", value: {} }],
+				undefined,
+				observed,
+			),
+		).rejects.toMatchObject({
+			code: "model_profile_ownership_conflict",
+			expectedVersion: observed.version,
+			actualVersion: observed.version,
+			actualMarker: profileB,
+		});
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+	});
+
+	it("locked validation rejection publishes no ownership, projection, or extra patches", async () => {
+		const settings = Settings.isolated({ modelRoles: { default: "original/model" } });
+		const observed = await commitDurableModelProfileOwnership(settings, profileA);
+		const rejected = new Error("request no longer bound");
+		const validate = vi.fn(() => {
+			throw rejected;
+		});
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(
+				settings,
+				profileB,
+				[{ path: "modelRoles", op: "set", value: {} }],
+				validate,
+				observed,
+			),
+		).rejects.toBe(rejected);
+		expect(validate).toHaveBeenCalledTimes(1);
+		expect(readDurableModelProfileOwnership(settings)).toEqual(observed);
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "original/model" });
+	});
+
+	it("same-name retries with changed extra patches advance the version", async () => {
+		const settings = Settings.isolated();
+		const first = await commitDurableModelProfileOwnershipWithResult(settings, profileA, [
+			{ path: "defaultThinkingLevel", op: "set", value: Effort.Low },
+		]);
+		const next = await commitDurableModelProfileOwnershipWithResult(
+			settings,
+			profileA,
+			[{ path: "defaultThinkingLevel", op: "set", value: Effort.High }],
+			undefined,
+			first.ownership,
+		);
+		expect(next).toEqual({ ownership: { ...first.ownership, version: first.ownership.version + 1 }, wrote: true });
+		expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.High);
+	});
+
+	it("exhausted ownership versions reject without clearing assignments or changing the owner", async () => {
+		const exhausted = { schemaVersion: 1 as const, version: Number.MAX_SAFE_INTEGER, marker: profileA };
+		const settings = Settings.isolated({
+			"modelProfile.ownership": exhausted,
+			"modelProfile.default": "profile-a",
+			modelRoles: { default: "original/model" },
+		});
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(
+				settings,
+				profileB,
+				[{ path: "modelRoles", op: "set", value: {} }],
+				undefined,
+				exhausted,
+			),
+		).rejects.toThrow("version is exhausted");
+		expect(readDurableModelProfileOwnership(settings)).toEqual(exhausted);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "original/model" });
 	});
 
 	it("reports a completed profile deletion when an unrelated setting changes during the models write", async () => {
