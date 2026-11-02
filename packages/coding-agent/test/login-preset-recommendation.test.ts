@@ -6,6 +6,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import type { PreparedProfileModelSelection } from "@gajae-code/coding-agent/session/agent-session";
 
 const model = (provider: string, id: string): Model =>
 	({
@@ -70,6 +71,50 @@ function createControllerContext(
 		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
 			return body();
 		},
+		disposed: false,
+		get sessionLifecycle() {
+			return Object.freeze({ generation: 0, transitioning: false, disposed: this.disposed });
+		},
+		async dispose() {
+			this.disposed = true;
+		},
+		// Activation publishes through the prepared selection, so the double has to
+		// expose the commit seam AgentSession uses instead of the deleted
+		// setModelTemporary escape hatch.
+		commitCalls: [] as PreparedProfileModelSelection[],
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			signal?.throwIfAborted();
+			const apiKey = await this.modelRegistry.getApiKey(next, this.sessionId);
+			if (!apiKey) throw new Error(`No API key for ${next.provider}/${next.id}`);
+			return {
+				sessionId: this.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: this.model,
+				previousThinkingLevel: this.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection) {
+			selection.signal?.throwIfAborted();
+			if (this.model !== selection.previousModel || this.thinkingLevel !== selection.previousThinkingLevel)
+				throw new Error("Session changed while publishing profile");
+			this.commitCalls.push(selection);
+			this.model = selection.model;
+			this.thinkingLevel = selection.committedThinkingLevel;
+		},
+		async finishPreparedProfileModelSelection(_selection: PreparedProfileModelSelection): Promise<void> {},
+		recordResumeDefaultModel(_selector: string | undefined) {},
+		setThinkingLevel(level: ThinkingLevel | undefined) {
+			this.thinkingLevel = level;
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -98,6 +143,7 @@ function createControllerContext(
 			getModelProfile: (name: string) => profiles.get(name),
 			getAvailableModelProfileNames: () => [...profiles.keys()],
 			getApiKeyForProvider: vi.fn(async () => "key"),
+			getApiKey: vi.fn(async (_model: Model, _credentialSessionId?: string) => "key"),
 			getAll: () => [codexModel, minimaxModel],
 			resolveCanonicalModel: () => undefined,
 			getCanonicalVariants: () => [],
@@ -141,7 +187,11 @@ describe("login preset recommendation", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
 		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
-		expect(session.setModelTemporaryCalls).toEqual([{ model: codexModel, thinkingLevel: ThinkingLevel.Medium }]);
+		// Session-only activation commits the prepared selection; it must not fall
+		// back to the temporary-model path the embedding work removed.
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls.map(call => call.model)).toEqual([codexModel]);
+		expect(session.commitCalls.map(call => call.committedThinkingLevel)).toEqual([ThinkingLevel.Medium]);
 		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium", true);
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(setCalls).not.toContainEqual({ path: "modelProfile.default", value: "codex-medium" });
@@ -155,6 +205,7 @@ describe("login preset recommendation", () => {
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
 		expect(session.markUserModelSelection).not.toHaveBeenCalled();
 		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls).toEqual([]);
 		expect(session.setActiveModelProfile).not.toHaveBeenCalled();
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "openai-codex/original-executor" });
 	});
@@ -166,7 +217,7 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showHookConfirm).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith("Preset codex-medium is available in /model.");
-		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls).toEqual([]);
 	});
 
 	test("login with default profile setting shows hint instead of prompting", async () => {
@@ -176,7 +227,7 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showHookConfirm).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith("Preset codex-medium is available in /model.");
-		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls).toEqual([]);
 	});
 
 	test("minimax-code login recommends minimax-medium", async () => {
@@ -185,7 +236,9 @@ describe("login preset recommendation", () => {
 		await login(ctx, "minimax-code");
 
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply minimax-medium now?", "");
-		expect(session.setModelTemporaryCalls).toEqual([{ model: minimaxModel, thinkingLevel: ThinkingLevel.Medium }]);
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls.map(call => call.model)).toEqual([minimaxModel]);
+		expect(session.commitCalls.map(call => call.committedThinkingLevel)).toEqual([ThinkingLevel.Medium]);
 		expect(session.setActiveModelProfile).toHaveBeenCalledWith("minimax-medium", true);
 	});
 
@@ -196,7 +249,7 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showHookConfirm).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith("Logging in to ollama…");
-		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls).toEqual([]);
 	});
 
 	test("plain minimax has no recommendation mapping", async () => {
@@ -210,6 +263,6 @@ describe("login preset recommendation", () => {
 		expect(ctx.showHookConfirm).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith("Logging in to minimax…");
 		expect(ctx.showStatus).not.toHaveBeenCalledWith("Preset minimax-medium is available in /model.");
-		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.commitCalls).toEqual([]);
 	});
 });
