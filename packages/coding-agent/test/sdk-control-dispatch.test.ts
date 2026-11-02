@@ -65,6 +65,7 @@ const methodByOperation: Record<string, string> = {
 	"retry.last": "retryLast",
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
+	"btw.ask": "askBtw",
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([

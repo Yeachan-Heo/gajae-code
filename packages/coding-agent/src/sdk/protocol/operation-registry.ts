@@ -129,6 +129,7 @@ const controls = [
 	["turn.image.append", "Append a canonical base64 image chunk."],
 	["turn.image.finish", "Verify and stage a complete image."],
 	["turn.image.discard", "Discard an unfinished or staged image."],
+	["btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
 ] as const;
 
 const globals = [
@@ -317,6 +318,7 @@ function controlErrors(id: string): string[] {
 		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
+		C60: ["invalid_input", "busy", "unavailable"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }
@@ -346,7 +348,8 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 export const OPERATIONS: readonly Operation[] = [
 	...controls.map(([sdkId, description], index) => {
-		const id = `C${String(index + 1).padStart(2, "0")}`;
+		// C58/C59 belong to the pending permission polling controls (#7497).
+		const id = sdkId === "btw.ask" ? "C60" : `C${String(index + 1).padStart(2, "0")}`;
 		return {
 			id,
 			sdkId,
@@ -354,7 +357,10 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52"] as string[]).includes(id)
+				: // C60 is fast-lane like the bash controls: it must reach the surface
+					// concurrently so its own single-flight `busy` contract can fire instead
+					// of being queued behind the ordered per-surface chain.
+					(["C25", "C52", "C60"] as string[]).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

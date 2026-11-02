@@ -3406,6 +3406,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getAskAnswerSource: () => session?.getAskAnswerSource(),
 			getGoalRuntime: () => session?.goalRuntime,
 			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
+			getSdkPermissionProvider: () => session?.getSdkPermissionProvider(),
 			getClientBridge: () => session?.clientBridge,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
@@ -4356,6 +4357,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (!session) throw new Error("Image owner session is not initialized.");
 									return session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null });
 								},
+							},
+							// INTERNAL ephemeral side-question runner (`/btw`), threaded directly
+							// from the owning session (NOT on the public extension context).
+							askEphemeralQuestion: async (question, signal?: AbortSignal) => {
+								if (!session) throw new Error("Ephemeral turns are unavailable.");
+								const { replyText } = await session.runEphemeralTurn({
+									purpose: "btw",
+									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
+									signal,
+								});
+								return replyText;
 							},
 						});
 					}

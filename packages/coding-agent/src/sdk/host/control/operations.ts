@@ -55,6 +55,8 @@ export interface ControlSurface {
 	setThinking(level: ControlValue): Promise<ControlValue> | ControlValue;
 	cycleThinking(): Promise<ControlValue> | ControlValue;
 	setPermissionMode(mode: ControlValue): Promise<ControlValue> | ControlValue;
+	configurePermissionChannel?(input: ControlInput): Promise<ControlValue> | ControlValue;
+	respondPermission?(input: ControlInput): ControlValue;
 	setQueueMode(kind: string, mode: ControlValue): Promise<ControlValue> | ControlValue;
 	runCompaction(): Promise<ControlValue> | ControlValue;
 	setAutoCompaction(on: boolean): Promise<ControlValue> | ControlValue;
@@ -88,6 +90,11 @@ export interface ControlSurface {
 	retryLast(): Promise<ControlValue> | ControlValue;
 	retryNow(): Promise<ControlValue> | ControlValue;
 	backgroundBash(): Promise<ControlValue> | ControlValue;
+	/**
+	 * Ephemeral side question (`/btw`): answers from the current session context
+	 * without owning a turn or appending anything to the session transcript.
+	 */
+	askBtw(question: string, signal?: AbortSignal): Promise<ControlValue> | ControlValue;
 	/** Returns the current revision for a registry revision resource. */
 	/** Installed per-session registry rows. Dispatch rejects other rows before invoking a surface method. */
 	installedOperations?: ReadonlySet<string>;

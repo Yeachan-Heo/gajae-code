@@ -1,4 +1,4 @@
-import { $credentialEnv } from "@gajae-code/utils";
+import { type EndpointConfiguration, readEndpointConfiguration } from "@gajae-code/utils";
 
 /**
  * Whether Anthropic requests run in Foundry gateway mode.
@@ -10,8 +10,8 @@ import { $credentialEnv } from "@gajae-code/utils";
  * same way the credentials themselves are (launching shell plus GJC/user-owned
  * `.env` files, never the project `.env`).
  */
-export function isFoundryEnabled(): boolean {
-	const value = $credentialEnv("CLAUDE_CODE_USE_FOUNDRY");
+export function isFoundryEnabled(endpointConfiguration?: EndpointConfiguration): boolean {
+	const value = readEndpointConfiguration(endpointConfiguration, "CLAUDE_CODE_USE_FOUNDRY");
 	if (!value) return false;
 	const normalized = value.trim().toLowerCase();
 	return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
