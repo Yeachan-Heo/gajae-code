@@ -799,7 +799,7 @@ describe("queued promotion run identity (#4668)", () => {
 		await prompt;
 	});
 
-	it("settles a queued follow-up removed by successor startup failure", async () => {
+	it("settles a queued follow-up as refused by successor startup failure", async () => {
 		session = buildSession([{ content: ["first answer"] }], {
 			name: "echo",
 			label: "Echo",
@@ -818,12 +818,12 @@ describe("queued promotion run identity (#4668)", () => {
 		await expect(submission.execution).resolves.toMatchObject({
 			submissionId: submission.submissionId,
 			disposition: "removed",
-			reason: "removed",
+			reason: "refused",
 		});
 		await expect(submission.terminal).resolves.toMatchObject({
 			submissionId: submission.submissionId,
 			disposition: "removed",
-			reason: "removed",
+			reason: "refused",
 		});
 	});
 
