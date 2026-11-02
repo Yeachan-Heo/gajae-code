@@ -17,8 +17,10 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../src/extensibility/extensions";
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
+import { createBtwAskHandler } from "../src/sdk/host/control/btw-ask";
 import { createSdkSessionRuntimeExtension, type SessionSdkTransport } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
 import { BTW_MAX_QUESTION_UTF8_BYTES } from "../src/session/btw-contract";
@@ -48,9 +50,11 @@ interface ControlResponseFrame {
 
 function memoryTransport(): SessionSdkTransport & {
 	feed(connectionId: string, frame: SdkFrame): void;
+	disconnect(connectionId: string): void;
 	readonly sent: SdkFrame[];
 } {
 	let handler: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	let closeHandler: ((connectionId: string) => void) | undefined;
 	const sent: SdkFrame[] = [];
 	let started = false;
 	return {
@@ -64,6 +68,12 @@ function memoryTransport(): SessionSdkTransport & {
 				if (handler === next) handler = undefined;
 			};
 		},
+		onConnectionClose(next) {
+			closeHandler = next;
+			return () => {
+				closeHandler = undefined;
+			};
+		},
 		sendFrame(_connectionId, frame) {
 			sent.push(frame);
 		},
@@ -75,6 +85,7 @@ function memoryTransport(): SessionSdkTransport & {
 			started = false;
 		},
 		broadcastFrame: () => {},
+		disconnect: connectionId => closeHandler?.(connectionId),
 		feed(connectionId, frame) {
 			if (!started) throw new Error("transport is not started");
 			handler?.(connectionId, frame);
@@ -87,6 +98,7 @@ interface BtwAskHarness {
 	/** Frames already answered for a request id, without waiting. */
 	responseFor(id: string): ControlResponseFrame | undefined;
 	send(id: string, input: unknown): void;
+	disconnect(): void;
 	readonly transcript: ExtensionTranscriptEntry[];
 	/** Prompt submissions routed through the extension API (`turn.prompt` admission). */
 	readonly promptDispatches: number;
@@ -94,7 +106,7 @@ interface BtwAskHarness {
 }
 
 async function createBtwAskHarness(
-	askEphemeralQuestion?: (question: string) => Promise<string>,
+	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>,
 ): Promise<BtwAskHarness> {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-btw-ask-"));
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
@@ -151,6 +163,7 @@ async function createBtwAskHarness(
 			return harnessState.promptDispatches;
 		},
 		send,
+		disconnect: () => transport.disconnect("client"),
 		responseFor,
 		async control(operation, input) {
 			const id = `btw-ask-${nextId++}-${operation}`;
@@ -287,4 +300,124 @@ test("btw.ask reports unavailable when the host has no ephemeral runner seam", a
 	} finally {
 		await harness.stop();
 	}
+});
+
+test("property: generated question types and UTF-8 boundaries are validated before runner admission", async () => {
+	await fc.assert(
+		fc.asyncProperty(
+			fc.oneof(
+				fc.jsonValue(),
+				fc
+					.tuple(fc.constantFrom("a", "한", "🦞", " "), fc.integer({ min: -2, max: 2 }))
+					.map(([unit, offset]) =>
+						unit.repeat(
+							Math.floor(BTW_MAX_QUESTION_UTF8_BYTES / new TextEncoder().encode(unit).byteLength) + offset,
+						),
+					),
+			),
+			async question => {
+				const calls: string[] = [];
+				const ask = createBtwAskHandler(async value => {
+					calls.push(value);
+					return " answer ";
+				});
+				const valid =
+					typeof question === "string" &&
+					question.trim().length > 0 &&
+					new TextEncoder().encode(question).byteLength <= BTW_MAX_QUESTION_UTF8_BYTES;
+				// Wire input is untrusted; deliberately exercise runtime type validation.
+				if (valid) {
+					expect(await ask(question as string)).toEqual({ reply: "answer" });
+					expect(calls).toEqual([(question as string).trim()]);
+				} else {
+					await expect(ask(question as string)).rejects.toMatchObject({ code: "invalid_input" });
+					expect(calls).toEqual([]);
+				}
+			},
+		),
+		{ seed: 750401, numRuns: 150 },
+	);
+});
+
+for (const ending of ["disconnect", "shutdown"] as const) {
+	test(`SDK-only BTW runner receives ${ending} cancellation without releasing single-flight early`, async () => {
+		const started = Promise.withResolvers<AbortSignal>();
+		const release = Promise.withResolvers<string>();
+		let calls = 0;
+		const harness = await createBtwAskHarness(async (_question, signal) => {
+			calls++;
+			if (!signal) throw new Error("Missing request cancellation signal");
+			started.resolve(signal);
+			return await release.promise;
+		});
+		let stopped = false;
+		try {
+			harness.send("pending", { question: "first" });
+			const signal = await started.promise;
+			expect(signal.aborted).toBe(false);
+			if (ending === "disconnect") harness.disconnect();
+			else {
+				await harness.stop();
+				stopped = true;
+			}
+			expect(signal.aborted).toBe(true);
+			if (ending === "disconnect") {
+				const response = await harness.control("btw.ask", { question: "second" });
+				expect(response).toMatchObject({ ok: false, error: { code: "busy" } });
+				expect(calls).toBe(1);
+			}
+		} finally {
+			release.resolve("settled");
+			if (!stopped) await harness.stop();
+		}
+	});
+}
+
+test("property: concurrent callers never overlap runners and settle/reject permits retry", async () => {
+	await fc.assert(
+		fc.asyncProperty(
+			fc.array(fc.record({ reject: fc.boolean(), contenders: fc.integer({ min: 1, max: 5 }), reply: fc.string() }), {
+				minLength: 1,
+				maxLength: 12,
+			}),
+			async rounds => {
+				let release = Promise.withResolvers<string>();
+				let active = 0;
+				let calls = 0;
+				const ask = createBtwAskHandler(async () => {
+					calls++;
+					active++;
+					expect(active).toBe(1);
+					try {
+						return await release.promise;
+					} finally {
+						active--;
+					}
+				});
+				for (const [index, round] of rounds.entries()) {
+					release = Promise.withResolvers<string>();
+					const answer = ask("question").then(
+						result => ({ result }),
+						error => ({ error }),
+					);
+					try {
+						await Promise.all(
+							Array.from({ length: round.contenders }, () =>
+								expect(ask("concurrent question")).rejects.toThrow("already running"),
+							),
+						);
+						expect(calls).toBe(index + 1);
+					} finally {
+						if (round.reject) release.reject(new Error("provider rejected"));
+						else release.resolve(round.reply);
+						const outcome = await answer;
+						if (round.reject) expect(outcome).toMatchObject({ error: { message: "provider rejected" } });
+						else expect(outcome).toEqual({ result: { reply: round.reply.trim() } });
+					}
+					expect(active).toBe(0);
+				}
+			},
+		),
+		{ seed: 750402, numRuns: 100 },
+	);
 });

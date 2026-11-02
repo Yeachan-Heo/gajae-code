@@ -307,6 +307,7 @@ function start(
 	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
+	runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -349,6 +350,7 @@ function start(
 		effectiveSettings
 			? {
 					settings: effectiveSettings,
+					runBtwTurn,
 					ensureTelegramDaemon,
 					ensureProviderDaemon,
 					controller,
@@ -3475,6 +3477,64 @@ test.each([
 		for (const release of cleanupReservations) release();
 	}
 });
+
+test.each(["disconnect", "shutdown"] as const)("broker BTW cancellation reaches runner on %s", async ending => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-abort-"));
+	dirs.push(cwd);
+	const sessionId = `btw-abort-${ending}-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		sdkBindings: () => ["sdkControl"],
+		sdkControl: () => {
+			throw new Error("BTW must use its private runner");
+		},
+	};
+	const started = Promise.withResolvers<AbortSignal>();
+	const release = Promise.withResolvers<void>();
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		undefined,
+		false,
+		undefined,
+		undefined,
+		true,
+		undefined,
+		undefined,
+		undefined,
+		async (_question, signal) => {
+			started.resolve(signal);
+			await release.promise;
+			return { replyText: "settled" };
+		},
+	);
+	let client: SdkClient | undefined;
+	let request: Promise<unknown> | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "BTW endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		request = client.control("btw.ask", { question: "side question" }).catch(error => error);
+		const signal = await Promise.race([
+			started.promise,
+			request.then(result => {
+				throw new Error(`BTW failed before runner admission: ${JSON.stringify(result)}`);
+			}),
+		]);
+		expect(signal.aborted).toBe(false);
+		if (ending === "disconnect") await client.close();
+		else await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await waitFor(() => signal.aborted, "BTW runner abort signal");
+		expect(signal.aborted).toBe(true);
+	} finally {
+		release.resolve();
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await request;
+	}
+}, 20_000);
 
 test.each([
 	"settlement",

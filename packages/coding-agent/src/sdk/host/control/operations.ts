@@ -92,7 +92,7 @@ export interface ControlSurface {
 	 * Ephemeral side question (`/btw`): answers from the current session context
 	 * without owning a turn or appending anything to the session transcript.
 	 */
-	askBtw(question: string): Promise<ControlValue> | ControlValue;
+	askBtw(question: string, signal?: AbortSignal): Promise<ControlValue> | ControlValue;
 	/** Returns the current revision for a registry revision resource. */
 	/** Installed per-session registry rows. Dispatch rejects other rows before invoking a surface method. */
 	installedOperations?: ReadonlySet<string>;

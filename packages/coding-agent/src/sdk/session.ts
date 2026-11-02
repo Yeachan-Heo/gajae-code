@@ -4347,11 +4347,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							},
 							// INTERNAL ephemeral side-question runner (`/btw`), threaded directly
 							// from the owning session (NOT on the public extension context).
-							askEphemeralQuestion: async question => {
+							askEphemeralQuestion: async (question, signal?: AbortSignal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
 								const { replyText } = await session.runEphemeralTurn({
 									purpose: "btw",
 									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
+									signal,
 								});
 								return replyText;
 							},

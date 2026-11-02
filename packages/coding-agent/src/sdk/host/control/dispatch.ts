@@ -21,6 +21,8 @@ export interface ControlRequest {
 	expectedRevision?: string;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	/** Internal request lifetime; never populated from a wire frame. */
+	signal?: AbortSignal;
 }
 
 export type ControlErrorCode = string;
@@ -253,6 +255,7 @@ function invoke(
 	input: ControlInput,
 	confirm: boolean | undefined,
 	idempotencyKey: string | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
@@ -378,7 +381,7 @@ function invoke(
 		case "bash.background":
 			return surface.backgroundBash();
 		case "btw.ask":
-			return surface.askBtw(text(input, "question"));
+			return surface.askBtw(text(input, "question"), signal);
 		default:
 			throw new Error("unknown operation");
 	}
@@ -433,6 +436,7 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 				request.input as ControlInput,
 				request.confirm,
 				request.idempotencyKey,
+				request.signal,
 			),
 		};
 	} catch (error) {

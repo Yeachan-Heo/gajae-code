@@ -2,7 +2,7 @@ import { BTW_MAX_QUESTION_UTF8_BYTES, utf8ByteLength } from "../../../session/bt
 import { BusyError } from "./dispatch";
 
 /** Session-owned ephemeral side-question runner (`/btw`); absent when the host has none. */
-export type EphemeralQuestionRunner = (question: string) => Promise<string>;
+export type EphemeralQuestionRunner = (question: string, signal?: AbortSignal) => Promise<string>;
 
 /**
  * Builds the `btw.ask` (C60) handler shared by both session host surfaces (the
@@ -20,9 +20,9 @@ export type EphemeralQuestionRunner = (question: string) => Promise<string>;
  */
 export function createBtwAskHandler(
 	runner: EphemeralQuestionRunner | undefined,
-): (question: string) => Promise<{ reply: string }> {
+): (question: string, signal?: AbortSignal) => Promise<{ reply: string }> {
 	let questionInFlight = false;
-	return async question => {
+	return async (question, signal) => {
 		if (typeof question !== "string" || question.trim().length === 0)
 			throw Object.assign(new Error("btw.ask requires a nonempty question."), { code: "invalid_input" });
 		if (utf8ByteLength(question) > BTW_MAX_QUESTION_UTF8_BYTES)
@@ -35,9 +35,10 @@ export function createBtwAskHandler(
 				code: "unavailable",
 			});
 		if (questionInFlight) throw new BusyError("A /btw question is already running. Wait for it to finish.");
+		signal?.throwIfAborted();
 		questionInFlight = true;
 		try {
-			return { reply: (await runner(question.trim())).trim() };
+			return { reply: (await runner(question.trim(), signal)).trim() };
 		} finally {
 			questionInFlight = false;
 		}
