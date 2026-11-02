@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
+import fc from "fast-check";
 import { type ExternalPermissionError, ExternalPermissionRuntime } from "../src/sdk/host/external-permissions";
-import type { ClientBridgePermissionOption, ClientBridgePermissionToolCall } from "../src/session/client-bridge";
+import type {
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../src/session/client-bridge";
 
 const options: ClientBridgePermissionOption[] = [
 	{ optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -227,5 +232,199 @@ describe("ExternalPermissionRuntime", () => {
 		expect(await pending).toEqual({ outcome: "cancelled" });
 		expect(disposed.enabled).toBe(false);
 		expectErrorCode(() => disposed.request(toolCall(), options), "resource_gone");
+	});
+
+	it("property: generated JSON evidence and offered options remain isolated and responses are fenced", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.jsonValue(),
+				fc.uniqueArray(fc.string({ minLength: 1, maxLength: 32 }), { minLength: 1, maxLength: 8 }),
+				fc.constantFrom("allow_once", "allow_always", "reject_once", "reject_always"),
+				fc.string({ maxLength: 128 }),
+				async (evidence, ids, kind, comment) => {
+					const channel = runtime();
+					try {
+						const offered: ClientBridgePermissionOption[] = ids.map(optionId => ({
+							optionId,
+							name: optionId,
+							kind,
+						}));
+						const call = toolCall({ rawInput: evidence });
+						const pending = channel.request(call, offered);
+						const original = channel.list();
+						const request = original.requests[0]!;
+						expectErrorCode(() => channel.configure({ enabled: true, extra: evidence }), "invalid_input");
+						expectErrorCode(() => channel.list({ extra: evidence }), "invalid_input");
+						for (const title of ["", ids[0]!.repeat(4097)])
+							expectErrorCode(() => channel.request(toolCall({ title }), offered), "invalid_input");
+						expectErrorCode(() => channel.request(call, [...offered, offered[0]!]), "invalid_input");
+						expect(channel.list()).toEqual(original);
+						call.rawInput = { replaced: true };
+						offered[0]!.optionId = "mutated";
+						const listing = channel.list();
+						listing.requests[0]!.toolCall.rawInput = null;
+						listing.requests[0]!.options.length = 0;
+						const response = { sessionId: "session-1", id: request.id, optionId: ids[0]! };
+						for (const invalid of [
+							{ ...response, sessionId: `other-${comment}` },
+							{ ...response, id: "unknown" },
+							{ ...response, optionId: `${ids.join("")}!` },
+							{ ...response, extra: evidence },
+						]) {
+							expectErrorCode(() => channel.respond(invalid), "invalid_input");
+							expect(channel.list()).toEqual(original);
+						}
+						const rejecting = kind.startsWith("reject");
+						if (!rejecting) expectErrorCode(() => channel.respond({ ...response, comment }), "invalid_input");
+						channel.respond(rejecting ? { ...response, comment } : response);
+						expect(await pending).toEqual({
+							outcome: "selected",
+							optionId: ids[0]!,
+							kind,
+							...(rejecting ? { comment } : {}),
+						});
+						expectErrorCode(() => channel.respond(response), "invalid_input");
+						expect(channel.list().requests).toEqual([]);
+					} finally {
+						channel.dispose();
+					}
+				},
+			),
+			{ seed: 749501, numRuns: 100 },
+		);
+	});
+
+	it("property: generated command traces match the bounded queue lifecycle model", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 1, max: 5 }),
+				fc.array(
+					fc.constantFrom(
+						"request",
+						"allow",
+						"reject",
+						"abort",
+						"cancel",
+						"disable",
+						"enable",
+						"dispose",
+						"expire",
+					),
+					{ minLength: 1, maxLength: 40 },
+				),
+				async (capacity, commands) => {
+					vi.useFakeTimers();
+					const channel = runtime({ maxPending: capacity, timeoutMs: 10 });
+					let enabled = true;
+					let disposed = false;
+					const pending = new Map<
+						string,
+						{ controller: AbortController; promise: Promise<ClientBridgePermissionOutcome> }
+					>();
+					try {
+						for (const command of commands) {
+							const first = pending.entries().next().value;
+							if (command === "request") {
+								if (!enabled || disposed)
+									expectErrorCode(() => channel.request(toolCall(), options), "resource_gone");
+								else if (pending.size === capacity)
+									expectErrorCode(() => channel.request(toolCall(), options), "too_many_outstanding");
+								else {
+									const controller = new AbortController();
+									const promise = channel.request(toolCall(), options, controller.signal);
+									const request = channel.list().requests.at(-1)!;
+									pending.set(request.id, { controller, promise });
+								}
+							} else if ((command === "allow" || command === "reject" || command === "abort") && first) {
+								const [id, entry] = first;
+								if (command === "abort") entry.controller.abort();
+								else channel.respond({ sessionId: "session-1", id, optionId: command });
+								expect(await entry.promise).toEqual(
+									command === "abort"
+										? { outcome: "cancelled" }
+										: {
+												outcome: "selected",
+												optionId: command,
+												kind: command === "allow" ? "allow_once" : "reject_once",
+											},
+								);
+								pending.delete(id);
+								expectErrorCode(
+									() => channel.respond({ sessionId: "session-1", id, optionId: "allow" }),
+									"invalid_input",
+								);
+							} else if (command === "enable") {
+								if (disposed) expectErrorCode(() => channel.configure({ enabled: true }), "resource_gone");
+								else {
+									channel.configure({ enabled: true });
+									enabled = true;
+								}
+							} else if (["cancel", "disable", "dispose", "expire"].includes(command)) {
+								if (command === "cancel") channel.cancelPending();
+								if (command === "disable") {
+									channel.configure({ enabled: false });
+									enabled = false;
+								}
+								if (command === "dispose") {
+									channel.dispose();
+									enabled = false;
+									disposed = true;
+								}
+								if (command === "expire") vi.advanceTimersByTime(10);
+								for (const entry of pending.values())
+									expect(await entry.promise).toEqual({ outcome: "cancelled" });
+								pending.clear();
+							}
+							expect(channel.enabled).toBe(enabled);
+							expect(channel.list().requests.map(request => request.id)).toEqual([...pending.keys()]);
+						}
+					} finally {
+						channel.dispose();
+						for (const entry of pending.values()) expect(await entry.promise).toEqual({ outcome: "cancelled" });
+						vi.useRealTimers();
+					}
+				},
+			),
+			{ seed: 749502, numRuns: 200 },
+		);
+	});
+
+	it("property: UTF-8 and JSON escaping cannot bypass aggregate payload limits", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.constantFrom("a", "한", "🦞", '"', "\n"),
+				fc.integer({ min: -2, max: 2 }),
+				async (character, delta) => {
+					const channel = runtime();
+					try {
+						const empty = channel.request(toolCall({ rawInput: { text: "" } }), options);
+						const overhead = new TextEncoder().encode(JSON.stringify(channel.list())).byteLength;
+						channel.cancelPending();
+						expect(await empty).toEqual({ outcome: "cancelled" });
+						const bytesPerCharacter = new TextEncoder().encode(JSON.stringify(character)).byteLength - 2;
+						const length = Math.floor((192 * 1024 - overhead) / bytesPerCharacter) + delta;
+						const call = toolCall({ rawInput: { text: character.repeat(length) } });
+						if (overhead + length * bytesPerCharacter > 192 * 1024) {
+							expectErrorCode(() => channel.request(call, options), "payload_too_large");
+							expect(channel.list().requests).toEqual([]);
+						} else {
+							const pending = channel.request(call, options);
+							const before = channel.list();
+							expectErrorCode(() => channel.request(call, options), "payload_too_large");
+							expect(channel.list()).toEqual(before);
+							channel.cancelPending();
+							expect(await pending).toEqual({ outcome: "cancelled" });
+						}
+						expectErrorCode(
+							() => channel.request(toolCall({ rawInput: character.repeat(260 * 1024) }), options),
+							"payload_too_large",
+						);
+					} finally {
+						channel.dispose();
+					}
+				},
+			),
+			{ seed: 749503, numRuns: 50 },
+		);
 	});
 });
