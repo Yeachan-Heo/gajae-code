@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 import { disposeAllShellSessions, executeBash } from "../../src/exec/bash-executor";
-import type { ToolSession } from "../../src/tools";
 import * as masterCli from "../../src/sdk/cli/master-cli";
+import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
