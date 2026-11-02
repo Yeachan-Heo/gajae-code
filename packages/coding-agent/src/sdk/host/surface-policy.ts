@@ -103,7 +103,9 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
-					(!operation.sdkId.startsWith("permission.") ||
+					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
+						operation.sdkId,
+					) ||
 						(options.externalPermissionsAvailable === true && hasBinding("sdkControl"))) &&
 					(!WORKFLOW_GATE_CONTROL_OPERATIONS.has(operation.sdkId) || options.workflowGateAvailable) &&
 					(!required[operation.sdkId] || hasBinding(required[operation.sdkId]!)),
