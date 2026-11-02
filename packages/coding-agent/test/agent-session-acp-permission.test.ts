@@ -276,12 +276,16 @@ for (const providerKind of ["SDK", "ACP"] as const) {
 }
 
 for (const change of ["mode", "provider", "bridge", "resolved-then-deny"] as const) {
-	it(`SDK pending approvals cancel on ${change} changes and cannot execute late`, async () => {
+	it(`pending approvals cancel on ${change} authority changes and cannot execute late`, async () => {
 		const bashTool = makeFakeTool("bash");
 		session = await createSession([bashTool]);
 		const channel = new ExternalPermissionRuntime("session");
 		channel.configure({ enabled: true });
-		session.setSdkPermissionProvider((call, options, signal) => channel.request(call, options, signal));
+		const provider: NonNullable<ClientBridge["requestPermission"]> = (call, options, signal) =>
+			channel.request(call, options, signal);
+		if (change === "bridge")
+			session.setClientBridge({ capabilities: { requestPermission: true }, requestPermission: provider });
+		else session.setSdkPermissionProvider(provider);
 		await session.setActiveToolsByName(["bash"]);
 		const tool = session.agent.state.tools.find(t => t.name === "bash")!;
 		const execution = tool
@@ -302,6 +306,35 @@ for (const change of ["mode", "provider", "bridge", "resolved-then-deny"] as con
 		channel.dispose();
 	});
 }
+
+it("SDK approval survives filesystem bridge installation, replacement, and removal", async () => {
+	const bashTool = makeFakeTool("bash");
+	session = await createSession([bashTool]);
+	const channel = new ExternalPermissionRuntime("session");
+	channel.configure({ enabled: true });
+	session.setSdkPermissionProvider((call, options, signal) => channel.request(call, options, signal));
+	try {
+		await session.setActiveToolsByName(["bash"]);
+		const tool = session.agent.state.tools.find(t => t.name === "bash")!;
+		const execution = tool.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never);
+		for (let attempt = 0; channel.list().requests.length === 0 && attempt < 100; attempt++) await Bun.sleep(1);
+		const request = channel.list().requests[0]!;
+		expect(request).toBeDefined();
+		for (const bridge of [
+			{ capabilities: { readTextFile: true } },
+			{ capabilities: { writeTextFile: true } },
+			undefined,
+		]) {
+			session.setClientBridge(bridge);
+			expect(channel.list().requests.map(pending => pending.id)).toEqual([request.id]);
+		}
+		channel.respond({ sessionId: "session", id: request.id, optionId: "allow_once" });
+		await execution;
+		expect(bashTool.executeCalls).toBe(1);
+	} finally {
+		channel.dispose();
+	}
+});
 
 it("Function Hook transforms reach ACP permission and execution consistently", async () => {
 	let executedArgs: unknown;

@@ -271,6 +271,78 @@ async function runDelegated(
 }
 
 describe("task subagent approval inheritance", () => {
+	test.each([
+		"allow",
+		"reject",
+		"revoked",
+	] as const)("production parent routes child approval through its SDK provider: %s", async decision => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "task-production-approval-"));
+		roots.push(root);
+		const bash = makeBashTool();
+		const gate = await createGateSession(root, bash);
+		const { session: parent } = await sdkModule.createAgentSession({
+			cwd: root,
+			agentDir: root,
+			sessionManager: SessionManager.inMemory(root),
+			settings: Settings.isolated({ "async.enabled": false }),
+			disableExtensionDiscovery: true,
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["task"],
+		});
+		gates.push(parent);
+		const manager = AsyncJobManager.instance();
+		if (!manager) throw new Error("production parent has no async job manager");
+		parent.setSdkPermissionMode("prompt");
+		let permissionCalls = 0;
+		let receivedInput: unknown;
+		let aborted = false;
+		parent.setSdkPermissionProvider(async (toolCall, _options, signal) => {
+			permissionCalls += 1;
+			receivedInput = toolCall.rawInput;
+			if (decision === "revoked") parent.setSdkPermissionMode("deny");
+			aborted = signal?.aborted ?? false;
+			return decision === "reject"
+				? { outcome: "selected", optionId: "reject_once", kind: "reject_once" }
+				: { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		});
+		let toolError: unknown;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => ({
+			session: createChildSession(
+				gate,
+				() => {},
+				error => {
+					toolError = error;
+				},
+			),
+			extensionsResult: {} as CreateAgentSessionResult["extensionsResult"],
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		}));
+		const tool = parent.getToolByName("task") as TaskTool | undefined;
+		if (!tool) throw new Error("production parent task tool missing");
+		const result = await tool.execute("tool-call", {
+			agent: "executor",
+			tasks: [{ id: "Child", description: "approval", assignment: "Run the command." }],
+		});
+		if (!result.details?.async?.jobId) {
+			const text = result.content.find(part => part.type === "text")?.text ?? "";
+			throw new Error(`production task was not scheduled: ${text}`);
+		}
+		await manager.waitForAll();
+		expect(permissionCalls).toBe(1);
+		expect(receivedInput).toMatchObject({ command: "echo hi" });
+		expect(aborted).toBe(decision === "revoked");
+		expect(bash.executeCalls).toBe(decision === "allow" ? 1 : 0);
+		if (decision === "allow") expect(toolError).toBeUndefined();
+		else expect(toolError).toBeInstanceOf(Error);
+	});
+
 	test.each(["allow_once", "reject_once"] as const)("external queue routes child approval: %s", async optionId => {
 		const { bash, installed, toolError } = await runDelegated(
 			"prompt",

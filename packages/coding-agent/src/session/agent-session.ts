@@ -14978,10 +14978,14 @@ export class AgentSession {
 	setClientBridge(bridge: ClientBridge | undefined): void {
 		if (bridge?.capabilities.requestPermission && this.#sdkPermissionProvider)
 			throw Object.assign(new Error("An SDK permission provider is connected."), { code: "provider_lease_conflict" });
-		this.#permissionEpoch.abort();
-		this.#permissionEpoch = new AbortController();
+		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission ? this.#clientBridge : undefined;
+		const nextPermissionBridge = bridge?.capabilities.requestPermission ? bridge : undefined;
+		if (previousPermissionBridge !== nextPermissionBridge) {
+			this.#permissionEpoch.abort();
+			this.#permissionEpoch = new AbortController();
+			this.#acpPermissionDecisions.clear();
+		}
 		this.#clientBridge = bridge;
-		this.#acpPermissionDecisions.clear();
 		this.#acpPermissionWrapperVersion++;
 		const activeToolNames = this.getActiveToolNames();
 		const activeTools = activeToolNames
