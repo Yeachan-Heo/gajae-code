@@ -57,6 +57,7 @@ let ordinaryHarness: string;
 let fixtureHome: string;
 let fixtureAgentDir: string;
 let absentAgentDir: string;
+let loaderSidecars: string[] = [];
 
 const TRAP_PRELOAD = `
 const nodeFs = require("node:fs");
@@ -398,6 +399,7 @@ const READ_ONLY_OPEN_FLAG_BITS =
 // permission to exactly that descriptor, and closing it revokes the permission so a reused
 // number cannot inherit it.
 const ARTIFACT_PATH = process.env.GJC_ENTRY_TRAP_ARTIFACT ?? "";
+const SIDECAR_PATHS = JSON.parse(process.env.GJC_ENTRY_TRAP_SIDECARS ?? "[]");
 const artifactDescriptors = new Set();
 
 nodeFs.openSync = (target, flags, ...rest) => {
@@ -412,7 +414,8 @@ nodeFs.openSync = (target, flags, ...rest) => {
 	const entry = "fs.openSync " + describeCmd(target) + " " + mode;
 	report.reads.push(entry);
 	const fd = rawOpenSync(target, flags, ...rest);
-	if (ARTIFACT_PATH !== "" && String(target) === ARTIFACT_PATH) artifactDescriptors.add(fd);
+	if ((ARTIFACT_PATH !== "" && String(target) === ARTIFACT_PATH) || SIDECAR_PATHS.includes(String(target)))
+		artifactDescriptors.add(fd);
 	return fd;
 };
 const rawCloseSync = nodeFs.closeSync;
@@ -463,7 +466,7 @@ await runCli(process.argv.slice(2));
 `;
 
 /** The preserved ordinary graph: the pre-split route for this argv, kept as the
- * old-path baseline that must attempt the forbidden managed-owner handoff write. */
+ * baseline that must reach managed-owner admission rather than render diagnostics. */
 const ORDINARY_HARNESS = `
 const { runOrdinaryCli } = await import(process.env.GJC_ENTRY_ORDINARY_SOURCE);
 try {
@@ -492,6 +495,7 @@ async function runEntry(
 		// The descriptor registry needs the artifact identity in every run, not only in the
 		// negative-control rows.
 		GJC_ENTRY_TRAP_ARTIFACT: RESOLVED_ARTIFACT_PATH,
+		GJC_ENTRY_TRAP_SIDECARS: JSON.stringify(loaderSidecars),
 		GJC_ENTRY_CLI_SOURCE: CLI_SOURCE,
 		GJC_ENTRY_ORDINARY_SOURCE: ORDINARY_SOURCE,
 		...(options.agentDirEnv === undefined ? {} : { GJC_CODING_AGENT_DIR: options.agentDirEnv }),
@@ -581,9 +585,16 @@ function approvedLoaderReads(): string[] {
 		`fs.openSync "${RESOLVED_ARTIFACT_PATH}" ${ARTIFACT_OPEN_FLAGS}`,
 		`fs.openSync "${RESOLVED_ARTIFACT_PATH}" ${ARTIFACT_OPEN_FLAGS}`,
 	];
+	// Source-mode local builds prove their version and digest through two trusted
+	// sidecars. Each sidecar independently opens the same ancestor chain.
+	for (const sidecar of loaderSidecars) {
+		reads.push(`fs.openSync "${sidecar}" ${ARTIFACT_OPEN_FLAGS}`);
+		reads.push(`fs.openSync "${sidecar}" ${ARTIFACT_OPEN_FLAGS}`);
+	}
 	let current = path.dirname(RESOLVED_ARTIFACT_PATH);
 	for (;;) {
 		reads.push(`fs.openSync "${current}" ${CHAIN_OPEN_FLAGS}`);
+		for (const _sidecar of loaderSidecars) reads.push(`fs.openSync "${current}" ${CHAIN_OPEN_FLAGS}`);
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
@@ -642,7 +653,7 @@ function expectInert(run: EntryRun, options: { approvedLoaderChain?: boolean } =
 		// derived from its real size plus a small slack for the final short read and the
 		// pre-activation metadata re-check.
 		const artifactBytes = fsStatSync(RESOLVED_ARTIFACT_PATH).size;
-		const chunkBound = Math.ceil(artifactBytes / (1024 * 1024)) + 2;
+		const chunkBound = Math.ceil(artifactBytes / (1024 * 1024)) + 2 + loaderSidecars.length * 2;
 		expect(descriptorReads.length).toBeGreaterThan(0);
 		expect(descriptorReads.length).toBeLessThanOrEqual(chunkBound);
 		expect(unattributedReads).toEqual([]);
@@ -661,6 +672,13 @@ function expectInert(run: EntryRun, options: { approvedLoaderChain?: boolean } =
 }
 
 beforeAll(async () => {
+	const metadataPath = `${RESOLVED_ARTIFACT_PATH}.build.json`;
+	if (SUPPORTED_RUNTIME && (await Bun.file(metadataPath).exists())) {
+		loaderSidecars = [metadataPath];
+		const metadata = await Bun.file(metadataPath).json();
+		if (metadata.profile === "local")
+			loaderSidecars.push(path.join(path.dirname(RESOLVED_ARTIFACT_PATH), "diagnostic-artifact.local.json"));
+	}
 	workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? os.tmpdir(), "gjc-diag-entry-"));
 	fixtureHome = path.join(workspace, "home");
 	fixtureAgentDir = path.join(workspace, "agent");
@@ -802,12 +820,7 @@ describe("sdk diagnostics public entry (B1)", () => {
 		// Create and prepare the lifecycle root with proper owner-only security.
 		const lifecycleRoot = path.join(ownerStateDir, "g1-session", "owner-lifecycle");
 		await fs.mkdir(lifecycleRoot, { recursive: true, mode: 0o700 });
-		try {
-			prepareManagedDirectoryRoot(lifecycleRoot);
-		} catch (e) {
-			// prepareManagedDirectoryRoot may fail in test environment; ensure directory exists with proper mode
-			await fs.chmod(lifecycleRoot, 0o700);
-		}
+		prepareManagedDirectoryRoot(lifecycleRoot);
 		const ownerEnv = {
 			GJC_TMUX_OWNER_STATE_DIR: ownerStateDir,
 			GJC_COORDINATOR_SESSION_ID: "g1-session",
@@ -817,29 +830,38 @@ describe("sdk diagnostics public entry (B1)", () => {
 			GJC_MANAGED_OWNER_CHILD_TOKEN: "g1childtoken",
 		};
 
-		// Old-path baseline: the preserved ordinary graph really does attempt the
-		// forbidden write for exactly this argv. Without this row a "zero mutations"
-		// result proves nothing -- the earlier stale-addon receipt recorded
-		// fsMutations=[] only because the addon import failed first, which is NOT
-		// evidence that the admission write was avoided.
-		// After PR #7399, durableHandoff uses the native addon (not Node.js fs functions),
-		// so we check for native activation and verify the handoff file was actually created.
+		// The ordinary graph must reach admission for exactly this argv. Check its
+		// output and durable result, not JS writer traps: native retained-authority
+		// handoffs deliberately bypass those pathname APIs.
 		const baseline = await runEntry(["sdk", "diagnostics", "--help"], { mode: "ordinary", env: ownerEnv });
-		// The ordinary path should activate the native addon when attempting the durable handoff write.
+		expect(baseline.exitCode).toBe(75);
+		expect(baseline.stderr).toContain("child admission blocked: exact_child_binding_unavailable");
 		expect(baseline.trap.nativeActivations).toBeGreaterThan(0);
-		// Verify the handoff file was actually created in the lifecycle root (use a fresh check).
-		const handoffFiles = (await fs.readdir(lifecycleRoot)).filter(f => f.startsWith("admission-handoff-"));
-		expect(handoffFiles.length).toBeGreaterThan(0);
-		// Clean up the handoff file and empty directories so the later assertion passes.
-		for (const file of handoffFiles) {
+		// Handoffs now use retained native authority, not JS pathname writers.
+		// Observe the durable result on Linux; other platforms explicitly fail closed.
+		const handoffs = await fs.readdir(lifecycleRoot);
+		if (process.platform === "linux") {
+			expect(handoffs).toHaveLength(1);
+			expect(handoffs[0]).toMatch(/^admission-handoff-.*\.json$/);
+			const handoff = await Bun.file(path.join(lifecycleRoot, handoffs[0]!)).json();
+			expect(handoff).toMatchObject({
+				state: "fail_closed_handoff",
+				reason: "exact_child_binding_unavailable",
+				session_id: "g1-session",
+			});
+		} else {
+			expect(handoffs).toEqual([]);
+			expect(baseline.stderr).toContain("managed_owner_admission_blocked: handoff_not_persisted");
+		}
+		// Remove the baseline receipt before checking that diagnostics creates none.
+		for (const file of handoffs) {
 			await fs.unlink(path.join(lifecycleRoot, file));
 		}
-		// Remove the empty lifecycle root and session directories
 		await fs.rm(lifecycleRoot, { recursive: true, force: true });
 		await fs.rm(path.join(ownerStateDir, "g1-session"), { recursive: true, force: true });
 
 		// Fixed path: the actual bin entry and the exported runCli render help with no
-		// mutation anywhere, and the owner state root stays empty.
+		// mutation anywhere, and the owner state root stays unchanged.
 		for (const mode of ["bin", "runCli"] as const) {
 			const run = await runEntry(["sdk", "diagnostics", "--help"], { mode, env: ownerEnv });
 			// Assert the absence of the forbidden write first, so a regression reports the
@@ -977,7 +999,8 @@ describe("sdk diagnostics public entry (B1)", () => {
 				// its own task-owned sentinel -- asserted exactly, and never by stat'ing an addon
 				// that does not exist on this platform.
 				const descriptorReadsAccounted = SUPPORTED_RUNTIME
-					? descriptorReads.length <= Math.ceil(fsStatSync(RESOLVED_ARTIFACT_PATH).size / (1024 * 1024)) + 2
+					? descriptorReads.length <=
+						Math.ceil(fsStatSync(RESOLVED_ARTIFACT_PATH).size / (1024 * 1024)) + 2 + loaderSidecars.length * 2
 					: descriptorReads.length === unattributed.length;
 				const openGatePasses =
 					row.inject === "live-foreign-fd-read"
