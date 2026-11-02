@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import fc from "fast-check";
+import type { ControlSurface } from "../src/sdk/host/control/operations";
 import { type ExternalPermissionError, ExternalPermissionRuntime } from "../src/sdk/host/external-permissions";
 import type {
 	ClientBridgePermissionOption,
@@ -40,6 +41,30 @@ afterEach(() => {
 });
 
 describe("ExternalPermissionRuntime", () => {
+	it("rolls back an installed provider when switching to prompt mode fails", async () => {
+		const channel = new ExternalPermissionRuntime("session");
+		const providers: unknown[] = [];
+		const failure = new Error("policy failed");
+		const surface: Pick<ControlSurface, "setPermissionMode" | "configurePermissionChannel" | "respondPermission"> = {
+			setPermissionMode: async () => {
+				throw failure;
+			},
+		};
+		channel.installControls(
+			surface,
+			provider => providers.push(provider),
+			() => false,
+		);
+		try {
+			await expect(surface.configurePermissionChannel!({ enabled: true })).rejects.toBe(failure);
+			expect(providers).toHaveLength(2);
+			expect(typeof providers[0]).toBe("function");
+			expect(providers[1]).toBeUndefined();
+			expect(channel.enabled).toBe(false);
+		} finally {
+			channel.dispose();
+		}
+	});
 	it("approves with a snapshotted option and returns raw input and path evidence", async () => {
 		const channel = runtime();
 		const pending = channel.request(toolCall(), options);
