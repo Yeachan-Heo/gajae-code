@@ -31025,6 +31025,7 @@ export class AgentSession {
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
 		let sessionIdentityCommitted = false;
+		let differentSessionCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -31472,6 +31473,7 @@ export class AgentSession {
 					);
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
+					differentSessionCommitted = true;
 					// Bind plan before post-commit cleanup. A cleanup failure leaves this
 					// successor active and must not keep the predecessor plan slot.
 					this.#rebindSwitchedSessionMode(sessionContext);
@@ -31790,11 +31792,17 @@ export class AgentSession {
 			}
 			this.#endSessionTransition();
 			if (sessionIdentityCommitted) {
-				for (const listener of [...this.#committedSessionSwitchListeners]) {
-					try {
-						await listener();
-					} catch (error) {
-						logger.warn("Committed session switch listener failed", { error: String(error) });
+				// Committed-switch listeners rebind controllers from the successor file. A
+				// same-file reload that replaced the logical identity still publishes the new
+				// identity, but #rebindSwitchedSessionMode does not run for it, so the
+				// listeners would detach the live mode. Pair them with that rebind.
+				if (differentSessionCommitted) {
+					for (const listener of [...this.#committedSessionSwitchListeners]) {
+						try {
+							await listener();
+						} catch (error) {
+							logger.warn("Committed session switch listener failed", { error: String(error) });
+						}
 					}
 				}
 				await this.notifySessionIdentityChanged();
