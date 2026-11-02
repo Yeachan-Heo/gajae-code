@@ -8,6 +8,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { assertMasterLaunchDisposition, createMasterModeContext } from "@gajae-code/coding-agent/master-mode/context";
 import {
 	createMasterPeerSnapshotContributor,
+	createOwnerEndpointGenerationTracker,
 	MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
 } from "@gajae-code/coding-agent/master-mode/first-request";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -556,6 +557,79 @@ describe("master SDK host composition", () => {
 				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 			} finally {
 				startHost.mockRestore();
+				await cleanupFixtureRoot(cleanup);
+			}
+		}
+	});
+
+	it("reports the owner's broker generation through the notifications host across a switch", async () => {
+		// #7459: an interactive master with notifications enabled is hosted by the
+		// notifications extension, not the SDK-only runtime. Its owner registration
+		// must reach the tracker so a later independent resume is told apart from
+		// the master's own stale owner row.
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-notification-generation-"));
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+		const capability = "master-capability-generation";
+		const epoch = "master-generation-epoch";
+		const ownerSessionId = `master-generation-owner-${Snowflake.next()}`;
+		const successorSessionId = `master-generation-successor-${Snowflake.next()}`;
+		let activeSessionId = ownerSessionId;
+		const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+		const api = {
+			on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+			registerCommand: () => {},
+			sendUserMessage: async () => {},
+		} as never;
+		const ctx = {
+			cwd,
+			sessionManager: {
+				getSessionId: () => activeSessionId,
+				getSessionName: () => "Master notification session",
+				getArtifactsDir: () => cwd,
+				getCwd: () => cwd,
+				getSessionFile: () => path.join(cwd, "sessions", `${activeSessionId}.jsonl`),
+			},
+		} as never;
+		// No lifecycle startup generation: the tracker can only learn it from the host.
+		const tracker = createOwnerEndpointGenerationTracker(ownerSessionId, () => undefined);
+		const registered: string[] = [];
+		createNotificationsExtension(api, {
+			settings: configuredNotificationSettings(agentDir),
+			masterCapability: capability,
+			masterAttestationEpoch: epoch,
+			masterOwnerSessionId: ownerSessionId,
+			onBrokerRegistered: (sessionId, generation) => {
+				registered.push(sessionId);
+				tracker.record(sessionId, generation);
+			},
+			ensureProviderDaemon: async () => "attached",
+		});
+		const indexedGeneration = async (sessionId: string) =>
+			(await new SessionIndex(agentDir).open()).listSessions().sessions.find(row => row.sessionId === sessionId)
+				?.endpointGeneration;
+		try {
+			await handlers.get("session_start")!({ type: "session_start" }, ctx);
+			await waitForMasterAttestation(agentDir, ownerSessionId, epoch);
+			await waitFor(async () => tracker.get() !== undefined, "owner generation reported");
+			const ownerGeneration = tracker.get();
+			expect(ownerGeneration).toBe(await indexedGeneration(ownerSessionId));
+
+			activeSessionId = successorSessionId;
+			await handlers.get("session_switch")!(
+				{
+					type: "session_switch",
+					previousSessionFile: path.join(cwd, "sessions", `${ownerSessionId}.jsonl`),
+				},
+				ctx,
+			);
+			await waitForMasterAttestation(agentDir, successorSessionId, epoch, ownerSessionId);
+			await waitFor(async () => registered.includes(successorSessionId), "successor registration reported");
+			expect(tracker.get()).toBe(ownerGeneration);
+		} finally {
+			try {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			} finally {
 				await cleanupFixtureRoot(cleanup);
 			}
 		}

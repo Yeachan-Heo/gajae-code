@@ -4211,6 +4211,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										masterCapability: masterModeContext.getCapability(),
 										masterAttestationEpoch: masterModeContext.attestationEpoch,
 										masterOwnerSessionId: masterModeContext.ownerSessionId,
+										onBrokerRegistered: ownerEndpointGeneration?.record,
 									}
 								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
