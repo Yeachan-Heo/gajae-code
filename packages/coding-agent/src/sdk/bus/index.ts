@@ -2870,11 +2870,10 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	// Track the run context (active preflightKeys) when abort-and-prompt steers are reserved.
-	// This ensures that fallback steers are only sent to the run they targeted, not to
-	// a new run that started after the original run ended (BUG_P2 / finding 2).
-	const abortAndPromptRunContexts = new Map<string, Set<string>>();
-	const sendSteer = async (text: string, clientRef?: string) => {
+	// expectedPromptHandle: undefined is an unbounded steer; a string binds the
+	// message to that exact captured run; null means no run was active at the
+	// fallback decision and the session must reject rather than follow a successor.
+	const sendSteer = async (text: string, clientRef?: string, expectedPromptHandle?: string | null) => {
 		// A steer is always queued: its handle is held from dispatch until the
 		// message leaves the session queue (consumed in-run, promoted to its own
 		// run, or removed), which is the only boundary bound to THIS message.
@@ -2883,6 +2882,7 @@ function sdkControlSurface(
 			deliverAs: "steer" as const,
 			onPreflightAcceptCommit: admission.accepted,
 			onPreflightAccepted: admission.accepted,
+			...(expectedPromptHandle === undefined ? {} : { expectedPromptHandle }),
 			...admission.hooks,
 		};
 		if (clientRef === undefined) {
@@ -2897,29 +2897,6 @@ function sdkControlSurface(
 			return { ...correlation, accepted: true };
 		}
 		const normalizedClientRef = clientRef.trim();
-		// Verify that abort-and-prompt fallback steers target the run they were created for.
-		// If the original run has ended and a new run has started, don't send the steer.
-		const savedContext = abortAndPromptRunContexts.get(normalizedClientRef);
-		if (savedContext !== undefined && savedContext.size > 0) {
-			const currentPreflightKeys = new Set([...pendingPreflightCancellations.keys()]);
-			// Check if any of the original preflight keys are still active
-			const originalContextStillActive = [...savedContext].some(key => currentPreflightKeys.has(key));
-			// Check if there are any preflight keys that were not in the original context
-			const newKeysExist = [...currentPreflightKeys].some(key => !savedContext.has(key));
-			// If the original run has ended and a new run has started, don't send the steer.
-			if (!originalContextStillActive && newKeysExist) {
-				admission.abandon();
-				// Return a rejected status without attempting to send.
-				if (skillRecon?.settleSteer) {
-					await skillRecon.settleSteer(
-						normalizedClientRef,
-						"rejected",
-						new Error("Fallback steer target run has ended"),
-					);
-				}
-				return { sessionId: ctx.sessionManager.getSessionId(), status: "rejected" as const };
-			}
-		}
 		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer) {
 			admission.abandon();
 			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
@@ -3565,15 +3542,8 @@ function sdkControlSurface(
 				skillRecon?.reserveSteer && skillRecon.settleSteer && skillRecon.lookupSteer
 					? abortAndPromptSteerClientRef(idempotencyKey)
 					: undefined;
-			const queueAsSteer = async () => {
-				// Capture the current run context (active preflight keys) to ensure this fallback
-				// steer is only sent to the run it targeted. This prevents steers from being
-				// sent to a new run that started after the original run ended (finding 2).
-				if (steerClientRef !== undefined) {
-					const currentPreflightKeys = new Set([...pendingPreflightCancellations.keys()]);
-					abortAndPromptRunContexts.set(steerClientRef, currentPreflightKeys);
-				}
-				const steer = await sendSteer(text, steerClientRef);
+			const queueAsSteer = async (expectedPromptHandle?: string | null) => {
+				const steer = await sendSteer(text, steerClientRef, expectedPromptHandle);
 				// A durable steer reports its reconciliation status; only an accepted
 				// one acknowledges delivery.
 				const accepted = "accepted" in steer ? steer.accepted : steer.status === "accepted";
@@ -3581,7 +3551,10 @@ function sdkControlSurface(
 			};
 			if (steerClientRef !== undefined && skillRecon?.lookupSteer?.(steerClientRef).status !== "unknown")
 				return await queueAsSteer();
-			if (!mayReplaceActiveWork(requesterConnectionId)) return await queueAsSteer();
+			// Capture the target synchronously before the durable reservation. A replay
+			// above uses only its retained outcome, never a successor's run identity.
+			if (!mayReplaceActiveWork(requesterConnectionId))
+				return await queueAsSteer(ctx.getActivePromptHandle() ?? null);
 			await awaitAbortReady();
 			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},

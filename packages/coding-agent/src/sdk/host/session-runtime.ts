@@ -3203,6 +3203,8 @@ function createControlSurface(
 	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
 		sdkRunCapability?: SdkRunCapability;
 		expectedSdkRunToken?: string;
+		/** undefined: unbounded; string: exact captured run; null: no active run, reject. */
+		expectedPromptHandle?: string | null;
 		onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 	};
 	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
@@ -4702,19 +4704,13 @@ function createControlSurface(
 		text: string,
 		clientRef: string | undefined,
 		expectedSdkRunToken?: string,
-		targetRunEpoch?: number,
+		expectedPromptHandle?: string | null,
 	) => {
-		// Verify the target run hasn't been replaced since abort-and-prompt decided
-		// to degrade to a steer. If the epoch has changed, the original run has ended
-		// and a new run has started, so the steer must not be sent.
-		if (targetRunEpoch !== undefined && targetRunEpoch !== activePromptOwner.lifecycleEpoch) {
-			// The run the steer targeted has ended and been replaced.
-			throw Object.assign(new Error("target_run_ended"), { code: "stale_run" });
-		}
 		const dispatch = () =>
 			sendSdkUserMessage(text, {
 				deliverAs: "steer",
 				...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
+				...(expectedPromptHandle === undefined ? {} : { expectedPromptHandle }),
 			});
 		if (clientRef === undefined) {
 			const correlation = newCorrelation();
@@ -4728,7 +4724,7 @@ function createControlSurface(
 			await dispatch();
 		} catch (error) {
 			const settled = await durable.settleSteer(clientRef, "rejected", error);
-			if (expectedSdkRunToken !== undefined || targetRunEpoch !== undefined) throw error;
+			if (expectedSdkRunToken !== undefined) throw error;
 			return { accepted: false, ...settled };
 		}
 		try {
@@ -4860,16 +4856,18 @@ function createControlSurface(
 			// does not own the active run (another client's prompt, or a turn the
 			// host itself started) must not stop it. The replacement text degrades
 			// to a queued steer for that run instead.
-			// Capture the current run's lifecycle epoch so the steer can be verified
-			// to target only the same run. If the run ends before the steer is sent,
-			// the steer will be rejected to prevent delivery to a successor run.
+			// Capture the real run identity synchronously, before any await (including
+			// the durable reservation), so the session can reject the steer if that
+			// run ends first instead of delivering it to a successor.
 			const connectionId = sdkControlRequesterContext.getStore();
-			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsReplaceableWork(connectionId))
+			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsReplaceableWork(connectionId)) {
+				const expectedPromptHandle = ctx.getActivePromptHandle() ?? null;
 				return {
-					...(await sendSteer(text, steerClientRef, undefined, activePromptOwner.lifecycleEpoch)),
+					...(await sendSteer(text, steerClientRef, undefined, expectedPromptHandle)),
 					aborted: false,
 					queuedAs: "steer",
 				};
+			}
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),

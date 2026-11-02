@@ -4738,7 +4738,12 @@ async function invocationHarness(
 	sessionId: string,
 	cwd: string,
 	hooks: {
-		sendUserMessage?: (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => Promise<unknown>;
+		sendUserMessage?: (
+			content: unknown,
+			options?: PreflightHooks & { deliverAs?: string; expectedPromptHandle?: string | null },
+		) => Promise<unknown>;
+		/** Active prompt handle reported by the extension context; undefined when absent. */
+		activePromptHandle?: () => string | undefined;
 		invokeSkill?: (name: string, args?: string, options?: PreflightHooks) => Promise<unknown>;
 		abort?: () => void;
 		isIdle?: () => boolean;
@@ -4784,7 +4789,10 @@ async function invocationHarness(
 		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
 			handlers.set(event, handler);
 		},
-		sendUserMessage: async (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => {
+		sendUserMessage: async (
+			content: unknown,
+			options?: PreflightHooks & { deliverAs?: string; expectedPromptHandle?: string | null },
+		) => {
 			const result = await hooks.sendUserMessage?.(content, options);
 			return result === undefined ? "completed" : result;
 		},
@@ -4871,6 +4879,7 @@ async function invocationHarness(
 		sdkBindings: () => (hooks.invokeSkill ? ["invokeSkill"] : []),
 		isIdle: hooks.isIdle ?? (() => true),
 		abort: hooks.abort ?? (() => {}),
+		getActivePromptHandle: hooks.activePromptHandle ?? (() => undefined),
 		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
 		sessionManager: {
 			getSessionId: () => sessionId,
@@ -6836,6 +6845,50 @@ function createInterceptorReconciliationStore(
 		snapshotTerminalKeys: () => [],
 		transactTerminalScopes: async () => {},
 		transactTerminalState: async () => {},
+	};
+}
+
+/**
+ * Plain in-memory store whose first armed durable steer reservation blocks until
+ * released. The barrier is installed with spyOn on the instance's transact seam.
+ */
+function createSteerBarrierStore(): {
+	store: SdkOnlyReconciliationStore;
+	arm: () => void;
+	entered: Promise<void>;
+	release: () => void;
+} {
+	const backing = createInterceptorBackingStore();
+	const entered = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	let armed = false;
+	const store: SdkOnlyReconciliationStore = {
+		path: null,
+		load: async () => backing.records.map(record => ({ ...record })),
+		async transact(mutator) {
+			backing.records = mutator(backing.records.map(record => ({ ...record })));
+		},
+		snapshotTerminalScopes: () => [],
+		snapshotTerminalKeys: () => [],
+		transactTerminalScopes: async () => {},
+		transactTerminalState: async () => {},
+	};
+	const transact = store.transact.bind(store);
+	spyOn(store, "transact").mockImplementation(async mutator => {
+		const reservesSteer = armed && mutator([]).some(record => (record as { kind?: string }).kind === "steer");
+		await transact(current => mutator(current));
+		if (!reservesSteer) return;
+		armed = false;
+		entered.resolve();
+		await released.promise;
+	});
+	return {
+		store,
+		arm: () => {
+			armed = true;
+		},
+		entered: entered.promise,
+		release: released.resolve,
 	};
 }
 
@@ -11350,70 +11403,146 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("abort_and_prompt fallback steer is not sent when the target run has ended and been replaced", async () => {
-		// Verify finding 2: when abort-and-prompt degrades to a steer because the
-		// requester doesn't own the run, and the original run ends before the steer
-		// is sent, the steer must NOT be sent to a new run that starts afterwards.
-		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-run-ended-"));
+	const boundSteerHarness = async (name: string, cwd: string, initialHandle: string | undefined) => {
+		const state = {
+			handle: initialHandle,
+			abortCalls: 0,
+			attempts: [] as Array<{ content: unknown; options: Record<string, unknown> }>,
+			delivered: [] as Array<{ content: unknown; handle: string | undefined }>,
+		};
+		const barrier = createSteerBarrierStore();
+		const harness = await invocationHarness(name, cwd, {
+			isIdle: () => false,
+			activePromptHandle: () => state.handle,
+			abort: () => {
+				state.abortCalls += 1;
+			},
+			terminalAbortSeams: { getReconciliationStore: () => barrier.store },
+			// Emulates AgentSession queue admission: a bound message is refused unless
+			// the bound run is still the active run.
+			sendUserMessage: async (content, options) => {
+				state.attempts.push({ content, options: { ...options } });
+				const bound = options?.expectedPromptHandle;
+				if (bound !== undefined && bound !== state.handle)
+					throw Object.assign(new Error("turn_not_active"), { code: "turn_not_active" });
+				state.delivered.push({ content, handle: state.handle });
+				await options?.onPreflightAcceptCommit?.();
+			},
+		});
+		return { harness, state, barrier };
+	};
+
+	test("abort_and_prompt fallback steer stays bound to the run captured before its durable reservation", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-bound-"));
 		let harness: InvocationHarness | undefined;
 		try {
-			const state = {
-				idle: false,
-				abortCalls: 0,
-				deliveries: [] as Array<{ content: unknown; deliverAs?: string }>,
-				runs: Promise.withResolvers<void>(),
-				// Track which commandIds are active at each point in time
-				activeCommandIds: new Set<string>(),
-			};
-			harness = await invocationHarness("replacement-steer-run-ended", cwd, {
-				isIdle: () => state.idle,
-				abort: () => {
-					state.abortCalls += 1;
-					state.idle = true;
-				},
-				sendUserMessage: async (content, options) => {
-					state.deliveries.push({ content, deliverAs: options?.deliverAs });
-					await options?.onPreflightAcceptCommit?.();
-					// For non-steer messages, wait for the run to complete
-					if (options?.deliverAs === undefined) await state.runs.promise;
-				},
-			});
+			const fixture = await boundSteerHarness("replacement-steer-bound", cwd, "run-a");
+			harness = fixture.harness;
+			const { state, barrier } = fixture;
 			await harness.emit("agent_start");
 			await Bun.sleep(25);
-			// Connection-b calls abort_and_prompt, which should queue as a steer
-			// because connection-b doesn't own the run (connection-a does via agent_start).
-			const first = await harness.controlAs(
+			barrier.arm();
+			const pending = harness.controlAs(
 				"connection-b",
 				"turn.abort_and_prompt",
-				{ text: "text from b" },
-				"finding-2-key",
+				{ text: "text for run a" },
+				"fresh-bound-key",
 			);
+			await barrier.entered;
+			// Run A ends and run B starts while the reservation is blocked.
+			state.handle = "run-b";
+			void harness.emit("agent_end");
+			void harness.emit("agent_start");
+			await Bun.sleep(25);
+			barrier.release();
+			const first = await pending;
 			expect(first).toMatchObject({
 				ok: true,
-				result: { accepted: true, aborted: false, queuedAs: "steer" },
+				result: { accepted: false, aborted: false, queuedAs: "steer" },
 			});
-			// Verify the steer was queued
-			expect(state.deliveries).toEqual([{ content: "text from b", deliverAs: "steer" }]);
-			// End the current run
-			state.runs.resolve();
-			await Bun.sleep(50);
-			// Emit agent_end to complete the first run
-			await harness.emit("agent_end");
-			await Bun.sleep(25);
-			// Start a new run with agent_start
-			state.runs = Promise.withResolvers<void>();
-			state.deliveries.length = 0;
-			state.idle = false;
-			// Emit agent_start for the new run: this changes the lifecycle epoch
+			expect(state.attempts.map(attempt => attempt.options.expectedPromptHandle)).toEqual(["run-a"]);
+			expect(state.delivered).toEqual([]);
+			expect(state.abortCalls).toBe(0);
+
+			// The exact key replays the durable rejection and never recaptures run B.
+			const retried = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "text for run a" },
+				"fresh-bound-key",
+			);
+			expect(retried).toMatchObject({
+				ok: true,
+				result: {
+					accepted: false,
+					aborted: false,
+					queuedAs: "steer",
+					commandId: first.result?.commandId,
+					turnId: first.result?.turnId,
+				},
+			});
+			expect(state.attempts).toHaveLength(1);
+			expect(state.delivered).toEqual([]);
+			expect(state.abortCalls).toBe(0);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keyless abort_and_prompt fallback binds a null target when no run is active and never delivers", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-null-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await boundSteerHarness("replacement-steer-null", cwd, undefined);
+			harness = fixture.harness;
+			const { state } = fixture;
 			await harness.emit("agent_start");
 			await Bun.sleep(25);
-			// Now attempt to consume the steer that was originally queued.
-			// Since the original run has ended and a new run has started,
-			// the steer should NOT be delivered to this new run.
-			// The host should reject it because the target run's lifecycle epoch no longer matches.
-			const deliveryFailureCheck = state.deliveries.length;
-			// Verify no new deliveries were made (the steer must not reach the new run)
-			expect(deliveryFailureCheck).toBe(0);
+			const response = await harness.controlAs("connection-b", "turn.abort_and_prompt", { text: "no target" });
+			expect(response.ok).toBe(false);
+			expect(state.attempts).toHaveLength(1);
+			expect(state.attempts[0]?.options.expectedPromptHandle).toBeNull();
+			expect(state.delivered).toEqual([]);
+			expect(state.abortCalls).toBe(0);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keyless abort_and_prompt fallback binds the captured run handle", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-keyless-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await boundSteerHarness("replacement-steer-keyless", cwd, "run-a");
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const response = await harness.controlAs("connection-b", "turn.abort_and_prompt", { text: "keyless" });
+			expect(response).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(state.attempts.map(attempt => attempt.options.expectedPromptHandle)).toEqual(["run-a"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("explicit turn.steer remains unbounded by a run handle", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-steer-unbounded-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await boundSteerHarness("steer-unbounded", cwd, "run-a");
+			harness = fixture.harness;
+			const { state } = fixture;
+			const response = await harness.control("turn.steer", { text: "plain steer" });
+			expect(response).toMatchObject({ ok: true, result: { accepted: true } });
+			expect(state.attempts).toHaveLength(1);
+			expect(state.attempts[0]?.options).not.toHaveProperty("expectedPromptHandle");
 		} finally {
 			await harness?.stop();
 			await Bun.sleep(10);

@@ -259,6 +259,42 @@ function failNextReconciliationCommit(
 }
 
 /**
+ * Hold the next armed durable steer reservation commit after it is written, so a
+ * test can change the active run while the reservation is still in flight.
+ */
+function holdNextSteerReservationCommit(
+	sessionFile: string,
+	sessionId: string,
+): { entered: Promise<void>; arm: () => void; release: () => void; restore: () => void } {
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const entered = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let armed = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		const reservesSteer =
+			armed &&
+			String(to) === target &&
+			((await Bun.file(String(from)).json()) as ReconciliationStoreDocument).records.some(
+				record => record.kind === "steer" && record.status === "dispatching",
+			);
+		await realRename(from, to);
+		if (!reservesSteer) return;
+		armed = false;
+		entered.resolve();
+		await released.promise;
+	});
+	return {
+		entered: entered.promise,
+		arm: () => {
+			armed = true;
+		},
+		release: released.resolve,
+		restore: () => rename.mockRestore(),
+	};
+}
+
+/**
  * Capture process-level unhandled rejections for the duration of a teardown
  * assertion. The repo treats an unhandled rejection as process-killing
  * (`src/modes/components/session-selector.ts`), so a durable-write failure must
@@ -7027,6 +7063,117 @@ test("SDK host abort-and-prompt queues a steer instead of stopping a run the con
 	expect(abortCalls).toBe(0);
 	expect(deliveries).toHaveLength(1);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("SDK host abort-and-prompt keeps a fallback steer bound to the run captured before its durable reservation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-bound-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-bound-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const live = { idle: false };
+	let activeHandle: string | undefined = "run-a";
+	let abortCalls = 0;
+	const attempts: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const delivered: Array<{ content: unknown; handle: string | undefined }> = [];
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		getActivePromptHandle: () => activeHandle,
+		abort: () => {
+			abortCalls += 1;
+		},
+	};
+	const barrier = holdNextSteerReservationCommit(sessionFile, sessionId);
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (content, options) => {
+				attempts.push([content, options]);
+				const bound = (options as { expectedPromptHandle?: string | null } | undefined)?.expectedPromptHandle;
+				// Emulates AgentSession queue admission refusing a bound message whose run ended.
+				if (bound !== undefined && bound !== activeHandle)
+					throw Object.assign(new Error("turn_not_active"), { code: "turn_not_active" });
+				delivered.push({ content, handle: activeHandle });
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const respond = async (id: string) => {
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`abort-and-prompt response ${id}`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id) as {
+				result?: { commandId?: string; turnId?: string };
+			};
+		};
+		const replace = (id: string) =>
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id,
+					operation: "turn.abort_and_prompt",
+					input: { text: "text for run a" },
+					idempotencyKey: "fresh-bound-key",
+				}),
+			);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		barrier.arm();
+		replace("bound-first");
+		await barrier.entered;
+		// Run A ends and run B starts while the reservation is blocked.
+		activeHandle = "run-b";
+		void handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+		void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await Bun.sleep(25);
+		barrier.release();
+		const first = await respond("bound-first");
+		expect(first).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer" },
+		});
+		expect(
+			attempts.map(([, options]) => (options as { expectedPromptHandle?: string | null }).expectedPromptHandle),
+		).toEqual(["run-a"]);
+		expect(delivered).toEqual([]);
+		expect(abortCalls).toBe(0);
+
+		// The exact key replays the durable rejection and never recaptures run B.
+		replace("bound-retry");
+		expect(await respond("bound-retry")).toMatchObject({
+			ok: true,
+			result: {
+				accepted: false,
+				aborted: false,
+				queuedAs: "steer",
+				commandId: first.result?.commandId,
+				turnId: first.result?.turnId,
+			},
+		});
+		expect(attempts).toHaveLength(1);
+		expect(delivered).toEqual([]);
+		expect(abortCalls).toBe(0);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		barrier.release();
+		barrier.restore();
+	}
 });
 
 test("SDK host abort-and-prompt reports a delivered steer as uncertain when its acceptance write fails", async () => {
