@@ -1,16 +1,10 @@
-import { $credentialEnv } from "@gajae-code/utils";
+import { type EndpointConfiguration, isDefaultOpenAIBaseUrl, readEndpointConfiguration } from "@gajae-code/utils";
 
 export const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_DEFAULT_BASE_URL_HOST = "api.openai.com";
 
-export function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
-	try {
-		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST && (url.pathname === "" || url.pathname === "/v1");
-	} catch {
-		return baseUrl === OPENAI_DEFAULT_BASE_URL;
-	}
-}
+/** Single trusted-routing classifier; re-exported so provider call sites keep one authority. */
+export { isDefaultOpenAIBaseUrl };
 
 export function isOpenAIHostBaseUrl(baseUrl: string): boolean {
 	try {
@@ -24,12 +18,15 @@ export function isOpenAIHostBaseUrl(baseUrl: string): boolean {
 export function resolveOpenAIProviderBaseUrl(
 	baseUrl: string | undefined,
 	authCredentialType: "api_key" | "oauth" | undefined,
+	endpointConfiguration?: EndpointConfiguration,
 ): string {
 	if (authCredentialType === "oauth") return OPENAI_DEFAULT_BASE_URL;
 	// Trusted sources only: this base URL becomes the request endpoint that carries
 	// the OpenAI credential, and `$env` merges the caller's `cwd/.env`, so reading it
-	// there would let repository content redirect authenticated traffic.
-	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
+	// there would let repository content redirect authenticated traffic. A supplied
+	// capture is read instead of live state so the request keeps the routing it was
+	// admitted with.
+	const envBaseUrl = readEndpointConfiguration(endpointConfiguration, "OPENAI_BASE_URL");
 	const configuredBaseUrl = baseUrl?.trim();
 	if (envBaseUrl && (!configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl))) {
 		return envBaseUrl;
