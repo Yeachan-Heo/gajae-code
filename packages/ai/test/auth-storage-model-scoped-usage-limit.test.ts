@@ -354,7 +354,6 @@ describe("AuthStorage model-scoped usage limits", () => {
 
 		it("keeps a reset-less wide limit credential-wide when ranking credentials", async () => {
 			const { storage, firstRowId } = await useReports(wideResetLessPlusScoped());
-			console.error("PRE", storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1"));
 			await storage.getApiKey("anthropic", "ranked-wide-session", { modelId: "claude-sonnet-4-5" });
 			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(false);
 		}, 20_000);
