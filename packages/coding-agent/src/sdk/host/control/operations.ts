@@ -55,6 +55,8 @@ export interface ControlSurface {
 	setThinking(level: ControlValue): Promise<ControlValue> | ControlValue;
 	cycleThinking(): Promise<ControlValue> | ControlValue;
 	setPermissionMode(mode: ControlValue): Promise<ControlValue> | ControlValue;
+	configurePermissionChannel?(input: ControlInput): Promise<ControlValue> | ControlValue;
+	respondPermission?(input: ControlInput): ControlValue;
 	setQueueMode(kind: string, mode: ControlValue): Promise<ControlValue> | ControlValue;
 	runCompaction(): Promise<ControlValue> | ControlValue;
 	setAutoCompaction(on: boolean): Promise<ControlValue> | ControlValue;
