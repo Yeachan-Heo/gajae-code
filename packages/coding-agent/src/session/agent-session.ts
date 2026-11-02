@@ -13188,6 +13188,10 @@ export class AgentSession {
 		persistMCPSelection?: boolean,
 	): Promise<string[]> {
 		while (true) {
+			// A disposing session never commits another selection, so retrying would spin
+			// forever and hold every caller that awaits this activation (owned MCP tool
+			// publication, and through it the tool-session cleanup that disposal awaits).
+			if (this.#isDisposed) return [];
 			if (
 				sessionTransitionGeneration !== this.#sessionTransitionGeneration ||
 				explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
