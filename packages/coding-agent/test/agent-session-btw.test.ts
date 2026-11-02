@@ -199,6 +199,7 @@ function createHarness(options: HarnessOptions = {}): {
 		modelRegistry: {
 			authStorage: undefined,
 			getApiKey,
+			getSessionCredentialType: () => "api_key" as const,
 			getAvailable: () => [model],
 			getAuthStorageOwner: () => ({}),
 			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
