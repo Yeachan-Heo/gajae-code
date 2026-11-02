@@ -303,6 +303,19 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:setDefaultModelProfileForControl":
 		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
+	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getSessionAgentModelOverrideState": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:retireSessionAgentModelOverrides":
+		"internal session-lifecycle plumbing for agent-model overrides, not an independent public SDK operation",
+	"agent_session:restoreSessionAgentModelOverrides":
+		"internal rollback plumbing for agent-model overrides, not an independent public SDK operation",
+	"agent_session:setSessionAgentModelSelection":
+		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
+	"agent_session:getThinkingLevelMutationRevision":
+		"internal revision fence for thinking-level rollback, not a user-facing control seam",
+	"agent_session:withMcpControlAdmission":
+		"internal Host-JS admission wrapper for session MCP mutations, not an independent public SDK operation",
 	"agent_session:withSdkControlMutation":
 		"internal session admission wrapper for the reviewed config.patch seam, not an independent public SDK operation",
 	"agent_session:setThinkingLevelForControl":
